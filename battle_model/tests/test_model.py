@@ -120,3 +120,16 @@ def test_ppo_loss_gradients_are_finite():
 		if param.grad is not None:
 			assert torch.isfinite(param.grad).all(), name
 	assert abs(float(parts["ratio"]) - 1.0) < 1e-4  # same parameters: ratio is 1
+
+
+def test_untrained_model_picks_types_with_the_prior_odds():
+	from battle_model.model import ACTION_TYPE_PRIOR
+	torch.manual_seed(3)
+	m = BattleModel().eval()
+	x = random_inputs(batch=1, seed=4)
+	out = run(m, x)
+	legal = np.flatnonzero(x["m_type"][0])
+	prior = np.array([ACTION_TYPE_PRIOR.get(ActionType(t), 0.0) for t in legal])
+	expected = np.exp(prior) / np.exp(prior).sum()
+	assert np.allclose(out["logp_type"][0, legal].exp().numpy(), expected, atol=1e-5)
+	assert np.allclose(out["value"].numpy(), 0.0)

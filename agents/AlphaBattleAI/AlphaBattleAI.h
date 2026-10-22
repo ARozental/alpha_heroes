@@ -53,6 +53,7 @@ class AlphaBattleAI : public CBattleGameInterface
 	std::optional<TurnKey> lastTurn;
 	std::vector<ChosenAction> rejected;
 	int lastActionType = -1;
+	bool lastActionForced = false; // last action was a test fault, not the model's choice
 	bool spellCastSeen = false;
 	std::vector<std::string> faults; // ALPHA_BATTLE_TEST_FAULT
 	std::vector<std::string> faultsDoneThisBattle;

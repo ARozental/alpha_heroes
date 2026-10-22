@@ -62,30 +62,60 @@ SETTINGS='{"ai":{"combatEnemyAI":"UpLeftAI"}}' scripts/headless.sh "Maps/Elbow R
 
 ## Battle model (`battle_model/`, `agents/AlphaBattleAI/`)
 
-The model's interface is a contract shared by Python and C++:
+Everything about *what* the model learns lives in Python; the C++ side only turns the game into the
+model's input tensors and the model's choice back into a game action.
 
-- `battle_model/constants.py` and `schema.py` define every input tensor (raw engine values plus legality
-  masks) and output tensor (masked conditional log-probabilities and a value). `codegen.py` generates
-  `agents/AlphaBattleAI/Schema.generated.h` from them; a test fails if it is out of date.
-- `export.py` stores `schema_version` and `contract_hash` in the ONNX metadata. AlphaBattleAI refuses
-  any model whose metadata, input or output names, dtypes or shapes differ, and StupidAI plays instead.
-- Any architecture works as long as it keeps the contract: export it and point `ALPHA_BATTLE_MODEL` at it.
+The science (Python, the part to read and change):
+
+| File | What it is |
+|---|---|
+| `model.py` | The network: raw inputs -> embeddings and in-graph transforms (log scaling, relative sides) -> attention over unit, hero, hex and global tokens -> conditional output heads. Also the starting action-type preferences (`ACTION_TYPE_PRIOR`). Replace the architecture freely; only its inputs and outputs are fixed. |
+| `distributions.py` | The maths of the output: log p(full action) as a sum of conditional choices, its exact entropy, and the reference sampler the C++ side mirrors. |
+| `losses.py` | How the model learns: the PPO loss (policy, value, entropy terms) and its weights. |
+| `reward.py` | What counts as good: the terminal reward and the fixed value functions (units, heroes, retreat, surrender). |
+| `vocab.py` | What the ids mean: creatures, spells, heroes, skills, artifacts, battlefields and obstacles by engine id, with names and base stats. |
+
+The contract (shared with C++; change deliberately, then run codegen and bump `SCHEMA_VERSION`):
+
+| File | What it is |
+|---|---|
+| `constants.py` | Sizes, action types, target kinds, embedding vocabulary sizes. |
+| `schema.py` | Every input tensor (raw engine values and legality masks) and output tensor, with dtype, shape, fill value and meaning; random consistent inputs for tests. |
+
+Plumbing (tools around the model):
+
+| File | What it is |
+|---|---|
+| `export.py` | Writes the ONNX file with the contract hash in its metadata and checks it against torch. |
+| `codegen.py` | Generates `agents/AlphaBattleAI/Schema.generated.h` from the contract. |
+| `check_dumps.py` | Replays decisions dumped by the C++ side through the model in Python and checks the masks and actions. |
+| `tests/` | Contract, maths, reward and vocabulary tests. |
+
+`agents/AlphaBattleAI/` (C++, no modelling in it): `Encoder` reads the battle into the input tensors and
+builds the legality masks from the engine's own rules; `Model` loads and validates the ONNX file and runs
+it; `Policy` samples an action from the outputs; `AlphaBattleAI` executes it and falls back to StupidAI for
+war machines, the tactics phase and round 30 onwards; `tools/ExportVocab` writes the id tables.
 
 ```sh
-.venv/bin/python -m pytest battle_model/tests       # model, distributions, losses, reward, export, codegen
+.venv/bin/python -m pytest battle_model/tests       # model, distributions, losses, reward, export, codegen, vocab
+scripts/export_vocab.sh                             # id -> name/stats tables into battle_model/artifacts/vocab.json
+.venv/bin/python -m battle_model.export             # default model into battle_model/artifacts/battle_model.onnx
 .venv/bin/python -m battle_model.codegen            # after changing constants.py / schema.py
 ALPHA_BATTLE_DUMP_DIR=$PWD/runtime/dumps SETTINGS='{"ai":{"combatNeutralAI":"AlphaBattleAI"}}' \
   scripts/headless.sh "Maps/Elbow Room" 120 100
-.venv/bin/python -m battle_model.check_dumps runtime/dumps   # replays C++ decisions through the model in Python
+.venv/bin/python -m battle_model.check_dumps runtime/dumps   # C++ and Python agree on every dumped decision
 ```
+
+To use a better model: export any architecture with `export.py` and point `ALPHA_BATTLE_MODEL` at the file.
+AlphaBattleAI refuses a file whose contract differs (schema version, hash, input/output names, dtypes or
+shapes); StupidAI then plays.
 
 AlphaBattleAI settings (environment variables): `ALPHA_BATTLE_MODEL` (default
 `battle_model/artifacts/battle_model.onnx`, set by the scripts), `ALPHA_BATTLE_TEMPERATURE` (1 = sample,
 0 = most likely action), `ALPHA_BATTLE_SEED`, `ALPHA_BATTLE_DUMP_DIR`, `ALPHA_BATTLE_DUMP_LIMIT` (default 50;
-one decision is about 0.2 MB). War machines and the tactics phase are scripted with StupidAI, and so is
-everything from round 30 on, so no battle can run forever.
+one decision is about 0.2 MB).
 
-Illegal actions never cost a turn: the masks use the engine's own legality checks, every chosen action is
-checked against them before it is sent (an illegal one is excluded and the model chooses again), and if the
-server still refuses a hero spell, retreat or surrender it asks the same unit again, which then takes its
-next best legal action. `ALPHA_BATTLE_TEST_FAULT=surrender,spell,decoder` injects such failures for testing.
+Illegal actions never cost a turn, and our own checks must never find one: every chosen action is checked
+against the masks before it is sent, and a server refusal of a hero spell, retreat or surrender makes the
+same unit choose its next best action. Either one logs `BUG:` and means our masks need fixing.
+`ALPHA_BATTLE_TEST_FAULT=surrender,spell,decoder` injects such failures on purpose to test the recovery.

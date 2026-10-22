@@ -17,7 +17,7 @@ from .constants import (
 	MAX_EFFECTS,
 	MAX_UNITS,
 	N_ACTION_TYPES,
-	N_EFFECT_IDS,
+	EFFECT_VOCAB,
 	N_HEXES,
 	N_SECONDARY_SKILLS,
 	N_SIDES,
@@ -194,7 +194,7 @@ def random_inputs(batch=1, seed=0, n_units=14):
 			x["u_retaliations"][b, u] = rng.integers(0, 4)
 			x["u_queue_now"][b, u] = u
 			x["u_queue_next"][b, u] = u
-			x["u_effect_id"][b, u, 0] = rng.integers(0, N_EFFECT_IDS)
+			x["u_effect_id"][b, u, 0] = rng.integers(0, EFFECT_VOCAB)
 			x["u_effect_turns"][b, u, 0] = rng.integers(0, 5)
 		for side in range(N_SIDES):
 			x["h_present"][b, side] = 1

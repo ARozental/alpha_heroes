@@ -15,7 +15,6 @@ constexpr int MAX_UNITS = 40;
 constexpr int MAX_EFFECTS = 8;
 constexpr int N_SIDES = 2;
 constexpr int N_SPELLS = 70;
-constexpr int N_EFFECT_IDS = 82;
 constexpr int N_SECONDARY_SKILLS = 28;
 constexpr int MAX_RETALIATIONS = 3;
 constexpr int N_ACTION_TYPES = 13;

@@ -175,8 +175,14 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 		rejected.clear();
 	else if(previousActionRejected(*battle))
 	{
+		// Must NEVER happen for the model's own choices: the masks use the engine's legality checks and are
+		// stricter than the server's. A single occurrence (outside ALPHA_BATTLE_TEST_FAULT) is a bug in the
+		// masks that must be fixed right away. The recovery below only keeps the unit from losing its turn.
 		++stats.serverRejections;
-		logAi->warn("AlphaBattleAI: the server rejected action type %d of unit %d, choosing the next best action", lastActionType, stack->unitId());
+		if(lastActionForced)
+			logAi->info("AlphaBattleAI: the server rejected test fault action type %d of unit %d, choosing the next best action", lastActionType, stack->unitId());
+		else
+			logAi->error("AlphaBattleAI: BUG: the server rejected action type %d of unit %d although the masks allowed it; choosing the next best action", lastActionType, stack->unitId());
 	}
 	else
 		rejected.clear(); // e.g. our hero's spell went through and the unit acts now
@@ -204,6 +210,7 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 			logAi->info("AlphaBattleAI: test fault: sending %s, which the server must reject", forced->toJson());
 			rejected.push_back(*forced);
 			lastActionType = forced->type;
+			lastActionForced = true;
 			spellCastSeen = false;
 			execute(battleID, stack, encoded, *forced);
 			return;
@@ -219,10 +226,13 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 		}
 		stats.modelMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 
+		// Check before sending. Must NEVER trigger (except for the "decoder" test fault): the sampler only
+		// picks entries the masks allow, so a failure here is a bug in our code that must be fixed right away.
+		// It costs a few mask lookups; once full games show it never triggers it may be commented out.
 		if(!isLegal(encoded, action))
 		{
 			++stats.preSendRejections;
-			logAi->warn("AlphaBattleAI: chosen action %s is not legal under the masks, choosing again", action.toJson());
+			logAi->error("AlphaBattleAI: BUG: chosen action %s is not legal under the masks; choosing again", action.toJson());
 			rejected.push_back(action);
 			continue;
 		}
@@ -242,6 +252,7 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 		}
 		rejected.push_back(action); // excluded only if the server asks this unit again because it was rejected
 		lastActionType = action.type;
+		lastActionForced = false;
 		spellCastSeen = false;
 		execute(battleID, stack, encoded, action);
 		return;

@@ -23,7 +23,7 @@ from .constants import (
 	MAX_RETALIATIONS,
 	MAX_UNITS,
 	N_ACTION_TYPES,
-	N_EFFECT_IDS,
+	EFFECT_VOCAB,
 	N_HEXES,
 	N_SECONDARY_SKILLS,
 	N_SIDES,
@@ -31,8 +31,24 @@ from .constants import (
 	OBSTACLE_ID_VOCAB,
 	OBSTACLE_TYPE_VOCAB,
 	WALL_STATE_VOCAB,
+	ActionType,
 )
 from .schema import INPUT_NAMES, OUTPUT_NAMES
+
+# Starting preference between action types, as type-head logits. The head's weights start at zero,
+# so an untrained model picks among the legal types with exactly these odds. A modelling choice:
+# start aggressive and rarely give up, so the first self-play games are real fights instead of
+# mostly retreats. Training moves these freely; types not listed start at 0.
+ACTION_TYPE_PRIOR = {
+	ActionType.MELEE: 1.0,
+	ActionType.SHOOT: 1.0,
+	ActionType.HERO_SPELL: 0.5,
+	ActionType.MOVE: 0.5,
+	ActionType.WAIT: 0.0,
+	ActionType.DEFEND: 0.0,
+	ActionType.RETREAT: -2.0,
+	ActionType.SURRENDER: -2.0,
+}
 
 
 def vocab_index(ids, vocab):
@@ -84,7 +100,7 @@ class BattleModel(nn.Module):
 		super().__init__()
 		self.dim = dim
 		self.creature = nn.Embedding(CREATURE_VOCAB + 1, dim)
-		self.effect = nn.Embedding(N_EFFECT_IDS + 1, dim)
+		self.effect = nn.Embedding(EFFECT_VOCAB + 1, dim)
 		self.hero_type = nn.Embedding(HERO_TYPE_VOCAB + 1, dim)
 		self.battlefield = nn.Embedding(BATTLEFIELD_VOCAB + 1, dim)
 		self.access = nn.Embedding(ACCESSIBILITY_VOCAB + 1, dim)
@@ -111,6 +127,13 @@ class BattleModel(nn.Module):
 		# One query projection from the context, and one key projection, per pointer head
 		self.queries = nn.ModuleDict({name: nn.Linear(dim, dim) for name in ("move", "melee", "melee_from", "shoot", "spell", "spell2")})
 		self.keys = nn.ModuleDict({name: nn.Linear(dim, dim) for name in ("move_hex", "melee_unit", "melee_from_unit", "melee_from_hex", "shoot_unit", "spell_unit", "spell_hex", "spell2_from_unit", "spell2_hex", "spell2_unit")})
+
+		with torch.no_grad():
+			self.type_head.weight.zero_()
+			self.type_head.bias.copy_(torch.tensor([ACTION_TYPE_PRIOR.get(a, 0.0) for a in ActionType]))
+			# Value starts at 0 for every state
+			self.value_head[-1].weight.zero_()
+			self.value_head[-1].bias.zero_()
 
 	def _embed(self, x):
 		batch = x["g_our_side"].shape[0]
@@ -150,7 +173,7 @@ class BattleModel(nn.Module):
 		)
 		effect_valid = (x["u_effect_id"] >= 0).float().unsqueeze(-1)
 		effect_num = torch.stack([x["u_effect_turns"].float() / 10, torch.sign(x["u_effect_value"].float()) * log_scale(x["u_effect_value"].abs())], dim=-1)
-		effects = ((self.effect(vocab_index(x["u_effect_id"], N_EFFECT_IDS)) + self.effect_num(effect_num)) * effect_valid).sum(dim=2)
+		effects = ((self.effect(vocab_index(x["u_effect_id"], EFFECT_VOCAB)) + self.effect_num(effect_num)) * effect_valid).sum(dim=2)
 		unit_ours = (x["u_side"] == our_side[:, None]).long()
 		units = (
 			self.creature(vocab_index(x["u_creature"], CREATURE_VOCAB))

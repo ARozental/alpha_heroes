@@ -24,17 +24,21 @@ MAX_EFFECTS = 8
 # Heroes are indexed by battle side: 0 = attacker, 1 = defender.
 N_SIDES = 2
 
-# SpellID 0..69 are real spells; 70..81 are creature ability effects (poison, aging, ...)
-# that only ever appear as active effects on units.
+# SpellID 0..69 are the castable spells (the HERO_SPELL output covers these). Higher ids are creature
+# ability effects (poison, aging, petrify, ...) and internal obstacle triggers (fire wall, land mine)
+# that only appear as active effects on units, never as something a hero casts.
 N_SPELLS = 70
-N_EFFECT_IDS = 82
 N_SECONDARY_SKILLS = 28
 
 # Retaliations are capped: "unlimited" (Royal Griffins) is reported as this value.
 MAX_RETALIATIONS = 3
 
-# Embedding vocabularies for raw ids. Any id outside [0, size) maps to an extra "none/unknown" row.
+# Embedding vocabularies for raw ids. All ids are the engine's own (VCMI identifiers); their names and
+# stats are in battle_model/artifacts/vocab.json (scripts/export_vocab.sh), read by vocab.py.
+# Sizes are internal to the model, not part of the contract. Any id outside [0, size) maps to an
+# extra "none/unknown" row.
 CREATURE_VOCAB = 150  # core H3 creatures 0..149
+EFFECT_VOCAB = 128  # spells and ability effects: 0..103 in VCMI 1.7.5
 HERO_TYPE_VOCAB = 256
 BATTLEFIELD_VOCAB = 64
 OBSTACLE_ID_VOCAB = 256

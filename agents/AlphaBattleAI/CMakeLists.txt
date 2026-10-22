@@ -7,3 +7,9 @@ target_include_directories(AlphaBattleAI PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${C
 find_package(onnxruntime CONFIG REQUIRED)
 target_link_libraries(AlphaBattleAI PRIVATE vcmi onnxruntime::onnxruntime)
 vcmi_set_output_dir(AlphaBattleAI "AI")
+
+# Exports the id -> name/stats tables the Python side uses (scripts/export_vocab.sh)
+add_executable(alpha_export_vocab tools/ExportVocab.cpp)
+target_include_directories(alpha_export_vocab PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR})
+target_link_libraries(alpha_export_vocab PRIVATE vcmi)
+vcmi_set_output_dir(alpha_export_vocab "")
