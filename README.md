@@ -44,5 +44,13 @@ Run `scripts/make_app.sh` once to create `Heroes 3.app` in the repo root; double
 ```sh
 scripts/vcmi.sh client              # game main menu
 scripts/vcmi.sh                     # launcher (play normally)
-scripts/vcmi.sh client --headless --testmap "Maps/Arrogance"   # AI-only game, no window
+```
+
+AI-only games without a window: always use `scripts/headless.sh`, never `vcmi.sh client --headless` directly.
+Each run gets its own directory in `runtime/runs/` (own settings and logs, info-level logging) and is
+killed on a time limit, a disk limit, a stalled log (a stack sample is saved first) or when the script exits:
+
+```sh
+scripts/headless.sh "Maps/Elbow Room" 120 100      # map, max seconds, max MB
+SETTINGS='{"ai":{"combatEnemyAI":"UpLeftAI"}}' scripts/headless.sh "Maps/Elbow Room"
 ```
