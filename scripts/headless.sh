@@ -16,6 +16,7 @@ MAX_SECONDS="${2:-300}"
 MAX_MB="${3:-200}"
 STALL_SECONDS="${4:-30}"
 SHARED="$ROOT/runtime/vcmi-user"
+export ALPHA_BATTLE_MODEL="${ALPHA_BATTLE_MODEL:-$ROOT/battle_model/artifacts/battle_model.onnx}"
 
 RUN_DIR="$ROOT/runtime/runs/$(date +%Y%m%d-%H%M%S)-$$-$(basename "$MAP" | tr -c 'A-Za-z0-9\n' '_')"
 mkdir -p "$RUN_DIR/config"
