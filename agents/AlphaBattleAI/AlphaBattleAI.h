@@ -67,6 +67,7 @@ class AlphaBattleAI : public CBattleGameInterface
 		std::array<int, 4> spellTargets{}; // no target, unit, hex, two targets
 		double modelMs = 0;
 		bool siege = false;
+		bool walls = false;
 		int serverRejections = 0; // handled: server rejected an action, chose again
 		int preSendRejections = 0; // handled: chosen action failed the mask check, chose again
 		int faultsInjected = 0;

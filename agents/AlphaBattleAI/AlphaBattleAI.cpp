@@ -90,6 +90,7 @@ void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * 
 	rejected.clear();
 	faultsDoneThisBattle.clear();
 	stats.siege = cb->getBattle(battleID)->battleGetDefendedTown() != nullptr;
+	stats.walls = cb->getBattle(battleID)->battleGetWallState(EWallPart::KEEP) != EWallState::NONE;
 	fallback->battleStart(battleID, army1, army2, tile, hero1, hero2, side, replayAllowed);
 }
 
@@ -99,7 +100,7 @@ void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br
 	for(int t = 0; t < N_ACTION_TYPES; ++t)
 		types += std::to_string(stats.types[t]) + (t + 1 < N_ACTION_TYPES ? "," : "");
 	const auto & st = stats.spellTargets;
-	logAi->info("AlphaBattleAI: battle summary: decisions=%d fallbacks=%d errors=%d types=[%s] spell_targets(none,unit,hex,two)=[%d,%d,%d,%d] siege=%d server_rejections=%d presend_rejections=%d faults=%d avg_model_ms=%.2f", stats.decisions, stats.fallbacks, stats.errors, types, st[0], st[1], st[2], st[3], stats.siege, stats.serverRejections, stats.preSendRejections, stats.faultsInjected, stats.decisions ? stats.modelMs / stats.decisions : 0.0);
+	logAi->info("AlphaBattleAI: battle summary: decisions=%d fallbacks=%d errors=%d types=[%s] spell_targets(none,unit,hex,two)=[%d,%d,%d,%d] siege=%d walls=%d server_rejections=%d presend_rejections=%d faults=%d avg_model_ms=%.2f", stats.decisions, stats.fallbacks, stats.errors, types, st[0], st[1], st[2], st[3], stats.siege, stats.walls, stats.serverRejections, stats.preSendRejections, stats.faultsInjected, stats.decisions ? stats.modelMs / stats.decisions : 0.0);
 	fallback->battleEnd(battleID, br, queryID);
 }
 
