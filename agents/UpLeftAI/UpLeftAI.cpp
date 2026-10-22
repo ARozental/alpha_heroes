@@ -6,6 +6,12 @@
 #include "lib/battle/CPlayerBattleCallback.h"
 #include "lib/bonuses/BonusEnum.h"
 #include "lib/callback/CBattleCallback.h"
+#include "lib/callback/CDynLibHandler.h"
+
+namespace
+{
+constexpr int HANDOVER_ROUND = 10;
+}
 
 UpLeftAI::~UpLeftAI()
 {
@@ -19,7 +25,10 @@ void UpLeftAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::shared
 	env = ENV;
 	cb = CB;
 
+	// Save before the fallback touches the callback, both restore the same original value
 	wasWaitingForRealize = CB->waitTillRealize;
+	fallback = CDynLibHandler::getNewBattleAI("StupidAI");
+	fallback->initBattleInterface(ENV, CB);
 	CB->waitTillRealize = false;
 }
 
@@ -33,9 +42,20 @@ void UpLeftAI::yourTacticPhase(const BattleID & battleID, int distance)
 	cb->battleMakeTacticAction(battleID, BattleAction::makeEndOFTacticPhase(cb->getBattle(battleID)->battleGetTacticsSide()));
 }
 
+void UpLeftAI::battleStart(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2, int3 tile, const CGHeroInstance * hero1, const CGHeroInstance * hero2, BattleSide side, bool replayAllowed)
+{
+	fallback->battleStart(battleID, army1, army2, tile, hero1, hero2, side, replayAllowed);
+}
+
 void UpLeftAI::activeStack(const BattleID & battleID, const CStack * stack)
 {
 	auto battle = cb->getBattle(battleID);
+
+	if(battle->battleGetRound() >= HANDOVER_ROUND)
+	{
+		fallback->activeStack(battleID, stack);
+		return;
+	}
 
 	if(stack->hasBonusOfType(BonusType::SIEGE_WEAPON))
 	{
