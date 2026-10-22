@@ -1,0 +1,7 @@
+# Build output
+/build/
+
+# Game data (copyrighted), VCMI config, saves and logs
+/runtime/
+
+.DS_Store
