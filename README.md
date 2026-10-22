@@ -35,7 +35,7 @@ mv runtime/gog-extract/{Data,Maps,Mp3} runtime/vcmi-user/ && rm -rf runtime/gog-
 
 ## Running
 
-Run `scripts/make_app.sh` once to create `Heroes 3.app` in the repo root; double-click it to open the game.
+Run `scripts/make_app.sh` once to create `Heroes 3.app` in the repo root; double-click it to open the VCMI launcher (Play starts the game).
 
 ```sh
 scripts/vcmi.sh client              # game main menu
