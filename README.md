@@ -7,6 +7,9 @@ Training a strong Heroes of Might and Magic III AI on the [VCMI](https://github.
 - `vcmi/` — submodule: our VCMI branch `alpha_heroes`, based on the 1.7.5 release
   - upstream headless/testmap fixes cherry-picked from `develop`
   - `VCMI_USER_DIR` env var to keep game data, config, saves and logs out of `~/Library`
+- `agents/` — our AI libraries, built into `build/bin/AI/` via VCMI's `EXTRA_AI_DIRS`
+  - `UpLeftAI` — test battle AI: units walk to the top-left hex and hit adjacent enemies.
+    Select it in the launcher under Settings → AI (Enemy / Neutral / Friendly combat AI).
 - `scripts/vcmi.sh` — runs the local build with user data in `runtime/vcmi-user`
 - `build/` — CMake build output (ignored)
 - `runtime/` — game data, VCMI config, saves, logs (ignored; the game data is copyrighted)
@@ -21,7 +24,8 @@ brew install cmake ninja ccache innoextract boost minizip sdl2 sdl2_image sdl2_m
   sdl2_ttf tbb libsquish onnxruntime fmt glaze ffmpeg qt
 
 cmake -S vcmi -B build -G Ninja -D CMAKE_BUILD_TYPE=RelWithDebInfo \
-  -D CMAKE_C_COMPILER_LAUNCHER=ccache -D CMAKE_CXX_COMPILER_LAUNCHER=ccache -D ENABLE_TEST=OFF
+  -D CMAKE_C_COMPILER_LAUNCHER=ccache -D CMAKE_CXX_COMPILER_LAUNCHER=ccache -D ENABLE_TEST=OFF \
+  -D EXTRA_AI_DIRS="$(pwd)/agents/UpLeftAI"
 cmake --build build
 ```
 
