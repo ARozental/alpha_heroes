@@ -2,10 +2,17 @@
 
 #include "lib/callback/CBattleGameInterface.h"
 
+#include "Policy.h"
+
+#include <optional>
 #include <random>
+#include <vector>
+
+VCMI_LIB_NAMESPACE_BEGIN
+class CPlayerBattleCallback;
+VCMI_LIB_NAMESPACE_END
 
 class BattleModel;
-struct ChosenAction;
 struct EncodedBattle;
 
 /// Battle AI that plays with an ONNX model implementing battle_model's contract.
@@ -16,6 +23,12 @@ struct EncodedBattle;
 ///   ALPHA_BATTLE_SEED         random seed (default: random)
 ///   ALPHA_BATTLE_DUMP_DIR     write inputs/outputs/action of decisions there (battle_model/check_dumps.py)
 ///   ALPHA_BATTLE_DUMP_LIMIT   decisions to dump per process (default 50)
+///   ALPHA_BATTLE_TEST_FAULT   test hook, comma list: "surrender" / "spell" send one action per battle the
+///                             server must reject, "decoder" corrupts one chosen action per battle
+///
+/// Every chosen action is checked against the masks before it is sent; an illegal one is excluded and
+/// the model chooses again. If the server still rejects a hero spell, retreat or surrender, it asks the
+/// same unit again: that choice is excluded and the next best legal action is taken.
 ///
 /// War machines and the tactics phase are scripted (StupidAI), as is everything from round
 /// ROUND_CAP on, so a battle cannot go on forever. Any error falls back to StupidAI for that decision.
@@ -29,6 +42,21 @@ class AlphaBattleAI : public CBattleGameInterface
 	float temperature = 1.0f;
 	bool wasWaitingForRealize = false;
 
+	// Rejection handling: actions excluded for the current unit's turn
+	struct TurnKey
+	{
+		int battle;
+		int round;
+		int unit;
+		bool operator==(const TurnKey &) const = default;
+	};
+	std::optional<TurnKey> lastTurn;
+	std::vector<ChosenAction> rejected;
+	int lastActionType = -1;
+	bool spellCastSeen = false;
+	std::vector<std::string> faults; // ALPHA_BATTLE_TEST_FAULT
+	std::vector<std::string> faultsDoneThisBattle;
+
 	struct Stats
 	{
 		int decisions = 0;
@@ -38,7 +66,13 @@ class AlphaBattleAI : public CBattleGameInterface
 		std::array<int, 4> spellTargets{}; // no target, unit, hex, two targets
 		double modelMs = 0;
 		bool siege = false;
+		int serverRejections = 0; // handled: server rejected an action, chose again
+		int preSendRejections = 0; // handled: chosen action failed the mask check, chose again
+		int faultsInjected = 0;
 	} stats;
+
+	bool previousActionRejected(const CPlayerBattleCallback & battle) const;
+	bool injectFault(const std::string & fault);
 
 	void playWithModel(const BattleID & battleID, const CStack * stack);
 	void execute(const BattleID & battleID, const CStack * stack, const EncodedBattle & encoded, const ChosenAction & action);
@@ -52,6 +86,7 @@ public:
 
 	void battleStart(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2, int3 tile, const CGHeroInstance * hero1, const CGHeroInstance * hero2, BattleSide side, bool replayAllowed) override;
 	void battleEnd(const BattleID & battleID, const BattleResult * br, QueryID queryID) override;
+	void battleSpellCast(const BattleID & battleID, const BattleSpellCast * sc) override;
 	void activeStack(const BattleID & battleID, const CStack * stack) override;
 	void yourTacticPhase(const BattleID & battleID, int distance) override;
 };

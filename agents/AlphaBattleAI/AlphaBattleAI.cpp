@@ -12,10 +12,13 @@
 #include "lib/bonuses/BonusEnum.h"
 #include "lib/callback/CBattleCallback.h"
 #include "lib/callback/CDynLibHandler.h"
+#include "lib/networkPacks/PacksForClientBattle.h"
+#include "lib/spells/CSpellHandler.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <sstream>
 #include <unistd.h>
 
 using namespace AlphaSchema;
@@ -23,6 +26,7 @@ using namespace AlphaSchema;
 namespace
 {
 constexpr int ROUND_CAP = 30;
+constexpr int MAX_ATTEMPTS = 8; // choices per unit turn before StupidAI takes over
 
 std::string envString(const char * name)
 {
@@ -54,6 +58,11 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 	const auto temp = envString("ALPHA_BATTLE_TEMPERATURE");
 	temperature = temp.empty() ? 1.0f : std::stof(temp);
 
+	std::stringstream faultList(envString("ALPHA_BATTLE_TEST_FAULT"));
+	for(std::string fault; std::getline(faultList, fault, ',');)
+		if(!fault.empty())
+			faults.push_back(fault);
+
 	const auto path = envString("ALPHA_BATTLE_MODEL");
 	try
 	{
@@ -77,6 +86,9 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2, int3 tile, const CGHeroInstance * hero1, const CGHeroInstance * hero2, BattleSide side, bool replayAllowed)
 {
 	stats = Stats(); // the neutral player's battle AI is reused for every battle
+	lastTurn.reset();
+	rejected.clear();
+	faultsDoneThisBattle.clear();
 	stats.siege = cb->getBattle(battleID)->battleGetDefendedTown() != nullptr;
 	fallback->battleStart(battleID, army1, army2, tile, hero1, hero2, side, replayAllowed);
 }
@@ -87,8 +99,38 @@ void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br
 	for(int t = 0; t < N_ACTION_TYPES; ++t)
 		types += std::to_string(stats.types[t]) + (t + 1 < N_ACTION_TYPES ? "," : "");
 	const auto & st = stats.spellTargets;
-	logAi->info("AlphaBattleAI: battle summary: decisions=%d fallbacks=%d errors=%d types=[%s] spell_targets(none,unit,hex,two)=[%d,%d,%d,%d] siege=%d avg_model_ms=%.2f", stats.decisions, stats.fallbacks, stats.errors, types, st[0], st[1], st[2], st[3], stats.siege, stats.decisions ? stats.modelMs / stats.decisions : 0.0);
+	logAi->info("AlphaBattleAI: battle summary: decisions=%d fallbacks=%d errors=%d types=[%s] spell_targets(none,unit,hex,two)=[%d,%d,%d,%d] siege=%d server_rejections=%d presend_rejections=%d faults=%d avg_model_ms=%.2f", stats.decisions, stats.fallbacks, stats.errors, types, st[0], st[1], st[2], st[3], stats.siege, stats.serverRejections, stats.preSendRejections, stats.faultsInjected, stats.decisions ? stats.modelMs / stats.decisions : 0.0);
 	fallback->battleEnd(battleID, br, queryID);
+}
+
+void AlphaBattleAI::battleSpellCast(const BattleID & battleID, const BattleSpellCast * sc)
+{
+	if(sc->side == cb->getBattle(battleID)->battleGetMySide())
+		spellCastSeen = true;
+	fallback->battleSpellCast(battleID, sc);
+}
+
+bool AlphaBattleAI::previousActionRejected(const CPlayerBattleCallback & battle) const
+{
+	switch(static_cast<ActionType>(lastActionType))
+	{
+		case ActionType::RETREAT:
+		case ActionType::SURRENDER:
+			return true; // accepted would have ended the battle
+		case ActionType::HERO_SPELL:
+			return !spellCastSeen;
+		default:
+			return false; // unit actions end the unit's turn; being asked again is good morale
+	}
+}
+
+bool AlphaBattleAI::injectFault(const std::string & fault)
+{
+	if(std::find(faults.begin(), faults.end(), fault) == faults.end() || std::find(faultsDoneThisBattle.begin(), faultsDoneThisBattle.end(), fault) != faultsDoneThisBattle.end())
+		return false;
+	faultsDoneThisBattle.push_back(fault);
+	++stats.faultsInjected;
+	return true;
 }
 
 void AlphaBattleAI::yourTacticPhase(const BattleID & battleID, int distance)
@@ -125,25 +167,86 @@ void AlphaBattleAI::activeStack(const BattleID & battleID, const CStack * stack)
 void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stack)
 {
 	auto battle = cb->getBattle(battleID);
-	const auto start = std::chrono::steady_clock::now();
-	const auto encoded = encodeBattle(*battle, stack, *env, cb->getPlayerID().value_or(PlayerColor::NEUTRAL));
-	const auto outputs = model->run(encoded.tensors);
-	const auto action = chooseAction(outputs, rng, temperature);
-	stats.modelMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-	++stats.decisions;
-	++stats.types[action.type];
-	if(action.type == static_cast<int>(ActionType::HERO_SPELL))
-		++stats.spellTargets[action.target2Hex >= 0 || action.target2Unit >= 0 ? 3 : action.targetHex >= 0 ? 2 : action.targetUnit >= 0 ? 1 : 0];
+	const auto player = cb->getPlayerID().value_or(PlayerColor::NEUTRAL);
 
-	const auto dumpDir = envString("ALPHA_BATTLE_DUMP_DIR");
-	if(!dumpDir.empty())
+	// Asked again for the same unit in the same round: find out whether our last action was rejected
+	const TurnKey turn{battleID.getNum(), battle->battleGetRound(), static_cast<int>(stack->unitId())};
+	if(lastTurn != turn)
+		rejected.clear();
+	else if(previousActionRejected(*battle))
 	{
-		const auto limit = envString("ALPHA_BATTLE_DUMP_LIMIT");
-		const int n = dumpedDecisions++;
-		if(n < (limit.empty() ? 50 : std::stoi(limit)))
-			dumpDecision(dumpDir, "decision_" + std::to_string(getpid()) + "_" + std::to_string(n), encoded.tensors, outputs, action);
+		++stats.serverRejections;
+		logAi->warn("AlphaBattleAI: the server rejected action type %d of unit %d, choosing the next best action", lastActionType, stack->unitId());
 	}
-	execute(battleID, stack, encoded, action);
+	else
+		rejected.clear(); // e.g. our hero's spell went through and the unit acts now
+	lastTurn = turn;
+
+	for(int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt)
+	{
+		const auto start = std::chrono::steady_clock::now();
+		auto encoded = encodeBattle(*battle, stack, *env, player);
+		for(const auto & action : rejected)
+			excludeAction(encoded, action);
+		if(!encoded.tensors.any(In::m_type))
+			throw std::runtime_error("no legal action left for this unit");
+
+		// Test hook: send something the server must reject (masks are bypassed on purpose)
+		std::optional<ChosenAction> forced;
+		if(battle->battleGetSurrenderCost() < 0 && injectFault("surrender")) // our mask is stricter than the server: only force what it must refuse
+			forced = ChosenAction{.type = static_cast<int>(ActionType::SURRENDER)};
+		else if(battle->battleGetMyHero() && injectFault("spell"))
+			for(int s = 0; s < N_SPELLS && !forced; ++s)
+				if(!encoded.tensors.get(In::m_spell, s) && SpellID(s).toSpell() && !SpellID(s).toSpell()->isAdventure())
+					forced = ChosenAction{.type = static_cast<int>(ActionType::HERO_SPELL), .spell = s};
+		if(forced)
+		{
+			logAi->info("AlphaBattleAI: test fault: sending %s, which the server must reject", forced->toJson());
+			rejected.push_back(*forced);
+			lastActionType = forced->type;
+			spellCastSeen = false;
+			execute(battleID, stack, encoded, *forced);
+			return;
+		}
+
+		const auto outputs = model->run(encoded.tensors);
+		auto action = chooseAction(outputs, rng, temperature);
+		if(injectFault("decoder"))
+		{
+			logAi->info("AlphaBattleAI: test fault: corrupting chosen action %s", action.toJson());
+			action.type = static_cast<int>(ActionType::MOVE);
+			action.hex = 0; // side column: never a legal destination
+		}
+		stats.modelMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+
+		if(!isLegal(encoded, action))
+		{
+			++stats.preSendRejections;
+			logAi->warn("AlphaBattleAI: chosen action %s is not legal under the masks, choosing again", action.toJson());
+			rejected.push_back(action);
+			continue;
+		}
+
+		++stats.decisions;
+		++stats.types[action.type];
+		if(action.type == static_cast<int>(ActionType::HERO_SPELL))
+			++stats.spellTargets[action.target2Hex >= 0 || action.target2Unit >= 0 ? 3 : action.targetHex >= 0 ? 2 : action.targetUnit >= 0 ? 1 : 0];
+
+		const auto dumpDir = envString("ALPHA_BATTLE_DUMP_DIR");
+		if(!dumpDir.empty())
+		{
+			const auto limit = envString("ALPHA_BATTLE_DUMP_LIMIT");
+			const int n = dumpedDecisions++;
+			if(n < (limit.empty() ? 50 : std::stoi(limit)))
+				dumpDecision(dumpDir, "decision_" + std::to_string(getpid()) + "_" + std::to_string(n), encoded.tensors, outputs, action);
+		}
+		rejected.push_back(action); // excluded only if the server asks this unit again because it was rejected
+		lastActionType = action.type;
+		spellCastSeen = false;
+		execute(battleID, stack, encoded, action);
+		return;
+	}
+	throw std::runtime_error("no legal action found after " + std::to_string(MAX_ATTEMPTS) + " attempts");
 }
 
 void AlphaBattleAI::execute(const BattleID & battleID, const CStack * stack, const EncodedBattle & encoded, const ChosenAction & a)

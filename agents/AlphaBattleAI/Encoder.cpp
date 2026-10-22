@@ -1,6 +1,8 @@
 #include "StdInc.h"
 #include "Encoder.h"
 
+#include "Policy.h"
+
 #include "lib/CStack.h"
 #include "lib/battle/CObstacleInstance.h"
 #include "lib/battle/CPlayerBattleCallback.h"
@@ -223,6 +225,7 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 		if(aims.empty() || aims.size() > 2 || (aims.size() == 2) != (second != TargetKind::NONE))
 			continue; // shape the contract does not describe
 
+		e.spellTargetKind[s] = aims[0] == spells::AimType::LOCATION ? TargetKind::HEX : aims[0] == spells::AimType::CREATURE ? TargetKind::UNIT : TargetKind::NONE;
 		if(aims[0] == spells::AimType::NO_TARGET)
 		{
 			if(mechanics->canBeCastAt(spells::Target()))
@@ -316,14 +319,102 @@ EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * 
 	auto type = [&](ActionType a, bool legal) { t.set(In::m_type, static_cast<int>(a), legal); };
 	type(ActionType::WAIT, !active->waitedThisTurn);
 	type(ActionType::DEFEND, true);
-	type(ActionType::MOVE, t.any(In::m_move_hex));
-	type(ActionType::MELEE, t.any(In::m_melee_target));
-	type(ActionType::SHOOT, t.any(In::m_shoot_target));
-	type(ActionType::HERO_SPELL, heroCanCast && t.any(In::m_spell));
+	type(ActionType::HERO_SPELL, heroCanCast);
 	type(ActionType::RETREAT, battle.battleCanFlee());
 	// Surrender only when the hero can be bought back afterwards
 	const int surrenderCost = battle.battleGetSurrenderCost();
 	const bool canPay = surrenderCost >= 0 && player.isValidPlayer() && env.game()->getResource(player, EGameResID::GOLD) >= surrenderCost + GameConstants::HERO_GOLD_COST;
 	type(ActionType::SURRENDER, canPay);
+	refreshDerivedMasks(e);
 	return e;
+}
+
+void refreshDerivedMasks(EncodedBattle & e)
+{
+	auto & t = e.tensors;
+	for(int s = 0; s < N_SPELLS; ++s)
+	{
+		const auto second = secondTargetKind(s);
+		for(int u = 0; u < MAX_UNITS && second != TargetKind::NONE; ++u)
+			if(t.get(In::m_spell_unit, s, u) && !t.anyInRow(second == TargetKind::HEX ? In::m_spell2_hex : In::m_spell2_unit, u))
+				t.set(In::m_spell_unit, s, u, 0);
+		const bool hasTargets = t.anyInRow(In::m_spell_unit, s) || t.anyInRow(In::m_spell_hex, s);
+		if(e.spellTargetKind[s] != TargetKind::NONE && !hasTargets)
+			t.set(In::m_spell, s, 0);
+	}
+	for(int u = 0; u < MAX_UNITS; ++u)
+		t.set(In::m_melee_target, u, t.anyInRow(In::m_melee_from, u));
+
+	auto type = [&](ActionType a, bool legal) { t.set(In::m_type, static_cast<int>(a), legal); };
+	type(ActionType::MOVE, t.any(In::m_move_hex));
+	type(ActionType::MELEE, t.any(In::m_melee_target));
+	type(ActionType::SHOOT, t.any(In::m_shoot_target));
+	type(ActionType::HERO_SPELL, t.get(In::m_type, static_cast<int>(ActionType::HERO_SPELL)) && t.any(In::m_spell));
+}
+
+void excludeAction(EncodedBattle & e, const ChosenAction & a)
+{
+	auto & t = e.tensors;
+	auto clear = [&](In in, int i, int j = 0)
+	{
+		if(i >= 0 && j >= 0)
+			t.set(in, i, j, 0);
+	};
+	switch(static_cast<ActionType>(a.type))
+	{
+		case ActionType::MOVE: clear(In::m_move_hex, a.hex); break;
+		case ActionType::MELEE: clear(In::m_melee_from, a.unit, a.hex); break;
+		case ActionType::SHOOT: clear(In::m_shoot_target, a.unit); break;
+		case ActionType::HERO_SPELL:
+			if(a.target2Hex >= 0)
+				clear(In::m_spell2_hex, a.targetUnit, a.target2Hex);
+			else if(a.target2Unit >= 0)
+				clear(In::m_spell2_unit, a.targetUnit, a.target2Unit);
+			else if(a.targetUnit >= 0)
+				clear(In::m_spell_unit, a.spell, a.targetUnit);
+			else if(a.targetHex >= 0)
+				clear(In::m_spell_hex, a.spell, a.targetHex);
+			else
+				clear(In::m_spell, a.spell);
+			break;
+		default:
+			if(a.type >= 0 && a.type < N_ACTION_TYPES)
+				t.set(In::m_type, a.type, 0);
+			break;
+	}
+	refreshDerivedMasks(e);
+}
+
+bool isLegal(const EncodedBattle & e, const ChosenAction & a)
+{
+	const auto & t = e.tensors;
+	auto in = [](int v, int n) { return v >= 0 && v < n; };
+	if(!in(a.type, N_ACTION_TYPES) || !t.get(In::m_type, a.type))
+		return false;
+	switch(static_cast<ActionType>(a.type))
+	{
+		case ActionType::MOVE: return in(a.hex, N_HEXES) && t.get(In::m_move_hex, a.hex);
+		case ActionType::MELEE: return in(a.unit, MAX_UNITS) && in(a.hex, N_HEXES) && t.get(In::m_melee_target, a.unit) && t.get(In::m_melee_from, a.unit, a.hex);
+		case ActionType::SHOOT: return in(a.unit, MAX_UNITS) && t.get(In::m_shoot_target, a.unit);
+		case ActionType::HERO_SPELL:
+		{
+			if(!in(a.spell, N_SPELLS) || !t.get(In::m_spell, a.spell))
+				return false;
+			const auto kind = e.spellTargetKind[a.spell];
+			if(kind == TargetKind::UNIT && !(in(a.targetUnit, MAX_UNITS) && t.get(In::m_spell_unit, a.spell, a.targetUnit)))
+				return false;
+			if(kind == TargetKind::HEX && !(in(a.targetHex, N_HEXES) && t.get(In::m_spell_hex, a.spell, a.targetHex)))
+				return false;
+			if(kind == TargetKind::NONE && (a.targetUnit >= 0 || a.targetHex >= 0))
+				return false;
+			const auto second = secondTargetKind(a.spell);
+			if(second == TargetKind::HEX)
+				return in(a.target2Hex, N_HEXES) && t.get(In::m_spell2_hex, a.targetUnit, a.target2Hex);
+			if(second == TargetKind::UNIT)
+				return in(a.target2Unit, MAX_UNITS) && t.get(In::m_spell2_unit, a.targetUnit, a.target2Unit);
+			return a.target2Hex < 0 && a.target2Unit < 0;
+		}
+		default:
+			return true;
+	}
 }

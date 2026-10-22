@@ -84,3 +84,8 @@ AlphaBattleAI settings (environment variables): `ALPHA_BATTLE_MODEL` (default
 0 = most likely action), `ALPHA_BATTLE_SEED`, `ALPHA_BATTLE_DUMP_DIR`, `ALPHA_BATTLE_DUMP_LIMIT` (default 50;
 one decision is about 0.2 MB). War machines and the tactics phase are scripted with StupidAI, and so is
 everything from round 30 on, so no battle can run forever.
+
+Illegal actions never cost a turn: the masks use the engine's own legality checks, every chosen action is
+checked against them before it is sent (an illegal one is excluded and the model chooses again), and if the
+server still refuses a hero spell, retreat or surrender it asks the same unit again, which then takes its
+next best legal action. `ALPHA_BATTLE_TEST_FAULT=surrender,spell,decoder` injects such failures for testing.
