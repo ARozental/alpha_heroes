@@ -54,13 +54,15 @@ def main():
 	parser.add_argument("--scenario", default=TrainConfig.scenario)
 	parser.add_argument("--ai", default="AlphaBattleAI")
 	parser.add_argument("--opponent", default="BattleAI")
+	parser.add_argument("--map", default="", help="play this existing map (e.g. Maps/alpha/castle_vs_inferno-<run>, the one a run trained on) instead of building one")
 	args = parser.parse_args()
 	model, epoch = load(args.checkpoint)
-	battle_map = play.build_map(args.scenario, variant=f"evaluate-{os.getpid()}")
+	battle_map = args.map or play.build_map(args.scenario, variant=f"evaluate-{os.getpid()}")
 	try:
 		results = evaluate(model, args.scenario, tuple(int(s) for s in args.seeds.split(",")), args.games, args.temperature, ai=args.ai, opponent=args.opponent, battle_map=battle_map)
 	finally:
-		(play.USER_DIR / (battle_map + ".vmap")).unlink(missing_ok=True)
+		if not args.map:
+			(play.USER_DIR / (battle_map + ".vmap")).unlink(missing_ok=True)
 	for side, name in ((0, "attack"), (1, "defence")):
 		summaries = results[side]
 		wins = sum(s.outcome.name == "WIN" for s in summaries)
