@@ -115,7 +115,8 @@ Training on a scenario. Battle records never touch the disk: AlphaBattleAI keeps
 and sends it to the trainer over a Unix socket when the battle ends (`play.RecordServer`); `--set keep_records=true`
 also writes them to `runtime/train/<run>/records` for debugging. Torch trains on the GPU (`device`, Apple MPS here)
 while the CPU plays the next epoch's battles in the background (`prefetch`). Each run plays its own copy of the
-scenario's map. Any config field can be set with `--set`, including `ppo.*`, `advantage.*`, `reward.*`:
+scenario's map. A run's folder is `runtime/train/<start time>-<name>` (e.g. `20261023-1412-selfplay`), so name order is
+time order; `--run NAME --resume` continues the newest run with that name. Any config field can be set with `--set`, including `ppo.*`, `advantage.*`, `reward.*`:
 
 ```sh
 .venv/bin/python -m battle_model.train --run NAME            # 8 battles per side per epoch, fixed seeds

@@ -52,11 +52,40 @@ class BattleSummary:
 	decisions: int = 0
 	advantage_std: float = 0.0  # std of the raw (not normalised) advantages, -1..1 scale: how much there is to learn
 	value_error: float = 0.0  # mean |V - final reward| over the decisions, -1..1 scale, V from the model that played
+	values: list = field(default_factory=list)  # V at every decision (-1..1), for the value head's explained variance
+	# Per decision but the last: (our army value lost, enemy army value killed, change of V) until the next decision,
+	# values as fractions of the armies at the start: what V's changes, which make the advantages, reward (credit_check)
+	credit: list = field(default_factory=list)
 
 
 def army_value(stacks):
 	"""Value of [[creature id, count], ...] (gold + resources)."""
 	return float(sum(vocab.creature_value(creature) * count for creature, count in stacks))
+
+
+def army_values(tensors, side):
+	"""[T] value of a battle side's living army units at every decision of a record (summoned units and clones excluded)."""
+	alive = (tensors["u_present"] != 0) & (tensors["u_alive"] != 0) & (tensors["u_side"] == side) & (tensors["u_is_summoned"] == 0) & (tensors["u_is_clone"] == 0)
+	prices = np.vectorize(lambda c: vocab.creature_value(int(c)) if c >= 0 else 0.0)(tensors["u_creature"]) if tensors["u_creature"].size else np.zeros_like(tensors["u_creature"], dtype=float)
+	return (prices * tensors["u_count"] * alive).sum(axis=1)
+
+
+def credit_check(summaries):
+	"""What the value head rewards, from the battles of one side: (explained variance of V, change of V per fraction
+	of our army lost, change of V per fraction of the enemy army killed), by least squares over every step between
+	two decisions. These changes of V are what GAE turns into the advantages (losses.battle_returns_and_advantages).
+
+	On a lost battle the reward counts only kills (about +0.47 on the -1..1 scale per whole enemy army), so an
+	honest V changes by ~0 when we lose units and positively when we kill; a negative kill coefficient or a strongly
+	negative loss one means the advantages teach the wrong thing."""
+	values = np.array([v for s in summaries for v in s.values])
+	rewards = np.array([to_scale(s.reward) for s in summaries for _ in s.values])
+	ev = float(1 - np.var(rewards - values) / np.var(rewards)) if len(values) > 1 and np.var(rewards) > 1e-12 else float("nan")
+	rows = np.array([c for s in summaries for c in s.credit])
+	if len(rows) < 3:
+		return ev, float("nan"), float("nan")
+	coef, *_ = np.linalg.lstsq(np.c_[rows[:, :2], np.ones(len(rows))], rows[:, 2], rcond=None)
+	return ev, float(coef[0]), float(coef[1])
 
 
 def read_events(record_dir):
@@ -211,6 +240,10 @@ def battle_examples(record, reward_config=RewardConfig(), advantage_config=Advan
 	_, advantages = battle_returns_and_advantages(values, rewards, advantage_config)
 	summary.advantage_std = float(advantages.std()) if len(advantages) > 1 else 0.0
 	summary.value_error = float((values - rewards[-1]).abs().mean())
+	summary.values = values.tolist()
+	own = army_values(record.tensors, summary.our_side) / max(summary.own_start_value, 1.0)
+	enemy = army_values(record.tensors, 1 - summary.our_side) / max(summary.enemy_start_value, 1.0)
+	summary.credit = list(zip(-np.diff(own), -np.diff(enemy), np.diff(values.numpy()).tolist()))
 	rounds = [int(d[0]["g_round"]) for d in decisions]
 	labels = value_targets(rounds, summary.round_scores, summary.reward, reward_config=reward_config)
 

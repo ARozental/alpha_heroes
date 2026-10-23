@@ -151,6 +151,21 @@ def test_boost_stop_gradient_keeps_long_horizon_labels_off_short_heads():
 	x = {k: torch.from_numpy(v) for k, v in random_inputs(batch=2, seed=3).items()}
 	for stop, expect_grad in ((True, False), (False, True)):
 		m = BattleModel(boost_stop_gradient=stop)
-		m(x)["value_logit"][:, -1].sum().backward()  # a loss on the final-reward head only
+		m(x)["value_logit"][:, -2].sum().backward()  # a loss on V2, the longest round horizon, only
 		v0_grad = m.value_heads[0].weight.grad
 		assert (v0_grad is not None and v0_grad.abs().sum() > 0) == expect_grad
+
+
+def test_final_value_head_stands_alone():
+	"""V, used for the advantages, predicts the final reward itself: it must not inherit V0..V2's swings."""
+	torch.manual_seed(0)
+	x = {k: torch.from_numpy(v) for k, v in random_inputs(batch=2, seed=3).items()}
+	m = BattleModel(boost_stop_gradient=False)
+	for head in m.value_heads:  # non-zero heads, so a chained logit would differ from the head's own output
+		torch.nn.init.normal_(head.weight)
+	out = m(x)
+	out["value_logit"][:, -1].sum().backward()
+	assert all(h.weight.grad is None or h.weight.grad.abs().sum() == 0 for h in m.value_heads[:-1])
+	chained = BattleModel(boost_stop_gradient=False, chain_final_value=True)
+	chained.load_state_dict(m.state_dict())
+	assert not torch.allclose(chained(x)["value_logit"][:, -1], out["value_logit"][:, -1])

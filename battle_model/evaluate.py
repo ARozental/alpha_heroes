@@ -24,7 +24,8 @@ from .train import ROOT, TrainConfig, model_kwargs
 
 def load(checkpoint):
 	state = torch.load(checkpoint, map_location="cpu")
-	model = BattleModel(**state.get("model_kwargs", model_kwargs(TrainConfig())))  # older checkpoints: the default model
+	# older checkpoints: the default model of their time, with the final value head chained
+	model = BattleModel(**{"chain_final_value": True, **state.get("model_kwargs", model_kwargs(TrainConfig()))})
 	model.load_state_dict(state["model"])
 	return model.eval(), state["epoch"]
 

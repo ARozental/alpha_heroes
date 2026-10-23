@@ -8,10 +8,13 @@ Tokens: 1 global + 2 heroes + MAX_UNITS units + N_HEXES hexes, mixed by a few
 self-attention blocks. Output heads score units and hexes by dot products against
 query vectors built from the global token, the acting unit and our hero.
 
-Value heads, "boosted" over horizons: V0 predicts the reward formula at the end of this round,
-V1 at the end of the next round, ..., V at the end of the battle. Each is one linear layer on the
-last hidden state, and each head's logit is added to the previous head's logit, so a later head
-only learns the difference to the shorter-horizon estimate. Each outputs tanh(logit), a value in
+Value heads over horizons: V0 predicts the reward formula at the end of this round, V1 at the end of
+the next round, V2 the round after, and V the final reward (the one used for the advantages). Each is
+one linear layer on the last hidden state. V0..V2 are "boosted": each head's logit is added to the
+previous head's logit, so a later head only learns the difference to the shorter-horizon estimate.
+V is not chained to them (chain_final_value=False): chained, it inherited their swings, which follow
+our surviving army; on a lost battle that army counts for nothing, so the advantages rewarded keeping
+units alive and even punished kills, and the defence learned to stay passive. Each outputs tanh(logit), a value in
 -1..1: the reward rescaled by reward.to_scale (-1 = worst possible, +1 = best possible), trained
 with the matching cross-entropy (losses.value_loss).
 
@@ -111,9 +114,12 @@ class Block(nn.Module):
 
 
 class BattleModel(nn.Module):
-	def __init__(self, dim=64, layers=2, heads=4, boost_stop_gradient=True, mask_features=False):
+	def __init__(self, dim=64, layers=2, heads=4, boost_stop_gradient=True, mask_features=False, chain_final_value=False):
 		"""boost_stop_gradient: each value head adds a detached copy of the previous head's logit, so a
 		longer-horizon label never pulls on a shorter-horizon head (true boosting). False lets it.
+
+		chain_final_value: V, the final-reward head, is chained to V0..V2 like they are to each other (as
+		before 2026-10-23); default False, V stands alone (see the top of this file).
 
 		mask_features: also feed the acting unit's legal choices into the tokens (they are model inputs
 		already, used for the output masks): per hex "can move here", "can attack someone from here",
@@ -124,6 +130,7 @@ class BattleModel(nn.Module):
 		self.dim = dim
 		self.boost_stop_gradient = boost_stop_gradient
 		self.mask_features = mask_features
+		self.chain_final_value = chain_final_value
 		self.creature = nn.Embedding(CREATURE_VOCAB + 1, dim)
 		self.effect = nn.Embedding(EFFECT_VOCAB + 1, dim)
 		self.hero_type = nn.Embedding(HERO_TYPE_VOCAB + 1, dim)
@@ -336,9 +343,10 @@ class BattleModel(nn.Module):
 
 	def _values(self, context):
 		logits, previous = [], None
-		for head in self.value_heads:
+		for k, head in enumerate(self.value_heads):
 			logit = head(context).squeeze(-1)
-			if previous is not None:
+			final = k == len(self.value_heads) - 1
+			if previous is not None and (self.chain_final_value or not final):
 				logit = logit + (previous.detach() if self.boost_stop_gradient else previous)
 			logits.append(logit)
 			previous = logit

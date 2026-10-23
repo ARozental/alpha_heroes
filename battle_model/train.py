@@ -52,7 +52,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from . import play
-from .data import collate, make_dataloader, summarize
+from .data import collate, credit_check, make_dataloader, summarize
 from .export import export
 from .losses import AdvantageConfig, PPOConfig, ppo_loss
 from .constants import ActionType
@@ -92,6 +92,7 @@ class TrainConfig:
 	model_dim: int = 64
 	model_layers: int = 2
 	model_mask_features: bool = False  # model.BattleModel(mask_features=...)
+	model_chain_final_value: bool = False  # model.BattleModel(chain_final_value=...)
 	seed: int = 0  # the model's initial weights
 	reward: RewardConfig = field(default_factory=RewardConfig)
 	advantage: AdvantageConfig = field(default_factory=AdvantageConfig)
@@ -111,8 +112,20 @@ def with_overrides(config, assignments):
 	return config
 
 
-def run_dir(config):
-	return ROOT / "runtime" / "train" / config.run
+TRAIN_ROOT = ROOT / "runtime" / "train"
+
+
+def run_dir(config, new=False):
+	"""The folder of run config.run: <start time>-<name> (e.g. 20261023-1412-selfplay), so that sorting runs by name
+	(TensorBoard, ls) sorts them by time. An existing run is the newest folder with that name (or exactly that
+	folder name); new=True makes a new one."""
+	if not new:
+		if (TRAIN_ROOT / config.run).is_dir():
+			return TRAIN_ROOT / config.run
+		matches = sorted(TRAIN_ROOT.glob(f"????????-????-{config.run}"))
+		if matches:
+			return matches[-1]
+	return TRAIN_ROOT / f"{time.strftime('%Y%m%d-%H%M')}-{config.run}"
 
 
 # Action types whose share of each side's decisions is logged every epoch (actions_<side>/<type> in TensorBoard)
@@ -123,13 +136,16 @@ COLUMNS = [
 	"epoch", "attack_reward", "attack_outcome", "defence_reward", "defence_outcome", "mean_reward", "attack_raw_reward", "defence_raw_reward", "attack_win_rate", "defence_win_rate",
 	"decisions", "rounds", "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "signal_ratio", "weight_change",
 	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds",
-] + [f"{side}_share_{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
+] + [f"{side}_share_{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS] + [
+	f"{side}_{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")
+]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
 # error. decisions: all decisions of the epoch; rounds: attack + defence battle rounds, averaged over the games.
 
 # progress.csv column -> TensorBoard tag
 TENSORBOARD_TAGS = {
 	**{f"{side}_share_{kind.lower()}": f"actions_{side}/{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS},
+	**{f"{side}_{name}": f"credit_{side}/{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")},
 	"mean_reward": "reward/mean", "attack_reward": "reward/attack", "defence_reward": "reward/defence",
 	"attack_raw_reward": "raw_reward/attack", "defence_raw_reward": "raw_reward/defence",
 	"attack_win_rate": "won/attack", "defence_win_rate": "won/defence",
@@ -341,7 +357,7 @@ class Producer:
 
 
 def model_kwargs(config):
-	return {"dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features}
+	return {"dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features, "chain_final_value": config.model_chain_final_value}
 
 
 def save_checkpoint(path, model, optimizer, epoch, config):
@@ -349,7 +365,7 @@ def save_checkpoint(path, model, optimizer, epoch, config):
 
 
 def train(config, resume=False):
-	out = run_dir(config)
+	out = run_dir(config, new=not resume)
 	out.mkdir(parents=True, exist_ok=True)
 	(out / "config.txt").write_text("\n".join(f"{k} = {v}" for k, v in asdict(config).items()) + "\n")
 	torch.manual_seed(config.seed)
@@ -360,6 +376,9 @@ def train(config, resume=False):
 	latest = out / "checkpoint_latest.pt"
 	if resume and latest.exists():
 		state = torch.load(latest, map_location=device)
+		# the architecture the run was started with (older checkpoints: chained final value head)
+		model = BattleModel(**{"chain_final_value": True, **state.get("model_kwargs", {})}).to(device)
+		optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 		model.load_state_dict(state["model"])
 		optimizer.load_state_dict(state["optimizer"])
 		first_epoch = state["epoch"] + 1
@@ -485,6 +504,8 @@ def train(config, resume=False):
 			row[f"{name}_outcome"] = outcome_text(side_summaries)
 			row[f"{name}_advantage_std"] = round(average([s.advantage_std for s in side_summaries]), 4)
 			row[f"{name}_value_error"] = round(average([s.value_error for s in side_summaries]), 4)
+			ev, own_lost, killed = credit_check(side_summaries)
+			row[f"{name}_value_ev"], row[f"{name}_credit_own_lost"], row[f"{name}_credit_killed"] = round(ev, 3), round(own_lost, 3), round(killed, 3)
 		with progress.open("a", newline="") as f:
 			csv.writer(f).writerow([row[c] for c in COLUMNS])
 		log_tensorboard(writer, row, self_play=config.opponent == play.SELF_PLAY)
