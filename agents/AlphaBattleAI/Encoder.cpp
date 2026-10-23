@@ -56,6 +56,7 @@ void encodeUnits(EncodedBattle & e, const CPlayerBattleCallback & battle, const 
 		t.set(In::u_alive, u, s->alive());
 		t.set(In::u_creature, u, s->creatureId().getNum());
 		t.set(In::u_side, u, static_cast<int>(s->unitSide()));
+		t.set(In::u_owner_side, u, static_cast<int>(battle.playerToSide(battle.battleGetOwner(s))));
 		t.set(In::u_hex, u, s->getPosition().toInt());
 		t.set(In::u_rear_hex, u, s->doubleWide() ? s->occupiedHex().toInt() : -1);
 		t.set(In::u_count, u, s->getCount());
@@ -193,6 +194,11 @@ void encodeUnitMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, co
 {
 	auto & t = e.tensors;
 	const auto activePos = active->getPosition();
+	// Whom the unit may attack at all: the engine's rule (enemies by current owner, so hypnosis counts; not
+	// invincible ones; only if the unit can melee), as the client applies it. Where from is checked per hex.
+	std::array<bool, MAX_UNITS> canAttack{};
+	for(int u = 0; u < MAX_UNITS; ++u)
+		canAttack[u] = e.units[u] && battle.battleCanAttackUnit(active, e.units[u]);
 	for(const auto & hex : battle.battleGetAvailableHexes(active, false))
 	{
 		const int h = hex.toInt();
@@ -211,18 +217,20 @@ void encodeUnitMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, co
 				continue;
 		}
 		for(int u = 0; u < MAX_UNITS; ++u)
-		{
-			const CStack * target = e.units[u];
-			if(target && target->alive() && target->unitSide() != active->unitSide() && CStack::isMeleeAttackPossible(active, target, hex))
+			if(canAttack[u] && CStack::isMeleeAttackPossible(active, e.units[u], hex))
 				t.set(In::m_melee_from, u, h, 1);
-		}
 	}
 	for(int u = 0; u < MAX_UNITS; ++u)
 	{
 		const CStack * target = e.units[u];
+		// A long weapon also reaches a unit two hexes away in a line, from where the unit stands
+		if(canAttack[u] && battle.isLongWeaponAttack(active, target))
+			t.set(In::m_melee_from, u, activePos.toInt(), 1);
 		if(t.anyInRow(In::m_melee_from, u))
 			t.set(In::m_melee_target, u, 1);
-		if(target && target->alive() && target->unitSide() != active->unitSide() && battle.battleCanShoot(active, target->getPosition()))
+		// The engine's rule for shooting at the unit's hex (who counts as an enemy, berserk, range), and the
+		// unit the engine would hit there must be this one
+		if(target && battle.battleCanShoot(active, target->getPosition()) && battle.battleGetUnitByPos(target->getPosition(), true) == static_cast<const battle::Unit *>(target))
 			t.set(In::m_shoot_target, u, 1);
 	}
 }

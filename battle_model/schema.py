@@ -64,6 +64,7 @@ INPUTS = (
 	_i("u_alive", (U,), "1 if alive (dead stacks are kept: resurrection can target them)"),
 	_i("u_creature", (U,), "creature id", fill=-1),
 	_i("u_side", (U,), "battle side of the unit: 0 attacker, 1 defender", fill=-1),
+	_i("u_owner_side", (U,), "battle side of the player controlling the unit now (the engine's battleGetOwner): the other side while it is hypnotized", fill=-1),
 	_i("u_hex", (U,), "position: front hex (BattleHex index)", fill=-1),
 	_i("u_rear_hex", (U,), "second hex of a two-hex unit, -1 for one-hex units", fill=-1),
 	_i("u_count", (U,), "creatures in the stack"),
@@ -185,6 +186,7 @@ def random_inputs(batch=1, seed=0, n_units=14):
 			x["u_alive"][b, u] = 1 if u < n_units - 2 else 0
 			x["u_creature"][b, u] = rng.integers(0, 150)
 			x["u_side"][b, u] = side
+			x["u_owner_side"][b, u] = side if rng.random() < 0.9 else 1 - side
 			x["u_hex"][b, u] = rng.integers(0, H)
 			x["u_rear_hex"][b, u] = rng.integers(0, H) if rng.random() < 0.3 else -1
 			x["u_count"][b, u] = rng.integers(1, 3000)

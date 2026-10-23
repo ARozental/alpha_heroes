@@ -134,7 +134,8 @@ class BattleModel(nn.Module):
 		self.wall_state = nn.Embedding(WALL_STATE_VOCAB + 1, dim)
 		self.gate_state = nn.Embedding(GATE_STATE_VOCAB + 1, dim)
 		self.hex_pos = nn.Embedding(N_HEXES, dim)
-		self.ours = nn.Embedding(2, dim)  # 0 = enemy, 1 = ours
+		self.ours = nn.Embedding(2, dim)  # 0 = enemy, 1 = ours (heroes; units: controlled by us now)
+		self.home = nn.Embedding(2, dim)  # units: 1 = on our battle side (differs from ours while hypnotized)
 		self.token_kind = nn.Embedding(4, dim)  # global, hero, unit, hex
 		self.unit_num = nn.Linear(23, dim)
 		self.effect_num = nn.Linear(2, dim)
@@ -203,12 +204,14 @@ class BattleModel(nn.Module):
 		effect_valid = (x["u_effect_id"] >= 0).float().unsqueeze(-1)
 		effect_num = torch.stack([x["u_effect_turns"].float() / 10, torch.sign(x["u_effect_value"].float()) * log_scale(x["u_effect_value"].abs())], dim=-1)
 		effects = ((self.effect(vocab_index(x["u_effect_id"], EFFECT_VOCAB)) + self.effect_num(effect_num)) * effect_valid).sum(dim=2)
-		unit_ours = (x["u_side"] == our_side[:, None]).long()
+		unit_ours = (x["u_owner_side"] == our_side[:, None]).long()  # controlled by us now (a hypnotized enemy is ours)
+		unit_home = (x["u_side"] == our_side[:, None]).long()
 		units = (
 			self.creature(vocab_index(x["u_creature"], CREATURE_VOCAB))
 			+ self.unit_num(numeric)
 			+ effects
 			+ self.ours(unit_ours)
+			+ self.home(unit_home)
 			+ self.hex_pos(x["u_hex"].clamp(0, N_HEXES - 1))
 			+ self.hex_pos(x["u_rear_hex"].clamp(0, N_HEXES - 1)) * has_rear.float().unsqueeze(-1)
 			+ self.token_kind.weight[2]
