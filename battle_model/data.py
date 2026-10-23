@@ -86,8 +86,11 @@ def summarize(events, hero_value=0.0, fresh_hero_value=0.0, config=RewardConfig(
 	else:
 		outcome = Outcome.LOSS
 
-	# An enemy that retreated has lost its whole army; one that surrendered keeps what survived
-	if outcome == Outcome.WIN and end["result"] == RESULT_ESCAPE:
+	# An enemy that retreated has lost its whole army. One that surrendered keeps its army but pays us for
+	# it, so it also counts as fully destroyed. The real value of an enemy surrender depends on the game:
+	# this is right for a 2-player zero-sum game; with more players a surrender might even beat a retreat,
+	# which needs information from outside the battle.
+	if outcome == Outcome.WIN and end["result"] in (RESULT_ESCAPE, RESULT_SURRENDER):
 		enemy_lost = enemy_army_start
 	else:
 		enemy_lost = army_value(end["casualties"][enemy])

@@ -48,3 +48,8 @@ def test_round_scores_from_round_end_events():
 def test_refused_model_makes_the_record_unusable():
 	with pytest.raises(RuntimeError):
 		summarize([{"event": "error", "message": "cannot use model: x"}] + events(0, {"round": 1, "winner": 0, "result": 0, "casualties": [[], []], "alive": [[], []]}))
+
+
+def test_enemy_surrender_counts_as_full_destruction():
+	s = summarize(events(0, {"round": 2, "winner": 0, "result": RESULT_SURRENDER, "casualties": [[], [[42, 2]]], "alive": [[], []]}))
+	assert s.outcome == Outcome.WIN and s.enemy_lost == army_value(THEIRS)

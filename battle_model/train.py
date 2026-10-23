@@ -1,13 +1,16 @@
 """Training loop: play battles against a fixed opponent, learn from them with PPO, repeat.
 
 	.venv/bin/python -m battle_model.train [--epochs N] [--run NAME] [--resume]
+	.venv/bin/python -m battle_model.train --follow NAME   # mirror a running run's progress.csv into TensorBoard
+	.venv/bin/tensorboard --logdir runtime/train            # then open http://localhost:6006
 
 Each epoch:
   1. export the current model to ONNX (the C++ battle AI plays with it),
   2. play one battle per scenario side in parallel (we attack with sides[0], we defend with sides[1]),
      with VCMI's seed fixed per side, so only our own choices change between epochs,
   3. turn the records into training examples (data.py) and update the model with PPO (losses.py),
-  4. log both battles' rewards and outcomes to <run dir>/progress.csv, delete the records.
+  4. log both battles' rewards and outcomes to <run dir>/progress.csv and TensorBoard (<run dir>/tensorboard),
+     delete the records.
 
 The first test: the untrained model should lose in epoch 1, and the model should overfit this fixed
 scenario and win by epoch 1000. If it needs more, something is probably wrong.
@@ -20,6 +23,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from . import play
 from .data import make_dataloader
@@ -52,6 +56,36 @@ def run_dir(config):
 	return ROOT / "runtime" / "train" / config.run
 
 
+def log_tensorboard(writer, row):
+	"""One epoch's progress row as TensorBoard scalars."""
+	epoch = int(row["epoch"])
+	for name in ("mean", "attack", "defence"):
+		writer.add_scalar(f"reward/{name}", float(row[f"{name}_reward"]), epoch)
+	for name in ("attack", "defence"):
+		writer.add_scalar(f"won/{name}", float(row[f"{name}_outcome"] == "WIN"), epoch)
+	for name in ("policy", "value"):
+		writer.add_scalar(f"loss/{name}", float(row[f"{name}_loss"]), epoch)
+	writer.add_scalar("loss/entropy", float(row["entropy"]), epoch)
+	for name in ("decisions", "rounds", "seconds"):
+		writer.add_scalar(f"battle/{name}", float(row[name]), epoch)
+	writer.flush()
+
+
+def follow(run, poll_seconds=10, idle_minutes=10):
+	"""Mirror a run's progress.csv into its TensorBoard folder until no new epoch arrives for idle_minutes."""
+	out = run_dir(TrainConfig(run=run))
+	writer = SummaryWriter(out / "tensorboard", purge_step=1)
+	logged, idle_since = 0, time.time()
+	while time.time() - idle_since < idle_minutes * 60:
+		rows = list(csv.DictReader((out / "progress.csv").open()))
+		for row in rows[logged:]:
+			log_tensorboard(writer, row)
+		if len(rows) > logged:
+			logged, idle_since = len(rows), time.time()
+		time.sleep(poll_seconds)
+	writer.close()
+
+
 def save_checkpoint(path, model, optimizer, epoch):
 	torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch}, path)
 
@@ -78,6 +112,7 @@ def train(config, resume=False):
 	if not progress.exists() or not resume:
 		with progress.open("w", newline="") as f:
 			csv.writer(f).writerow(columns)
+	writer = SummaryWriter(out / "tensorboard", purge_step=first_epoch)
 
 	for epoch in range(first_epoch, config.epochs + 1):
 		started = time.time()
@@ -129,6 +164,7 @@ def train(config, resume=False):
 		}
 		with progress.open("a", newline="") as f:
 			csv.writer(f).writerow([row[c] for c in columns])
+		log_tensorboard(writer, row)
 		print(f"epoch {epoch:4d}  attack {row['attack_outcome']:9s} {row['attack_reward']:+.3f}  defence {row['defence_outcome']:9s} {row['defence_reward']:+.3f}  mean {row['mean_reward']:+.3f}  decisions {row['decisions']:3d}  {row['seconds']}s", flush=True)
 
 		shutil.rmtree(records, ignore_errors=True)
@@ -142,8 +178,12 @@ def main():
 	parser.add_argument("--epochs", type=int, default=TrainConfig.epochs)
 	parser.add_argument("--run", default=TrainConfig.run)
 	parser.add_argument("--resume", action="store_true")
+	parser.add_argument("--follow", metavar="RUN", help="mirror a running run's progress.csv into TensorBoard instead of training")
 	args = parser.parse_args()
-	train(TrainConfig(epochs=args.epochs, run=args.run), resume=args.resume)
+	if args.follow:
+		follow(args.follow)
+	else:
+		train(TrainConfig(epochs=args.epochs, run=args.run), resume=args.resume)
 
 
 if __name__ == "__main__":
