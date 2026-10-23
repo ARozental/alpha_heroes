@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 from battle_model.losses import AdvantageConfig, battle_returns_and_advantages
@@ -58,10 +59,47 @@ def test_value_loss_weights_and_minimum():
 	assert torch.isclose(value_loss(off, labels, only_v)[0], value_loss(perfect, labels, only_v)[0])
 
 
-def test_advantages_normalised_over_an_epoch_only_with_enough_decisions():
+def test_advantages_normalised_per_side_only_with_enough_decisions():
 	from battle_model.losses import normalize_advantages
+	config = AdvantageConfig(normalize_min_decisions=8)
 	few = torch.tensor([0.3, -0.1, 0.2])
-	assert torch.equal(normalize_advantages(few, AdvantageConfig(normalize_min_decisions=8)), few)
-	many = torch.arange(10, dtype=torch.float32)
-	scaled = normalize_advantages(many, AdvantageConfig(normalize_min_decisions=8))
-	assert abs(float(scaled.mean())) < 1e-6 and abs(float(scaled.std()) - 1) < 1e-5
+	assert torch.equal(normalize_advantages(few, torch.zeros(3), torch.zeros(3), config), few)
+
+	# Two sides with very different scales, two battles each: each side ends up with mean 0, std 1
+	attack = torch.arange(10, dtype=torch.float32) * 10
+	defence = torch.arange(10, dtype=torch.float32) * 0.01 + 5
+	sides = torch.tensor([0] * 10 + [1] * 10)
+	battles = torch.tensor([0] * 5 + [1] * 5 + [2] * 5 + [3] * 5)
+	scaled = normalize_advantages(torch.cat([attack, defence]), sides, battles, config)
+	for side in (0, 1):
+		part = scaled[sides == side]
+		assert abs(float(part.mean())) < 1e-4 and abs(float(part.std()) - 1) < 1e-4
+
+
+def test_a_single_battle_is_scaled_not_centred():
+	from battle_model.losses import normalize_advantages
+	won = torch.linspace(0.1, 0.3, 10)  # every decision of a won battle did better than expected
+	scaled = normalize_advantages(won, torch.zeros(10), torch.zeros(10), AdvantageConfig(normalize_min_decisions=8))
+	assert (scaled > 0).all() and abs(float(scaled.pow(2).mean()) - 1) < 1e-5
+
+
+def test_self_imitation_pulls_only_toward_lines_better_than_expected():
+	from battle_model.losses import PPOConfig, self_imitation_loss
+	from battle_model.model import BattleModel
+	from battle_model.schema import random_inputs
+	from battle_model.distributions import log_prob, sample, stack_actions
+	torch.manual_seed(0)
+	model = BattleModel(dim=32, layers=1)
+	inputs = {k: torch.as_tensor(v) for k, v in random_inputs(4).items()}
+	out = model(inputs)
+	action = stack_actions([sample(out, b, np.random.default_rng(b)) for b in range(4)])
+	config = PPOConfig(self_imitation_weight=1.0)
+	# V starts at 0: a line worth -0.5 is worse than expected, so it is not imitated
+	assert float(self_imitation_loss(out, action, -0.5, config)[0]) == 0.0
+	loss, _ = self_imitation_loss(out, action, 0.8, config)
+	loss.backward()
+	with torch.no_grad():
+		for p in model.parameters():
+			if p.grad is not None:
+				p -= 0.05 * p.grad
+	assert float(log_prob(model(inputs), action).sum()) > float(log_prob(out, action).sum())

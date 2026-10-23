@@ -265,6 +265,11 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 				const CStack * unit = e.units[u];
 				if(!unit)
 					continue;
+				// The engine aims creature spells at the unit's hex and hits the living unit there
+				// (BattleSpellMechanics::transformSpellTarget): a dead unit under a living one would only be
+				// another name for that one
+				if(!unit->alive() && battle.battleGetUnitByPos(unit->getPosition(), true))
+					continue;
 				const battle::Destination first(unit);
 				if(second == TargetKind::NONE)
 				{

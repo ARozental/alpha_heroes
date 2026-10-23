@@ -1,13 +1,14 @@
 """Training loop: play battles against a fixed opponent, learn from them with PPO, repeat.
 
-	.venv/bin/python -m battle_model.train [--epochs N] [--run NAME] [--resume]
+	.venv/bin/python -m battle_model.train [--epochs N] [--run NAME] [--resume] [--set games_per_side=8 ppo.entropy_weight=0.02 ...]
 	.venv/bin/python -m battle_model.train --follow NAME   # mirror a running run's progress.csv into TensorBoard
 	.venv/bin/tensorboard --logdir runtime/train            # then open http://localhost:6006
 
 Each epoch:
   1. export the current model to ONNX (the C++ battle AI plays with it),
-  2. play one battle per scenario side in parallel (we attack with sides[0], we defend with sides[1]),
-     with VCMI's seed fixed per side, so only our own choices change between epochs,
+  2. play games_per_side battles per scenario side, all in parallel (we attack with sides[0], we defend
+     with sides[1]), with VCMI's seed fixed per side, so only our own (sampled) choices differ between
+     the battles of a side and between epochs,
   3. turn the records into training examples (data.py) and update the model with PPO (losses.py),
   4. log both battles' rewards and outcomes to <run dir>/progress.csv and TensorBoard
      (<run dir>/tensorboard/<start time>: one folder per start, so a restarted run never mixes with old
@@ -35,7 +36,8 @@ import argparse
 import csv
 import shutil
 import time
-from dataclasses import asdict, dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 
 import torch
@@ -45,9 +47,9 @@ from . import play
 from .data import collate, make_dataloader
 from .distributions import log_prob
 from .export import export
-from .losses import AdvantageConfig, PPOConfig, ppo_loss
+from .losses import AdvantageConfig, PPOConfig, ppo_loss, self_imitation_loss
 from .model import BattleModel
-from .reward import RewardConfig, to_scale
+from .reward import Outcome, RewardConfig, to_scale
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -58,7 +60,8 @@ class TrainConfig:
 	run: str = "castle_vs_inferno"
 	epochs: int = 1000
 	opponent: str = "BattleAI"
-	game_seeds: tuple = (1, 2)  # VCMI seed of the attack battle and of the defence battle: fixed, so the test is about learning, not luck
+	game_seeds: tuple = (1, 2)  # VCMI seed of the attack battles and of the defence battles: fixed, so the test is about learning, not luck
+	games_per_side: int = 1  # battles per side per epoch; they differ only by our sampling. More = less noisy updates
 	learning_rate: float = 1e-4  # Adam; 3e-4 (the usual PPO default) learned and then forgot this scenario
 	ppo_passes: int = 4  # optimisation passes over each epoch's decisions; PPO reuses its data a few times
 	batch_size: int = 64  # an epoch is only ~20-80 decisions, so usually one batch
@@ -67,7 +70,24 @@ class TrainConfig:
 	attempts: int = 3  # tries per epoch when a battle fails or stalls before the run stops
 	model_dim: int = 64
 	model_layers: int = 2
+	model_mask_features: bool = False  # model.BattleModel(mask_features=...)
 	seed: int = 0  # the model's initial weights
+	reward: RewardConfig = field(default_factory=RewardConfig)
+	advantage: AdvantageConfig = field(default_factory=AdvantageConfig)
+	ppo: PPOConfig = field(default_factory=PPOConfig)
+
+
+def with_overrides(config, assignments):
+	"""config with "name=value" assignments applied; "ppo.name", "advantage.name", "reward.name" set the sub-configs."""
+	for assignment in assignments:
+		key, value = assignment.split("=", 1)
+		target, name = key.split(".", 1) if "." in key else (None, key)
+		owner = getattr(config, target) if target else config
+		kind = {f.name: f.type for f in fields(owner)}[name]
+		kind = {"int": int, "float": float, "str": str, "bool": lambda v: v.lower() in ("1", "true", "yes"), "tuple": lambda v: tuple(int(x) if x.lstrip("-").isdigit() else float(x) for x in v.split(","))}.get(getattr(kind, "__name__", kind), kind)
+		owner = replace(owner, **{name: kind(value)})
+		config = replace(config, **{target: owner}) if target else owner
+	return config
 
 
 def run_dir(config):
@@ -75,15 +95,18 @@ def run_dir(config):
 
 
 COLUMNS = [
-	"epoch", "attack_reward", "attack_outcome", "defence_reward", "defence_outcome", "mean_reward", "attack_raw_reward", "defence_raw_reward",
+	"epoch", "attack_reward", "attack_outcome", "defence_reward", "defence_outcome", "mean_reward", "attack_raw_reward", "defence_raw_reward", "attack_win_rate", "defence_win_rate",
 	"decisions", "rounds", "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "signal_ratio", "weight_change",
 	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "attack_best_line_logp", "defence_best_line_logp", "seconds",
-]  # progress.csv; rewards on the -1..1 scale, raw_reward in reward units
+]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
+# units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
+# error. decisions: all decisions of the epoch; rounds: attack + defence battle rounds, averaged over the games.
 
 # progress.csv column -> TensorBoard tag
 TENSORBOARD_TAGS = {
 	"mean_reward": "reward/mean", "attack_reward": "reward/attack", "defence_reward": "reward/defence",
 	"attack_raw_reward": "raw_reward/attack", "defence_raw_reward": "raw_reward/defence",
+	"attack_win_rate": "won/attack", "defence_win_rate": "won/defence",
 	"policy_loss": "loss/policy", "value_loss": "loss/value", "entropy": "loss/entropy",
 	"attack_best_line_logp": "best_line_logp/attack", "defence_best_line_logp": "best_line_logp/defence",
 	"signal_ratio": "stability/signal_ratio", "weight_change": "stability/weight_change", "approx_kl": "stability/approx_kl", "clip_fraction": "stability/clip_fraction",
@@ -100,8 +123,17 @@ def log_tensorboard(writer, row):
 		if row.get(column) not in (None, ""):
 			writer.add_scalar(tag, float(row[column]), epoch)
 	for name in ("attack", "defence"):
-		writer.add_scalar(f"won/{name}", float(row[f"{name}_outcome"] == "WIN"), epoch)
+		if row.get(f"{name}_win_rate") in (None, ""):  # runs from before win rates were logged
+			writer.add_scalar(f"won/{name}", float(row[f"{name}_outcome"] == "WIN"), epoch)
 	writer.flush()
+
+
+def outcome_text(summaries):
+	"""One battle: its outcome's name; several: counts, e.g. "WIN:3 LOSS:5"."""
+	if len(summaries) == 1:
+		return summaries[0].outcome.name
+	counts = Counter(s.outcome.name for s in summaries)
+	return " ".join(f"{name}:{n}" for name, n in sorted(counts.items()))
 
 
 def signal_ratio(optimizer):
@@ -145,8 +177,12 @@ def follow(run, poll_seconds=10, idle_minutes=10):
 	writer.close()
 
 
-def save_checkpoint(path, model, optimizer, epoch):
-	torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch}, path)
+def model_kwargs(config):
+	return {"dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features}
+
+
+def save_checkpoint(path, model, optimizer, epoch, config):
+	torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "model_kwargs": model_kwargs(config)}, path)
 
 
 def train(config, resume=False):
@@ -154,7 +190,7 @@ def train(config, resume=False):
 	out.mkdir(parents=True, exist_ok=True)
 	(out / "config.txt").write_text("\n".join(f"{k} = {v}" for k, v in asdict(config).items()) + "\n")
 	torch.manual_seed(config.seed)
-	model = BattleModel(dim=config.model_dim, layers=config.model_layers)
+	model = BattleModel(**model_kwargs(config))
 	optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 	first_epoch = 1
 	latest = out / "checkpoint_latest.pt"
@@ -171,7 +207,7 @@ def train(config, resume=False):
 	best = torch.load(best_path) if resume and best_path.exists() else [None, None]
 
 	play.build_map(config.scenario)
-	reward_config, advantage_config, ppo_config = RewardConfig(), AdvantageConfig(), PPOConfig()
+	reward_config, advantage_config, ppo_config = config.reward, config.advantage, config.ppo
 	progress = out / "progress.csv"
 	if not progress.exists() or not resume:
 		with progress.open("w", newline="") as f:
@@ -183,7 +219,11 @@ def train(config, resume=False):
 		model_path = out / "model.onnx"
 		export(model, model_path)
 
-		games = [play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=config.game_seeds[side], sampler_seed=2 * epoch + side) for side in (0, 1)]
+		games = [
+			play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=config.game_seeds[side], sampler_seed=(2 * epoch + side) * config.games_per_side + g)
+			for side in (0, 1)
+			for g in range(config.games_per_side)
+		]
 		records = out / "records" / f"epoch_{epoch}"
 		for attempt in range(1, config.attempts + 1):
 			try:
@@ -196,9 +236,11 @@ def train(config, resume=False):
 				if attempt == config.attempts:
 					raise
 
-		examples = loader.dataset  # the attack battle's decisions, then the defence battle's
-		split = summaries[0].decisions
-		for side, (summary, decisions) in enumerate(zip(summaries, (examples[:split], examples[split:]))):
+		examples, start = loader.dataset, 0  # the decisions of each battle, in the order of `games`
+		for game, summary in zip(games, summaries):
+			decisions = examples[start : start + summary.decisions]
+			start += summary.decisions
+			side = game.our_side
 			if decisions and (best[side] is None or summary.reward > best[side]["reward"]):
 				best[side] = {"reward": summary.reward, "epoch": epoch, "line": collate(decisions)}
 				torch.save(best, best_path)
@@ -210,6 +252,11 @@ def train(config, resume=False):
 			for batch in loader:
 				out_batch = model(batch["inputs"])
 				loss, parts = ppo_loss(out_batch, batch["action"], batch["old_log_prob"], batch["advantage"], batch["value_labels"], ppo_config)
+				if ppo_config.self_imitation_weight > 0:
+					for line in best:
+						if line:
+							imitation, _ = self_imitation_loss(model(line["line"]["inputs"]), line["line"]["action"], to_scale(line["reward"], reward_config), ppo_config)
+							loss = loss + imitation
 				optimizer.zero_grad()
 				loss.backward()
 				torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
@@ -219,13 +266,14 @@ def train(config, resume=False):
 				batches += 1
 		model.eval()
 
-		attack, defence = summaries
+		by_side = [[s for game, s in zip(games, summaries) if game.our_side == side] for side in (0, 1)]
+		average = lambda values: sum(values) / len(values)
 		mean = {key: value / max(batches, 1) for key, value in parts_sum.items()}
 		row = {
 			"epoch": epoch,
-			"mean_reward": round(to_scale((attack.reward + defence.reward) / 2, reward_config), 4),
-			"decisions": attack.decisions + defence.decisions,
-			"rounds": attack.rounds + defence.rounds,
+			"mean_reward": round(to_scale(average([s.reward for s in summaries]), reward_config), 4),
+			"decisions": sum(s.decisions for s in summaries),
+			"rounds": round(sum(s.rounds for s in summaries) / config.games_per_side, 2),
 			"policy_loss": round(mean["policy"], 5),
 			"value_loss": round(mean["value"], 5),
 			"entropy": round(mean["entropy"], 4),
@@ -235,27 +283,29 @@ def train(config, resume=False):
 			"weight_change": round(float((flat_weights(model) - weights_before).norm()), 4),
 			"seconds": round(time.time() - started, 1),
 		}
-		for name, summary, line in (("attack", attack, best[0]), ("defence", defence, best[1])):
-			row[f"{name}_reward"] = round(to_scale(summary.reward, reward_config), 4)
-			row[f"{name}_raw_reward"] = round(summary.reward, 4)
-			row[f"{name}_outcome"] = summary.outcome.name
-			row[f"{name}_advantage_std"] = round(summary.advantage_std, 4)
-			row[f"{name}_value_error"] = round(summary.value_error, 4)
+		for name, side_summaries, line in (("attack", by_side[0], best[0]), ("defence", by_side[1], best[1])):
+			raw = average([s.reward for s in side_summaries])
+			row[f"{name}_reward"] = round(to_scale(raw, reward_config), 4)
+			row[f"{name}_raw_reward"] = round(raw, 4)
+			row[f"{name}_win_rate"] = round(average([float(s.outcome == Outcome.WIN) for s in side_summaries]), 4)
+			row[f"{name}_outcome"] = outcome_text(side_summaries)
+			row[f"{name}_advantage_std"] = round(average([s.advantage_std for s in side_summaries]), 4)
+			row[f"{name}_value_error"] = round(average([s.value_error for s in side_summaries]), 4)
 			row[f"{name}_best_line_logp"] = round(line_log_prob(model, line["line"]), 3) if line else ""
 		with progress.open("a", newline="") as f:
 			csv.writer(f).writerow([row[c] for c in COLUMNS])
 		log_tensorboard(writer, row)
 		print(
-			f"epoch {epoch:4d}  attack {row['attack_outcome']:9s} {row['attack_reward']:+.3f}  defence {row['defence_outcome']:9s} {row['defence_reward']:+.3f}"
+			f"epoch {epoch:4d}  attack {row['attack_outcome']:9s} {row['attack_reward']:+.3f}  defence {row['defence_outcome']:9s} {row['defence_reward']:+.3f}  won {row['attack_win_rate']:.2f} / {row['defence_win_rate']:.2f}"
 			f"  mean {row['mean_reward']:+.3f}  decisions {row['decisions']:3d}  best-line logp {row['attack_best_line_logp']} / {row['defence_best_line_logp']}"
 			f"  signal {row['signal_ratio']}  {row['seconds']}s",
 			flush=True,
 		)
 
 		shutil.rmtree(records, ignore_errors=True)
-		save_checkpoint(latest, model, optimizer, epoch)
+		save_checkpoint(latest, model, optimizer, epoch, config)
 		if epoch % config.checkpoint_every == 0:
-			save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch)
+			save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config)
 
 
 def main():
@@ -264,11 +314,12 @@ def main():
 	parser.add_argument("--run", default=TrainConfig.run)
 	parser.add_argument("--resume", action="store_true")
 	parser.add_argument("--follow", metavar="RUN", help="mirror a running run's progress.csv into TensorBoard instead of training")
+	parser.add_argument("--set", nargs="*", default=[], metavar="NAME=VALUE", help="override TrainConfig fields; ppo.NAME, advantage.NAME, reward.NAME for the sub-configs")
 	args = parser.parse_args()
 	if args.follow:
 		follow(args.follow)
 	else:
-		train(TrainConfig(epochs=args.epochs, run=args.run), resume=args.resume)
+		train(with_overrides(TrainConfig(epochs=args.epochs, run=args.run), args.set), resume=args.resume)
 
 
 if __name__ == "__main__":

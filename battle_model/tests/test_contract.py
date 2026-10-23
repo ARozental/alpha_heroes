@@ -21,3 +21,9 @@ def test_any_architecture_exports_to_the_same_contract(tmp_path):
 	torch.manual_seed(1)
 	model = BattleModel(dim=96, layers=3, heads=6)
 	assert verify(model, export(model, tmp_path / "big.onnx")) < 1e-4
+
+
+def test_mask_feature_model_exports_to_the_same_contract(tmp_path):
+	torch.manual_seed(2)
+	model = BattleModel(dim=32, layers=1, mask_features=True)
+	assert verify(model, export(model, tmp_path / "mask_features.onnx")) < 1e-4

@@ -76,7 +76,7 @@ from .reward import RewardConfig, to_scale
 class AdvantageConfig:
 	gamma: float = 1.0  # discount per decision (step 3); 1 = the battle's end counts fully for every decision
 	lam: float = 0.95  # GAE lambda (step 5); 1 = judge each decision by the final outcome only
-	normalize_min_decisions: int = 8  # step 5: rescale advantages over an epoch only if it has at least this many decisions
+	normalize_min_decisions: int = 8  # step 5: rescale a group's advantages only if it has at least this many decisions
 
 
 @dataclass(frozen=True)
@@ -85,6 +85,7 @@ class PPOConfig:
 	value_weight: float = 0.5  # step 7: the value loss shares the network with the policy, standard PPO weight
 	entropy_weight: float = 0.01  # step 7: small exploration bonus
 	value_head_weights: tuple = (1.0,) * (N_VALUE_HORIZONS + 1)  # step 4: share of each value head (V0, V1, V2, V) in the value loss
+	self_imitation_weight: float = 0.0  # self_imitation_loss; 0 = off (pure PPO)
 
 
 def value_targets(decision_rounds, round_scores, final_reward, horizons=N_VALUE_HORIZONS, reward_config=RewardConfig()):
@@ -139,23 +140,55 @@ def value_loss(out, targets, config=PPOConfig()):
 	return (per_head * weights).sum() / weights.sum(), per_head.detach()
 
 
-def normalize_advantages(advantages, config=AdvantageConfig()):
-	"""Step 5: rescale one epoch's advantages to mean 0, std 1, so the step size does not depend on the reward scale.
+def normalize_advantages(advantages, groups, battles, config=AdvantageConfig()):
+	"""Step 5: rescale one epoch's advantages to mean 0, std 1 per group, so the step size does not depend on the reward scale.
 
-	Done over all of an epoch's decisions together, never per batch. With fewer than
-	normalize_min_decisions decisions the mean and std are meaningless (with 2 decisions it only ranks
-	them, whatever the outcome), so the advantages are left as they are.
+	advantages, groups, battles: [N], for all decisions of the epoch. groups: the problem each decision
+	belongs to (the side we played: attacking and defending are different problems); battles: the
+	battle it was made in.
+
+	Per group, never across groups, and never per batch. Normalising both sides together (as before)
+	was a mistake: the centring shifted one side's advantages by the other side's luck (an unexpected
+	attack win pushed every defence decision down), and the joint std is dominated by the side whose
+	outcomes vary most, so the other side learned as if with a ~10x smaller learning rate (the lr 3e-4
+	run's defence stopped improving once its attack started winning).
+
+	A group is centred only if it has at least 2 battles: centring a single battle's advantages would
+	make half the decisions of a won battle look bad. A single battle is only scaled, by its root mean
+	square. With fewer than normalize_min_decisions decisions the statistics are meaningless (with 2
+	decisions it only ranks them, whatever the outcome), so those advantages are left as they are.
 	"""
-	if len(advantages) < config.normalize_min_decisions:
-		return advantages
-	return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+	out = advantages.clone()
+	for group in groups.unique():
+		member = groups == group
+		a = advantages[member]
+		if len(a) < config.normalize_min_decisions:
+			continue
+		if len(battles[member].unique()) >= 2:
+			out[member] = (a - a.mean()) / (a.std() + 1e-8)
+		else:
+			out[member] = a / (a.pow(2).mean().sqrt() + 1e-8)
+	return out
+
+
+def self_imitation_loss(out, action, line_reward, config=PPOConfig()):
+	"""Self-imitation (Oh et al. 2018, "Self-Imitation Learning"): make the best battle found so far more likely.
+
+	out: model outputs for that battle's decisions; action: its actions; line_reward: its final reward, -1..1.
+	Each decision is weighted by how much the battle beat what V now expects from that state, (R - V)+:
+	once the model plays that well anyway, the term vanishes. Battles are deterministic given our actions
+	(fixed VCMI seed), so replaying a won battle's actions wins it again. Returns (loss, parts).
+	"""
+	weight = (line_reward - out["value"][:, -1].detach()).clamp(min=0)
+	loss = -(weight * log_prob(out, action)).mean() * config.self_imitation_weight
+	return loss, {"self_imitation": loss.detach(), "self_imitation_weight": weight.mean()}
 
 
 def ppo_loss(out, action, old_log_prob, advantage, value_labels, config=PPOConfig()):
 	"""Steps 4-7 for a batch of decisions. out: model outputs for the batch inputs.
 
 	advantage: [B] from battle_returns_and_advantages (using V, the final-reward head, as values), already
-	           normalised over the epoch by normalize_advantages
+	           normalised per side over the epoch by normalize_advantages
 	value_labels: [B, N_VALUE_HORIZONS + 1] from value_targets
 	Returns (loss, parts for logging). approx_kl (mean old - new log-prob) and clip_fraction (share of
 	decisions whose ratio left the clip range) show how far this update moved the policy from the one

@@ -1,0 +1,67 @@
+"""Win rates of a training checkpoint: play the scenario from both sides at a given temperature.
+
+	.venv/bin/python -m battle_model.evaluate runtime/train/<run>/checkpoint_latest.pt [--games 8] [--temperature 0] [--seeds 1,2]
+
+Temperature 0 plays greedily (the most likely action every time): with VCMI's seed fixed the battle is then
+deterministic, so one game per side and seed says everything. Records are deleted afterwards.
+"""
+import argparse
+import shutil
+import tempfile
+from collections import Counter
+from pathlib import Path
+
+import torch
+
+from . import play
+from .data import read_events, summarize
+from .export import export
+from .model import BattleModel
+from .reward import to_scale
+from .train import ROOT, TrainConfig, model_kwargs
+
+
+def load(checkpoint):
+	state = torch.load(checkpoint)
+	model = BattleModel(**state.get("model_kwargs", model_kwargs(TrainConfig())))  # older checkpoints: the default model
+	model.load_state_dict(state["model"])
+	return model.eval(), state["epoch"]
+
+
+def evaluate(model, scenario, seeds=(1, 2), games=8, temperature=1.0, sampler_seed=10_000):
+	"""{side: [BattleSummary]} for `games` battles per side (one when greedy), side s played with VCMI seed seeds[s]."""
+	work = Path(tempfile.mkdtemp(prefix="evaluate-", dir=ROOT / "runtime"))
+	try:
+		export(model, work / "model.onnx")
+		n = 1 if temperature <= 0 else games
+		battles = [play.Game(scenario, our_side=side, game_seed=seeds[side], sampler_seed=sampler_seed + i, temperature=temperature) for side in (0, 1) for i in range(n)]
+		dirs = play.play(battles, work / "model.onnx", work / "records")
+		results = {0: [], 1: []}
+		for game, d in zip(battles, dirs):
+			results[game.our_side].append(summarize(read_events(d)))
+		return results
+	finally:
+		shutil.rmtree(work, ignore_errors=True)
+
+
+def main():
+	parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+	parser.add_argument("checkpoint")
+	parser.add_argument("--games", type=int, default=8)
+	parser.add_argument("--temperature", type=float, default=1.0)
+	parser.add_argument("--seeds", default="1,2", help="VCMI seed of the attack battles, of the defence battles")
+	parser.add_argument("--scenario", default=TrainConfig.scenario)
+	args = parser.parse_args()
+	model, epoch = load(args.checkpoint)
+	play.build_map(args.scenario)
+	results = evaluate(model, args.scenario, tuple(int(s) for s in args.seeds.split(",")), args.games, args.temperature)
+	for side, name in ((0, "attack"), (1, "defence")):
+		summaries = results[side]
+		wins = sum(s.outcome.name == "WIN" for s in summaries)
+		outcomes = " ".join(f"{k}:{v}" for k, v in sorted(Counter(s.outcome.name for s in summaries).items()))
+		mean = sum(to_scale(s.reward) for s in summaries) / len(summaries)
+		print(f"epoch {epoch} {name}: won {wins}/{len(summaries)}  mean reward {mean:+.3f}  ({outcomes})")
+
+
+if __name__ == "__main__":
+	main()

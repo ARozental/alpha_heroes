@@ -51,6 +51,9 @@ from .schema import INPUT_NAMES, OUTPUT_NAMES
 # so an untrained model picks among the legal types with exactly these odds. A modelling choice:
 # start aggressive and rarely give up, so the first self-play games are real fights instead of
 # mostly retreats. Training moves these freely; types not listed start at 0.
+# Giving up is offered at every decision, ~40 times a battle, so its odds compound: at -2 (~2.5% a
+# decision each) about 2 in 3 untrained battles ended in a retreat or surrender. At -6 (~0.05% a
+# decision each) it is ~4% of battles.
 ACTION_TYPE_PRIOR = {
 	ActionType.MELEE: 1.0,
 	ActionType.SHOOT: 1.0,
@@ -58,8 +61,8 @@ ACTION_TYPE_PRIOR = {
 	ActionType.MOVE: 0.5,
 	ActionType.WAIT: 0.0,
 	ActionType.DEFEND: 0.0,
-	ActionType.RETREAT: -2.0,
-	ActionType.SURRENDER: -2.0,
+	ActionType.RETREAT: -6.0,
+	ActionType.SURRENDER: -6.0,
 }
 
 
@@ -108,12 +111,19 @@ class Block(nn.Module):
 
 
 class BattleModel(nn.Module):
-	def __init__(self, dim=64, layers=2, heads=4, boost_stop_gradient=True):
+	def __init__(self, dim=64, layers=2, heads=4, boost_stop_gradient=True, mask_features=False):
 		"""boost_stop_gradient: each value head adds a detached copy of the previous head's logit, so a
-		longer-horizon label never pulls on a shorter-horizon head (true boosting). False lets it."""
+		longer-horizon label never pulls on a shorter-horizon head (true boosting). False lets it.
+
+		mask_features: also feed the acting unit's legal choices into the tokens (they are model inputs
+		already, used for the output masks): per hex "can move here", "can attack someone from here",
+		"a spell can target this hex"; per unit "can be attacked", "can be shot", "a spell can target it".
+		Otherwise the network has to work out reachability and adjacency from positions and speeds.
+		"""
 		super().__init__()
 		self.dim = dim
 		self.boost_stop_gradient = boost_stop_gradient
+		self.mask_features = mask_features
 		self.creature = nn.Embedding(CREATURE_VOCAB + 1, dim)
 		self.effect = nn.Embedding(EFFECT_VOCAB + 1, dim)
 		self.hero_type = nn.Embedding(HERO_TYPE_VOCAB + 1, dim)
@@ -131,6 +141,9 @@ class BattleModel(nn.Module):
 		self.hero_num = nn.Linear(7 + N_SECONDARY_SKILLS + N_SPELLS, dim)
 		self.hex_num = nn.Linear(4, dim)
 		self.global_num = nn.Linear(3, dim)
+		if mask_features:
+			self.unit_mask_num = nn.Linear(3, dim)
+			self.hex_mask_num = nn.Linear(3, dim)
 		self.blocks = nn.ModuleList(Block(dim, heads) for _ in range(layers))
 		self.norm = nn.LayerNorm(dim)
 
@@ -201,6 +214,9 @@ class BattleModel(nn.Module):
 			+ self.token_kind.weight[2]
 		)
 		unit_valid = x["u_present"] != 0
+		if self.mask_features:
+			unit_masks = torch.stack([flag(x["m_melee_target"]), flag(x["m_shoot_target"]), flag(x["m_spell_unit"]).amax(dim=1)], dim=-1)
+			units = units + self.unit_mask_num(unit_masks)
 
 		# Heroes (index = battle side)
 		hero_numeric = torch.cat(
@@ -247,6 +263,9 @@ class BattleModel(nn.Module):
 			+ self.hex_num(hex_numeric)
 			+ self.token_kind.weight[3]
 		)
+		if self.mask_features:
+			hex_masks = torch.stack([flag(x["m_move_hex"]), flag(x["m_melee_from"]).amax(dim=1), flag(x["m_spell_hex"]).amax(dim=1)], dim=-1)
+			hexes = hexes + self.hex_mask_num(hex_masks)
 
 		# Global
 		global_numeric = torch.stack([(x["g_round"].float() + 1) / 20, x["g_tactic_distance"].float() / 7, flag(x["g_hero_can_cast"])], dim=-1)

@@ -165,15 +165,18 @@ def collate(examples):
 def make_dataloader(record_dirs, batch_size=64, shuffle=True, reward_config=RewardConfig(), advantage_config=AdvantageConfig()):
 	"""DataLoader over all decisions of the given battle records (one epoch), and the battles' summaries.
 
-	Advantages are normalised over all of these decisions together, not per batch (losses.normalize_advantages).
+	Advantages are normalised per side we played over all of its decisions here, not per batch
+	(losses.normalize_advantages).
 	"""
-	examples, summaries = [], []
-	for record_dir in record_dirs:
+	examples, summaries, sides, battles = [], [], [], []
+	for i, record_dir in enumerate(record_dirs):
 		battle, summary = battle_examples(record_dir, reward_config, advantage_config)
 		examples += battle
 		summaries.append(summary)
+		sides += [summary.our_side] * len(battle)
+		battles += [i] * len(battle)
 	if examples:
-		advantages = normalize_advantages(torch.stack([e["advantage"] for e in examples]), advantage_config)
+		advantages = normalize_advantages(torch.stack([e["advantage"] for e in examples]), torch.tensor(sides), torch.tensor(battles), advantage_config)
 		for example, advantage in zip(examples, advantages):
 			example["advantage"] = advantage
 	loader = torch.utils.data.DataLoader(examples, batch_size=batch_size, shuffle=shuffle, collate_fn=collate)
