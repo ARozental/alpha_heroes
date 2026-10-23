@@ -262,20 +262,28 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 		}
 		else if(aims[0] == spells::AimType::CREATURE)
 		{
+			// The engine aims a creature spell at the unit's hex and picks the unit there by the spell's own
+			// rules (BattleSpellMechanics::transformSpellTarget, UnitEffect::transformTargetByRange): a slot is
+			// a legal target only if the cast really affects that unit. A corpse under a living unit is then
+			// no alias for the living one (Lightning Bolt would hit the living one), Resurrection and Animate
+			// Dead cannot revive a corpse any unit stands on (Heal::isValidTarget), and Sacrifice can still
+			// revive one an enemy stands on but not one under our own living unit (that one is picked instead).
+			auto castAffects = [&](const battle::Target & target, const CStack * unit)
+			{
+				if(!mechanics->canBeCastAt(target))
+					return false;
+				const auto affected = mechanics->getAffectedStacks(target);
+				return std::find(affected.begin(), affected.end(), unit) != affected.end();
+			};
 			for(int u = 0; u < MAX_UNITS; ++u)
 			{
 				const CStack * unit = e.units[u];
 				if(!unit)
 					continue;
-				// The engine aims creature spells at the unit's hex and hits the living unit there
-				// (BattleSpellMechanics::transformSpellTarget): a dead unit under a living one would only be
-				// another name for that one
-				if(!unit->alive() && battle.battleGetUnitByPos(unit->getPosition(), true))
-					continue;
 				const battle::Destination first(unit);
 				if(second == TargetKind::NONE)
 				{
-					if(mechanics->canBeCastAt({first}))
+					if(castAffects({first}, unit))
 						t.set(In::m_spell_unit, s, u, 1);
 					continue;
 				}
@@ -285,7 +293,7 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 				if(second == TargetKind::HEX && aims[1] == spells::AimType::LOCATION)
 				{
 					for(int h = 0; h < N_HEXES; ++h)
-						if(mechanics->canBeCastAt({first, battle::Destination(BattleHex(h))}))
+						if(castAffects({first, battle::Destination(BattleHex(h))}, unit))
 						{
 							t.set(In::m_spell2_hex, u, h, 1);
 							anySecond = true;
@@ -294,7 +302,7 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 				else if(second == TargetKind::UNIT && aims[1] == spells::AimType::CREATURE)
 				{
 					for(int v = 0; v < MAX_UNITS; ++v)
-						if(e.units[v] && mechanics->canBeCastAt({first, battle::Destination(e.units[v])}))
+						if(e.units[v] && castAffects({first, battle::Destination(e.units[v])}, unit))
 						{
 							t.set(In::m_spell2_unit, u, v, 1);
 							anySecond = true;
