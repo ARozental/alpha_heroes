@@ -76,6 +76,7 @@ from .reward import RewardConfig, to_unit
 class AdvantageConfig:
 	gamma: float = 1.0  # discount per decision (step 3); 1 = the battle's end counts fully for every decision
 	lam: float = 0.95  # GAE lambda (step 5); 1 = judge each decision by the final outcome only
+	normalize_min_decisions: int = 8  # step 5: rescale advantages over an epoch only if it has at least this many decisions
 
 
 @dataclass(frozen=True)
@@ -83,7 +84,6 @@ class PPOConfig:
 	clip_range: float = 0.2  # step 6: one update may change p(action) by at most +-20%; PPO's standard value
 	value_weight: float = 0.5  # step 7: the value loss shares the network with the policy, standard PPO weight
 	entropy_weight: float = 0.01  # step 7: small exploration bonus
-	normalize_advantages: bool = True  # scale advantages to mean 0, std 1 per batch: the step size then does not depend on the reward scale
 	value_head_weights: tuple = (1.0,) * (N_VALUE_HORIZONS + 1)  # step 4: share of each value head (V0, V1, V2, V) in the value loss
 
 
@@ -136,15 +136,26 @@ def value_loss(out, targets, config=PPOConfig()):
 	return (per_head * weights).sum() / weights.sum(), per_head.detach()
 
 
+def normalize_advantages(advantages, config=AdvantageConfig()):
+	"""Step 5: rescale one epoch's advantages to mean 0, std 1, so the step size does not depend on the reward scale.
+
+	Done over all of an epoch's decisions together, never per batch. With fewer than
+	normalize_min_decisions decisions the mean and std are meaningless (with 2 decisions it only ranks
+	them, whatever the outcome), so the advantages are left as they are.
+	"""
+	if len(advantages) < config.normalize_min_decisions:
+		return advantages
+	return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+
 def ppo_loss(out, action, old_log_prob, advantage, value_labels, config=PPOConfig()):
 	"""Steps 4-7 for a batch of decisions. out: model outputs for the batch inputs.
 
-	advantage: [B] from battle_returns_and_advantages (using V, the final-reward head, as values)
+	advantage: [B] from battle_returns_and_advantages (using V, the final-reward head, as values), already
+	           normalised over the epoch by normalize_advantages
 	value_labels: [B, N_VALUE_HORIZONS + 1] from value_targets
 	Returns (loss, parts for logging).
 	"""
-	if config.normalize_advantages and advantage.numel() > 1:
-		advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 	ratio = torch.exp(log_prob(out, action) - old_log_prob)
 	clipped = ratio.clamp(1 - config.clip_range, 1 + config.clip_range)
 	policy = -torch.min(ratio * advantage, clipped * advantage).mean()

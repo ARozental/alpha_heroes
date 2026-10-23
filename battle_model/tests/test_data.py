@@ -53,3 +53,8 @@ def test_refused_model_makes_the_record_unusable():
 def test_enemy_surrender_counts_as_full_destruction():
 	s = summarize(events(0, {"round": 2, "winner": 0, "result": RESULT_SURRENDER, "casualties": [[], [[42, 2]]], "alive": [[], []]}))
 	assert s.outcome == Outcome.WIN and s.enemy_lost == army_value(THEIRS)
+
+
+def test_no_winner_is_a_draw():
+	s = summarize(events(1, {"round": 1, "winner": -1, "result": RESULT_NORMAL, "casualties": [THEIRS, OURS], "alive": [[], []]}))
+	assert s.outcome == Outcome.DRAW and s.own_kept == 0 and s.enemy_lost == army_value(THEIRS)

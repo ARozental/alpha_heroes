@@ -45,9 +45,10 @@ def test_scenario_ordering():
 	assert cheap_win > costly_win > surrender > retreat > death
 
 
-def test_weak_hero_retreat_equals_death():
-	weak = 1_000  # below a fresh tavern hero
-	assert reward(Outcome.RETREAT, 0, weak, 10_000) == reward(Outcome.LOSS, 0, weak, 10_000)
+def test_weak_hero_retreat_is_death_plus_the_mana_bill():
+	weak = 1_000  # below a fresh tavern hero: worth nothing after retreating
+	retreat, death = reward(Outcome.RETREAT, 0, weak, 10_000, mana=0.3), reward(Outcome.LOSS, 0, weak, 10_000, mana=0.3)
+	assert abs(death - retreat - 0.05 * 0.3) < 1e-9  # the dead hero pays no mana penalty
 
 
 def test_surrender_pays_cost_and_rehire():
@@ -64,7 +65,7 @@ def test_penalties_reduce_reward():
 def test_bounds_cover_every_reward_and_round_score():
 	from battle_model.reward import MAX_PENALIZED_ROUNDS, reward_bounds, round_score
 	low, high = reward_bounds()
-	worst = terminal_reward(Outcome.LOSS, 1, 0, 1, 0, rounds=10 * MAX_PENALIZED_ROUNDS, mana_used_fraction=1.0)
+	worst = terminal_reward(Outcome.RETREAT, 1, 0, 1, 0, rounds=10 * MAX_PENALIZED_ROUNDS, mana_used_fraction=1.0)  # hero alive: pays for mana
 	best = terminal_reward(Outcome.WIN, 1, 1, 1, 1, rounds=0, mana_used_fraction=0.0)
 	assert worst == low and best == high
 	assert low <= round_score(10, 0, 10, 0, rounds=500, mana_used_fraction=1.0) <= round_score(10, 10, 10, 10, 0, 0) <= high
@@ -81,3 +82,17 @@ def test_unit_scale_maps_the_reward_range_to_0_1():
 	low, high = reward_bounds()
 	assert to_unit(low) == 0.0 and to_unit(high) == 1.0
 	assert abs(from_unit(to_unit(1.7)) - 1.7) < 1e-12
+
+
+def test_draw_is_worth_minus_half_and_better_than_a_loss():
+	kept, lost = 0, ENEMY
+	draw = terminal_reward(Outcome.DRAW, ARMY, kept, ENEMY, lost, rounds=1, mana_used_fraction=0.5)
+	loss = terminal_reward(Outcome.LOSS, ARMY, kept, ENEMY, lost, rounds=1, mana_used_fraction=0.5)
+	assert abs(draw - (-0.5 + 1.0 - 0.002)) < 1e-9 and draw > loss
+
+
+def test_no_mana_penalty_when_our_hero_dies():
+	for outcome in (Outcome.LOSS, Outcome.DRAW):
+		assert terminal_reward(outcome, ARMY, 0, ENEMY, 100, 1, 1.0) == terminal_reward(outcome, ARMY, 0, ENEMY, 100, 1, 0.0)
+	for outcome in (Outcome.WIN, Outcome.RETREAT, Outcome.SURRENDER):
+		assert terminal_reward(outcome, ARMY, ARMY, ENEMY, 100, 1, 1.0) < terminal_reward(outcome, ARMY, ARMY, ENEMY, 100, 1, 0.0)

@@ -24,7 +24,7 @@ import torch
 
 from . import vocab
 from .distributions import ACTION_FIELDS, log_prob, stack_actions
-from .losses import AdvantageConfig, battle_returns_and_advantages, value_targets
+from .losses import AdvantageConfig, battle_returns_and_advantages, normalize_advantages, value_targets
 from .reward import Outcome, RewardConfig, own_kept_value, round_score, terminal_reward, to_unit
 from .schema import INPUTS, OUTPUTS
 
@@ -79,6 +79,8 @@ def summarize(events, hero_value=0.0, fresh_hero_value=0.0, config=RewardConfig(
 
 	if end["winner"] == our:
 		outcome = Outcome.WIN
+	elif end["winner"] not in (0, 1):  # no winner: both armies destroyed
+		outcome = Outcome.DRAW
 	elif end["result"] == RESULT_ESCAPE:
 		outcome = Outcome.RETREAT
 	elif end["result"] == RESULT_SURRENDER:
@@ -157,11 +159,18 @@ def collate(examples):
 
 
 def make_dataloader(record_dirs, batch_size=64, shuffle=True, reward_config=RewardConfig(), advantage_config=AdvantageConfig()):
-	"""DataLoader over all decisions of the given battle records, and the battles' summaries."""
+	"""DataLoader over all decisions of the given battle records (one epoch), and the battles' summaries.
+
+	Advantages are normalised over all of these decisions together, not per batch (losses.normalize_advantages).
+	"""
 	examples, summaries = [], []
 	for record_dir in record_dirs:
 		battle, summary = battle_examples(record_dir, reward_config, advantage_config)
 		examples += battle
 		summaries.append(summary)
+	if examples:
+		advantages = normalize_advantages(torch.stack([e["advantage"] for e in examples]), advantage_config)
+		for example, advantage in zip(examples, advantages):
+			example["advantage"] = advantage
 	loader = torch.utils.data.DataLoader(examples, batch_size=batch_size, shuffle=shuffle, collate_fn=collate)
 	return loader, summaries

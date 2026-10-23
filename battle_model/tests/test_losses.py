@@ -56,3 +56,12 @@ def test_value_loss_weights_and_minimum():
 	assert value_loss(off, labels, config)[0] > value_loss(perfect, labels, config)[0]
 	only_v = PPOConfig(value_head_weights=(0.0, 0.0, 0.0, 1.0))
 	assert torch.isclose(value_loss(off, labels, only_v)[0], value_loss(perfect, labels, only_v)[0])
+
+
+def test_advantages_normalised_over_an_epoch_only_with_enough_decisions():
+	from battle_model.losses import normalize_advantages
+	few = torch.tensor([0.3, -0.1, 0.2])
+	assert torch.equal(normalize_advantages(few, AdvantageConfig(normalize_min_decisions=8)), few)
+	many = torch.arange(10, dtype=torch.float32)
+	scaled = normalize_advantages(many, AdvantageConfig(normalize_min_decisions=8))
+	assert abs(float(scaled.mean())) < 1e-6 and abs(float(scaled.std()) - 1) < 1e-5

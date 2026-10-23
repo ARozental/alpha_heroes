@@ -1,9 +1,9 @@
 """Terminal battle reward and the fixed value functions it uses. No trainable parameters.
 
-	reward = (+1 win | -1 otherwise)
+	reward = outcome term (+1 win, -0.5 draw, -1 otherwise)
 	       + enemy value lost / enemy value at start          (0..1)
 	       + own value kept / own value at start              (0..1)
-	       - round_penalty * rounds - mana_penalty * fraction of the mana pool used
+	       - round_penalty * rounds - mana_penalty * fraction of the mana pool used (only if our hero lives)
 
 The same formula scores a battle that is still going on at the end of a round (round_score): the
 outcome term is 0 there, since nobody has won yet. The value heads predict these scores.
@@ -23,9 +23,16 @@ HERO_HIRE_COST = 2500
 
 class Outcome(IntEnum):
 	WIN = 0
-	LOSS = 1  # all our units died
+	LOSS = 1  # all our units died, our hero with them
 	RETREAT = 2  # hero fled: army lost, hero back in the tavern with 1 creature
 	SURRENDER = 3  # paid to leave: hero back in the tavern with its army
+	DRAW = 4  # both armies destroyed (e.g. Armageddon): both heroes dead
+
+
+# The outcome term. A draw's value depends on the campaign map (zero-sum or not): -0.5 for now.
+OUTCOME_TERM = {Outcome.WIN: 1.0, Outcome.DRAW: -0.5, Outcome.LOSS: -1.0, Outcome.RETREAT: -1.0, Outcome.SURRENDER: -1.0}
+# Mana only matters if our hero survives the battle to use it again
+HERO_SURVIVES = (Outcome.WIN, Outcome.RETREAT, Outcome.SURRENDER)
 
 
 # The round penalty stops growing after this many rounds, so the reward has fixed bounds.
@@ -95,7 +102,7 @@ def own_kept_value(outcome, army_end_value, hero_value_, fresh_hero_value=0.0, s
 	return 0.0
 
 
-def _score(outcome_term, own_start_value, own_kept, enemy_start_value, enemy_lost, rounds, mana_used_fraction, config):
+def _score(outcome_term, own_start_value, own_kept, enemy_start_value, enemy_lost, rounds, mana_used_fraction, config, hero_alive=True):
 	def fraction(part, whole):
 		return min(1.0, max(0.0, part / whole)) if whole > 0 else 0.0
 
@@ -103,13 +110,14 @@ def _score(outcome_term, own_start_value, own_kept, enemy_start_value, enemy_los
 	score += fraction(enemy_lost, enemy_start_value)
 	score += fraction(own_kept, own_start_value)
 	score -= config.round_penalty * min(rounds, MAX_PENALIZED_ROUNDS)
-	score -= config.mana_penalty * min(1.0, max(0.0, mana_used_fraction))
+	if hero_alive:
+		score -= config.mana_penalty * min(1.0, max(0.0, mana_used_fraction))
 	return score
 
 
 def terminal_reward(outcome, own_start_value, own_kept, enemy_start_value, enemy_lost, rounds, mana_used_fraction, config=RewardConfig()):
 	"""own_start_value / enemy_start_value: army + hero value at the start of the battle."""
-	return _score(1.0 if outcome == Outcome.WIN else -1.0, own_start_value, own_kept, enemy_start_value, enemy_lost, rounds, mana_used_fraction, config)
+	return _score(OUTCOME_TERM[Outcome(outcome)], own_start_value, own_kept, enemy_start_value, enemy_lost, rounds, mana_used_fraction, config, hero_alive=outcome in HERO_SURVIVES)
 
 
 def round_score(own_start_value, own_kept, enemy_start_value, enemy_lost, rounds, mana_used_fraction, config=RewardConfig()):
