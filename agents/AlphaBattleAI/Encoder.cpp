@@ -105,7 +105,7 @@ void encodeUnits(EncodedBattle & e, const CPlayerBattleCallback & battle, const 
 	}
 }
 
-void encodeHeroes(InputTensors & t, const CPlayerBattleCallback & battle, BattleSide mySide)
+void encodeHeroes(InputTensors & t, const CPlayerBattleCallback & battle, BattleSide mySide, const CGHeroInstance * enemyHero)
 {
 	// Our hero: everything
 	const int my = static_cast<int>(mySide);
@@ -125,11 +125,13 @@ void encodeHeroes(InputTensors & t, const CPlayerBattleCallback & battle, Battle
 			for(int spell = 0; spell < N_SPELLS; ++spell)
 				t.set(In::h_spells, my, spell, hero->spellbookContainsSpell(SpellID(spell)));
 	}
-	// The enemy hero: only what a player sees in battle (no secondary skills, no spellbook)
+	// The enemy hero: only what a player sees in battle (no secondary skills, no spellbook). The player
+	// callback's battleGetEnemyHero() hides even that (BASIC level), but the client shows a human both heroes'
+	// in-battle stats (BattleWindow::createStickyHeroInfoWindows, INBATTLE level): use the same.
 	const int enemy = 1 - my;
 	if(battle.battleHasHero(static_cast<BattleSide>(enemy)))
 	{
-		const auto info = battle.battleGetEnemyHero();
+		const auto info = enemyHero ? InfoAboutHero(enemyHero, InfoAboutHero::EInfoLevel::INBATTLE) : battle.battleGetEnemyHero();
 		t.set(In::h_present, enemy, 1);
 		t.set(In::h_type, enemy, info.portraitSource.getNum());
 		if(info.details)
@@ -311,7 +313,7 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 }
 }
 
-EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * active, const Environment & env, PlayerColor player)
+EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * active, const Environment & env, PlayerColor player, const CGHeroInstance * enemyHero)
 {
 	EncodedBattle e;
 	auto & t = e.tensors;
@@ -333,7 +335,7 @@ EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * 
 	t.set(In::g_active_unit, e.activeSlot);
 	t.set(In::g_hero_can_cast, heroCanCast);
 	t.set(In::g_gate_state, static_cast<int>(battle.battleGetGateState()));
-	encodeHeroes(t, battle, mySide);
+	encodeHeroes(t, battle, mySide, enemyHero);
 
 	std::array<bool, N_HEXES> stopping{};
 	encodeHexes(t, battle, mySide, stopping);

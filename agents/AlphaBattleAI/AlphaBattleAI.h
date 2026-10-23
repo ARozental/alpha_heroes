@@ -40,6 +40,7 @@ class AlphaBattleAI : public CBattleGameInterface
 	std::shared_ptr<Environment> env;
 	std::shared_ptr<CBattleGameInterface> fallback;
 	std::shared_ptr<BattleModel> model;
+	std::array<const CGHeroInstance *, 2> heroes{}; // per battle side, from battleStart
 	std::mt19937 rng;
 	float temperature = 1.0f;
 	bool wasWaitingForRealize = false;

@@ -125,6 +125,7 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2, int3 tile, const CGHeroInstance * hero1, const CGHeroInstance * hero2, BattleSide side, bool replayAllowed)
 {
 	stats = Stats(); // the neutral player's battle AI is reused for every battle
+	heroes = {hero1, hero2};
 	lastTurn.reset();
 	rejected.clear();
 	faultsDoneThisBattle.clear();
@@ -288,7 +289,7 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 	for(int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt)
 	{
 		const auto start = std::chrono::steady_clock::now();
-		auto encoded = encodeBattle(*battle, stack, *env, player);
+		auto encoded = encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(battle->battleGetMySide())]);
 		for(const auto & action : rejected)
 			excludeAction(encoded, action);
 		if(!encoded.tensors.any(In::m_type))

@@ -5,6 +5,7 @@
 #include "lib/constants/EntityIdentifiers.h"
 
 VCMI_LIB_NAMESPACE_BEGIN
+class CGHeroInstance;
 class CPlayerBattleCallback;
 class CStack;
 class Environment;
@@ -21,7 +22,9 @@ struct EncodedBattle
 	int activeSlot = -1;
 };
 
-EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * active, const Environment & env, PlayerColor player);
+/// enemyHero: the enemy side's hero (from battleStart) or nullptr; encoded with what a player sees of it in
+/// battle (the client's hero info windows): primary skills, mana and mana limit, not skills or spellbook.
+EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * active, const Environment & env, PlayerColor player, const CGHeroInstance * enemyHero);
 
 /// Recompute every mask that is derived from more specific ones: a choice is legal only if
 /// some complete action through it is legal (melee targets from hexes, spells from targets, types).
