@@ -51,6 +51,7 @@ from .constants import (
 	ActionType,
 )
 from .schema import INPUT_NAMES, OUTPUT_NAMES
+from . import rules
 
 # Starting preference between action types, as type-head logits. The head's weights start at zero,
 # so an untrained model picks among the legal types with exactly these odds. A modelling choice:
@@ -116,7 +117,7 @@ class Block(nn.Module):
 
 
 class BattleModel(nn.Module):
-	def __init__(self, dim=64, layers=2, heads=4, boost_stop_gradient=True, mask_features=False, chain_final_value=False):
+	def __init__(self, dim=64, layers=2, heads=4, boost_stop_gradient=True, mask_features=False, chain_final_value=False, kill_rule=True):
 		"""boost_stop_gradient: each value head adds a detached copy of the previous head's logit, so a
 		longer-horizon label never pulls on a shorter-horizon head (true boosting). False lets it.
 
@@ -127,6 +128,9 @@ class BattleModel(nn.Module):
 		already, used for the output masks): per hex "can move here", "can attack someone from here",
 		"a spell can target this hex"; per unit "can be attacked", "can be shot", "a spell can target it".
 		Otherwise the network has to work out reachability and adjacency from positions and speeds.
+
+		kill_rule: a hand-made rule, with a learnable weight: attack the most valuable enemy stack the acting unit
+		kills for sure, if there is one (add_kill_rule).
 		"""
 		super().__init__()
 		self.dim = dim
@@ -162,6 +166,13 @@ class BattleModel(nn.Module):
 		self.spell_head = nn.Linear(dim, N_SPELLS)
 		self.spell_query = nn.Embedding(N_SPELLS, dim)
 		self.value_heads = nn.ModuleList(nn.Linear(dim, 1) for _ in range(N_VALUE_HORIZONS + 1))
+		# Per creature id: value in gold and abilities, for rules.py (constants, not saved in checkpoints)
+		for name, table in rules.creature_tables().items():
+			self.register_buffer(f"creature_{name}", table, persistent=False)
+		self.register_buffer("type_one_hot", torch.eye(N_ACTION_TYPES), persistent=False)
+		self.kill_rule = kill_rule
+		if kill_rule:
+			self.kill_rule_weight = nn.Parameter(torch.tensor(1000.0))
 		# One query projection from the context, and one key projection, per pointer head
 		self.queries = nn.ModuleDict({name: nn.Linear(dim, dim) for name in ("move", "melee", "melee_from", "shoot", "spell", "spell2")})
 		self.keys = nn.ModuleDict({name: nn.Linear(dim, dim) for name in ("move_hex", "melee_unit", "melee_from_unit", "melee_from_hex", "shoot_unit", "spell_unit", "spell_hex", "spell2_from_unit", "spell2_hex", "spell2_unit")})
@@ -329,12 +340,19 @@ class BattleModel(nn.Module):
 		spell2_hex = torch.einsum("bud,bhd->buh", spell2_from, k["spell2_hex"](hexes)) * scale
 		spell2_unit = torch.einsum("bud,bvd->buv", spell2_from, k["spell2_unit"](units)) * scale
 
+		logits = {
+			"type": self.type_head(context),
+			"melee_target": point(q["melee"], units, "melee_unit"),
+			"shoot_target": point(q["shoot"], units, "shoot_unit"),
+		}
+		if self.kill_rule:
+			logits = self.add_kill_rule(logits, x)
 		return {
-			"logp_type": masked_log_softmax(self.type_head(context), x["m_type"]),
+			"logp_type": masked_log_softmax(logits["type"], x["m_type"]),
 			"logp_move_hex": masked_log_softmax(point(q["move"], hexes, "move_hex"), x["m_move_hex"]),
-			"logp_melee_target": masked_log_softmax(point(q["melee"], units, "melee_unit"), x["m_melee_target"]),
+			"logp_melee_target": masked_log_softmax(logits["melee_target"], x["m_melee_target"]),
 			"logp_melee_from": masked_log_softmax(melee_from, x["m_melee_from"]),
-			"logp_shoot_target": masked_log_softmax(point(q["shoot"], units, "shoot_unit"), x["m_shoot_target"]),
+			"logp_shoot_target": masked_log_softmax(logits["shoot_target"], x["m_shoot_target"]),
 			"logp_spell": masked_log_softmax(self.spell_head(context), x["m_spell"]),
 			"logp_spell_unit": masked_log_softmax(spell_unit, x["m_spell_unit"]),
 			"logp_spell_hex": masked_log_softmax(spell_hex, x["m_spell_hex"]),
@@ -342,6 +360,26 @@ class BattleModel(nn.Module):
 			"logp_spell2_unit": masked_log_softmax(spell2_unit, x["m_spell2_unit"]),
 			**self._values(context),
 		}
+
+	def creature_tables(self):
+		return {name: getattr(self, f"creature_{name}") for name in ("value", "shooter", "no_melee_penalty", "no_distance_penalty")}
+
+	def add_kill_rule(self, logits, x):
+		"""Rule: attack the most valuable enemy stack the acting unit kills whatever the dice, if it can.
+
+		A stack it kills for sure (rules.cross_stack_features) gets kill_rule_weight * (1 + its share of its army's
+		value) added to its target logit, so the most valuable one wins. The type (melee or shoot) is chosen before
+		the target, so that type's logit gets the score of its best legal target.
+		"""
+		f = rules.cross_stack_features(x, self.creature_tables())
+		score = self.kill_rule_weight * (1 + f["value_share"])
+		logits = dict(logits)
+		for kills, target, mask, action in (("kills_melee", "melee_target", "m_melee_target", ActionType.MELEE), ("kills_shot", "shoot_target", "m_shoot_target", ActionType.SHOOT)):
+			rule = score * f[kills]  # [B, U], 0 where it does not kill for sure
+			logits[target] = logits[target] + rule
+			best = (rule * x[mask]).amax(dim=1)  # the best legal target's score
+			logits["type"] = logits["type"] + best[:, None] * self.type_one_hot[action]
+		return logits
 
 	def _values(self, context):
 		logits, previous = [], None

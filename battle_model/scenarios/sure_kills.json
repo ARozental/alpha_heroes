@@ -1,0 +1,118 @@
+{
+	"name": "sure_kills",
+	"_about": "For checking the kill rule (check_rules.py): each side has three strong stacks (one of them shooters) and four single creatures that the strong ones can kill whatever the dice. Otherwise as castle_vs_inferno: primary skills 5/5/5/5, no secondary skills, no war machines, the same 10 spells.",
+	"terrain": "grass",
+	"seed": 1,
+	"sides": [
+		{
+			"faction": "castle",
+			"hero": "caitlin",
+			"primary_skills": [
+				5,
+				5,
+				5,
+				5
+			],
+			"secondary_skills": [],
+			"army": [
+				[
+					"angel",
+					3
+				],
+				[
+					"cavalier",
+					4
+				],
+				[
+					"archer",
+					12
+				],
+				[
+					"pikeman",
+					1
+				],
+				[
+					"swordsman",
+					1
+				],
+				[
+					"griffin",
+					1
+				],
+				[
+					"monk",
+					1
+				]
+			],
+			"spellbook": true,
+			"spells": [
+				"bless",
+				"blind",
+				"cure",
+				"destroyUndead",
+				"forgetfulness",
+				"hypnotize",
+				"lightningBolt",
+				"mirth",
+				"protectEarth",
+				"slow"
+			],
+			"war_machines": false
+		},
+		{
+			"faction": "inferno",
+			"hero": "calid",
+			"primary_skills": [
+				5,
+				5,
+				5,
+				5
+			],
+			"secondary_skills": [],
+			"army": [
+				[
+					"devil",
+					3
+				],
+				[
+					"efreet",
+					4
+				],
+				[
+					"gog",
+					12
+				],
+				[
+					"imp",
+					1
+				],
+				[
+					"demon",
+					1
+				],
+				[
+					"hellHound",
+					1
+				],
+				[
+					"pitFiend",
+					1
+				]
+			],
+			"spellbook": true,
+			"spells": [
+				"bless",
+				"blind",
+				"cure",
+				"destroyUndead",
+				"forgetfulness",
+				"hypnotize",
+				"lightningBolt",
+				"mirth",
+				"protectEarth",
+				"slow"
+			],
+			"war_machines": false
+		}
+	]
+}

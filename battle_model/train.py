@@ -97,6 +97,7 @@ class TrainConfig:
 	model_layers: int = 2
 	model_mask_features: bool = False  # model.BattleModel(mask_features=...)
 	model_chain_final_value: bool = False  # model.BattleModel(chain_final_value=...)
+	model_kill_rule: bool = True  # model.BattleModel(kill_rule=...)
 	seed: int = 0  # the model's initial weights
 	reward: RewardConfig = field(default_factory=RewardConfig)
 	advantage: AdvantageConfig = field(default_factory=AdvantageConfig)
@@ -396,7 +397,7 @@ class Producer:
 
 
 def model_kwargs(config):
-	return {"dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features, "chain_final_value": config.model_chain_final_value}
+	return {"dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features, "chain_final_value": config.model_chain_final_value, "kill_rule": config.model_kill_rule}
 
 
 def save_checkpoint(path, model, optimizer, epoch, config):
