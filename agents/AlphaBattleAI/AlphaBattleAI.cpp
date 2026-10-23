@@ -14,8 +14,13 @@
 #include "lib/callback/CDynLibHandler.h"
 #include "lib/networkPacks/PacksForClientBattle.h"
 #include "lib/spells/CSpellHandler.h"
+#include "lib/mapObjects/CGHeroInstance.h"
+#include "lib/mapObjects/army/CCreatureSet.h"
+#include "lib/mapObjects/army/CStackInstance.h"
 
 #include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <chrono>
 #include <cstdlib>
 #include <sstream>
@@ -63,6 +68,10 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 		if(!fault.empty())
 			faults.push_back(fault);
 
+	recordDir = envString("ALPHA_BATTLE_RECORD_DIR");
+	if(!recordDir.empty())
+		std::filesystem::create_directories(recordDir);
+
 	const auto path = envString("ALPHA_BATTLE_MODEL");
 	try
 	{
@@ -75,6 +84,12 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 		static std::atomic<bool> reported{false};
 		if(!reported.exchange(true))
 			logAi->error("AlphaBattleAI: cannot use model '%s': %s. StupidAI plays instead.", path, e.what());
+		if(!recordDir.empty()) // a training record must never silently contain StupidAI's battle
+		{
+			std::string message = e.what();
+			std::replace(message.begin(), message.end(), '"', '\'');
+			recordEvent("{\"event\": \"error\", \"message\": \"cannot use model: " + message + "\"}");
+		}
 	}
 }
 
@@ -91,11 +106,68 @@ void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * 
 	faultsDoneThisBattle.clear();
 	stats.siege = cb->getBattle(battleID)->battleGetDefendedTown() != nullptr;
 	stats.walls = cb->getBattle(battleID)->battleGetWallState(EWallPart::KEEP) != EWallState::NONE;
+
+	if(!recordDir.empty())
+	{
+		auto army = [](const CCreatureSet * set)
+		{
+			std::string json = "[";
+			for(const auto & [slot, stack] : set->Slots())
+				json += std::string(json.size() > 1 ? ", " : "") + "[" + std::to_string(stack->getCreatureID().getNum()) + ", " + std::to_string(stack->getCount()) + "]";
+			return json + "]";
+		};
+		const auto * hero = cb->getBattle(battleID)->battleGetMyHero();
+		recordEvent("{\"event\": \"start\", \"our_side\": " + std::to_string(static_cast<int>(side)) + ", \"armies\": [" + army(army1) + ", " + army(army2) + "], \"our_mana\": " + std::to_string(hero ? hero->mana : 0) + ", \"our_mana_max\": " + std::to_string(hero ? hero->manaLimit() : 0) + "}");
+	}
 	fallback->battleStart(battleID, army1, army2, tile, hero1, hero2, side, replayAllowed);
+}
+
+void AlphaBattleAI::recordEvent(const std::string & json) const
+{
+	std::ofstream(std::filesystem::path(recordDir) / "events.jsonl", std::ios::app) << json << "\n";
+}
+
+std::string AlphaBattleAI::aliveArmies(const BattleID & battleID) const
+{
+	// Army units only: summoned units and clones vanish after the battle and are worth nothing
+	std::array<std::string, 2> sides = {"[", "["};
+	for(const auto * s : cb->getBattle(battleID)->battleGetAllStacks(true))
+	{
+		if(!s->alive() || s->isClone() || s->summoned || !s->unitSlot().validSlot())
+			continue;
+		auto & json = sides[static_cast<int>(s->unitSide())];
+		json += std::string(json.size() > 1 ? ", " : "") + "[" + std::to_string(s->creatureId().getNum()) + ", " + std::to_string(s->getCount()) + "]";
+	}
+	return "[" + sides[0] + "], " + sides[1] + "]]";
+}
+
+int AlphaBattleAI::ourMana(const BattleID & battleID) const
+{
+	const auto * hero = cb->getBattle(battleID)->battleGetMyHero();
+	return hero ? hero->mana : 0;
+}
+
+void AlphaBattleAI::battleNewRoundFirst(const BattleID & battleID)
+{
+	// Called before the new round's changes: the state here is the end of the previous round
+	if(!recordDir.empty())
+		recordEvent("{\"event\": \"round_end\", \"round\": " + std::to_string(cb->getBattle(battleID)->battleGetRound()) + ", \"alive\": " + aliveArmies(battleID) + ", \"our_mana\": " + std::to_string(ourMana(battleID)) + "}");
+	fallback->battleNewRoundFirst(battleID);
 }
 
 void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br, QueryID queryID)
 {
+	if(!recordDir.empty())
+	{
+		auto casualties = [&](BattleSide side)
+		{
+			std::string json = "[";
+			for(const auto & [creature, count] : br->casualties[side])
+				json += std::string(json.size() > 1 ? ", " : "") + "[" + std::to_string(creature.getNum()) + ", " + std::to_string(count) + "]";
+			return json + "]";
+		};
+		recordEvent("{\"event\": \"end\", \"round\": " + std::to_string(cb->getBattle(battleID)->battleGetRound()) + ", \"winner\": " + std::to_string(static_cast<int>(br->winner)) + ", \"result\": " + std::to_string(static_cast<int>(br->result)) + ", \"casualties\": [" + casualties(BattleSide::ATTACKER) + ", " + casualties(BattleSide::DEFENDER) + "], \"alive\": " + aliveArmies(battleID) + ", \"our_mana\": " + std::to_string(ourMana(battleID)) + "}");
+	}
 	std::string types;
 	for(int t = 0; t < N_ACTION_TYPES; ++t)
 		types += std::to_string(stats.types[t]) + (t + 1 < N_ACTION_TYPES ? "," : "");
@@ -243,6 +315,12 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 		if(action.type == static_cast<int>(ActionType::HERO_SPELL))
 			++stats.spellTargets[action.target2Hex >= 0 || action.target2Unit >= 0 ? 3 : action.targetHex >= 0 ? 2 : action.targetUnit >= 0 ? 1 : 0];
 
+		if(!recordDir.empty())
+		{
+			char name[32];
+			std::snprintf(name, sizeof(name), "decision_%05d", recordedDecisions++);
+			dumpDecision(recordDir, name, encoded.tensors, outputs, action);
+		}
 		const auto dumpDir = envString("ALPHA_BATTLE_DUMP_DIR");
 		if(!dumpDir.empty())
 		{
@@ -292,6 +370,8 @@ void AlphaBattleAI::execute(const BattleID & battleID, const CStack * stack, con
 			cb->battleMakeUnitAction(battleID, BattleAction::makeRetreat(side));
 			return;
 		case ActionType::SURRENDER:
+			if(!recordDir.empty())
+				recordEvent("{\"event\": \"surrender\", \"cost\": " + std::to_string(cb->getBattle(battleID)->battleGetSurrenderCost()) + "}");
 			cb->battleMakeUnitAction(battleID, BattleAction::makeSurrender(side));
 			return;
 		case ActionType::HERO_SPELL:

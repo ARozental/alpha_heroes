@@ -23,6 +23,8 @@ struct EncodedBattle;
 ///   ALPHA_BATTLE_SEED         random seed (default: random)
 ///   ALPHA_BATTLE_DUMP_DIR     write inputs/outputs/action of decisions there (battle_model/check_dumps.py)
 ///   ALPHA_BATTLE_DUMP_LIMIT   decisions to dump per process (default 50)
+///   ALPHA_BATTLE_RECORD_DIR   record the battle for training (battle_model/data.py): every decision plus
+///                             events.jsonl (start armies, units alive at each round end, end result)
 ///   ALPHA_BATTLE_TEST_FAULT   test hook, comma list: "surrender" / "spell" send one action per battle the
 ///                             server must reject, "decoder" corrupts one chosen action per battle
 ///
@@ -58,6 +60,13 @@ class AlphaBattleAI : public CBattleGameInterface
 	std::vector<std::string> faults; // ALPHA_BATTLE_TEST_FAULT
 	std::vector<std::string> faultsDoneThisBattle;
 
+	// Training record (ALPHA_BATTLE_RECORD_DIR)
+	std::string recordDir;
+	int recordedDecisions = 0;
+	void recordEvent(const std::string & json) const;
+	std::string aliveArmies(const BattleID & battleID) const;
+	int ourMana(const BattleID & battleID) const;
+
 	struct Stats
 	{
 		int decisions = 0;
@@ -89,6 +98,7 @@ public:
 	void battleStart(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2, int3 tile, const CGHeroInstance * hero1, const CGHeroInstance * hero2, BattleSide side, bool replayAllowed) override;
 	void battleEnd(const BattleID & battleID, const BattleResult * br, QueryID queryID) override;
 	void battleSpellCast(const BattleID & battleID, const BattleSpellCast * sc) override;
+	void battleNewRoundFirst(const BattleID & battleID) override;
 	void activeStack(const BattleID & battleID, const CStack * stack) override;
 	void yourTacticPhase(const BattleID & battleID, int distance) override;
 };

@@ -10,6 +10,8 @@
 #include "lib/bonuses/BonusSelector.h"
 #include "lib/callback/IGameInfoCallback.h"
 #include "lib/constants/NumericConstants.h"
+#include "lib/gameState/InfoAboutArmy.h"
+#include "lib/spells/Problem.h"
 #include "lib/mapObjects/CGHeroInstance.h"
 #include "lib/spells/CSpellHandler.h"
 #include "lib/spells/ISpellMechanics.h"
@@ -105,25 +107,41 @@ void encodeUnits(EncodedBattle & e, const CPlayerBattleCallback & battle, const 
 
 void encodeHeroes(InputTensors & t, const CPlayerBattleCallback & battle, BattleSide mySide)
 {
-	for(int side = 0; side < N_SIDES; ++side)
+	// Our hero: everything
+	const int my = static_cast<int>(mySide);
+	if(const auto * hero = battle.battleGetMyHero())
 	{
-		const auto * hero = battle.battleGetFightingHero(static_cast<BattleSide>(side));
-		if(!hero)
-			continue;
-		t.set(In::h_present, side, 1);
-		t.set(In::h_type, side, hero->getHeroTypeID().getNum());
-		t.set(In::h_attack, side, hero->getPrimSkillLevel(PrimarySkill::ATTACK));
-		t.set(In::h_defense, side, hero->getPrimSkillLevel(PrimarySkill::DEFENSE));
-		t.set(In::h_power, side, hero->getPrimSkillLevel(PrimarySkill::SPELL_POWER));
-		t.set(In::h_knowledge, side, hero->getPrimSkillLevel(PrimarySkill::KNOWLEDGE));
-		t.set(In::h_mana, side, hero->mana);
-		t.set(In::h_mana_max, side, hero->manaLimit());
+		t.set(In::h_present, my, 1);
+		t.set(In::h_type, my, hero->getHeroTypeID().getNum());
+		t.set(In::h_attack, my, hero->getPrimSkillLevel(PrimarySkill::ATTACK));
+		t.set(In::h_defense, my, hero->getPrimSkillLevel(PrimarySkill::DEFENSE));
+		t.set(In::h_power, my, hero->getPrimSkillLevel(PrimarySkill::SPELL_POWER));
+		t.set(In::h_knowledge, my, hero->getPrimSkillLevel(PrimarySkill::KNOWLEDGE));
+		t.set(In::h_mana, my, hero->mana);
+		t.set(In::h_mana_max, my, hero->manaLimit());
 		for(int skill = 0; skill < N_SECONDARY_SKILLS; ++skill)
-			t.set(In::h_skills, side, skill, hero->getSecSkillLevel(SecondarySkill(skill)));
-		// A player cannot see the enemy's spellbook
-		if(side == static_cast<int>(mySide) && hero->hasSpellbook())
+			t.set(In::h_skills, my, skill, hero->getSecSkillLevel(SecondarySkill(skill)));
+		if(hero->hasSpellbook())
 			for(int spell = 0; spell < N_SPELLS; ++spell)
-				t.set(In::h_spells, side, spell, hero->spellbookContainsSpell(SpellID(spell)));
+				t.set(In::h_spells, my, spell, hero->spellbookContainsSpell(SpellID(spell)));
+	}
+	// The enemy hero: only what a player sees in battle (no secondary skills, no spellbook)
+	const int enemy = 1 - my;
+	if(battle.battleHasHero(static_cast<BattleSide>(enemy)))
+	{
+		const auto info = battle.battleGetEnemyHero();
+		t.set(In::h_present, enemy, 1);
+		t.set(In::h_type, enemy, info.portraitSource.getNum());
+		if(info.details)
+		{
+			const auto & primary = info.details->primskills;
+			t.set(In::h_attack, enemy, primary.size() > 0 ? primary[0] : 0);
+			t.set(In::h_defense, enemy, primary.size() > 1 ? primary[1] : 0);
+			t.set(In::h_power, enemy, primary.size() > 2 ? primary[2] : 0);
+			t.set(In::h_knowledge, enemy, primary.size() > 3 ? primary[3] : 0);
+			t.set(In::h_mana, enemy, info.details->mana);
+			t.set(In::h_mana_max, enemy, info.details->manaLimit);
+		}
 	}
 }
 
@@ -228,7 +246,9 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 		e.spellTargetKind[s] = aims[0] == spells::AimType::LOCATION ? TargetKind::HEX : aims[0] == spells::AimType::CREATURE ? TargetKind::UNIT : TargetKind::NONE;
 		if(aims[0] == spells::AimType::NO_TARGET)
 		{
-			if(mechanics->canBeCastAt(spells::Target()))
+			// The server's own check for spells without a destination
+			spells::detail::ProblemImpl problem;
+			if(mechanics->canBeCast(problem))
 				t.set(In::m_spell, s, 1);
 			continue;
 		}

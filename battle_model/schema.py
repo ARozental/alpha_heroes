@@ -53,7 +53,7 @@ def _m(name, shape, doc):
 INPUTS = (
 	# Global
 	_i("g_our_side", (), "battle side the model plays: 0 attacker, 1 defender"),
-	_i("g_round", (), "battle round, VCMI numbering (0 = first round, -1 = tactics phase)"),
+	_i("g_round", (), "battle round, VCMI numbering: 1 = first round (0 = before it, e.g. the tactics phase)"),
 	_i("g_battlefield", (), "battlefield type id"),
 	_i("g_tactic_distance", (), "columns allowed in the tactics phase, 0 outside it"),
 	_i("g_active_unit", (), "index into the unit slots of the unit that acts now"),
@@ -98,7 +98,7 @@ INPUTS = (
 	_i("h_knowledge", (N_SIDES,), "primary skill: knowledge"),
 	_i("h_mana", (N_SIDES,), "mana points left"),
 	_i("h_mana_max", (N_SIDES,), "mana limit"),
-	_i("h_skills", (N_SIDES, N_SECONDARY_SKILLS), "secondary skill levels 0..3"),
+	_i("h_skills", (N_SIDES, N_SECONDARY_SKILLS), "secondary skill levels 0..3; all 0 for the enemy hero (hidden from a player)"),
 	_i("h_spells", (N_SIDES, S), "1 if the spell is in the spellbook; all 0 for the enemy hero (hidden from a player)"),
 	# Hexes, BattleHex index 0..186
 	_i("x_access", (H,), "EAccessibility"),
