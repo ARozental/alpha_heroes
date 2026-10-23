@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from battle_model import features as F
+from battle_model import rules
 from battle_model import vocab
 from battle_model.model import BattleModel, best_of
 from battle_model.schema import finalize_masks, random_inputs
@@ -146,3 +147,52 @@ def test_unit_summaries_cover_both_sides():
 	assert best_hit[0] == 1.0  # our two Angels wipe out the Imps
 	assert worst_hit[1] == 1.0  # the Imps can lose everything to them
 	assert 0 < worst_hit[0] < 1  # the Devils can hurt the Angels
+
+
+def two_hex_battle(units):
+	"""battle() with the Cavaliers (slot 0) as the two-hex unit they are: front hex 88, second hex 87 (row 5)."""
+	x = battle(units)
+	x["u_rear_hex"][0, 0] = 87
+	return x
+
+
+def facts_of(x):
+	finalize_masks(x, 0)
+	t = {k: torch.from_numpy(v) for k, v in x.items()}
+	b = F.read_battle(t, BattleModel().tables())
+	return t, b, F.distance_maps(b)[0]
+
+
+def test_a_two_hex_unit_stands_only_where_its_second_hex_is_free():
+	"""An obstacle on 91: the Cavaliers can stand neither on it nor on 92 (their second hex would be on it)."""
+	x = two_hex_battle([("Cavalier", 1, 0, 88, 10, 10)])
+	x["x_access"][0, 91] = 2  # OBSTACLE
+	_, _, reach = facts_of(x)
+	assert reach[0, 0, 91] == rules.INFINITE_DISTANCE and reach[0, 0, 92] == rules.INFINITE_DISTANCE
+	assert reach[0, 0, 90] == 2 and reach[0, 0, 93] < rules.INFINITE_DISTANCE  # around the obstacle
+
+
+def test_a_two_hex_unit_attacks_and_is_attacked_through_either_hex():
+	"""An Imp on 86 is next to the Cavaliers' second hex (87) only: each can attack the other without moving."""
+	x = two_hex_battle([("Cavalier", 1, 0, 88, 10, 10), ("Imp", 1, 1, 86, 3, 3)])
+	x["u_speed"][0, :2] = 0
+	_, b, reach = facts_of(x)
+	assert 88 in F.attack_positions(torch.tensor(86), torch.tensor(True), torch.tensor(0)).tolist()
+	can = F.can_attack_at(b, reach)
+	assert can[0, 0, 86]  # the Cavaliers reach the Imp's hex from where they stand
+	assert F.can_attack_at_units(b, can)[0, 1, 0]  # the Imp reaches the Cavaliers, through 87
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_distance_maps_match_the_engines_search(seed):
+	"""The acting unit's walking distances equal rules.reachability's (the engine's breadth-first search, which StupidAI
+	matches exactly), two-hex units included, within REACH_STEPS; no moat or quicksand here."""
+	x = random_inputs(batch=8, seed=seed)
+	x["x_obstacle_type"][:] = -1
+	t = {k: torch.from_numpy(v) for k, v in x.items()}
+	b = F.read_battle(t, BattleModel().tables())
+	walkers = ~b.me["flying"][:, 0]
+	ours = b.mine(F.distance_maps(b)[0])
+	engine, _ = rules.reachability(t, b.me, b.me["flying"][:, 0])
+	engine = torch.where(engine <= F.REACH_STEPS, engine, rules.INFINITE_DISTANCE)
+	assert torch.equal(ours[walkers], engine[walkers])

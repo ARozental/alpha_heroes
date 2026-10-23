@@ -293,8 +293,9 @@ def damage_range(attacker, target, shooting, tables, dtype=torch.float64):
 	Not computed (0 here): hero skills and artifacts (Offense, Archery, Armorer: hidden for the enemy hero), Slayer,
 	hate of traits, back attacks, HotA's Revenge, walls (sieges), arrow towers and war machines.
 
-	dtype: float64 matches the engine exactly (StupidAI); float32 (the learned model, on a GPU without float64) can be
-	off by one where the engine's result is a whole number.
+	dtype: float64 matches the engine exactly (StupidAI); float32 (the learned model, on a GPU without float64) is off by
+	one hit point in ~1.7% of pairs, where the engine's result is a whole number, but the same on the CPU and the Apple
+	GPU (0 differences in 1.6M pairs, 2026-10-23), so playing and training see the same features.
 	"""
 	f64 = dtype
 	# Base damage per creature, Bless and Curse (getBaseDamageBlessCurse), times the creatures

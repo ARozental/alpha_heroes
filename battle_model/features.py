@@ -248,44 +248,79 @@ def stack_features(b):
 
 # ---- Reach ----
 
-def _open(b, unit_hexes):
-	"""[B, U, H]: the hexes each unit could stand on: free, or its own."""
-	free = (b.x["x_access"] == rules.ACCESSIBLE)[:, None, :]
-	hexes = torch.arange(N_HEXES, device=free.device)
-	return free | (unit_hexes[..., :, None] == hexes).any(dim=-2)
+# Positions are a unit's front hex (u_hex, the move mask's hexes); a two-hex unit also covers rules.rear_hex of it.
+
+def per_unit(table, hexes, fill=False):
+	"""rules.lookup per unit: table [B, U, H] at hexes [B, U, ...]."""
+	return rules.lookup(table.flatten(0, 1), hexes.flatten(0, 1), fill).view(hexes.shape)
+
+
+def standable(b, footprint, wide, side):
+	"""[B, U, H]: the positions each unit could stand on (AccessibilityInfo::accessible): its hex free or its own, and
+	for a two-hex unit its second hex too. footprint [B, U, 2]: the unit's hexes now; wide, side [B, U]."""
+	hexes = torch.arange(N_HEXES, device=footprint.device)
+	free = (b.x["x_access"] == rules.ACCESSIBLE)[:, None, :] | (footprint[..., :, None] == hexes).any(dim=-2)
+	second = rules.rear_hex(hexes, side[..., None]).expand_as(free)
+	return free & (~wide[..., None] | per_unit(free, second))
+
+
+def attack_positions(target_hexes, wide, side):
+	"""[..., 12]: the positions a unit can melee a unit on target_hexes from (CStack::meleeAttackHexes: a target hex
+	around its footprint): next to it, and for a two-hex unit also where its second hex is next to it. -1 = none.
+	wide, side broadcast against target_hexes."""
+	around = rules.neighbours(target_hexes)  # [..., 6]
+	shift = torch.where(side == rules.ATTACKER, 1, -1)[..., None]  # the front hex is right of the second for attackers
+	shifted = torch.where((around >= 0) & wide[..., None], around + shift, -1)
+	shifted = torch.where((shifted >= 0) & (shifted < N_HEXES), shifted, -1)
+	return torch.cat([around, shifted], dim=-1)
+
+
+def covered(per_hex, wide, side):
+	"""per_hex [..., H] over a unit's footprint: for each position, true if true at its hex or, for a two-hex unit (wide,
+	side [...]), at its second hex: e.g. it can be attacked there through either hex."""
+	hexes = torch.arange(N_HEXES, device=per_hex.device)
+	second = rules.rear_hex(hexes, side[..., None]).expand_as(per_hex)
+	return per_hex | (wide[..., None] & rules.lookup(per_hex.flatten(0, -2), second.flatten(0, -2)).view(per_hex.shape))
 
 
 def distance_maps(b):
-	"""(reach, to_enemy), [B, U, H] each; INFINITE_DISTANCE past REACH_STEPS or where it cannot go:
-	reach     per unit, the steps from where it stands to every hex: walking around obstacles and units (a one-hex
-	          footprint, an approximation for two-hex units), or flying straight
-	to_enemy  per unit, the acting unit's steps from every hex to a hex next to that unit (how far it would be from
-	          attacking it), on the acting unit's own terms (its open hexes, whether it flies)
+	"""(reach, to_enemy), [B, U, H] each, over positions; INFINITE_DISTANCE past REACH_STEPS or where it cannot go:
+	reach     per unit, the steps from where it stands to every position it could stand on: walking around obstacles and
+	          units, or flying straight (two-hex units need both hexes free: rules.reachability, makeBFS)
+	to_enemy  per unit, the acting unit's steps from every position to one it could attack that unit from (how far it is
+	          from attacking it), on its own terms (its footprint, whether it flies)
 	Both searches run as one (walk_distances over 2U rows)."""
 	hexes = torch.arange(N_HEXES, device=b.health.device)
 	own = torch.stack([b.units["hex"], b.units["rear"]], dim=-1)  # [B, U, 2]
-	open_ = _open(b, own)
+	wide, side = b.units["rear"] >= 0, b.units["side"]
+	stand = standable(b, own, wide, side)
 	start = (b.units["hex"][..., None] == hexes) & (b.units["hex"][..., None] >= 0)
-	my_open = _open(b, torch.stack([b.me["hex"][:, 0], b.me["rear"][:, 0]], dim=-1)[:, None, :]).expand_as(open_)
-	beside = rules.neighbours(own).flatten(2)  # [B, U, 12]: the hexes next to each unit
-	targets = (beside[..., :, None] == hexes).any(dim=-2) & my_open
-	walk = rules.walk_distances(torch.cat([open_, my_open], dim=1), torch.cat([start, targets], dim=1), REACH_STEPS)
-	walk_reach, walk_to = walk.split(open_.shape[1], dim=1)
-	reach = torch.where(b.units["flying"][..., None], rules.fly_distances(open_, b.units["hex"][..., None]), walk_reach)
-	fly_to = rules.fly_distances(my_open, torch.where(rules.lookup(my_open[:, 0], beside), beside, -1))
+	my_own = torch.stack([b.me["hex"][:, 0], b.me["rear"][:, 0]], dim=-1)[:, None, :].expand_as(own)
+	my_wide, my_side = (b.me["rear"] >= 0).expand_as(wide), b.me["side"].expand_as(side)
+	my_stand = standable(b, my_own, my_wide, my_side)
+	positions = attack_positions(own, my_wide[..., None], my_side[..., None]).flatten(2)  # [B, U, 24]: to attack each unit from
+	positions = torch.where(per_unit(my_stand, positions), positions, -1)
+	targets = (positions[..., :, None] == hexes).any(dim=-2)
+	walk = rules.walk_distances(torch.cat([stand, my_stand], dim=1), torch.cat([start, targets], dim=1), REACH_STEPS)
+	walk_reach, walk_to = walk.split(stand.shape[1], dim=1)
+	reach = torch.where(b.units["flying"][..., None], rules.fly_distances(stand, b.units["hex"][..., None]), walk_reach)
+	fly_to = rules.fly_distances(my_stand, positions)
 	return reach, torch.where(b.me["flying"][..., None], fly_to, walk_to)
 
 
 def melee_reach(b, reach):
-	"""[B, U, H]: whether each unit could get next to each hex this coming turn, to attack a unit standing there."""
-	around = rules.neighbours(torch.arange(N_HEXES, device=reach.device))  # [H, 6]
-	steps = rules.smallest(torch.where(around >= 0, reach[..., around.clamp(min=0)], rules.INFINITE_DISTANCE))
-	return steps <= b.units["speed"][..., None]
+	"""[B, U, H]: whether each unit could attack a unit on each hex in melee this coming turn: whether it can get to a
+	position it attacks that hex from (attack_positions)."""
+	hexes = torch.arange(N_HEXES, device=reach.device)
+	wide, side = (b.units["rear"] >= 0)[..., None], b.units["side"][..., None]  # [B, U, 1]
+	positions = attack_positions(hexes.expand(*wide.shape[:2], -1), wide, side)  # [B, U, H, 12]
+	steps = per_unit(reach, positions.flatten(2), fill=rules.INFINITE_DISTANCE).view(positions.shape)
+	return rules.smallest(steps) <= b.units["speed"][..., None]
 
 
 def can_attack_at(b, reach):
-	"""[B, U, H]: whether each unit could attack a unit standing on each hex this coming turn: a shooter with
-	ammunition from anywhere, any unit if it can get next to the hex."""
+	"""[B, U, H]: whether each unit could attack a unit on each hex this coming turn: a shooter with ammunition from
+	anywhere, any unit in melee if it can get to attack it (melee_reach)."""
 	return b.units["can_shoot"][..., None] | melee_reach(b, reach)
 
 
@@ -366,10 +401,12 @@ def threat_maps(b, reach, to_enemy):
 	progress            steps it gains there toward the nearest enemy, of its speed: -1..1
 	Also returned: can_attack [B, U, H] (can_attack_at, every unit: unit_summaries, action_features).
 	"""
-	reaches = melee_reach(b, reach)  # [B, U, H], every unit
+	reaches = melee_reach(b, reach)  # [B, U, H], every unit: can attack a unit on that hex
 	can_attack = reaches | b.units["can_shoot"][..., None]
-	melee = reaches & b.enemy[..., None]
-	can = can_attack & b.enemy[..., None]
+	# The acting unit standing on a position can be attacked through either of its hexes
+	me_wide, me_side = (b.me["rear"] >= 0).expand_as(b.enemy), b.me["side"].expand_as(b.enemy)
+	melee = covered(reaches, me_wide, me_side) & b.enemy[..., None]
+	can = covered(can_attack, me_wide, me_side) & b.enemy[..., None]
 	value = b.value[..., None]
 	enemy_value = b.enemy_value[:, None].clamp(min=EPS)
 	threat_value = (value * can).sum(dim=1) / enemy_value
@@ -382,6 +419,7 @@ def threat_maps(b, reach, to_enemy):
 	on = (b.units["hex"][..., None] == hexes) | (b.units["rear"][..., None] == hexes)  # [B, U, H]
 	around = rules.neighbours(hexes)
 	next_to = rules.lookup(on.flatten(0, 1), around.expand(on.shape[0] * on.shape[1], -1, -1)).any(dim=-1).view(on.shape)
+	next_to = covered(next_to, me_wide, me_side)  # next to the acting unit's footprint on that position
 	blocked = (value * (next_to & b.enemy[..., None] & shooting[..., None])).sum(dim=1) / enemy_value
 	next_to_enemy = (next_to & b.enemy[..., None]).any(dim=1).float()
 
@@ -423,9 +461,9 @@ def unit_summaries(b, can_attack):
 
 
 def can_attack_at_units(b, can_attack):
-	"""[B, attacker, target]: whether each unit can attack each unit where it stands (can_attack_at of its hex)."""
-	hexes = b.units["hex"].clamp(min=0)[:, None, :].expand(-1, can_attack.shape[1], -1)
-	return can_attack.gather(2, hexes) & (b.units["hex"][:, None, :] >= 0)
+	"""[B, attacker, target]: whether each unit can attack each unit where it stands, through either of its hexes."""
+	at = lambda hexes: per_unit(can_attack, hexes[:, None, :].expand(-1, can_attack.shape[1], -1))
+	return at(b.units["hex"]) | at(b.units["rear"])
 
 
 # ---- The battle ----
@@ -475,7 +513,9 @@ def action_features(b, melee, shot, maps, can_attack, battle):
 	here = lambda name: column(name).gather(1, b.me["hex"].clamp(min=0))  # [B, 1]: where it stands
 	change = lambda name: column(name) - here(name)  # [B, H], -1..1
 	value = b.value[..., None]
-	losses = value * melee[..., ATTACK_FEATURES.index("kills"), None] * can_attack  # [B, U, H]: the threat value the target loses
+	me_wide, me_side = (b.me["rear"] >= 0).expand_as(b.enemy), b.me["side"].expand_as(b.enemy)
+	reaches_me = covered(can_attack, me_wide, me_side)  # [B, U, H]: each unit could attack the acting unit there
+	losses = value * melee[..., ATTACK_FEATURES.index("kills"), None] * reaches_me  # the threat value the target loses
 	threat_after = (column("threat_value")[:, None, :] - losses / b.enemy_value[:, None, None].clamp(min=EPS)).clamp(0, 1)
 	shooter = b.me["can_shoot"].float()  # [B, 1]
 	hexes = torch.stack([
