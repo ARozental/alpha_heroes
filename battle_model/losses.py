@@ -85,7 +85,6 @@ class PPOConfig:
 	value_weight: float = 0.5  # step 7: the value loss shares the network with the policy, standard PPO weight
 	entropy_weight: float = 0.01  # step 7: small exploration bonus
 	value_head_weights: tuple = (1.0,) * (N_VALUE_HORIZONS + 1)  # step 4: share of each value head (V0, V1, V2, V) in the value loss
-	self_imitation_weight: float = 0.0  # self_imitation_loss; 0 = off (pure PPO)
 
 
 def value_targets(decision_rounds, round_scores, final_reward, horizons=N_VALUE_HORIZONS, reward_config=RewardConfig()):
@@ -169,19 +168,6 @@ def normalize_advantages(advantages, groups, battles, config=AdvantageConfig()):
 		else:
 			out[member] = a / (a.pow(2).mean().sqrt() + 1e-8)
 	return out
-
-
-def self_imitation_loss(out, action, line_reward, config=PPOConfig()):
-	"""Self-imitation (Oh et al. 2018, "Self-Imitation Learning"): make the best battle found so far more likely.
-
-	out: model outputs for that battle's decisions; action: its actions; line_reward: its final reward, -1..1.
-	Each decision is weighted by how much the battle beat what V now expects from that state, (R - V)+:
-	once the model plays that well anyway, the term vanishes. Battles are deterministic given our actions
-	(fixed VCMI seed), so replaying a won battle's actions wins it again. Returns (loss, parts).
-	"""
-	weight = (line_reward - out["value"][:, -1].detach()).clamp(min=0)
-	loss = -(weight * log_prob(out, action)).mean() * config.self_imitation_weight
-	return loss, {"self_imitation": loss.detach(), "self_imitation_weight": weight.mean()}
 
 
 def ppo_loss(out, action, old_log_prob, advantage, value_labels, config=PPOConfig()):

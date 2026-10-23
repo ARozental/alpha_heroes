@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 
 from battle_model.losses import AdvantageConfig, battle_returns_and_advantages
@@ -82,24 +81,3 @@ def test_a_single_battle_is_scaled_not_centred():
 	scaled = normalize_advantages(won, torch.zeros(10), torch.zeros(10), AdvantageConfig(normalize_min_decisions=8))
 	assert (scaled > 0).all() and abs(float(scaled.pow(2).mean()) - 1) < 1e-5
 
-
-def test_self_imitation_pulls_only_toward_lines_better_than_expected():
-	from battle_model.losses import PPOConfig, self_imitation_loss
-	from battle_model.model import BattleModel
-	from battle_model.schema import random_inputs
-	from battle_model.distributions import log_prob, sample, stack_actions
-	torch.manual_seed(0)
-	model = BattleModel(dim=32, layers=1)
-	inputs = {k: torch.as_tensor(v) for k, v in random_inputs(4).items()}
-	out = model(inputs)
-	action = stack_actions([sample(out, b, np.random.default_rng(b)) for b in range(4)])
-	config = PPOConfig(self_imitation_weight=1.0)
-	# V starts at 0: a line worth -0.5 is worse than expected, so it is not imitated
-	assert float(self_imitation_loss(out, action, -0.5, config)[0]) == 0.0
-	loss, _ = self_imitation_loss(out, action, 0.8, config)
-	loss.backward()
-	with torch.no_grad():
-		for p in model.parameters():
-			if p.grad is not None:
-				p -= 0.05 * p.grad
-	assert float(log_prob(model(inputs), action).sum()) > float(log_prob(out, action).sum())

@@ -77,7 +77,7 @@ The science (Python, the part to read and change):
 | `scenarios/*.json` | Fixed battles to train on, e.g. `castle_vs_inferno.json`: both heroes, armies, skills, spells, battlefield. |
 | `play.py` | Plays recorded battles in VCMI: a scenario becomes a battle-only map; our model on one side, another battle AI (BattleAI) on the other. |
 | `data.py` | Battle records -> rewards, value labels and advantages -> per-decision training examples -> DataLoader. |
-| `train.py` | The training loop: each epoch plays `games_per_side` battles per side, trains with PPO (optionally plus self-imitation of each side's best battle and Go-Explore restarts from it) and logs win rates, rewards (-1..1) and the warning signs of forgetting (best-line log-prob, Adam signal ratio, weight change, KL) to `runtime/train/<run>/progress.csv` and TensorBoard. |
+| `train.py` | The training loop: each epoch plays `games_per_side` battles per side, trains with PPO and logs win rates, rewards (-1..1) and the warning signs of forgetting (Adam signal ratio, weight change, KL, clip fraction) to `runtime/train/<run>/progress.csv` and TensorBoard. Nothing in it may depend on fixed seeds: the same training must work on real, ever-different battles. |
 | `evaluate.py` | Win rates of a checkpoint, greedy (temperature 0: one deterministic battle per side) or sampled. |
 
 The contract (shared with C++; change deliberately, then run codegen and bump `SCHEMA_VERSION`):
@@ -115,17 +115,16 @@ Training on a scenario (records, ~16 KB a decision, are deleted after each epoch
 of the scenario's map). Any config field can be set with `--set`, including `ppo.*`, `advantage.*`, `reward.*`:
 
 ```sh
-# What solves castle_vs_inferno (both sides win from scratch within ~100 epochs, ~13 s an epoch):
-.venv/bin/python -m battle_model.train --run NAME --set games_per_side=8 explore_from_best=3 ppo.self_imitation_weight=1.0
-# Plain PPO with 8 battles per side also gets there, in ~500-800 epochs: --set games_per_side=8
+.venv/bin/python -m battle_model.train --run NAME            # 8 battles per side per epoch, fixed seeds
+.venv/bin/python -m battle_model.train --run NAME --set random_seeds=true   # a fresh VCMI seed for every battle
 .venv/bin/python -m battle_model.evaluate runtime/train/NAME/checkpoint_latest.pt --temperature 0   # greedy
 .venv/bin/python -m battle_model.evaluate runtime/train/NAME/checkpoint_latest.pt --games 16 --map Maps/alpha/castle_vs_inferno-NAME
 ```
 
-Battles are deterministic given VCMI's seed and our actions, so `explore_from_best` (Go-Explore) restores a
-state of the best battle so far by replaying its opening (`ALPHA_BATTLE_PREFIX`) and explores from there.
-`random_seeds=true` gives every battle its own seed (a strategy instead of one battle). To try C++ changes
-while runs use `AlphaBattleAI`, build `--target AlphaBattleAIDev` and pass `--set ai=AlphaBattleAIDev`.
+Battles are deterministic given VCMI's seed and our actions, so replaying a battle's first actions
+(`play.Game.prefix`, `ALPHA_BATTLE_PREFIX`) restores any of its states: a primitive for search, not used by
+training. To try C++ changes while runs use `AlphaBattleAI`, build `--target AlphaBattleAIDev` and pass
+`--set ai=AlphaBattleAIDev`.
 
 VCMI changes this relies on: `VCMI_BATTLE_AI_<COLOR>` chooses a player's battle AI, battle-only games end
 only after their battle's result is decided, the `--testmap` start-up no longer races the network thread
