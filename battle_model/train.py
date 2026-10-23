@@ -218,7 +218,7 @@ def train(config, resume=False):
 	best_path = out / "best_lines.pt"
 	best = torch.load(best_path) if resume and best_path.exists() else [None, None]
 
-	play.build_map(config.scenario)
+	battle_map = play.build_map(config.scenario, variant=config.run)
 	reward_config, advantage_config, ppo_config = config.reward, config.advantage, config.ppo
 	progress = out / "progress.csv"
 	if not progress.exists() or not resume:
@@ -241,7 +241,7 @@ def train(config, resume=False):
 				prefix = ()
 				if g < config.explore_from_best and best[side] is not None and len(best[side].get("actions", ())) > 1:
 					prefix = tuple(best[side]["actions"][: openings.randrange(1, len(best[side]["actions"]))])
-				games.append(play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=config.game_seeds[side], sampler_seed=(2 * epoch + side) * config.games_per_side + g, ai=config.ai, prefix=prefix))
+				games.append(play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=config.game_seeds[side], sampler_seed=(2 * epoch + side) * config.games_per_side + g, ai=config.ai, prefix=prefix, map=battle_map))
 				restarted.append(bool(prefix))
 		records = out / "records" / f"epoch_{epoch}"
 		for attempt in range(1, config.attempts + 1):

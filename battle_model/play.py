@@ -28,6 +28,9 @@ class Game:
 	sampler_seed: int = 0  # our model's sampling
 	temperature: float = 1.0
 	ai: str = "AlphaBattleAI"  # our side's battle AI library; AlphaBattleAIDev to try C++ changes during training runs
+	# Map to play, as returned by build_map; empty = the scenario's shared map (map_name). Training runs use
+	# their own copy, so rebuilding a map (e.g. after a map tool fix) never changes a running experiment.
+	map: str = ""
 	# Actions (dicts as in a record's action.json) our side plays before the model chooses: battles are
 	# deterministic given game_seed and our actions, so this restores a state of a recorded battle
 	prefix: tuple = ()
@@ -37,19 +40,23 @@ def load_scenario(path):
 	return json.loads(Path(path).read_text())
 
 
-def map_name(scenario_path):
-	return "Maps/alpha/" + Path(scenario_path).stem
+def map_name(scenario_path, variant=""):
+	return "Maps/alpha/" + Path(scenario_path).stem + (f"-{variant}" if variant else "")
 
 
-def build_map(scenario_path):
-	"""Write the scenario's battle-only map into the VCMI user data folder (overwrites)."""
-	out = USER_DIR / (map_name(scenario_path) + ".vmap")
+def build_map(scenario_path, variant=""):
+	"""Write the scenario's battle-only map into the VCMI user data folder (overwrites); returns its map name.
+
+	variant: a suffix for a private copy (e.g. the training run's name).
+	"""
+	name = map_name(scenario_path, variant)
+	out = USER_DIR / (name + ".vmap")
 	out.parent.mkdir(parents=True, exist_ok=True)
 	env = {**os.environ, "VCMI_USER_DIR": str(USER_DIR)}
 	result = subprocess.run([str(ROOT / "build" / "bin" / "alpha_make_battle_map"), str(scenario_path), str(out)], env=env, capture_output=True, text=True)
 	if result.returncode != 0 or not out.exists():
 		raise RuntimeError(f"building the map failed:\n{result.stdout[-2000:]}\n{result.stderr[-2000:]}")
-	return out
+	return name
 
 
 def start(game, model_path, record_dir, max_seconds=120, max_mb=200):
@@ -69,7 +76,7 @@ def start(game, model_path, record_dir, max_seconds=120, max_mb=200):
 		prefix.parent.mkdir(parents=True, exist_ok=True)
 		prefix.write_text("".join(json.dumps(action) + "\n" for action in game.prefix))
 		env["ALPHA_BATTLE_PREFIX"] = str(prefix)
-	command = [str(ROOT / "scripts" / "headless.sh"), map_name(game.scenario), str(max_seconds), str(max_mb), "20"]
+	command = [str(ROOT / "scripts" / "headless.sh"), game.map or map_name(game.scenario), str(max_seconds), str(max_mb), "20"]
 	env["ALPHA_BATTLE_MODEL"] = str(Path(model_path).resolve())
 	env["ALPHA_BATTLE_RECORD_DIR"] = str(Path(record_dir).resolve())
 	return subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)

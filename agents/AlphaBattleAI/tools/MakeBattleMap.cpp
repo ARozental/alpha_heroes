@@ -22,7 +22,6 @@
 #include "lib/mapping/CMapService.h"
 #include "lib/modding/IdentifierStorage.h"
 #include "lib/CRandomGenerator.h"
-#include "lib/CSkillHandler.h"
 #include "lib/mapping/MapFormat.h"
 
 #include <fstream>
@@ -56,6 +55,14 @@ void addHero(CMap & map, EditorCallback & cb, const JsonNode & side, PlayerColor
 	for(const auto & stack : side["army"].Vector())
 		hero->setCreature(SlotID(slot++), CreatureID(lookup("creature", stack.Vector()[0].String())), stack.Vector()[1].Integer());
 
+	// A new hero gets its hero type's starting spells, spellbook and secondary skills when the game starts
+	// (CGHeroInstance::initHero) unless the map marks them as custom, as the map editor does. The scenario
+	// lists all of them, so mark all three custom: without this Calid also knew Haste, and both heroes had
+	// their starting skills (Caitlin Wisdom + Intelligence, Calid Wisdom + Learning).
+	hero->addSpellToSpellbook(SpellID::PRESET); // exactly the listed spells
+	hero->addSpellToSpellbook(SpellID::SPELLBOOK_PRESET); // a spellbook only if the scenario says so
+	hero->secSkills.clear(); // drops the (NONE, -1) "starting skills" marker: exactly the listed skills
+
 	if(side["spellbook"].Bool() && !hero->getArt(ArtifactPosition::SPELLBOOK))
 		hero->putArtifact(ArtifactPosition::SPELLBOOK, map.createArtifact(ArtifactID::SPELLBOOK));
 	else if(!side["spellbook"].Bool() && hero->getArt(ArtifactPosition::SPELLBOOK))
@@ -70,8 +77,6 @@ void addHero(CMap & map, EditorCallback & cb, const JsonNode & side, PlayerColor
 		hero->putArtifact(ArtifactPosition::MACH3, map.createArtifact(ArtifactID::FIRST_AID_TENT));
 	}
 
-	for(const auto & skill : LIBRARY->skillh->objects) // no secondary skills unless listed
-		hero->setSecSkillLevel(SecondarySkill(skill->getId()), MasteryLevel::NONE, ChangeValueMode::ABSOLUTE);
 	for(const auto & skill : side["secondary_skills"].Vector())
 		hero->setSecSkillLevel(SecondarySkill(lookup("skill", skill.Vector()[0].String())), static_cast<MasteryLevel::Type>(skill.Vector()[1].Integer()), ChangeValueMode::ABSOLUTE);
 
