@@ -29,7 +29,7 @@ import torch
 
 from . import vocab
 from .distributions import ACTION_FIELDS, log_prob, stack_actions
-from .losses import AdvantageConfig, battle_returns_and_advantages, normalize_advantages, value_targets
+from .losses import AdvantageConfig, battle_returns_and_advantages, normalize_advantages, policy_advantages, value_targets
 from .reward import Outcome, RewardConfig, own_kept_value, round_score, terminal_reward, to_scale
 from .schema import INPUTS, OUTPUTS
 
@@ -237,15 +237,16 @@ def battle_examples(record, reward_config=RewardConfig(), advantage_config=Advan
 	values = outputs["value"][:, -1]  # V, the final-reward head (-1..1)
 	rewards = torch.zeros(len(decisions))
 	rewards[-1] = to_scale(summary.reward, reward_config)
-	_, advantages = battle_returns_and_advantages(values, rewards, advantage_config)
+	_, final_advantages = battle_returns_and_advantages(values, rewards, advantage_config)
+	rounds = [int(d[0]["g_round"]) for d in decisions]
+	labels = value_targets(rounds, summary.round_scores, summary.reward, reward_config=reward_config)
+	advantages = policy_advantages(final_advantages, labels, outputs["value"], advantage_config)
 	summary.advantage_std = float(advantages.std()) if len(advantages) > 1 else 0.0
 	summary.value_error = float((values - rewards[-1]).abs().mean())
 	summary.values = values.tolist()
 	own = army_values(record.tensors, summary.our_side) / max(summary.own_start_value, 1.0)
 	enemy = army_values(record.tensors, 1 - summary.our_side) / max(summary.enemy_start_value, 1.0)
 	summary.credit = list(zip(-np.diff(own), -np.diff(enemy), np.diff(values.numpy()).tolist()))
-	rounds = [int(d[0]["g_round"]) for d in decisions]
-	labels = value_targets(rounds, summary.round_scores, summary.reward, reward_config=reward_config)
 
 	examples = [
 		{"inputs": d[0], "action": d[2], "old_log_prob": old_log_prob[i], "advantage": advantages[i], "value_labels": labels[i], "forced": bool(d[2].get("forced", False))}

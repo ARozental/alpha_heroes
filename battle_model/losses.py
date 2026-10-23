@@ -39,7 +39,9 @@ From reward to loss, for one battle seen by one side:
    Each head outputs tanh (-1..1) and its loss is the cross-entropy against its -1..1 label (both
    mapped to 0..1): same minimum as the squared error, but the gradient does not vanish when the
    output saturates on a wrong answer.
-   Only V, the final-reward head, is used for the advantages below.
+   Only V, the final-reward head, is used for the advantages below, and V stands alone (not chained to
+   V0..V2, model.py): V0..V2 are auxiliary predictions that shape the shared network but do not steer the
+   policy. AdvantageConfig.policy_heads can switch a round head on as an extra advantage term (step 5b).
 
 5. Advantage. A_t is how much better than expected the outcome of decision t was. GAE(lambda) mixes
 	   one step:    delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)   how much the prediction rose after the action
@@ -77,6 +79,10 @@ class AdvantageConfig:
 	gamma: float = 1.0  # discount per decision (step 3); 1 = the battle's end counts fully for every decision
 	lam: float = 0.95  # GAE lambda (step 5); 1 = judge each decision by the final outcome only
 	normalize_min_decisions: int = 8  # step 5: rescale a group's advantages only if it has at least this many decisions
+	# Which value heads (V0, V1, V2, V) the policy maximizes (policy_advantages). Default: only V, the final reward;
+	# V0..V2 are then auxiliary predictions that shape the shared network but never steer the policy (playing to
+	# maximize the score at the end of this round would e.g. reward keeping units alive even when that is pointless).
+	policy_heads: tuple = (0, 0, 0, 1)
 
 
 @dataclass(frozen=True)
@@ -137,6 +143,24 @@ def value_loss(out, targets, config=PPOConfig()):
 	per_head = F.binary_cross_entropy_with_logits(2 * out["value_logit"], probabilities, reduction="none").mean(dim=0)
 	weights = torch.tensor(config.value_head_weights, dtype=per_head.dtype, device=per_head.device)
 	return (per_head * weights).sum() / weights.sum(), per_head.detach()
+
+
+def policy_advantages(final_advantages, value_labels, values, config=AdvantageConfig()):
+	"""Step 5b: the advantage the policy follows, from the value heads that config.policy_heads switches on.
+
+	final_advantages: [T] GAE advantages with V and the final reward (battle_returns_and_advantages)
+	value_labels:     [T, heads] value_targets; values: [T, heads] the heads' outputs, both -1..1
+	V counts with its GAE advantage; a round head k with its label (the reward formula at the end of round
+	r_t + k) minus its own prediction: how much better than it expected that round went.
+	"""
+	heads = config.policy_heads
+	if len(heads) != values.shape[1]:
+		raise ValueError(f"policy_heads needs one flag per value head ({values.shape[1]}), got {heads}")
+	total = final_advantages * float(heads[-1])
+	for k, on in enumerate(heads[:-1]):
+		if on:
+			total = total + (value_labels[:, k] - values[:, k])
+	return total
 
 
 def normalize_advantages(advantages, groups, battles, config=AdvantageConfig()):

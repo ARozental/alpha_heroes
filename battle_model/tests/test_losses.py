@@ -81,3 +81,15 @@ def test_a_single_battle_is_scaled_not_centred():
 	scaled = normalize_advantages(won, torch.zeros(10), torch.zeros(10), AdvantageConfig(normalize_min_decisions=8))
 	assert (scaled > 0).all() and abs(float(scaled.pow(2).mean()) - 1) < 1e-5
 
+
+
+def test_policy_follows_only_the_heads_switched_on():
+	from battle_model.losses import policy_advantages
+	final = torch.tensor([0.5, -0.2])
+	labels = torch.tensor([[0.3, 0.1, 0.4, 0.6], [0.2, 0.0, -0.1, 0.6]])
+	values = torch.tensor([[0.1, 0.1, 0.1, 0.2], [0.4, 0.0, 0.3, 0.1]])
+	assert torch.equal(policy_advantages(final, labels, values), final)  # default: only V
+	both = policy_advantages(final, labels, values, AdvantageConfig(policy_heads=(0, 0, 1, 1)))
+	assert torch.allclose(both, final + (labels[:, 2] - values[:, 2]))
+	only_v2 = policy_advantages(final, labels, values, AdvantageConfig(policy_heads=(0, 0, 1, 0)))
+	assert torch.allclose(only_v2, labels[:, 2] - values[:, 2])
