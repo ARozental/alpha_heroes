@@ -74,6 +74,10 @@ The science (Python, the part to read and change):
 | `losses.py` | How the reward becomes a training signal: value-head labels, returns and advantages (GAE), and the PPO loss with its weights, explained step by step. |
 | `reward.py` | What counts as good: the terminal reward, the same formula at the end of a round (`round_score`), its bounds, and the fixed value functions (units, heroes, retreat, surrender). |
 | `vocab.py` | What the ids mean: creatures, spells, heroes, skills, artifacts, battlefields and obstacles by engine id, with names and base stats. |
+| `scenarios/*.json` | Fixed battles to train on, e.g. `castle_vs_inferno.json`: both heroes, armies, skills, spells, battlefield. |
+| `play.py` | Plays recorded battles in VCMI: a scenario becomes a battle-only map; our model on one side, another battle AI (BattleAI) on the other. |
+| `data.py` | Battle records -> rewards, value labels and advantages -> per-decision training examples -> DataLoader. |
+| `train.py` | The training loop: each epoch plays one battle per side, trains with PPO and logs both rewards to `runtime/train/<run>/progress.csv`. |
 
 The contract (shared with C++; change deliberately, then run codegen and bump `SCHEMA_VERSION`):
 
@@ -105,6 +109,15 @@ ALPHA_BATTLE_DUMP_DIR=$PWD/runtime/dumps SETTINGS='{"ai":{"combatNeutralAI":"Alp
   scripts/headless.sh "Maps/Elbow Room" 120 100
 .venv/bin/python -m battle_model.check_dumps runtime/dumps   # C++ and Python agree on every dumped decision
 ```
+
+Training on a scenario (about 2 s per epoch; records are deleted after each epoch):
+
+```sh
+.venv/bin/python -m battle_model.train --epochs 1000 --run castle_vs_inferno   # --resume continues a run
+```
+
+VCMI changes this relies on: `VCMI_BATTLE_AI_<COLOR>` chooses a player's battle AI, battle-only games end
+only after their battle's result is decided, and `server.seed` in the settings fixes the game's random seed.
 
 To use a better model: export any architecture with `export.py` and point `ALPHA_BATTLE_MODEL` at the file.
 AlphaBattleAI refuses a file whose contract differs (schema version, hash, input/output names, dtypes or
