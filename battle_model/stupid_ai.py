@@ -31,7 +31,7 @@ from torch import nn
 
 from . import rules
 from .constants import MAX_UNITS, N_HEXES, N_VALUE_HORIZONS, ActionType
-from .model import masked_log_softmax
+from .layers import masked_log_softmax
 
 UNLIKELY = -1000.0  # logit of every action StupidAI does not take
 

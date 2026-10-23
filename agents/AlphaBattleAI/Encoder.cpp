@@ -71,8 +71,10 @@ void encodeUnits(EncodedBattle & e, const CPlayerBattleCallback & battle, const 
 		t.set(In::u_shots, u, s->shots.available());
 		t.set(In::u_retaliations, u, s->counterAttacks.isLimited() ? std::min(s->counterAttacks.available(), MAX_RETALIATIONS) : MAX_RETALIATIONS);
 		t.set(In::u_casts, u, s->casts.available());
-		t.set(In::u_morale, u, s->valOfBonuses(BonusType::MORALE));
-		t.set(In::u_luck, u, s->valOfBonuses(BonusType::LUCK));
+		// The engine's effective values (clamped to +-3; 0 for units morale or luck does not affect, e.g. undead), not the
+		// raw sum of bonuses (bug fix 2026-10-23)
+		t.set(In::u_morale, u, s->moraleVal());
+		t.set(In::u_luck, u, s->luckVal());
 		t.set(In::u_moved, u, s->moved());
 		t.set(In::u_waited, u, s->waitedThisTurn);
 		t.set(In::u_defending, u, s->defending);

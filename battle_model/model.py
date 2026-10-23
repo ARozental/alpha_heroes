@@ -1,45 +1,53 @@
-"""A small battle model implementing the schema contract.
+"""The battle model: the contract's raw inputs to its outputs (the log-probability of every action, the value heads),
+built on features.py: the game's own rules, computed exactly, as bounded and scale-free features.
 
-The architecture is deliberately simple and replaceable; what matters is the contract:
-forward(inputs) takes the dict described by schema.INPUTS and returns the dict described
-by schema.OUTPUTS. All feature transforms live here, inputs are raw engine values.
+	forward(x, facts=None)
+	  facts        = facts(x)                            features.py, no parameters (training computes them once):
+	                   distance_maps                     per unit, the steps to every hex; to each enemy, from every hex
+	                   attack_features                   what the acting unit's melee attack and shot would do to each unit
+	                   threat_maps                       per hex: threat, danger, blocked shooters, new targets, progress
+	                   stack_features, unit_summaries, battle_features
+	  tokens       = embed(...)                          the battle, the heroes, the units, the hexes
+	  context      = trunk(tokens)                       attention over all of them
+	  logits       = score_actions(context, tokens, action_features(...))
+	  return log-probabilities (masked) and the values
 
-Tokens: 1 global + 2 heroes + MAX_UNITS units + N_HEXES hexes, mixed by a few
-self-attention blocks. Output heads score units and hexes by dot products against
-query vectors built from the global token, the acting unit and our hero.
+How a choice is scored (ActionHeads): its logit is the sum of
+  - a learned pointer score: the context's query against the choice's token (unit or hex), as in model_v1;
+  - its rule score (RuleScore): first order, one weight per feature of this choice (features.*_FEATURES), starting at
+    hand-chosen values (RULE_START), so a handful of parameters learns how each meaningful number of an action moves
+    that action's own logit; and second order, a low-rank term (rank 4) of the choice's features against a summary of
+    all legal choices and the context, for what the first order cannot express;
+  - the value of its best follow-up: the largest logit among the legal choices it leads to (a type gets its best
+    target's or hex's, a melee target its best hex's, a spell its best target's). So an attack the rules like lifts its
+    type, not just itself, and many poor options (most hexes are threatened) do not sink a type with one good one, as
+    an average would (the first version averaged, log-mean-exp, and the untrained model stopped moving). With all
+    follow-ups equal it adds nothing, so the untrained types keep ACTION_TYPE_PRIOR's odds.
 
-Value heads over horizons: V0 predicts the reward formula at the end of this round, V1 at the end of
-the next round, V2 the round after, and V the final reward (the one used for the advantages). Each is
-one linear layer on the last hidden state. V0..V2 are "boosted": each head's logit is added to the
-previous head's logit, so a later head only learns the difference to the shorter-horizon estimate.
-V is not chained to them (chain_final_value=False): chained, it inherited their swings, which follow
-our surviving army; on a lost battle that army counts for nothing, so the advantages rewarded keeping
-units alive and even punished kills, and the defence learned to stay passive. Each outputs tanh(logit), a value in
--1..1: the reward rescaled by reward.to_scale (-1 = worst possible, +1 = best possible), trained
-with the matching cross-entropy (losses.value_loss).
+Untrained, the pointer scores are 0 (zero queries), so the model plays its rule scores: kill what dies for sure, prefer
+valuable targets and threatening ones, avoid retaliation and threatened hexes, block shooters, move toward the enemy.
+The type head starts at ACTION_TYPE_PRIOR. The value heads are as in model_v1: V0..V2 the reward formula at the end of
+this and the next two rounds (boosted), V the final reward (standing alone), each tanh, trained with cross-entropy.
 
-The model does not know the reward settings today. Do not design around that: a later version will
-probably get the price of mana for this battle as an input (free next to a Magic Well, costly far from
-one), and possibly other reward weights, so that one model can play by the map's current priorities.
-
-Later, not now: hidden information and a battle memory (docs/hidden_information.md).
+Embeddings (creatures, effects, positions, ...) start small (std 0.1) next to the features, so the numbers count from
+the first update. Hidden information and a battle memory: later (docs/hidden_information.md).
 """
 import math
 
 import torch
 from torch import nn
 
+from . import features as F
+from . import rules
 from .constants import (
 	ACCESSIBILITY_VOCAB,
 	BATTLEFIELD_VOCAB,
 	CREATURE_VOCAB,
+	EFFECT_VOCAB,
 	GATE_STATE_VOCAB,
 	HERO_TYPE_VOCAB,
 	MASKED_LOGIT,
-	MAX_RETALIATIONS,
-	MAX_UNITS,
 	N_ACTION_TYPES,
-	EFFECT_VOCAB,
 	N_HEXES,
 	N_SECONDARY_SKILLS,
 	N_SIDES,
@@ -47,361 +55,329 @@ from .constants import (
 	N_VALUE_HORIZONS,
 	OBSTACLE_ID_VOCAB,
 	OBSTACLE_TYPE_VOCAB,
+	SECOND_TARGET_KIND,
 	WALL_STATE_VOCAB,
 	ActionType,
+	TargetKind,
 )
-from .schema import INPUT_NAMES, OUTPUT_NAMES
-from . import rules
+from .layers import ACTION_TYPE_PRIOR, Block, masked_log_softmax, vocab_index
 
-# Starting preference between action types, as type-head logits. The head's weights start at zero,
-# so an untrained model picks among the legal types with exactly these odds. A modelling choice:
-# start aggressive and rarely give up, so the first self-play games are real fights instead of
-# mostly retreats. Training moves these freely; types not listed start at 0.
-# Giving up is offered at every decision, ~40 times a battle, so its odds compound: at -2 (~2.5% a
-# decision each) about 2 in 3 untrained battles ended in a retreat or surrender. At -6 (~0.05% a
-# decision each) it is ~4% of battles.
-ACTION_TYPE_PRIOR = {
-	ActionType.MELEE: 1.0,
-	ActionType.SHOOT: 1.0,
-	ActionType.HERO_SPELL: 0.5,
-	ActionType.MOVE: 0.5,
-	ActionType.WAIT: 0.0,
-	ActionType.DEFEND: 0.0,
-	ActionType.RETREAT: -6.0,
-	ActionType.SURRENDER: -6.0,
+# The rule weights' starting values, per head and feature (nats per unit of the feature); the rest start at 0.
+# Hand-chosen: the untrained model's play, and the defaults training moves from.
+RULE_START = {
+	"melee_target": {"sure_kill": 2.0, "value_destroyed": 4.0, "threat_removed": 2.0, "value_lost": -4.0},
+	"shoot_target": {"sure_kill": 2.0, "value_destroyed": 4.0, "threat_removed": 2.0},
+	"melee_from": {"threat_change": -1.0, "danger_change": -1.0, "blocked_change": 1.0},
+	# An attacker has to walk into threat to win: getting closer outweighs becoming more threatened
+	"move": {"threat_change": -1.0, "danger_change": -1.0, "blocked_change": 1.0, "new_targets": 1.0, "progress": 2.0},
 }
+EMBEDDING_STD = 0.1
 
 
-def vocab_index(ids, vocab):
-	"""Map raw ids to embedding rows; anything outside [0, vocab) uses the extra row `vocab`."""
-	return torch.where((ids >= 0) & (ids < vocab), ids, torch.full_like(ids, vocab))
+def small_embedding(count, dim):
+	embedding = nn.Embedding(count, dim)
+	nn.init.normal_(embedding.weight, std=EMBEDDING_STD)
+	return embedding
 
 
-def masked_log_softmax(logits, mask):
-	"""log_softmax over the legal entries only; illegal entries are -inf.
-
-	Rows with no legal entry come out all -inf (never sampled, the parent choice is illegal).
-	"""
-	z = logits.masked_fill(~mask, MASKED_LOGIT)
-	return torch.log_softmax(z, dim=-1).masked_fill(~mask, float("-inf"))
+def best_of(logits, legal):
+	"""The largest legal entry of the last axis; 0 where none is legal."""
+	return torch.where(legal.any(dim=-1), logits.masked_fill(~legal, MASKED_LOGIT).amax(dim=-1), torch.zeros_like(logits[..., 0]))
 
 
-def log_scale(x):
-	return torch.log1p(x.clamp(min=0).float())
+class RuleScore(nn.Module):
+	"""A choice's score from its own features [B, *choices, features]: first order, one weight per feature (starting
+	at `start`), plus a second-order term of rank `rank`: the choice's features (projected) against a summary of all
+	legal choices' and of the context. The second order starts at 0."""
 
-
-def flag(x):
-	return (x != 0).float()
-
-
-class Block(nn.Module):
-	"""Pre-norm self-attention block written with plain ops so it exports cleanly to ONNX."""
-
-	def __init__(self, dim, heads):
+	def __init__(self, names, start, dim, rank):
 		super().__init__()
-		self.heads = heads
-		self.norm1 = nn.LayerNorm(dim)
-		self.qkv = nn.Linear(dim, 3 * dim)
-		self.proj = nn.Linear(dim, dim)
-		self.norm2 = nn.LayerNorm(dim)
-		self.mlp = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+		self.names = tuple(names)
+		self.weight = nn.Parameter(torch.tensor([float(start.get(n, 0.0)) for n in self.names]))
+		self.project = nn.Linear(len(self.names), rank, bias=False)
+		self.summary = nn.Linear(2 * rank + dim, rank)
+		nn.init.zeros_(self.summary.weight)
+		nn.init.zeros_(self.summary.bias)
 
-	def forward(self, x, key_valid):
-		b, n, d = x.shape
-		q, k, v = self.qkv(self.norm1(x)).chunk(3, dim=-1)
-		q, k, v = (t.reshape(b, n, self.heads, d // self.heads).transpose(1, 2) for t in (q, k, v))
-		att = (q @ k.transpose(-1, -2)) / math.sqrt(d // self.heads)
-		att = att.masked_fill(~key_valid[:, None, None, :], MASKED_LOGIT).softmax(dim=-1)
-		x = x + self.proj((att @ v).transpose(1, 2).reshape(b, n, d))
-		return x + self.mlp(self.norm2(x))
+	def forward(self, features, legal, context):
+		first = (features * self.weight).sum(dim=-1)
+		z = self.project(features)  # [B, *choices, rank]
+		flat, flat_legal = z.flatten(1, -2), legal.flatten(1)[..., None].float()
+		mean = (flat * flat_legal).sum(dim=1) / flat_legal.sum(dim=1).clamp(min=1)
+		top = flat.masked_fill(flat_legal == 0, -1e4).amax(dim=1).clamp(min=-1e3) * (flat_legal.sum(dim=1) > 0)
+		g = self.summary(torch.cat([mean, top, context], dim=-1))  # [B, rank]
+		second = (z * g.view(g.shape[0], *([1] * (z.dim() - 2)), -1)).sum(dim=-1)
+		return first + second
 
 
-class BattleModel(nn.Module):
-	def __init__(self, dim=64, layers=2, heads=4, boost_stop_gradient=True, mask_features=False, chain_final_value=False, kill_rule=True):
-		"""boost_stop_gradient: each value head adds a detached copy of the previous head's logit, so a
-		longer-horizon label never pulls on a shorter-horizon head (true boosting). False lets it.
+class BattleEmbedding(nn.Module):
+	"""The global token: the battlefield, the gate, and the battle's features (features.battle_features)."""
 
-		chain_final_value: V, the final-reward head, is chained to V0..V2 like they are to each other (as
-		before 2026-10-23); default False, V stands alone (see the top of this file).
-
-		mask_features: also feed the acting unit's legal choices into the tokens (they are model inputs
-		already, used for the output masks): per hex "can move here", "can attack someone from here",
-		"a spell can target this hex"; per unit "can be attacked", "can be shot", "a spell can target it".
-		Otherwise the network has to work out reachability and adjacency from positions and speeds.
-
-		kill_rule: a hand-made rule, with a learnable weight: attack the most valuable enemy stack the acting unit
-		kills for sure, if there is one (add_kill_rule).
-		"""
+	def __init__(self, dim):
 		super().__init__()
-		self.dim = dim
-		self.boost_stop_gradient = boost_stop_gradient
-		self.mask_features = mask_features
-		self.chain_final_value = chain_final_value
-		self.creature = nn.Embedding(CREATURE_VOCAB + 1, dim)
-		self.effect = nn.Embedding(EFFECT_VOCAB + 1, dim)
-		self.hero_type = nn.Embedding(HERO_TYPE_VOCAB + 1, dim)
-		self.battlefield = nn.Embedding(BATTLEFIELD_VOCAB + 1, dim)
-		self.access = nn.Embedding(ACCESSIBILITY_VOCAB + 1, dim)
-		self.obstacle_type = nn.Embedding(OBSTACLE_TYPE_VOCAB + 1, dim)
-		self.obstacle_id = nn.Embedding(OBSTACLE_ID_VOCAB + 1, dim)
-		self.wall_state = nn.Embedding(WALL_STATE_VOCAB + 1, dim)
-		self.gate_state = nn.Embedding(GATE_STATE_VOCAB + 1, dim)
-		self.hex_pos = nn.Embedding(N_HEXES, dim)
-		self.ours = nn.Embedding(2, dim)  # 0 = enemy, 1 = ours (heroes; units: controlled by us now)
-		self.home = nn.Embedding(2, dim)  # units: 1 = on our battle side (differs from ours while hypnotized)
-		self.token_kind = nn.Embedding(4, dim)  # global, hero, unit, hex
-		self.unit_num = nn.Linear(23, dim)
-		self.effect_num = nn.Linear(2, dim)
-		self.hero_num = nn.Linear(7 + N_SECONDARY_SKILLS + N_SPELLS, dim)
-		self.hex_num = nn.Linear(4, dim)
-		self.global_num = nn.Linear(3, dim)
-		if mask_features:
-			self.unit_mask_num = nn.Linear(3, dim)
-			self.hex_mask_num = nn.Linear(3, dim)
-		self.blocks = nn.ModuleList(Block(dim, heads) for _ in range(layers))
-		self.norm = nn.LayerNorm(dim)
+		self.battlefield = small_embedding(BATTLEFIELD_VOCAB + 1, dim)
+		self.gate = small_embedding(GATE_STATE_VOCAB + 1, dim)
+		self.numbers = nn.Linear(len(F.BATTLE_FEATURES), dim)
 
-		self.context = nn.Sequential(nn.Linear(3 * dim, dim), nn.GELU(), nn.Linear(dim, dim))
-		self.type_head = nn.Linear(dim, N_ACTION_TYPES)
-		self.spell_head = nn.Linear(dim, N_SPELLS)
-		self.spell_query = nn.Embedding(N_SPELLS, dim)
-		self.value_heads = nn.ModuleList(nn.Linear(dim, 1) for _ in range(N_VALUE_HORIZONS + 1))
-		# Per creature id: value in gold and abilities, for rules.py (constants, not saved in checkpoints)
-		for name, table in rules.creature_tables().items():
-			self.register_buffer(f"creature_{name}", table, persistent=False)
-		self.register_buffer("type_one_hot", torch.eye(N_ACTION_TYPES), persistent=False)
-		self.kill_rule = kill_rule
-		if kill_rule:
-			self.kill_rule_weight = nn.Parameter(torch.tensor(1000.0))
-		# One query projection from the context, and one key projection, per pointer head
-		self.queries = nn.ModuleDict({name: nn.Linear(dim, dim) for name in ("move", "melee", "melee_from", "shoot", "spell", "spell2")})
-		self.keys = nn.ModuleDict({name: nn.Linear(dim, dim) for name in ("move_hex", "melee_unit", "melee_from_unit", "melee_from_hex", "shoot_unit", "spell_unit", "spell_hex", "spell2_from_unit", "spell2_hex", "spell2_unit")})
+	def forward(self, b, facts):
+		x = b.x
+		return self.battlefield(vocab_index(x["g_battlefield"], BATTLEFIELD_VOCAB)) + self.gate(vocab_index(x["g_gate_state"], GATE_STATE_VOCAB)) + self.numbers(facts["battle"])
 
-		with torch.no_grad():
-			self.type_head.weight.zero_()
-			self.type_head.bias.copy_(torch.tensor([ACTION_TYPE_PRIOR.get(a, 0.0) for a in ActionType]))
-			# Every value head starts at 0, the middle of the reward range
-			for head in self.value_heads:
-				head.weight.zero_()
-				head.bias.zero_()
 
-	def _embed(self, x):
-		batch = x["g_our_side"].shape[0]
-		our_side = x["g_our_side"]
+class HeroEmbedding(nn.Module):
+	"""One token per side's hero: its type, whether it is ours, primary skills (x / (x + 10)), mana (left of its
+	pool, and the pool against 50), secondary skill levels (of 3) and spellbook (both hidden for the enemy's hero)."""
 
-		# Units
-		active = x["g_active_unit"].clamp(0, MAX_UNITS - 1)
-		slots = torch.arange(MAX_UNITS, device=active.device)
-		has_rear = x["u_rear_hex"] >= 0
-		numeric = torch.stack(
-			[
-				log_scale(x["u_count"]),
-				log_scale(x["u_first_hp"]),
-				log_scale(x["u_max_hp"]),
-				log_scale(x["u_dmg_min"]),
-				log_scale(x["u_dmg_max"]),
-				x["u_attack"].float() / 50,
-				x["u_defense"].float() / 50,
-				x["u_speed"].float() / 20,
-				x["u_shots"].float() / 24,
-				x["u_retaliations"].clamp(max=MAX_RETALIATIONS).float() / MAX_RETALIATIONS,
-				x["u_casts"].float() / 5,
-				x["u_morale"].float() / 3,
-				x["u_luck"].float() / 3,
-				flag(x["u_alive"]),
-				flag(x["u_moved"]),
-				flag(x["u_waited"]),
-				flag(x["u_defending"]),
-				flag(x["u_is_clone"]),
-				flag(x["u_is_summoned"]),
-				has_rear.float(),
-				(slots[None, :] == active[:, None]).float(),
-				(x["u_queue_now"].float() + 1) / MAX_UNITS,
-				(x["u_queue_next"].float() + 1) / MAX_UNITS,
-			],
-			dim=-1,
-		)
-		effect_valid = (x["u_effect_id"] >= 0).float().unsqueeze(-1)
-		effect_num = torch.stack([x["u_effect_turns"].float() / 10, torch.sign(x["u_effect_value"].float()) * log_scale(x["u_effect_value"].abs())], dim=-1)
-		effects = ((self.effect(vocab_index(x["u_effect_id"], EFFECT_VOCAB)) + self.effect_num(effect_num)) * effect_valid).sum(dim=2)
-		unit_ours = (x["u_owner_side"] == our_side[:, None]).long()  # controlled by us now (a hypnotized enemy is ours)
-		unit_home = (x["u_side"] == our_side[:, None]).long()
-		units = (
-			self.creature(vocab_index(x["u_creature"], CREATURE_VOCAB))
-			+ self.unit_num(numeric)
-			+ effects
-			+ self.ours(unit_ours)
-			+ self.home(unit_home)
-			+ self.hex_pos(x["u_hex"].clamp(0, N_HEXES - 1))
-			+ self.hex_pos(x["u_rear_hex"].clamp(0, N_HEXES - 1)) * has_rear.float().unsqueeze(-1)
-			+ self.token_kind.weight[2]
-		)
-		unit_valid = x["u_present"] != 0
-		if self.mask_features:
-			unit_masks = torch.stack([flag(x["m_melee_target"]), flag(x["m_shoot_target"]), flag(x["m_spell_unit"]).amax(dim=1)], dim=-1)
-			units = units + self.unit_mask_num(unit_masks)
+	def __init__(self, dim):
+		super().__init__()
+		self.hero_type = small_embedding(HERO_TYPE_VOCAB + 1, dim)
+		self.ours = small_embedding(2, dim)
+		self.numbers = nn.Linear(7 + N_SECONDARY_SKILLS + N_SPELLS, dim)
 
-		# Heroes (index = battle side)
-		hero_numeric = torch.cat(
-			[
-				torch.stack(
-					[
-						flag(x["h_present"]),
-						x["h_attack"].float() / 50,
-						x["h_defense"].float() / 50,
-						x["h_power"].float() / 50,
-						x["h_knowledge"].float() / 50,
-						log_scale(x["h_mana"]),
-						log_scale(x["h_mana_max"]),
-					],
-					dim=-1,
-				),
-				x["h_skills"].float() / 3,
-				flag(x["h_spells"]),
-			],
-			dim=-1,
-		)
-		sides = torch.arange(N_SIDES, device=active.device)
-		hero_ours = (sides[None, :] == our_side[:, None]).long()
-		heroes = self.hero_type(vocab_index(x["h_type"], HERO_TYPE_VOCAB)) + self.hero_num(hero_numeric) + self.ours(hero_ours) + self.token_kind.weight[1]
-		hero_valid = x["h_present"] != 0
+	def forward(self, b):
+		x = b.x
+		skill = lambda name: F.relative(x[name].float(), torch.full_like(x[name], 10, dtype=torch.float32))
+		mana, pool = x["h_mana"].float(), x["h_mana_max"].float()
+		numbers = torch.cat([
+			torch.stack([(x["h_present"] != 0).float(), skill("h_attack"), skill("h_defense"), skill("h_power"), skill("h_knowledge"), F.fraction(mana, pool), F.relative(pool, torch.full_like(pool, 50))], dim=-1),
+			x["h_skills"].float().clamp(0, 3) / 3,
+			(x["h_spells"] != 0).float(),
+		], dim=-1)
+		sides = torch.arange(N_SIDES, device=mana.device)
+		ours = (sides[None, :] == x["g_our_side"][:, None]).long()
+		return self.hero_type(vocab_index(x["h_type"], HERO_TYPE_VOCAB)) + self.ours(ours) + self.numbers(numbers), x["h_present"] != 0
 
-		# Hexes
-		obstacle_side = x["x_obstacle_side"]
-		hex_numeric = torch.stack(
-			[
-				(obstacle_side == our_side[:, None]).float(),
-				((obstacle_side >= 0) & (obstacle_side != our_side[:, None])).float(),
-				x["x_obstacle_turns"].clamp(min=0).float() / 10,
-				(x["x_obstacle_type"] >= 0).float(),
-			],
-			dim=-1,
-		)
-		hexes = (
-			self.hex_pos.weight[None, :, :]
+
+class UnitEmbedding(nn.Module):
+	"""One token per unit slot: the creature, its spell effects (with their turns left and value, bounded), where it
+	stands, and its numbers: stack_features (itself) and unit_summaries (against the others)."""
+
+	def __init__(self, dim):
+		super().__init__()
+		self.creature = small_embedding(CREATURE_VOCAB + 1, dim)
+		self.effect = small_embedding(EFFECT_VOCAB + 1, dim)
+		self.effect_numbers = nn.Linear(2, dim)
+		self.position = small_embedding(N_HEXES, dim)
+		self.numbers = nn.Linear(len(F.STACK_FEATURES) + len(F.SUMMARY_FEATURES), dim)
+
+	def forward(self, b, facts):
+		x = b.x
+		has_effect = (x["u_effect_id"] >= 0).float()[..., None]
+		effect_numbers = torch.stack([x["u_effect_turns"].float().clamp(0, 10) / 10, x["u_effect_value"].float() / (x["u_effect_value"].float().abs() + 10)], dim=-1)
+		effects = ((self.effect(vocab_index(x["u_effect_id"], EFFECT_VOCAB)) + self.effect_numbers(effect_numbers)) * has_effect).sum(dim=2)
+		rear = b.units["rear"]
+		where = self.position(b.units["hex"].clamp(0, N_HEXES - 1)) + self.position(rear.clamp(0, N_HEXES - 1)) * (rear >= 0).float()[..., None]
+		numbers = torch.cat([facts["stack"], facts["summaries"]], dim=-1)
+		return self.creature(vocab_index(x["u_creature"], CREATURE_VOCAB)) + effects + where + self.numbers(numbers), x["u_present"] != 0
+
+
+class HexEmbedding(nn.Module):
+	"""One token per hex: its position, accessibility, obstacle and wall, the side and turns of a spell obstacle, and
+	the acting unit's maps there (features.threat_maps)."""
+
+	def __init__(self, dim):
+		super().__init__()
+		self.position = small_embedding(N_HEXES, dim)
+		self.access = small_embedding(ACCESSIBILITY_VOCAB + 1, dim)
+		self.obstacle_type = small_embedding(OBSTACLE_TYPE_VOCAB + 1, dim)
+		self.obstacle_id = small_embedding(OBSTACLE_ID_VOCAB + 1, dim)
+		self.wall = small_embedding(WALL_STATE_VOCAB + 1, dim)
+		self.numbers = nn.Linear(4 + len(F.HEX_FEATURES), dim)
+
+	def forward(self, b, facts):
+		x = b.x
+		side = x["x_obstacle_side"]
+		our = x["g_our_side"][:, None]
+		obstacle = torch.stack([(side == our).float(), ((side >= 0) & (side != our)).float(), x["x_obstacle_turns"].float().clamp(0, 10) / 10, (x["x_obstacle_type"] >= 0).float()], dim=-1)
+		return (
+			self.position.weight[None, :, :]
 			+ self.access(vocab_index(x["x_access"], ACCESSIBILITY_VOCAB))
 			+ self.obstacle_type(vocab_index(x["x_obstacle_type"], OBSTACLE_TYPE_VOCAB))
 			+ self.obstacle_id(vocab_index(x["x_obstacle_id"], OBSTACLE_ID_VOCAB))
-			+ self.wall_state(vocab_index(x["x_wall_state"], WALL_STATE_VOCAB))
-			+ self.hex_num(hex_numeric)
-			+ self.token_kind.weight[3]
-		)
-		if self.mask_features:
-			hex_masks = torch.stack([flag(x["m_move_hex"]), flag(x["m_melee_from"]).amax(dim=1), flag(x["m_spell_hex"]).amax(dim=1)], dim=-1)
-			hexes = hexes + self.hex_mask_num(hex_masks)
-
-		# Global
-		global_numeric = torch.stack([(x["g_round"].float() + 1) / 20, x["g_tactic_distance"].float() / 7, flag(x["g_hero_can_cast"])], dim=-1)
-		glob = (
-			self.battlefield(vocab_index(x["g_battlefield"], BATTLEFIELD_VOCAB))
-			+ self.gate_state(vocab_index(x["g_gate_state"], GATE_STATE_VOCAB))
-			+ self.global_num(global_numeric)
-			+ self.token_kind.weight[0]
+			+ self.wall(vocab_index(x["x_wall_state"], WALL_STATE_VOCAB))
+			+ self.numbers(torch.cat([obstacle, facts["maps"]], dim=-1))
 		)
 
-		tokens = torch.cat([glob[:, None, :], heroes, units, hexes], dim=1)
-		valid = torch.cat(
-			[
-				torch.ones(batch, 1, dtype=torch.bool, device=active.device),
-				hero_valid,
-				unit_valid,
-				torch.ones(batch, N_HEXES, dtype=torch.bool, device=active.device),
-			],
-			dim=1,
-		)
-		return tokens, valid
 
-	def forward(self, x):
-		tokens, valid = self._embed(x)
+class Trunk(nn.Module):
+	"""Attention over all tokens (global, heroes, units, hexes; a learned kind embedding each), then the context: the
+	global token, the acting unit's and our hero's, through a small MLP."""
+
+	def __init__(self, dim, layers, heads):
+		super().__init__()
+		self.kind = small_embedding(4, dim)  # global, hero, unit, hex
+		self.blocks = nn.ModuleList(Block(dim, heads) for _ in range(layers))
+		self.norm = nn.LayerNorm(dim)
+		self.context = nn.Sequential(nn.Linear(3 * dim, dim), nn.GELU(), nn.Linear(dim, dim))
+
+	def forward(self, b, glob, heroes, units, hexes, hero_valid, unit_valid):
+		k = self.kind.weight
+		tokens = torch.cat([(glob + k[0])[:, None, :], heroes + k[1], units + k[2], hexes + k[3]], dim=1)
+		always = torch.ones_like(unit_valid[:, :1])
+		valid = torch.cat([always, hero_valid, unit_valid, always.expand(-1, N_HEXES)], dim=1)
 		for block in self.blocks:
 			tokens = block(tokens, valid)
 		tokens = self.norm(tokens)
-		glob = tokens[:, 0]
-		heroes = tokens[:, 1 : 1 + N_SIDES]
-		units = tokens[:, 1 + N_SIDES : 1 + N_SIDES + MAX_UNITS]
-		hexes = tokens[:, 1 + N_SIDES + MAX_UNITS :]
+		glob, heroes = tokens[:, 0], tokens[:, 1 : 1 + N_SIDES]
+		units, hexes = tokens[:, 1 + N_SIDES : -N_HEXES], tokens[:, -N_HEXES:]
+		batch = torch.arange(glob.shape[0], device=glob.device)
+		context = self.context(torch.cat([glob, units[batch, b.acting], heroes[batch, b.x["g_our_side"].clamp(0, N_SIDES - 1)]], dim=-1))
+		return context, units, hexes
 
-		batch_index = torch.arange(glob.shape[0], device=glob.device)
-		active = units[batch_index, x["g_active_unit"].clamp(0, MAX_UNITS - 1)]
-		our_hero = heroes[batch_index, x["g_our_side"].clamp(0, N_SIDES - 1)]
-		context = self.context(torch.cat([glob, active, our_hero], dim=-1))
-		scale = 1.0 / math.sqrt(self.dim)
+
+class ActionHeads(nn.Module):
+	"""Every choice's logit: pointer score + rule score + the value of its follow-ups (see the top of this file)."""
+
+	POINTERS = ("move", "melee", "melee_from", "shoot", "spell", "spell2")
+	KEYS = ("move_hex", "melee_unit", "melee_from_unit", "melee_from_hex", "shoot_unit", "spell_unit", "spell_hex", "spell2_from_unit", "spell2_hex", "spell2_unit")
+
+	def __init__(self, dim, rank):
+		super().__init__()
+		self.type_head = nn.Linear(dim, N_ACTION_TYPES)
+		self.type_rules = nn.Linear(len(F.TYPE_FEATURES), N_ACTION_TYPES, bias=False)
+		self.spell_head = nn.Linear(dim, N_SPELLS)
+		self.spell_query = small_embedding(N_SPELLS, dim)
+		self.queries = nn.ModuleDict({name: nn.Linear(dim, dim) for name in self.POINTERS})
+		self.keys = nn.ModuleDict({name: nn.Linear(dim, dim) for name in self.KEYS})
+		names = {"melee_target": F.ATTACK_FEATURES, "melee_from": F.FROM_FEATURES, "shoot_target": F.SHOT_FEATURES, "move": F.MOVE_FEATURES}
+		self.rules = nn.ModuleDict({head: RuleScore(names[head], RULE_START.get(head, {}), dim, rank) for head in names})
+		second = torch.zeros(N_SPELLS, dtype=torch.long)
+		for spell, kind in SECOND_TARGET_KIND.items():
+			second[spell] = int(kind)
+		self.register_buffer("second_target", second, persistent=False)
+		self.register_buffer("type_one_hot", torch.eye(N_ACTION_TYPES), persistent=False)
+		with torch.no_grad():  # untrained: the type prior, no type rules, zero pointer scores
+			self.type_head.weight.zero_()
+			self.type_head.bias.copy_(torch.tensor([ACTION_TYPE_PRIOR.get(a, 0.0) for a in ActionType]))
+			self.type_rules.weight.zero_()
+			# every pointer score starts at 0: the queries, and the per-unit offsets added to them, start at 0
+			for layer in (*self.queries.values(), self.keys["melee_from_unit"], self.keys["spell2_from_unit"], self.spell_head):
+				layer.weight.zero_()
+				layer.bias.zero_()
+			self.spell_query.weight.zero_()
+
+	def forward(self, context, units, hexes, actions, x):
+		scale = 1.0 / math.sqrt(context.shape[-1])
 		q = {name: layer(context) for name, layer in self.queries.items()}
 		k = self.keys
+		point = lambda query, items, key: torch.einsum("bd,bnd->bn", query, k[key](items)) * scale
+		rule = lambda head, legal: self.rules[head](actions[head], legal, context)
 
-		def point(query, items, key):  # [B, D] x [B, N, D] -> [B, N]
-			return torch.einsum("bd,bnd->bn", query, k[key](items)) * scale
+		# Leaves first: a choice's logit includes the value of the best choice it leads to
+		melee_from = torch.einsum("bud,bhd->buh", k["melee_from_unit"](units) + q["melee_from"][:, None, :], k["melee_from_hex"](hexes)) * scale + rule("melee_from", x["m_melee_from"])
+		melee_target = point(q["melee"], units, "melee_unit") + rule("melee_target", x["m_melee_target"]) + best_of(melee_from, x["m_melee_from"])
+		shoot_target = point(q["shoot"], units, "shoot_unit") + rule("shoot_target", x["m_shoot_target"])
+		move = point(q["move"], hexes, "move_hex") + rule("move", x["m_move_hex"])
 
-		melee_from = torch.einsum("bud,bhd->buh", k["melee_from_unit"](units) + q["melee_from"][:, None, :], k["melee_from_hex"](hexes)) * scale
-		spell_q = self.spell_query.weight[None, :, :] + q["spell"][:, None, :]
-		spell_unit = torch.einsum("bsd,bud->bsu", spell_q, k["spell_unit"](units)) * scale
-		spell_hex = torch.einsum("bsd,bhd->bsh", spell_q, k["spell_hex"](hexes)) * scale
 		spell2_from = k["spell2_from_unit"](units) + q["spell2"][:, None, :]
 		spell2_hex = torch.einsum("bud,bhd->buh", spell2_from, k["spell2_hex"](hexes)) * scale
 		spell2_unit = torch.einsum("bud,bvd->buv", spell2_from, k["spell2_unit"](units)) * scale
+		spell_q = self.spell_query.weight[None, :, :] + q["spell"][:, None, :]
+		second_value = torch.stack([torch.zeros_like(spell2_hex[..., 0]), best_of(spell2_unit, x["m_spell2_unit"]), best_of(spell2_hex, x["m_spell2_hex"])], dim=1)  # [B, kind, U]
+		spell_unit = torch.einsum("bsd,bud->bsu", spell_q, k["spell_unit"](units)) * scale + second_value[:, self.second_target, :]
+		spell_hex = torch.einsum("bsd,bhd->bsh", spell_q, k["spell_hex"](hexes)) * scale
+		first_targets = torch.cat([spell_unit, spell_hex], dim=-1)
+		spell = self.spell_head(context) + best_of(first_targets, torch.cat([x["m_spell_unit"], x["m_spell_hex"]], dim=-1))
 
-		logits = {
-			"type": self.type_head(context),
-			"melee_target": point(q["melee"], units, "melee_unit"),
-			"shoot_target": point(q["shoot"], units, "shoot_unit"),
-		}
-		if self.kill_rule:
-			logits = self.add_kill_rule(logits, x)
+		follow = torch.zeros_like(self.type_head(context))
+		for action, logits, legal in ((ActionType.MOVE, move, x["m_move_hex"]), (ActionType.MELEE, melee_target, x["m_melee_target"]), (ActionType.SHOOT, shoot_target, x["m_shoot_target"]), (ActionType.HERO_SPELL, spell, x["m_spell"])):
+			follow = follow + best_of(logits, legal)[:, None] * self.type_one_hot[action]
+		kind = self.type_head(context) + self.type_rules(actions["type"]) + follow
 		return {
-			"logp_type": masked_log_softmax(logits["type"], x["m_type"]),
-			"logp_move_hex": masked_log_softmax(point(q["move"], hexes, "move_hex"), x["m_move_hex"]),
-			"logp_melee_target": masked_log_softmax(logits["melee_target"], x["m_melee_target"]),
+			"logp_type": masked_log_softmax(kind, x["m_type"]),
+			"logp_move_hex": masked_log_softmax(move, x["m_move_hex"]),
+			"logp_melee_target": masked_log_softmax(melee_target, x["m_melee_target"]),
 			"logp_melee_from": masked_log_softmax(melee_from, x["m_melee_from"]),
-			"logp_shoot_target": masked_log_softmax(logits["shoot_target"], x["m_shoot_target"]),
-			"logp_spell": masked_log_softmax(self.spell_head(context), x["m_spell"]),
+			"logp_shoot_target": masked_log_softmax(shoot_target, x["m_shoot_target"]),
+			"logp_spell": masked_log_softmax(spell, x["m_spell"]),
 			"logp_spell_unit": masked_log_softmax(spell_unit, x["m_spell_unit"]),
 			"logp_spell_hex": masked_log_softmax(spell_hex, x["m_spell_hex"]),
 			"logp_spell2_hex": masked_log_softmax(spell2_hex, x["m_spell2_hex"]),
 			"logp_spell2_unit": masked_log_softmax(spell2_unit, x["m_spell2_unit"]),
-			**self._values(context),
 		}
 
-	def creature_tables(self):
-		return {name: getattr(self, f"creature_{name}") for name in ("value", "shooter", "no_melee_penalty", "no_distance_penalty")}
 
-	def add_kill_rule(self, logits, x):
-		"""Rule: attack the most valuable enemy stack the acting unit kills whatever the dice, if it can.
+class ValueHeads(nn.Module):
+	"""V0..V2: the reward formula at the end of this round and the next two, boosted (each adds to the previous logit,
+	detached); V: the final reward, standing alone. Each tanh(logit), -1..1 (reward.to_scale); all start at 0."""
 
-		A stack it kills for sure (rules.cross_stack_features) gets kill_rule_weight * (1 + its share of its army's
-		value) added to its target logit, so the most valuable one wins. The type (melee or shoot) is chosen before
-		the target, so that type's logit gets the score of its best legal target.
-		"""
-		f = rules.cross_stack_features(x, self.creature_tables())
-		score = self.kill_rule_weight * (1 + f["value_share"])
-		logits = dict(logits)
-		for kills, target, mask, action in (("kills_melee", "melee_target", "m_melee_target", ActionType.MELEE), ("kills_shot", "shoot_target", "m_shoot_target", ActionType.SHOOT)):
-			rule = score * f[kills]  # [B, U], 0 where it does not kill for sure
-			logits[target] = logits[target] + rule
-			best = (rule * x[mask]).amax(dim=1)  # the best legal target's score
-			logits["type"] = logits["type"] + best[:, None] * self.type_one_hot[action]
-		return logits
+	def __init__(self, dim, boost_stop_gradient=True):
+		super().__init__()
+		self.boost_stop_gradient = boost_stop_gradient
+		self.heads = nn.ModuleList(nn.Linear(dim, 1) for _ in range(N_VALUE_HORIZONS + 1))
+		with torch.no_grad():
+			for head in self.heads:
+				head.weight.zero_()
+				head.bias.zero_()
 
-	def _values(self, context):
+	def forward(self, context):
 		logits, previous = [], None
-		for k, head in enumerate(self.value_heads):
+		for i, head in enumerate(self.heads):
 			logit = head(context).squeeze(-1)
-			final = k == len(self.value_heads) - 1
-			if previous is not None and (self.chain_final_value or not final):
+			if previous is not None and i < len(self.heads) - 1:
 				logit = logit + (previous.detach() if self.boost_stop_gradient else previous)
 			logits.append(logit)
 			previous = logit
 		value_logit = torch.stack(logits, dim=-1)
-		# value_logit is for the training loss only; it is not a model output in the contract
-		return {"value": torch.tanh(value_logit), "value_logit": value_logit}
+		return {"value": torch.tanh(value_logit), "value_logit": value_logit}  # value_logit: for the loss only
 
 
-class OnnxWrapper(nn.Module):
-	"""Positional-argument wrapper for ONNX export: inputs and outputs in schema order."""
-
-	def __init__(self, model):
+class BattleModel(nn.Module):
+	def __init__(self, dim=64, layers=2, heads=4, rank=4, boost_stop_gradient=True):
 		super().__init__()
-		self.model = model
+		for name, table in rules.creature_tables().items():
+			self.register_buffer(f"table_{name}", table, persistent=False)
+		self.battle = BattleEmbedding(dim)
+		self.heroes = HeroEmbedding(dim)
+		self.units = UnitEmbedding(dim)
+		self.hexes = HexEmbedding(dim)
+		self.trunk = Trunk(dim, layers, heads)
+		self.actions = ActionHeads(dim, rank)
+		self.values = ValueHeads(dim, boost_stop_gradient)
 
-	def forward(self, *tensors):
-		outputs = self.model(dict(zip(INPUT_NAMES, tensors)))
-		return tuple(outputs[name] for name in OUTPUT_NAMES)
+	def tables(self):
+		return {name[len("table_"):]: buffer for name, buffer in self.named_buffers() if name.startswith("table_")}
+
+	def facts(self, x):
+		"""Everything features.py computes from the inputs: no parameters, no gradients. Training computes them once per
+		decision and epoch and passes them to forward; the exported model computes them itself."""
+		with torch.no_grad():
+			b = F.read_battle(x, self.tables())
+			reach, to_enemy = F.distance_maps(b)
+			maps, can_attack = F.threat_maps(b, reach, to_enemy)
+			return {
+				"melee": F.attack_features(b, shooting=False),
+				"shot": F.attack_features(b, shooting=True),
+				"maps": maps,
+				"can_attack": can_attack,
+				"stack": F.stack_features(b),
+				"summaries": F.unit_summaries(b, can_attack),
+				"battle": F.battle_features(b, maps),
+			}
+
+	def forward(self, x, facts=None):
+		facts = self.facts(x) if facts is None else facts
+		b = F.read_battle(x, self.tables())
+		heroes, hero_valid = self.heroes(b)
+		units, unit_valid = self.units(b, facts)
+		context, units, hexes = self.trunk(b, self.battle(b, facts), heroes, units, self.hexes(b, facts), hero_valid, unit_valid)
+		actions = F.action_features(b, facts["melee"], facts["shot"], facts["maps"], facts["can_attack"], facts["battle"])
+		return {**self.actions(context, units, hexes, actions, x), **self.values(context)}
+
+	def set_rule_weights(self, head, **weights):
+		"""Set first-order rule weights by feature name, e.g. set_rule_weights("melee_target", sure_kill=1000.0)."""
+		score = self.actions.rules[head]
+		with torch.no_grad():
+			for name, value in weights.items():
+				score.weight[score.names.index(name)] = value
+
+
+def build_model(kwargs):
+	"""The model a checkpoint's model_kwargs describe: this one, or model_v1's for checkpoints from before (no
+	"architecture" key)."""
+	kwargs = dict(kwargs)
+	if kwargs.pop("architecture", "v1") == "v2":
+		return BattleModel(**kwargs)
+	from .model_v1 import BattleModelV1
+
+	return BattleModelV1(**{"chain_final_value": True, "kill_rule": False, **kwargs})

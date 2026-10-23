@@ -59,7 +59,7 @@ from .data import collate, credit_check, make_dataloader, summarize
 from .export import export
 from .losses import AdvantageConfig, PPOConfig, ppo_loss
 from .constants import ActionType
-from .model import BattleModel
+from .model import build_model
 from .trace import trace
 from .reward import Outcome, RewardConfig, to_scale
 
@@ -93,11 +93,13 @@ class TrainConfig:
 	# Play the next epoch's battles while this epoch trains (Producer): the battles are then one update older than the
 	# model they train, which PPO handles (each record holds the probabilities of the model that played it)
 	prefetch: bool = True
+	model_architecture: str = "v2"  # "v2": model.BattleModel (rules and features); "v1": model_v1.BattleModelV1
 	model_dim: int = 64
 	model_layers: int = 2
-	model_mask_features: bool = False  # model.BattleModel(mask_features=...)
-	model_chain_final_value: bool = False  # model.BattleModel(chain_final_value=...)
-	model_kill_rule: bool = True  # model.BattleModel(kill_rule=...)
+	model_rank: int = 4  # v2: rank of the rule scores' second-order term
+	model_mask_features: bool = False  # v1 only: BattleModelV1(mask_features=...)
+	model_chain_final_value: bool = False  # v1 only: BattleModelV1(chain_final_value=...)
+	model_kill_rule: bool = True  # v1 only: BattleModelV1(kill_rule=...)
 	seed: int = 0  # the model's initial weights
 	reward: RewardConfig = field(default_factory=RewardConfig)
 	advantage: AdvantageConfig = field(default_factory=AdvantageConfig)
@@ -397,7 +399,10 @@ class Producer:
 
 
 def model_kwargs(config):
-	return {"dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features, "chain_final_value": config.model_chain_final_value, "kill_rule": config.model_kill_rule}
+	"""The model's constructor arguments, saved in checkpoints (model.build_model rebuilds the model from them)."""
+	if config.model_architecture == "v2":
+		return {"architecture": "v2", "dim": config.model_dim, "layers": config.model_layers, "rank": config.model_rank}
+	return {"architecture": "v1", "dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features, "chain_final_value": config.model_chain_final_value, "kill_rule": config.model_kill_rule}
 
 
 def save_checkpoint(path, model, optimizer, epoch, config):
@@ -410,14 +415,13 @@ def train(config, resume=False):
 	(out / "config.txt").write_text("\n".join(f"{k} = {v}" for k, v in asdict(config).items()) + "\n")
 	torch.manual_seed(config.seed)
 	device = resolve_device(config.device)
-	model = BattleModel(**model_kwargs(config)).to(device)
+	model = build_model(model_kwargs(config)).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 	first_epoch = 1
 	latest = out / "checkpoint_latest.pt"
 	if resume and latest.exists():
 		state = torch.load(latest, map_location=device)
-		# the architecture the run was started with (older checkpoints: chained final value head)
-		model = BattleModel(**{"chain_final_value": True, **state.get("model_kwargs", {})}).to(device)
+		model = build_model(state.get("model_kwargs", {})).to(device)  # the architecture the run was started with
 		optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 		model.load_state_dict(state["model"])
 		optimizer.load_state_dict(state["optimizer"])
@@ -492,11 +496,14 @@ def train(config, resume=False):
 		model.train()
 		examples = loader.dataset
 		epoch_data = to_device(collate(examples), device) if examples else None  # every decision of the epoch, moved to the GPU once
+		if epoch_data is not None and hasattr(model, "facts"):  # the features: once per decision, not once per pass
+			chunks = [model.facts(select(epoch_data["inputs"], torch.arange(i, min(i + 256, len(examples)), device=device))) for i in range(0, len(examples), 256)]
+			epoch_data["facts"] = {key: torch.cat([c[key] for c in chunks]) for key in chunks[0]}
 		for _ in range(config.ppo_passes if examples else 0):
 			order = torch.randperm(len(examples)).to(device)
 			for first in range(0, len(examples), config.batch_size):
 				batch = select(epoch_data, order[first : first + config.batch_size])
-				out_batch = model(batch["inputs"])
+				out_batch = model(batch["inputs"], batch["facts"]) if "facts" in batch else model(batch["inputs"])
 				loss, parts = ppo_loss(out_batch, batch["action"], batch["old_log_prob"], batch["advantage"], batch["value_labels"], ppo_config)
 				optimizer.zero_grad()
 				loss.backward()

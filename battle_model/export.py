@@ -14,7 +14,8 @@ import onnxruntime as ort
 import torch
 
 from .constants import SCHEMA_VERSION
-from .model import BattleModel, OnnxWrapper
+from .layers import OnnxWrapper
+from .model import BattleModel
 from .schema import INPUT_NAMES, INPUTS, OUTPUT_NAMES, OUTPUTS, contract_hash, random_inputs
 
 DEFAULT_PATH = Path(__file__).resolve().parent / "artifacts" / "battle_model.onnx"

@@ -6,6 +6,7 @@ from battle_model.constants import RESERVED_ACTION_TYPES, ActionType
 from battle_model.distributions import entropy, enumerate_actions, is_legal, log_prob, sample, stack_actions
 from battle_model.losses import ppo_loss
 from battle_model.model import BattleModel
+from battle_model.model_v1 import BattleModelV1
 from battle_model.schema import INPUTS, OUTPUTS, finalize_masks, random_inputs
 
 
@@ -124,9 +125,14 @@ def test_ppo_loss_gradients_are_finite():
 
 
 def test_untrained_model_picks_types_with_the_prior_odds():
-	from battle_model.model import ACTION_TYPE_PRIOR
+	"""With its rule weights at 0, the untrained model's types follow ACTION_TYPE_PRIOR exactly (zero pointer scores:
+	every follow-up is worth 0, so the best one adds nothing)."""
+	from battle_model.layers import ACTION_TYPE_PRIOR
 	torch.manual_seed(3)
 	m = BattleModel().eval()
+	with torch.no_grad():
+		for rule in m.actions.rules.values():
+			rule.weight.zero_()
 	x = random_inputs(batch=1, seed=4)
 	out = run(m, x)
 	legal = np.flatnonzero(x["m_type"][0])
@@ -139,7 +145,7 @@ def test_untrained_model_picks_types_with_the_prior_odds():
 def test_values_stay_in_the_unit_range():
 	torch.manual_seed(0)
 	m = BattleModel().eval()
-	for head in m.value_heads:  # large random heads to push the outputs to their limits
+	for head in m.values.heads:  # large random heads to push the outputs to their limits
 		torch.nn.init.normal_(head.weight, std=50.0)
 	out = run(m, random_inputs(batch=8, seed=2))
 	assert (out["value"] >= -1).all() and (out["value"] <= 1).all()
@@ -152,7 +158,7 @@ def test_boost_stop_gradient_keeps_long_horizon_labels_off_short_heads():
 	for stop, expect_grad in ((True, False), (False, True)):
 		m = BattleModel(boost_stop_gradient=stop)
 		m(x)["value_logit"][:, -2].sum().backward()  # a loss on V2, the longest round horizon, only
-		v0_grad = m.value_heads[0].weight.grad
+		v0_grad = m.values.heads[0].weight.grad
 		assert (v0_grad is not None and v0_grad.abs().sum() > 0) == expect_grad
 
 
@@ -160,12 +166,12 @@ def test_final_value_head_stands_alone():
 	"""V, used for the advantages, predicts the final reward itself: it must not inherit V0..V2's swings."""
 	torch.manual_seed(0)
 	x = {k: torch.from_numpy(v) for k, v in random_inputs(batch=2, seed=3).items()}
-	m = BattleModel(boost_stop_gradient=False)
+	m = BattleModelV1(boost_stop_gradient=False)
 	for head in m.value_heads:  # non-zero heads, so a chained logit would differ from the head's own output
 		torch.nn.init.normal_(head.weight)
 	out = m(x)
 	out["value_logit"][:, -1].sum().backward()
 	assert all(h.weight.grad is None or h.weight.grad.abs().sum() == 0 for h in m.value_heads[:-1])
-	chained = BattleModel(boost_stop_gradient=False, chain_final_value=True)
+	chained = BattleModelV1(boost_stop_gradient=False, chain_final_value=True)
 	chained.load_state_dict(m.state_dict())
 	assert not torch.allclose(chained(x)["value_logit"][:, -1], out["value_logit"][:, -1])

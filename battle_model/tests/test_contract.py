@@ -3,6 +3,7 @@ import torch
 from battle_model.codegen import HEADER_PATH, render
 from battle_model.export import export, verify
 from battle_model.model import BattleModel
+from battle_model.model_v1 import BattleModelV1
 
 
 def test_generated_header_is_up_to_date():
@@ -23,7 +24,7 @@ def test_any_architecture_exports_to_the_same_contract(tmp_path):
 	assert verify(model, export(model, tmp_path / "big.onnx")) < 1e-4
 
 
-def test_mask_feature_model_exports_to_the_same_contract(tmp_path):
+def test_v1_mask_feature_model_exports_to_the_same_contract(tmp_path):
 	torch.manual_seed(2)
-	model = BattleModel(dim=32, layers=1, mask_features=True)
+	model = BattleModelV1(dim=32, layers=1, mask_features=True)
 	assert verify(model, export(model, tmp_path / "mask_features.onnx")) < 1e-4

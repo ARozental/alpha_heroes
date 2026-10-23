@@ -17,16 +17,14 @@ import torch
 from . import play
 from .data import summarize
 from .export import export
-from .model import BattleModel
+from .model import build_model
 from .reward import to_scale
-from .train import ROOT, TrainConfig, model_kwargs
+from .train import ROOT, TrainConfig
 
 
 def load(checkpoint):
 	state = torch.load(checkpoint, map_location="cpu")
-	# older checkpoints: the default model of their time, with the final value head chained
-	# (and without the kill rule, added 2026-10-23)
-	model = BattleModel(**{"chain_final_value": True, "kill_rule": False, **state.get("model_kwargs", model_kwargs(TrainConfig()))})
+	model = build_model(state.get("model_kwargs", {}))  # without the key: the first model (model_v1)
 	model.load_state_dict(state["model"])
 	return model.eval(), state["epoch"]
 

@@ -4,8 +4,10 @@ computed the way the engine computes them, for the model (model.py) to build on.
 Here:
 	least_damage, cross_stack_features   what the acting unit's attack does at least, whatever the dice, and
 	                                     which stacks it kills for sure (the kill rule in model.py)
-	damage_range, after_damage           the engine's damage estimate (min, max), as BattleAI and StupidAI use it
-	reachability                         the engine's pathfinding: distances and the path back
+	damage_range, after_damage, kills    the engine's damage estimate (min, max), as BattleAI and StupidAI use it
+	reachability                         the engine's pathfinding: distances and the path back (StupidAI)
+	walk_distances, fly_distances        distances only, from any hexes, for many units at once (features.py)
+	unit_value                           a stack's value in gold, as the reward counts it
 	geometry                             neighbours, two-hex units, available hexes
 
 The least damage of an attack. The engine (lib/battle/DamageCalculator.cpp, BattleInfo::getActualDamage) deals
@@ -55,6 +57,11 @@ SPELL_CREATED, MOAT = 2, 3
 INFINITE_DISTANCE = 1_000_000  # ReachabilityInfo::INFINITE_DIST
 ATTACKER, DEFENDER = 0, 1
 
+# config/gameConfig.json "combat": the chance of good and bad morale and luck, by its value (1, 2, 3), out of a die of
+# 24 (goodMoraleChance, badMoraleChance, moraleDiceSize, goodLuckChance, badLuckChance (empty: no bad luck), luckDiceSize)
+GOOD_MORALE, BAD_MORALE = (0.0, 1 / 24, 2 / 24, 3 / 24), (0.0, 2 / 24, 4 / 24, 6 / 24)
+GOOD_LUCK, BAD_LUCK = (0.0, 1 / 24, 2 / 24, 3 / 24), (0.0, 0.0, 0.0, 0.0)
+
 
 # Per-creature tables (creature_tables): name -> (dtype, from a vocabulary row)
 def _ability_value(row, name, subtype=None):
@@ -77,6 +84,10 @@ CREATURE_TABLES = {
 	"ranged_reduction": (torch.int64, lambda row: _ability_value(row, "GENERAL_DAMAGE_REDUCTION", 1)),  # damageTypeRanged
 	"all_reduction": (torch.int64, lambda row: _ability_value(row, "GENERAL_DAMAGE_REDUCTION", -1)),  # damageTypeAll
 	"damage_cap": (torch.int64, lambda row: _ability_value(row, "DAMAGE_RECEIVED_CAP")),  # percent of max health
+	"base_attack": (torch.int64, lambda row: row.get("attack", 0)),
+	"base_defense": (torch.int64, lambda row: row.get("defense", 0)),
+	"extra_attacks": (torch.int64, lambda row: _ability_value(row, "ADDITIONAL_ATTACK")),  # e.g. Marksmen shoot twice
+	"war_machine": (torch.bool, lambda row: "SIEGE_WEAPON" in row.get("abilities", ())),
 }
 
 
@@ -273,15 +284,18 @@ def effect(unit, spell):
 	return (unit["effect_value"] * has).sum(dim=-1), has.any(dim=-1)
 
 
-def damage_range(attacker, target, shooting, tables):
+def damage_range(attacker, target, shooting, tables, dtype=torch.float64):
 	"""DamageCalculator::calculateDmgRange: the (min, max) damage of `attacker` hitting `target` (unit fields that
 	broadcast against each other), in double precision and in the engine's order of operations, so that it matches the
 	engine exactly. Charge distance 0 and no luck (as in the engine's estimates, battleEstimateDamage).
 
 	Not computed (0 here): hero skills and artifacts (Offense, Archery, Armorer: hidden for the enemy hero), Slayer,
 	hate of traits, back attacks, HotA's Revenge, walls (sieges), arrow towers and war machines.
+
+	dtype: float64 matches the engine exactly (StupidAI); float32 (the learned model, on a GPU without float64) can be
+	off by one where the engine's result is a whole number.
 	"""
-	f64 = torch.float64
+	f64 = dtype
 	# Base damage per creature, Bless and Curse (getBaseDamageBlessCurse), times the creatures
 	curse, cursed = effect(attacker, CURSE)
 	bless, blessed = effect(attacker, BLESS)
@@ -401,3 +415,51 @@ def reachability(x, me, flying):
 		new_key = torch.where(new, best_key, never)
 		queue_rank = torch.where(new, (new_key[:, None, :] < new_key[:, :, None]).sum(dim=-1), 0)
 	return torch.where(flying[:, None], fly_distance, distance), torch.where(flying[:, None], fly_from, came_from)
+
+
+def kills(damage, unit):
+	"""The creatures `damage` kills (DamageCalculator::getCasualties): the top one if it covers its hit points left,
+	then one per full max hit points, at most all of them."""
+	max_hp = unit["max_hp"].clamp(min=1)
+	more = torch.div((damage - unit["first_hp"]).clamp(min=0), max_hp, rounding_mode="floor")
+	return torch.where(damage >= unit["first_hp"], torch.minimum(1 + more, unit["count"].to(more.dtype)), torch.zeros_like(more))
+
+
+def unit_value(unit, tables):
+	"""A stack's value in gold as the reward counts it: the creature's price times its creatures, the top one counted
+	by its health left; 0 when dead or empty."""
+	health = (unit["count"] - 1).float() + unit["first_hp"].float() / unit["max_hp"].clamp(min=1).float()
+	return torch.where(unit["alive"] & (unit["count"] > 0), tables["value"][unit["creature"]] * health, torch.zeros_like(health))
+
+
+def smallest(x, dim=-1):
+	"""x.amin(dim) for a short axis, as elementwise minimums: torch's integer amin over a short last axis is ~100x slower
+	on the CPU."""
+	parts = x.unbind(dim)
+	result = parts[0]
+	for part in parts[1:]:
+		result = torch.minimum(result, part)
+	return result
+
+
+def walk_distances(open_, sources, steps):
+	"""Breadth-first distances [..., N_HEXES] from the source hexes (bool [..., N_HEXES]) over the open hexes (the
+	sources count as open), INFINITE_DISTANCE beyond `steps` steps; any leading dimensions (e.g. one per unit)."""
+	neighbour = NEIGHBOURS.to(open_.device)
+	on_field = neighbour >= 0
+	distance = torch.where(sources, 0, INFINITE_DISTANCE)
+	for _ in range(steps):
+		around = distance[..., neighbour.clamp(min=0)]  # [..., H, 6]
+		around = torch.where(on_field, around, INFINITE_DISTANCE)
+		closer = smallest(around) + 1
+		distance = torch.where((open_ | sources) & (closer < distance), closer, distance)
+	return distance
+
+
+def fly_distances(open_, source_hexes):
+	"""Straight distances [..., N_HEXES] from the nearest of source_hexes ([..., S], -1 = none) to every open hex
+	(a flyer goes over anything), INFINITE_DISTANCE to the others."""
+	hexes = torch.arange(N_HEXES, device=open_.device)
+	steps = hex_distance(source_hexes[..., :, None], hexes)  # [..., S, H]
+	steps = smallest(torch.where(source_hexes[..., :, None] >= 0, steps, INFINITE_DISTANCE), dim=-2)
+	return torch.where(open_ | (steps == 0), steps, INFINITE_DISTANCE)

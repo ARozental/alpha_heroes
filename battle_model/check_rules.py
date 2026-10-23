@@ -1,8 +1,9 @@
-"""Play battles in VCMI with the hand-made rules alone, an untrained model (its rule weights as set, everything
-else random), and check in the records that each rule did what it says:
+"""Play battles in VCMI with the hand-made rules alone, an untrained model.BattleModel whose first-order rule weights
+make the rule (everything else as initialised), and check in the records that each rule did what it says:
 
-  kill rule  at every decision where the acting unit could kill an enemy stack whatever the dice, it attacked the
-             most valuable such stack, and that stack was dead at our next decision.
+  kill rule  sure_kill and value_destroyed at 1000 for melee and shot targets: at every decision where the acting unit
+             could kill an enemy stack whatever the dice, it attacked the most valuable such stack, and that stack
+             was dead at our next decision.
 
 	.venv/bin/python -m battle_model.check_rules [--scenario PATH] [--seeds N] [--opponent BattleAI]
 
@@ -78,6 +79,8 @@ def main():
 
 	torch.manual_seed(args.model_seed)
 	model = BattleModel().eval()
+	for head in ("melee_target", "shoot_target"):
+		model.set_rule_weights(head, sure_kill=1000.0, value_destroyed=1000.0)
 	work = Path(tempfile.mkdtemp(prefix="check-rules-", dir=ROOT / "runtime"))
 	battle_map = play.build_map(args.scenario, variant="check-rules")
 	try:
@@ -90,7 +93,7 @@ def main():
 		shutil.rmtree(work, ignore_errors=True)
 		(play.USER_DIR / (battle_map + ".vmap")).unlink(missing_ok=True)
 
-	tables = model.creature_tables()
+	tables = model.tables()
 	totals = np.zeros(4, dtype=int)
 	decisions = 0
 	failed = False
