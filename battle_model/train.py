@@ -8,11 +8,15 @@ Each epoch:
   1. export the current model to ONNX (the C++ battle AI plays with it),
   2. play games_per_side battles per scenario side, all in parallel (we attack with sides[0], we defend
      with sides[1]), with VCMI's seed fixed per side, so only our own (sampled) choices differ between
-     the battles of a side and between epochs,
+     the battles of a side and between epochs. With opponent=self (self-play) our model plays both sides
+     of games_per_side battles, half with each side's seed, and learns from both sides' records,
   3. turn the records into training examples (data.py) and update the model with PPO (losses.py),
   4. log both battles' rewards and outcomes to <run dir>/progress.csv and TensorBoard
      (<run dir>/tensorboard/<start time>: one folder per start, so a restarted run never mixes with old
      data a running TensorBoard still holds in memory), delete the records.
+  5. every eval_every epochs (and before the first), an eval round, not trained on: games_per_side
+     sampled battles per side plus one greedy battle per side against eval_opponent (BattleAI) on the
+     fixed game_seeds, logged to <run dir>/eval.csv and under eval/ in TensorBoard.
 
 Rewards are logged on the -1..1 scale (reward.to_scale: -1 = worst possible, +1 = best possible), the
 raw reward next to them.
@@ -43,7 +47,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from . import play
-from .data import make_dataloader
+from .data import make_dataloader, read_events, summarize
 from .export import export
 from .losses import AdvantageConfig, PPOConfig, ppo_loss
 from .model import BattleModel
@@ -57,8 +61,10 @@ class TrainConfig:
 	scenario: str = str(ROOT / "battle_model" / "scenarios" / "castle_vs_inferno.json")
 	run: str = "castle_vs_inferno"
 	epochs: int = 1000
-	opponent: str = "BattleAI"
+	opponent: str = "BattleAI"  # who we train against; "self" (play.SELF_PLAY): our model on both sides, learning from both
 	ai: str = "AlphaBattleAI"  # play.Game.ai
+	eval_every: int = 10  # epochs between eval rounds against eval_opponent; 0 = none
+	eval_opponent: str = "BattleAI"
 	game_seeds: tuple = (1, 2)  # VCMI seed of the attack battles and of the defence battles: fixed, so the test is about learning, not luck
 	games_per_side: int = 8  # battles per side per epoch, played in parallel; 1 (~40 decisions an update) was far too noisy
 	# Give every battle its own random VCMI seed instead of game_seeds (dice, obstacles and the opponent's
@@ -118,6 +124,23 @@ TENSORBOARD_TAGS = {
 }
 
 
+EVAL_COLUMNS = [
+	"epoch", "attack_win_rate", "defence_win_rate", "attack_reward", "defence_reward", "mean_reward", "attack_outcome", "defence_outcome",
+	"attack_greedy_outcome", "defence_greedy_outcome", "attack_greedy_reward", "defence_greedy_reward", "seconds",
+]  # eval.csv: sampled battles (win rate, mean reward -1..1, outcomes) and the one greedy battle, per side
+
+
+def log_eval_tensorboard(writer, row):
+	epoch = int(row["epoch"])
+	for name in ("attack", "defence"):
+		writer.add_scalar(f"eval/won/{name}", float(row[f"{name}_win_rate"]), epoch)
+		writer.add_scalar(f"eval/reward/{name}", float(row[f"{name}_reward"]), epoch)
+		writer.add_scalar(f"eval/won_greedy/{name}", float(row[f"{name}_greedy_outcome"] == "WIN"), epoch)
+		writer.add_scalar(f"eval/reward_greedy/{name}", float(row[f"{name}_greedy_reward"]), epoch)
+	writer.add_scalar("eval/reward/mean", float(row["mean_reward"]), epoch)
+	writer.flush()
+
+
 def log_tensorboard(writer, row):
 	"""One epoch's progress row as TensorBoard scalars; empty columns are skipped."""
 	epoch = int(row["epoch"])
@@ -173,6 +196,49 @@ def follow(run, poll_seconds=10, idle_minutes=10):
 	writer.close()
 
 
+def play_with_retries(games, model_path, records, config, label):
+	"""play.play with up to config.attempts tries (a battle can fail or stall); the record dirs."""
+	for attempt in range(1, config.attempts + 1):
+		try:
+			shutil.rmtree(records, ignore_errors=True)
+			return play.play(games, model_path, records)
+		except RuntimeError as error:  # a battle failed or stalled; its runner folder is kept for debugging
+			print(f"{label}: attempt {attempt} failed: {str(error)[:300]}", flush=True)
+			if attempt == config.attempts:
+				raise
+
+
+def eval_round(model, epoch, out, battle_map, config):
+	"""Play the eval battles against config.eval_opponent with the current model; the eval.csv row."""
+	started = time.time()
+	model_path = out / "eval.onnx"
+	export(model, model_path)
+	n = config.games_per_side
+	games = [
+		play.Game(config.scenario, our_side=side, opponent=config.eval_opponent, game_seed=config.game_seeds[side], sampler_seed=10**7 + (2 * epoch + side) * (n + 1) + g, temperature=0.0 if g == n else 1.0, ai=config.ai, map=battle_map)
+		for side in (0, 1)
+		for g in range(n + 1)
+	]  # g == n: the greedy battle
+	records = out / "records" / f"eval_{epoch}"
+	dirs = play_with_retries(games, model_path, records, config, f"eval {epoch}")
+	summaries = [summarize(read_events(d)) for d in dirs]
+	shutil.rmtree(records, ignore_errors=True)
+	row = {"epoch": epoch}
+	sampled_all = []
+	for side, name in ((0, "attack"), (1, "defence")):
+		sampled = [s for game, s in zip(games, summaries) if game.our_side == side and game.temperature > 0]
+		greedy = next(s for game, s in zip(games, summaries) if game.our_side == side and game.temperature == 0)
+		sampled_all += sampled
+		row[f"{name}_win_rate"] = round(sum(s.outcome == Outcome.WIN for s in sampled) / len(sampled), 4)
+		row[f"{name}_reward"] = round(to_scale(sum(s.reward for s in sampled) / len(sampled), config.reward), 4)
+		row[f"{name}_outcome"] = outcome_text(sampled)
+		row[f"{name}_greedy_outcome"] = greedy.outcome.name
+		row[f"{name}_greedy_reward"] = round(to_scale(greedy.reward, config.reward), 4)
+	row["mean_reward"] = round(to_scale(sum(s.reward for s in sampled_all) / len(sampled_all), config.reward), 4)
+	row["seconds"] = round(time.time() - started, 1)
+	return row
+
+
 def model_kwargs(config):
 	return {"dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features}
 
@@ -204,7 +270,20 @@ def train(config, resume=False):
 		with progress.open("w", newline="") as f:
 			csv.writer(f).writerow(COLUMNS)
 	writer = SummaryWriter(out / "tensorboard" / time.strftime("%Y%m%d-%H%M%S"))
+	eval_csv = out / "eval.csv"
+	if not eval_csv.exists() or not resume:
+		with eval_csv.open("w", newline="") as f:
+			csv.writer(f).writerow(EVAL_COLUMNS)
 
+	def evaluate_now(epoch):
+		row = eval_round(model, epoch, out, battle_map, config)
+		with eval_csv.open("a", newline="") as f:
+			csv.writer(f).writerow([row[c] for c in EVAL_COLUMNS])
+		log_eval_tensorboard(writer, row)
+		print(f"eval  {epoch:4d}  vs {config.eval_opponent}: attack won {row['attack_win_rate']:.2f} (greedy {row['attack_greedy_outcome']})  defence won {row['defence_win_rate']:.2f} (greedy {row['defence_greedy_outcome']})  {row['seconds']}s", flush=True)
+
+	if config.eval_every and first_epoch == 1:
+		evaluate_now(0)  # the untrained model
 	for epoch in range(first_epoch, config.epochs + 1):
 		started = time.time()
 		if config.lr_schedule == "linear":
@@ -214,22 +293,21 @@ def train(config, resume=False):
 		export(model, model_path)
 
 		seeds = random.Random(epoch)
-		games = []
-		for side in (0, 1):
-			for g in range(config.games_per_side):
-				game_seed = seeds.randrange(1, 2**31) if config.random_seeds else config.game_seeds[side]
-				games.append(play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=game_seed, sampler_seed=(2 * epoch + side) * config.games_per_side + g, ai=config.ai, map=battle_map))
+		seed_for = lambda side: seeds.randrange(1, 2**31) if config.random_seeds else config.game_seeds[side]
+		if config.opponent == play.SELF_PLAY:  # each battle records both sides: half the battles with each side's seed
+			games = [
+				play.Game(config.scenario, our_side=0, opponent=play.SELF_PLAY, game_seed=seed_for(g % 2), sampler_seed=2 * epoch * config.games_per_side + g, ai=config.ai, map=battle_map)
+				for g in range(config.games_per_side)
+			]
+		else:
+			games = [
+				play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=seed_for(side), sampler_seed=(2 * epoch + side) * config.games_per_side + g, ai=config.ai, map=battle_map)
+				for side in (0, 1)
+				for g in range(config.games_per_side)
+			]
 		records = out / "records" / f"epoch_{epoch}"
-		for attempt in range(1, config.attempts + 1):
-			try:
-				shutil.rmtree(records, ignore_errors=True)
-				dirs = play.play(games, model_path, records)
-				loader, summaries, _ = make_dataloader(dirs, config.batch_size, True, reward_config, advantage_config)
-				break
-			except RuntimeError as error:  # a battle failed or stalled; its runner folder is kept for debugging
-				print(f"epoch {epoch}: attempt {attempt} failed: {str(error)[:300]}", flush=True)
-				if attempt == config.attempts:
-					raise
+		dirs = play_with_retries(games, model_path, records, config, f"epoch {epoch}")
+		loader, summaries, _ = make_dataloader(dirs, config.batch_size, True, reward_config, advantage_config)
 
 		weights_before = flat_weights(model)
 		parts_sum, batches = {"policy": 0.0, "value": 0.0, "entropy": 0.0, "approx_kl": 0.0, "clip_fraction": 0.0}, 0
@@ -247,7 +325,7 @@ def train(config, resume=False):
 				batches += 1
 		model.eval()
 
-		by_side = [[s for game, s in zip(games, summaries) if game.our_side == side] for side in (0, 1)]
+		by_side = [[s for s in summaries if s.our_side == side] for side in (0, 1)]
 		average = lambda values: sum(values) / len(values)
 		mean = {key: value / max(batches, 1) for key, value in parts_sum.items()}
 		row = {
@@ -283,6 +361,8 @@ def train(config, resume=False):
 		)
 
 		shutil.rmtree(records, ignore_errors=True)
+		if config.eval_every and epoch % config.eval_every == 0:
+			evaluate_now(epoch)
 		save_checkpoint(latest, model, optimizer, epoch, config)
 		if epoch % config.checkpoint_every == 0:
 			save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config)

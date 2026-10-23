@@ -117,6 +117,8 @@ of the scenario's map). Any config field can be set with `--set`, including `ppo
 ```sh
 .venv/bin/python -m battle_model.train --run NAME            # 8 battles per side per epoch, fixed seeds
 .venv/bin/python -m battle_model.train --run NAME --set random_seeds=true   # a fresh VCMI seed for every battle
+.venv/bin/python -m battle_model.train --run NAME --set opponent=self       # self-play: our model on both sides, learning from both
+# every eval_every (10) epochs an eval round against BattleAI (not trained on): eval.csv and eval/* in TensorBoard
 .venv/bin/python -m battle_model.evaluate runtime/train/NAME/checkpoint_latest.pt --temperature 0   # greedy
 .venv/bin/python -m battle_model.evaluate runtime/train/NAME/checkpoint_latest.pt --games 16 --map Maps/alpha/castle_vs_inferno-NAME
 ```

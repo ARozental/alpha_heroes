@@ -40,6 +40,19 @@ std::string envString(const char * name)
 	return value ? std::string(value) : std::string();
 }
 
+/// ALPHA_BATTLE_<NAME>_<COLOR> (e.g. ALPHA_BATTLE_RECORD_DIR_BLUE) overrides ALPHA_BATTLE_<NAME> for one player,
+/// so that two AlphaBattleAIs in one game (self-play) can use their own model, seed and record folder
+std::string playerSetting(const CBattleCallback & cb, const std::string & name)
+{
+	if(const auto player = cb.getPlayerID(); player && player->isValidPlayer())
+	{
+		auto perPlayer = envString((name + "_" + boost::to_upper_copy(player->toString())).c_str());
+		if(!perPlayer.empty())
+			return perPlayer;
+	}
+	return envString(name.c_str());
+}
+
 std::atomic<int> dumpedDecisions{0};
 }
 
@@ -59,17 +72,17 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 	fallback->initBattleInterface(ENV, CB);
 	CB->waitTillRealize = false;
 
-	const auto seed = envString("ALPHA_BATTLE_SEED");
+	const auto seed = playerSetting(*CB, "ALPHA_BATTLE_SEED");
 	rng.seed(seed.empty() ? std::random_device{}() : static_cast<unsigned>(std::stoul(seed)));
-	const auto temp = envString("ALPHA_BATTLE_TEMPERATURE");
+	const auto temp = playerSetting(*CB, "ALPHA_BATTLE_TEMPERATURE");
 	temperature = temp.empty() ? 1.0f : std::stof(temp);
 
-	std::stringstream faultList(envString("ALPHA_BATTLE_TEST_FAULT"));
+	std::stringstream faultList(playerSetting(*CB, "ALPHA_BATTLE_TEST_FAULT"));
 	for(std::string fault; std::getline(faultList, fault, ',');)
 		if(!fault.empty())
 			faults.push_back(fault);
 
-	const auto prefixPath = envString("ALPHA_BATTLE_PREFIX");
+	const auto prefixPath = playerSetting(*CB, "ALPHA_BATTLE_PREFIX");
 	if(!prefixPath.empty())
 	{
 		std::ifstream file(prefixPath);
@@ -92,11 +105,11 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 		}
 	}
 
-	recordDir = envString("ALPHA_BATTLE_RECORD_DIR");
+	recordDir = playerSetting(*CB, "ALPHA_BATTLE_RECORD_DIR");
 	if(!recordDir.empty())
 		std::filesystem::create_directories(recordDir);
 
-	const auto path = envString("ALPHA_BATTLE_MODEL");
+	const auto path = playerSetting(*CB, "ALPHA_BATTLE_MODEL");
 	try
 	{
 		if(path.empty())

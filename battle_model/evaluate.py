@@ -38,8 +38,9 @@ def evaluate(model, scenario, seeds=(1, 2), games=8, temperature=1.0, sampler_se
 		battles = [play.Game(scenario, our_side=side, opponent=opponent, game_seed=seeds[side], sampler_seed=sampler_seed + i, temperature=temperature, ai=ai, map=battle_map) for side in (0, 1) for i in range(n)]
 		dirs = play.play(battles, work / "model.onnx", work / "records")
 		results = {0: [], 1: []}
-		for game, d in zip(battles, dirs):
-			results[game.our_side].append(summarize(read_events(d)))
+		for d in dirs:
+			summary = summarize(read_events(d))
+			results[summary.our_side].append(summary)
 		return results
 	finally:
 		shutil.rmtree(work, ignore_errors=True)
