@@ -251,6 +251,19 @@ def eval_round(model, epoch, out, battle_map, config):
 	return row
 
 
+def upgrade_csv(path, columns):
+	"""Rewrite a log written by an older version with the current columns (missing ones empty), so a resumed run appends cleanly."""
+	with path.open(newline="") as f:
+		reader = csv.DictReader(f)
+		if reader.fieldnames == columns:
+			return
+		rows = list(reader)
+	with path.open("w", newline="") as f:
+		writer = csv.DictWriter(f, columns, extrasaction="ignore")
+		writer.writeheader()
+		writer.writerows({c: row.get(c, "") for c in columns} for row in rows)
+
+
 def resolve_device(name):
 	if name != "auto":
 		return torch.device(name)
@@ -338,11 +351,15 @@ def train(config, resume=False):
 	if not progress.exists() or not resume:
 		with progress.open("w", newline="") as f:
 			csv.writer(f).writerow(COLUMNS)
+	else:
+		upgrade_csv(progress, COLUMNS)
 	writer = SummaryWriter(out / "tensorboard" / time.strftime("%Y%m%d-%H%M%S"))
 	eval_csv = out / "eval.csv"
 	if not eval_csv.exists() or not resume:
 		with eval_csv.open("w", newline="") as f:
 			csv.writer(f).writerow(EVAL_COLUMNS)
+	else:
+		upgrade_csv(eval_csv, EVAL_COLUMNS)
 
 	def evaluate_now(epoch):
 		row = eval_round(model, epoch, out, battle_map, config)
