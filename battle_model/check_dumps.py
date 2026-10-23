@@ -2,7 +2,7 @@
 
 	.venv/bin/python -m battle_model.check_dumps <dump dir> [--model PATH]
 
-For every decision_* directory (written when ALPHA_BATTLE_DUMP_DIR is set) it checks that:
+For every decision_* (a .npz, or a directory in older dumps; written when ALPHA_BATTLE_DUMP_DIR is set) it checks that:
   - every input/output tensor has the contract's dtype and shape,
   - the masks are consistent (each legal choice has legal follow-up choices, reserved types are off),
   - onnxruntime in Python produces the same outputs from the same inputs as the C++ side did,
@@ -10,15 +10,14 @@ For every decision_* directory (written when ALPHA_BATTLE_DUMP_DIR is set) it ch
 Exits non-zero on any failure.
 """
 import argparse
-import json
 import sys
 from collections import Counter
-from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
 import torch
 
+from . import data
 from .constants import RESERVED_ACTION_TYPES, SECOND_TARGET_KIND, ActionType, TargetKind
 from .distributions import is_legal, log_prob, stack_actions
 from .export import DEFAULT_PATH
@@ -28,13 +27,11 @@ DTYPES = {"int64": np.int64, "bool": np.bool_, "float32": np.float32}
 
 
 def load_decision(path):
-	tensors = {}
+	tensors, action = data.load_decision(path)
 	for spec in INPUTS + OUTPUTS:
-		array = np.load(path / f"{spec.name}.npy")
+		array = tensors[spec.name]
 		if array.dtype != DTYPES[spec.dtype] or array.shape != (1,) + spec.shape:
 			raise AssertionError(f"{spec.name}: dtype {array.dtype} shape {array.shape}, contract says {spec.dtype} {(1,) + spec.shape}")
-		tensors[spec.name] = array
-	action = json.loads((path / "action.json").read_text())
 	return tensors, action
 
 
@@ -76,9 +73,9 @@ def main():
 	args = parser.parse_args()
 
 	session = ort.InferenceSession(args.model, providers=["CPUExecutionProvider"])
-	decisions = sorted(Path(args.dump_dir).glob("decision_*"))
+	decisions = data.decision_paths(args.dump_dir)
 	if not decisions:
-		sys.exit(f"no decision_* directories in {args.dump_dir}")
+		sys.exit(f"no decision_* in {args.dump_dir}")
 
 	failures, worst, types = [], 0.0, Counter()
 	for path in decisions:

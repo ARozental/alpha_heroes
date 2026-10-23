@@ -12,8 +12,10 @@ From it we compute, for every decision:
 	value_labels  labels of all value heads (losses.value_targets), on the -1..1 scale
 and per battle a BattleSummary with the reward (reward.py) and the outcome.
 
-Records are the dense per-decision dumps for now (~0.2 MB a decision); training deletes them after each
-epoch. Keeping data across epochs will need the compact format (sparse masks, ~115 bytes a decision).
+A decision is one compressed decision_*.npz (a .npy per tensor plus action.json, ~15 KB; the tensors are
+mostly zeros and -inf); older records were a decision_* directory of .npy files (~0.3 MB on disk). Training
+deletes the records after each epoch. Keeping data across epochs will want the compact format (sparse
+masks, ~115 bytes a decision).
 """
 import json
 from dataclasses import dataclass, field
@@ -113,13 +115,28 @@ def summarize(events, hero_value=0.0, fresh_hero_value=0.0, config=RewardConfig(
 	return BattleSummary(our, outcome, reward, rounds, own_start, enemy_army_start, kept, enemy_lost, mana_used(end["our_mana"]), scores)
 
 
+def load_decision(path):
+	"""(tensors, action) of one recorded decision: every input and output tensor by name, with the batch axis."""
+	path = Path(path)
+	names = [s.name for s in INPUTS + OUTPUTS]
+	if path.suffix == ".npz":
+		with np.load(path) as archive:
+			return {name: archive[name] for name in names}, json.loads(archive["action.json"])
+	return {name: np.load(path / f"{name}.npy") for name in names}, json.loads((path / "action.json").read_text())
+
+
+def decision_paths(record_dir):
+	"""A record's decisions in the order they were made (decision_00000.npz, ...; or older decision_* directories)."""
+	return sorted(Path(record_dir).glob("decision_*"))
+
+
 def read_decisions(record_dir):
 	"""[(inputs, outputs, action)] in the order they were made; each inputs/outputs without the batch axis."""
 	decisions = []
-	for path in sorted(Path(record_dir).glob("decision_*")):
-		inputs = {s.name: np.load(path / f"{s.name}.npy")[0] for s in INPUTS}
-		outputs = {s.name: np.load(path / f"{s.name}.npy")[0] for s in OUTPUTS}
-		action = json.loads((path / "action.json").read_text())
+	for path in decision_paths(record_dir):
+		tensors, action = load_decision(path)
+		inputs = {s.name: tensors[s.name][0] for s in INPUTS}
+		outputs = {s.name: tensors[s.name][0] for s in OUTPUTS}
 		decisions.append((inputs, outputs, action))
 	return decisions
 
