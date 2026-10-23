@@ -64,6 +64,10 @@ class TrainConfig:
 	ai: str = "AlphaBattleAI"  # play.Game.ai
 	game_seeds: tuple = (1, 2)  # VCMI seed of the attack battles and of the defence battles: fixed, so the test is about learning, not luck
 	games_per_side: int = 1  # battles per side per epoch; they differ only by our sampling. More = less noisy updates
+	# Give every battle its own random VCMI seed instead of game_seeds (dice, obstacles and the opponent's
+	# choices differ): learning a strategy rather than one battle. Not with explore_from_best, whose replayed
+	# openings are only valid for the seed they were recorded with.
+	random_seeds: bool = False
 	# Of each side's games, how many first replay a random-length opening of that side's best battle so far and
 	# play on from there (Go-Explore: battles are deterministic, so this restores the state). They are trained
 	# on only from where the model takes over, and are not counted in the logged rewards and win rates.
@@ -198,6 +202,8 @@ def save_checkpoint(path, model, optimizer, epoch, config):
 def train(config, resume=False):
 	if config.explore_from_best >= config.games_per_side:
 		raise ValueError("explore_from_best must leave at least one game per side that starts from the beginning")
+	if config.random_seeds and config.explore_from_best:
+		raise ValueError("explore_from_best replays openings recorded with one VCMI seed: it needs fixed game_seeds")
 	out = run_dir(config)
 	out.mkdir(parents=True, exist_ok=True)
 	(out / "config.txt").write_text("\n".join(f"{k} = {v}" for k, v in asdict(config).items()) + "\n")
@@ -241,7 +247,8 @@ def train(config, resume=False):
 				prefix = ()
 				if g < config.explore_from_best and best[side] is not None and len(best[side].get("actions", ())) > 1:
 					prefix = tuple(best[side]["actions"][: openings.randrange(1, len(best[side]["actions"]))])
-				games.append(play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=config.game_seeds[side], sampler_seed=(2 * epoch + side) * config.games_per_side + g, ai=config.ai, prefix=prefix, map=battle_map))
+				game_seed = openings.randrange(1, 2**31) if config.random_seeds else config.game_seeds[side]
+				games.append(play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=game_seed, sampler_seed=(2 * epoch + side) * config.games_per_side + g, ai=config.ai, prefix=prefix, map=battle_map))
 				restarted.append(bool(prefix))
 		records = out / "records" / f"epoch_{epoch}"
 		for attempt in range(1, config.attempts + 1):
