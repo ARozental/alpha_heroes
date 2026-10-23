@@ -55,9 +55,13 @@ def verify(model, path, seeds=(1, 2, 3), batch_sizes=(1, 4)):
 	assert meta.get("schema_version") == str(SCHEMA_VERSION), meta
 	assert meta.get("contract_hash") == contract_hash(), meta
 
+	# The model may leave inputs out that it does not read (the exporter drops them; the C++ side passes only those
+	# a model declares), but the ones it has come in the contract's order
 	inputs = {i.name: i for i in session.get_inputs()}
-	assert tuple(inputs) == INPUT_NAMES, f"input names/order differ: {tuple(inputs)}"
+	assert tuple(inputs) == tuple(name for name in INPUT_NAMES if name in inputs), f"input names/order differ: {tuple(inputs)}"
 	for spec in INPUTS:
+		if spec.name not in inputs:
+			continue
 		got = inputs[spec.name]
 		assert got.type == ORT_TYPES[spec.dtype], (spec.name, got.type)
 		assert tuple(got.shape[1:]) == spec.shape, (spec.name, got.shape)
@@ -71,7 +75,7 @@ def verify(model, path, seeds=(1, 2, 3), batch_sizes=(1, 4)):
 	for seed in seeds:
 		for batch in batch_sizes:
 			x = random_inputs(batch=batch, seed=seed)
-			ort_out = dict(zip(OUTPUT_NAMES, session.run(list(OUTPUT_NAMES), x)))
+			ort_out = dict(zip(OUTPUT_NAMES, session.run(list(OUTPUT_NAMES), {k: v for k, v in x.items() if k in inputs})))
 			with torch.no_grad():
 				torch_out = model({k: torch.from_numpy(v) for k, v in x.items()})
 			for spec in OUTPUTS:

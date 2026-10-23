@@ -4,6 +4,7 @@
 
 #include "BattleSim.h"
 #include "Dump.h"
+#include "Encoder.h"
 #include "Policy.h"
 #include "Reward.h"
 
@@ -18,7 +19,6 @@ class CPlayerBattleCallback;
 VCMI_LIB_NAMESPACE_END
 
 class BattleModel;
-struct EncodedBattle;
 
 /// Battle AI that plays with an ONNX model implementing battle_model's contract.
 ///
@@ -33,8 +33,9 @@ struct EncodedBattle;
 ///   ALPHA_BATTLE_SEARCH_SIMULATIONS  > 0: search every decision with that many simulations (Gumbel AlphaZero,
 ///                             BattleSearch.h); the network's choice when the search fails. Default 0: no search
 ///   ALPHA_BATTLE_SEARCH_CONSIDERED   root actions the search starts with (default 16)
-///   ALPHA_BATTLE_DELEGATE     another battle AI (e.g. BattleAI) plays every decision; the battle's events are
-///                             still recorded (no decisions): results of other AIs, e.g. for baselines
+///   ALPHA_BATTLE_DELEGATE     another battle AI (e.g. BattleAI) plays every decision; the battle is still
+///                             recorded: its events, and each decision with the action the other AI took (the
+///                             outputs are our model's), e.g. for baselines and for checking battle_model/stupid_ai.py
 ///   ALPHA_BATTLE_TEST_FAULT   test hook, comma list: "surrender" / "spell" send one action per battle the
 ///                             server must reject, "decoder" corrupts one chosen action per battle
 ///
@@ -54,6 +55,8 @@ class AlphaBattleAI : public CBattleGameInterface
 	std::mt19937 rng;
 	float temperature = 1.0f;
 	bool delegated = false; // ALPHA_BATTLE_DELEGATE
+	std::unique_ptr<EncodedBattle> delegatePending; // the state the delegate was asked to act in, until its action starts
+	uint32_t delegateStack = 0;
 	bool wasWaitingForRealize = false;
 
 	// Rejection handling: actions excluded for the current unit's turn
@@ -148,6 +151,7 @@ public:
 
 	void battleStart(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2, int3 tile, const CGHeroInstance * hero1, const CGHeroInstance * hero2, BattleSide side, bool replayAllowed) override;
 	void battleEnd(const BattleID & battleID, const BattleResult * br, QueryID queryID) override;
+	void actionStarted(const BattleID & battleID, const BattleAction & action) override;
 	void actionFinished(const BattleID & battleID, const BattleAction & action) override;
 	void battleSpellCast(const BattleID & battleID, const BattleSpellCast * sc) override;
 	void battleNewRoundFirst(const BattleID & battleID) override;

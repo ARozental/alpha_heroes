@@ -77,7 +77,15 @@ JsonNode creatures()
 				node["cost"][RESOURCES[r]].Integer() = amount;
 		std::set<std::string> abilities; // creature-type bonuses, base stats included (PRIMARY_SKILL, STACK_HEALTH, ...)
 		for(const auto & bonus : c->getExportedBonusList())
+		{
 			abilities.insert(bonusName(bonus->type));
+			// Each bonus's subtype (e.g. the creature a HATE is against) and value (e.g. its percentage), for the rules
+			// battle_model/rules.py computes: {"HATE": [[subtype, value], ...], ...}
+			JsonNode pair;
+			pair.Vector().emplace_back(static_cast<si64>(bonus->subtype.getNum()));
+			pair.Vector().emplace_back(static_cast<si64>(bonus->val));
+			node["ability_values"][bonusName(bonus->type)].Vector().push_back(pair);
+		}
 		for(const auto & name : abilities)
 		{
 			JsonNode ability;

@@ -552,6 +552,48 @@ std::vector<ChosenAction> legalActions(const EncodedBattle & e)
 	return actions;
 }
 
+std::optional<ChosenAction> chosenAction(const EncodedBattle & e, const BattleAction & action)
+{
+	auto slotOf = [&](const BattleAction::DestinationInfo & d) -> int
+	{
+		for(int u = 0; u < MAX_UNITS; ++u)
+		{
+			const CStack * s = e.units[u];
+			if(s && ((d.unitValue >= 0 && static_cast<int>(s->unitId()) == d.unitValue) || (d.unitValue < 0 && s->alive() && s->coversPos(d.hexValue))))
+				return u;
+		}
+		return -1;
+	};
+	const auto & targets = action.target;
+	ChosenAction a;
+	switch(action.actionType)
+	{
+		case EActionType::WAIT: a.type = static_cast<int>(ActionType::WAIT); return a;
+		case EActionType::DEFEND: a.type = static_cast<int>(ActionType::DEFEND); return a;
+		case EActionType::WALK:
+			if(targets.empty())
+				return std::nullopt;
+			a.type = static_cast<int>(ActionType::MOVE);
+			a.hex = targets[0].hexValue.toInt();
+			return a;
+		case EActionType::WALK_AND_ATTACK: // makeMeleeAttack: the hex to attack from, then the target
+			if(targets.size() < 2)
+				return std::nullopt;
+			a.type = static_cast<int>(ActionType::MELEE);
+			a.hex = targets[0].hexValue.toInt();
+			a.unit = slotOf(targets[1]);
+			return a.unit >= 0 ? std::optional(a) : std::nullopt;
+		case EActionType::SHOOT:
+			if(targets.empty())
+				return std::nullopt;
+			a.type = static_cast<int>(ActionType::SHOOT);
+			a.unit = slotOf(targets[0]);
+			return a.unit >= 0 ? std::optional(a) : std::nullopt;
+		default:
+			return std::nullopt;
+	}
+}
+
 BattleAction engineAction(BattleSide side, const CStack * active, const ChosenAction & a, const std::function<const battle::Unit *(int)> & unit)
 {
 	auto target = [&](int i)

@@ -6,6 +6,7 @@
 #include "lib/constants/EntityIdentifiers.h"
 
 #include <functional>
+#include <optional>
 #include <vector>
 
 VCMI_LIB_NAMESPACE_BEGIN
@@ -47,6 +48,10 @@ bool isLegal(const EncodedBattle & e, const ChosenAction & action);
 
 /// Every legal full action, from the masks alone, in the order of battle_model/distributions.py enumerate_actions
 std::vector<ChosenAction> legalActions(const EncodedBattle & e);
+
+/// The model action of an engine action of the acting unit (in the slots of e), or nothing for actions the
+/// contract does not describe; for recording what another AI did (ALPHA_BATTLE_DELEGATE)
+std::optional<ChosenAction> chosenAction(const EncodedBattle & e, const BattleAction & action);
 
 /// The engine's action for a model action of unit `active` of side `side`. unit(i) is the unit an action field
 /// refers to (a unit slot of an encoding, or a unit id); throws for an unknown unit or action type.

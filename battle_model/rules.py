@@ -1,8 +1,12 @@
 """VCMI's battle rules as tensor ops on the raw model inputs: the numbers a hand-written battle AI works with,
 computed the way the engine computes them, for the model (model.py) to build on.
 
-So far: what the acting unit's attack does to every unit slot at least, whatever the dice, and with it which
-stacks it kills for sure.
+Here:
+	least_damage, cross_stack_features   what the acting unit's attack does at least, whatever the dice, and
+	                                     which stacks it kills for sure (the kill rule in model.py)
+	damage_range, after_damage           the engine's damage estimate (min, max), as BattleAI and StupidAI use it
+	reachability                         the engine's pathfinding: distances and the path back
+	geometry                             neighbours, two-hex units, available hexes
 
 The least damage of an attack. The engine (lib/battle/DamageCalculator.cpp, BattleInfo::getActualDamage) deals
 the average of min(10, count) rolls in the range
@@ -31,7 +35,7 @@ land just below it, so that case counts one less.
 import torch
 
 from . import vocab
-from .constants import CREATURE_VOCAB, FIELD_WIDTH
+from .constants import CREATURE_VOCAB, FIELD_WIDTH, N_HEXES
 from .reward import resources_value
 
 # config/gameConfig.json "combat", in exact steps: attack over defence adds 1/20 a point (0.05), at most 80 points
@@ -40,25 +44,59 @@ ATTACK_STEPS, ATTACK_POINTS_CAP = 20, 80
 DEFENSE_STEPS, DEFENSE_POINTS_CAP = 40, 28
 SHOOTING_PENALTY_DISTANCE = 10  # GameConstants::BATTLE_SHOOTING_PENALTY_DISTANCE
 
-# Spell effects (SpellID, config/spells/timed.json) that change the damage of an attack
+# Spell effects (SpellID, config/spells/timed.json) that change the damage of an attack or how a unit moves
 SHIELD, AIR_SHIELD, BLESS, CURSE, FORGETFULNESS = 27, 28, 41, 42, 61
+BLIND, PARALYZE, STONE_GAZE, FLY, QUICKSAND = 62, 74, 70, 6, 10
+MAGIC_ELEMENTAL, PSYCHIC_ELEMENTAL = 121, 120  # CreatureID: half damage against some targets (DamageCalculator)
+
+# EAccessibility and CObstacleInstance::EObstacleType values in the inputs (x_access, x_obstacle_type)
+ACCESSIBLE, GATE = 0, 4
+SPELL_CREATED, MOAT = 2, 3
+INFINITE_DISTANCE = 1_000_000  # ReachabilityInfo::INFINITE_DIST
+ATTACKER, DEFENDER = 0, 1
+
+
+# Per-creature tables (creature_tables): name -> (dtype, from a vocabulary row)
+def _ability_value(row, name, subtype=None):
+	"""Sum of the values of a creature's bonuses of type `name` (and of that subtype), from the vocabulary."""
+	return sum(v for s, v in row.get("ability_values", {}).get(name, ()) if subtype is None or s == subtype)
+
+
+CREATURE_TABLES = {
+	"value": (torch.float32, lambda row: resources_value(row.get("cost", {}))),
+	"shooter": (torch.bool, lambda row: "SHOOTER" in row.get("abilities", ())),
+	"flying": (torch.bool, lambda row: "FLYING" in row.get("abilities", ())),
+	"no_melee_penalty": (torch.bool, lambda row: "NO_MELEE_PENALTY" in row.get("abilities", ())),
+	"no_distance_penalty": (torch.bool, lambda row: "NO_DISTANCE_PENALTY" in row.get("abilities", ())),
+	"blocks_retaliation": (torch.bool, lambda row: "BLOCKS_RETALIATION" in row.get("abilities", ())),
+	"mind_immune": (torch.bool, lambda row: "MIND_IMMUNITY" in row.get("abilities", ())),
+	"spell_immunity_level": (torch.int64, lambda row: _ability_value(row, "LEVEL_SPELL_IMMUNITY")),
+	"enemy_defence_reduction": (torch.int64, lambda row: _ability_value(row, "ENEMY_DEFENCE_REDUCTION")),  # percent
+	"enemy_attack_reduction": (torch.int64, lambda row: _ability_value(row, "ENEMY_ATTACK_REDUCTION")),  # percent
+	"melee_reduction": (torch.int64, lambda row: _ability_value(row, "GENERAL_DAMAGE_REDUCTION", 0)),  # percent, damageTypeMelee
+	"ranged_reduction": (torch.int64, lambda row: _ability_value(row, "GENERAL_DAMAGE_REDUCTION", 1)),  # damageTypeRanged
+	"all_reduction": (torch.int64, lambda row: _ability_value(row, "GENERAL_DAMAGE_REDUCTION", -1)),  # damageTypeAll
+	"damage_cap": (torch.int64, lambda row: _ability_value(row, "DAMAGE_RECEIVED_CAP")),  # percent of max health
+}
 
 
 def creature_tables(path=vocab.VOCAB_PATH):
-	"""Per creature id, from the vocabulary: its value in gold (reward.py prices) and the abilities the rules use.
+	"""Per creature id, from the vocabulary: its value in gold (reward.py prices) and the abilities the rules use
+	(CREATURE_TABLES), [CREATURE_VOCAB + 1] each; and "hate": [attacker, target] its HATE percentage.
 
-	Rows [CREATURE_VOCAB + 1]; the last row (and every row without a vocabulary) is a creature worth 0 with none.
+	The last row (and every row without a vocabulary) is a creature worth 0 with no abilities.
 	"""
-	tables = {name: torch.zeros(CREATURE_VOCAB + 1, dtype=dtype) for name, dtype in (("value", torch.float32), ("shooter", torch.bool), ("no_melee_penalty", torch.bool), ("no_distance_penalty", torch.bool))}
+	tables = {name: torch.zeros(CREATURE_VOCAB + 1, dtype=dtype) for name, (dtype, _) in CREATURE_TABLES.items()}
+	tables["hate"] = torch.zeros(CREATURE_VOCAB + 1, CREATURE_VOCAB + 1, dtype=torch.int64)
 	if not path.exists():
 		return tables
-	for c in vocab.tables(path)["creatures"].values():
-		if 0 <= c["id"] < CREATURE_VOCAB:
-			abilities = set(c.get("abilities", ()))
-			tables["value"][c["id"]] = resources_value(c.get("cost", {}))
-			tables["shooter"][c["id"]] = "SHOOTER" in abilities
-			tables["no_melee_penalty"][c["id"]] = "NO_MELEE_PENALTY" in abilities
-			tables["no_distance_penalty"][c["id"]] = "NO_DISTANCE_PENALTY" in abilities
+	for row in vocab.tables(path)["creatures"].values():
+		if 0 <= row["id"] < CREATURE_VOCAB:
+			for name, (_, value) in CREATURE_TABLES.items():
+				tables[name][row["id"]] = value(row)
+			for target, percent in row.get("ability_values", {}).get("HATE", ()):
+				if 0 <= target < CREATURE_VOCAB:
+					tables["hate"][row["id"], target] += percent
 	return tables
 
 
@@ -154,3 +192,212 @@ def cross_stack_features(x, tables):
 		"value": value,
 		"value_share": value / own_total.clamp(min=1.0),
 	}
+
+
+# ---- Geometry (lib/battle/BattleHex.h, BattleHexArray.cpp, Unit.cpp) ----
+
+FIELD_HEIGHT = N_HEXES // FIELD_WIDTH
+
+
+def _step(hex_, direction):
+	"""BattleHex::cloneInDirection for one hex (python ints): the neighbour, or -1 off the field.
+	Directions in BattleHex::hexagonalDirections order: top left, top right, right, bottom right, bottom left, left."""
+	y, x = divmod(hex_, FIELD_WIDTH)
+	odd = y % 2
+	nx, ny = [(x - 1 if odd else x, y - 1), (x if odd else x + 1, y - 1), (x + 1, y), (x if odd else x + 1, y + 1), (x - 1 if odd else x, y + 1), (x - 1, y)][direction]
+	return ny * FIELD_WIDTH + nx if 0 <= nx < FIELD_WIDTH and 0 <= ny < FIELD_HEIGHT else -1
+
+
+TOP_LEFT, TOP_RIGHT, RIGHT, BOTTOM_RIGHT, BOTTOM_LEFT, LEFT = range(6)
+# [N_HEXES, 6]: each hex's neighbours in direction order, -1 off the field (getNeighbouringTiles keeps the others in this order)
+NEIGHBOURS = torch.tensor([[_step(h, d) for d in range(6)] for h in range(N_HEXES)])
+# [N_HEXES, 8] per side: the hexes around a two-hex unit standing on a hex (getNeighbouringTilesDoubleWide), -1 padded
+_wide = {
+	ATTACKER: lambda h: [_step(h, d) for d in range(5)] + [_step(h - 1, d) if h - 1 >= 0 else -1 for d in (BOTTOM_LEFT, LEFT, TOP_LEFT)],
+	DEFENDER: lambda h: [_step(h, TOP_LEFT)] + [_step(h + 1, d) if h + 1 < N_HEXES else -1 for d in range(5)] + [_step(h, BOTTOM_LEFT), _step(h, LEFT)],
+}
+WIDE_NEIGHBOURS = torch.stack([torch.tensor([[n for n in _wide[side](h)] for h in range(N_HEXES)]) for side in (ATTACKER, DEFENDER)])
+
+
+def neighbours(hexes):
+	"""[..., 6] the neighbours of hexes (any shape, -1 = none), -1 off the field."""
+	return torch.where(hexes[..., None] >= 0, NEIGHBOURS.to(hexes.device)[hexes.clamp(min=0)], -1)
+
+
+def available(hexes):
+	"""BattleHex::isAvailable: on the field and not in the first or last column."""
+	column = hexes % FIELD_WIDTH
+	return (hexes >= 0) & (hexes < N_HEXES) & (column > 0) & (column < FIELD_WIDTH - 1)
+
+
+def rear_hex(hexes, side):
+	"""Unit::occupiedHex: the second hex of a two-hex unit of `side` standing on hexes (attackers face right, so
+	their second hex is on the left)."""
+	return torch.where(side == ATTACKER, hexes - 1, hexes + 1)
+
+
+def lookup(table, hexes, fill=False):
+	"""table[b, hexes[b, ...]] for a [B, N_HEXES] table; fill where hexes is off the field."""
+	batch = torch.arange(table.shape[0], device=table.device).view(-1, *([1] * (hexes.dim() - 1)))
+	on_field = (hexes >= 0) & (hexes < table.shape[1])
+	values = table[batch, hexes.clamp(0, table.shape[1] - 1)]
+	if values.dtype == torch.bool:  # (onnxruntime has no Where for booleans)
+		return (values | ~on_field) if fill else (values & on_field)
+	return torch.where(on_field, values, torch.zeros_like(values) + (int(fill) if isinstance(fill, bool) else fill))
+
+
+# ---- The damage estimate (lib/battle/DamageCalculator.cpp calculateDmgRange) ----
+
+def units_of(x, tables):
+	"""The unit fields the damage rules use, [B, U] each, as the engine reads them."""
+	creature = torch.where((x["u_creature"] >= 0) & (x["u_creature"] < CREATURE_VOCAB), x["u_creature"], torch.full_like(x["u_creature"], CREATURE_VOCAB))
+	return {
+		"creature": creature, "side": x["u_side"], "hex": x["u_hex"], "rear": x["u_rear_hex"],
+		"alive": (x["u_present"] != 0) & (x["u_alive"] != 0), "retaliations": x["u_retaliations"], "speed": x["u_speed"],
+		"count": x["u_count"], "first_hp": x["u_first_hp"], "max_hp": x["u_max_hp"],
+		"attack": x["u_attack"], "defense": x["u_defense"], "dmg_min": x["u_dmg_min"], "dmg_max": x["u_dmg_max"],
+		"effect_id": x["u_effect_id"], "effect_value": x["u_effect_value"],
+		**{name: tables[name][creature] for name in CREATURE_TABLES},
+	}
+
+
+def select(units, index):
+	"""The fields of one unit per battle (index [B]), shaped [B, 1] to broadcast against every unit."""
+	batch = torch.arange(index.shape[0], device=index.device)
+	return {k: v[batch, index][:, None] for k, v in units.items()}
+
+
+def effect(unit, spell):
+	"""(value of the spell's effect on the unit, whether it has it), for unit fields shaped [..., E]."""
+	has = unit["effect_id"] == spell
+	return (unit["effect_value"] * has).sum(dim=-1), has.any(dim=-1)
+
+
+def damage_range(attacker, target, shooting, tables):
+	"""DamageCalculator::calculateDmgRange: the (min, max) damage of `attacker` hitting `target` (unit fields that
+	broadcast against each other), in double precision and in the engine's order of operations, so that it matches the
+	engine exactly. Charge distance 0 and no luck (as in the engine's estimates, battleEstimateDamage).
+
+	Not computed (0 here): hero skills and artifacts (Offense, Archery, Armorer: hidden for the enemy hero), Slayer,
+	hate of traits, back attacks, HotA's Revenge, walls (sieges), arrow towers and war machines.
+	"""
+	f64 = torch.float64
+	# Base damage per creature, Bless and Curse (getBaseDamageBlessCurse), times the creatures
+	curse, cursed = effect(attacker, CURSE)
+	bless, blessed = effect(attacker, BLESS)
+	shift = bless - curse
+	low, high = (attacker["dmg_min"] + shift).clamp(min=1), (attacker["dmg_max"] + shift).clamp(min=1)
+	low, high = torch.where(cursed & ~blessed, low, torch.where(blessed & ~cursed, high, low)), torch.where(cursed & ~blessed, low, torch.where(blessed & ~cursed, high, high))
+	low, high = low * attacker["count"], high * attacker["count"]
+
+	# Attack and defence as they count (getActorAttackEffective, getTargetDefenseEffective)
+	attack, defense = attacker["attack"], target["defense"]
+	attack_cut = (attack * target["enemy_attack_reduction"] + 100 // 2 - 1) // 100  # vstd::divideAndRound
+	attack = attack - torch.where(target["enemy_attack_reduction"] > 0, torch.minimum(attack_cut, attack), torch.zeros_like(attack))
+	defense_cut = torch.floor(attacker["enemy_defence_reduction"].to(f64) / 100.0 * defense.to(f64)).long() + 1
+	defense = defense - torch.where(attacker["enemy_defence_reduction"] > 0, torch.minimum(defense_cut, defense), torch.zeros_like(defense))
+	advantage = (attack - defense).to(f64)
+
+	# Attack factors, added (getAttackFactors): attack over defence, hate
+	skill_bonus = torch.where(advantage > 0, torch.clamp(0.05 * advantage, max=4.0), torch.zeros_like(advantage))
+	hate = tables["hate"][attacker["creature"], target["creature"]].to(f64) / 100.0
+	attack_total = 1.0 + skill_bonus + hate
+
+	# Defence factors, multiplied in the engine's order (getDefenseFactors)
+	shield, _ = effect(target, SHIELD)
+	air_shield, under_air_shield = effect(target, AIR_SHIELD)
+	_, forgetful = effect(attacker, FORGETFULNESS)
+	blind, _ = effect(attacker, BLIND)
+	paralyzed, _ = effect(attacker, PARALYZE)
+	petrified, _ = effect(target, STONE_GAZE)
+	near = (hex_distance(attacker["hex"], target["hex"]) <= SHOOTING_PENALTY_DISTANCE) | ((target["rear"] >= 0) & (hex_distance(attacker["hex"], target["rear"]) <= SHOOTING_PENALTY_DISTANCE))
+	far = ~near & ~attacker["no_distance_penalty"]
+	half = torch.full_like(advantage, 0.5)
+	zero = torch.zeros_like(advantage)
+	factors = [
+		torch.where(advantage < 0, torch.clamp(0.025 * -advantage, max=0.7), zero),  # defence over attack
+		target["all_reduction"].to(f64) / 100.0,  # armorer-like abilities
+		torch.where(shooting, air_shield + target["ranged_reduction"], shield + target["melee_reduction"]).to(f64) / 100.0,  # Shield, Air Shield
+		torch.where(shooting, torch.where(far | under_air_shield, half, zero), torch.where(attacker["shooter"] & ~attacker["no_melee_penalty"], half, zero)),  # range, melee penalty
+		(blind + paralyzed).to(f64) / 100.0,  # GENERAL_ATTACK_REDUCTION on the attacker (a blinded unit retaliating)
+		torch.where(shooting & forgetful, half, zero),
+		petrified.to(f64) / 100.0,
+		torch.where((attacker["creature"] == MAGIC_ELEMENTAL) & (target["spell_immunity_level"] >= 5), half, zero),
+		torch.where((attacker["creature"] == PSYCHIC_ELEMENTAL) & target["mind_immune"], half, zero),
+	]
+	defense_total = torch.ones_like(advantage)
+	for factor in factors:
+		defense_total = defense_total * (1 - torch.clamp(factor, max=1.0))
+	factor = attack_total * defense_total
+
+	low = torch.floor(low.to(f64) * factor).long().clamp(min=1)
+	high = torch.floor(high.to(f64) * factor).long().clamp(min=1)
+	cap = target["max_hp"] * target["damage_cap"] // 100
+	low = torch.where(target["damage_cap"] > 0, torch.minimum(low, cap), low)
+	high = torch.where(target["damage_cap"] > 0, torch.minimum(high, cap), high)
+	return low, high
+
+
+def total_health(unit):
+	return torch.where(unit["count"] > 0, (unit["count"] - 1) * unit["max_hp"] + unit["first_hp"], torch.zeros_like(unit["count"]))
+
+
+def after_damage(unit, damage):
+	"""The unit fields after taking `damage` (CHealth::damage): fewer creatures, the top one hurt."""
+	left = (total_health(unit) - damage).clamp(min=0)
+	max_hp = unit["max_hp"].clamp(min=1)
+	count = (left + max_hp - 1) // max_hp
+	return {**unit, "count": count, "first_hp": torch.where(count > 0, left - (count - 1) * max_hp, torch.zeros_like(left))}
+
+
+# ---- Pathfinding (CBattleInfoCallback::getReachability, makeBFS, getFlyingReachability) ----
+
+MAX_PATH = 64  # steps the search follows; no path on a battlefield is longer
+
+
+def reachability(x, me, flying):
+	"""The engine's reachability of unit `me` (unit fields [B, 1]) from where it stands: (distances [B, N_HEXES], with
+	INFINITE_DISTANCE where it cannot go; predecessors [B, N_HEXES], the hex before on the path, -1 if none).
+
+	Walking: the engine's breadth-first search, so that the predecessors are the engine's too: a hex's predecessor is
+	the first hex the search took from its queue that leads to it (queue order: discovery order, neighbours in
+	direction order). Flying: every hex it may stand on, at its hex distance, reached straight from the start.
+	A hex is open if the battlefield marks it accessible (x_access; the gate only for the defender) or it is the
+	unit's own; a two-hex unit needs its second hex open too. Moat and quicksand stop a walk (getStoppers).
+	"""
+	batch = x["x_access"].shape[0]
+	hexes = torch.arange(N_HEXES, device=x["x_access"].device).expand(batch, N_HEXES)
+	start, side = me["hex"][:, 0], me["side"][:, 0]
+	wide = me["rear"][:, 0] >= 0
+	own = (hexes == start[:, None]) | (wide[:, None] & (hexes == me["rear"]))
+	tile_open = (x["x_access"] == ACCESSIBLE) | ((x["x_access"] == GATE) & (side[:, None] == DEFENDER)) | own
+	second = rear_hex(hexes, side[:, None])
+	second_open = lookup(tile_open, torch.where((second >= 0) & (second < N_HEXES), second, -1))
+	can_stand = tile_open & (~wide[:, None] | second_open)
+	stopper = (x["x_obstacle_type"] == MOAT) | ((x["x_obstacle_type"] == SPELL_CREATED) & (x["x_obstacle_id"] == QUICKSAND))
+	stopper = stopper & ~own
+	stuck = stopper | (wide[:, None] & lookup(stopper, torch.where((second >= 0) & (second < N_HEXES), second, -1)))
+
+	# Flying
+	fly_distance = torch.where(can_stand, hex_distance(start[:, None], hexes), torch.full_like(hexes, INFINITE_DISTANCE))
+	fly_from = torch.where(can_stand, start[:, None].expand_as(hexes), torch.full_like(hexes, -1))
+
+	# Walking: one breadth-first layer at a time
+	distance = torch.where(hexes == start[:, None], 0, INFINITE_DISTANCE)
+	came_from = torch.full_like(hexes, -1)
+	queue_rank = torch.zeros_like(hexes)  # order in the search's queue within the current layer
+	around = neighbours(hexes)  # [B, H, 6]: the hexes a hex can be reached from
+	# Direction from neighbour k of h back to h: the opposite direction
+	back = torch.tensor([BOTTOM_RIGHT, BOTTOM_LEFT, LEFT, TOP_LEFT, TOP_RIGHT, RIGHT], device=hexes.device)
+	never = N_HEXES * 6
+	for layer in range(MAX_PATH):
+		expands = (distance == layer) & ~stuck  # a hex in a moat or quicksand is reached but not left
+		from_open = lookup(expands, around)  # [B, H, 6]
+		key = torch.where(from_open, lookup(queue_rank, around) * 6 + back, never)
+		best_key, best = key.min(dim=-1)
+		new = (best_key < never) & can_stand & (distance == INFINITE_DISTANCE)
+		distance = torch.where(new, layer + 1, distance)
+		came_from = torch.where(new, around.gather(-1, best[..., None])[..., 0], came_from)
+		new_key = torch.where(new, best_key, never)
+		queue_rank = torch.where(new, (new_key[:, None, :] < new_key[:, :, None]).sum(dim=-1), 0)
+	return torch.where(flying[:, None], fly_distance, distance), torch.where(flying[:, None], fly_from, came_from)

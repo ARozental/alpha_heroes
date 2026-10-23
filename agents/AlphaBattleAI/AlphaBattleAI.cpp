@@ -330,6 +330,12 @@ void AlphaBattleAI::activeStack(const BattleID & battleID, const CStack * stack)
 	auto battle = cb->getBattle(battleID);
 	if(delegated)
 	{
+		if(record)
+		{
+			const auto player = cb->getPlayerID().value_or(PlayerColor::NEUTRAL);
+			delegatePending = std::make_unique<EncodedBattle>(encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(battle->battleGetMySide())]));
+			delegateStack = stack->unitId();
+		}
 		fallback->activeStack(battleID, stack);
 		return;
 	}
@@ -548,6 +554,27 @@ void AlphaBattleAI::execute(const BattleID & battleID, const CStack * stack, con
 		cb->battleMakeSpellAction(battleID, action); // the engine asks this unit for its action again after the hero's cast
 	else
 		cb->battleMakeUnitAction(battleID, action);
+}
+
+void AlphaBattleAI::actionStarted(const BattleID & battleID, const BattleAction & action)
+{
+	// ALPHA_BATTLE_DELEGATE: the action the other AI took for the state it was asked about
+	if(delegatePending && action.stackNumber == static_cast<int>(delegateStack) && action.side == cb->getBattle(battleID)->battleGetMySide())
+	{
+		if(const auto chosen = chosenAction(*delegatePending, action))
+		{
+			auto outputs = model ? model->run(delegatePending->tensors) : OutputTensors();
+			if(!model) // a record has every output: zeros
+				for(int o = 0; o < static_cast<int>(Out::COUNT); ++o)
+					outputs.data(static_cast<Out>(o)).assign(numel(OUTPUTS[o]), 0.0f);
+			record->addDecision(delegatePending->tensors, outputs, *chosen);
+			++stats.decisions;
+		}
+		else
+			logAi->warn("AlphaBattleAI: the delegate's action %s has no model action; not recorded", action.toString());
+		delegatePending.reset();
+	}
+	fallback->actionStarted(battleID, action);
 }
 
 void AlphaBattleAI::actionFinished(const BattleID & battleID, const BattleAction & action)
