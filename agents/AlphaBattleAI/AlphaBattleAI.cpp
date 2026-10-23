@@ -108,6 +108,10 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 	recordDir = playerSetting(*CB, "ALPHA_BATTLE_RECORD_DIR");
 	if(!recordDir.empty())
 		std::filesystem::create_directories(recordDir);
+	recordSocket = playerSetting(*CB, "ALPHA_BATTLE_RECORD_SOCKET");
+	recordKey = playerSetting(*CB, "ALPHA_BATTLE_RECORD_KEY");
+	if(!recordDir.empty() || !recordSocket.empty())
+		record = std::make_unique<BattleRecord>();
 
 	const auto path = playerSetting(*CB, "ALPHA_BATTLE_MODEL");
 	try
@@ -121,7 +125,7 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 		static std::atomic<bool> reported{false};
 		if(!reported.exchange(true))
 			logAi->error("AlphaBattleAI: cannot use model '%s': %s. StupidAI plays instead.", path, e.what());
-		if(!recordDir.empty()) // a training record must never silently contain StupidAI's battle
+		if(record) // a training record must never silently contain StupidAI's battle
 		{
 			std::string message = e.what();
 			std::replace(message.begin(), message.end(), '"', '\'');
@@ -145,7 +149,7 @@ void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * 
 	stats.siege = cb->getBattle(battleID)->battleGetDefendedTown() != nullptr;
 	stats.walls = cb->getBattle(battleID)->battleGetWallState(EWallPart::KEEP) != EWallState::NONE;
 
-	if(!recordDir.empty())
+	if(record)
 	{
 		auto army = [](const CCreatureSet * set)
 		{
@@ -160,9 +164,11 @@ void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * 
 	fallback->battleStart(battleID, army1, army2, tile, hero1, hero2, side, replayAllowed);
 }
 
-void AlphaBattleAI::recordEvent(const std::string & json) const
+void AlphaBattleAI::recordEvent(const std::string & json)
 {
-	std::ofstream(std::filesystem::path(recordDir) / "events.jsonl", std::ios::app) << json << "\n";
+	record->addEvent(json);
+	if(!recordDir.empty())
+		std::ofstream(std::filesystem::path(recordDir) / "events.jsonl", std::ios::app) << json << "\n";
 }
 
 std::string AlphaBattleAI::aliveArmies(const BattleID & battleID) const
@@ -188,14 +194,14 @@ int AlphaBattleAI::ourMana(const BattleID & battleID) const
 void AlphaBattleAI::battleNewRoundFirst(const BattleID & battleID)
 {
 	// Called before the new round's changes: the state here is the end of the previous round
-	if(!recordDir.empty())
+	if(record)
 		recordEvent("{\"event\": \"round_end\", \"round\": " + std::to_string(cb->getBattle(battleID)->battleGetRound()) + ", \"alive\": " + aliveArmies(battleID) + ", \"our_mana\": " + std::to_string(ourMana(battleID)) + "}");
 	fallback->battleNewRoundFirst(battleID);
 }
 
 void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br, QueryID queryID)
 {
-	if(!recordDir.empty())
+	if(record)
 	{
 		auto casualties = [&](BattleSide side)
 		{
@@ -205,6 +211,19 @@ void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br
 			return json + "]";
 		};
 		recordEvent("{\"event\": \"end\", \"round\": " + std::to_string(cb->getBattle(battleID)->battleGetRound()) + ", \"winner\": " + std::to_string(static_cast<int>(br->winner)) + ", \"result\": " + std::to_string(static_cast<int>(br->result)) + ", \"casualties\": [" + casualties(BattleSide::ATTACKER) + ", " + casualties(BattleSide::DEFENDER) + "], \"alive\": " + aliveArmies(battleID) + ", \"our_mana\": " + std::to_string(ourMana(battleID)) + "}");
+
+		if(!recordSocket.empty())
+		{
+			try
+			{
+				record->send(recordSocket, recordKey);
+			}
+			catch(const std::exception & e)
+			{
+				logAi->error("AlphaBattleAI: the record of this battle is lost: %s", e.what()); // the trainer reports it missing
+			}
+		}
+		record = std::make_unique<BattleRecord>(); // the next battle (an AI can play several) starts a new record
 	}
 	std::string types;
 	for(int t = 0; t < N_ACTION_TYPES; ++t)
@@ -344,7 +363,7 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 			if(!isLegal(encoded, action))
 			{
 				const auto message = "prefix action " + std::to_string(prefixPlayed - 1) + " " + action.toJson() + " is not legal here: the battle did not replay as recorded";
-				if(!recordDir.empty())
+				if(record)
 				{
 					std::string quoted = message;
 					std::replace(quoted.begin(), quoted.end(), '"', '\'');
@@ -370,11 +389,15 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 		if(action.type == static_cast<int>(ActionType::HERO_SPELL))
 			++stats.spellTargets[action.target2Hex >= 0 || action.target2Unit >= 0 ? 3 : action.targetHex >= 0 ? 2 : action.targetUnit >= 0 ? 1 : 0];
 
-		if(!recordDir.empty())
+		if(record)
 		{
-			char name[32];
-			std::snprintf(name, sizeof(name), "decision_%05d", recordedDecisions++);
-			dumpDecision(recordDir, name, encoded.tensors, outputs, action);
+			record->addDecision(encoded.tensors, outputs, action);
+			if(!recordDir.empty())
+			{
+				char name[32];
+				std::snprintf(name, sizeof(name), "decision_%05d", recordedDecisions++);
+				dumpDecision(recordDir, name, encoded.tensors, outputs, action);
+			}
 		}
 		const auto dumpDir = envString("ALPHA_BATTLE_DUMP_DIR");
 		if(!dumpDir.empty())
@@ -425,7 +448,7 @@ void AlphaBattleAI::execute(const BattleID & battleID, const CStack * stack, con
 			cb->battleMakeUnitAction(battleID, BattleAction::makeRetreat(side));
 			return;
 		case ActionType::SURRENDER:
-			if(!recordDir.empty())
+			if(record)
 				recordEvent("{\"event\": \"surrender\", \"cost\": " + std::to_string(cb->getBattle(battleID)->battleGetSurrenderCost()) + "}");
 			cb->battleMakeUnitAction(battleID, BattleAction::makeSurrender(side));
 			return;

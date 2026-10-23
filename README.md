@@ -111,8 +111,11 @@ ALPHA_BATTLE_DUMP_DIR=$PWD/runtime/dumps SETTINGS='{"ai":{"combatNeutralAI":"Alp
 .venv/bin/python -m battle_model.check_dumps runtime/dumps   # C++ and Python agree on every dumped decision
 ```
 
-Training on a scenario (records, ~16 KB a decision, are deleted after each epoch; each run plays its own copy
-of the scenario's map). Any config field can be set with `--set`, including `ppo.*`, `advantage.*`, `reward.*`:
+Training on a scenario. Battle records never touch the disk: AlphaBattleAI keeps each battle's record in memory
+and sends it to the trainer over a Unix socket when the battle ends (`play.RecordServer`); `--set keep_records=true`
+also writes them to `runtime/train/<run>/records` for debugging. Torch trains on the GPU (`device`, Apple MPS here)
+while the CPU plays the next epoch's battles in the background (`prefetch`). Each run plays its own copy of the
+scenario's map. Any config field can be set with `--set`, including `ppo.*`, `advantage.*`, `reward.*`:
 
 ```sh
 .venv/bin/python -m battle_model.train --run NAME            # 8 battles per side per epoch, fixed seeds

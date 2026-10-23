@@ -3,7 +3,7 @@
 	.venv/bin/python -m battle_model.evaluate runtime/train/<run>/checkpoint_latest.pt [--games 8] [--temperature 0] [--seeds 1,2]
 
 Temperature 0 plays greedily (the most likely action every time): with VCMI's seed fixed the battle is then
-deterministic, so one game per side and seed says everything. Records are deleted afterwards.
+deterministic, so one game per side and seed says everything. Records stay in memory.
 """
 import argparse
 import os
@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 from . import play
-from .data import read_events, summarize
+from .data import summarize
 from .export import export
 from .model import BattleModel
 from .reward import to_scale
@@ -23,7 +23,7 @@ from .train import ROOT, TrainConfig, model_kwargs
 
 
 def load(checkpoint):
-	state = torch.load(checkpoint)
+	state = torch.load(checkpoint, map_location="cpu")
 	model = BattleModel(**state.get("model_kwargs", model_kwargs(TrainConfig())))  # older checkpoints: the default model
 	model.load_state_dict(state["model"])
 	return model.eval(), state["epoch"]
@@ -36,10 +36,9 @@ def evaluate(model, scenario, seeds=(1, 2), games=8, temperature=1.0, sampler_se
 		export(model, work / "model.onnx")
 		n = 1 if temperature <= 0 else games
 		battles = [play.Game(scenario, our_side=side, opponent=opponent, game_seed=seeds[side], sampler_seed=sampler_seed + i, temperature=temperature, ai=ai, map=battle_map) for side in (0, 1) for i in range(n)]
-		dirs = play.play(battles, work / "model.onnx", work / "records")
 		results = {0: [], 1: []}
-		for d in dirs:
-			summary = summarize(read_events(d))
+		for record in play.play(battles, work / "model.onnx"):
+			summary = summarize(record.events)
 			results[summary.our_side].append(summary)
 		return results
 	finally:

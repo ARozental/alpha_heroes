@@ -8,10 +8,15 @@ data.py turns into training examples.
 
 Each game runs through scripts/headless.sh, so it has a time limit, a disk limit and stall detection.
 """
+import itertools
 import json
 import os
+import select
 import shutil
+import socket
+import struct
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +24,9 @@ ROOT = Path(__file__).resolve().parent.parent
 USER_DIR = ROOT / "runtime" / "vcmi-user"
 COLORS = ("RED", "BLUE")  # battle side 0 (attacker) and 1 (defender)
 SELF_PLAY = "self"  # Game.opponent for our model against itself
+SOCKET_DIR = ROOT / "runtime" / "sockets"  # RecordServer sockets: only addresses, no data on disk
+PREFIX_DIR = ROOT / "runtime" / "prefixes"  # Game.prefix files, deleted after each battle
+_server_numbers = itertools.count()
 
 
 @dataclass(frozen=True)
@@ -72,11 +80,59 @@ def build_map(scenario_path, variant=""):
 	return name
 
 
-def start(game, model_path, record_dir, max_seconds=120, max_mb=200):
-	"""Start one battle in the background; returns the process. record_dir must not exist yet.
+class RecordServer:
+	"""Receives battle records from AlphaBattleAI over a Unix socket, so training data never touches the disk.
 
-	Each side our model plays gets its own settings (AlphaBattleAI reads ALPHA_BATTLE_<NAME>_<COLOR> before
-	ALPHA_BATTLE_<NAME>): its record folder (record_dirs) and its sampling seed.
+	Each AI connects at the end of its battle and sends a key (u32 length + bytes) and the record
+	(agents/AlphaBattleAI/Dump.h BattleRecord); records: {key: bytes}. Use as a context manager: leaving it
+	reads what is still queued, then closes the socket.
+	"""
+
+	def __init__(self):
+		SOCKET_DIR.mkdir(parents=True, exist_ok=True)
+		self.path = SOCKET_DIR / f"{os.getpid()}-{next(_server_numbers)}.sock"
+		if len(str(self.path)) >= 100:  # sockaddr_un.sun_path is 104 bytes on macOS
+			raise RuntimeError(f"socket path too long: {self.path}")
+		self.path.unlink(missing_ok=True)
+		self.records = {}
+		self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		self._socket.bind(str(self.path))
+		self._socket.listen(128)
+		self._stop = threading.Event()
+		self._thread = threading.Thread(target=self._serve, daemon=True)
+		self._thread.start()
+
+	def _serve(self):
+		while True:
+			ready, _, _ = select.select([self._socket], [], [], 0.1)
+			if ready:
+				connection, _ = self._socket.accept()
+				with connection:
+					data = bytearray()
+					while chunk := connection.recv(1 << 20):
+						data += chunk
+				(key_length,) = struct.unpack_from("<I", data, 0)
+				self.records[bytes(data[4 : 4 + key_length]).decode()] = bytes(data[4 + key_length :])
+			elif self._stop.is_set():
+				return
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *exc):
+		self._stop.set()
+		self._thread.join()
+		self._socket.close()
+		self.path.unlink(missing_ok=True)
+
+
+def start(game, model_path, records, max_seconds=120, max_mb=200):
+	"""Start one battle in the background; returns the process.
+
+	records: per side in game.recorded_sides, where its record goes: "socket" and "key" (a RecordServer: sent
+	at the end of the battle, no files) and/or "dir" (written there for debugging; must not exist yet). Each
+	side our model plays gets its own settings (AlphaBattleAI reads ALPHA_BATTLE_<NAME>_<COLOR> before
+	ALPHA_BATTLE_<NAME>): its record and its sampling seed.
 	"""
 	env = dict(os.environ)
 	env.update(
@@ -86,16 +142,24 @@ def start(game, model_path, record_dir, max_seconds=120, max_mb=200):
 	)
 	for side, color in enumerate(COLORS):
 		env[f"VCMI_BATTLE_AI_{color}"] = game.ai if side in game.recorded_sides else game.opponent
-	for i, (side, folder) in enumerate(zip(game.recorded_sides, record_dirs(game, record_dir))):
-		env[f"ALPHA_BATTLE_RECORD_DIR_{COLORS[side]}"] = str(folder)
-		env[f"ALPHA_BATTLE_SEED_{COLORS[side]}"] = str(game.sampler_seed + 1_000_003 * i)  # the two sides sample independently
+	for i, (side, target) in enumerate(zip(game.recorded_sides, records)):
+		color = COLORS[side]
+		if target.get("socket"):
+			env[f"ALPHA_BATTLE_RECORD_SOCKET_{color}"] = str(target["socket"])
+			env[f"ALPHA_BATTLE_RECORD_KEY_{color}"] = target["key"]
+		if target.get("dir"):
+			env[f"ALPHA_BATTLE_RECORD_DIR_{color}"] = str(Path(target["dir"]).resolve())
+		env[f"ALPHA_BATTLE_SEED_{color}"] = str(game.sampler_seed + 1_000_003 * i)  # the two sides sample independently
+	prefix = None
 	if game.prefix:
-		prefix = Path(str(Path(record_dir).resolve()) + ".prefix.jsonl")
-		prefix.parent.mkdir(parents=True, exist_ok=True)
+		PREFIX_DIR.mkdir(parents=True, exist_ok=True)
+		prefix = PREFIX_DIR / f"{os.getpid()}-{next(_server_numbers)}.jsonl"  # a few KB, deleted by finish()
 		prefix.write_text("".join(json.dumps(action) + "\n" for action in game.prefix))
 		env[f"ALPHA_BATTLE_PREFIX_{COLORS[game.our_side]}"] = str(prefix)
 	command = [str(ROOT / "scripts" / "headless.sh"), game.map or map_name(game.scenario), str(max_seconds), str(max_mb), "20"]
-	return subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+	process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+	process.prefix_file = prefix
+	return process
 
 
 def finish(process, keep_run=False):
@@ -105,6 +169,8 @@ def finish(process, keep_run=False):
 	it is kept when the battle failed, for debugging.
 	"""
 	output, _ = process.communicate()
+	if getattr(process, "prefix_file", None):
+		process.prefix_file.unlink(missing_ok=True)
 	report = dict(line.split(":", 1) for line in output.splitlines() if ":" in line)
 	report = {key.strip(): value.strip() for key, value in report.items()}
 	status = report.get("status", "")
@@ -115,29 +181,39 @@ def finish(process, keep_run=False):
 	return report
 
 
-def play(games, model_path, record_root):
-	"""Play several battles in parallel. Returns every record dir: per game in the order of `games`, one per
-	side in game.recorded_sides (each record says which side it played)."""
-	record_root = Path(record_root).resolve()  # VCMI runs in build/bin: paths must be absolute
-	model_path = Path(model_path).resolve()
-	game_dirs = [record_root / f"game_{i}" for i in range(len(games))]
-	processes = [start(game, model_path, d) for game, d in zip(games, game_dirs)]
-	reports, failures = [], []
-	for process in processes:  # wait for every battle before raising, so none is left writing its record
-		try:
-			reports.append(finish(process, keep_run=True))
-		except RuntimeError as error:
-			reports.append({})
-			failures.append(str(error))
-	dirs = [record_dirs(game, d) for game, d in zip(games, game_dirs)]
-	recorded = [all((r / "events.jsonl").exists() for r in records) for records in dirs]
+def play(games, model_path, record_root=None):
+	"""Play several battles in parallel. Returns every battle's records (data.Record, in memory): per game in the
+	order of `games`, one per side in game.recorded_sides (each record says which side it played).
+
+	The records come over a RecordServer socket, never through files. With record_root they are also written
+	there (game_<i>[/side_<s>] folders) for debugging.
+	"""
+	from .data import parse_record
+
+	model_path = Path(model_path).resolve()  # VCMI runs in build/bin: paths must be absolute
+	game_dirs = [Path(record_root).resolve() / f"game_{i}" for i in range(len(games))] if record_root else [None] * len(games)
+	with RecordServer() as server:
+		targets = [
+			[{"socket": server.path, "key": f"{i}:{side}", "dir": folder} for side, folder in zip(game.recorded_sides, record_dirs(game, d) if d else [None] * len(game.recorded_sides))]
+			for i, (game, d) in enumerate(zip(games, game_dirs))
+		]
+		processes = [start(game, model_path, t) for game, t in zip(games, targets)]
+		reports, failures = [], []
+		for process in processes:  # wait for every battle before raising, so none is left sending or writing its record
+			try:
+				reports.append(finish(process, keep_run=True))
+			except RuntimeError as error:
+				reports.append({})
+				failures.append(str(error))
+	received = server.records
+	recorded = [all(t["key"] in received for t in game_targets) for game_targets in targets]
 	for report, ok in zip(reports, recorded):
 		if report.get("run") and ok:
 			shutil.rmtree(report["run"], ignore_errors=True)
 	# Failed battles keep their runner folders (VCMI logs) for debugging
 	if failures:
 		raise RuntimeError(f"{len(failures)} of {len(processes)} battles failed; first: {failures[0]}")
-	missing = [(d, report) for d, report, ok in zip(game_dirs, reports, recorded) if report and not ok]
+	missing = [(i, report) for i, (report, ok) in enumerate(zip(reports, recorded)) if report and not ok]
 	if missing:
-		raise RuntimeError("no record written in " + ", ".join(f"{d} (run {report.get('run')})" for d, report in missing))
-	return [r for records in dirs for r in records]
+		raise RuntimeError("no record received from " + ", ".join(f"game {i} (run {report.get('run')})" for i, report in missing))
+	return [parse_record(received[t["key"]]) for game_targets in targets for t in game_targets]

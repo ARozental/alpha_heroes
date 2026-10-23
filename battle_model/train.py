@@ -5,15 +5,18 @@
 	.venv/bin/tensorboard --logdir runtime/train            # then open http://localhost:6006
 
 Each epoch:
-  1. export the current model to ONNX (the C++ battle AI plays with it),
+  1. the model, exported to ONNX, plays the epoch's battles in VCMI on the CPU (C++ battle AI), in a background
+     thread (Producer) while the previous epoch trains: playing and training overlap (prefetch),
   2. play games_per_side battles per scenario side, all in parallel (we attack with sides[0], we defend
      with sides[1]), with VCMI's seed fixed per side, so only our own (sampled) choices differ between
      the battles of a side and between epochs. With opponent=self (self-play) our model plays both sides
      of games_per_side battles, half with each side's seed, and learns from both sides' records,
-  3. turn the records into training examples (data.py) and update the model with PPO (losses.py),
+  3. turn the records into training examples (data.py) and update the model with PPO (losses.py), on the GPU
+     when there is one (device),
   4. log both battles' rewards and outcomes to <run dir>/progress.csv and TensorBoard
      (<run dir>/tensorboard/<start time>: one folder per start, so a restarted run never mixes with old
-     data a running TensorBoard still holds in memory), delete the records.
+     data a running TensorBoard still holds in memory). The records only ever exist in memory
+     (play.RecordServer); keep_records also writes them to <run dir>/records for debugging.
   5. every eval_every epochs (and before the first), an eval round, not trained on: games_per_side
      sampled battles per side plus one greedy battle per side against eval_opponent (BattleAI) on the
      fixed game_seeds, logged to <run dir>/eval.csv and under eval/ in TensorBoard.
@@ -35,9 +38,11 @@ scenario and win by epoch 1000. If it needs more, something is probably wrong. N
 on the seeds being fixed: the same training has to work on real, ever-different battles.
 """
 import argparse
+import copy
 import csv
 import random
 import shutil
+import threading
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -47,7 +52,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from . import play
-from .data import make_dataloader, read_events, summarize
+from .data import collate, make_dataloader, summarize
 from .export import export
 from .losses import AdvantageConfig, PPOConfig, ppo_loss
 from .model import BattleModel
@@ -77,6 +82,11 @@ class TrainConfig:
 	grad_clip: float = 0.5  # max gradient norm, the usual PPO value
 	checkpoint_every: int = 50
 	attempts: int = 3  # tries per epoch when a battle fails or stalls before the run stops
+	keep_records: bool = False  # also write every battle record to <run dir>/records (debugging; ~0.3 MB a decision on disk)
+	device: str = "auto"  # where torch trains: "auto" = the GPU (cuda, Apple mps) if there is one, else "cpu"; the CPU plays the battles
+	# Play the next epoch's battles while this epoch trains (Producer): the battles are then one update older than the
+	# model they train, which PPO handles (each record holds the probabilities of the model that played it)
+	prefetch: bool = True
 	model_dim: int = 64
 	model_layers: int = 2
 	model_mask_features: bool = False  # model.BattleModel(mask_features=...)
@@ -106,7 +116,7 @@ def run_dir(config):
 COLUMNS = [
 	"epoch", "attack_reward", "attack_outcome", "defence_reward", "defence_outcome", "mean_reward", "attack_raw_reward", "defence_raw_reward", "attack_win_rate", "defence_win_rate",
 	"decisions", "rounds", "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "signal_ratio", "weight_change",
-	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds",
+	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds",
 ]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
 # error. decisions: all decisions of the epoch; rounds: attack + defence battle rounds, averaged over the games.
@@ -120,7 +130,8 @@ TENSORBOARD_TAGS = {
 	"signal_ratio": "stability/signal_ratio", "weight_change": "stability/weight_change", "approx_kl": "stability/approx_kl", "clip_fraction": "stability/clip_fraction",
 	"attack_advantage_std": "advantage_std/attack", "defence_advantage_std": "advantage_std/defence",
 	"attack_value_error": "value_error/attack", "defence_value_error": "value_error/defence",
-	"decisions": "battle/decisions", "rounds": "battle/rounds", "seconds": "battle/seconds",
+	"decisions": "battle/decisions", "rounds": "battle/rounds", "seconds": "time/epoch_seconds",
+	"wait_seconds": "time/waiting_for_battles_seconds", "train_seconds": "time/training_seconds",
 }
 
 
@@ -196,12 +207,15 @@ def follow(run, poll_seconds=10, idle_minutes=10):
 	writer.close()
 
 
-def play_with_retries(games, model_path, records, config, label):
-	"""play.play with up to config.attempts tries (a battle can fail or stall); the record dirs."""
+def play_with_retries(games, model_path, record_root, config, label):
+	"""play.play with up to config.attempts tries (a battle can fail or stall); the records (in memory).
+
+	record_root: where to also write them for debugging (config.keep_records), or None."""
 	for attempt in range(1, config.attempts + 1):
 		try:
-			shutil.rmtree(records, ignore_errors=True)
-			return play.play(games, model_path, records)
+			if record_root:
+				shutil.rmtree(record_root, ignore_errors=True)
+			return play.play(games, model_path, record_root)
 		except RuntimeError as error:  # a battle failed or stalled; its runner folder is kept for debugging
 			print(f"{label}: attempt {attempt} failed: {str(error)[:300]}", flush=True)
 			if attempt == config.attempts:
@@ -212,17 +226,15 @@ def eval_round(model, epoch, out, battle_map, config):
 	"""Play the eval battles against config.eval_opponent with the current model; the eval.csv row."""
 	started = time.time()
 	model_path = out / "eval.onnx"
-	export(model, model_path)
+	export(cpu_copy(model), model_path)
 	n = config.games_per_side
 	games = [
 		play.Game(config.scenario, our_side=side, opponent=config.eval_opponent, game_seed=config.game_seeds[side], sampler_seed=10**7 + (2 * epoch + side) * (n + 1) + g, temperature=0.0 if g == n else 1.0, ai=config.ai, map=battle_map)
 		for side in (0, 1)
 		for g in range(n + 1)
 	]  # g == n: the greedy battle
-	records = out / "records" / f"eval_{epoch}"
-	dirs = play_with_retries(games, model_path, records, config, f"eval {epoch}")
-	summaries = [summarize(read_events(d)) for d in dirs]
-	shutil.rmtree(records, ignore_errors=True)
+	record_root = out / "records" / f"eval_{epoch}" if config.keep_records else None
+	summaries = [summarize(r.events) for r in play_with_retries(games, model_path, record_root, config, f"eval {epoch}")]
 	row = {"epoch": epoch}
 	sampled_all = []
 	for side, name in ((0, "attack"), (1, "defence")):
@@ -239,6 +251,62 @@ def eval_round(model, epoch, out, battle_map, config):
 	return row
 
 
+def resolve_device(name):
+	if name != "auto":
+		return torch.device(name)
+	if torch.cuda.is_available():
+		return torch.device("cuda")
+	if torch.backends.mps.is_available():
+		return torch.device("mps")
+	return torch.device("cpu")
+
+
+def to_device(batch, device):
+	"""A collated batch (nested dicts of tensors) on device."""
+	if isinstance(batch, dict):
+		return {key: to_device(value, device) for key, value in batch.items()}
+	return batch.to(device)
+
+
+def select(batch, index):
+	"""The rows `index` of a collated batch (nested dicts of tensors)."""
+	if isinstance(batch, dict):
+		return {key: select(value, index) for key, value in batch.items()}
+	return batch[index]
+
+
+def cpu_copy(model):
+	"""A CPU copy of the model, for the ONNX export (the battles run the model on the CPU)."""
+	return copy.deepcopy(model).cpu()
+
+
+class Producer:
+	"""The source of training data: plays an epoch's battles in a background thread, so that playing (VCMI, on the
+	CPU) and training (torch, on the GPU) overlap. start(epoch, model_file) begins; take() waits for the records."""
+
+	def __init__(self, play_epoch):
+		self._play_epoch = play_epoch
+		self._thread, self._result = None, None
+
+	def start(self, epoch, model_file):
+		def run():
+			try:
+				self._result = (self._play_epoch(epoch, model_file), None)
+			except BaseException as error:  # re-raised by take() in the training thread
+				self._result = (None, error)
+
+		self._thread = threading.Thread(target=run, daemon=True)
+		self._thread.start()
+
+	def take(self):
+		self._thread.join()
+		records, error = self._result
+		self._thread, self._result = None, None
+		if error:
+			raise error
+		return records
+
+
 def model_kwargs(config):
 	return {"dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features}
 
@@ -252,12 +320,13 @@ def train(config, resume=False):
 	out.mkdir(parents=True, exist_ok=True)
 	(out / "config.txt").write_text("\n".join(f"{k} = {v}" for k, v in asdict(config).items()) + "\n")
 	torch.manual_seed(config.seed)
-	model = BattleModel(**model_kwargs(config))
+	device = resolve_device(config.device)
+	model = BattleModel(**model_kwargs(config)).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 	first_epoch = 1
 	latest = out / "checkpoint_latest.pt"
 	if resume and latest.exists():
-		state = torch.load(latest)
+		state = torch.load(latest, map_location=device)
 		model.load_state_dict(state["model"])
 		optimizer.load_state_dict(state["optimizer"])
 		first_epoch = state["epoch"] + 1
@@ -284,36 +353,51 @@ def train(config, resume=False):
 
 	if config.eval_every and first_epoch == 1:
 		evaluate_now(0)  # the untrained model
+	def epoch_games(epoch):
+		seeds = random.Random(epoch)
+		seed_for = lambda side: seeds.randrange(1, 2**31) if config.random_seeds else config.game_seeds[side]
+		if config.opponent == play.SELF_PLAY:  # each battle records both sides: half the battles with each side's seed
+			return [
+				play.Game(config.scenario, our_side=0, opponent=play.SELF_PLAY, game_seed=seed_for(g % 2), sampler_seed=2 * epoch * config.games_per_side + g, ai=config.ai, map=battle_map)
+				for g in range(config.games_per_side)
+			]
+		return [
+			play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=seed_for(side), sampler_seed=(2 * epoch + side) * config.games_per_side + g, ai=config.ai, map=battle_map)
+			for side in (0, 1)
+			for g in range(config.games_per_side)
+		]
+
+	def play_epoch(epoch, model_path):
+		record_root = out / "records" / f"epoch_{epoch}" if config.keep_records else None
+		return play_with_retries(epoch_games(epoch), model_path, record_root, config, f"epoch {epoch}")
+
+	# The model plays from one of two ONNX files: while battles run with one, the next export goes to the other
+	model_files = [out / "model_a.onnx", out / "model_b.onnx"]
+	current = 0
+	export(cpu_copy(model), model_files[current])
+	producer = Producer(play_epoch)
+	producer.start(first_epoch, model_files[current])
 	for epoch in range(first_epoch, config.epochs + 1):
 		started = time.time()
 		if config.lr_schedule == "linear":
 			for group in optimizer.param_groups:
 				group["lr"] = config.learning_rate * (1 - (epoch - 1) / config.epochs)
-		model_path = out / "model.onnx"
-		export(model, model_path)
-
-		seeds = random.Random(epoch)
-		seed_for = lambda side: seeds.randrange(1, 2**31) if config.random_seeds else config.game_seeds[side]
-		if config.opponent == play.SELF_PLAY:  # each battle records both sides: half the battles with each side's seed
-			games = [
-				play.Game(config.scenario, our_side=0, opponent=play.SELF_PLAY, game_seed=seed_for(g % 2), sampler_seed=2 * epoch * config.games_per_side + g, ai=config.ai, map=battle_map)
-				for g in range(config.games_per_side)
-			]
-		else:
-			games = [
-				play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=seed_for(side), sampler_seed=(2 * epoch + side) * config.games_per_side + g, ai=config.ai, map=battle_map)
-				for side in (0, 1)
-				for g in range(config.games_per_side)
-			]
-		records = out / "records" / f"epoch_{epoch}"
-		dirs = play_with_retries(games, model_path, records, config, f"epoch {epoch}")
-		loader, summaries, _ = make_dataloader(dirs, config.batch_size, True, reward_config, advantage_config)
+		records = producer.take()
+		waited = time.time() - started
+		if config.prefetch and epoch < config.epochs:
+			producer.start(epoch + 1, model_files[current])  # with the model before this epoch's update
+		loader, summaries, _ = make_dataloader(records, config.batch_size, True, reward_config, advantage_config)
 
 		weights_before = flat_weights(model)
-		parts_sum, batches = {"policy": 0.0, "value": 0.0, "entropy": 0.0, "approx_kl": 0.0, "clip_fraction": 0.0}, 0
+		parts_sum, batches = {key: torch.zeros((), device=device) for key in ("policy", "value", "entropy", "approx_kl", "clip_fraction")}, 0
+		trained = time.time()
 		model.train()
-		for _ in range(config.ppo_passes):
-			for batch in loader:
+		examples = loader.dataset
+		epoch_data = to_device(collate(examples), device) if examples else None  # every decision of the epoch, moved to the GPU once
+		for _ in range(config.ppo_passes if examples else 0):
+			order = torch.randperm(len(examples)).to(device)
+			for first in range(0, len(examples), config.batch_size):
+				batch = select(epoch_data, order[first : first + config.batch_size])
 				out_batch = model(batch["inputs"])
 				loss, parts = ppo_loss(out_batch, batch["action"], batch["old_log_prob"], batch["advantage"], batch["value_labels"], ppo_config)
 				optimizer.zero_grad()
@@ -321,13 +405,18 @@ def train(config, resume=False):
 				torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 				optimizer.step()
 				for key in parts_sum:
-					parts_sum[key] += float(parts[key])
+					parts_sum[key] += parts[key]  # summed on the device: no sync each step
 				batches += 1
 		model.eval()
+		current = 1 - current
+		export(cpu_copy(model), model_files[current])
+		if not config.prefetch and epoch < config.epochs:
+			producer.start(epoch + 1, model_files[current])
+		train_seconds = time.time() - trained
 
 		by_side = [[s for s in summaries if s.our_side == side] for side in (0, 1)]
 		average = lambda values: sum(values) / len(values)
-		mean = {key: value / max(batches, 1) for key, value in parts_sum.items()}
+		mean = {key: float(value) / max(batches, 1) for key, value in parts_sum.items()}
 		row = {
 			"epoch": epoch,
 			"mean_reward": round(to_scale(average([s.reward for s in by_side[0] + by_side[1]]), reward_config), 4),
@@ -341,6 +430,8 @@ def train(config, resume=False):
 			"signal_ratio": round(signal_ratio(optimizer), 4),
 			"weight_change": round(float((flat_weights(model) - weights_before).norm()), 4),
 			"seconds": round(time.time() - started, 1),
+			"wait_seconds": round(waited, 1),
+			"train_seconds": round(train_seconds, 1),
 		}
 		for name, side_summaries in (("attack", by_side[0]), ("defence", by_side[1])):
 			raw = average([s.reward for s in side_summaries])
@@ -360,7 +451,6 @@ def train(config, resume=False):
 			flush=True,
 		)
 
-		shutil.rmtree(records, ignore_errors=True)
 		if config.eval_every and epoch % config.eval_every == 0:
 			evaluate_now(epoch)
 		save_checkpoint(latest, model, optimizer, epoch, config)

@@ -1,8 +1,10 @@
 """Battle records -> training examples -> DataLoader.
 
-A record (written by AlphaBattleAI when play.py sets ALPHA_BATTLE_RECORD_DIR) holds one side's view of
-one battle: every decision (model inputs, model outputs and the chosen action) and events.jsonl (the
-armies at the start, the army units alive at the end of each round, how the battle ended).
+A record (Record) holds one side's view of one battle: every decision (model inputs, model outputs and the
+chosen action) and its events (the armies at the start, the army units alive at the end of each round, how
+the battle ended). AlphaBattleAI keeps it in memory and sends it in one piece at the end of the battle to
+play.py's RecordServer (parse_record): training data never touches the disk. For debugging it can also write
+it to a folder (ALPHA_BATTLE_RECORD_DIR: events.jsonl and a decision_*.npz per decision, load_record).
 
 From it we compute, for every decision:
 	inputs        the model inputs (schema.INPUTS), dense
@@ -13,12 +15,12 @@ From it we compute, for every decision:
 	forced        replayed from a prefix (play.Game.prefix), not chosen by the model: not trained on
 and per battle a BattleSummary with the reward (reward.py) and the outcome.
 
-A decision is one compressed decision_*.npz (a .npy per tensor plus action.json, ~15 KB; the tensors are
-mostly zeros and -inf); older records were a decision_* directory of .npy files (~0.3 MB on disk). Training
-deletes the records after each epoch. Keeping data across epochs will want the compact format (sparse
-masks, ~115 bytes a decision).
+A sent record is ~190 KB a decision, in memory only. Keeping data across epochs will want a compact format
+(sparse masks, ~115 bytes a decision).
 """
+import io
 import json
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -116,6 +118,57 @@ def summarize(events, hero_value=0.0, fresh_hero_value=0.0, config=RewardConfig(
 	return BattleSummary(our, outcome, reward, rounds, own_start, enemy_army_start, kept, enemy_lost, mana_used(end["our_mana"]), scores)
 
 
+@dataclass
+class Record:
+	"""One side's record of one battle. tensors: every input and output by name, decisions stacked on the first axis."""
+	events: list
+	actions: list
+	tensors: dict
+
+	@property
+	def decisions(self):
+		return len(self.actions)
+
+
+RECORD_MAGIC = b"ALPHAREC1\n"
+
+
+def parse_record(data):
+	"""A Record from the bytes AlphaBattleAI sends (agents/AlphaBattleAI/Dump.h BattleRecord): magic, then
+	entries of u32 name length, name, u64 size, bytes."""
+	if not data.startswith(RECORD_MAGIC):
+		raise ValueError("not a battle record")
+	view, offset, entries = memoryview(data), len(RECORD_MAGIC), {}
+	while offset < len(data):
+		(name_length,) = struct.unpack_from("<I", data, offset)
+		name = bytes(view[offset + 4 : offset + 4 + name_length]).decode()
+		offset += 4 + name_length
+		(size,) = struct.unpack_from("<Q", data, offset)
+		entries[name] = view[offset + 8 : offset + 8 + size]
+		offset += 8 + size
+	lines = lambda name: [json.loads(line) for line in bytes(entries[name]).decode().splitlines() if line.strip()]
+	tensors = {s.name: np.load(io.BytesIO(entries[s.name + ".npy"])) for s in INPUTS + OUTPUTS}
+	return Record(lines("events.jsonl"), lines("actions.jsonl"), tensors)
+
+
+def load_record(path):
+	"""A Record from disk: a record folder written for debugging (ALPHA_BATTLE_RECORD_DIR), or a file holding sent bytes."""
+	path = Path(path)
+	if path.is_file():
+		return parse_record(path.read_bytes())
+	decisions = [load_decision(d) for d in decision_paths(path)]
+	names = [s.name for s in INPUTS + OUTPUTS]
+	if decisions:
+		tensors = {name: np.concatenate([t[name] for t, _ in decisions]) for name in names}
+	else:
+		tensors = {s.name: np.zeros((0,) + s.shape, dtype=np.dtype({"int64": np.int64, "bool": np.bool_, "float32": np.float32}[s.dtype])) for s in INPUTS + OUTPUTS}
+	return Record(read_events(path), [a for _, a in decisions], tensors)
+
+
+def as_record(record):
+	return record if isinstance(record, Record) else load_record(record)
+
+
 def load_decision(path):
 	"""(tensors, action) of one recorded decision: every input and output tensor by name, with the batch axis."""
 	path = Path(path)
@@ -131,26 +184,25 @@ def decision_paths(record_dir):
 	return sorted(Path(record_dir).glob("decision_*"))
 
 
-def read_decisions(record_dir):
-	"""[(inputs, outputs, action)] in the order they were made; each inputs/outputs without the batch axis."""
-	decisions = []
-	for path in decision_paths(record_dir):
-		tensors, action = load_decision(path)
-		inputs = {s.name: tensors[s.name][0] for s in INPUTS}
-		outputs = {s.name: tensors[s.name][0] for s in OUTPUTS}
-		decisions.append((inputs, outputs, action))
-	return decisions
+def read_decisions(record):
+	"""[(inputs, outputs, action)] of a Record (or a record folder) in the order they were made, without the batch axis."""
+	record = as_record(record)
+	return [
+		({s.name: record.tensors[s.name][i] for s in INPUTS}, {s.name: record.tensors[s.name][i] for s in OUTPUTS}, action)
+		for i, action in enumerate(record.actions)
+	]
 
 
-def battle_examples(record_dir, reward_config=RewardConfig(), advantage_config=AdvantageConfig()):
-	"""(examples, summary) for one recorded battle. Each example is a dict as described at the top."""
-	summary = summarize(read_events(record_dir), config=reward_config)
-	decisions = read_decisions(record_dir)
+def battle_examples(record, reward_config=RewardConfig(), advantage_config=AdvantageConfig()):
+	"""(examples, summary) for one recorded battle (a Record, or a record folder). Each example is a dict as described at the top."""
+	record = as_record(record)
+	summary = summarize(record.events, config=reward_config)
+	decisions = read_decisions(record)
 	summary.decisions = len(decisions)
 	if not decisions:
 		return [], summary
 
-	outputs = {s.name: torch.from_numpy(np.stack([d[1][s.name] for d in decisions])) for s in OUTPUTS}
+	outputs = {s.name: torch.from_numpy(record.tensors[s.name]) for s in OUTPUTS}
 	actions = stack_actions([d[2] for d in decisions])
 	old_log_prob = log_prob(outputs, actions)
 	values = outputs["value"][:, -1]  # V, the final-reward head (-1..1)
@@ -180,16 +232,16 @@ def collate(examples):
 	}
 
 
-def make_dataloader(record_dirs, batch_size=64, shuffle=True, reward_config=RewardConfig(), advantage_config=AdvantageConfig()):
-	"""(DataLoader over the model's own decisions in the given battle records, the battles' summaries, every
-	battle's examples in order including replayed (forced) ones).
+def make_dataloader(records, batch_size=64, shuffle=True, reward_config=RewardConfig(), advantage_config=AdvantageConfig()):
+	"""(DataLoader over the model's own decisions in the given battle records (Records or record folders), the
+	battles' summaries, every battle's examples in order including replayed (forced) ones).
 
 	Advantages are computed over whole battles, then normalised per side we played over the decisions
 	trained on, not per batch (losses.normalize_advantages).
 	"""
 	examples, summaries, lines, sides, battles = [], [], [], [], []
-	for i, record_dir in enumerate(record_dirs):
-		battle, summary = battle_examples(record_dir, reward_config, advantage_config)
+	for i, record in enumerate(records):
+		battle, summary = battle_examples(record, reward_config, advantage_config)
 		lines.append(battle)
 		summaries.append(summary)
 		chosen = [e for e in battle if not e["forced"]]

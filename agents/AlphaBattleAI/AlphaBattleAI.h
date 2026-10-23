@@ -2,6 +2,7 @@
 
 #include "lib/callback/CBattleGameInterface.h"
 
+#include "Dump.h"
 #include "Policy.h"
 
 #include <optional>
@@ -67,10 +68,14 @@ class AlphaBattleAI : public CBattleGameInterface
 	std::vector<ChosenAction> prefix;
 	size_t prefixPlayed = 0;
 
-	// Training record (ALPHA_BATTLE_RECORD_DIR)
+	// Training record: kept in memory (record) and sent to the trainer at the end of the battle
+	// (ALPHA_BATTLE_RECORD_SOCKET, ALPHA_BATTLE_RECORD_KEY); also written to ALPHA_BATTLE_RECORD_DIR for debugging
+	std::unique_ptr<BattleRecord> record; // null when not recording
+	std::string recordSocket;
+	std::string recordKey;
 	std::string recordDir;
 	int recordedDecisions = 0;
-	void recordEvent(const std::string & json) const;
+	void recordEvent(const std::string & json);
 	std::string aliveArmies(const BattleID & battleID) const;
 	int ourMana(const BattleID & battleID) const;
 
