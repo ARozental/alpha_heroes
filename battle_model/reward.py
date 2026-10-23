@@ -5,6 +5,9 @@
 	       + own value kept / own value at start              (0..1)
 	       - round_penalty * rounds - mana_penalty * fraction of the mana pool used
 
+The same formula scores a battle that is still going on at the end of a round (round_score): the
+outcome term is 0 there, since nobody has won yet. The value heads predict these scores.
+
 Values are in gold: gold + resources at VCMI's base prices. A hero's value is its artifacts
 plus its experience (1000 for level 1 -> 2, then scaled like the XP needed per level, which
 makes it exactly 1 gold per XP point).
@@ -25,10 +28,20 @@ class Outcome(IntEnum):
 	SURRENDER = 3  # paid to leave: hero back in the tavern with its army
 
 
+# The round penalty stops growing after this many rounds, so the reward has fixed bounds
+MAX_PENALIZED_ROUNDS = 100
+
+
 @dataclass(frozen=True)
 class RewardConfig:
 	round_penalty: float = 0.002
 	mana_penalty: float = 0.05
+
+
+def reward_bounds(config=RewardConfig()):
+	"""Lowest and highest possible reward or round score: the output range of the value heads."""
+	low = -1.0 - config.round_penalty * MAX_PENALIZED_ROUNDS - config.mana_penalty
+	return low, 3.0
 
 
 def resources_value(resources):
@@ -69,15 +82,26 @@ def own_kept_value(outcome, army_end_value, hero_value_, fresh_hero_value=0.0, s
 	return 0.0
 
 
-def terminal_reward(outcome, own_start_value, own_kept, enemy_start_value, enemy_lost, rounds, mana_used_fraction, config=RewardConfig()):
-	"""own_start_value / enemy_start_value: army + hero value at the start of the battle."""
-
+def _score(outcome_term, own_start_value, own_kept, enemy_start_value, enemy_lost, rounds, mana_used_fraction, config):
 	def fraction(part, whole):
 		return min(1.0, max(0.0, part / whole)) if whole > 0 else 0.0
 
-	reward = 1.0 if outcome == Outcome.WIN else -1.0
-	reward += fraction(enemy_lost, enemy_start_value)
-	reward += fraction(own_kept, own_start_value)
-	reward -= config.round_penalty * rounds
-	reward -= config.mana_penalty * min(1.0, max(0.0, mana_used_fraction))
-	return reward
+	score = outcome_term
+	score += fraction(enemy_lost, enemy_start_value)
+	score += fraction(own_kept, own_start_value)
+	score -= config.round_penalty * min(rounds, MAX_PENALIZED_ROUNDS)
+	score -= config.mana_penalty * min(1.0, max(0.0, mana_used_fraction))
+	return score
+
+
+def terminal_reward(outcome, own_start_value, own_kept, enemy_start_value, enemy_lost, rounds, mana_used_fraction, config=RewardConfig()):
+	"""own_start_value / enemy_start_value: army + hero value at the start of the battle."""
+	return _score(1.0 if outcome == Outcome.WIN else -1.0, own_start_value, own_kept, enemy_start_value, enemy_lost, rounds, mana_used_fraction, config)
+
+
+def round_score(own_start_value, own_kept, enemy_start_value, enemy_lost, rounds, mana_used_fraction, config=RewardConfig()):
+	"""The reward formula at the end of a round while the battle goes on: outcome term 0, the rest so far.
+
+	own_kept: our surviving army + our hero's value (the hero is still with us); enemy_lost: enemy army lost so far.
+	"""
+	return _score(0.0, own_start_value, own_kept, enemy_start_value, enemy_lost, rounds, mana_used_fraction, config)

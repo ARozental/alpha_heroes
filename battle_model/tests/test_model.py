@@ -34,7 +34,7 @@ def small_masks(seed):
 def test_output_shapes(model):
 	for batch in (1, 3):
 		out = run(model, random_inputs(batch=batch, seed=batch))
-		assert set(out) == {s.name for s in OUTPUTS}
+		assert set(out) == {s.name for s in OUTPUTS} | {"value_logit"}  # value_logit: training only
 		for spec in OUTPUTS:
 			assert out[spec.name].shape == (batch,) + spec.shape, spec.name
 
@@ -113,7 +113,8 @@ def test_ppo_loss_gradients_are_finite():
 		out = model(tx)
 	actions = stack_actions([sample(out, b=b, rng=np.random.default_rng(b)) for b in range(4)])
 	old = log_prob(out, actions)
-	loss, parts = ppo_loss(model(tx), actions, old, advantage=torch.randn(4), returns=torch.randn(4))
+	labels = torch.rand(4, out["value"].shape[1]) * 4 - 1.25
+	loss, parts = ppo_loss(model(tx), actions, old, advantage=torch.randn(4), value_labels=labels)
 	loss.backward()
 	assert torch.isfinite(loss)
 	for name, param in model.named_parameters():
@@ -132,4 +133,31 @@ def test_untrained_model_picks_types_with_the_prior_odds():
 	prior = np.array([ACTION_TYPE_PRIOR.get(ActionType(t), 0.0) for t in legal])
 	expected = np.exp(prior) / np.exp(prior).sum()
 	assert np.allclose(out["logp_type"][0, legal].exp().numpy(), expected, atol=1e-5)
-	assert np.allclose(out["value"].numpy(), 0.0)
+	low, high = m.value_low.item(), m.value_high.item()
+	assert np.allclose(out["value"].numpy(), (low + high) / 2)  # all heads start mid-range
+
+
+def test_values_stay_in_the_reward_range_and_heads_are_boosted():
+	from battle_model.reward import reward_bounds
+	torch.manual_seed(0)
+	m = BattleModel().eval()
+	for head in m.value_heads:  # large random heads to push the sigmoids to their limits
+		torch.nn.init.normal_(head.weight, std=50.0)
+	out = run(m, random_inputs(batch=8, seed=2))
+	low, high = reward_bounds()
+	assert (out["value"] >= low - 1e-5).all() and (out["value"] <= high + 1e-5).all()
+	logits = out["value_logit"]
+	x = {k: torch.from_numpy(v) for k, v in random_inputs(batch=8, seed=2).items()}
+	with torch.no_grad():
+		context_out = m(x)["value_logit"]
+	assert torch.allclose(logits, context_out)
+
+
+def test_boost_stop_gradient_keeps_long_horizon_labels_off_short_heads():
+	torch.manual_seed(0)
+	x = {k: torch.from_numpy(v) for k, v in random_inputs(batch=2, seed=3).items()}
+	for stop, expect_grad in ((True, False), (False, True)):
+		m = BattleModel(boost_stop_gradient=stop)
+		m(x)["value_logit"][:, -1].sum().backward()  # a loss on the final-reward head only
+		v0_grad = m.value_heads[0].weight.grad
+		assert (v0_grad is not None and v0_grad.abs().sum() > 0) == expect_grad

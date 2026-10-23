@@ -59,3 +59,18 @@ def test_penalties_reduce_reward():
 	base = reward(Outcome.WIN, ARMY, 0, ENEMY, rounds=0, mana=0)
 	assert reward(Outcome.WIN, ARMY, 0, ENEMY, rounds=10, mana=0) < base
 	assert reward(Outcome.WIN, ARMY, 0, ENEMY, rounds=0, mana=0.5) < base
+
+
+def test_bounds_cover_every_reward_and_round_score():
+	from battle_model.reward import MAX_PENALIZED_ROUNDS, reward_bounds, round_score
+	low, high = reward_bounds()
+	worst = terminal_reward(Outcome.LOSS, 1, 0, 1, 0, rounds=10 * MAX_PENALIZED_ROUNDS, mana_used_fraction=1.0)
+	best = terminal_reward(Outcome.WIN, 1, 1, 1, 1, rounds=0, mana_used_fraction=0.0)
+	assert worst == low and best == high
+	assert low <= round_score(10, 0, 10, 0, rounds=500, mana_used_fraction=1.0) <= round_score(10, 10, 10, 10, 0, 0) <= high
+
+
+def test_round_score_is_the_reward_without_the_outcome_term():
+	from battle_model.reward import round_score
+	args = (ARMY, ARMY * 0.7, ENEMY, ENEMY * 0.4, 3, 0.2)
+	assert abs(round_score(*args) - (terminal_reward(Outcome.WIN, *args) - 1.0)) < 1e-9

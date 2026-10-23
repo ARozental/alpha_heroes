@@ -7,6 +7,12 @@ by schema.OUTPUTS. All feature transforms live here, inputs are raw engine value
 Tokens: 1 global + 2 heroes + MAX_UNITS units + N_HEXES hexes, mixed by a few
 self-attention blocks. Output heads score units and hexes by dot products against
 query vectors built from the global token, the acting unit and our hero.
+
+Value heads, "boosted" over horizons: V0 predicts the reward formula at the end of this round,
+V1 at the end of the next round, ..., V at the end of the battle. Each is one linear layer on the
+last hidden state, and each head's logit is added to the previous head's logit, so a later head
+only learns the difference to the shorter-horizon estimate. All go through a sigmoid scaled to
+the reward's possible range (reward.reward_bounds).
 """
 import math
 
@@ -28,11 +34,13 @@ from .constants import (
 	N_SECONDARY_SKILLS,
 	N_SIDES,
 	N_SPELLS,
+	N_VALUE_HORIZONS,
 	OBSTACLE_ID_VOCAB,
 	OBSTACLE_TYPE_VOCAB,
 	WALL_STATE_VOCAB,
 	ActionType,
 )
+from .reward import RewardConfig, reward_bounds
 from .schema import INPUT_NAMES, OUTPUT_NAMES
 
 # Starting preference between action types, as type-head logits. The head's weights start at zero,
@@ -96,9 +104,15 @@ class Block(nn.Module):
 
 
 class BattleModel(nn.Module):
-	def __init__(self, dim=64, layers=2, heads=4):
+	def __init__(self, dim=64, layers=2, heads=4, reward_config=RewardConfig(), boost_stop_gradient=True):
+		"""boost_stop_gradient: each value head adds a detached copy of the previous head's logit, so a
+		longer-horizon label never pulls on a shorter-horizon head (true boosting). False lets it."""
 		super().__init__()
 		self.dim = dim
+		self.boost_stop_gradient = boost_stop_gradient
+		low, high = reward_bounds(reward_config)
+		self.register_buffer("value_low", torch.tensor(low), persistent=False)
+		self.register_buffer("value_high", torch.tensor(high), persistent=False)
 		self.creature = nn.Embedding(CREATURE_VOCAB + 1, dim)
 		self.effect = nn.Embedding(EFFECT_VOCAB + 1, dim)
 		self.hero_type = nn.Embedding(HERO_TYPE_VOCAB + 1, dim)
@@ -123,7 +137,7 @@ class BattleModel(nn.Module):
 		self.type_head = nn.Linear(dim, N_ACTION_TYPES)
 		self.spell_head = nn.Linear(dim, N_SPELLS)
 		self.spell_query = nn.Embedding(N_SPELLS, dim)
-		self.value_head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 1))
+		self.value_heads = nn.ModuleList(nn.Linear(dim, 1) for _ in range(N_VALUE_HORIZONS + 1))
 		# One query projection from the context, and one key projection, per pointer head
 		self.queries = nn.ModuleDict({name: nn.Linear(dim, dim) for name in ("move", "melee", "melee_from", "shoot", "spell", "spell2")})
 		self.keys = nn.ModuleDict({name: nn.Linear(dim, dim) for name in ("move_hex", "melee_unit", "melee_from_unit", "melee_from_hex", "shoot_unit", "spell_unit", "spell_hex", "spell2_from_unit", "spell2_hex", "spell2_unit")})
@@ -131,9 +145,10 @@ class BattleModel(nn.Module):
 		with torch.no_grad():
 			self.type_head.weight.zero_()
 			self.type_head.bias.copy_(torch.tensor([ACTION_TYPE_PRIOR.get(a, 0.0) for a in ActionType]))
-			# Value starts at 0 for every state
-			self.value_head[-1].weight.zero_()
-			self.value_head[-1].bias.zero_()
+			# Every value head starts at the middle of the reward range
+			for head in self.value_heads:
+				head.weight.zero_()
+				head.bias.zero_()
 
 	def _embed(self, x):
 		batch = x["g_our_side"].shape[0]
@@ -293,8 +308,21 @@ class BattleModel(nn.Module):
 			"logp_spell_hex": masked_log_softmax(spell_hex, x["m_spell_hex"]),
 			"logp_spell2_hex": masked_log_softmax(spell2_hex, x["m_spell2_hex"]),
 			"logp_spell2_unit": masked_log_softmax(spell2_unit, x["m_spell2_unit"]),
-			"value": self.value_head(context).squeeze(-1),
+			**self._values(context),
 		}
+
+	def _values(self, context):
+		logits, previous = [], None
+		for head in self.value_heads:
+			logit = head(context).squeeze(-1)
+			if previous is not None:
+				logit = logit + (previous.detach() if self.boost_stop_gradient else previous)
+			logits.append(logit)
+			previous = logit
+		value_logit = torch.stack(logits, dim=-1)
+		value = self.value_low + (self.value_high - self.value_low) * torch.sigmoid(value_logit)
+		# value_logit is for the training loss only; it is not a model output in the contract
+		return {"value": value, "value_logit": value_logit}
 
 
 class OnnxWrapper(nn.Module):

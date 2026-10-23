@@ -6,8 +6,8 @@
 
 namespace AlphaSchema
 {
-constexpr int SCHEMA_VERSION = 1;
-constexpr const char * CONTRACT_HASH = "2e64ec2970bf7c08";
+constexpr int SCHEMA_VERSION = 2;
+constexpr const char * CONTRACT_HASH = "1b7a787fb1f24a62";
 
 constexpr int N_HEXES = 187;
 constexpr int FIELD_WIDTH = 17;
@@ -232,6 +232,6 @@ constexpr std::array<TensorSpec, static_cast<int>(Out::COUNT)> OUTPUTS = {{
 	TensorSpec{"logp_spell_hex", DType::FLOAT32, 2, {70, 187}, 0},
 	TensorSpec{"logp_spell2_hex", DType::FLOAT32, 2, {40, 187}, 0},
 	TensorSpec{"logp_spell2_unit", DType::FLOAT32, 2, {40, 40}, 0},
-	TensorSpec{"value", DType::FLOAT32, 0, {0, 0}, 0},
+	TensorSpec{"value", DType::FLOAT32, 1, {4, 0}, 0},
 }};
 }

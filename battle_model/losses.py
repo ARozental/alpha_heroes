@@ -16,8 +16,21 @@ From reward to loss, for one battle seen by one side:
    With gamma = 1 (our choice: battles are short, and the round penalty already prices slowness)
    every decision of a battle has the same return R.
 
-4. Value. The value head predicts V(s_t) ~ E[G_t]: the final reward expected from this state when
-   playing with the current model. The value loss (V(s_t) - G_t)^2 trains that prediction.
+4. Value. The value heads predict, from the state of decision t (played in battle round r_t):
+	   V0  the reward formula evaluated at the end of round r_t      (reward.round_score)
+	   V1  ... at the end of round r_t + 1
+	   V2  ... at the end of round r_t + 2
+	   V   the final reward R                                         (reward.terminal_reward)
+   So every decision has N_VALUE_HORIZONS + 1 labels (value_targets). V's label is R for every
+   decision of the battle; V0's label is shared by the decisions of one round and differs between
+   rounds. If the battle ends before round r_t + k ends, Vk's label is R, so in the last round
+   V0 = V1 = V2 = V. The shorter horizons are easier, less noisy targets that track the final
+   outcome closely; the model's heads are boosted (model.py), each learning the difference to the
+   previous one. The value loss is a weighted sum over the heads (value_head_weights, equal by default).
+   Each head's output is a sigmoid scaled to the reward's range, so its loss is the cross-entropy
+   between the head and its label scaled to 0..1: same minimum as the squared error, but its
+   gradient does not vanish when the sigmoid saturates on a wrong answer.
+   Only V, the final-reward head, is used for the advantages below.
 
 5. Advantage. A_t is how much better than expected the outcome of decision t was. GAE(lambda) mixes
 	   one step:    delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)   how much the prediction rose after the action
@@ -36,15 +49,18 @@ From reward to loss, for one battle seen by one side:
    PPO therefore clips the ratio to [1 - clip_range, 1 + clip_range] and takes the more pessimistic
    of the clipped and unclipped terms.
 
-7. Total loss = policy + value_weight * value - entropy_weight * entropy.
+7. Total loss = policy + value_weight * (weighted value losses) - entropy_weight * entropy.
    The entropy bonus keeps the action distribution from collapsing onto early habits. The ACTION_TYPE_PRIOR
    in model.py already starts the model at sensible odds, so this bonus can stay small.
 """
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 
+from .constants import N_VALUE_HORIZONS
 from .distributions import entropy, log_prob
+from .reward import reward_bounds
 
 
 @dataclass(frozen=True)
@@ -59,15 +75,36 @@ class PPOConfig:
 	value_weight: float = 0.5  # step 7: the value loss shares the network with the policy, standard PPO weight
 	entropy_weight: float = 0.01  # step 7: small exploration bonus
 	normalize_advantages: bool = True  # scale advantages to mean 0, std 1 per batch: the step size then does not depend on the reward scale
+	value_head_weights: tuple = (1.0,) * (N_VALUE_HORIZONS + 1)  # step 4: share of each value head (V0, V1, V2, V) in the value loss
+	value_bounds: tuple = reward_bounds()  # step 4: must be the range the model was built with (its reward_config)
+
+
+def value_targets(decision_rounds, round_scores, final_reward, horizons=N_VALUE_HORIZONS):
+	"""Step 4: the labels of the value heads for every decision of one battle seen by one side.
+
+	decision_rounds: [T] battle round of each decision
+	round_scores:    {round: reward.round_score at the end of that round} for every round that ended
+	                 with the battle still going on
+	final_reward:    reward.terminal_reward of the battle
+	Returns [T, horizons + 1]: column k < horizons is the score at the end of round r_t + k, or the
+	final reward if the battle ended before that; the last column is the final reward.
+	"""
+	labels = torch.full((len(decision_rounds), horizons + 1), float(final_reward))
+	for t, r in enumerate(decision_rounds):
+		for k in range(horizons):
+			if r + k in round_scores:
+				labels[t, k] = round_scores[r + k]
+	return labels
 
 
 def battle_returns_and_advantages(values, rewards, config=AdvantageConfig()):
 	"""Steps 3-5 for one battle seen by one side.
 
-	values:  [T] V(s_t) from the model that played the battle (recorded while playing)
+	values:  [T] V(s_t), the final-reward head, from the model that played the battle (recorded while playing)
 	rewards: [T] reward right after each decision: 0, except the last, which is reward.py's terminal reward
-	Returns (returns [T], advantages [T]). returns is the value head's target: the GAE(lambda) return,
-	equal to G_t for lambda = 1. The battle is over after the last decision, so its next value is 0.
+	Returns (returns [T], advantages [T]). returns is the GAE(lambda) return (G_t for lambda = 1); the
+	value heads are trained on value_targets instead, where V's label is the final reward itself.
+	The battle is over after the last decision, so its next value is 0.
 	"""
 	values = torch.as_tensor(values, dtype=torch.float32)
 	rewards = torch.as_tensor(rewards, dtype=torch.float32)
@@ -81,14 +118,31 @@ def battle_returns_and_advantages(values, rewards, config=AdvantageConfig()):
 	return advantages + values, advantages
 
 
-def ppo_loss(out, action, old_log_prob, advantage, returns, config=PPOConfig()):
-	"""Steps 6-7 for a batch of decisions. out: model outputs for the batch inputs. Returns (loss, parts for logging)."""
+def value_loss(out, targets, config=PPOConfig()):
+	"""Step 4 for a batch: weighted cross-entropy of each value head against its label scaled to 0..1.
+
+	targets: [B, N_VALUE_HORIZONS + 1] from value_targets. Returns (loss, per-head losses [heads]).
+	"""
+	low, high = config.value_bounds
+	scaled = ((targets - low) / (high - low)).clamp(0.0, 1.0)
+	per_head = F.binary_cross_entropy_with_logits(out["value_logit"], scaled, reduction="none").mean(dim=0)
+	weights = torch.tensor(config.value_head_weights, dtype=per_head.dtype)
+	return (per_head * weights).sum() / weights.sum(), per_head.detach()
+
+
+def ppo_loss(out, action, old_log_prob, advantage, value_labels, config=PPOConfig()):
+	"""Steps 4-7 for a batch of decisions. out: model outputs for the batch inputs.
+
+	advantage: [B] from battle_returns_and_advantages (using V, the final-reward head, as values)
+	value_labels: [B, N_VALUE_HORIZONS + 1] from value_targets
+	Returns (loss, parts for logging).
+	"""
 	if config.normalize_advantages and advantage.numel() > 1:
 		advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 	ratio = torch.exp(log_prob(out, action) - old_log_prob)
 	clipped = ratio.clamp(1 - config.clip_range, 1 + config.clip_range)
 	policy = -torch.min(ratio * advantage, clipped * advantage).mean()
-	value = (out["value"] - returns).pow(2).mean()
+	value, per_head = value_loss(out, value_labels, config)
 	bonus = entropy(out).mean()
 	total = policy + config.value_weight * value - config.entropy_weight * bonus
-	return total, {"policy": policy.detach(), "value": value.detach(), "entropy": bonus.detach(), "ratio": ratio.mean().detach()}
+	return total, {"policy": policy.detach(), "value": value.detach(), "value_per_head": per_head, "entropy": bonus.detach(), "ratio": ratio.mean().detach()}

@@ -9,7 +9,7 @@ Bump SCHEMA_VERSION on any change to sizes, enums, input or output definitions.
 """
 from enum import IntEnum
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Battlefield: VCMI BattleHex indices 0..186 are used as-is (17 columns x 11 rows,
 # columns 0 and 16 are the unplayable side columns). No remapping on the C++ side.
@@ -29,6 +29,10 @@ N_SIDES = 2
 # that only appear as active effects on units, never as something a hero casts.
 N_SPELLS = 70
 N_SECONDARY_SKILLS = 28
+
+# Value heads: the expected reward formula at the end of this round, of the next round, ... for
+# N_VALUE_HORIZONS rounds, then at the end of the battle (output "value", N_VALUE_HORIZONS + 1 entries).
+N_VALUE_HORIZONS = 3
 
 # Retaliations are capped: "unlimited" (Royal Griffins) is reported as this value.
 MAX_RETALIATIONS = 3

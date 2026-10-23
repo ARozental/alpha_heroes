@@ -69,10 +69,10 @@ The science (Python, the part to read and change):
 
 | File | What it is |
 |---|---|
-| `model.py` | The network: raw inputs -> embeddings and in-graph transforms (log scaling, relative sides) -> attention over unit, hero, hex and global tokens -> conditional output heads. Also the starting action-type preferences (`ACTION_TYPE_PRIOR`). Replace the architecture freely; only its inputs and outputs are fixed. |
+| `model.py` | The network: raw inputs -> embeddings and in-graph transforms (log scaling, relative sides) -> attention over unit, hero, hex and global tokens -> conditional output heads. Also the starting action-type preferences (`ACTION_TYPE_PRIOR`) and the boosted value heads (V0..V2 = reward formula at the end of this and the next rounds, V = end of battle). Replace the architecture freely; only its inputs and outputs are fixed. |
 | `distributions.py` | The maths of the output: log p(full action) as a sum of conditional choices, its exact entropy, and the reference sampler the C++ side mirrors. |
-| `losses.py` | How the model learns: the PPO loss (policy, value, entropy terms) and its weights. |
-| `reward.py` | What counts as good: the terminal reward and the fixed value functions (units, heroes, retreat, surrender). |
+| `losses.py` | How the reward becomes a training signal: value-head labels, returns and advantages (GAE), and the PPO loss with its weights, explained step by step. |
+| `reward.py` | What counts as good: the terminal reward, the same formula at the end of a round (`round_score`), its bounds, and the fixed value functions (units, heroes, retreat, surrender). |
 | `vocab.py` | What the ids mean: creatures, spells, heroes, skills, artifacts, battlefields and obstacles by engine id, with names and base stats. |
 
 The contract (shared with C++; change deliberately, then run codegen and bump `SCHEMA_VERSION`):
