@@ -1,6 +1,6 @@
 # Battle search (MCTS): how to try moves and take them back
 
-Status: design, with the first stage implemented (see the end). Written 2026-10-23.
+Status: stages 1 and 2 done and tested (see "Results"); stages 3 and 4 to do. Written 2026-10-23.
 
 ## What search needs
 
@@ -40,7 +40,25 @@ VCMI has no "undo". The vcmi-gym author gave up on MCTS for that reason.
 
 E is the only option that is fast enough for MCTS *and* usable when our AI plays a real game. Nothing in it is a hack: it is VCMI's rules, VCMI's packs and VCMI's own overlay type, run without network and clients.
 
-## Design E
+## Design E (as built: the copy is a copy of the game state, not a HypotheticBattle)
+
+The first idea was to run the rules on a `HypotheticBattle` overlay. That does not work: the server's rules
+read units as `CStack` (`battleGetStackByID`), and a `HypotheticBattle` only overlays `battle::Unit` queries,
+so the rules would read the real, unchanged stacks. What works, and is what is built:
+
+- **The copy:** `CGameState::cloneWithBattle(battleID)`, a new lib method.
+  - The game state is copied in memory the way a savegame is written and loaded.
+  - The battle is copied the way `BattleStart` sends it to a client.
+  - Each unit's current state (position, health, shots, flags) is then copied as JSON, the way `BattleUnitsChanged` sends it. A unit serializes only how it *started* the battle.
+- **The rules:** the server's `BattleActionProcessor` and `BattleFlowProcessor`, unchanged, behind `IBattleServer`/`IBattleOwner` (stage 1).
+- **The packs:** applied to the copy with `CGameState::apply` (`GameStatePackVisitor`), exactly as on the server and the clients.
+- **Dice:** the copy's own `CRandomGenerator` and `GameRandomizer` (luck, morale and ability rolls).
+- **Encoding:** `CPlayerBattleCallback(copy's battle, player)` is a player's view of the copy, so the existing encoder and masks work on it unchanged.
+- **Code:** `agents/AlphaBattleAI/BattleSim.{h,cpp}` (`BattleSimulation`: `copyOf`, `clone`, `apply`, `applyActionOnly`, `finished`, `winner`).
+
+The original sketch follows.
+
+### Original sketch (overlay)
 
 ```
           real game                                       search (inside AlphaBattleAI)
@@ -85,9 +103,30 @@ E is the only option that is fast enough for MCTS *and* usable when our AI plays
 - Hidden information. In a real game the copy starts from what our client sees, so the enemy's spellbook and hidden skills are unknown. The copy then needs a guess, or a fixed "no spells" assumption.
 - Speed of `HypotheticBattle` with deep overlays: every read walks the layers. Flatten a node when its depth exceeds a limit.
 
+## Results (2026-10-23)
+
+**Stage 1**, the `IBattleServer`/`IBattleOwner` refactor. 24 battles with fixed seeds produced byte-identical records before and after it: 882 decisions, covering normal play, self-play, Hypnotize, Resurrection, Animate Dead and Sacrifice.
+
+**Stage 2**, the simulator. With `ALPHA_BATTLE_SIM_CHECK=1` the AI first plays each of its actions in a copy, then compares the copy with the real game once the real game has applied the action:
+
+| Scenario | Actions compared | Refused by the copy | Mismatches not caused by dice | Count/health differences |
+|---|---|---|---|---|
+| castle_vs_inferno (incl. self-play) | 392 | 0 | 0 | 92, all after attacks |
+| Hypnotize on both sides | 372 | 0 | 0 | 112, all after attacks |
+| Resurrection, Animate Dead, Sacrifice, Lightning Bolt | 480 | 0 | 0 | 118, all after attacks |
+
+- **Compared exactly:** positions, defending, waited, moved, shots, retaliations, spell effects and hero mana, for every unit.
+- **Count and health** differ only after melee and shooting, because the copy rolls its own dice. They are exact after spells, moves, waits and defends.
+- **Speed:** copy 3.4 ms (whole game state of a battle-only map plus the battle); one action 0.05 ms.
+
+**Not covered yet:**
+- **Turn flow is unchecked.** `apply` runs the next-unit activation (morale, new rounds) with the server's own code, but the check only compares right after the action.
+- **Sieges** are not supported (`updateGateState` is a no-op).
+- **Big maps:** a copy of the whole game state will cost more on them. Copying only the battle and the heroes' mana into an existing copy would fix that.
+
 ## Stages
 
-1. **`IBattleServer` refactor.** No behaviour change; the regression test is identical records.
-2. **`SimulatedServer` + overlay**, with the replay test against recorded battles.
+1. **`IBattleServer` refactor.** No behaviour change; the regression test is identical records. DONE.
+2. **`BattleSimulation`** (a copy of the game state, the server's rules, the copy's own dice), checked against the real game. DONE.
 3. **Search API and IPC to Python**, with a simple MCTS in Python.
 4. **AlphaZero-style training** from search targets.

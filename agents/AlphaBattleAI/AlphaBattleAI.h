@@ -2,8 +2,11 @@
 
 #include "lib/callback/CBattleGameInterface.h"
 
+#include "BattleSim.h"
 #include "Dump.h"
 #include "Policy.h"
+
+#include "lib/battle/BattleAction.h"
 
 #include <optional>
 #include <random>
@@ -92,12 +95,27 @@ class AlphaBattleAI : public CBattleGameInterface
 		int serverRejections = 0; // handled: server rejected an action, chose again
 		int preSendRejections = 0; // handled: chosen action failed the mask check, chose again
 		int faultsInjected = 0;
+		// ALPHA_BATTLE_SIM_CHECK: our actions replayed in a BattleSimulation and compared with the real game
+		int simChecks = 0;
+		int simRejected = 0; // the simulation's rules refused an action the real game accepted
+		int simExactMismatches = 0; // a field that does not depend on dice differs (a bug in the simulation)
+		int simDiceMismatches = 0; // count or health differs: expected when dice were rolled (damage, luck)
+		double simCopyMs = 0;
+		double simApplyMs = 0;
 	} stats;
+
+	// ALPHA_BATTLE_SIM_CHECK=1: each of our actions is first played in a copy of the battle (BattleSimulation);
+	// when the real game has applied it (actionFinished) the two battles are compared
+	bool simCheckEnabled = false;
+	std::unique_ptr<BattleSimulation> simCheck;
+	std::optional<BattleAction> simCheckAction;
+	void compareWithSimulation(const BattleID & battleID);
 
 	bool previousActionRejected(const CPlayerBattleCallback & battle) const;
 	bool injectFault(const std::string & fault);
 
 	void playWithModel(const BattleID & battleID, const CStack * stack);
+	BattleAction toBattleAction(const BattleID & battleID, const CStack * stack, const EncodedBattle & encoded, const ChosenAction & action) const;
 	void execute(const BattleID & battleID, const CStack * stack, const EncodedBattle & encoded, const ChosenAction & action);
 	void useFallback(const BattleID & battleID, const CStack * stack);
 
@@ -109,6 +127,7 @@ public:
 
 	void battleStart(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2, int3 tile, const CGHeroInstance * hero1, const CGHeroInstance * hero2, BattleSide side, bool replayAllowed) override;
 	void battleEnd(const BattleID & battleID, const BattleResult * br, QueryID queryID) override;
+	void actionFinished(const BattleID & battleID, const BattleAction & action) override;
 	void battleSpellCast(const BattleID & battleID, const BattleSpellCast * sc) override;
 	void battleNewRoundFirst(const BattleID & battleID) override;
 	void activeStack(const BattleID & battleID, const CStack * stack) override;

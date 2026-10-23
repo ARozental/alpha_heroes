@@ -1,7 +1,7 @@
 # Built as part of VCMI via its EXTRA_AI_DIRS option
 set(ALPHA_BATTLE_AI_SOURCES
-	AlphaBattleAI.cpp Dump.cpp Encoder.cpp Model.cpp Policy.cpp Tensors.cpp main.cpp
-	AlphaBattleAI.h Dump.h Encoder.h Model.h Policy.h Schema.generated.h StdInc.h Tensors.h
+	AlphaBattleAI.cpp BattleSim.cpp Dump.cpp Encoder.cpp Model.cpp Policy.cpp Tensors.cpp main.cpp
+	AlphaBattleAI.h BattleSim.h Dump.h Encoder.h Model.h Policy.h Schema.generated.h StdInc.h Tensors.h
 )
 find_package(onnxruntime CONFIG REQUIRED)
 # AlphaBattleAIDev: the same AI under another name, to try C++ changes while training runs keep using
@@ -9,7 +9,8 @@ find_package(onnxruntime CONFIG REQUIRED)
 foreach(target AlphaBattleAI AlphaBattleAIDev)
 	add_library(${target} SHARED ${ALPHA_BATTLE_AI_SOURCES})
 	target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR})
-	target_link_libraries(${target} PRIVATE vcmi onnxruntime::onnxruntime)
+	# vcmiservercommon: the server's battle rules, run on copies of a battle by BattleSim
+	target_link_libraries(${target} PRIVATE vcmi vcmiservercommon onnxruntime::onnxruntime)
 	vcmi_set_output_dir(${target} "AI")
 endforeach()
 

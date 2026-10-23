@@ -13,6 +13,9 @@
 #include "lib/callback/CBattleCallback.h"
 #include "lib/callback/CDynLibHandler.h"
 #include "lib/json/JsonNode.h"
+#include "lib/gameState/CGameState.h"
+
+#include <vcmi/Environment.h>
 #include "lib/networkPacks/PacksForClientBattle.h"
 #include "lib/spells/CSpellHandler.h"
 #include "lib/mapObjects/CGHeroInstance.h"
@@ -82,6 +85,7 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 		if(!fault.empty())
 			faults.push_back(fault);
 
+	simCheckEnabled = playerSetting(*CB, "ALPHA_BATTLE_SIM_CHECK") == "1";
 	const auto prefixPath = playerSetting(*CB, "ALPHA_BATTLE_PREFIX");
 	if(!prefixPath.empty())
 	{
@@ -230,6 +234,8 @@ void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br
 		types += std::to_string(stats.types[t]) + (t + 1 < N_ACTION_TYPES ? "," : "");
 	const auto & st = stats.spellTargets;
 	logAi->info("AlphaBattleAI: battle summary: decisions=%d fallbacks=%d errors=%d types=[%s] spell_targets(none,unit,hex,two)=[%d,%d,%d,%d] siege=%d walls=%d server_rejections=%d presend_rejections=%d faults=%d avg_model_ms=%.2f", stats.decisions, stats.fallbacks, stats.errors, types, st[0], st[1], st[2], st[3], stats.siege, stats.walls, stats.serverRejections, stats.preSendRejections, stats.faultsInjected, stats.decisions ? stats.modelMs / stats.decisions : 0.0);
+	if(simCheckEnabled)
+		logAi->info("AlphaBattleAI: simulation check: checks=%d rejected=%d exact_mismatches=%d dice_mismatches=%d avg_copy_ms=%.3f avg_apply_ms=%.3f", stats.simChecks, stats.simRejected, stats.simExactMismatches, stats.simDiceMismatches, stats.simChecks ? stats.simCopyMs / stats.simChecks : 0.0, stats.simChecks ? stats.simApplyMs / stats.simChecks : 0.0);
 	fallback->battleEnd(battleID, br, queryID);
 }
 
@@ -417,7 +423,7 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 	throw std::runtime_error("no legal action found after " + std::to_string(MAX_ATTEMPTS) + " attempts");
 }
 
-void AlphaBattleAI::execute(const BattleID & battleID, const CStack * stack, const EncodedBattle & encoded, const ChosenAction & a)
+BattleAction AlphaBattleAI::toBattleAction(const BattleID & battleID, const CStack * stack, const EncodedBattle & encoded, const ChosenAction & a) const
 {
 	const auto side = cb->getBattle(battleID)->battleGetMySide();
 	auto unit = [&](int slot) -> const CStack *
@@ -430,28 +436,19 @@ void AlphaBattleAI::execute(const BattleID & battleID, const CStack * stack, con
 	switch(static_cast<ActionType>(a.type))
 	{
 		case ActionType::WAIT:
-			cb->battleMakeUnitAction(battleID, BattleAction::makeWait(stack));
-			return;
+			return BattleAction::makeWait(stack);
 		case ActionType::DEFEND:
-			cb->battleMakeUnitAction(battleID, BattleAction::makeDefend(stack));
-			return;
+			return BattleAction::makeDefend(stack);
 		case ActionType::MOVE:
-			cb->battleMakeUnitAction(battleID, BattleAction::makeMove(stack, BattleHex(a.hex)));
-			return;
+			return BattleAction::makeMove(stack, BattleHex(a.hex));
 		case ActionType::MELEE:
-			cb->battleMakeUnitAction(battleID, BattleAction::makeMeleeAttack(stack, unit(a.unit), BattleHex(a.hex)));
-			return;
+			return BattleAction::makeMeleeAttack(stack, unit(a.unit), BattleHex(a.hex));
 		case ActionType::SHOOT:
-			cb->battleMakeUnitAction(battleID, BattleAction::makeShotAttack(stack, unit(a.unit)));
-			return;
+			return BattleAction::makeShotAttack(stack, unit(a.unit));
 		case ActionType::RETREAT:
-			cb->battleMakeUnitAction(battleID, BattleAction::makeRetreat(side));
-			return;
+			return BattleAction::makeRetreat(side);
 		case ActionType::SURRENDER:
-			if(record)
-				recordEvent("{\"event\": \"surrender\", \"cost\": " + std::to_string(cb->getBattle(battleID)->battleGetSurrenderCost()) + "}");
-			cb->battleMakeUnitAction(battleID, BattleAction::makeSurrender(side));
-			return;
+			return BattleAction::makeSurrender(side);
 		case ActionType::HERO_SPELL:
 		{
 			battle::Target target;
@@ -469,11 +466,98 @@ void AlphaBattleAI::execute(const BattleID & battleID, const CStack * stack, con
 			cast.side = side;
 			cast.stackNumber = -1;
 			cast.setTarget(target);
-			// The engine asks this unit for its action again after the hero's cast
-			cb->battleMakeSpellAction(battleID, cast);
-			return;
+			return cast;
 		}
 		default:
 			throw std::runtime_error("model chose action type " + std::to_string(a.type) + ", which is not supported");
 	}
+}
+
+void AlphaBattleAI::execute(const BattleID & battleID, const CStack * stack, const EncodedBattle & encoded, const ChosenAction & a)
+{
+	const auto action = toBattleAction(battleID, stack, encoded, a);
+	if(simCheckEnabled)
+	{
+		const auto player = cb->getPlayerID().value_or(PlayerColor::NEUTRAL);
+		const auto started = std::chrono::steady_clock::now();
+		simCheck = BattleSimulation::copyOf(env->game()->gameState(), battleID, static_cast<int>(rng()));
+		const auto copied = std::chrono::steady_clock::now();
+		if(!simCheck->applyActionOnly(player, action))
+		{
+			++stats.simRejected;
+			logAi->error("AlphaBattleAI: SIM: the simulation refused %s: %s", action.toString(), simCheck->complaint());
+		}
+		stats.simCopyMs += std::chrono::duration<double, std::milli>(copied - started).count();
+		stats.simApplyMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - copied).count();
+		simCheckAction = action;
+	}
+	if(a.type == static_cast<int>(ActionType::SURRENDER) && record)
+		recordEvent("{\"event\": \"surrender\", \"cost\": " + std::to_string(cb->getBattle(battleID)->battleGetSurrenderCost()) + "}");
+	if(a.type == static_cast<int>(ActionType::HERO_SPELL))
+		cb->battleMakeSpellAction(battleID, action); // the engine asks this unit for its action again after the hero's cast
+	else
+		cb->battleMakeUnitAction(battleID, action);
+}
+
+void AlphaBattleAI::actionFinished(const BattleID & battleID, const BattleAction & action)
+{
+	if(simCheck && simCheckAction && action.actionType == simCheckAction->actionType && action.stackNumber == simCheckAction->stackNumber && action.side == simCheckAction->side)
+		compareWithSimulation(battleID);
+	fallback->actionFinished(battleID, action);
+}
+
+void AlphaBattleAI::compareWithSimulation(const BattleID & battleID)
+{
+	++stats.simChecks;
+	const auto real = cb->getBattle(battleID);
+	const auto & sim = simCheck->battle();
+	auto report = [&](int & counter, const std::string & what)
+	{
+		if(counter++ < 20)
+			logAi->warn("AlphaBattleAI: SIM: after %s: %s", simCheckAction->toString(), what);
+	};
+	for(const auto * s : real->battleGetAllStacks(true))
+	{
+		const auto * t = sim.battleGetStackByID(s->unitId(), false);
+		const auto name = "unit " + std::to_string(s->unitId()) + " (" + s->getName() + ")";
+		if(!t)
+		{
+			report(stats.simExactMismatches, name + " missing in the simulation");
+			continue;
+		}
+		auto exact = [&](const char * field, int64_t a, int64_t b)
+		{
+			if(a != b)
+				report(stats.simExactMismatches, name + " " + field + ": real " + std::to_string(a) + ", simulated " + std::to_string(b));
+		};
+		const bool sameDice = s->alive() == t->alive() && s->getCount() == t->getCount() && s->getFirstHPleft() == t->getFirstHPleft();
+		if(!sameDice)
+			report(stats.simDiceMismatches, name + " count/health: real " + std::to_string(s->getCount()) + "/" + std::to_string(s->getFirstHPleft()) + ", simulated " + std::to_string(t->getCount()) + "/" + std::to_string(t->getFirstHPleft()));
+		if(!sameDice)
+			continue; // what follows can depend on whether the unit died
+		exact("position", s->getPosition().toInt(), t->getPosition().toInt());
+		exact("defending", s->defending, t->defending);
+		exact("waited", s->waitedThisTurn, t->waitedThisTurn);
+		exact("moved", s->moved(), t->moved());
+		exact("shots", s->shots.available(), t->shots.available());
+		exact("retaliations", s->counterAttacks.available(), t->counterAttacks.available());
+		auto realSpells = s->activeSpells();
+		auto simSpells = t->activeSpells();
+		std::sort(realSpells.begin(), realSpells.end());
+		std::sort(simSpells.begin(), simSpells.end());
+		if(realSpells != simSpells)
+			report(stats.simExactMismatches, name + " spell effects differ");
+	}
+	for(const auto * t : sim.battleGetAllStacks(true))
+		if(!real->battleGetStackByID(t->unitId(), false))
+			report(stats.simExactMismatches, "unit " + std::to_string(t->unitId()) + " only in the simulation");
+	for(int side = 0; side < 2; ++side)
+	{
+		const auto * realHero = heroes[side]; // the player's callback hides the enemy hero
+		const auto * simHero = sim.battleGetFightingHero(static_cast<BattleSide>(side));
+		if(realHero && simHero && realHero->mana != simHero->mana)
+			report(stats.simExactMismatches, "hero mana of side " + std::to_string(side) + ": real " + std::to_string(realHero->mana) + ", simulated " + std::to_string(simHero->mana));
+	}
+	simCheck.reset();
+	simCheckAction.reset();
 }
