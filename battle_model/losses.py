@@ -39,9 +39,9 @@ From reward to loss, for one battle seen by one side:
    Each head outputs tanh (-1..1) and its loss is the cross-entropy against its -1..1 label (both
    mapped to 0..1): same minimum as the squared error, but the gradient does not vanish when the
    output saturates on a wrong answer.
-   Only V, the final-reward head, is used for the advantages below, and V stands alone (not chained to
-   V0..V2, model.py): V0..V2 are auxiliary predictions that shape the shared network but do not steer the
-   policy. AdvantageConfig.policy_heads can switch a round head on as an extra advantage term (step 5b).
+   V, the final-reward head, makes the advantages below, and V stands alone (not chained to V0..V2,
+   model.py). AdvantageConfig.policy_heads switches round heads on as extra advantage terms (step 5b): by
+   default V2 (the score two rounds ahead); V0 and V1 are only auxiliary predictions that shape the network.
 
 5. Advantage. A_t is how much better than expected the outcome of decision t was. GAE(lambda) mixes
 	   one step:    delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)   how much the prediction rose after the action
@@ -79,10 +79,11 @@ class AdvantageConfig:
 	gamma: float = 1.0  # discount per decision (step 3); 1 = the battle's end counts fully for every decision
 	lam: float = 0.95  # GAE lambda (step 5); 1 = judge each decision by the final outcome only
 	normalize_min_decisions: int = 8  # step 5: rescale a group's advantages only if it has at least this many decisions
-	# Which value heads (V0, V1, V2, V) the policy maximizes (policy_advantages). Default: only V, the final reward;
-	# V0..V2 are then auxiliary predictions that shape the shared network but never steer the policy (playing to
-	# maximize the score at the end of this round would e.g. reward keeping units alive even when that is pointless).
-	policy_heads: tuple = (0, 0, 0, 1)
+	# Which value heads (V0, V1, V2, V) the policy maximizes (policy_advantages). Default: V and V2. In 400-epoch
+	# self-play runs (2026-10-23, one seed each) adding V2 beat V alone against BattleAI on both sides: greedy reward
+	# minus BattleAI's own on the same seeds, attack -0.09 vs -0.24, defence +0.10 vs +0.01. V0 and V1 stay
+	# auxiliary: maximizing the score at the end of this round rewards e.g. keeping units alive even when that is pointless.
+	policy_heads: tuple = (0, 0, 1, 1)
 
 
 @dataclass(frozen=True)

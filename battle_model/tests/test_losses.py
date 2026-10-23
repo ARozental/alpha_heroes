@@ -88,8 +88,8 @@ def test_policy_follows_only_the_heads_switched_on():
 	final = torch.tensor([0.5, -0.2])
 	labels = torch.tensor([[0.3, 0.1, 0.4, 0.6], [0.2, 0.0, -0.1, 0.6]])
 	values = torch.tensor([[0.1, 0.1, 0.1, 0.2], [0.4, 0.0, 0.3, 0.1]])
-	assert torch.equal(policy_advantages(final, labels, values), final)  # default: only V
-	both = policy_advantages(final, labels, values, AdvantageConfig(policy_heads=(0, 0, 1, 1)))
+	assert torch.equal(policy_advantages(final, labels, values, AdvantageConfig(policy_heads=(0, 0, 0, 1))), final)
+	both = policy_advantages(final, labels, values)  # default: V and V2
 	assert torch.allclose(both, final + (labels[:, 2] - values[:, 2]))
 	only_v2 = policy_advantages(final, labels, values, AdvantageConfig(policy_heads=(0, 0, 1, 0)))
 	assert torch.allclose(only_v2, labels[:, 2] - values[:, 2])
