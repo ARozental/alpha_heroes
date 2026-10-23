@@ -36,7 +36,7 @@ MAX_PENALIZED_ROUNDS = 100
 @dataclass(frozen=True)
 class RewardConfig:
 	round_penalty: float = 0.002
-	mana_penalty: float = 0.05
+	mana_penalty: float = 0.05  # fixed for now; later per battle (0 next to a Magic Well) and then a model input
 
 
 def reward_bounds(config=RewardConfig()):

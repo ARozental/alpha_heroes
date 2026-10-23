@@ -14,6 +14,10 @@ last hidden state, and each head's logit is added to the previous head's logit, 
 only learns the difference to the shorter-horizon estimate. Each outputs sigmoid(logit), a value
 in 0..1: the reward rescaled by reward.to_unit (0 = worst possible, 1 = best possible), trained
 with cross-entropy.
+
+The model does not know the reward settings today. Do not design around that: a later version will
+probably get the price of mana for this battle as an input (free next to a Magic Well, costly far from
+one), and possibly other reward weights, so that one model can play by the map's current priorities.
 """
 import math
 
