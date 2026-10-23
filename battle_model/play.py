@@ -91,8 +91,9 @@ def finish(process, keep_run=False):
 	output, _ = process.communicate()
 	report = dict(line.split(":", 1) for line in output.splitlines() if ":" in line)
 	report = {key.strip(): value.strip() for key, value in report.items()}
-	if not report.get("status", "").startswith("finished"):
-		raise RuntimeError(f"battle did not finish cleanly:\n{output[-2000:]}")
+	status = report.get("status", "")
+	if not status.startswith("finished") or not status.endswith("(exit code 0)"):  # killed by a limit, or crashed
+		raise RuntimeError(f"battle did not finish cleanly ({status}; run {report.get('run')}):\n{output[-2000:]}")
 	if not keep_run and report.get("run"):
 		shutil.rmtree(report["run"], ignore_errors=True)
 	return report
@@ -104,11 +105,20 @@ def play(games, model_path, record_root):
 	model_path = Path(model_path).resolve()
 	dirs = [record_root / f"game_{i}" for i in range(len(games))]
 	processes = [start(game, model_path, d) for game, d in zip(games, dirs)]
-	reports = [finish(process, keep_run=True) for process in processes]
-	missing = [(d, report) for d, report in zip(dirs, reports) if not (d / "events.jsonl").exists()]
+	reports, failures = [], []
+	for process in processes:  # wait for every battle before raising, so none is left writing its record
+		try:
+			reports.append(finish(process, keep_run=True))
+		except RuntimeError as error:
+			reports.append({})
+			failures.append(str(error))
 	for d, report in zip(dirs, reports):
 		if report.get("run") and (d / "events.jsonl").exists():
 			shutil.rmtree(report["run"], ignore_errors=True)
-	if missing:  # their runner folders (VCMI logs) are kept for debugging
+	# Failed battles keep their runner folders (VCMI logs) for debugging
+	if failures:
+		raise RuntimeError(f"{len(failures)} of {len(processes)} battles failed; first: {failures[0]}")
+	missing = [(d, report) for d, report in zip(dirs, reports) if report and not (d / "events.jsonl").exists()]
+	if missing:
 		raise RuntimeError("no record written in " + ", ".join(f"{d} (run {report.get('run')})" for d, report in missing))
 	return dirs
