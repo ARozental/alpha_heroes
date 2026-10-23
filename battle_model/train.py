@@ -17,9 +17,12 @@ Each epoch:
      (<run dir>/tensorboard/<start time>: one folder per start, so a restarted run never mixes with old
      data a running TensorBoard still holds in memory). The records only ever exist in memory
      (play.RecordServer); keep_records also writes them to <run dir>/records for debugging.
-  5. every eval_every epochs (and before the first), an eval round, not trained on: games_per_side
-     sampled battles per side plus one greedy battle per side against eval_opponent (BattleAI) on the
-     fixed game_seeds, logged to <run dir>/eval.csv and under eval/ in TensorBoard.
+  5. every eval_every epochs (and before the first), an eval round, not trained on: greedy battles (the most
+     likely action, no sampling) against eval_opponent (BattleAI), one per side on each of eval_seeds fixed
+     random VCMI seeds (the same in every round and every run). Next to each, the eval opponent's own result
+     on the same seed and side (it plays both sides, once per run): vs_baseline = our reward minus its
+     reward, seed by seed, the fairest measure of strength (the scenario favours the attacker: BattleAI
+     never wins its defence against itself). Logged to <run dir>/eval.csv and under eval/ in TensorBoard.
 
 Rewards are logged on the -1..1 scale (reward.to_scale: -1 = worst possible, +1 = best possible), the
 raw reward next to them.
@@ -72,6 +75,7 @@ class TrainConfig:
 	ai: str = "AlphaBattleAI"  # play.Game.ai
 	eval_every: int = 10  # epochs between eval rounds against eval_opponent; 0 = none
 	eval_opponent: str = "BattleAI"
+	eval_seeds: int = 16  # greedy eval battles per side, each on its own fixed random seed (EVAL_SEEDS)
 	game_seeds: tuple = (1, 2)  # VCMI seed of the attack battles and of the defence battles: fixed, so the test is about learning, not luck
 	games_per_side: int = 8  # battles per side per epoch, played in parallel; 1 (~40 decisions an update) was far too noisy
 	# Give every battle its own random VCMI seed instead of game_seeds (dice, obstacles and the opponent's
@@ -160,18 +164,21 @@ TENSORBOARD_TAGS = {
 
 EVAL_COLUMNS = [
 	"epoch", "attack_win_rate", "defence_win_rate", "attack_reward", "defence_reward", "mean_reward", "attack_outcome", "defence_outcome",
-	"attack_greedy_outcome", "defence_greedy_outcome", "attack_greedy_reward", "defence_greedy_reward", "seconds",
-]  # eval.csv: sampled battles (win rate, mean reward -1..1, outcomes) and the one greedy battle, per side
+	"attack_vs_baseline", "defence_vs_baseline", "mean_vs_baseline", "attack_baseline_reward", "defence_baseline_reward", "seconds",
+]  # eval.csv, greedy battles per side: win rate, mean reward -1..1, outcomes; and minus the eval opponent's own reward on the same seeds
+
+# The eval battles' VCMI seeds: fixed random numbers, the same for every eval round of every run
+_eval_rng = random.Random(20261023)
+EVAL_SEEDS = tuple(_eval_rng.randrange(1, 2**31) for _ in range(256))
 
 
 def log_eval_tensorboard(writer, row):
 	epoch = int(row["epoch"])
-	for name in ("attack", "defence"):
-		writer.add_scalar(f"eval/won/{name}", float(row[f"{name}_win_rate"]), epoch)
+	for name in ("attack", "defence", "mean"):
+		if name != "mean":
+			writer.add_scalar(f"eval/won/{name}", float(row[f"{name}_win_rate"]), epoch)
 		writer.add_scalar(f"eval/reward/{name}", float(row[f"{name}_reward"]), epoch)
-		writer.add_scalar(f"eval/won_greedy/{name}", float(row[f"{name}_greedy_outcome"] == "WIN"), epoch)
-		writer.add_scalar(f"eval/reward_greedy/{name}", float(row[f"{name}_greedy_reward"]), epoch)
-	writer.add_scalar("eval/reward/mean", float(row["mean_reward"]), epoch)
+		writer.add_scalar(f"eval/vs_baseline/{name}", float(row[f"{name}_vs_baseline"]), epoch)
 	writer.flush()
 
 
@@ -248,33 +255,65 @@ def play_with_retries(games, model_path, record_root, config, label):
 				raise
 
 
-def eval_round(model, epoch, out, battle_map, config):
+def play_in_groups(games, model_path, config, label):
+	"""play_with_retries for many battles, games_per_side at a time (as many VCMI processes as a training epoch)."""
+	n = config.games_per_side
+	return [r for i in range(0, len(games), n) for r in play_with_retries(games[i : i + n], model_path, None, config, label)]
+
+
+def eval_games(config, battle_map):
+	"""The eval battles: greedy, one per side on each of the first config.eval_seeds EVAL_SEEDS."""
+	return [
+		play.Game(config.scenario, our_side=side, opponent=config.eval_opponent, game_seed=seed, temperature=0.0, ai=config.ai, map=battle_map)
+		for side in (0, 1)
+		for seed in EVAL_SEEDS[: config.eval_seeds]
+	]
+
+
+def eval_baseline(model, out, battle_map, config):
+	"""The eval opponent's own scaled rewards on the eval battles (it plays our side too: ALPHA_BATTLE_DELEGATE),
+	{(side, seed): reward}; computed once per run, kept in <run dir>/eval_baseline.csv."""
+	path = out / "eval_baseline.csv"
+	games = eval_games(config, battle_map)
+	if path.exists():
+		rows = {(int(r["side"]), int(r["seed"])): float(r["reward"]) for r in csv.DictReader(path.open())}
+		if all((g.our_side, g.game_seed) in rows for g in games):
+			return rows
+	model_path = out / "eval.onnx"
+	export(cpu_copy(model), model_path)  # loaded but not used: the delegate plays
+	records = play_in_groups([replace(g, settings=(("ALPHA_BATTLE_DELEGATE", config.eval_opponent),)) for g in games], model_path, config, "eval baseline")
+	rows = {(g.our_side, g.game_seed): to_scale(summarize(r.events).reward, config.reward) for g, r in zip(games, records)}
+	with path.open("w", newline="") as f:
+		writer = csv.writer(f)
+		writer.writerow(["side", "seed", "reward"])
+		writer.writerows([side, seed, round(reward, 6)] for (side, seed), reward in rows.items())
+	return rows
+
+
+def eval_round(model, epoch, out, battle_map, config, baseline):
 	"""Play the eval battles against config.eval_opponent with the current model; the eval.csv row."""
 	started = time.time()
 	model_path = out / "eval.onnx"
 	export(cpu_copy(model), model_path)
-	n = config.games_per_side
-	games = [
-		play.Game(config.scenario, our_side=side, opponent=config.eval_opponent, game_seed=config.game_seeds[side], sampler_seed=10**7 + (2 * epoch + side) * (n + 1) + g, temperature=0.0 if g == n else 1.0, ai=config.ai, map=battle_map)
-		for side in (0, 1)
-		for g in range(n + 1)
-	]  # g == n: the greedy battle
-	record_root = out / "records" / f"eval_{epoch}" if config.keep_records else None
-	records = play_with_retries(games, model_path, record_root, config, f"eval {epoch}")
+	games = eval_games(config, battle_map)
+	records = play_in_groups(games, model_path, config, f"eval {epoch}")
 	summaries = [summarize(r.events) for r in records]
-	write_traces(out, epoch, f"vs_{config.eval_opponent}_greedy", [r for game, r in zip(games, records) if game.temperature == 0])
+	write_traces(out, epoch, f"vs_{config.eval_opponent}_greedy", [next(r for g, r in zip(games, records) if g.our_side == side) for side in (0, 1)])  # the first seed's
 	row = {"epoch": epoch}
-	sampled_all = []
+	rewards, baselines = [], []
 	for side, name in ((0, "attack"), (1, "defence")):
-		sampled = [s for game, s in zip(games, summaries) if game.our_side == side and game.temperature > 0]
-		greedy = next(s for game, s in zip(games, summaries) if game.our_side == side and game.temperature == 0)
-		sampled_all += sampled
-		row[f"{name}_win_rate"] = round(sum(s.outcome == Outcome.WIN for s in sampled) / len(sampled), 4)
-		row[f"{name}_reward"] = round(to_scale(sum(s.reward for s in sampled) / len(sampled), config.reward), 4)
-		row[f"{name}_outcome"] = outcome_text(sampled)
-		row[f"{name}_greedy_outcome"] = greedy.outcome.name
-		row[f"{name}_greedy_reward"] = round(to_scale(greedy.reward, config.reward), 4)
-	row["mean_reward"] = round(to_scale(sum(s.reward for s in sampled_all) / len(sampled_all), config.reward), 4)
+		ours = [(g, s) for g, s in zip(games, summaries) if g.our_side == side]
+		reward = [to_scale(s.reward, config.reward) for _, s in ours]
+		base = [baseline[(side, g.game_seed)] for g, _ in ours]
+		rewards += reward
+		baselines += base
+		row[f"{name}_win_rate"] = round(sum(s.outcome == Outcome.WIN for _, s in ours) / len(ours), 4)
+		row[f"{name}_reward"] = round(sum(reward) / len(reward), 4)
+		row[f"{name}_outcome"] = outcome_text([s for _, s in ours])
+		row[f"{name}_baseline_reward"] = round(sum(base) / len(base), 4)
+		row[f"{name}_vs_baseline"] = round((sum(reward) - sum(base)) / len(reward), 4)
+	row["mean_reward"] = round(sum(rewards) / len(rewards), 4)
+	row["mean_vs_baseline"] = round((sum(rewards) - sum(baselines)) / len(rewards), 4)
 	row["seconds"] = round(time.time() - started, 1)
 	return row
 
@@ -400,12 +439,14 @@ def train(config, resume=False):
 	else:
 		upgrade_csv(eval_csv, EVAL_COLUMNS)
 
+	baseline = eval_baseline(model, out, battle_map, config) if config.eval_every else None
+
 	def evaluate_now(epoch):
-		row = eval_round(model, epoch, out, battle_map, config)
+		row = eval_round(model, epoch, out, battle_map, config, baseline)
 		with eval_csv.open("a", newline="") as f:
 			csv.writer(f).writerow([row[c] for c in EVAL_COLUMNS])
 		log_eval_tensorboard(writer, row)
-		print(f"eval  {epoch:4d}  vs {config.eval_opponent}: attack won {row['attack_win_rate']:.2f} (greedy {row['attack_greedy_outcome']})  defence won {row['defence_win_rate']:.2f} (greedy {row['defence_greedy_outcome']})  {row['seconds']}s", flush=True)
+		print(f"eval  {epoch:4d}  vs {config.eval_opponent}, greedy: attack won {row['attack_win_rate']:.2f} {row['attack_reward']:+.3f} ({row['attack_vs_baseline']:+.3f} vs its own)  defence won {row['defence_win_rate']:.2f} {row['defence_reward']:+.3f} ({row['defence_vs_baseline']:+.3f} vs its own)  {row['seconds']}s", flush=True)
 
 	if config.eval_every and first_epoch == 1:
 		evaluate_now(0)  # the untrained model

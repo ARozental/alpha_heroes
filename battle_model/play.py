@@ -44,6 +44,9 @@ class Game:
 	# Actions (dicts as in a record's action.json) our side plays before the model chooses: battles are
 	# deterministic given game_seed and our actions, so this restores a state of a recorded battle
 	prefix: tuple = ()
+	# Extra environment settings for this battle's AIs, (name, value) pairs, e.g. (("ALPHA_BATTLE_DELEGATE", "BattleAI"),)
+	# (agents/AlphaBattleAI/AlphaBattleAI.h lists them)
+	settings: tuple = ()
 
 	@property
 	def recorded_sides(self):
@@ -140,6 +143,7 @@ def start(game, model_path, records, max_seconds=120, max_mb=200):
 		ALPHA_BATTLE_TEMPERATURE=str(game.temperature),
 		SETTINGS=json.dumps({"server": {"seed": game.game_seed}}),
 	)
+	env.update(dict(game.settings))
 	for side, color in enumerate(COLORS):
 		env[f"VCMI_BATTLE_AI_{color}"] = game.ai if side in game.recorded_sides else game.opponent
 	for i, (side, target) in enumerate(zip(game.recorded_sides, records)):

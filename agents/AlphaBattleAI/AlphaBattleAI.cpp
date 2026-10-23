@@ -72,7 +72,8 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 	cb = CB;
 	// Save before the fallback touches the callback, both restore the same original value
 	wasWaitingForRealize = CB->waitTillRealize;
-	fallback = CDynLibHandler::getNewBattleAI("StupidAI");
+	delegated = !playerSetting(*CB, "ALPHA_BATTLE_DELEGATE").empty();
+	fallback = CDynLibHandler::getNewBattleAI(delegated ? playerSetting(*CB, "ALPHA_BATTLE_DELEGATE") : "StupidAI");
 	fallback->initBattleInterface(ENV, CB);
 	CB->waitTillRealize = false;
 
@@ -310,6 +311,11 @@ bool AlphaBattleAI::injectFault(const std::string & fault)
 
 void AlphaBattleAI::yourTacticPhase(const BattleID & battleID, int distance)
 {
+	if(delegated)
+	{
+		fallback->yourTacticPhase(battleID, distance);
+		return;
+	}
 	cb->battleMakeTacticAction(battleID, BattleAction::makeEndOFTacticPhase(cb->getBattle(battleID)->battleGetTacticsSide()));
 }
 
@@ -322,6 +328,11 @@ void AlphaBattleAI::useFallback(const BattleID & battleID, const CStack * stack)
 void AlphaBattleAI::activeStack(const BattleID & battleID, const CStack * stack)
 {
 	auto battle = cb->getBattle(battleID);
+	if(delegated)
+	{
+		fallback->activeStack(battleID, stack);
+		return;
+	}
 	if(!model || stack->hasBonusOfType(BonusType::SIEGE_WEAPON) || battle->battleGetTacticDist() || battle->battleGetRound() >= ROUND_CAP)
 	{
 		useFallback(battleID, stack);

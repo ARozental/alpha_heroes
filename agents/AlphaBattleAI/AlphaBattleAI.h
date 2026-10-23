@@ -33,6 +33,8 @@ struct EncodedBattle;
 ///   ALPHA_BATTLE_SEARCH_SIMULATIONS  > 0: search every decision with that many simulations (Gumbel AlphaZero,
 ///                             BattleSearch.h); the network's choice when the search fails. Default 0: no search
 ///   ALPHA_BATTLE_SEARCH_CONSIDERED   root actions the search starts with (default 16)
+///   ALPHA_BATTLE_DELEGATE     another battle AI (e.g. BattleAI) plays every decision; the battle's events are
+///                             still recorded (no decisions): results of other AIs, e.g. for baselines
 ///   ALPHA_BATTLE_TEST_FAULT   test hook, comma list: "surrender" / "spell" send one action per battle the
 ///                             server must reject, "decoder" corrupts one chosen action per battle
 ///
@@ -51,6 +53,7 @@ class AlphaBattleAI : public CBattleGameInterface
 	std::array<const CGHeroInstance *, 2> heroes{}; // per battle side, from battleStart
 	std::mt19937 rng;
 	float temperature = 1.0f;
+	bool delegated = false; // ALPHA_BATTLE_DELEGATE
 	bool wasWaitingForRealize = false;
 
 	// Rejection handling: actions excluded for the current unit's turn
