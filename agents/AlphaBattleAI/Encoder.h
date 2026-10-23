@@ -11,6 +11,7 @@
 
 VCMI_LIB_NAMESPACE_BEGIN
 class BattleAction;
+class CCreature;
 class CGHeroInstance;
 class CPlayerBattleCallback;
 class CStack;
@@ -45,6 +46,9 @@ void excludeAction(EncodedBattle & e, const ChosenAction & action);
 
 /// True if the complete action is legal under the masks (mirrors battle_model/distributions.py is_legal)
 bool isLegal(const EncodedBattle & e, const ChosenAction & action);
+
+/// A creature's value in gold (reward.py prices: gold and resources), as the reward counts it
+double creatureValue(const CCreature * creature);
 
 /// Every legal full action, from the masks alone, in the order of battle_model/distributions.py enumerate_actions
 std::vector<ChosenAction> legalActions(const EncodedBattle & e);

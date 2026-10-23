@@ -6,12 +6,13 @@
 
 namespace AlphaSchema
 {
-constexpr int SCHEMA_VERSION = 7;
-constexpr const char * CONTRACT_HASH = "4173f793a39af4d5";
+constexpr int SCHEMA_VERSION = 8;
+constexpr const char * CONTRACT_HASH = "f521e29fa3a6b531";
 
 constexpr int N_HEXES = 187;
 constexpr int FIELD_WIDTH = 17;
-constexpr int MAX_UNITS = 40;
+constexpr int MAX_UNITS = 20;
+constexpr int UNITS_PER_SIDE = 10;
 constexpr int MAX_EFFECTS = 8;
 constexpr int N_SIDES = 2;
 constexpr int N_SPELLS = 70;
@@ -149,36 +150,36 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"g_active_unit", DType::INT64, 0, {0, 0}, 0},
 	TensorSpec{"g_hero_can_cast", DType::INT64, 0, {0, 0}, 0},
 	TensorSpec{"g_gate_state", DType::INT64, 0, {0, 0}, 0},
-	TensorSpec{"u_present", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_alive", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_creature", DType::INT64, 1, {40, 0}, -1},
-	TensorSpec{"u_side", DType::INT64, 1, {40, 0}, -1},
-	TensorSpec{"u_owner_side", DType::INT64, 1, {40, 0}, -1},
-	TensorSpec{"u_hex", DType::INT64, 1, {40, 0}, -1},
-	TensorSpec{"u_rear_hex", DType::INT64, 1, {40, 0}, -1},
-	TensorSpec{"u_count", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_first_hp", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_max_hp", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_attack", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_defense", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_dmg_min", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_dmg_max", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_speed", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_shots", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_retaliations", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_casts", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_morale", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_luck", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_moved", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_waited", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_defending", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_is_clone", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_is_summoned", DType::INT64, 1, {40, 0}, 0},
-	TensorSpec{"u_queue_now", DType::INT64, 1, {40, 0}, -1},
-	TensorSpec{"u_queue_next", DType::INT64, 1, {40, 0}, -1},
-	TensorSpec{"u_effect_id", DType::INT64, 2, {40, 8}, -1},
-	TensorSpec{"u_effect_turns", DType::INT64, 2, {40, 8}, 0},
-	TensorSpec{"u_effect_value", DType::INT64, 2, {40, 8}, 0},
+	TensorSpec{"u_present", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_alive", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_creature", DType::INT64, 1, {20, 0}, -1},
+	TensorSpec{"u_side", DType::INT64, 1, {20, 0}, -1},
+	TensorSpec{"u_owner_side", DType::INT64, 1, {20, 0}, -1},
+	TensorSpec{"u_hex", DType::INT64, 1, {20, 0}, -1},
+	TensorSpec{"u_rear_hex", DType::INT64, 1, {20, 0}, -1},
+	TensorSpec{"u_count", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_first_hp", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_max_hp", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_attack", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_defense", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_dmg_min", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_dmg_max", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_speed", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_shots", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_retaliations", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_casts", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_morale", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_luck", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_moved", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_waited", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_defending", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_is_clone", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_is_summoned", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_queue_now", DType::INT64, 1, {20, 0}, -1},
+	TensorSpec{"u_queue_next", DType::INT64, 1, {20, 0}, -1},
+	TensorSpec{"u_effect_id", DType::INT64, 2, {20, 8}, -1},
+	TensorSpec{"u_effect_turns", DType::INT64, 2, {20, 8}, 0},
+	TensorSpec{"u_effect_value", DType::INT64, 2, {20, 8}, 0},
 	TensorSpec{"h_present", DType::INT64, 1, {2, 0}, 0},
 	TensorSpec{"h_type", DType::INT64, 1, {2, 0}, -1},
 	TensorSpec{"h_attack", DType::INT64, 1, {2, 0}, 0},
@@ -197,14 +198,14 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"x_wall_state", DType::INT64, 1, {187, 0}, -1},
 	TensorSpec{"m_type", DType::BOOL, 1, {13, 0}, 0},
 	TensorSpec{"m_move_hex", DType::BOOL, 1, {187, 0}, 0},
-	TensorSpec{"m_melee_target", DType::BOOL, 1, {40, 0}, 0},
-	TensorSpec{"m_melee_from", DType::BOOL, 2, {40, 187}, 0},
-	TensorSpec{"m_shoot_target", DType::BOOL, 1, {40, 0}, 0},
+	TensorSpec{"m_melee_target", DType::BOOL, 1, {20, 0}, 0},
+	TensorSpec{"m_melee_from", DType::BOOL, 2, {20, 187}, 0},
+	TensorSpec{"m_shoot_target", DType::BOOL, 1, {20, 0}, 0},
 	TensorSpec{"m_spell", DType::BOOL, 1, {70, 0}, 0},
-	TensorSpec{"m_spell_unit", DType::BOOL, 2, {70, 40}, 0},
+	TensorSpec{"m_spell_unit", DType::BOOL, 2, {70, 20}, 0},
 	TensorSpec{"m_spell_hex", DType::BOOL, 2, {70, 187}, 0},
-	TensorSpec{"m_spell2_hex", DType::BOOL, 2, {40, 187}, 0},
-	TensorSpec{"m_spell2_unit", DType::BOOL, 2, {40, 40}, 0},
+	TensorSpec{"m_spell2_hex", DType::BOOL, 2, {20, 187}, 0},
+	TensorSpec{"m_spell2_unit", DType::BOOL, 2, {20, 20}, 0},
 }};
 
 enum class Out : int
@@ -226,14 +227,14 @@ enum class Out : int
 constexpr std::array<TensorSpec, static_cast<int>(Out::COUNT)> OUTPUTS = {{
 	TensorSpec{"logp_type", DType::FLOAT32, 1, {13, 0}, 0},
 	TensorSpec{"logp_move_hex", DType::FLOAT32, 1, {187, 0}, 0},
-	TensorSpec{"logp_melee_target", DType::FLOAT32, 1, {40, 0}, 0},
-	TensorSpec{"logp_melee_from", DType::FLOAT32, 2, {40, 187}, 0},
-	TensorSpec{"logp_shoot_target", DType::FLOAT32, 1, {40, 0}, 0},
+	TensorSpec{"logp_melee_target", DType::FLOAT32, 1, {20, 0}, 0},
+	TensorSpec{"logp_melee_from", DType::FLOAT32, 2, {20, 187}, 0},
+	TensorSpec{"logp_shoot_target", DType::FLOAT32, 1, {20, 0}, 0},
 	TensorSpec{"logp_spell", DType::FLOAT32, 1, {70, 0}, 0},
-	TensorSpec{"logp_spell_unit", DType::FLOAT32, 2, {70, 40}, 0},
+	TensorSpec{"logp_spell_unit", DType::FLOAT32, 2, {70, 20}, 0},
 	TensorSpec{"logp_spell_hex", DType::FLOAT32, 2, {70, 187}, 0},
-	TensorSpec{"logp_spell2_hex", DType::FLOAT32, 2, {40, 187}, 0},
-	TensorSpec{"logp_spell2_unit", DType::FLOAT32, 2, {40, 40}, 0},
+	TensorSpec{"logp_spell2_hex", DType::FLOAT32, 2, {20, 187}, 0},
+	TensorSpec{"logp_spell2_unit", DType::FLOAT32, 2, {20, 20}, 0},
 	TensorSpec{"value", DType::FLOAT32, 1, {4, 0}, 0},
 }};
 

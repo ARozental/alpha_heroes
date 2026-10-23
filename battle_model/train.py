@@ -96,7 +96,6 @@ class TrainConfig:
 	model_architecture: str = "v2"  # "v2": model.BattleModel (rules and features); "v1": model_v1.BattleModelV1
 	model_dim: int = 64
 	model_layers: int = 2
-	model_rank: int = 4  # v2: rank of the rule scores' second-order term
 	model_mask_features: bool = False  # v1 only: BattleModelV1(mask_features=...)
 	model_chain_final_value: bool = False  # v1 only: BattleModelV1(chain_final_value=...)
 	model_kill_rule: bool = True  # v1 only: BattleModelV1(kill_rule=...)
@@ -401,7 +400,7 @@ class Producer:
 def model_kwargs(config):
 	"""The model's constructor arguments, saved in checkpoints (model.build_model rebuilds the model from them)."""
 	if config.model_architecture == "v2":
-		return {"architecture": "v2", "dim": config.model_dim, "layers": config.model_layers, "rank": config.model_rank}
+		return {"architecture": "v2", "dim": config.model_dim, "layers": config.model_layers}
 	return {"architecture": "v1", "dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features, "chain_final_value": config.model_chain_final_value, "kill_rule": config.model_kill_rule}
 
 

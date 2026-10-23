@@ -265,6 +265,7 @@ def units_of(x, tables):
 	return {
 		"creature": creature, "side": x["u_side"], "hex": x["u_hex"], "rear": x["u_rear_hex"],
 		"alive": (x["u_present"] != 0) & (x["u_alive"] != 0), "retaliations": x["u_retaliations"], "speed": x["u_speed"],
+		"summoned": x["u_is_summoned"] != 0, "clone": x["u_is_clone"] != 0,
 		"count": x["u_count"], "first_hp": x["u_first_hp"], "max_hp": x["u_max_hp"],
 		"attack": x["u_attack"], "defense": x["u_defense"], "dmg_min": x["u_dmg_min"], "dmg_max": x["u_dmg_max"],
 		"effect_id": x["u_effect_id"], "effect_value": x["u_effect_value"],
@@ -427,9 +428,29 @@ def kills(damage, unit):
 
 def unit_value(unit, tables):
 	"""A stack's value in gold as the reward counts it: the creature's price times its creatures, the top one counted
-	by its health left; 0 when dead or empty."""
+	by its health left; 0 when dead or empty, and for summoned units and clones (they vanish after the battle)."""
 	health = (unit["count"] - 1).float() + unit["first_hp"].float() / unit["max_hp"].clamp(min=1).float()
-	return torch.where(unit["alive"] & (unit["count"] > 0), tables["value"][unit["creature"]] * health, torch.zeros_like(health))
+	counts = unit["alive"] & (unit["count"] > 0) & ~unit["summoned"] & ~unit["clone"]
+	return torch.where(counts, tables["value"][unit["creature"]] * health, torch.zeros_like(health))
+
+
+# The magic schools and the secondary skill of each (vocab secondary_skills: Fire, Air, Water, Earth Magic)
+SCHOOLS = ("fire", "air", "water", "earth")
+SCHOOL_SKILLS = (14, 15, 16, 17)
+
+
+def spell_schools(path=vocab.VOCAB_PATH):
+	"""[N_SPELLS, len(SCHOOLS)]: the schools each spell belongs to (several for e.g. Magic Arrow), from the vocabulary."""
+	from .constants import N_SPELLS
+
+	schools = torch.zeros(N_SPELLS, len(SCHOOLS), dtype=torch.bool)
+	if path.exists():
+		for row in vocab.tables(path)["spells"].values():
+			if 0 <= row["id"] < N_SPELLS:
+				for school in row.get("schools", ()):
+					if school in SCHOOLS:
+						schools[row["id"], SCHOOLS.index(school)] = True
+	return schools
 
 
 def smallest(x, dim=-1):

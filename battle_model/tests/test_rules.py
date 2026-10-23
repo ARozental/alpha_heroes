@@ -9,7 +9,6 @@ import torch
 from battle_model import vocab
 from battle_model.constants import FIELD_WIDTH, N_HEXES, ActionType
 from battle_model.distributions import sample
-from battle_model.model import BattleModel
 from battle_model.model_v1 import BattleModelV1
 from battle_model.rules import creature_tables, cross_stack_features, hex_distance, least_damage
 from battle_model.schema import empty_inputs, finalize_masks
@@ -146,8 +145,6 @@ def test_shooting_far_halves_the_damage(seed):
 	assert f["least_shot"][0, 1:3].tolist() == [22, 11] and f["kills_shot"][0, 1:3].tolist() == [1.0, 0.0]
 	action = greedy(BattleModelV1().eval(), x)
 	assert (action["type"], action["unit"]) == (ActionType.SHOOT, 1)
-	action = greedy(kill_rule_model(), x)
-	assert (action["type"], action["unit"]) == (ActionType.SHOOT, 1)
 
 
 def test_the_rule_changes_nothing_without_a_legal_sure_kill():
@@ -166,28 +163,3 @@ def test_the_rule_changes_nothing_without_a_legal_sure_kill():
 	for name in ("logp_type", "logp_melee_target", "logp_shoot_target"):
 		assert torch.equal(with_rule[name], without[name]), name
 
-
-def kill_rule_model():
-	"""The current model with the kill rule as its first-order weights (check_rules.py)."""
-	model = BattleModel().eval()
-	for head in ("melee_target", "shoot_target"):
-		model.set_rule_weights(head, sure_kill=1000.0, value_destroyed=1000.0)
-	return model
-
-
-@pytest.mark.parametrize("seed", range(5))
-def test_untrained_model_with_the_kill_rule_attacks_the_most_valuable_stack_it_kills_for_sure(seed):
-	torch.manual_seed(seed)
-	action = greedy(kill_rule_model(), melee_position())
-	assert (action["type"], action["unit"]) == (ActionType.MELEE, 2)
-
-
-def test_untrained_model_prefers_a_sure_kill_by_its_starting_rules():
-	"""Without the 1000s, the starting rule weights alone (model.RULE_START) already make melee on the most valuable sure
-	kill the most likely action."""
-	torch.manual_seed(0)
-	x = melee_position()
-	finalize_masks(x, 0)
-	with torch.no_grad():
-		out = BattleModel().eval()({k: torch.from_numpy(v) for k, v in x.items()})
-	assert int(out["logp_type"][0].argmax()) == ActionType.MELEE and int(out["logp_melee_target"][0].argmax()) == 2

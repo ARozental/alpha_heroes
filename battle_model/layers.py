@@ -4,26 +4,13 @@ import math
 import torch
 from torch import nn
 
+from . import priors
 from .constants import MASKED_LOGIT, ActionType
 from .schema import INPUT_NAMES, OUTPUT_NAMES
 
-# Starting preference between action types, as type-head logits. The head's weights start at zero,
-# so an untrained model picks among the legal types with exactly these odds. A modelling choice:
-# start aggressive and rarely give up, so the first self-play games are real fights instead of
-# mostly retreats. Training moves these freely; types not listed start at 0.
-# Giving up is offered at every decision, ~40 times a battle, so its odds compound: at -2 (~2.5% a
-# decision each) about 2 in 3 untrained battles ended in a retreat or surrender. At -6 (~0.05% a
-# decision each) it is ~4% of battles.
-ACTION_TYPE_PRIOR = {
-	ActionType.MELEE: 1.0,
-	ActionType.SHOOT: 1.0,
-	ActionType.HERO_SPELL: 0.5,
-	ActionType.MOVE: 0.5,
-	ActionType.WAIT: 0.0,
-	ActionType.DEFEND: 0.0,
-	ActionType.RETREAT: -6.0,
-	ActionType.SURRENDER: -6.0,
-}
+# Starting preference between action types, as type-head logits: priors/action_types.csv (priors.py). The head's
+# weights start at zero, so an untrained model picks among the legal types with exactly these odds.
+ACTION_TYPE_PRIOR = {ActionType(i): float(bias) for i, bias in enumerate(priors.action_types().tolist())}
 
 
 def vocab_index(ids, vocab):

@@ -1,0 +1,71 @@
+name,id,bias
+Summon Boat,0,0.0
+Scuttle Boat,1,0.0
+Visions,2,0.0
+View Earth,3,0.0
+Disguise,4,0.0
+View Air,5,0.0
+Fly,6,0.0
+Water Walk,7,0.0
+Dimension Door,8,0.0
+Town Portal,9,0.0
+Quicksand,10,-0.5
+Land Mine,11,-0.5
+Force Field,12,-0.5
+Fire Wall,13,-0.25
+Earthquake,14,-1.0
+Magic Arrow,15,0.25
+Ice Bolt,16,0.5
+Lightning Bolt,17,0.5
+Implosion,18,0.75
+Chain Lightning,19,0.5
+Frost Ring,20,0.0
+Fireball,21,0.25
+Inferno,22,0.25
+Meteor Shower,23,0.25
+Death Ripple,24,0.0
+Destroy Undead,25,-0.5
+Armageddon,26,-1.0
+Shield,27,0.25
+Air Shield,28,0.25
+Fire Shield,29,0.25
+Protection from Air,30,-0.25
+Protection from Fire,31,-0.25
+Prot. from Water,32,-0.25
+Prot. from Earth,33,-0.25
+Anti-Magic,34,-0.25
+Dispel,35,0.0
+Magic Mirror,36,-0.25
+Cure,37,0.0
+Resurrection,38,0.5
+Animate Dead,39,0.25
+Sacrifice,40,0.0
+Bless,41,0.5
+Curse,42,0.25
+Bloodlust,43,0.25
+Precision,44,0.25
+Weakness,45,0.25
+Stone Skin,46,0.25
+Disrupting Ray,47,0.25
+Prayer,48,0.75
+Mirth,49,0.0
+Sorrow,50,0.25
+Fortune,51,0.0
+Misfortune,52,0.0
+Haste,53,0.5
+Slow,54,0.75
+Slayer,55,0.0
+Frenzy,56,0.0
+Titan's Lightning Bolt,57,0.5
+Counterstrike,58,0.0
+Berserk,59,0.25
+Hypnotize,60,0.5
+Forgetfulness,61,0.25
+Blind,62,0.5
+Teleport,63,0.0
+Remove Obstacle,64,-1.0
+Clone,65,0.25
+Fire Elemental,66,0.5
+Earth Elemental,67,0.5
+Water Elemental,68,0.5
+Air Elemental,69,0.5

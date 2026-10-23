@@ -9,7 +9,7 @@ Bump SCHEMA_VERSION on any change to sizes, enums, input or output definitions.
 """
 from enum import IntEnum
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8  # 8: 20 unit slots (10 per side) instead of 40
 
 # Battlefield: VCMI BattleHex indices 0..186 are used as-is (17 columns x 11 rows,
 # columns 0 and 16 are the unplayable side columns). No remapping on the C++ side.
@@ -17,8 +17,11 @@ FIELD_WIDTH = 17
 FIELD_HEIGHT = 11
 N_HEXES = FIELD_WIDTH * FIELD_HEIGHT
 
-# Unit slots, both sides together, dead stacks included (resurrection targets them).
-MAX_UNITS = 40
+# Unit slots: up to UNITS_PER_SIDE of each battle side (an army has at most 7 stacks, plus war machines, summoned
+# units and clones), dead stacks included (resurrection targets them). Over that the encoder keeps the acting unit,
+# then living stacks by value, then dead ones; the rest are not seen (wrong decisions possible, never illegal ones).
+UNITS_PER_SIDE = 10
+MAX_UNITS = 2 * UNITS_PER_SIDE
 # Active spell effects per unit (VCMI itself has no limit; its UI shows 8).
 MAX_EFFECTS = 8
 # Heroes are indexed by battle side: 0 = attacker, 1 = defender.

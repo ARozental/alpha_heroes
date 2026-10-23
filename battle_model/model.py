@@ -14,19 +14,22 @@ built on features.py: the game's own rules, computed exactly, as bounded and sca
 
 How a choice is scored (ActionHeads): its logit is the sum of
   - a learned pointer score: the context's query against the choice's token (unit or hex), as in model_v1;
-  - its rule score (RuleScore): first order, one weight per feature of this choice (features.*_FEATURES), starting at
-    hand-chosen values (RULE_START), so a handful of parameters learns how each meaningful number of an action moves
-    that action's own logit; and second order, a low-rank term (rank 4) of the choice's features against a summary of
-    all legal choices and the context, for what the first order cannot express;
+  - its own features' score (ActionScore), in three parts, each starting at 0 (how much each feature matters is learned):
+      linear  one weight per feature of this choice (features.*_FEATURES) on its own logit: a handful of parameters per
+              head, so the first-order effect of each meaningful number is quick to learn
+      own     a tiny layer from all of the choice's own features to 1: how they combine
+      wide    a wider layer from the choice's features and everything else (the context, all legal choices' features):
+              the corrections that need the whole situation;
+  - biases (priors.py, files in priors/): the type head's, each spell's, and each spell's by our hero's mastery of its
+    school;
   - the value of its best follow-up: the largest logit among the legal choices it leads to (a type gets its best
     target's or hex's, a melee target its best hex's, a spell its best target's). So an attack the rules like lifts its
     type, not just itself, and many poor options (most hexes are threatened) do not sink a type with one good one, as
     an average would (the first version averaged, log-mean-exp, and the untrained model stopped moving). With all
-    follow-ups equal it adds nothing, so the untrained types keep ACTION_TYPE_PRIOR's odds.
+    follow-ups equal it adds nothing, so the untrained types keep the type head's starting odds.
 
-Untrained, the pointer scores are 0 (zero queries), so the model plays its rule scores: kill what dies for sure, prefer
-valuable targets and threatening ones, avoid retaliation and threatened hexes, block shooters, move toward the enemy.
-The type head starts at ACTION_TYPE_PRIOR. The value heads are as in model_v1: V0..V2 the reward formula at the end of
+Untrained, the pointer and feature scores are 0: every choice is equally likely but for the biases (the type head starts
+at priors/action_types.csv, the spells at priors/spells.csv and MASTERY_BIAS). The value heads are as in model_v1: V0..V2 the reward formula at the end of
 this and the next two rounds (boosted), V the final reward (standing alone), each tanh, trained with cross-entropy.
 
 Embeddings (creatures, effects, positions, ...) start small (std 0.1) next to the features, so the numbers count from
@@ -38,7 +41,7 @@ import torch
 from torch import nn
 
 from . import features as F
-from . import rules
+from . import priors, rules
 from .constants import (
 	ACCESSIBILITY_VOCAB,
 	BATTLEFIELD_VOCAB,
@@ -60,17 +63,8 @@ from .constants import (
 	ActionType,
 	TargetKind,
 )
-from .layers import ACTION_TYPE_PRIOR, Block, masked_log_softmax, vocab_index
+from .layers import Block, masked_log_softmax, vocab_index
 
-# The rule weights' starting values, per head and feature (nats per unit of the feature); the rest start at 0.
-# Hand-chosen: the untrained model's play, and the defaults training moves from.
-RULE_START = {
-	"melee_target": {"sure_kill": 2.0, "value_destroyed": 4.0, "threat_removed": 2.0, "value_lost": -4.0},
-	"shoot_target": {"sure_kill": 2.0, "value_destroyed": 4.0, "threat_removed": 2.0},
-	"melee_from": {"threat_change": -1.0, "danger_change": -1.0, "blocked_change": 1.0},
-	# An attacker has to walk into threat to win: getting closer outweighs becoming more threatened
-	"move": {"threat_change": -1.0, "danger_change": -1.0, "blocked_change": 1.0, "new_targets": 1.0, "progress": 2.0},
-}
 EMBEDDING_STD = 0.1
 
 
@@ -85,29 +79,37 @@ def best_of(logits, legal):
 	return torch.where(legal.any(dim=-1), logits.masked_fill(~legal, MASKED_LOGIT).amax(dim=-1), torch.zeros_like(logits[..., 0]))
 
 
-class RuleScore(nn.Module):
-	"""A choice's score from its own features [B, *choices, features]: first order, one weight per feature (starting
-	at `start`), plus a second-order term of rank `rank`: the choice's features (projected) against a summary of all
-	legal choices' and of the context. The second order starts at 0."""
+def zero_output(layer):
+	nn.init.zeros_(layer.weight)
+	nn.init.zeros_(layer.bias)
+	return layer
 
-	def __init__(self, names, start, dim, rank):
+
+class ActionScore(nn.Module):
+	"""How a choice's own features [B, *choices, features] move its logit: linear (one weight per feature), own (a tiny
+	layer from the choice's features to 1) and wide (a wider layer from the choice's features, the context and a
+	summary of all legal choices' features: their mean and max). All start at 0."""
+
+	def __init__(self, names, dim, tiny=8, wide=32):
 		super().__init__()
 		self.names = tuple(names)
-		self.weight = nn.Parameter(torch.tensor([float(start.get(n, 0.0)) for n in self.names]))
-		self.project = nn.Linear(len(self.names), rank, bias=False)
-		self.summary = nn.Linear(2 * rank + dim, rank)
-		nn.init.zeros_(self.summary.weight)
-		nn.init.zeros_(self.summary.bias)
+		n = len(self.names)
+		self.linear = nn.Parameter(torch.zeros(n))
+		self.own = nn.Sequential(nn.Linear(n, tiny), nn.GELU(), zero_output(nn.Linear(tiny, 1)))
+		self.wide_choice = nn.Linear(n, wide)  # per choice
+		self.wide_rest = nn.Linear(dim + 2 * n, wide)  # per decision: the context and the summary
+		self.wide_out = zero_output(nn.Linear(wide, 1))
 
 	def forward(self, features, legal, context):
-		first = (features * self.weight).sum(dim=-1)
-		z = self.project(features)  # [B, *choices, rank]
-		flat, flat_legal = z.flatten(1, -2), legal.flatten(1)[..., None].float()
-		mean = (flat * flat_legal).sum(dim=1) / flat_legal.sum(dim=1).clamp(min=1)
-		top = flat.masked_fill(flat_legal == 0, -1e4).amax(dim=1).clamp(min=-1e3) * (flat_legal.sum(dim=1) > 0)
-		g = self.summary(torch.cat([mean, top, context], dim=-1))  # [B, rank]
-		second = (z * g.view(g.shape[0], *([1] * (z.dim() - 2)), -1)).sum(dim=-1)
-		return first + second
+		linear = (features * self.linear).sum(dim=-1)
+		own = self.own(features).squeeze(-1)
+		flat, flat_legal = features.flatten(1, -2), legal.flatten(1)[..., None].float()
+		count = flat_legal.sum(dim=1)
+		mean = (flat * flat_legal).sum(dim=1) / count.clamp(min=1)
+		top = flat.masked_fill(flat_legal == 0, -2.0).amax(dim=1) * (count > 0)  # features are >= -1
+		rest = self.wide_rest(torch.cat([context, mean, top], dim=-1))  # [B, wide]
+		hidden = nn.functional.gelu(self.wide_choice(features) + rest.view(rest.shape[0], *([1] * (features.dim() - 2)), -1))
+		return linear + own + self.wide_out(hidden).squeeze(-1)
 
 
 class BattleEmbedding(nn.Module):
@@ -231,7 +233,7 @@ class ActionHeads(nn.Module):
 	POINTERS = ("move", "melee", "melee_from", "shoot", "spell", "spell2")
 	KEYS = ("move_hex", "melee_unit", "melee_from_unit", "melee_from_hex", "shoot_unit", "spell_unit", "spell_hex", "spell2_from_unit", "spell2_hex", "spell2_unit")
 
-	def __init__(self, dim, rank):
+	def __init__(self, dim):
 		super().__init__()
 		self.type_head = nn.Linear(dim, N_ACTION_TYPES)
 		self.type_rules = nn.Linear(len(F.TYPE_FEATURES), N_ACTION_TYPES, bias=False)
@@ -240,21 +242,35 @@ class ActionHeads(nn.Module):
 		self.queries = nn.ModuleDict({name: nn.Linear(dim, dim) for name in self.POINTERS})
 		self.keys = nn.ModuleDict({name: nn.Linear(dim, dim) for name in self.KEYS})
 		names = {"melee_target": F.ATTACK_FEATURES, "melee_from": F.FROM_FEATURES, "shoot_target": F.SHOT_FEATURES, "move": F.MOVE_FEATURES}
-		self.rules = nn.ModuleDict({head: RuleScore(names[head], RULE_START.get(head, {}), dim, rank) for head in names})
+		self.rules = nn.ModuleDict({head: ActionScore(names[head], dim) for head in names})
+		self.spell_mastery = nn.Parameter(priors.mastery())  # [spell, our hero's mastery of its school]
+		self.register_buffer("spell_schools", rules.spell_schools(), persistent=False)
 		second = torch.zeros(N_SPELLS, dtype=torch.long)
 		for spell, kind in SECOND_TARGET_KIND.items():
 			second[spell] = int(kind)
 		self.register_buffer("second_target", second, persistent=False)
 		self.register_buffer("type_one_hot", torch.eye(N_ACTION_TYPES), persistent=False)
-		with torch.no_grad():  # untrained: the type prior, no type rules, zero pointer scores
+		with torch.no_grad():  # untrained: the biases (priors.py), no type rules, zero pointer scores
 			self.type_head.weight.zero_()
-			self.type_head.bias.copy_(torch.tensor([ACTION_TYPE_PRIOR.get(a, 0.0) for a in ActionType]))
+			self.type_head.bias.copy_(priors.action_types())
 			self.type_rules.weight.zero_()
 			# every pointer score starts at 0: the queries, and the per-unit offsets added to them, start at 0
-			for layer in (*self.queries.values(), self.keys["melee_from_unit"], self.keys["spell2_from_unit"], self.spell_head):
+			for layer in (*self.queries.values(), self.keys["melee_from_unit"], self.keys["spell2_from_unit"]):
 				layer.weight.zero_()
 				layer.bias.zero_()
+			self.spell_head.weight.zero_()
+			self.spell_head.bias.copy_(priors.spells())
 			self.spell_query.weight.zero_()
+
+	def mastery_bias(self, x):
+		"""[B, N_SPELLS]: each spell's bias for our hero's mastery of its school (the best of its schools: none, basic,
+		advanced, expert), learned per spell and mastery from priors.MASTERY_BIAS."""
+		our = x["g_our_side"].clamp(0, N_SIDES - 1)
+		skills = x["h_skills"][torch.arange(our.shape[0], device=our.device), our]  # [B, N_SECONDARY_SKILLS]
+		levels = skills[:, list(rules.SCHOOL_SKILLS)].clamp(0, 3)  # [B, schools]
+		level = (levels[:, None, :] * self.spell_schools[None, :, :]).amax(dim=-1)  # [B, N_SPELLS]
+		spells = torch.arange(self.spell_mastery.shape[0], device=level.device)
+		return self.spell_mastery[spells[None, :], level]
 
 	def forward(self, context, units, hexes, actions, x):
 		scale = 1.0 / math.sqrt(context.shape[-1])
@@ -277,7 +293,7 @@ class ActionHeads(nn.Module):
 		spell_unit = torch.einsum("bsd,bud->bsu", spell_q, k["spell_unit"](units)) * scale + second_value[:, self.second_target, :]
 		spell_hex = torch.einsum("bsd,bhd->bsh", spell_q, k["spell_hex"](hexes)) * scale
 		first_targets = torch.cat([spell_unit, spell_hex], dim=-1)
-		spell = self.spell_head(context) + best_of(first_targets, torch.cat([x["m_spell_unit"], x["m_spell_hex"]], dim=-1))
+		spell = self.spell_head(context) + self.mastery_bias(x) + best_of(first_targets, torch.cat([x["m_spell_unit"], x["m_spell_hex"]], dim=-1))
 
 		follow = torch.zeros_like(self.type_head(context))
 		for action, logits, legal in ((ActionType.MOVE, move, x["m_move_hex"]), (ActionType.MELEE, melee_target, x["m_melee_target"]), (ActionType.SHOOT, shoot_target, x["m_shoot_target"]), (ActionType.HERO_SPELL, spell, x["m_spell"])):
@@ -323,7 +339,7 @@ class ValueHeads(nn.Module):
 
 
 class BattleModel(nn.Module):
-	def __init__(self, dim=64, layers=2, heads=4, rank=4, boost_stop_gradient=True):
+	def __init__(self, dim=64, layers=2, heads=4, boost_stop_gradient=True):
 		super().__init__()
 		for name, table in rules.creature_tables().items():
 			self.register_buffer(f"table_{name}", table, persistent=False)
@@ -332,7 +348,7 @@ class BattleModel(nn.Module):
 		self.units = UnitEmbedding(dim)
 		self.hexes = HexEmbedding(dim)
 		self.trunk = Trunk(dim, layers, heads)
-		self.actions = ActionHeads(dim, rank)
+		self.actions = ActionHeads(dim)
 		self.values = ValueHeads(dim, boost_stop_gradient)
 
 	def tables(self):
@@ -365,11 +381,11 @@ class BattleModel(nn.Module):
 		return {**self.actions(context, units, hexes, actions, x), **self.values(context)}
 
 	def set_rule_weights(self, head, **weights):
-		"""Set first-order rule weights by feature name, e.g. set_rule_weights("melee_target", sure_kill=1000.0)."""
+		"""Set a head's linear feature weights by name, e.g. set_rule_weights("melee_target", wipe_chance=2.0)."""
 		score = self.actions.rules[head]
 		with torch.no_grad():
 			for name, value in weights.items():
-				score.weight[score.names.index(name)] = value
+				score.linear[score.names.index(name)] = value
 
 
 def build_model(kwargs):

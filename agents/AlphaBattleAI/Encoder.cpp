@@ -3,6 +3,7 @@
 
 #include "Policy.h"
 
+#include "lib/CCreatureHandler.h"
 #include "lib/CStack.h"
 #include "lib/battle/BattleAction.h"
 #include "lib/battle/CObstacleInstance.h"
@@ -24,22 +25,29 @@ using namespace AlphaSchema;
 
 namespace
 {
+/// The units the model sees: up to UNITS_PER_SIDE of each battle side: the acting unit, then living stacks by value,
+/// then dead ones (Resurrection can target them); in the engine's order (unit ids), as the slots always were
 std::vector<const CStack *> pickUnits(const CPlayerBattleCallback & battle, const CStack * active)
 {
 	auto stacks = battle.battleGetAllStacks(true);
 	std::sort(stacks.begin(), stacks.end(), [](const CStack * a, const CStack * b) { return a->unitId() < b->unitId(); });
-	// Over capacity: drop dead stacks first, never the acting one
-	while(stacks.size() > static_cast<size_t>(MAX_UNITS))
+	std::array<std::vector<const CStack *>, 2> sides;
+	for(const auto * s : stacks)
+		if(s->unitSide() == BattleSide::ATTACKER || s->unitSide() == BattleSide::DEFENDER)
+			sides[static_cast<int>(s->unitSide())].push_back(s);
+	std::vector<const CStack *> picked;
+	for(auto & side : sides)
 	{
-		auto dead = std::find_if(stacks.rbegin(), stacks.rend(), [&](const CStack * s) { return !s->alive() && s != active; });
-		if(dead != stacks.rend())
-			stacks.erase(std::next(dead).base());
-		else if(stacks.back() != active)
-			stacks.pop_back();
-		else
-			stacks.erase(stacks.end() - 2);
+		auto value = [](const CStack * s) { return s->alive() ? creatureValue(s->unitType()) * s->getCount() : 0.0; };
+		std::stable_sort(side.begin(), side.end(), [&](const CStack * a, const CStack * b)
+		{
+			return std::make_tuple(a != active, !a->alive(), -value(a)) < std::make_tuple(b != active, !b->alive(), -value(b));
+		});
+		side.resize(std::min(side.size(), static_cast<size_t>(UNITS_PER_SIDE)));
+		picked.insert(picked.end(), side.begin(), side.end());
 	}
-	return stacks;
+	std::sort(picked.begin(), picked.end(), [](const CStack * a, const CStack * b) { return a->unitId() < b->unitId(); });
+	return picked;
 }
 
 void encodeUnits(EncodedBattle & e, const CPlayerBattleCallback & battle, const std::vector<const CStack *> & stacks)
@@ -463,6 +471,14 @@ bool isLegal(const EncodedBattle & e, const ChosenAction & a)
 		default:
 			return true;
 	}
+}
+
+double creatureValue(const CCreature * creature)
+{
+	double value = 0;
+	for(int r = 0; r < static_cast<int>(RESOURCE_PRICES.size()); ++r)
+		value += RESOURCE_PRICES[r] * creature->getRecruitCost(GameResID(r));
+	return value;
 }
 
 std::vector<ChosenAction> legalActions(const EncodedBattle & e)

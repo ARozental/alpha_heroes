@@ -130,9 +130,9 @@ def test_untrained_model_picks_types_with_the_prior_odds():
 	from battle_model.layers import ACTION_TYPE_PRIOR
 	torch.manual_seed(3)
 	m = BattleModel().eval()
-	with torch.no_grad():
-		for rule in m.actions.rules.values():
-			rule.weight.zero_()
+	with torch.no_grad():  # the spells' biases lift HERO_SPELL by the best castable spell's: zero them here
+		m.actions.spell_head.bias.zero_()
+		m.actions.spell_mastery.zero_()
 	x = random_inputs(batch=1, seed=4)
 	out = run(m, x)
 	legal = np.flatnonzero(x["m_type"][0])

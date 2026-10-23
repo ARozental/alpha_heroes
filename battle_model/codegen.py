@@ -27,6 +27,7 @@ def render():
 		("N_HEXES", c.N_HEXES),
 		("FIELD_WIDTH", c.FIELD_WIDTH),
 		("MAX_UNITS", c.MAX_UNITS),
+		("UNITS_PER_SIDE", c.UNITS_PER_SIDE),
 		("MAX_EFFECTS", c.MAX_EFFECTS),
 		("N_SIDES", c.N_SIDES),
 		("N_SPELLS", c.N_SPELLS),

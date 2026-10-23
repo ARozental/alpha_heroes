@@ -276,17 +276,22 @@ def distance_maps(b):
 	return reach, torch.where(b.me["flying"][..., None], fly_to, walk_to)
 
 
-def can_attack_at(b, reach):
-	"""[B, U, H]: whether each unit could attack a unit standing on each hex this coming turn: a shooter with
-	ammunition from anywhere, any other one if it can get next to the hex."""
+def melee_reach(b, reach):
+	"""[B, U, H]: whether each unit could get next to each hex this coming turn, to attack a unit standing there."""
 	around = rules.neighbours(torch.arange(N_HEXES, device=reach.device))  # [H, 6]
 	steps = rules.smallest(torch.where(around >= 0, reach[..., around.clamp(min=0)], rules.INFINITE_DISTANCE))
-	return b.units["can_shoot"][..., None] | (steps <= b.units["speed"][..., None])
+	return steps <= b.units["speed"][..., None]
+
+
+def can_attack_at(b, reach):
+	"""[B, U, H]: whether each unit could attack a unit standing on each hex this coming turn: a shooter with
+	ammunition from anywhere, any unit if it can get next to the hex."""
+	return b.units["can_shoot"][..., None] | melee_reach(b, reach)
 
 
 # ---- The acting unit's attacks ----
 
-ATTACK_FEATURES = ("damage", "kills", "sure_kill", "wipe_chance", "value_destroyed", "threat_removed", "retaliation", "value_lost", "net_value")
+ATTACK_FEATURES = ("damage", "kills", "wipe_chance", "value_destroyed", "threat_removed", "retaliation", "value_lost", "net_value")
 
 
 def _average_damage(attacker, target, shooting, tables):
@@ -310,8 +315,7 @@ def attack_features(b, shooting):
 
 	damage           of the target's health left, the engine's average (capped)
 	kills            of its creatures
-	sure_kill        1 if even the least damage kills the whole stack (rules.cross_stack_features, exact)
-	wipe_chance      how much of the damage range reaches its whole health
+	wipe_chance      p(the whole stack dies): how much of the damage range reaches its whole health (1: whatever the dice)
 	value_destroyed  the share of the enemy army's value this removes
 	threat_removed   the share of the enemies' damage against the acting unit this removes (BattleAI's "damage
 	                 reduce": half for creatures killed, half for health)
@@ -325,7 +329,6 @@ def attack_features(b, shooting):
 	hp = b.health.float()
 	damage = fraction(average, hp)
 	killed = fraction(rules.kills(average.long(), units).float(), units["count"].float())
-	sure = rules.cross_stack_features(b.x, b.tables)["kills_shot" if shooting else "kills_melee"]
 	wipe = fraction(high - hp + 1, high - low + 1)
 	value_destroyed = fraction(b.value * damage, b.enemy_value[:, None])
 	threat_removed = threat_share(b) * (0.5 * killed + 0.5 * damage)
@@ -341,30 +344,36 @@ def attack_features(b, shooting):
 	my_value = b.mine(b.value)[:, None]
 	value_lost = fraction(my_value * retaliation, b.our_value[:, None])
 	net = (b.value * damage - my_value * retaliation) / (b.our_value + b.enemy_value)[:, None].clamp(min=EPS)
-	features = torch.stack([damage, killed, sure, wipe, value_destroyed, threat_removed, retaliation, value_lost, net.clamp(-1, 1)], dim=-1)
+	features = torch.stack([damage, killed, wipe, value_destroyed, threat_removed, retaliation, value_lost, net.clamp(-1, 1)], dim=-1)
 	return features * b.enemy[..., None]
 
 
 # ---- Per hex, for the acting unit ----
 
-HEX_FEATURES = ("reachable", "threat_value", "danger", "blocked_shooters", "new_targets", "progress")
+HEX_FEATURES = ("reachable", "threat_value", "melee_threat_value", "danger", "blocked_shooters", "next_to_enemy", "new_targets", "progress")
 
 
 def threat_maps(b, reach, to_enemy):
 	"""Per hex [B, H, len(HEX_FEATURES)], for the acting unit standing there:
 
 	reachable         it can move there this turn (m_move_hex)
-	threat_value      the share of the enemy army's value that could attack it there in its coming turn
-	danger            of its health, the damage those enemies could do to it there
-	blocked_shooters  the share of the enemy army's value in shooters next to the hex, which it would block
-	new_targets       the share of the enemy army's value it could attack next turn from there and cannot now
-	progress          steps it gains there toward the nearest enemy, of its speed: -1..1 (0 for a shooter with ammunition)
-	Also returned: can_attack [B, U, H] (can_attack_at), for attacks from a hex (action_features).
+	threat_value        the share of the enemy army's value that could attack it there in its coming turn
+	melee_threat_value  the same for attacks in melee only: what a shooter (or anyone) escapes by keeping its distance
+	danger              of its health, the damage those enemies could do to it there
+	blocked_shooters    the share of the enemy army's value in shooters next to the hex, which it would block
+	next_to_enemy       1 if an enemy stands next to the hex (a shooter there cannot shoot)
+	new_targets         the share of the enemy army's value it could attack next turn from there and cannot now
+	progress            steps it gains there toward the nearest enemy, of its speed: -1..1
+	Also returned: can_attack [B, U, H] (can_attack_at, every unit: unit_summaries, action_features).
 	"""
-	can = can_attack_at(b, reach) & b.enemy[..., None]
+	reaches = melee_reach(b, reach)  # [B, U, H], every unit
+	can_attack = reaches | b.units["can_shoot"][..., None]
+	melee = reaches & b.enemy[..., None]
+	can = can_attack & b.enemy[..., None]
 	value = b.value[..., None]
 	enemy_value = b.enemy_value[:, None].clamp(min=EPS)
 	threat_value = (value * can).sum(dim=1) / enemy_value
+	melee_threat_value = (value * melee).sum(dim=1) / enemy_value
 	shooting = b.units["can_shoot"]
 	average, _, _ = _average_damage(b.units, b.me, shooting, b.tables)
 	danger = fraction((average[..., None] * can).sum(dim=1), b.mine(b.health).float()[:, None])
@@ -374,6 +383,7 @@ def threat_maps(b, reach, to_enemy):
 	around = rules.neighbours(hexes)
 	next_to = rules.lookup(on.flatten(0, 1), around.expand(on.shape[0] * on.shape[1], -1, -1)).any(dim=-1).view(on.shape)
 	blocked = (value * (next_to & b.enemy[..., None] & shooting[..., None])).sum(dim=1) / enemy_value
+	next_to_enemy = (next_to & b.enemy[..., None]).any(dim=1).float()
 
 	my_speed = b.me["speed"]
 	attackable_now = b.x["m_melee_target"] | b.x["m_shoot_target"]
@@ -382,9 +392,8 @@ def threat_maps(b, reach, to_enemy):
 	nearest = torch.where(b.enemy[..., None], to_enemy, rules.INFINITE_DISTANCE).amin(dim=1).clamp(max=REACH_STEPS + 1).float()  # [B, H]
 	here = nearest.gather(1, b.me["hex"].clamp(min=0))  # [B, 1]: from where it stands
 	progress = ((here - nearest) / my_speed.clamp(min=1).float()).clamp(-1, 1)
-	progress = progress * ~b.me["can_shoot"]  # a shooter gains nothing by closing in: next to an enemy it cannot shoot
-	maps = torch.stack([b.x["m_move_hex"].float(), threat_value.clamp(0, 1), danger, blocked.clamp(0, 1), new_targets.clamp(0, 1), progress], dim=-1)
-	return maps, can
+	maps = torch.stack([b.x["m_move_hex"].float(), threat_value.clamp(0, 1), melee_threat_value.clamp(0, 1), danger, blocked.clamp(0, 1), next_to_enemy, new_targets.clamp(0, 1), progress], dim=-1)
+	return maps, can_attack
 
 
 # ---- Per unit, against everyone ----
@@ -443,9 +452,10 @@ def battle_features(b, maps):
 # ---- Per action ----
 
 # A move's (and an attack's hex's) features are changes from where the unit stands: staying (wait, defend) is the
-# baseline, a hex is better or worse than that. -1..1.
-FROM_FEATURES = ("threat_change", "danger_change", "blocked_change", "new_targets")
-MOVE_FEATURES = ("threat_change", "danger_change", "blocked_change", "new_targets", "progress")
+# baseline, a hex is better or worse than that, -1..1. Progress toward the enemy is split by whether the unit can shoot
+# (a melee unit closes in to hit, a shooter keeps away to shoot), with "next to an enemy" for shooters (cannot shoot).
+FROM_FEATURES = ("threat_change", "melee_threat_change", "danger_change", "blocked_change", "new_targets")
+MOVE_FEATURES = ("threat_change", "melee_threat_change", "danger_change", "blocked_change", "new_targets", "progress", "shooter_progress", "shooter_next_to_enemy")
 SHOT_FEATURES = tuple(f for f in ATTACK_FEATURES if f not in ("retaliation", "value_lost"))
 TYPE_FEATURES = ("danger_here", "threat_here", "strength")
 
@@ -467,8 +477,12 @@ def action_features(b, melee, shot, maps, can_attack, battle):
 	value = b.value[..., None]
 	losses = value * melee[..., ATTACK_FEATURES.index("kills"), None] * can_attack  # [B, U, H]: the threat value the target loses
 	threat_after = (column("threat_value")[:, None, :] - losses / b.enemy_value[:, None, None].clamp(min=EPS)).clamp(0, 1)
-	hexes = torch.stack([change("threat_value"), change("danger"), change("blocked_shooters"), column("new_targets"), column("progress")], dim=-1)  # MOVE_FEATURES
-	per_target = hexes[:, None, :, :4].expand(-1, b.health.shape[1], -1, -1)
+	shooter = b.me["can_shoot"].float()  # [B, 1]
+	hexes = torch.stack([
+		change("threat_value"), change("melee_threat_value"), change("danger"), change("blocked_shooters"), column("new_targets"),
+		column("progress") * (1 - shooter), column("progress") * shooter, column("next_to_enemy") * shooter,
+	], dim=-1)  # MOVE_FEATURES
+	per_target = hexes[:, None, :, : len(FROM_FEATURES)].expand(-1, b.health.shape[1], -1, -1)
 	melee_from = torch.cat([(threat_after - here("threat_value")[..., None])[..., None], per_target[..., 1:]], dim=-1)
 	return {
 		"melee_target": melee,

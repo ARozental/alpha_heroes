@@ -12,7 +12,7 @@ from battle_model.tests.test_rules import allow_melee, battle, melee_position
 
 pytestmark = pytest.mark.skipif(not vocab.VOCAB_PATH.exists(), reason="run scripts/export_vocab.sh to generate the vocabulary")
 
-BOUNDS = {"net_value": (-1, 1), "progress": (-1, 1), "threat_change": (-1, 1), "danger_change": (-1, 1), "blocked_change": (-1, 1), "attack_buff": (-1, 1), "defense_buff": (-1, 1), "morale": (np.log1p(-6 / 24), np.log1p(3 / 24)), "luck": (np.log1p(-0.5 * 3 / 24), np.log1p(3 / 24))}
+BOUNDS = {"net_value": (-1, 1), "progress": (-1, 1), "shooter_progress": (-1, 1), "threat_change": (-1, 1), "melee_threat_change": (-1, 1), "danger_change": (-1, 1), "blocked_change": (-1, 1), "attack_buff": (-1, 1), "defense_buff": (-1, 1), "morale": (np.log1p(-6 / 24), np.log1p(3 / 24)), "luck": (np.log1p(-0.5 * 3 / 24), np.log1p(3 / 24))}
 
 
 def everything(x):
@@ -44,7 +44,7 @@ def test_every_feature_is_bounded(seed):
 # Features that count whole creatures, so small stacks are lumpy: two Angels cannot kill one Devil (97 of its 160 hit
 # points), twenty kill six of twenty, and the Devils' retaliation and threat shrink with what they lose. That is the
 # game, not a scale problem; it fades as stacks grow.
-WHOLE_CREATURES = {"kills", "threat_removed", "retaliation", "value_lost", "net_value", "threat_change"}
+WHOLE_CREATURES = {"kills", "threat_removed", "retaliation", "value_lost", "net_value", "threat_change", "wipe_chance"}
 
 
 def scaled(x, factor):
@@ -90,9 +90,9 @@ def test_each_action_scores_its_own_logit():
 		maps, can = F.threat_maps(b, *F.distance_maps(b))
 		actions = F.action_features(b, F.attack_features(b, False), F.attack_features(b, True), maps, can, F.battle_features(b, maps))
 		rules = model.actions.rules
-		from_logits = (actions["melee_from"] * rules["melee_from"].weight).sum(-1)
-		target_logits = (actions["melee_target"] * rules["melee_target"].weight).sum(-1) + best_of(from_logits, t["m_melee_from"])
-		move_logits = (actions["move"] * rules["move"].weight).sum(-1)
+		from_logits = (actions["melee_from"] * rules["melee_from"].linear).sum(-1)
+		target_logits = (actions["melee_target"] * rules["melee_target"].linear).sum(-1) + best_of(from_logits, t["m_melee_from"])
+		move_logits = (actions["move"] * rules["move"].linear).sum(-1)
 	# The hexes of each target: the first-order scores, normalised over that target's legal hexes
 	for u in range(4):
 		legal = t["m_melee_from"][0, u]
@@ -132,3 +132,17 @@ def test_threat_maps_see_who_can_reach_a_hex():
 	pikeman_hex = 101 - 17 * 5
 	assert threat[pikeman_hex - 1] == 1.0  # next to the Pikeman: it can attack there
 	assert threat[17 * 9 + 2] == 0.0  # far away: a speed 4 Pikeman cannot get there
+
+
+def test_unit_summaries_cover_both_sides():
+	"""Regression: the summaries once saw only the enemies' reach, so our units' best hit read 0."""
+	x = melee_position()
+	finalize_masks(x, 0)
+	t = {k: torch.from_numpy(v) for k, v in x.items()}
+	b = F.read_battle(t, BattleModel().tables())
+	maps, can = F.threat_maps(b, *F.distance_maps(b))
+	summaries = F.unit_summaries(b, can)
+	best_hit, worst_hit = summaries[0, :4, 0], summaries[0, :4, 1]
+	assert best_hit[0] == 1.0  # our two Angels wipe out the Imps
+	assert worst_hit[1] == 1.0  # the Imps can lose everything to them
+	assert 0 < worst_hit[0] < 1  # the Devils can hurt the Angels

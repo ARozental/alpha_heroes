@@ -77,14 +77,6 @@ ChosenAction unpack(int64_t id)
 	}
 	return a;
 }
-
-double creatureValue(const CCreature * creature)
-{
-	double value = 0;
-	for(int r = 0; r < static_cast<int>(RESOURCE_PRICES.size()); ++r)
-		value += RESOURCE_PRICES[r] * creature->getRecruitCost(GameResID(r));
-	return value;
-}
 }
 
 double armyValue(const CCreatureSet & army)
