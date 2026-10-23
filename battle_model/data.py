@@ -10,6 +10,7 @@ From it we compute, for every decision:
 	old_log_prob  log p(action) under the model that played, from its recorded outputs
 	advantage     GAE advantage (losses.battle_returns_and_advantages), with V (the final-reward head)
 	value_labels  labels of all value heads (losses.value_targets), on the -1..1 scale
+	forced        replayed from a prefix (play.Game.prefix), not chosen by the model: not trained on
 and per battle a BattleSummary with the reward (reward.py) and the outcome.
 
 A decision is one compressed decision_*.npz (a .npy per tensor plus action.json, ~15 KB; the tensors are
@@ -162,7 +163,7 @@ def battle_examples(record_dir, reward_config=RewardConfig(), advantage_config=A
 	labels = value_targets(rounds, summary.round_scores, summary.reward, reward_config=reward_config)
 
 	examples = [
-		{"inputs": d[0], "action": d[2], "old_log_prob": old_log_prob[i], "advantage": advantages[i], "value_labels": labels[i]}
+		{"inputs": d[0], "action": d[2], "old_log_prob": old_log_prob[i], "advantage": advantages[i], "value_labels": labels[i], "forced": bool(d[2].get("forced", False))}
 		for i, d in enumerate(decisions)
 	]
 	return examples, summary
@@ -180,21 +181,24 @@ def collate(examples):
 
 
 def make_dataloader(record_dirs, batch_size=64, shuffle=True, reward_config=RewardConfig(), advantage_config=AdvantageConfig()):
-	"""DataLoader over all decisions of the given battle records (one epoch), and the battles' summaries.
+	"""(DataLoader over the model's own decisions in the given battle records, the battles' summaries, every
+	battle's examples in order including replayed (forced) ones).
 
-	Advantages are normalised per side we played over all of its decisions here, not per batch
-	(losses.normalize_advantages).
+	Advantages are computed over whole battles, then normalised per side we played over the decisions
+	trained on, not per batch (losses.normalize_advantages).
 	"""
-	examples, summaries, sides, battles = [], [], [], []
+	examples, summaries, lines, sides, battles = [], [], [], [], []
 	for i, record_dir in enumerate(record_dirs):
 		battle, summary = battle_examples(record_dir, reward_config, advantage_config)
-		examples += battle
+		lines.append(battle)
 		summaries.append(summary)
-		sides += [summary.our_side] * len(battle)
-		battles += [i] * len(battle)
+		chosen = [e for e in battle if not e["forced"]]
+		examples += chosen
+		sides += [summary.our_side] * len(chosen)
+		battles += [i] * len(chosen)
 	if examples:
 		advantages = normalize_advantages(torch.stack([e["advantage"] for e in examples]), torch.tensor(sides), torch.tensor(battles), advantage_config)
 		for example, advantage in zip(examples, advantages):
 			example["advantage"] = advantage
 	loader = torch.utils.data.DataLoader(examples, batch_size=batch_size, shuffle=shuffle, collate_fn=collate)
-	return loader, summaries
+	return loader, summaries, lines

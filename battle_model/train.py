@@ -34,6 +34,7 @@ scenario and win by epoch 1000. If it needs more, something is probably wrong.
 """
 import argparse
 import csv
+import random
 import shutil
 import time
 from collections import Counter
@@ -60,9 +61,15 @@ class TrainConfig:
 	run: str = "castle_vs_inferno"
 	epochs: int = 1000
 	opponent: str = "BattleAI"
+	ai: str = "AlphaBattleAI"  # play.Game.ai
 	game_seeds: tuple = (1, 2)  # VCMI seed of the attack battles and of the defence battles: fixed, so the test is about learning, not luck
 	games_per_side: int = 1  # battles per side per epoch; they differ only by our sampling. More = less noisy updates
+	# Of each side's games, how many first replay a random-length opening of that side's best battle so far and
+	# play on from there (Go-Explore: battles are deterministic, so this restores the state). They are trained
+	# on only from where the model takes over, and are not counted in the logged rewards and win rates.
+	explore_from_best: int = 0
 	learning_rate: float = 1e-4  # Adam; 3e-4 (the usual PPO default) learned and then forgot this scenario
+	lr_schedule: str = "constant"  # "linear": decay to 0 at the last epoch, as standard PPO does; Adam's steps stay ~lr even when the gradients are only noise
 	ppo_passes: int = 4  # optimisation passes over each epoch's decisions; PPO reuses its data a few times
 	batch_size: int = 64  # an epoch is only ~20-80 decisions, so usually one batch
 	grad_clip: float = 0.5  # max gradient norm, the usual PPO value
@@ -98,6 +105,7 @@ COLUMNS = [
 	"epoch", "attack_reward", "attack_outcome", "defence_reward", "defence_outcome", "mean_reward", "attack_raw_reward", "defence_raw_reward", "attack_win_rate", "defence_win_rate",
 	"decisions", "rounds", "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "signal_ratio", "weight_change",
 	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "attack_best_line_logp", "defence_best_line_logp", "seconds",
+	"attack_restart_win_rate", "defence_restart_win_rate", "attack_best_reward", "defence_best_reward",
 ]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
 # error. decisions: all decisions of the epoch; rounds: attack + defence battle rounds, averaged over the games.
@@ -107,6 +115,8 @@ TENSORBOARD_TAGS = {
 	"mean_reward": "reward/mean", "attack_reward": "reward/attack", "defence_reward": "reward/defence",
 	"attack_raw_reward": "raw_reward/attack", "defence_raw_reward": "raw_reward/defence",
 	"attack_win_rate": "won/attack", "defence_win_rate": "won/defence",
+	"attack_restart_win_rate": "won_after_restart/attack", "defence_restart_win_rate": "won_after_restart/defence",
+	"attack_best_reward": "best_reward/attack", "defence_best_reward": "best_reward/defence",
 	"policy_loss": "loss/policy", "value_loss": "loss/value", "entropy": "loss/entropy",
 	"attack_best_line_logp": "best_line_logp/attack", "defence_best_line_logp": "best_line_logp/defence",
 	"signal_ratio": "stability/signal_ratio", "weight_change": "stability/weight_change", "approx_kl": "stability/approx_kl", "clip_fraction": "stability/clip_fraction",
@@ -186,6 +196,8 @@ def save_checkpoint(path, model, optimizer, epoch, config):
 
 
 def train(config, resume=False):
+	if config.explore_from_best >= config.games_per_side:
+		raise ValueError("explore_from_best must leave at least one game per side that starts from the beginning")
 	out = run_dir(config)
 	out.mkdir(parents=True, exist_ok=True)
 	(out / "config.txt").write_text("\n".join(f"{k} = {v}" for k, v in asdict(config).items()) + "\n")
@@ -216,33 +228,38 @@ def train(config, resume=False):
 
 	for epoch in range(first_epoch, config.epochs + 1):
 		started = time.time()
+		if config.lr_schedule == "linear":
+			for group in optimizer.param_groups:
+				group["lr"] = config.learning_rate * (1 - (epoch - 1) / config.epochs)
 		model_path = out / "model.onnx"
 		export(model, model_path)
 
-		games = [
-			play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=config.game_seeds[side], sampler_seed=(2 * epoch + side) * config.games_per_side + g)
-			for side in (0, 1)
-			for g in range(config.games_per_side)
-		]
+		openings = random.Random(epoch)
+		games, restarted = [], []
+		for side in (0, 1):
+			for g in range(config.games_per_side):
+				prefix = ()
+				if g < config.explore_from_best and best[side] is not None and len(best[side].get("actions", ())) > 1:
+					prefix = tuple(best[side]["actions"][: openings.randrange(1, len(best[side]["actions"]))])
+				games.append(play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=config.game_seeds[side], sampler_seed=(2 * epoch + side) * config.games_per_side + g, ai=config.ai, prefix=prefix))
+				restarted.append(bool(prefix))
 		records = out / "records" / f"epoch_{epoch}"
 		for attempt in range(1, config.attempts + 1):
 			try:
 				shutil.rmtree(records, ignore_errors=True)
 				dirs = play.play(games, model_path, records)
-				loader, summaries = make_dataloader(dirs, config.batch_size, True, reward_config, advantage_config)
+				loader, summaries, lines = make_dataloader(dirs, config.batch_size, True, reward_config, advantage_config)
 				break
 			except RuntimeError as error:  # a battle failed or stalled; its runner folder is kept for debugging
 				print(f"epoch {epoch}: attempt {attempt} failed: {str(error)[:300]}", flush=True)
 				if attempt == config.attempts:
 					raise
 
-		examples, start = loader.dataset, 0  # the decisions of each battle, in the order of `games`
-		for game, summary in zip(games, summaries):
-			decisions = examples[start : start + summary.decisions]
-			start += summary.decisions
+		for game, summary, decisions in zip(games, summaries, lines):
 			side = game.our_side
 			if decisions and (best[side] is None or summary.reward > best[side]["reward"]):
-				best[side] = {"reward": summary.reward, "epoch": epoch, "line": collate(decisions)}
+				actions = [{k: v for k, v in e["action"].items() if k != "forced"} for e in decisions]
+				best[side] = {"reward": summary.reward, "epoch": epoch, "line": collate(decisions), "actions": actions}
 				torch.save(best, best_path)
 
 		weights_before = flat_weights(model)
@@ -266,14 +283,15 @@ def train(config, resume=False):
 				batches += 1
 		model.eval()
 
-		by_side = [[s for game, s in zip(games, summaries) if game.our_side == side] for side in (0, 1)]
+		by_side = [[s for game, s, r in zip(games, summaries, restarted) if game.our_side == side and not r] for side in (0, 1)]
+		restarted_by_side = [[s for game, s, r in zip(games, summaries, restarted) if game.our_side == side and r] for side in (0, 1)]
 		average = lambda values: sum(values) / len(values)
 		mean = {key: value / max(batches, 1) for key, value in parts_sum.items()}
 		row = {
 			"epoch": epoch,
-			"mean_reward": round(to_scale(average([s.reward for s in summaries]), reward_config), 4),
+			"mean_reward": round(to_scale(average([s.reward for s in by_side[0] + by_side[1]]), reward_config), 4),
 			"decisions": sum(s.decisions for s in summaries),
-			"rounds": round(sum(s.rounds for s in summaries) / config.games_per_side, 2),
+			"rounds": round(sum(average([s.rounds for s in side]) for side in by_side), 2),
 			"policy_loss": round(mean["policy"], 5),
 			"value_loss": round(mean["value"], 5),
 			"entropy": round(mean["entropy"], 4),
@@ -292,6 +310,9 @@ def train(config, resume=False):
 			row[f"{name}_advantage_std"] = round(average([s.advantage_std for s in side_summaries]), 4)
 			row[f"{name}_value_error"] = round(average([s.value_error for s in side_summaries]), 4)
 			row[f"{name}_best_line_logp"] = round(line_log_prob(model, line["line"]), 3) if line else ""
+			row[f"{name}_best_reward"] = round(to_scale(line["reward"], reward_config), 4) if line else ""
+		for name, side_summaries in (("attack", restarted_by_side[0]), ("defence", restarted_by_side[1])):
+			row[f"{name}_restart_win_rate"] = round(average([float(s.outcome == Outcome.WIN) for s in side_summaries]), 4) if side_summaries else ""
 		with progress.open("a", newline="") as f:
 			csv.writer(f).writerow([row[c] for c in COLUMNS])
 		log_tensorboard(writer, row)

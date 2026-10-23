@@ -17,6 +17,7 @@ struct ChosenAction
 	int targetHex = -1;
 	int target2Hex = -1;
 	int target2Unit = -1;
+	bool forced = false; // replayed from ALPHA_BATTLE_PREFIX, not chosen by the model
 
 	std::string toJson() const;
 };

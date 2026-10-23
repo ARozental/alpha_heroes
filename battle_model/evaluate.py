@@ -28,13 +28,13 @@ def load(checkpoint):
 	return model.eval(), state["epoch"]
 
 
-def evaluate(model, scenario, seeds=(1, 2), games=8, temperature=1.0, sampler_seed=10_000):
+def evaluate(model, scenario, seeds=(1, 2), games=8, temperature=1.0, sampler_seed=10_000, ai="AlphaBattleAI", opponent="BattleAI"):
 	"""{side: [BattleSummary]} for `games` battles per side (one when greedy), side s played with VCMI seed seeds[s]."""
 	work = Path(tempfile.mkdtemp(prefix="evaluate-", dir=ROOT / "runtime"))
 	try:
 		export(model, work / "model.onnx")
 		n = 1 if temperature <= 0 else games
-		battles = [play.Game(scenario, our_side=side, game_seed=seeds[side], sampler_seed=sampler_seed + i, temperature=temperature) for side in (0, 1) for i in range(n)]
+		battles = [play.Game(scenario, our_side=side, opponent=opponent, game_seed=seeds[side], sampler_seed=sampler_seed + i, temperature=temperature, ai=ai) for side in (0, 1) for i in range(n)]
 		dirs = play.play(battles, work / "model.onnx", work / "records")
 		results = {0: [], 1: []}
 		for game, d in zip(battles, dirs):
@@ -51,10 +51,12 @@ def main():
 	parser.add_argument("--temperature", type=float, default=1.0)
 	parser.add_argument("--seeds", default="1,2", help="VCMI seed of the attack battles, of the defence battles")
 	parser.add_argument("--scenario", default=TrainConfig.scenario)
+	parser.add_argument("--ai", default="AlphaBattleAI")
+	parser.add_argument("--opponent", default="BattleAI")
 	args = parser.parse_args()
 	model, epoch = load(args.checkpoint)
 	play.build_map(args.scenario)
-	results = evaluate(model, args.scenario, tuple(int(s) for s in args.seeds.split(",")), args.games, args.temperature)
+	results = evaluate(model, args.scenario, tuple(int(s) for s in args.seeds.split(",")), args.games, args.temperature, ai=args.ai, opponent=args.opponent)
 	for side, name in ((0, "attack"), (1, "defence")):
 		summaries = results[side]
 		wins = sum(s.outcome.name == "WIN" for s in summaries)

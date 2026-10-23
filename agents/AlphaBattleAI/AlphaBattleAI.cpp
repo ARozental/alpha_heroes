@@ -12,6 +12,7 @@
 #include "lib/bonuses/BonusEnum.h"
 #include "lib/callback/CBattleCallback.h"
 #include "lib/callback/CDynLibHandler.h"
+#include "lib/json/JsonNode.h"
 #include "lib/networkPacks/PacksForClientBattle.h"
 #include "lib/spells/CSpellHandler.h"
 #include "lib/mapObjects/CGHeroInstance.h"
@@ -67,6 +68,29 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 	for(std::string fault; std::getline(faultList, fault, ',');)
 		if(!fault.empty())
 			faults.push_back(fault);
+
+	const auto prefixPath = envString("ALPHA_BATTLE_PREFIX");
+	if(!prefixPath.empty())
+	{
+		std::ifstream file(prefixPath);
+		for(std::string line; std::getline(file, line);)
+		{
+			if(line.empty())
+				continue;
+			const JsonNode node(reinterpret_cast<const std::byte *>(line.data()), line.size(), prefixPath);
+			ChosenAction a;
+			a.type = node["type"].Integer();
+			a.hex = node["hex"].Integer();
+			a.unit = node["unit"].Integer();
+			a.spell = node["spell"].Integer();
+			a.targetUnit = node["target_unit"].Integer();
+			a.targetHex = node["target_hex"].Integer();
+			a.target2Hex = node["target2_hex"].Integer();
+			a.target2Unit = node["target2_unit"].Integer();
+			a.forced = true;
+			prefix.push_back(a);
+		}
+	}
 
 	recordDir = envString("ALPHA_BATTLE_RECORD_DIR");
 	if(!recordDir.empty())
@@ -298,6 +322,23 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 			action.hex = 0; // side column: never a legal destination
 		}
 		stats.modelMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+
+		if(prefixPlayed < prefix.size())
+		{
+			// Replaying a recorded battle: its action must be legal here, or the battle did not replay as recorded
+			action = prefix[prefixPlayed++];
+			if(!isLegal(encoded, action))
+			{
+				const auto message = "prefix action " + std::to_string(prefixPlayed - 1) + " " + action.toJson() + " is not legal here: the battle did not replay as recorded";
+				if(!recordDir.empty())
+				{
+					std::string quoted = message;
+					std::replace(quoted.begin(), quoted.end(), '"', '\'');
+					recordEvent("{\"event\": \"error\", \"message\": \"" + quoted + "\"}");
+				}
+				throw std::runtime_error(message);
+			}
+		}
 
 		// Check before sending. Must NEVER trigger (except for the "decoder" test fault): the sampler only
 		// picks entries the masks allow, so a failure here is a bug in our code that must be fixed right away.

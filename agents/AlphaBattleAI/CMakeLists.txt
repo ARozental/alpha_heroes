@@ -1,12 +1,17 @@
 # Built as part of VCMI via its EXTRA_AI_DIRS option
-add_library(AlphaBattleAI SHARED
+set(ALPHA_BATTLE_AI_SOURCES
 	AlphaBattleAI.cpp Dump.cpp Encoder.cpp Model.cpp Policy.cpp Tensors.cpp main.cpp
 	AlphaBattleAI.h Dump.h Encoder.h Model.h Policy.h Schema.generated.h StdInc.h Tensors.h
 )
-target_include_directories(AlphaBattleAI PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR})
 find_package(onnxruntime CONFIG REQUIRED)
-target_link_libraries(AlphaBattleAI PRIVATE vcmi onnxruntime::onnxruntime)
-vcmi_set_output_dir(AlphaBattleAI "AI")
+# AlphaBattleAIDev: the same AI under another name, to try C++ changes while training runs keep using
+# AlphaBattleAI: `cmake --build build --target AlphaBattleAIDev`, then play with ai="AlphaBattleAIDev"
+foreach(target AlphaBattleAI AlphaBattleAIDev)
+	add_library(${target} SHARED ${ALPHA_BATTLE_AI_SOURCES})
+	target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR})
+	target_link_libraries(${target} PRIVATE vcmi onnxruntime::onnxruntime)
+	vcmi_set_output_dir(${target} "AI")
+endforeach()
 
 # Exports the id -> name/stats tables the Python side uses (scripts/export_vocab.sh)
 add_executable(alpha_export_vocab tools/ExportVocab.cpp)

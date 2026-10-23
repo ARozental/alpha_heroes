@@ -27,6 +27,10 @@ class Game:
 	game_seed: int = 1  # VCMI's random seed: dice, obstacles, the opponent's choices
 	sampler_seed: int = 0  # our model's sampling
 	temperature: float = 1.0
+	ai: str = "AlphaBattleAI"  # our side's battle AI library; AlphaBattleAIDev to try C++ changes during training runs
+	# Actions (dicts as in a record's action.json) our side plays before the model chooses: battles are
+	# deterministic given game_seed and our actions, so this restores a state of a recorded battle
+	prefix: tuple = ()
 
 
 def load_scenario(path):
@@ -52,7 +56,7 @@ def start(game, model_path, record_dir, max_seconds=120, max_mb=200):
 	"""Start one battle in the background; returns the process. record_dir must not exist yet."""
 	env = dict(os.environ)
 	for side, color in enumerate(COLORS):
-		env[f"VCMI_BATTLE_AI_{color}"] = "AlphaBattleAI" if side == game.our_side else game.opponent
+		env[f"VCMI_BATTLE_AI_{color}"] = game.ai if side == game.our_side else game.opponent
 	env.update(
 		ALPHA_BATTLE_MODEL=str(model_path),
 		ALPHA_BATTLE_RECORD_DIR=str(record_dir),
@@ -60,6 +64,11 @@ def start(game, model_path, record_dir, max_seconds=120, max_mb=200):
 		ALPHA_BATTLE_TEMPERATURE=str(game.temperature),
 		SETTINGS=json.dumps({"server": {"seed": game.game_seed}}),
 	)
+	if game.prefix:
+		prefix = Path(str(Path(record_dir).resolve()) + ".prefix.jsonl")
+		prefix.parent.mkdir(parents=True, exist_ok=True)
+		prefix.write_text("".join(json.dumps(action) + "\n" for action in game.prefix))
+		env["ALPHA_BATTLE_PREFIX"] = str(prefix)
 	command = [str(ROOT / "scripts" / "headless.sh"), map_name(game.scenario), str(max_seconds), str(max_mb), "20"]
 	env["ALPHA_BATTLE_MODEL"] = str(Path(model_path).resolve())
 	env["ALPHA_BATTLE_RECORD_DIR"] = str(Path(record_dir).resolve())
@@ -88,9 +97,11 @@ def play(games, model_path, record_root):
 	model_path = Path(model_path).resolve()
 	dirs = [record_root / f"game_{i}" for i in range(len(games))]
 	processes = [start(game, model_path, d) for game, d in zip(games, dirs)]
-	for process in processes:
-		finish(process)
-	for d in dirs:
-		if not (d / "events.jsonl").exists():
-			raise RuntimeError(f"no record written in {d}")
+	reports = [finish(process, keep_run=True) for process in processes]
+	missing = [(d, report) for d, report in zip(dirs, reports) if not (d / "events.jsonl").exists()]
+	for d, report in zip(dirs, reports):
+		if report.get("run") and (d / "events.jsonl").exists():
+			shutil.rmtree(report["run"], ignore_errors=True)
+	if missing:  # their runner folders (VCMI logs) are kept for debugging
+		raise RuntimeError("no record written in " + ", ".join(f"{d} (run {report.get('run')})" for d, report in missing))
 	return dirs

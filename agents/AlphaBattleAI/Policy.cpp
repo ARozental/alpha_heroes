@@ -82,6 +82,6 @@ ChosenAction chooseAction(const OutputTensors & out, std::mt19937 & rng, float t
 std::string ChosenAction::toJson() const
 {
 	std::ostringstream s;
-	s << "{\"type\": " << type << ", \"hex\": " << hex << ", \"unit\": " << unit << ", \"spell\": " << spell << ", \"target_unit\": " << targetUnit << ", \"target_hex\": " << targetHex << ", \"target2_hex\": " << target2Hex << ", \"target2_unit\": " << target2Unit << "}";
+	s << "{\"type\": " << type << ", \"hex\": " << hex << ", \"unit\": " << unit << ", \"spell\": " << spell << ", \"target_unit\": " << targetUnit << ", \"target_hex\": " << targetHex << ", \"target2_hex\": " << target2Hex << ", \"target2_unit\": " << target2Unit << (forced ? ", \"forced\": true" : "") << "}";
 	return s.str();
 }

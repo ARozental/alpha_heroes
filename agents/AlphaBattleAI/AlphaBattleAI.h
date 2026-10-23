@@ -60,6 +60,12 @@ class AlphaBattleAI : public CBattleGameInterface
 	std::vector<std::string> faults; // ALPHA_BATTLE_TEST_FAULT
 	std::vector<std::string> faultsDoneThisBattle;
 
+	// Forced opening (ALPHA_BATTLE_PREFIX, a JSON-lines file of actions as in action.json): played instead of
+	// the model's choice for the first decisions, to replay a recorded battle up to a point. Battles are
+	// deterministic given VCMI's seed and our actions, so this restores any state of a recorded battle.
+	std::vector<ChosenAction> prefix;
+	size_t prefixPlayed = 0;
+
 	// Training record (ALPHA_BATTLE_RECORD_DIR)
 	std::string recordDir;
 	int recordedDecisions = 0;
