@@ -55,7 +55,9 @@ from . import play
 from .data import collate, make_dataloader, summarize
 from .export import export
 from .losses import AdvantageConfig, PPOConfig, ppo_loss
+from .constants import ActionType
 from .model import BattleModel
+from .trace import trace
 from .reward import Outcome, RewardConfig, to_scale
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -113,16 +115,21 @@ def run_dir(config):
 	return ROOT / "runtime" / "train" / config.run
 
 
+# Action types whose share of each side's decisions is logged every epoch (actions_<side>/<type> in TensorBoard)
+ACTION_KINDS = ("WAIT", "DEFEND", "MOVE", "MELEE", "SHOOT", "HERO_SPELL", "RETREAT", "SURRENDER")
+
+
 COLUMNS = [
 	"epoch", "attack_reward", "attack_outcome", "defence_reward", "defence_outcome", "mean_reward", "attack_raw_reward", "defence_raw_reward", "attack_win_rate", "defence_win_rate",
 	"decisions", "rounds", "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "signal_ratio", "weight_change",
 	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds",
-]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
+] + [f"{side}_share_{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
 # error. decisions: all decisions of the epoch; rounds: attack + defence battle rounds, averaged over the games.
 
 # progress.csv column -> TensorBoard tag
 TENSORBOARD_TAGS = {
+	**{f"{side}_share_{kind.lower()}": f"actions_{side}/{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS},
 	"mean_reward": "reward/mean", "attack_reward": "reward/attack", "defence_reward": "reward/defence",
 	"attack_raw_reward": "raw_reward/attack", "defence_raw_reward": "raw_reward/defence",
 	"attack_win_rate": "won/attack", "defence_win_rate": "won/defence",
@@ -152,10 +159,13 @@ def log_eval_tensorboard(writer, row):
 	writer.flush()
 
 
-def log_tensorboard(writer, row):
-	"""One epoch's progress row as TensorBoard scalars; empty columns are skipped."""
+def log_tensorboard(writer, row, self_play=False):
+	"""One epoch's progress row as TensorBoard scalars; empty columns are skipped. In self-play the mean reward of
+	the two sides is left out: one side's win is the other's loss, so it is flat whatever the model learns."""
 	epoch = int(row["epoch"])
 	for column, tag in TENSORBOARD_TAGS.items():
+		if self_play and column == "mean_reward":
+			continue
 		if row.get(column) not in (None, ""):
 			writer.add_scalar(tag, float(row[column]), epoch)
 	for name in ("attack", "defence"):
@@ -234,7 +244,9 @@ def eval_round(model, epoch, out, battle_map, config):
 		for g in range(n + 1)
 	]  # g == n: the greedy battle
 	record_root = out / "records" / f"eval_{epoch}" if config.keep_records else None
-	summaries = [summarize(r.events) for r in play_with_retries(games, model_path, record_root, config, f"eval {epoch}")]
+	records = play_with_retries(games, model_path, record_root, config, f"eval {epoch}")
+	summaries = [summarize(r.events) for r in records]
+	write_traces(out, epoch, f"vs_{config.eval_opponent}_greedy", [r for game, r in zip(games, records) if game.temperature == 0])
 	row = {"epoch": epoch}
 	sampled_all = []
 	for side, name in ((0, "attack"), (1, "defence")):
@@ -262,6 +274,14 @@ def upgrade_csv(path, columns):
 		writer = csv.DictWriter(f, columns, extrasaction="ignore")
 		writer.writeheader()
 		writer.writerows({c: row.get(c, "") for c in columns} for row in rows)
+
+
+def write_traces(out, epoch, label, records):
+	"""Readable traces (trace.py) of a few battles, to see what the model does: <run>/traces/epoch_<epoch>_<label>.txt
+	(a few KB each)."""
+	folder = out / "traces"
+	folder.mkdir(exist_ok=True)
+	(folder / f"epoch_{epoch:05d}_{label}.txt").write_text("\n\n".join(trace(r) for r in records) + "\n")
 
 
 def resolve_device(name):
@@ -450,6 +470,13 @@ def train(config, resume=False):
 			"wait_seconds": round(waited, 1),
 			"train_seconds": round(train_seconds, 1),
 		}
+		for side, name in ((0, "attack"), (1, "defence")):
+			kinds = Counter(ActionType(a["type"]).name for r in records if r.events[0]["our_side"] == side for a in r.actions)
+			total = max(sum(kinds.values()), 1)
+			for kind in ACTION_KINDS:
+				row[f"{name}_share_{kind.lower()}"] = round(kinds[kind] / total, 4)
+		if config.eval_every and epoch % config.eval_every == 0 and config.opponent == play.SELF_PLAY:
+			write_traces(out, epoch, "selfplay", records[:2])  # one self-play battle, seen from both sides
 		for name, side_summaries in (("attack", by_side[0]), ("defence", by_side[1])):
 			raw = average([s.reward for s in side_summaries])
 			row[f"{name}_reward"] = round(to_scale(raw, reward_config), 4)
@@ -460,7 +487,7 @@ def train(config, resume=False):
 			row[f"{name}_value_error"] = round(average([s.value_error for s in side_summaries]), 4)
 		with progress.open("a", newline="") as f:
 			csv.writer(f).writerow([row[c] for c in COLUMNS])
-		log_tensorboard(writer, row)
+		log_tensorboard(writer, row, self_play=config.opponent == play.SELF_PLAY)
 		print(
 			f"epoch {epoch:4d}  attack {row['attack_outcome']:9s} {row['attack_reward']:+.3f}  defence {row['defence_outcome']:9s} {row['defence_reward']:+.3f}  won {row['attack_win_rate']:.2f} / {row['defence_win_rate']:.2f}"
 			f"  mean {row['mean_reward']:+.3f}  decisions {row['decisions']:3d}"
