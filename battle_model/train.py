@@ -80,7 +80,7 @@ class TrainConfig:
 	ppo_passes: int = 4  # optimisation passes over each epoch's decisions; PPO reuses its data a few times
 	batch_size: int = 64  # minibatch of decisions; an epoch of 16 battles is ~300 decisions
 	grad_clip: float = 0.5  # max gradient norm, the usual PPO value
-	checkpoint_every: int = 50
+	checkpoint_every: int = 0  # also keep checkpoint_<epoch>.pt every this many epochs; 0 = only checkpoint_latest.pt
 	attempts: int = 3  # tries per epoch when a battle fails or stalls before the run stops
 	keep_records: bool = False  # also write every battle record to <run dir>/records (debugging; ~0.3 MB a decision on disk)
 	device: str = "auto"  # where torch trains: "auto" = the GPU (cuda, Apple mps) if there is one, else "cpu"; the CPU plays the battles
@@ -471,7 +471,7 @@ def train(config, resume=False):
 		if config.eval_every and epoch % config.eval_every == 0:
 			evaluate_now(epoch)
 		save_checkpoint(latest, model, optimizer, epoch, config)
-		if epoch % config.checkpoint_every == 0:
+		if config.checkpoint_every and epoch % config.checkpoint_every == 0:
 			save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config)
 
 
