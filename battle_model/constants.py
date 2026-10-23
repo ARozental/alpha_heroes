@@ -9,7 +9,7 @@ Bump SCHEMA_VERSION on any change to sizes, enums, input or output definitions.
 """
 from enum import IntEnum
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Battlefield: VCMI BattleHex indices 0..186 are used as-is (17 columns x 11 rows,
 # columns 0 and 16 are the unplayable side columns). No remapping on the C++ side.

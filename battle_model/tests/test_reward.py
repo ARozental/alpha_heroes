@@ -77,11 +77,11 @@ def test_round_score_is_the_reward_without_the_outcome_term():
 	assert abs(round_score(*args) - (terminal_reward(Outcome.WIN, *args) - 1.0)) < 1e-9
 
 
-def test_unit_scale_maps_the_reward_range_to_0_1():
-	from battle_model.reward import from_unit, reward_bounds, to_unit
+def test_scale_maps_the_reward_range_to_minus_1_1():
+	from battle_model.reward import from_scale, reward_bounds, to_scale
 	low, high = reward_bounds()
-	assert to_unit(low) == 0.0 and to_unit(high) == 1.0
-	assert abs(from_unit(to_unit(1.7)) - 1.7) < 1e-12
+	assert to_scale(low) == -1.0 and to_scale(high) == 1.0
+	assert abs(from_scale(to_scale(1.7)) - 1.7) < 1e-12
 
 
 def test_draw_is_worth_minus_half_and_better_than_a_loss():

@@ -9,7 +9,7 @@ From it we compute, for every decision:
 	action        the action taken (distributions.ACTION_FIELDS)
 	old_log_prob  log p(action) under the model that played, from its recorded outputs
 	advantage     GAE advantage (losses.battle_returns_and_advantages), with V (the final-reward head)
-	value_labels  labels of all value heads (losses.value_targets), on the 0..1 scale
+	value_labels  labels of all value heads (losses.value_targets), on the -1..1 scale
 and per battle a BattleSummary with the reward (reward.py) and the outcome.
 
 Records are the dense per-decision dumps for now (~0.2 MB a decision); training deletes them after each
@@ -25,7 +25,7 @@ import torch
 from . import vocab
 from .distributions import ACTION_FIELDS, log_prob, stack_actions
 from .losses import AdvantageConfig, battle_returns_and_advantages, normalize_advantages, value_targets
-from .reward import Outcome, RewardConfig, own_kept_value, round_score, terminal_reward, to_unit
+from .reward import Outcome, RewardConfig, own_kept_value, round_score, terminal_reward, to_scale
 from .schema import INPUTS, OUTPUTS
 
 # EBattleResult
@@ -45,6 +45,8 @@ class BattleSummary:
 	mana_used_fraction: float
 	round_scores: dict = field(default_factory=dict)  # {round: round_score at its end} while the battle went on
 	decisions: int = 0
+	advantage_std: float = 0.0  # std of the raw (not normalised) advantages, -1..1 scale: how much there is to learn
+	value_error: float = 0.0  # mean |V - final reward| over the decisions, -1..1 scale, V from the model that played
 
 
 def army_value(stacks):
@@ -133,10 +135,12 @@ def battle_examples(record_dir, reward_config=RewardConfig(), advantage_config=A
 	outputs = {s.name: torch.from_numpy(np.stack([d[1][s.name] for d in decisions])) for s in OUTPUTS}
 	actions = stack_actions([d[2] for d in decisions])
 	old_log_prob = log_prob(outputs, actions)
-	values = outputs["value"][:, -1]  # V, the final-reward head (0..1)
+	values = outputs["value"][:, -1]  # V, the final-reward head (-1..1)
 	rewards = torch.zeros(len(decisions))
-	rewards[-1] = to_unit(summary.reward, reward_config)
+	rewards[-1] = to_scale(summary.reward, reward_config)
 	_, advantages = battle_returns_and_advantages(values, rewards, advantage_config)
+	summary.advantage_std = float(advantages.std()) if len(advantages) > 1 else 0.0
+	summary.value_error = float((values - rewards[-1]).abs().mean())
 	rounds = [int(d[0]["g_round"]) for d in decisions]
 	labels = value_targets(rounds, summary.round_scores, summary.reward, reward_config=reward_config)
 

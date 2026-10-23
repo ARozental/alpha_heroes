@@ -6,9 +6,9 @@ PPO = Proximal Policy Optimization: improve the policy from games it played itse
 Plan: PPO now, AlphaZero-style search (MCTS) later as an upgrade reusing this network; the vcmi-gym
 author dropped MCTS because VCMI cannot copy and restore a battle state, which search needs.
 
-Every value, label and reward below is on the 0..1 scale of the value heads (reward.to_unit:
-0 = worst possible reward, 1 = best possible). Everything that is a probability or 0..1 quantity
-is a sigmoid (or softmax) trained with cross-entropy.
+Every value, label and reward below is on the -1..1 scale (reward.to_scale: -1 = worst possible
+reward, +1 = best possible). Value heads are tanh outputs trained with cross-entropy; tanh(z) is
+2 * sigmoid(2z) - 1, so this is the same model and loss as a sigmoid on 0..1, just easier to read.
 
 From reward to loss, for one battle seen by one side:
 
@@ -36,9 +36,9 @@ From reward to loss, for one battle seen by one side:
    V0 = V1 = V2 = V. The shorter horizons are easier, less noisy targets that track the final
    outcome closely; the model's heads are boosted (model.py), each learning the difference to the
    previous one. The value loss is a weighted sum over the heads (value_head_weights, equal by default).
-   Each head outputs a sigmoid (0..1) and its loss is the cross-entropy against its 0..1 label:
-   same minimum as the squared error, but the gradient does not vanish when the sigmoid saturates
-   on a wrong answer.
+   Each head outputs tanh (-1..1) and its loss is the cross-entropy against its -1..1 label (both
+   mapped to 0..1): same minimum as the squared error, but the gradient does not vanish when the
+   output saturates on a wrong answer.
    Only V, the final-reward head, is used for the advantages below.
 
 5. Advantage. A_t is how much better than expected the outcome of decision t was. GAE(lambda) mixes
@@ -69,7 +69,7 @@ import torch.nn.functional as F
 
 from .constants import N_VALUE_HORIZONS
 from .distributions import entropy, log_prob
-from .reward import RewardConfig, to_unit
+from .reward import RewardConfig, to_scale
 
 
 @dataclass(frozen=True)
@@ -94,7 +94,7 @@ def value_targets(decision_rounds, round_scores, final_reward, horizons=N_VALUE_
 	round_scores:    {round: reward.round_score at the end of that round} for every round that ended
 	                 with the battle still going on (reward units)
 	final_reward:    reward.terminal_reward of the battle (reward units)
-	Returns [T, horizons + 1] on the 0..1 scale: column k < horizons is the score at the end of round
+	Returns [T, horizons + 1] on the -1..1 scale: column k < horizons is the score at the end of round
 	r_t + k, or the final reward if the battle ended before that; the last column is the final reward.
 	"""
 	labels = torch.full((len(decision_rounds), horizons + 1), float(final_reward))
@@ -102,14 +102,14 @@ def value_targets(decision_rounds, round_scores, final_reward, horizons=N_VALUE_
 		for k in range(horizons):
 			if r + k in round_scores:
 				labels[t, k] = round_scores[r + k]
-	return to_unit(labels, reward_config)
+	return to_scale(labels, reward_config)
 
 
 def battle_returns_and_advantages(values, rewards, config=AdvantageConfig()):
 	"""Steps 3-5 for one battle seen by one side.
 
-	values:  [T] V(s_t), the final-reward head (0..1), from the model that played the battle (recorded while playing)
-	rewards: [T] reward right after each decision: 0, except the last, which is reward.to_unit(terminal reward)
+	values:  [T] V(s_t), the final-reward head (-1..1), from the model that played the battle (recorded while playing)
+	rewards: [T] reward right after each decision: 0, except the last, which is reward.to_scale(terminal reward)
 	Returns (returns [T], advantages [T]). returns is the GAE(lambda) return (G_t for lambda = 1); the
 	value heads are trained on value_targets instead, where V's label is the final reward itself.
 	The battle is over after the last decision, so its next value is 0.
@@ -127,11 +127,14 @@ def battle_returns_and_advantages(values, rewards, config=AdvantageConfig()):
 
 
 def value_loss(out, targets, config=PPOConfig()):
-	"""Step 4 for a batch: weighted cross-entropy of each value head (sigmoid of its logit) against its 0..1 label.
+	"""Step 4 for a batch: weighted cross-entropy of each value head against its -1..1 label.
 
-	targets: [B, N_VALUE_HORIZONS + 1] from value_targets. Returns (loss, per-head losses [heads]).
+	A head's output is tanh(z) = 2 * sigmoid(2z) - 1, so its cross-entropy is the one of sigmoid(2z)
+	against the label mapped to 0..1. targets: [B, N_VALUE_HORIZONS + 1] from value_targets.
+	Returns (loss, per-head losses [heads]).
 	"""
-	per_head = F.binary_cross_entropy_with_logits(out["value_logit"], targets.clamp(0.0, 1.0), reduction="none").mean(dim=0)
+	probabilities = ((targets + 1) / 2).clamp(0.0, 1.0)
+	per_head = F.binary_cross_entropy_with_logits(2 * out["value_logit"], probabilities, reduction="none").mean(dim=0)
 	weights = torch.tensor(config.value_head_weights, dtype=per_head.dtype)
 	return (per_head * weights).sum() / weights.sum(), per_head.detach()
 
@@ -154,12 +157,23 @@ def ppo_loss(out, action, old_log_prob, advantage, value_labels, config=PPOConfi
 	advantage: [B] from battle_returns_and_advantages (using V, the final-reward head, as values), already
 	           normalised over the epoch by normalize_advantages
 	value_labels: [B, N_VALUE_HORIZONS + 1] from value_targets
-	Returns (loss, parts for logging).
+	Returns (loss, parts for logging). approx_kl (mean old - new log-prob) and clip_fraction (share of
+	decisions whose ratio left the clip range) show how far this update moved the policy from the one
+	that played: PPO's usual warning signs of too large steps.
 	"""
-	ratio = torch.exp(log_prob(out, action) - old_log_prob)
+	new_log_prob = log_prob(out, action)
+	ratio = torch.exp(new_log_prob - old_log_prob)
 	clipped = ratio.clamp(1 - config.clip_range, 1 + config.clip_range)
 	policy = -torch.min(ratio * advantage, clipped * advantage).mean()
 	value, per_head = value_loss(out, value_labels, config)
 	bonus = entropy(out).mean()
 	total = policy + config.value_weight * value - config.entropy_weight * bonus
-	return total, {"policy": policy.detach(), "value": value.detach(), "value_per_head": per_head, "entropy": bonus.detach(), "ratio": ratio.mean().detach()}
+	return total, {
+		"policy": policy.detach(),
+		"value": value.detach(),
+		"value_per_head": per_head,
+		"entropy": bonus.detach(),
+		"ratio": ratio.mean().detach(),
+		"approx_kl": (old_log_prob - new_log_prob).mean().detach(),
+		"clip_fraction": ((ratio - 1).abs() > config.clip_range).float().mean().detach(),
+	}

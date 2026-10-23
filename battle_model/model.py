@@ -11,9 +11,9 @@ query vectors built from the global token, the acting unit and our hero.
 Value heads, "boosted" over horizons: V0 predicts the reward formula at the end of this round,
 V1 at the end of the next round, ..., V at the end of the battle. Each is one linear layer on the
 last hidden state, and each head's logit is added to the previous head's logit, so a later head
-only learns the difference to the shorter-horizon estimate. Each outputs sigmoid(logit), a value
-in 0..1: the reward rescaled by reward.to_unit (0 = worst possible, 1 = best possible), trained
-with cross-entropy.
+only learns the difference to the shorter-horizon estimate. Each outputs tanh(logit), a value in
+-1..1: the reward rescaled by reward.to_scale (-1 = worst possible, +1 = best possible), trained
+with the matching cross-entropy (losses.value_loss).
 
 The model does not know the reward settings today. Do not design around that: a later version will
 probably get the price of mana for this battle as an input (free next to a Magic Well, costly far from
@@ -146,7 +146,7 @@ class BattleModel(nn.Module):
 		with torch.no_grad():
 			self.type_head.weight.zero_()
 			self.type_head.bias.copy_(torch.tensor([ACTION_TYPE_PRIOR.get(a, 0.0) for a in ActionType]))
-			# Every value head starts at 0.5, the middle of the reward range
+			# Every value head starts at 0, the middle of the reward range
 			for head in self.value_heads:
 				head.weight.zero_()
 				head.bias.zero_()
@@ -322,7 +322,7 @@ class BattleModel(nn.Module):
 			previous = logit
 		value_logit = torch.stack(logits, dim=-1)
 		# value_logit is for the training loss only; it is not a model output in the contract
-		return {"value": torch.sigmoid(value_logit), "value_logit": value_logit}
+		return {"value": torch.tanh(value_logit), "value_logit": value_logit}
 
 
 class OnnxWrapper(nn.Module):

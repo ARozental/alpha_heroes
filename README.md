@@ -77,7 +77,7 @@ The science (Python, the part to read and change):
 | `scenarios/*.json` | Fixed battles to train on, e.g. `castle_vs_inferno.json`: both heroes, armies, skills, spells, battlefield. |
 | `play.py` | Plays recorded battles in VCMI: a scenario becomes a battle-only map; our model on one side, another battle AI (BattleAI) on the other. |
 | `data.py` | Battle records -> rewards, value labels and advantages -> per-decision training examples -> DataLoader. |
-| `train.py` | The training loop: each epoch plays one battle per side, trains with PPO and logs both rewards to `runtime/train/<run>/progress.csv`. |
+| `train.py` | The training loop: each epoch plays one battle per side, trains with PPO and logs both rewards (-1..1) and the warning signs of forgetting (best-line log-prob, Adam signal ratio, weight change, KL) to `runtime/train/<run>/progress.csv` and TensorBoard. |
 
 The contract (shared with C++; change deliberately, then run codegen and bump `SCHEMA_VERSION`):
 

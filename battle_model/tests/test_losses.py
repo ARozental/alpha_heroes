@@ -43,14 +43,14 @@ def test_value_targets_per_round_and_final():
 		[0.9, 2.4, 2.4, 2.4],
 		[2.4, 2.4, 2.4, 2.4],  # last round: V0 == V1 == V2 == V
 	])
-	from battle_model.reward import to_unit
-	assert torch.allclose(labels, to_unit(expected))
+	from battle_model.reward import to_scale
+	assert torch.allclose(labels, to_scale(expected))
 
 
 def test_value_loss_weights_and_minimum():
 	from battle_model.losses import PPOConfig, value_loss
-	labels = torch.tensor([[0.3, 0.5, 0.7, 0.9]])
-	perfect = {"value_logit": torch.log(labels / (1 - labels))}  # heads predict exactly the labels
+	labels = torch.tensor([[-0.4, 0.0, 0.4, 0.8]])
+	perfect = {"value_logit": torch.atanh(labels)}  # heads predict exactly the labels
 	off = {"value_logit": perfect["value_logit"] + torch.tensor([[2.0, 0.0, 0.0, 0.0]])}  # only V0 wrong
 	config = PPOConfig()
 	assert value_loss(off, labels, config)[0] > value_loss(perfect, labels, config)[0]

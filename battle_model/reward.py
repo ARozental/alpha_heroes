@@ -52,16 +52,19 @@ def reward_bounds(config=RewardConfig()):
 	return low, 3.0
 
 
-def to_unit(reward, config=RewardConfig()):
-	"""Reward (or round score) -> 0..1, the scale of the value heads and their labels."""
+def to_scale(reward, config=RewardConfig()):
+	"""Reward (or round score) -> -1..1: -1 = worst possible, +1 = best possible.
+
+	The scale of everything the model and the logs show: value heads, their labels, reported rewards.
+	"""
 	low, high = reward_bounds(config)
-	return (reward - low) / (high - low)
+	return 2 * (reward - low) / (high - low) - 1
 
 
-def from_unit(value, config=RewardConfig()):
-	"""Value head output (0..1) -> reward units, for reading and reporting."""
+def from_scale(value, config=RewardConfig()):
+	"""-1..1 (a value head output or a scaled reward) -> reward units."""
 	low, high = reward_bounds(config)
-	return low + (high - low) * value
+	return low + (high - low) * (value + 1) / 2
 
 
 def resources_value(resources):
