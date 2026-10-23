@@ -9,8 +9,9 @@ Each epoch:
   2. play one battle per scenario side in parallel (we attack with sides[0], we defend with sides[1]),
      with VCMI's seed fixed per side, so only our own choices change between epochs,
   3. turn the records into training examples (data.py) and update the model with PPO (losses.py),
-  4. log both battles' rewards and outcomes to <run dir>/progress.csv and TensorBoard (<run dir>/tensorboard),
-     delete the records.
+  4. log both battles' rewards and outcomes to <run dir>/progress.csv and TensorBoard
+     (<run dir>/tensorboard/<start time>: one folder per start, so a restarted run never mixes with old
+     data a running TensorBoard still holds in memory), delete the records.
 
 The first test: the untrained model should lose in epoch 1, and the model should overfit this fixed
 scenario and win by epoch 1000. If it needs more, something is probably wrong.
@@ -74,7 +75,7 @@ def log_tensorboard(writer, row):
 def follow(run, poll_seconds=10, idle_minutes=10):
 	"""Mirror a run's progress.csv into its TensorBoard folder until no new epoch arrives for idle_minutes."""
 	out = run_dir(TrainConfig(run=run))
-	writer = SummaryWriter(out / "tensorboard", purge_step=1)
+	writer = SummaryWriter(out / "tensorboard" / ("follow-" + time.strftime("%Y%m%d-%H%M%S")))
 	logged, idle_since = 0, time.time()
 	while time.time() - idle_since < idle_minutes * 60:
 		rows = list(csv.DictReader((out / "progress.csv").open()))
@@ -112,7 +113,7 @@ def train(config, resume=False):
 	if not progress.exists() or not resume:
 		with progress.open("w", newline="") as f:
 			csv.writer(f).writerow(columns)
-	writer = SummaryWriter(out / "tensorboard", purge_step=first_epoch)
+	writer = SummaryWriter(out / "tensorboard" / time.strftime("%Y%m%d-%H%M%S"))
 
 	for epoch in range(first_epoch, config.epochs + 1):
 		started = time.time()
