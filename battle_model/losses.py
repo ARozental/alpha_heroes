@@ -135,7 +135,7 @@ def value_loss(out, targets, config=PPOConfig()):
 	"""
 	probabilities = ((targets + 1) / 2).clamp(0.0, 1.0)
 	per_head = F.binary_cross_entropy_with_logits(2 * out["value_logit"], probabilities, reduction="none").mean(dim=0)
-	weights = torch.tensor(config.value_head_weights, dtype=per_head.dtype)
+	weights = torch.tensor(config.value_head_weights, dtype=per_head.dtype, device=per_head.device)
 	return (per_head * weights).sum() / weights.sum(), per_head.detach()
 
 
