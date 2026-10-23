@@ -6,8 +6,8 @@
 
 namespace AlphaSchema
 {
-constexpr int SCHEMA_VERSION = 2;
-constexpr const char * CONTRACT_HASH = "1b7a787fb1f24a62";
+constexpr int SCHEMA_VERSION = 3;
+constexpr const char * CONTRACT_HASH = "6948fe093360a2c2";
 
 constexpr int N_HEXES = 187;
 constexpr int FIELD_WIDTH = 17;

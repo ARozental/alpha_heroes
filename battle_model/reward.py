@@ -28,7 +28,8 @@ class Outcome(IntEnum):
 	SURRENDER = 3  # paid to leave: hero back in the tavern with its army
 
 
-# The round penalty stops growing after this many rounds, so the reward has fixed bounds
+# The round penalty stops growing after this many rounds, so the reward has fixed bounds.
+# Arbitrary: no battle should ever get there.
 MAX_PENALIZED_ROUNDS = 100
 
 
@@ -39,9 +40,21 @@ class RewardConfig:
 
 
 def reward_bounds(config=RewardConfig()):
-	"""Lowest and highest possible reward or round score: the output range of the value heads."""
+	"""Lowest and highest possible reward or round score."""
 	low = -1.0 - config.round_penalty * MAX_PENALIZED_ROUNDS - config.mana_penalty
 	return low, 3.0
+
+
+def to_unit(reward, config=RewardConfig()):
+	"""Reward (or round score) -> 0..1, the scale of the value heads and their labels."""
+	low, high = reward_bounds(config)
+	return (reward - low) / (high - low)
+
+
+def from_unit(value, config=RewardConfig()):
+	"""Value head output (0..1) -> reward units, for reading and reporting."""
+	low, high = reward_bounds(config)
+	return low + (high - low) * value
 
 
 def resources_value(resources):
@@ -101,6 +114,8 @@ def terminal_reward(outcome, own_start_value, own_kept, enemy_start_value, enemy
 
 def round_score(own_start_value, own_kept, enemy_start_value, enemy_lost, rounds, mana_used_fraction, config=RewardConfig()):
 	"""The reward formula at the end of a round while the battle goes on: outcome term 0, the rest so far.
+
+	The 0 is a choice, not a necessity: another mid-battle definition of the outcome term would also work.
 
 	own_kept: our surviving army + our hero's value (the hero is still with us); enemy_lost: enemy army lost so far.
 	"""

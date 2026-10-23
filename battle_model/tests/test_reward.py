@@ -74,3 +74,10 @@ def test_round_score_is_the_reward_without_the_outcome_term():
 	from battle_model.reward import round_score
 	args = (ARMY, ARMY * 0.7, ENEMY, ENEMY * 0.4, 3, 0.2)
 	assert abs(round_score(*args) - (terminal_reward(Outcome.WIN, *args) - 1.0)) < 1e-9
+
+
+def test_unit_scale_maps_the_reward_range_to_0_1():
+	from battle_model.reward import from_unit, reward_bounds, to_unit
+	low, high = reward_bounds()
+	assert to_unit(low) == 0.0 and to_unit(high) == 1.0
+	assert abs(from_unit(to_unit(1.7)) - 1.7) < 1e-12

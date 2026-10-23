@@ -1,6 +1,15 @@
 """How the reward becomes a training signal: returns, advantages and the PPO loss.
 (What counts as good is reward.py; this file is how the model learns from it.)
 
+PPO = Proximal Policy Optimization: improve the policy from games it played itself, in small steps
+("proximal": each update stays close to the policy that collected the data).
+Plan: PPO now, AlphaZero-style search (MCTS) later as an upgrade reusing this network; the vcmi-gym
+author dropped MCTS because VCMI cannot copy and restore a battle state, which search needs.
+
+Every value, label and reward below is on the 0..1 scale of the value heads (reward.to_unit:
+0 = worst possible reward, 1 = best possible). Everything that is a probability or 0..1 quantity
+is a sigmoid (or softmax) trained with cross-entropy.
+
 From reward to loss, for one battle seen by one side:
 
 1. Trajectory. The side's model makes decisions d_0 .. d_{T-1}: one per unit turn it plays, plus one
@@ -27,9 +36,9 @@ From reward to loss, for one battle seen by one side:
    V0 = V1 = V2 = V. The shorter horizons are easier, less noisy targets that track the final
    outcome closely; the model's heads are boosted (model.py), each learning the difference to the
    previous one. The value loss is a weighted sum over the heads (value_head_weights, equal by default).
-   Each head's output is a sigmoid scaled to the reward's range, so its loss is the cross-entropy
-   between the head and its label scaled to 0..1: same minimum as the squared error, but its
-   gradient does not vanish when the sigmoid saturates on a wrong answer.
+   Each head outputs a sigmoid (0..1) and its loss is the cross-entropy against its 0..1 label:
+   same minimum as the squared error, but the gradient does not vanish when the sigmoid saturates
+   on a wrong answer.
    Only V, the final-reward head, is used for the advantages below.
 
 5. Advantage. A_t is how much better than expected the outcome of decision t was. GAE(lambda) mixes
@@ -60,7 +69,7 @@ import torch.nn.functional as F
 
 from .constants import N_VALUE_HORIZONS
 from .distributions import entropy, log_prob
-from .reward import reward_bounds
+from .reward import RewardConfig, to_unit
 
 
 @dataclass(frozen=True)
@@ -76,32 +85,31 @@ class PPOConfig:
 	entropy_weight: float = 0.01  # step 7: small exploration bonus
 	normalize_advantages: bool = True  # scale advantages to mean 0, std 1 per batch: the step size then does not depend on the reward scale
 	value_head_weights: tuple = (1.0,) * (N_VALUE_HORIZONS + 1)  # step 4: share of each value head (V0, V1, V2, V) in the value loss
-	value_bounds: tuple = reward_bounds()  # step 4: must be the range the model was built with (its reward_config)
 
 
-def value_targets(decision_rounds, round_scores, final_reward, horizons=N_VALUE_HORIZONS):
+def value_targets(decision_rounds, round_scores, final_reward, horizons=N_VALUE_HORIZONS, reward_config=RewardConfig()):
 	"""Step 4: the labels of the value heads for every decision of one battle seen by one side.
 
 	decision_rounds: [T] battle round of each decision
 	round_scores:    {round: reward.round_score at the end of that round} for every round that ended
-	                 with the battle still going on
-	final_reward:    reward.terminal_reward of the battle
-	Returns [T, horizons + 1]: column k < horizons is the score at the end of round r_t + k, or the
-	final reward if the battle ended before that; the last column is the final reward.
+	                 with the battle still going on (reward units)
+	final_reward:    reward.terminal_reward of the battle (reward units)
+	Returns [T, horizons + 1] on the 0..1 scale: column k < horizons is the score at the end of round
+	r_t + k, or the final reward if the battle ended before that; the last column is the final reward.
 	"""
 	labels = torch.full((len(decision_rounds), horizons + 1), float(final_reward))
 	for t, r in enumerate(decision_rounds):
 		for k in range(horizons):
 			if r + k in round_scores:
 				labels[t, k] = round_scores[r + k]
-	return labels
+	return to_unit(labels, reward_config)
 
 
 def battle_returns_and_advantages(values, rewards, config=AdvantageConfig()):
 	"""Steps 3-5 for one battle seen by one side.
 
-	values:  [T] V(s_t), the final-reward head, from the model that played the battle (recorded while playing)
-	rewards: [T] reward right after each decision: 0, except the last, which is reward.py's terminal reward
+	values:  [T] V(s_t), the final-reward head (0..1), from the model that played the battle (recorded while playing)
+	rewards: [T] reward right after each decision: 0, except the last, which is reward.to_unit(terminal reward)
 	Returns (returns [T], advantages [T]). returns is the GAE(lambda) return (G_t for lambda = 1); the
 	value heads are trained on value_targets instead, where V's label is the final reward itself.
 	The battle is over after the last decision, so its next value is 0.
@@ -119,13 +127,11 @@ def battle_returns_and_advantages(values, rewards, config=AdvantageConfig()):
 
 
 def value_loss(out, targets, config=PPOConfig()):
-	"""Step 4 for a batch: weighted cross-entropy of each value head against its label scaled to 0..1.
+	"""Step 4 for a batch: weighted cross-entropy of each value head (sigmoid of its logit) against its 0..1 label.
 
 	targets: [B, N_VALUE_HORIZONS + 1] from value_targets. Returns (loss, per-head losses [heads]).
 	"""
-	low, high = config.value_bounds
-	scaled = ((targets - low) / (high - low)).clamp(0.0, 1.0)
-	per_head = F.binary_cross_entropy_with_logits(out["value_logit"], scaled, reduction="none").mean(dim=0)
+	per_head = F.binary_cross_entropy_with_logits(out["value_logit"], targets.clamp(0.0, 1.0), reduction="none").mean(dim=0)
 	weights = torch.tensor(config.value_head_weights, dtype=per_head.dtype)
 	return (per_head * weights).sum() / weights.sum(), per_head.detach()
 

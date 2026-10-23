@@ -11,8 +11,9 @@ query vectors built from the global token, the acting unit and our hero.
 Value heads, "boosted" over horizons: V0 predicts the reward formula at the end of this round,
 V1 at the end of the next round, ..., V at the end of the battle. Each is one linear layer on the
 last hidden state, and each head's logit is added to the previous head's logit, so a later head
-only learns the difference to the shorter-horizon estimate. All go through a sigmoid scaled to
-the reward's possible range (reward.reward_bounds).
+only learns the difference to the shorter-horizon estimate. Each outputs sigmoid(logit), a value
+in 0..1: the reward rescaled by reward.to_unit (0 = worst possible, 1 = best possible), trained
+with cross-entropy.
 """
 import math
 
@@ -40,7 +41,6 @@ from .constants import (
 	WALL_STATE_VOCAB,
 	ActionType,
 )
-from .reward import RewardConfig, reward_bounds
 from .schema import INPUT_NAMES, OUTPUT_NAMES
 
 # Starting preference between action types, as type-head logits. The head's weights start at zero,
@@ -104,15 +104,12 @@ class Block(nn.Module):
 
 
 class BattleModel(nn.Module):
-	def __init__(self, dim=64, layers=2, heads=4, reward_config=RewardConfig(), boost_stop_gradient=True):
+	def __init__(self, dim=64, layers=2, heads=4, boost_stop_gradient=True):
 		"""boost_stop_gradient: each value head adds a detached copy of the previous head's logit, so a
 		longer-horizon label never pulls on a shorter-horizon head (true boosting). False lets it."""
 		super().__init__()
 		self.dim = dim
 		self.boost_stop_gradient = boost_stop_gradient
-		low, high = reward_bounds(reward_config)
-		self.register_buffer("value_low", torch.tensor(low), persistent=False)
-		self.register_buffer("value_high", torch.tensor(high), persistent=False)
 		self.creature = nn.Embedding(CREATURE_VOCAB + 1, dim)
 		self.effect = nn.Embedding(EFFECT_VOCAB + 1, dim)
 		self.hero_type = nn.Embedding(HERO_TYPE_VOCAB + 1, dim)
@@ -145,7 +142,7 @@ class BattleModel(nn.Module):
 		with torch.no_grad():
 			self.type_head.weight.zero_()
 			self.type_head.bias.copy_(torch.tensor([ACTION_TYPE_PRIOR.get(a, 0.0) for a in ActionType]))
-			# Every value head starts at the middle of the reward range
+			# Every value head starts at 0.5, the middle of the reward range
 			for head in self.value_heads:
 				head.weight.zero_()
 				head.bias.zero_()
@@ -320,9 +317,8 @@ class BattleModel(nn.Module):
 			logits.append(logit)
 			previous = logit
 		value_logit = torch.stack(logits, dim=-1)
-		value = self.value_low + (self.value_high - self.value_low) * torch.sigmoid(value_logit)
 		# value_logit is for the training loss only; it is not a model output in the contract
-		return {"value": value, "value_logit": value_logit}
+		return {"value": torch.sigmoid(value_logit), "value_logit": value_logit}
 
 
 class OnnxWrapper(nn.Module):

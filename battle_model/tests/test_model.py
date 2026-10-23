@@ -113,7 +113,7 @@ def test_ppo_loss_gradients_are_finite():
 		out = model(tx)
 	actions = stack_actions([sample(out, b=b, rng=np.random.default_rng(b)) for b in range(4)])
 	old = log_prob(out, actions)
-	labels = torch.rand(4, out["value"].shape[1]) * 4 - 1.25
+	labels = torch.rand(4, out["value"].shape[1])  # value labels are on the 0..1 scale
 	loss, parts = ppo_loss(model(tx), actions, old, advantage=torch.randn(4), value_labels=labels)
 	loss.backward()
 	assert torch.isfinite(loss)
@@ -133,24 +133,17 @@ def test_untrained_model_picks_types_with_the_prior_odds():
 	prior = np.array([ACTION_TYPE_PRIOR.get(ActionType(t), 0.0) for t in legal])
 	expected = np.exp(prior) / np.exp(prior).sum()
 	assert np.allclose(out["logp_type"][0, legal].exp().numpy(), expected, atol=1e-5)
-	low, high = m.value_low.item(), m.value_high.item()
-	assert np.allclose(out["value"].numpy(), (low + high) / 2)  # all heads start mid-range
+	assert np.allclose(out["value"].numpy(), 0.5)  # all heads start mid-range
 
 
-def test_values_stay_in_the_reward_range_and_heads_are_boosted():
-	from battle_model.reward import reward_bounds
+def test_values_stay_in_the_unit_range():
 	torch.manual_seed(0)
 	m = BattleModel().eval()
 	for head in m.value_heads:  # large random heads to push the sigmoids to their limits
 		torch.nn.init.normal_(head.weight, std=50.0)
 	out = run(m, random_inputs(batch=8, seed=2))
-	low, high = reward_bounds()
-	assert (out["value"] >= low - 1e-5).all() and (out["value"] <= high + 1e-5).all()
-	logits = out["value_logit"]
-	x = {k: torch.from_numpy(v) for k, v in random_inputs(batch=8, seed=2).items()}
-	with torch.no_grad():
-		context_out = m(x)["value_logit"]
-	assert torch.allclose(logits, context_out)
+	assert (out["value"] >= 0).all() and (out["value"] <= 1).all()
+	assert torch.allclose(out["value"], torch.sigmoid(out["value_logit"]))
 
 
 def test_boost_stop_gradient_keeps_long_horizon_labels_off_short_heads():

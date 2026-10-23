@@ -134,7 +134,7 @@ OUTPUTS = (
 	TensorSpec("logp_spell_hex", "float32", (S, H), 0, "log p(hex target | spell)"),
 	TensorSpec("logp_spell2_hex", "float32", (U, H), 0, "log p(second hex | first unit)  (Teleport)"),
 	TensorSpec("logp_spell2_unit", "float32", (U, U), 0, "log p(second unit | first unit)  (Sacrifice)"),
-	TensorSpec("value", "float32", (N_VALUE_HORIZONS + 1,), 0, "expected reward formula at the end of this round, the next round, ... (N_VALUE_HORIZONS of them), then at the end of the battle"),
+	TensorSpec("value", "float32", (N_VALUE_HORIZONS + 1,), 0, "expected reward formula at the end of this round, the next round, ... (N_VALUE_HORIZONS of them), then at the end of the battle; each in 0..1 (reward.to_unit)"),
 )
 
 INPUT_NAMES = tuple(spec.name for spec in INPUTS)
