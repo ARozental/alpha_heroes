@@ -58,3 +58,51 @@ def test_enemy_surrender_counts_as_full_destruction():
 def test_no_winner_is_a_draw():
 	s = summarize(events(1, {"round": 1, "winner": -1, "result": RESULT_NORMAL, "casualties": [THEIRS, OURS], "alive": [[], []]}))
 	assert s.outcome == Outcome.DRAW and s.own_kept == 0 and s.enemy_lost == army_value(THEIRS)
+
+
+def write_record(path, decisions, events_):
+	"""A record as AlphaBattleAI writes it: events.jsonl and one decision_*.npz (a .npy per tensor + action.json) per decision."""
+	import io
+	import json
+	import zipfile
+
+	import numpy as np
+
+	path.mkdir(parents=True)
+	(path / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events_))
+	for i, (tensors, action) in enumerate(decisions):
+		with zipfile.ZipFile(path / f"decision_{i:05d}.npz", "w", zipfile.ZIP_DEFLATED) as archive:
+			for name, array in tensors.items():
+				buffer = io.BytesIO()
+				np.lib.format.write_array(buffer, np.ascontiguousarray(array))
+				archive.writestr(name + ".npy", buffer.getvalue())
+			archive.writestr("action.json", json.dumps(action) + "\n")
+
+
+def test_replayed_decisions_are_kept_in_the_line_but_not_trained_on(tmp_path):
+	import numpy as np
+	import torch
+
+	from battle_model.data import make_dataloader, read_decisions
+	from battle_model.distributions import sample
+	from battle_model.model import BattleModel
+	from battle_model.schema import random_inputs
+
+	torch.manual_seed(0)
+	model = BattleModel(dim=32, layers=1).eval()
+	decisions = []
+	for i in range(4):
+		x = random_inputs(batch=1, seed=i)
+		with torch.no_grad():
+			out = model({k: torch.from_numpy(v) for k, v in x.items()})
+		outputs = {k: v.numpy() for k, v in out.items() if k != "value_logit"}
+		action = sample(outputs, 0, np.random.default_rng(i))
+		action["forced"] = i < 2  # the first two were replayed from a prefix
+		decisions.append(({**x, **outputs}, action))
+	write_record(tmp_path / "game_0", decisions, events(0, {"round": 3, "winner": 0, "result": RESULT_NORMAL, "casualties": [[], THEIRS], "alive": [[], []]}))
+
+	assert len(read_decisions(tmp_path / "game_0")) == 4
+	loader, summaries, lines = make_dataloader([tmp_path / "game_0"], batch_size=8, shuffle=False)
+	assert [e["forced"] for e in lines[0]] == [True, True, False, False]
+	assert len(loader.dataset) == 2 and not any(e["forced"] for e in loader.dataset)
+	assert summaries[0].outcome == Outcome.WIN and summaries[0].decisions == 4
