@@ -24,6 +24,12 @@ class BattleFlowProcessor;
 /// The copy is a deep copy through VCMI's savegame serialization (the game state) and the serialization that
 /// sends a battle to the clients (the battle itself). Packs are applied to it with GameStatePackVisitor, as on
 /// the server and the clients. Dice (damage, luck, morale, abilities) come from the copy's own random generators.
+///
+/// TODO: the battle needs nothing from the adventure map, only the two heroes, their armies, the defended town
+/// (sieges), player and global bonuses, and the gold for surrender. The world-map facts that matter to a battle
+/// (e.g. the price of mana when a well is near) will come as one short vector made once at the start of the battle
+/// by a function over what the player knows (later possibly an output of the campaign network). Then this copy
+/// should be built from the battle and that context alone, instead of copying the whole game state.
 class BattleSimulation
 {
 public:

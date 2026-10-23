@@ -122,7 +122,7 @@ The original sketch follows.
 **Not covered yet:**
 - **Turn flow is unchecked.** `apply` runs the next-unit activation (morale, new rounds) with the server's own code, but the check only compares right after the action.
 - **Sieges** are not supported (`updateGateState` is a no-op).
-- **Big maps:** a copy of the whole game state will cost more on them. Copying only the battle and the heroes' mana into an existing copy would fix that.
+- **The copy still includes the game state.** The battle needs nothing from the adventure map. Its world-map inputs will be one short "battle context" vector, made once at battle start by a function over what the player knows (later possibly an output of the campaign network). So the copy should come from the battle plus that context, never the map (TODO in `BattleSim.h`).
 
 ## Stages
 
