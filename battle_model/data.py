@@ -92,26 +92,35 @@ def read_events(record_dir):
 	return [json.loads(line) for line in (Path(record_dir) / "events.jsonl").read_text().splitlines() if line.strip()]
 
 
-def summarize(events, hero_value=0.0, fresh_hero_value=0.0, config=RewardConfig()):
+def summarize(events, hero_value=0.0, fresh_hero_value=0.0, config=RewardConfig(), side=None):
 	"""The reward and outcome of one battle, from our side's events.
 
 	hero_value: our hero's value (reward.hero_value); 0 for level-1 heroes without artifacts, as in the
 	current scenarios (not recorded yet). The enemy hero's value is not counted either.
+	side: score the battle for this battle side instead of the recording one (e.g. to check the C++ reward,
+	Reward.h, of both sides: the end event's cpp_rewards).
+	For the enemy, the mana used comes from enemy_mana in the events (0 when missing), and the cost of a
+	surrender it made is unknown to us (taken as 0).
 	"""
 	errors = [e["message"] for e in events if e["event"] == "error"]
 	if errors:
 		raise RuntimeError("battle record is unusable: " + "; ".join(errors))
 	start = next(e for e in events if e["event"] == "start")
 	end = next(e for e in events if e["event"] == "end")
-	surrender = next((e for e in events if e["event"] == "surrender"), None)
-	our = start["our_side"]
+	surrender = next((e for e in events if e["event"] == "surrender"), None)  # always the recording side's
+	recorder = start["our_side"]
+	our = recorder if side is None else side
 	enemy = 1 - our
+	if our != recorder:
+		surrender = None
+	mana_key = "our_mana" if our == recorder else "enemy_mana"
 	own_army_start = army_value(start["armies"][our])
 	enemy_army_start = army_value(start["armies"][enemy])
 	own_start = own_army_start + hero_value
 
 	def mana_used(mana):
-		return (start["our_mana"] - mana) / start["our_mana_max"] if start["our_mana_max"] > 0 else 0.0
+		start_mana, mana_max = start.get(mana_key, 0), start.get(mana_key + "_max", 0)
+		return (start_mana - mana) / mana_max if mana_max > 0 else 0.0
 
 	if end["winner"] == our:
 		outcome = Outcome.WIN
@@ -135,16 +144,16 @@ def summarize(events, hero_value=0.0, fresh_hero_value=0.0, config=RewardConfig(
 	own_army_end = own_army_start - army_value(end["casualties"][our])
 	kept = own_kept_value(outcome, own_army_end, hero_value, fresh_hero_value, surrender["cost"] if surrender else 0.0)
 	rounds = end["round"]  # VCMI numbering: the first round is 1
-	reward = terminal_reward(outcome, own_start, kept, enemy_army_start, enemy_lost, rounds, mana_used(end["our_mana"]), config)
+	reward = terminal_reward(outcome, own_start, kept, enemy_army_start, enemy_lost, rounds, mana_used(end.get(mana_key, 0)), config)
 
 	scores = {}
 	for e in events:
 		if e["event"] == "round_end" and e["round"] >= 1:  # round 0 is the start of the battle
 			own_alive = army_value(e["alive"][our]) + hero_value
 			enemy_lost_so_far = enemy_army_start - army_value(e["alive"][enemy])
-			scores[e["round"]] = round_score(own_start, own_alive, enemy_army_start, enemy_lost_so_far, e["round"], mana_used(e["our_mana"]), config)
+			scores[e["round"]] = round_score(own_start, own_alive, enemy_army_start, enemy_lost_so_far, e["round"], mana_used(e.get(mana_key, 0)), config)
 
-	return BattleSummary(our, outcome, reward, rounds, own_start, enemy_army_start, kept, enemy_lost, mana_used(end["our_mana"]), scores)
+	return BattleSummary(our, outcome, reward, rounds, own_start, enemy_army_start, kept, enemy_lost, mana_used(end.get(mana_key, 0)), scores)
 
 
 @dataclass

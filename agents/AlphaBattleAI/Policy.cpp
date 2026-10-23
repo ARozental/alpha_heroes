@@ -79,6 +79,26 @@ ChosenAction chooseAction(const OutputTensors & out, std::mt19937 & rng, float t
 	return a;
 }
 
+double logProb(const OutputTensors & out, const ChosenAction & a)
+{
+	auto at = [&](Out o, int row, int i) { return i >= 0 ? static_cast<double>(out.row(o, row)[i]) : 0.0; }; // -1: the field is not used
+	double lp = at(Out::logp_type, 0, a.type);
+	switch(static_cast<ActionType>(a.type))
+	{
+		case ActionType::MOVE:
+			return lp + at(Out::logp_move_hex, 0, a.hex);
+		case ActionType::MELEE:
+			return lp + at(Out::logp_melee_target, 0, a.unit) + at(Out::logp_melee_from, a.unit, a.hex);
+		case ActionType::SHOOT:
+			return lp + at(Out::logp_shoot_target, 0, a.unit);
+		case ActionType::HERO_SPELL:
+			return lp + at(Out::logp_spell, 0, a.spell) + at(Out::logp_spell_unit, a.spell, a.targetUnit) + at(Out::logp_spell_hex, a.spell, a.targetHex)
+				+ (a.targetUnit >= 0 ? at(Out::logp_spell2_hex, a.targetUnit, a.target2Hex) + at(Out::logp_spell2_unit, a.targetUnit, a.target2Unit) : 0.0);
+		default:
+			return lp;
+	}
+}
+
 std::string ChosenAction::toJson() const
 {
 	std::ostringstream s;

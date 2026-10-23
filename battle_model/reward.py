@@ -67,6 +67,17 @@ def from_scale(value, config=RewardConfig()):
 	return low + (high - low) * (value + 1) / 2
 
 
+def other_side_value(value, config=RewardConfig()):
+	"""The other side's expected final reward from one side's, both on the -1..1 scale, for the search's leaves
+	(agents/AlphaBattleAI/Reward.h otherSideValue) while the model predicts only its own side's.
+
+	In a battle to the death the two rewards add up to about 2: the winner gets +1, 1 for the enemy destroyed and
+	the fraction of its army it kept; the loser -1 and the fraction of the winner's army it killed, which is what
+	the winner did not keep. The round and mana penalties are left out. Wrong for retreats and surrenders.
+	"""
+	return to_scale(2.0 - from_scale(value, config), config)
+
+
 def resources_value(resources):
 	"""Gold value of a cost dict, e.g. {"gold": 3000, "gems": 1}."""
 	return sum(RESOURCE_PRICES[name] * amount for name, amount in resources.items())

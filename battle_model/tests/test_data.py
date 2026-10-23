@@ -106,3 +106,15 @@ def test_replayed_decisions_are_kept_in_the_line_but_not_trained_on(tmp_path):
 	assert [e["forced"] for e in lines[0]] == [True, True, False, False]
 	assert len(loader.dataset) == 2 and not any(e["forced"] for e in loader.dataset)
 	assert summaries[0].outcome == Outcome.WIN and summaries[0].decisions == 4
+
+
+def test_the_enemy_side_scores_the_same_battle_mirrored():
+	end = {"round": 3, "winner": 0, "result": RESULT_NORMAL, "casualties": [[[0, 4]], THEIRS], "alive": [[], []]}
+	ours = summarize(events(0, end))
+	theirs = summarize(events(0, end), side=1)
+	assert ours.outcome == Outcome.WIN and theirs.outcome == Outcome.LOSS
+	assert theirs.our_side == 1 and theirs.own_kept == 0 and theirs.enemy_lost == army_value([[0, 4]])
+	assert theirs.own_start_value == army_value(THEIRS) and theirs.enemy_start_value == army_value(OURS)
+	# We retreat: the enemy wins and counts our whole army as destroyed
+	fled = summarize(events(1, {"round": 2, "winner": 0, "result": RESULT_ESCAPE, "casualties": [[], []], "alive": [[], []]}), side=0)
+	assert fled.outcome == Outcome.WIN and fled.enemy_lost == army_value(OURS)

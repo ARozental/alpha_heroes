@@ -25,3 +25,6 @@ struct ChosenAction
 /// Sample (temperature > 0) or take the most likely (temperature == 0) action, mirroring
 /// battle_model/distributions.py sample(). Throws if a needed choice has no legal entry.
 ChosenAction chooseAction(const AlphaSchema::OutputTensors & out, std::mt19937 & rng, float temperature);
+
+/// log p(action) of a full action under the model outputs, mirroring battle_model/distributions.py log_prob()
+double logProb(const AlphaSchema::OutputTensors & out, const ChosenAction & action);

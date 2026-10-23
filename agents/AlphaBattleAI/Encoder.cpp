@@ -4,6 +4,7 @@
 #include "Policy.h"
 
 #include "lib/CStack.h"
+#include "lib/battle/BattleAction.h"
 #include "lib/battle/CObstacleInstance.h"
 #include "lib/battle/CPlayerBattleCallback.h"
 #include "lib/bonuses/Bonus.h"
@@ -459,5 +460,144 @@ bool isLegal(const EncodedBattle & e, const ChosenAction & a)
 		}
 		default:
 			return true;
+	}
+}
+
+std::vector<ChosenAction> legalActions(const EncodedBattle & e)
+{
+	const auto & t = e.tensors;
+	std::vector<ChosenAction> actions;
+	for(int type = 0; type < N_ACTION_TYPES; ++type)
+	{
+		if(!t.get(In::m_type, type))
+			continue;
+		const ChosenAction base{.type = type};
+		switch(static_cast<ActionType>(type))
+		{
+			case ActionType::MOVE:
+				for(int h = 0; h < N_HEXES; ++h)
+					if(t.get(In::m_move_hex, h))
+						actions.push_back(ChosenAction{.type = type, .hex = h});
+				break;
+			case ActionType::MELEE:
+				for(int u = 0; u < MAX_UNITS; ++u)
+					if(t.get(In::m_melee_target, u))
+						for(int h = 0; h < N_HEXES; ++h)
+							if(t.get(In::m_melee_from, u, h))
+								actions.push_back(ChosenAction{.type = type, .hex = h, .unit = u});
+				break;
+			case ActionType::SHOOT:
+				for(int u = 0; u < MAX_UNITS; ++u)
+					if(t.get(In::m_shoot_target, u))
+						actions.push_back(ChosenAction{.type = type, .unit = u});
+				break;
+			case ActionType::HERO_SPELL:
+				for(int s = 0; s < N_SPELLS; ++s)
+				{
+					if(!t.get(In::m_spell, s))
+						continue;
+					const ChosenAction spell{.type = type, .spell = s};
+					if(t.anyInRow(In::m_spell_unit, s))
+					{
+						const auto second = secondTargetKind(s);
+						for(int u = 0; u < MAX_UNITS; ++u)
+						{
+							if(!t.get(In::m_spell_unit, s, u))
+								continue;
+							auto first = spell;
+							first.targetUnit = u;
+							if(second == TargetKind::HEX)
+							{
+								for(int h = 0; h < N_HEXES; ++h)
+									if(t.get(In::m_spell2_hex, u, h))
+									{
+										auto both = first;
+										both.target2Hex = h;
+										actions.push_back(both);
+									}
+							}
+							else if(second == TargetKind::UNIT)
+							{
+								for(int v = 0; v < MAX_UNITS; ++v)
+									if(t.get(In::m_spell2_unit, u, v))
+									{
+										auto both = first;
+										both.target2Unit = v;
+										actions.push_back(both);
+									}
+							}
+							else
+								actions.push_back(first);
+						}
+					}
+					else if(t.anyInRow(In::m_spell_hex, s))
+					{
+						for(int h = 0; h < N_HEXES; ++h)
+							if(t.get(In::m_spell_hex, s, h))
+							{
+								auto target = spell;
+								target.targetHex = h;
+								actions.push_back(target);
+							}
+					}
+					else
+						actions.push_back(spell);
+				}
+				break;
+			default:
+				actions.push_back(base);
+				break;
+		}
+	}
+	return actions;
+}
+
+BattleAction engineAction(BattleSide side, const CStack * active, const ChosenAction & a, const std::function<const battle::Unit *(int)> & unit)
+{
+	auto target = [&](int i)
+	{
+		const auto * u = unit(i);
+		if(!u)
+			throw std::runtime_error("action refers to an unknown unit " + std::to_string(i));
+		return u;
+	};
+
+	switch(static_cast<ActionType>(a.type))
+	{
+		case ActionType::WAIT:
+			return BattleAction::makeWait(active);
+		case ActionType::DEFEND:
+			return BattleAction::makeDefend(active);
+		case ActionType::MOVE:
+			return BattleAction::makeMove(active, BattleHex(a.hex));
+		case ActionType::MELEE:
+			return BattleAction::makeMeleeAttack(active, target(a.unit), BattleHex(a.hex));
+		case ActionType::SHOOT:
+			return BattleAction::makeShotAttack(active, target(a.unit));
+		case ActionType::RETREAT:
+			return BattleAction::makeRetreat(side);
+		case ActionType::SURRENDER:
+			return BattleAction::makeSurrender(side);
+		case ActionType::HERO_SPELL:
+		{
+			battle::Target destinations;
+			if(a.targetUnit >= 0)
+				destinations.emplace_back(target(a.targetUnit));
+			if(a.targetHex >= 0)
+				destinations.emplace_back(BattleHex(a.targetHex));
+			if(a.target2Hex >= 0)
+				destinations.emplace_back(BattleHex(a.target2Hex));
+			if(a.target2Unit >= 0)
+				destinations.emplace_back(target(a.target2Unit));
+			BattleAction cast;
+			cast.actionType = EActionType::HERO_SPELL;
+			cast.spell = SpellID(a.spell);
+			cast.side = side;
+			cast.stackNumber = -1;
+			cast.setTarget(destinations);
+			return cast;
+		}
+		default:
+			throw std::runtime_error("model chose action type " + std::to_string(a.type) + ", which is not supported");
 	}
 }

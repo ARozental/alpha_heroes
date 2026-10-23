@@ -5,6 +5,7 @@
 #include "BattleSim.h"
 #include "Dump.h"
 #include "Policy.h"
+#include "Reward.h"
 
 #include "lib/battle/BattleAction.h"
 
@@ -29,6 +30,9 @@ struct EncodedBattle;
 ///   ALPHA_BATTLE_DUMP_LIMIT   decisions to dump per process (default 50)
 ///   ALPHA_BATTLE_RECORD_DIR   record the battle for training (battle_model/data.py): every decision plus
 ///                             events.jsonl (start armies, units alive at each round end, end result)
+///   ALPHA_BATTLE_SEARCH_SIMULATIONS  > 0: search every decision with that many simulations (Gumbel AlphaZero,
+///                             BattleSearch.h); the network's choice when the search fails. Default 0: no search
+///   ALPHA_BATTLE_SEARCH_CONSIDERED   root actions the search starts with (default 16)
 ///   ALPHA_BATTLE_TEST_FAULT   test hook, comma list: "surrender" / "spell" send one action per battle the
 ///                             server must reject, "decoder" corrupts one chosen action per battle
 ///
@@ -81,6 +85,7 @@ class AlphaBattleAI : public CBattleGameInterface
 	void recordEvent(const std::string & json);
 	std::string aliveArmies(const BattleID & battleID) const;
 	int ourMana(const BattleID & battleID) const;
+	int enemyMana(const BattleID & battleID) const; // the enemy hero's spell points, as a player sees them in battle
 
 	struct Stats
 	{
@@ -102,7 +107,20 @@ class AlphaBattleAI : public CBattleGameInterface
 		int simDiceMismatches = 0; // count or health differs: expected when dice were rolled (damage, luck)
 		double simCopyMs = 0;
 		double simApplyMs = 0;
+		// ALPHA_BATTLE_SEARCH_SIMULATIONS
+		int searched = 0;
+		int searchErrors = 0;
+		int searchChanged = 0; // the search played another action than the network's most likely one
+		int searchEvaluations = 0;
+		double searchMs = 0, searchCopyMs = 0, searchEncodeMs = 0, searchModelMs = 0, searchApplyMs = 0;
 	} stats;
+
+	int searchSimulations = 0;
+	int searchConsidered = 16;
+	AlphaReward::BattleEnd battleStartValues; // armies and mana at the start of the battle, as the reward counts them
+	double surrenderCostPaid = 0;
+	/// The searched action in the slots of encoded, or nothing if the search failed
+	std::optional<ChosenAction> searchAction(const BattleID & battleID, const EncodedBattle & encoded, const AlphaSchema::OutputTensors & outputs);
 
 	// ALPHA_BATTLE_SIM_CHECK=1: each of our actions is first played in a copy of the battle (BattleSimulation);
 	// when the real game has applied it (actionFinished) the two battles are compared

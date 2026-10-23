@@ -1,7 +1,7 @@
 # Built as part of VCMI via its EXTRA_AI_DIRS option
 set(ALPHA_BATTLE_AI_SOURCES
-	AlphaBattleAI.cpp BattleSim.cpp Dump.cpp Encoder.cpp Model.cpp Policy.cpp Tensors.cpp main.cpp
-	AlphaBattleAI.h BattleSim.h Dump.h Encoder.h Model.h Policy.h Schema.generated.h StdInc.h Tensors.h
+	AlphaBattleAI.cpp BattleSearch.cpp BattleSim.cpp Dump.cpp Encoder.cpp Model.cpp Policy.cpp Tensors.cpp main.cpp
+	AlphaBattleAI.h BattleSearch.h BattleSim.h Dump.h Encoder.h GumbelSearch.h Model.h Policy.h Reward.h Schema.generated.h StdInc.h Tensors.h
 )
 find_package(onnxruntime CONFIG REQUIRED)
 # AlphaBattleAIDev: the same AI under another name, to try C++ changes while training runs keep using
@@ -25,3 +25,10 @@ add_executable(alpha_make_battle_map tools/MakeBattleMap.cpp)
 target_include_directories(alpha_make_battle_map PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR})
 target_link_libraries(alpha_make_battle_map PRIVATE vcmi)
 vcmi_set_output_dir(alpha_make_battle_map "")
+
+# The search and the reward on a toy game, against their Python copies (battle_model/tests/test_search.py).
+# No FMA contraction, so its floating point is exactly Python's.
+add_executable(alpha_search_selftest tools/SearchSelfTest.cpp GumbelSearch.h Reward.h Schema.generated.h)
+target_include_directories(alpha_search_selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(alpha_search_selftest PRIVATE -ffp-contract=off)
+vcmi_set_output_dir(alpha_search_selftest "")

@@ -236,4 +236,23 @@ constexpr std::array<TensorSpec, static_cast<int>(Out::COUNT)> OUTPUTS = {{
 	TensorSpec{"logp_spell2_unit", DType::FLOAT32, 2, {40, 40}, 0},
 	TensorSpec{"value", DType::FLOAT32, 1, {4, 0}, 0},
 }};
+
+// The terminal reward, battle_model/reward.py (computed in Reward.h)
+enum class Outcome : int
+{
+	WIN = 0,
+	LOSS = 1,
+	RETREAT = 2,
+	SURRENDER = 3,
+	DRAW = 4,
+};
+
+constexpr std::array<double, 5> OUTCOME_TERM = {1.0, -1.0, -1.0, -1.0, -0.5};
+constexpr std::array<bool, 5> HERO_SURVIVES = {true, false, true, true, false};
+constexpr int MAX_PENALIZED_ROUNDS = 100;
+constexpr double ROUND_PENALTY = 0.002;
+constexpr double MANA_PENALTY = 0.05;
+constexpr int HERO_HIRE_COST = 2500;
+/// Gold value of one unit of each resource, in VCMI's order: wood, mercury, ore, sulfur, crystal, gems, gold
+constexpr std::array<int, 7> RESOURCE_PRICES = {250, 500, 250, 500, 500, 500, 1};
 }

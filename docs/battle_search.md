@@ -1,6 +1,6 @@
 # Battle search (MCTS): how to try moves and take them back
 
-Status: stages 1 and 2 done and tested (see "Results"); stages 3 and 4 to do. Written 2026-10-23.
+Status: stages 1-3 done and tested (see "Results" and "Stage 3"); stage 4 (training from search) to do. Written 2026-10-23.
 
 ## What search needs
 
@@ -128,5 +128,26 @@ The original sketch follows.
 
 1. **`IBattleServer` refactor.** No behaviour change; the regression test is identical records. DONE.
 2. **`BattleSimulation`** (a copy of the game state, the server's rules, the copy's own dice), checked against the real game. DONE.
-3. **Search API and IPC to Python**, with a simple MCTS in Python.
-4. **AlphaZero-style training** from search targets.
+3. **Search in C++, next to the model**, with a readable Python copy checked against it. DONE (below).
+4. **AlphaZero-style training** from search targets: the record must then carry the search's improved policy.
+
+## Stage 3: the search (2026-10-23)
+
+- **Algorithm:** Gumbel AlphaZero (Danihelka et al., ICLR 2022; mctx's formulas), `agents/AlphaBattleAI/GumbelSearch.h`.
+  Gumbel-Top-k + Sequential Halving at the root, completed-Q improved policy below it. Chosen because it improves
+  the policy even with few simulations (8-32), where visit-count MCTS needs hundreds; the alternatives found
+  (Sampled MuZero, EfficientZero V2, Stochastic MuZero) are this plus more machinery.
+- **Readable copy:** `battle_model/search.py`, only for review. `battle_model/tests/test_search.py` builds
+  `alpha_search_selftest` and checks that both make the same decisions on a toy stochastic general-sum game
+  (64 cases, every branch reached); changing one copy alone makes it fail (checked by mutating each).
+- **General-sum:** each node's mover maximises its own Q. Terminal rewards are exact for both sides (`Reward.h`,
+  checked against `data.summarize` on synthetic ends and on real battles: the end event's `cpp_rewards`). The model
+  predicts only its own side's value, so a leaf's value for the other side is estimated from it
+  (`reward.other_side_value`: the two rewards of a battle to the death add up to about 2).
+- **Dice:** new dice in every simulation (open loop: each simulation replays the tree's actions on a fresh copy of
+  the root). A child is split by the acting unit; at each node only the actions legal in the current state count.
+- **Opponent in the tree:** our network, also against BattleAI (an approximation, only in eval).
+- **In play:** `ALPHA_BATTLE_SEARCH_SIMULATIONS=N` (off by default), dev library only until runs end.
+- **Cost (with two training runs loading the CPU):** 16 simulations ~130 ms a decision: copies ~70 ms (4 ms each),
+  network ~40 ms (17 calls), encoding ~7 ms, actions ~2 ms. The copy is the first thing to make cheaper
+  (battle-only copies, TODO in `BattleSim.h`).

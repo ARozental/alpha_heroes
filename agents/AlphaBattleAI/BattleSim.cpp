@@ -55,6 +55,7 @@ public:
 	std::string complaint;
 	bool ended = false;
 	std::optional<BattleSide> winner;
+	EBattleResult result = EBattleResult::NORMAL;
 
 	Server(BattleSimulation & sim, int seed)
 		: sim(sim)
@@ -102,10 +103,11 @@ public:
 	{
 		return sim.actions->makeAutomaticBattleAction(battle, ba);
 	}
-	void setBattleResult(const CBattleInfoCallback &, EBattleResult, BattleSide victor) override
+	void setBattleResult(const CBattleInfoCallback &, EBattleResult how, BattleSide victor) override
 	{
 		ended = true;
 		winner = victor;
+		result = how;
 	}
 };
 
@@ -128,6 +130,7 @@ std::unique_ptr<BattleSimulation> BattleSimulation::clone(int seed) const
 	auto copy = copyOf(*game, BattleID(battleNumber), seed);
 	copy->server->ended = server->ended;
 	copy->server->winner = server->winner;
+	copy->server->result = server->result;
 	return copy;
 }
 
@@ -162,6 +165,11 @@ bool BattleSimulation::finished() const
 std::optional<BattleSide> BattleSimulation::winner() const
 {
 	return server->winner;
+}
+
+int BattleSimulation::result() const
+{
+	return static_cast<int>(server->result);
 }
 
 const std::string & BattleSimulation::complaint() const

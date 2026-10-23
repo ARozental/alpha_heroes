@@ -2,13 +2,22 @@
 
 #include "Tensors.h"
 
+#include "lib/battle/BattleSide.h"
 #include "lib/constants/EntityIdentifiers.h"
 
+#include <functional>
+#include <vector>
+
 VCMI_LIB_NAMESPACE_BEGIN
+class BattleAction;
 class CGHeroInstance;
 class CPlayerBattleCallback;
 class CStack;
 class Environment;
+namespace battle
+{
+class Unit;
+}
 VCMI_LIB_NAMESPACE_END
 
 struct ChosenAction;
@@ -35,3 +44,10 @@ void excludeAction(EncodedBattle & e, const ChosenAction & action);
 
 /// True if the complete action is legal under the masks (mirrors battle_model/distributions.py is_legal)
 bool isLegal(const EncodedBattle & e, const ChosenAction & action);
+
+/// Every legal full action, from the masks alone, in the order of battle_model/distributions.py enumerate_actions
+std::vector<ChosenAction> legalActions(const EncodedBattle & e);
+
+/// The engine's action for a model action of unit `active` of side `side`. unit(i) is the unit an action field
+/// refers to (a unit slot of an encoding, or a unit id); throws for an unknown unit or action type.
+BattleAction engineAction(BattleSide side, const CStack * active, const ChosenAction & a, const std::function<const battle::Unit *(int)> & unit);

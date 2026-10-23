@@ -21,6 +21,8 @@ with the matching cross-entropy (losses.value_loss).
 The model does not know the reward settings today. Do not design around that: a later version will
 probably get the price of mana for this battle as an input (free next to a Magic Well, costly far from
 one), and possibly other reward weights, so that one model can play by the map's current priorities.
+
+Later, not now: hidden information and a battle memory (docs/hidden_information.md).
 """
 import math
 

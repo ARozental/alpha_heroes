@@ -49,6 +49,7 @@ public:
 
 	bool finished() const;
 	std::optional<BattleSide> winner() const;
+	int result() const; // EBattleResult of a finished battle: normal, escape (retreat) or surrender
 	const std::string & complaint() const;
 
 private:

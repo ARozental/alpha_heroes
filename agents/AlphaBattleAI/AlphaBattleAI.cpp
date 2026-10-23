@@ -1,6 +1,7 @@
 #include "StdInc.h"
 #include "AlphaBattleAI.h"
 
+#include "BattleSearch.h"
 #include "Dump.h"
 #include "Encoder.h"
 #include "Model.h"
@@ -86,6 +87,10 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 			faults.push_back(fault);
 
 	simCheckEnabled = playerSetting(*CB, "ALPHA_BATTLE_SIM_CHECK") == "1";
+	const auto simulations = playerSetting(*CB, "ALPHA_BATTLE_SEARCH_SIMULATIONS");
+	searchSimulations = simulations.empty() ? 0 : std::stoi(simulations);
+	const auto considered = playerSetting(*CB, "ALPHA_BATTLE_SEARCH_CONSIDERED");
+	searchConsidered = considered.empty() ? 16 : std::stoi(considered);
 	const auto prefixPath = playerSetting(*CB, "ALPHA_BATTLE_PREFIX");
 	if(!prefixPath.empty())
 	{
@@ -152,6 +157,14 @@ void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * 
 	faultsDoneThisBattle.clear();
 	stats.siege = cb->getBattle(battleID)->battleGetDefendedTown() != nullptr;
 	stats.walls = cb->getBattle(battleID)->battleGetWallState(EWallPart::KEEP) != EWallState::NONE;
+	battleStartValues = AlphaReward::BattleEnd();
+	surrenderCostPaid = 0;
+	for(int s = 0; s < 2; ++s)
+	{
+		battleStartValues.armyStart[s] = armyValue(*(s == 0 ? army1 : army2));
+		battleStartValues.manaStart[s] = heroes[s] ? heroes[s]->mana : 0;
+		battleStartValues.manaMax[s] = heroes[s] ? heroes[s]->manaLimit() : 0;
+	}
 
 	if(record)
 	{
@@ -163,7 +176,8 @@ void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * 
 			return json + "]";
 		};
 		const auto * hero = cb->getBattle(battleID)->battleGetMyHero();
-		recordEvent("{\"event\": \"start\", \"our_side\": " + std::to_string(static_cast<int>(side)) + ", \"armies\": [" + army(army1) + ", " + army(army2) + "], \"our_mana\": " + std::to_string(hero ? hero->mana : 0) + ", \"our_mana_max\": " + std::to_string(hero ? hero->manaLimit() : 0) + "}");
+		const auto * enemyHero = heroes[1 - static_cast<int>(side)];
+		recordEvent("{\"event\": \"start\", \"our_side\": " + std::to_string(static_cast<int>(side)) + ", \"armies\": [" + army(army1) + ", " + army(army2) + "], \"our_mana\": " + std::to_string(hero ? hero->mana : 0) + ", \"our_mana_max\": " + std::to_string(hero ? hero->manaLimit() : 0) + ", \"enemy_mana\": " + std::to_string(enemyHero ? enemyHero->mana : 0) + ", \"enemy_mana_max\": " + std::to_string(enemyHero ? enemyHero->manaLimit() : 0) + "}");
 	}
 	fallback->battleStart(battleID, army1, army2, tile, hero1, hero2, side, replayAllowed);
 }
@@ -189,6 +203,12 @@ std::string AlphaBattleAI::aliveArmies(const BattleID & battleID) const
 	return "[" + sides[0] + "], " + sides[1] + "]]";
 }
 
+int AlphaBattleAI::enemyMana(const BattleID & battleID) const
+{
+	const auto * hero = heroes[1 - static_cast<int>(cb->getBattle(battleID)->battleGetMySide())];
+	return hero ? hero->mana : 0;
+}
+
 int AlphaBattleAI::ourMana(const BattleID & battleID) const
 {
 	const auto * hero = cb->getBattle(battleID)->battleGetMyHero();
@@ -199,7 +219,7 @@ void AlphaBattleAI::battleNewRoundFirst(const BattleID & battleID)
 {
 	// Called before the new round's changes: the state here is the end of the previous round
 	if(record)
-		recordEvent("{\"event\": \"round_end\", \"round\": " + std::to_string(cb->getBattle(battleID)->battleGetRound()) + ", \"alive\": " + aliveArmies(battleID) + ", \"our_mana\": " + std::to_string(ourMana(battleID)) + "}");
+		recordEvent("{\"event\": \"round_end\", \"round\": " + std::to_string(cb->getBattle(battleID)->battleGetRound()) + ", \"alive\": " + aliveArmies(battleID) + ", \"our_mana\": " + std::to_string(ourMana(battleID)) + ", \"enemy_mana\": " + std::to_string(enemyMana(battleID)) + "}");
 	fallback->battleNewRoundFirst(battleID);
 }
 
@@ -214,7 +234,21 @@ void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br
 				json += std::string(json.size() > 1 ? ", " : "") + "[" + std::to_string(creature.getNum()) + ", " + std::to_string(count) + "]";
 			return json + "]";
 		};
-		recordEvent("{\"event\": \"end\", \"round\": " + std::to_string(cb->getBattle(battleID)->battleGetRound()) + ", \"winner\": " + std::to_string(static_cast<int>(br->winner)) + ", \"result\": " + std::to_string(static_cast<int>(br->result)) + ", \"casualties\": [" + casualties(BattleSide::ATTACKER) + ", " + casualties(BattleSide::DEFENDER) + "], \"alive\": " + aliveArmies(battleID) + ", \"our_mana\": " + std::to_string(ourMana(battleID)) + "}");
+		// The reward of each side by Reward.h (the search's terminal reward), to check it against data.summarize.
+		// The enemy's surrender cost is unknown to us, as in summarize.
+		auto end = battleStartValues;
+		for(int s = 0; s < 2; ++s)
+		{
+			end.armyEnd[s] = aliveArmyValue(*cb->getBattle(battleID), static_cast<BattleSide>(s));
+			end.manaEnd[s] = heroes[s] ? heroes[s]->mana : 0;
+		}
+		end.winner = static_cast<int>(br->winner);
+		end.result = static_cast<int>(br->result);
+		end.rounds = cb->getBattle(battleID)->battleGetRound();
+		end.surrenderCost[static_cast<int>(cb->getBattle(battleID)->battleGetMySide())] = surrenderCostPaid;
+		char rewards[64];
+		std::snprintf(rewards, sizeof(rewards), "[%.17g, %.17g]", AlphaReward::reward(end, 0), AlphaReward::reward(end, 1));
+		recordEvent("{\"event\": \"end\", \"round\": " + std::to_string(cb->getBattle(battleID)->battleGetRound()) + ", \"winner\": " + std::to_string(static_cast<int>(br->winner)) + ", \"result\": " + std::to_string(static_cast<int>(br->result)) + ", \"casualties\": [" + casualties(BattleSide::ATTACKER) + ", " + casualties(BattleSide::DEFENDER) + "], \"alive\": " + aliveArmies(battleID) + ", \"our_mana\": " + std::to_string(ourMana(battleID)) + ", \"enemy_mana\": " + std::to_string(enemyMana(battleID)) + ", \"cpp_rewards\": " + rewards + "}");
 
 		if(!recordSocket.empty())
 		{
@@ -234,6 +268,11 @@ void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br
 		types += std::to_string(stats.types[t]) + (t + 1 < N_ACTION_TYPES ? "," : "");
 	const auto & st = stats.spellTargets;
 	logAi->info("AlphaBattleAI: battle summary: decisions=%d fallbacks=%d errors=%d types=[%s] spell_targets(none,unit,hex,two)=[%d,%d,%d,%d] siege=%d walls=%d server_rejections=%d presend_rejections=%d faults=%d avg_model_ms=%.2f", stats.decisions, stats.fallbacks, stats.errors, types, st[0], st[1], st[2], st[3], stats.siege, stats.walls, stats.serverRejections, stats.preSendRejections, stats.faultsInjected, stats.decisions ? stats.modelMs / stats.decisions : 0.0);
+	if(searchSimulations > 0)
+	{
+		const double n = std::max(1, stats.searched);
+		logAi->info("AlphaBattleAI: search: simulations=%d searched=%d errors=%d changed=%d avg_ms=%.1f (copy %.1f, encode %.1f, model %.1f, apply %.1f) avg_network_calls=%.1f", searchSimulations, stats.searched, stats.searchErrors, stats.searchChanged, stats.searchMs / n, stats.searchCopyMs / n, stats.searchEncodeMs / n, stats.searchModelMs / n, stats.searchApplyMs / n, stats.searchEvaluations / n);
+	}
 	if(simCheckEnabled)
 		logAi->info("AlphaBattleAI: simulation check: checks=%d rejected=%d exact_mismatches=%d dice_mismatches=%d avg_copy_ms=%.3f avg_apply_ms=%.3f", stats.simChecks, stats.simRejected, stats.simExactMismatches, stats.simDiceMismatches, stats.simChecks ? stats.simCopyMs / stats.simChecks : 0.0, stats.simChecks ? stats.simApplyMs / stats.simChecks : 0.0);
 	fallback->battleEnd(battleID, br, queryID);
@@ -354,6 +393,10 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 
 		const auto outputs = model->run(encoded.tensors);
 		auto action = chooseAction(outputs, rng, temperature);
+		// The record keeps the network's outputs: training on searched actions (stage 4) needs the search's policy in it
+		if(searchSimulations > 0 && prefixPlayed >= prefix.size() && faults.empty() && rejected.empty())
+			if(auto searched = searchAction(battleID, encoded, outputs))
+				action = *searched;
 		if(injectFault("decoder"))
 		{
 			logAi->info("AlphaBattleAI: test fault: corrupting chosen action %s", action.toJson());
@@ -425,51 +468,46 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 
 BattleAction AlphaBattleAI::toBattleAction(const BattleID & battleID, const CStack * stack, const EncodedBattle & encoded, const ChosenAction & a) const
 {
-	const auto side = cb->getBattle(battleID)->battleGetMySide();
-	auto unit = [&](int slot) -> const CStack *
-	{
-		if(slot < 0 || slot >= MAX_UNITS || !encoded.units[slot])
-			throw std::runtime_error("action refers to an empty unit slot " + std::to_string(slot));
-		return encoded.units[slot];
-	};
+	return engineAction(cb->getBattle(battleID)->battleGetMySide(), stack, a, [&](int slot) -> const battle::Unit * { return slot >= 0 && slot < MAX_UNITS ? encoded.units[slot] : nullptr; });
+}
 
-	switch(static_cast<ActionType>(a.type))
+std::optional<ChosenAction> AlphaBattleAI::searchAction(const BattleID & battleID, const EncodedBattle & encoded, const OutputTensors & outputs)
+{
+	const auto started = std::chrono::steady_clock::now();
+	try
 	{
-		case ActionType::WAIT:
-			return BattleAction::makeWait(stack);
-		case ActionType::DEFEND:
-			return BattleAction::makeDefend(stack);
-		case ActionType::MOVE:
-			return BattleAction::makeMove(stack, BattleHex(a.hex));
-		case ActionType::MELEE:
-			return BattleAction::makeMeleeAttack(stack, unit(a.unit), BattleHex(a.hex));
-		case ActionType::SHOOT:
-			return BattleAction::makeShotAttack(stack, unit(a.unit));
-		case ActionType::RETREAT:
-			return BattleAction::makeRetreat(side);
-		case ActionType::SURRENDER:
-			return BattleAction::makeSurrender(side);
-		case ActionType::HERO_SPELL:
-		{
-			battle::Target target;
-			if(a.targetUnit >= 0)
-				target.emplace_back(unit(a.targetUnit));
-			if(a.targetHex >= 0)
-				target.emplace_back(BattleHex(a.targetHex));
-			if(a.target2Hex >= 0)
-				target.emplace_back(BattleHex(a.target2Hex));
-			if(a.target2Unit >= 0)
-				target.emplace_back(unit(a.target2Unit));
-			BattleAction cast;
-			cast.actionType = EActionType::HERO_SPELL;
-			cast.spell = SpellID(a.spell);
-			cast.side = side;
-			cast.stackNumber = -1;
-			cast.setTarget(target);
-			return cast;
-		}
-		default:
-			throw std::runtime_error("model chose action type " + std::to_string(a.type) + ", which is not supported");
+		const auto root = BattleSimulation::copyOf(env->game()->gameState(), battleID, 0); // its dice are replaced in every simulation
+		BattleSearchEnv game(*root, *model, *env, battleStartValues, ROUND_CAP);
+		GumbelSearch::Config config;
+		config.simulations = searchSimulations;
+		config.maxConsidered = searchConsidered;
+		config.gumbelScale = temperature > 0 ? 1.0 : 0.0; // greedy play: the search's best action, no noise
+		GumbelSearch::Search<BattleSearchEnv> search(game, config);
+		const auto result = search.run(static_cast<uint64_t>(rng()) << 32 | rng());
+
+		std::optional<ChosenAction> chosen; // the search's action in the slots of this decision's encoding
+		for(const auto & a : legalActions(encoded))
+			if(BattleSearchEnv::actionId(encoded, a) == result.action)
+				chosen = a;
+		if(!chosen)
+			throw std::runtime_error("the searched action is not legal in the real battle");
+		std::mt19937 noRandomness;
+		const auto networkBest = chooseAction(outputs, noRandomness, 0.0f);
+		++stats.searched;
+		stats.searchChanged += BattleSearchEnv::actionId(encoded, networkBest) != result.action;
+		stats.searchEvaluations += game.evaluations;
+		stats.searchCopyMs += game.copyMs;
+		stats.searchEncodeMs += game.encodeMs;
+		stats.searchModelMs += game.modelMs;
+		stats.searchApplyMs += game.applyMs;
+		stats.searchMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+		return chosen;
+	}
+	catch(const std::exception & e)
+	{
+		++stats.searchErrors;
+		logAi->error("AlphaBattleAI: search failed: %s; the network's action is played", e.what());
+		return std::nullopt;
 	}
 }
 
@@ -491,6 +529,8 @@ void AlphaBattleAI::execute(const BattleID & battleID, const CStack * stack, con
 		stats.simApplyMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - copied).count();
 		simCheckAction = action;
 	}
+	if(a.type == static_cast<int>(ActionType::SURRENDER))
+		surrenderCostPaid = cb->getBattle(battleID)->battleGetSurrenderCost();
 	if(a.type == static_cast<int>(ActionType::SURRENDER) && record)
 		recordEvent("{\"event\": \"surrender\", \"cost\": " + std::to_string(cb->getBattle(battleID)->battleGetSurrenderCost()) + "}");
 	if(a.type == static_cast<int>(ActionType::HERO_SPELL))
