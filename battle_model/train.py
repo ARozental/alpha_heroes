@@ -168,13 +168,14 @@ TENSORBOARD_TAGS = {
 
 
 EVAL_COLUMNS = [
-	"epoch", "attack_win_rate", "defence_win_rate", "attack_reward", "defence_reward", "mean_reward", "attack_outcome", "defence_outcome",
+	"epoch", "total_score", "attack_win_rate", "defence_win_rate", "attack_reward", "defence_reward", "mean_reward", "attack_outcome", "defence_outcome",
 	"attack_vs_baseline", "defence_vs_baseline", "mean_vs_baseline", "attack_baseline_reward", "defence_baseline_reward", "seconds",
 	"attack_army_kept", "attack_army_killed", "defence_army_kept", "defence_army_killed",
 	"attack_baseline_army_kept", "attack_baseline_army_killed", "defence_baseline_army_kept", "defence_baseline_army_killed",
 ]  # eval.csv, greedy battles per side: win rate, mean reward -1..1, outcomes; and minus the eval opponent's own reward on
 # the same seeds. army_kept / army_killed: shares of our army kept and of the enemy's lost (data.BattleSummary), ours
-# and the eval opponent's on the same seeds: the same whatever the reward's definition
+# and the eval opponent's on the same seeds: the same whatever the reward's definition. total_score: THE measure of a
+# model, the mean zero-sum reward (reward.py) of all eval battles, attack and defence: -1..1, higher is better
 
 # The eval battles' VCMI seeds: fixed random numbers, the same for every eval round of every run
 _eval_rng = random.Random(20261023)
@@ -183,6 +184,7 @@ EVAL_SEEDS = tuple(_eval_rng.randrange(1, 2**31) for _ in range(256))
 
 def log_eval_tensorboard(writer, row):
 	epoch = int(row["epoch"])
+	writer.add_scalar("eval/total_score", float(row["total_score"]), epoch)
 	for name in ("attack", "defence", "mean"):
 		if name != "mean":
 			writer.add_scalar(f"eval/won/{name}", float(row[f"{name}_win_rate"]), epoch)
@@ -331,6 +333,7 @@ def eval_round(model, epoch, out, battle_map, config, baseline):
 		row[f"{name}_baseline_reward"] = round(sum(base) / len(base), 4)
 		row[f"{name}_vs_baseline"] = round((sum(reward) - sum(base)) / len(reward), 4)
 	row["mean_reward"] = round(sum(rewards) / len(rewards), 4)
+	row["total_score"] = row["mean_reward"]
 	row["mean_vs_baseline"] = round((sum(rewards) - sum(baselines)) / len(rewards), 4)
 	row["seconds"] = round(time.time() - started, 1)
 	return row
@@ -466,7 +469,7 @@ def train(config, resume=False):
 		with eval_csv.open("a", newline="") as f:
 			csv.writer(f).writerow([row[c] for c in EVAL_COLUMNS])
 		log_eval_tensorboard(writer, row)
-		print(f"eval  {epoch:4d}  vs {config.eval_opponent}, greedy: attack won {row['attack_win_rate']:.2f} {row['attack_reward']:+.3f} ({row['attack_vs_baseline']:+.3f} vs its own)  defence won {row['defence_win_rate']:.2f} {row['defence_reward']:+.3f} ({row['defence_vs_baseline']:+.3f} vs its own)  {row['seconds']}s", flush=True)
+		print(f"eval  {epoch:4d}  total score {row['total_score']:+.3f}  vs {config.eval_opponent}, greedy: attack won {row['attack_win_rate']:.2f} {row['attack_reward']:+.3f} ({row['attack_vs_baseline']:+.3f} vs its own)  defence won {row['defence_win_rate']:.2f} {row['defence_reward']:+.3f} ({row['defence_vs_baseline']:+.3f} vs its own)  {row['seconds']}s", flush=True)
 
 	if config.eval_every and first_epoch == 1:
 		evaluate_now(0)  # the untrained model
