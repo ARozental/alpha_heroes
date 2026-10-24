@@ -203,5 +203,5 @@ def test_escapes_are_about_never_unless_we_are_much_weaker():
 	from battle_model import priors
 
 	relief = lambda ratio: float(priors.escape_relief(torch.tensor(np.log(ratio))))
-	assert relief(1.0) < 0.02 and relief(4.0) < 0.02 and relief(1 / 4) < 0.2  # even, stronger, the enemy 2x our army
-	assert relief(1 / 25) > 0.85  # the enemy 5x our army: about as likely as waiting
+	assert relief(1.0) < 0.01 and relief(4.0) < 0.01 and relief(1 / 9) < 0.15  # even, stronger, the enemy 3x our army
+	assert relief(1 / 100) > 0.9  # the enemy 10x our army: about as likely as waiting
