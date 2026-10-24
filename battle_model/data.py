@@ -100,12 +100,13 @@ def read_events(record_dir):
 	return [json.loads(line) for line in (Path(record_dir) / "events.jsonl").read_text().splitlines() if line.strip()]
 
 
-def summarize(events, hero_value=0.0, fresh_hero_value=0.0, config=RewardConfig(), side=None):
+def summarize(events, config=RewardConfig(), side=None):
 	"""The reward and outcome of one battle, from our side's events (reward.py: zero-sum, from each side's assets).
 
-	hero_value: our hero's value (reward.hero_value); 0 for level-1 heroes without artifacts, as in the current
-	scenarios (not recorded yet), and the enemy hero's is not known: 0. side: score the battle for this battle side
-	instead of the recording one (e.g. to check the C++ reward, Reward.h, of both sides: the end event's cpp_rewards).
+	Heroes: their level and artifacts from the start event ("heroes": true values, the reward is no input; 0 for records
+	without them and sides without a hero); the winner over a hero takes its artifacts. side: score the battle for this
+	battle side instead of the recording one (e.g. to check the C++ reward, Reward.h, of both sides: the end event's
+	cpp_rewards).
 	The cost of a surrender the enemy made is unknown to us (taken as 0).
 	"""
 	errors = [e["message"] for e in events if e["event"] == "error"]
@@ -118,7 +119,8 @@ def summarize(events, hero_value=0.0, fresh_hero_value=0.0, config=RewardConfig(
 	our = recorder if side is None else side
 	enemy = 1 - our
 	powers = start.get("powers", [0, 0])  # each battle side's hero's spell power
-	heroes = {our: hero_asset(hero_value, fresh_hero_value), enemy: 0.0}
+	hero_facts = start.get("heroes", [[0.0, 0.0], [0.0, 0.0]])  # per battle side: [level and its way to the next, artifacts' price]
+	heroes = {s: hero_asset(hero_facts[s][0], hero_facts[s][1], config) for s in (our, enemy)}
 
 	def mana(event, s):  # the mana value of side s's hero in an event
 		return mana_value(event.get("our_mana" if s == recorder else "enemy_mana", 0), powers[s], config)
@@ -137,7 +139,8 @@ def summarize(events, hero_value=0.0, fresh_hero_value=0.0, config=RewardConfig(
 	army_end = {s: army_start[s] - army_value(end["casualties"][s]) + army_value(summoned[s]) for s in (our, enemy)}
 	assets_start = {s: army_start[s] + heroes[s] + mana(start, s) for s in (our, enemy)}
 	cost = {s: surrender["cost"] if surrender and s == recorder else 0.0 for s in (our, enemy)}  # only the recorder's is known
-	assets_end = {s: assets_after(outcome_of(s), army_end[s], heroes[s], mana(end, s), cost[s]) for s in (our, enemy)}
+	captured = {s: hero_facts[1 - s][1] if outcome_of(s) == Outcome.WIN and outcome_of(1 - s) == Outcome.LOSS else 0.0 for s in (our, enemy)}
+	assets_end = {s: assets_after(outcome_of(s), army_end[s], heroes[s], mana(end, s), cost[s], captured[s]) for s in (our, enemy)}
 	reward = terminal_reward(assets_start[our], assets_end[our], assets_start[enemy], assets_end[enemy])
 
 	scores = {}

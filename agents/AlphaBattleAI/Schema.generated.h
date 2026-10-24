@@ -6,8 +6,8 @@
 
 namespace AlphaSchema
 {
-constexpr int SCHEMA_VERSION = 11;
-constexpr const char * CONTRACT_HASH = "698eb70741fcf68a";
+constexpr int SCHEMA_VERSION = 12;
+constexpr const char * CONTRACT_HASH = "a4de609ff757d35e";
 
 constexpr int N_HEXES = 187;
 constexpr int FIELD_WIDTH = 17;
@@ -128,6 +128,9 @@ enum class In : int
 	h_mana_max,
 	h_skills,
 	h_spells,
+	h_level,
+	h_level_progress,
+	h_artifacts,
 	x_access,
 	x_obstacle_type,
 	x_obstacle_id,
@@ -150,8 +153,20 @@ enum class In : int
 	s_hex_value,
 	c_unit_value,
 	c_hex_value,
+	s_unit_enemies,
+	s_unit_allies,
+	s_hex_enemies,
+	s_hex_allies,
+	c_unit_enemies,
+	c_unit_allies,
+	c_hex_enemies,
+	c_hex_allies,
 	a_melee_value,
 	a_shoot_value,
+	a_melee_enemies,
+	a_melee_allies,
+	a_shoot_enemies,
+	a_shoot_allies,
 	p_melee_min,
 	p_melee_max,
 	p_shot_min,
@@ -212,6 +227,9 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"h_mana_max", DType::INT64, 1, {2, 0}, 0},
 	TensorSpec{"h_skills", DType::INT64, 2, {2, 28}, 0},
 	TensorSpec{"h_spells", DType::INT64, 2, {2, 70}, 0},
+	TensorSpec{"h_level", DType::INT64, 1, {2, 0}, 0},
+	TensorSpec{"h_level_progress", DType::INT64, 1, {2, 0}, 0},
+	TensorSpec{"h_artifacts", DType::INT64, 1, {2, 0}, 0},
 	TensorSpec{"x_access", DType::INT64, 1, {187, 0}, 0},
 	TensorSpec{"x_obstacle_type", DType::INT64, 1, {187, 0}, -1},
 	TensorSpec{"x_obstacle_id", DType::INT64, 1, {187, 0}, -1},
@@ -234,8 +252,20 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"s_hex_value", DType::INT64, 2, {70, 187}, 0},
 	TensorSpec{"c_unit_value", DType::INT64, 1, {20, 0}, 0},
 	TensorSpec{"c_hex_value", DType::INT64, 1, {187, 0}, 0},
+	TensorSpec{"s_unit_enemies", DType::INT64, 2, {70, 20}, 0},
+	TensorSpec{"s_unit_allies", DType::INT64, 2, {70, 20}, 0},
+	TensorSpec{"s_hex_enemies", DType::INT64, 2, {70, 187}, 0},
+	TensorSpec{"s_hex_allies", DType::INT64, 2, {70, 187}, 0},
+	TensorSpec{"c_unit_enemies", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"c_unit_allies", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"c_hex_enemies", DType::INT64, 1, {187, 0}, 0},
+	TensorSpec{"c_hex_allies", DType::INT64, 1, {187, 0}, 0},
 	TensorSpec{"a_melee_value", DType::INT64, 2, {20, 187}, 0},
 	TensorSpec{"a_shoot_value", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"a_melee_enemies", DType::INT64, 2, {20, 187}, 0},
+	TensorSpec{"a_melee_allies", DType::INT64, 2, {20, 187}, 0},
+	TensorSpec{"a_shoot_enemies", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"a_shoot_allies", DType::INT64, 1, {20, 0}, 0},
 	TensorSpec{"p_melee_min", DType::INT64, 2, {20, 20}, 0},
 	TensorSpec{"p_melee_max", DType::INT64, 2, {20, 20}, 0},
 	TensorSpec{"p_shot_min", DType::INT64, 2, {20, 20}, 0},
@@ -287,6 +317,10 @@ enum class Outcome : int
 };
 
 constexpr double MANA_VALUE = 2.0; // gold per mana point per point of spell power
+/// A hero's levels: LEVEL_VALUE x (level - FREE_LEVELS) ^ LEVEL_EXPONENT (reward.py hero_level_value)
+constexpr double LEVEL_VALUE = 2500.0;
+constexpr double FREE_LEVELS = 3.0;
+constexpr double LEVEL_EXPONENT = 1.3;
 constexpr int HERO_HIRE_COST = 2500;
 /// Gold value of one unit of each resource, in VCMI's order: wood, mercury, ore, sulfur, crystal, gems, gold
 constexpr std::array<int, 7> RESOURCE_PRICES = {250, 500, 250, 500, 500, 500, 1};

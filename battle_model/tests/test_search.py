@@ -199,14 +199,16 @@ def battle_end_cases(n=300, seed=0):
 		cost = [0, 0]
 		if result == RESULT_SURRENDER:
 			cost[1 - winner] = int(rng.integers(0, 4000))
-		yield dict(start=start.tolist(), end=end.tolist(), mana_start=mana_start.tolist(), mana_max=mana_max.tolist(), mana_end=mana_end.tolist(), power=power.tolist(), winner=winner, result=result, rounds=int(rng.integers(1, 130)), cost=cost)
+		level = (rng.integers(0, 30, 2) + rng.random(2).round(3)) * (rng.random(2) < 0.8)  # 0: no hero
+		artifacts = rng.integers(0, 20000, 2) * (rng.random(2) < 0.5)
+		yield dict(start=start.tolist(), end=end.tolist(), mana_start=mana_start.tolist(), mana_max=mana_max.tolist(), mana_end=mana_end.tolist(), power=power.tolist(), winner=winner, result=result, rounds=int(rng.integers(1, 130)), cost=cost, level=level.tolist(), artifacts=artifacts.tolist())
 
 
 def python_reward(case, side):
 	"""Training's reward for side: data.summarize over the events the battle would record from that side."""
 	armies = [[[CREATURE, case["start"][s]]] for s in (0, 1)]
 	casualties = [[[CREATURE, case["start"][s] - case["end"][s]]] for s in (0, 1)]
-	start = {"event": "start", "our_side": side, "armies": armies, "our_mana": case["mana_start"][side], "our_mana_max": case["mana_max"][side], "enemy_mana": case["mana_start"][1 - side], "enemy_mana_max": case["mana_max"][1 - side], "powers": case["power"]}
+	start = {"event": "start", "our_side": side, "armies": armies, "our_mana": case["mana_start"][side], "our_mana_max": case["mana_max"][side], "enemy_mana": case["mana_start"][1 - side], "enemy_mana_max": case["mana_max"][1 - side], "powers": case["power"], "heroes": [[case["level"][s], case["artifacts"][s]] for s in (0, 1)]}
 	end = {"event": "end", "round": case["rounds"], "winner": case["winner"], "result": case["result"], "casualties": casualties, "alive": [[], []], "our_mana": case["mana_end"][side], "enemy_mana": case["mana_end"][1 - side]}
 	events = [start, end]
 	if case["result"] == RESULT_SURRENDER and case["winner"] == 1 - side:
@@ -222,7 +224,7 @@ def test_cpp_reward_matches_training_reward(selftest):
 	commands = []
 	for c, side in cases:
 		cost = [c["cost"][s] if s == side else 0 for s in (0, 1)]
-		numbers = [c["start"][0] * value, c["start"][1] * value, c["end"][0] * value, c["end"][1] * value, *c["mana_start"], *c["power"], *c["mana_end"], c["winner"], c["result"], c["rounds"], *cost]
+		numbers = [c["start"][0] * value, c["start"][1] * value, c["end"][0] * value, c["end"][1] * value, *c["mana_start"], *c["power"], *c["mana_end"], c["winner"], c["result"], c["rounds"], *cost, *c["level"], *c["artifacts"]]
 		commands.append("reward " + " ".join(str(x) for x in numbers))
 	for (c, side), cpp in zip(cases, selftest(commands), strict=True):
 		expected = python_reward(c, side)

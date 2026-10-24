@@ -15,6 +15,7 @@ pytestmark = pytest.mark.skipif(not vocab.VOCAB_PATH.exists(), reason="run scrip
 
 BOUNDS = {
 	"net_value": (-1, 1), "versus_best": (-1, 1), "hex_value": (-1, 0), "progress": (-1, 1), "shooter_progress": (-1, 1), "threat_change": (-1, 1), "melee_threat_change": (-1, 1), "danger_change": (-1, 1), "blocked_change": (-1, 1),
+	"allies_next_to_change": (-1, 1), "enemies_next_to_change": (-1, 1),
 	**{f"{name}_{c}": (-1, 1) for name in ("attack_buff", "defense_buff") for c in F.STAT_SCALES},
 	**{name: (-1, 1) for name in F.OUTCOME_FEATURES},
 	"morale": (np.log1p(-6 / 24), np.log1p(3 / 24)), "luck": (np.log1p(-0.5 * 3 / 24), np.log1p(3 / 24)),

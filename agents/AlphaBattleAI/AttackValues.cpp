@@ -82,11 +82,23 @@ double expectedChange(BattleSimulation & sim, const CGameState & game, const Bat
 	return mass > 0 ? total / mass : 0.0;
 }
 
-std::vector<uint32_t> ids(const battle::Units & units)
+/// The living units among `units` by who controls them: (enemies of player, player's own but `self`)
+std::pair<int, int> sides(const CBattleInfoCallback & battle, const std::vector<uint32_t> & units, PlayerColor player, uint32_t self)
 {
-	std::vector<uint32_t> result;
-	for(const auto * u : units)
-		result.push_back(u->unitId());
+	int enemies = 0, allies = 0;
+	for(const auto id : units)
+		if(const auto * unit = battle.battleGetUnitByID(id); unit && unit->alive() && id != self)
+			++(battle.battleGetOwner(unit) == player ? allies : enemies);
+	return {enemies, allies};
+}
+
+/// The units an attack hits, as the server's attack finds them (BattleActionProcessor::makeAttack:
+/// getAttackedCreatures, aimed at the target's hex, from attackerPos), the target too; sorted ids
+std::vector<uint32_t> attacked(const CBattleInfoCallback & battle, const CStack * attacker, const CStack * target, bool shooting, BattleHex attackerPos)
+{
+	std::vector<uint32_t> result = {target->unitId()};
+	for(const auto * unit : battle.getAttackedCreatures(attacker, target->getPosition(), shooting, attackerPos).first)
+		result.push_back(unit->unitId());
 	std::sort(result.begin(), result.end());
 	result.erase(std::unique(result.begin(), result.end()), result.end());
 	return result;
@@ -116,6 +128,9 @@ void encodeAttackValues(EncodedBattle & e, const CGameState & game, const Battle
 			++stats.attacks;
 			++stats.played;
 			t.set(In::a_shoot_value, u, value(ChosenAction{.type = static_cast<int>(ActionType::SHOOT), .unit = u}));
+			const auto [enemies, allies] = sides(battle, attacked(battle, active, e.units[u], true, active->getPosition()), player, active->unitId());
+			t.set(In::a_shoot_enemies, u, enemies);
+			t.set(In::a_shoot_allies, u, allies);
 		}
 
 	// Attacks from different hexes end the same when the same units are hit, both ways, after the same charge (if
@@ -137,12 +152,16 @@ void encodeAttackValues(EncodedBattle & e, const CGameState & game, const Battle
 				continue;
 			++stats.attacks;
 			const BattleHex from(h);
-			battle::Units hit;
-			for(const auto & hex : target->getHexes())
-				for(const auto * v : battle.getAttackedBattleUnits(active, target, hex, false, from, target->getPosition()))
-					hit.push_back(v);
-			const auto retaliated = battle.getAttackedBattleUnits(target, active, from, false, target->getPosition(), from);
-			const auto key = std::make_tuple(u, jousting ? static_cast<int>(reach->distances[from.toInt()]) : -1, triggering ? h : -1, ids(hit), ids(retaliated));
+			const auto hit = attacked(battle, active, target, false, from);
+			const auto [enemies, allies] = sides(battle, hit, player, active->unitId());
+			t.set(In::a_melee_enemies, u, h, enemies);
+			t.set(In::a_melee_allies, u, h, allies);
+			// the retaliation, aimed at the attacker where it attacks from (its area attack can hit others there)
+			std::vector<uint32_t> retaliated;
+			for(const auto * unit : battle.getAttackedCreatures(target, from, false, target->getPosition()).first)
+				retaliated.push_back(unit->unitId());
+			std::sort(retaliated.begin(), retaliated.end());
+			const auto key = std::make_tuple(u, jousting ? static_cast<int>(reach->distances[from.toInt()]) : -1, triggering ? h : -1, hit, retaliated);
 			auto found = outcomes.find(key);
 			if(found == outcomes.end())
 			{

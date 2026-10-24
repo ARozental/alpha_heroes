@@ -53,6 +53,14 @@ bool isLegal(const EncodedBattle & e, const ChosenAction & action);
 /// A creature's value in gold (reward.py prices: gold and resources), as the reward counts it
 double creatureValue(const CCreature * creature);
 
+/// A hero's level and its way to the next from its experience (12.5: halfway to 13), as reward.py's
+/// hero_level_value takes it; 0 without a hero
+double heroLevel(const CGHeroInstance * hero);
+
+/// The market price in gold of the artifacts a winner takes from a defeated hero (BattleResultProcessor: its removable
+/// worn artifacts and its backpack, not the Grail); 0 without a hero
+double heroArtifacts(const CGHeroInstance * hero);
+
 /// True for a unit the side keeps after the battle if it is alive then: its army's stacks and permanently summoned
 /// units (Pit Lords' demons: the engine adds them to the army, BattleResultProcessor); not summoned units and clones,
 /// which vanish, nor war machines and arrow towers

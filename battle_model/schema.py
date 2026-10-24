@@ -106,6 +106,9 @@ INPUTS = (
 	_i("h_mana_max", (N_SIDES,), "mana limit"),
 	_i("h_skills", (N_SIDES, N_SECONDARY_SKILLS), "secondary skill levels 0..3; all 0 for the enemy hero (hidden from a player)"),
 	_i("h_spells", (N_SIDES, S), "1 if the spell is in the spellbook; all 0 for the enemy hero (hidden from a player)"),
+	_i("h_level", (N_SIDES,), "hero level; 0 for the enemy hero (a player's view of an enemy hero, InfoAboutHero, has no level)"),
+	_i("h_level_progress", (N_SIDES,), "of the way from its level to the next, in thousandths; 0 for the enemy hero (its experience is hidden)"),
+	_i("h_artifacts", (N_SIDES,), "market price in gold of the artifacts a winner would take from the hero (reward.py); 0 for the enemy hero (hidden)"),
 	# Hexes, BattleHex index 0..186
 	_i("x_access", (H,), "EAccessibility"),
 	_i("x_obstacle_type", (H,), "EObstacleType of an obstacle on the hex, -1 if none", fill=-1),
@@ -134,11 +137,25 @@ INPUTS = (
 	_i("s_hex_value", (S, H), "HERO_SPELL: predicted value change (attacker - defender, gold) of the cast at this hex"),
 	_i("c_unit_value", (U,), "CREATURE_SPELL: predicted value change (attacker - defender, gold) of the cast at this unit"),
 	_i("c_hex_value", (H,), "CREATURE_SPELL: predicted value change (attacker - defender, gold) of the cast at this hex"),
+	# How many units each legal cast or attack hits (the engine's affected units: area spells, chains, breath, area
+	# attacks, ...): enemies of the caster, and the caster's own units (not the attacker itself)
+	_i("s_unit_enemies", (S, U), "HERO_SPELL: enemy units the cast at this unit affects"),
+	_i("s_unit_allies", (S, U), "HERO_SPELL: our units the cast at this unit affects"),
+	_i("s_hex_enemies", (S, H), "HERO_SPELL: enemy units the cast at this hex affects"),
+	_i("s_hex_allies", (S, H), "HERO_SPELL: our units the cast at this hex affects"),
+	_i("c_unit_enemies", (U,), "CREATURE_SPELL: enemy units the cast at this unit affects"),
+	_i("c_unit_allies", (U,), "CREATURE_SPELL: our units the cast at this unit affects"),
+	_i("c_hex_enemies", (H,), "CREATURE_SPELL: enemy units the cast at this hex affects"),
+	_i("c_hex_allies", (H,), "CREATURE_SPELL: our units the cast at this hex affects"),
 	# What each legal attack would do, as the engine's own rules play it on a copy of the battle (AttackValues.cpp):
 	# everything counts (retaliation, area attacks, Fire Shield, life drain, death stare, jousting, rebirth, spells
 	# after an attack, hero skills, ...), dice at their expectation; priced as s_unit_value.
 	_i("a_melee_value", (U, H), "MELEE: predicted value change (attacker - defender, gold) of attacking the unit from the hex"),
 	_i("a_shoot_value", (U,), "SHOOT: predicted value change (attacker - defender, gold) of shooting the unit"),
+	_i("a_melee_enemies", (U, H), "MELEE: enemy units the attack on the unit from the hex hits (the target too)"),
+	_i("a_melee_allies", (U, H), "MELEE: our units the attack on the unit from the hex hits (not the attacker)"),
+	_i("a_shoot_enemies", (U,), "SHOOT: enemy units the shot at the unit hits (the target too)"),
+	_i("a_shoot_allies", (U,), "SHOOT: our units the shot at the unit hits"),
 	# The engine's damage estimate (battleEstimateDamage: every damage bonus, hero skills and artifacts included, as
 	# the game shows a player) of one attack of unit i on unit j as they stand now, without luck or charge; 0 for
 	# pairs that cannot fight (same controller, dead, a shooter without shots)
@@ -275,6 +292,14 @@ def random_inputs(batch=1, seed=0, n_units=14):
 		x["c_hex_value"][b] = value(H) * x["m_creature_spell_hex"][b]
 		x["a_melee_value"][b] = value((U, H)) * x["m_melee_from"][b]
 		x["a_shoot_value"][b] = value(U) * x["m_shoot_target"][b]
+		hits = lambda shape, legal: (1 + rng.integers(0, 3, shape) * (rng.random(shape) < 0.2)) * legal
+		x["a_melee_enemies"][b], x["a_melee_allies"][b] = hits((U, H), x["m_melee_from"][b]), (hits((U, H), x["m_melee_from"][b]) - 1).clip(0)
+		x["a_shoot_enemies"][b], x["a_shoot_allies"][b] = hits(U, x["m_shoot_target"][b]), (hits(U, x["m_shoot_target"][b]) - 1).clip(0)
+		for name, legal in (("s_unit", x["m_spell_unit"][b]), ("s_hex", x["m_spell_hex"][b]), ("c_unit", x["m_creature_spell_unit"][b]), ("c_hex", x["m_creature_spell_hex"][b])):
+			x[f"{name}_enemies"][b], x[f"{name}_allies"][b] = hits(legal.shape, legal), (hits(legal.shape, legal) - 1).clip(0)
+		x["h_level"][b] = rng.integers(1, 30, N_SIDES)
+		x["h_level_progress"][b] = rng.integers(0, 1000, N_SIDES)
+		x["h_artifacts"][b] = rng.integers(0, 20000, N_SIDES) * (rng.random(N_SIDES) < 0.5)
 		x["g_surrender_cost"][b] = rng.integers(-1, 5000)
 		x["g_start_army"][b] = rng.integers(1000, 50000, N_SIDES)
 		x["g_start_mana"][b] = rng.integers(0, 100, N_SIDES)

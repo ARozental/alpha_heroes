@@ -10,6 +10,10 @@
 #include "lib/battle/BattleAttackInfo.h"
 #include "lib/battle/CObstacleInstance.h"
 #include "lib/battle/CPlayerBattleCallback.h"
+#include "lib/GameLibrary.h"
+#include "lib/entities/artifact/ArtifactUtils.h"
+#include "lib/entities/artifact/CArtifact.h"
+#include "lib/entities/hero/CHeroHandler.h"
 #include "lib/bonuses/Bonus.h"
 #include "lib/bonuses/BonusSelector.h"
 #include "lib/callback/IGameInfoCallback.h"
@@ -139,6 +143,10 @@ void encodeHeroes(InputTensors & t, const CPlayerBattleCallback & battle, Battle
 		if(hero->hasSpellbook())
 			for(int spell = 0; spell < N_SPELLS; ++spell)
 				t.set(In::h_spells, my, spell, hero->spellbookContainsSpell(SpellID(spell)));
+		const double level = heroLevel(hero);
+		t.set(In::h_level, my, static_cast<int64_t>(hero->level));
+		t.set(In::h_level_progress, my, std::llround(1000 * (level - hero->level)));
+		t.set(In::h_artifacts, my, std::llround(heroArtifacts(hero)));
 	}
 	// The enemy hero: only what a player sees in battle (no secondary skills, no spellbook). The player
 	// callback's battleGetEnemyHero() hides even that (BASIC level), but the client shows a human both heroes'
@@ -310,7 +318,18 @@ int64_t castValue(const CPlayerBattleCallback & battle, const CSpell & spell, co
 	return std::llround(value);
 }
 
-void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, const CGHeroInstance * hero)
+/// The living units a cast aimed at `aim` affects (the spell's own rule, as the cast uses it): (enemies of player,
+/// player's own), by who controls them now
+std::pair<int, int> castHits(const CPlayerBattleCallback & battle, const spells::Mechanics & mechanics, const battle::Target & aim, PlayerColor player)
+{
+	int enemies = 0, allies = 0;
+	for(const auto * unit : mechanics.getAffectedStacks(aim))
+		if(unit && unit->alive())
+			++(battle.battleGetOwner(unit) == player ? allies : enemies);
+	return {enemies, allies};
+}
+
+void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, const CGHeroInstance * hero, PlayerColor player)
 {
 	auto & t = e.tensors;
 	std::array<int, MAX_UNITS> spell2Owner;
@@ -344,6 +363,9 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 				{
 					t.set(In::m_spell_hex, s, h, 1);
 					t.set(In::s_hex_value, s, h, castValue(battle, *spell, *mechanics, {battle::Destination(BattleHex(h))}));
+					const auto [enemies, allies] = castHits(battle, *mechanics, {battle::Destination(BattleHex(h))}, player);
+					t.set(In::s_hex_enemies, s, h, enemies);
+					t.set(In::s_hex_allies, s, h, allies);
 				}
 		}
 		else if(aims[0] == spells::AimType::CREATURE)
@@ -361,6 +383,9 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 					{
 						t.set(In::m_spell_unit, s, u, 1);
 						t.set(In::s_unit_value, s, u, castValue(battle, *spell, *mechanics, {first}));
+						const auto [enemies, allies] = castHits(battle, *mechanics, {first}, player);
+						t.set(In::s_unit_enemies, s, u, enemies);
+						t.set(In::s_unit_allies, s, u, allies);
 					}
 					continue;
 				}
@@ -403,7 +428,7 @@ namespace
 /// The acting unit's legal targets for a spell it casts as its action (CREATURE_SPELL), at the level the server casts
 /// it (doUnitSpellAction: its SPELLCASTER value). Only spells with one unit or hex target: creature spells without a
 /// target or with two (none in the core game) are not offered. True if it has any.
-bool encodeCreatureSpellTargets(EncodedBattle & e, const CPlayerBattleCallback & battle, const CStack * active, SpellID id)
+bool encodeCreatureSpellTargets(EncodedBattle & e, const CPlayerBattleCallback & battle, const CStack * active, SpellID id, PlayerColor player)
 {
 	auto & t = e.tensors;
 	const auto * spell = id.toSpell();
@@ -424,6 +449,9 @@ bool encodeCreatureSpellTargets(EncodedBattle & e, const CPlayerBattleCallback &
 			{
 				t.set(In::m_creature_spell_hex, h, 1);
 				t.set(In::c_hex_value, h, castValue(battle, *spell, *mechanics, {battle::Destination(BattleHex(h))}));
+				const auto [enemies, allies] = castHits(battle, *mechanics, {battle::Destination(BattleHex(h))}, player);
+				t.set(In::c_hex_enemies, h, enemies);
+				t.set(In::c_hex_allies, h, allies);
 				any = true;
 			}
 	}
@@ -434,6 +462,9 @@ bool encodeCreatureSpellTargets(EncodedBattle & e, const CPlayerBattleCallback &
 			{
 				t.set(In::m_creature_spell_unit, u, 1);
 				t.set(In::c_unit_value, u, castValue(battle, *spell, *mechanics, {battle::Destination(e.units[u])}));
+				const auto [enemies, allies] = castHits(battle, *mechanics, {battle::Destination(e.units[u])}, player);
+				t.set(In::c_unit_enemies, u, enemies);
+				t.set(In::c_unit_allies, u, allies);
 				any = true;
 			}
 	}
@@ -460,7 +491,7 @@ void encodeCreatureSpell(EncodedBattle & e, const CPlayerBattleCallback & battle
 	if(drawn.hasValue())
 		spells.push_back(drawn);
 	for(const auto id : spells)
-		if(encodeCreatureSpellTargets(e, battle, active, id))
+		if(encodeCreatureSpellTargets(e, battle, active, id, player))
 		{
 			t.set(In::g_creature_spell, id.getNum());
 			return;
@@ -544,7 +575,7 @@ EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * 
 	encodeHexes(t, battle, mySide, stopping);
 	encodeUnitMasks(e, battle, active, stopping);
 	if(heroCanCast)
-		encodeSpellMasks(e, battle, hero);
+		encodeSpellMasks(e, battle, hero, player);
 	encodeCreatureSpell(e, battle, active, player);
 
 	auto type = [&](ActionType a, bool legal) { t.set(In::m_type, static_cast<int>(a), legal); };
@@ -659,6 +690,32 @@ bool isLegal(const EncodedBattle & e, const ChosenAction & a)
 		default:
 			return true;
 	}
+}
+
+double heroLevel(const CGHeroInstance * hero)
+{
+	if(!hero)
+		return 0.0;
+	const auto & heroes = *LIBRARY->heroh;
+	const auto level = hero->level;
+	if(level >= heroes.maxSupportedLevel())
+		return level;
+	const double from = static_cast<double>(heroes.reqExp(level)), to = static_cast<double>(heroes.reqExp(level + 1));
+	return level + (to > from ? std::clamp((static_cast<double>(hero->exp) - from) / (to - from), 0.0, 0.999) : 0.0);
+}
+
+double heroArtifacts(const CGHeroInstance * hero)
+{
+	if(!hero)
+		return 0.0;
+	double price = 0;
+	for(const auto & slot : ArtifactUtils::commonWornSlots())
+		if(const auto worn = hero->artifactsWorn.find(slot); worn != hero->artifactsWorn.end() && ArtifactUtils::isArtRemovable(*worn))
+			price += worn->second.getArt()->getType()->getPrice();
+	for(const auto & slot : hero->artifactsInBackpack)
+		if(const auto * art = slot.getArt(); art && art->getTypeId() != ArtifactID::GRAIL)
+			price += art->getType()->getPrice();
+	return price;
 }
 
 bool keptAfterBattle(const CStack * unit)

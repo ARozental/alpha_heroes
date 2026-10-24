@@ -107,6 +107,7 @@ def ending_battle(our_side, cost=1000):
 	x["g_start_army"][0] = (30_000, 40_000)
 	x["g_start_mana"][0] = (20, 10)
 	x["h_present"][0], x["h_power"][0], x["h_mana"][0] = (1, 1), (3, 2), (12, 10)
+	x["h_level"][0, our_side], x["h_level_progress"][0, our_side], x["h_artifacts"][0, our_side] = 12, 500, 6000  # the enemy's: hidden
 	x["g_surrender_cost"][0] = cost
 	return x
 
@@ -114,19 +115,23 @@ def ending_battle(our_side, cost=1000):
 @pytest.mark.parametrize("our_side", (0, 1))
 def test_ending_now_scores_as_the_reward_would(our_side):
 	"""score_now, retreat_reward and surrender_reward are reward.py's zero-sum on the assets summarize() counts."""
-	from battle_model.reward import HERO_HIRE_COST, Outcome, assets_after, mana_value, zero_sum
+	from battle_model.reward import Outcome, assets_after, hero_asset, mana_value, zero_sum
 
 	x = ending_battle(our_side)
 	b = F.read_battle(tensors(x), BattleModel().tables())
 	got = dict(zip(F.OUTCOME_FEATURES, F.outcome_features(b)[0].tolist()))
 	army = [2 * vocab.creature_value(int(x["u_creature"][0, 0])), 3 * vocab.creature_value(int(x["u_creature"][0, 1]))]
 	mana = [mana_value(12, 3), mana_value(10, 2)]
-	start = [30_000 + mana_value(20, 3), 40_000 + mana_value(10, 2)]
 	us, them = our_side, 1 - our_side
+	hero = [0.0, 0.0]
+	hero[us] = hero_asset(12.5, 6000)  # what we see of the enemy's hero: nothing
+	start = [30_000 + hero[0] + mana_value(20, 3), 40_000 + hero[1] + mana_value(10, 2)]
+	theirs = army[them] + hero[them] + mana[them]
 	expect = {
-		"score_now": zero_sum(start[us], army[us] + mana[us], start[them], army[them] + mana[them]),
-		"retreat_reward": zero_sum(start[us], assets_after(Outcome.RETREAT, army[us], 0, mana[us]), start[them], army[them] + mana[them]),
-		"surrender_reward": zero_sum(start[us], assets_after(Outcome.SURRENDER, army[us], 0, mana[us], 1000), start[them], army[them] + mana[them]),
+		"score_now": zero_sum(start[us], army[us] + hero[us] + mana[us], start[them], theirs),
+		"retreat_reward": zero_sum(start[us], assets_after(Outcome.RETREAT, army[us], hero[us], mana[us]), start[them], theirs),
+		"surrender_reward": zero_sum(start[us], assets_after(Outcome.SURRENDER, army[us], hero[us], mana[us], 1000), start[them], theirs),
+		"hero_stake": hero[us] / (start[0] + start[1]),
 	}
 	assert got == pytest.approx(expect, abs=1e-5)
 	assert expect["surrender_reward"] > expect["retreat_reward"]  # paying 1000 + rehire keeps the Angels
@@ -178,3 +183,18 @@ def test_multi_scale_features_tell_small_numbers_apart_and_do_not_saturate():
 	"""4 and 10 mana differ as much as 400 and 1000 do, somewhere among the scales."""
 	small, large = F.scales(torch.tensor([4.0, 10.0]), F.MANA_SCALES), F.scales(torch.tensor([400.0, 1000.0]), F.MANA_SCALES)
 	assert (small[1] - small[0]).max() > 0.2 and (large[1] - large[0]).max() > 0.1
+
+
+def test_grouped_units_see_their_neighbours():
+	"""The slow path to area attacks: each unit sees how much of its side stands next to it, and each hex how much of
+	ours the acting unit would stand next to there (a Hydra or a breath hits them together)."""
+	x = battle([("Angel", 1, 0, 86, 20, 20), ("Pikeman", 10, 0, 87, 4, 5), ("Hydra", 1, 1, 120, 16, 18), ("Imp", 5, 0, 30, 2, 3)])
+	finalize_masks(x, 0)
+	b = F.read_battle(tensors(x), BattleModel().tables())
+	stack = F.stack_features(b)[0]
+	allies = stack[:, F.STACK_FEATURES.index("allies_next_to")]
+	assert allies[0] > 0 and allies[1] > 0 and allies[3] == 0  # the Angel and the Pikemen stand together, the Imps alone
+	assert stack[2, F.STACK_FEATURES.index("enemies_next_to")] == 0
+	maps, _ = F.threat_maps(b, *F.distance_maps(b))
+	near = maps[0, :, F.HEX_FEATURES.index("allies_next_to")]
+	assert near[88] > 0 and near[100] == 0  # next to the Pikemen (87), and nowhere near anyone

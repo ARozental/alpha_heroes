@@ -1,7 +1,7 @@
 """The battle reward: zero-sum, from what each side owns. No trainable parameters.
 
 	assets(side) = army      the value of the creatures it keeps after the battle (gold + resources at base prices)
-	             + hero      what its hero is worth above a fresh tavern hero, while the side still has its hero
+	             + hero      what its hero is worth (hero_asset: its levels and its artifacts), while the side has it
 	             + mana      mana_value x the hero's spell power x its mana left, while the side still has its hero
 	reward(side) = (assets the enemy lost - assets we lost) / (both sides' assets at the start)      in -1..1
 
@@ -12,8 +12,8 @@ and its mana; a costly win can be worth less than a loss that killed more than i
 wants. Losing the hero loses its mana; spending mana in battle costs its value (the mana penalty of before).
 
 What each outcome leaves a side (assets_after):
-	WIN        its surviving army, its hero, its mana
-	LOSS/DRAW  nothing: army, hero and mana are gone
+	WIN        its surviving army, its hero, its mana, and the artifacts it takes from a hero it defeated
+	LOSS/DRAW  nothing: army, hero and mana are gone (the winner takes the hero's artifacts)
 	RETREAT    its hero (back in the tavern) and its mana; the army is lost
 	SURRENDER  its army, hero and mana, minus the surrender payment and the cost of rehiring the hero
 
@@ -28,6 +28,7 @@ correction, learned by a small separate head, once they matter:
 	- RETREAT: the army is destroyed without the winner owning it; the hero's rehire is paid to nobody
 	- experience: the winner gains experience (levels, skills) for what it kills, which the loser does not pay
 	- Necromancy and similar: raising creatures after the battle from the enemy's dead
+	- war machines: destroyed ones are lost (their artifact is removed), but neither side's assets count them yet
 	- Eagle Eye: learning the enemy's spells; Learning, Scholar-like effects
 	- time: a long battle costs both sides nothing here (the round penalty of before is gone), but movement and days
 	  matter in a campaign
@@ -56,6 +57,14 @@ class RewardConfig:
 	# Gold per mana point per point of spell power. Fixed for now; later from outside (the campaign: a Magic Well
 	# nearby makes mana worth ~0). At 2, a power-5 hero's 50 mana is worth 500 gold: ~3% of a week-1 army.
 	mana_value: float = 2.0
+	# A hero's levels (hero_level_value): level_value x (levels above free_levels) ^ level_exponent. A fresh hero (its
+	# hire price buys it with a few creatures) and one of the first levels is worth nothing beyond that; a level is
+	# worth about a hire price; and more than linear, as a high level also stands for the shrines, skills and
+	# specialty growth a hero collects, though far from the experience the levels take (which grows 20% a level).
+	# 2500 x (L - 3) ^ 1.3: level 4 2500, 10 ~31 600, 20 ~100 000, 30 ~181 000.
+	level_value: float = 2500.0
+	free_levels: float = 3.0
+	level_exponent: float = 1.3
 
 
 def resources_value(resources):
@@ -67,26 +76,27 @@ def stack_value(unit_cost, count):
 	return resources_value(unit_cost) * count
 
 
-def hero_value(artifact_prices, experience):
-	"""A hero's value: its artifacts plus its experience (1000 for level 1 -> 2, then scaled like the XP needed per
-	level, which makes it exactly 1 gold per XP point)."""
-	return sum(artifact_prices) + experience
-
-
 def mana_value(mana, power, config=RewardConfig()):
 	return config.mana_value * max(power, 0) * max(mana, 0)
 
 
-def hero_asset(hero_value_, fresh_hero_value=0.0):
-	"""What a hero is worth to its side: what it adds over hiring a fresh one (who comes with a small army)."""
-	return max(0.0, hero_value_ - fresh_hero_value)
+def hero_level_value(level, config=RewardConfig()):
+	"""What a hero's levels are worth (RewardConfig): level counts its way to the next level (12.5: halfway to 13)."""
+	return config.level_value * max(0.0, level - config.free_levels) ** config.level_exponent
 
 
-def assets_after(outcome, army_end, hero, mana, surrender_cost=0.0):
+def hero_asset(level, artifacts, config=RewardConfig()):
+	"""What a hero is worth to its side: its levels, and its artifacts at their market price (artifacts: the price of
+	those a winner would take). Primary skills and spells are not counted on their own (the level stands for them)."""
+	return hero_level_value(level, config) + artifacts
+
+
+def assets_after(outcome, army_end, hero, mana, surrender_cost=0.0, captured=0.0):
 	"""What a side owns after the battle (see the top). army_end: its surviving army (at the moment of surrender for
-	SURRENDER); hero: hero_asset; mana: mana_value of the mana it has left."""
+	SURRENDER); hero: hero_asset; mana: mana_value of the mana it has left; captured: for a WIN over a hero, the
+	price of that hero's artifacts, which the winner takes."""
 	if outcome == Outcome.WIN:
-		return army_end + hero + mana
+		return army_end + hero + mana + captured
 	if outcome == Outcome.RETREAT:
 		return hero + mana
 	if outcome == Outcome.SURRENDER:

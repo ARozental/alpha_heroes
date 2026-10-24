@@ -124,9 +124,10 @@ def with_engine(x):
 				back = 0.0 if shooting else min(float(x["p_melee_min"][b, u, me] + x["p_melee_max"][b, u, me]) / 2 * (1 - dealt / max(float(health[b, u]), 1)), float(health[b, me]))
 				value = sign * (dealt * float(price[b, u]) - back * float(price[b, me]))
 				if shooting:
-					x["a_shoot_value"][b, u] = round(value)
+					x["a_shoot_value"][b, u], x["a_shoot_enemies"][b, u] = round(value), 1
 				else:
 					x["a_melee_value"][b, u] = np.where(x["m_melee_from"][b, u], round(value), 0)
+					x["a_melee_enemies"][b, u] = x["m_melee_from"][b, u]  # the target alone
 	return x
 
 

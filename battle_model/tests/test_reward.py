@@ -1,7 +1,9 @@
 """reward.py: zero-sum from each side's assets."""
 import itertools
 
-from battle_model.reward import HERO_HIRE_COST, Outcome, RewardConfig, assets_after, hero_asset, hero_value, mana_value, other_side_value, resources_value, round_score, terminal_reward, zero_sum
+import pytest
+
+from battle_model.reward import HERO_HIRE_COST, Outcome, RewardConfig, assets_after, hero_asset, hero_level_value, mana_value, other_side_value, resources_value, round_score, terminal_reward, zero_sum
 
 ARMY, ENEMY = 50_000, 40_000
 
@@ -11,9 +13,19 @@ def test_resource_prices():
 	assert resources_value({"wood": 2, "ore": 2}) == 1000
 
 
-def test_hero_value_is_artifacts_plus_experience_and_counts_above_a_fresh_hero():
-	assert hero_value([2000, 5000], 14700) == 21700  # level 10 = 14700 XP
-	assert hero_asset(2_000, 3_000) == 0 and hero_asset(30_000, 3_000) == 27_000
+def test_a_hero_is_worth_its_levels_above_the_first_few_and_its_artifacts():
+	assert hero_level_value(1) == 0 == hero_level_value(3)  # a fresh hero's hire price covers the first levels
+	assert hero_level_value(4) == 2500
+	assert 31_000 < hero_level_value(10) < 32_000 and 99_000 < hero_level_value(20) < 101_000  # more than linear
+	assert hero_level_value(10) / 7 < hero_level_value(20) / 17  # each level is worth more than the one before
+	assert hero_level_value(12.5) == pytest.approx(2500 * 9.5 ** 1.3)  # halfway to 13
+	assert hero_asset(4, 7000) == 9500
+
+
+def test_the_winner_over_a_hero_takes_its_artifacts():
+	assert assets_after(Outcome.WIN, 30_000, 10_000, 0, captured=4000) == 44_000
+	assert assets_after(Outcome.LOSS, 30_000, 10_000, 0) == 0
+	assert assets_after(Outcome.RETREAT, 30_000, 10_000, 600) == 10_600  # the hero and its artifacts escape
 
 
 def test_the_two_sides_rewards_always_sum_to_zero():

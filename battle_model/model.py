@@ -62,6 +62,7 @@ from .constants import (
 	WALL_STATE_VOCAB,
 	ActionType,
 )
+from .reward import RewardConfig
 from .layers import EMBEDDING_STD, ActionScore, ValueHeads, best_of, masked_log_softmax, small_embedding, vocab_index
 
 __all__ = ["BattleModel", "best_of", "build_model"]
@@ -138,12 +139,13 @@ class BattleTokens(nn.Module):
 class HeroTokens(nn.Module):
 	"""One token per side's hero, signed by team: whether it is ours; its attack against the other hero's defence and
 	the other's attack against its defence, as the damage formula's factor (F.damage_factor: no hero is 0 and 0);
-	spell power and knowledge at several scales (F.COUNT_SCALES); mana left of its pool, mana and the pool at several
-	scales (F.MANA_SCALES); secondary skill levels (of 3) and spellbook (both 0 for the enemy's hero, which a player
-	cannot see). No embedding of the hero's type: what a hero is shows in these, and its specialty in its units'
-	numbers and its spells' predicted values."""
+	spell power, knowledge and level at several scales (F.COUNT_SCALES); mana left of its pool, mana and the pool at
+	several scales (F.MANA_SCALES); what it is worth (reward.hero_asset) of both sides' start assets; secondary skill
+	levels (of 3) and spellbook. The enemy hero's level, artifacts, skills and spellbook are 0: a player cannot see
+	them. No embedding of the hero's type: what a hero is shows in these, and its specialty in its units' numbers and
+	its spells' predicted values."""
 
-	NUMBERS = 4 + 2 * len(F.COUNT_SCALES) + 1 + 2 * len(F.MANA_SCALES) + N_SECONDARY_SKILLS + N_SPELLS
+	NUMBERS = 4 + 3 * len(F.COUNT_SCALES) + 1 + 2 * len(F.MANA_SCALES) + 1 + N_SECONDARY_SKILLS + N_SPELLS
 
 	def __init__(self, dim):
 		super().__init__()
@@ -161,9 +163,11 @@ class HeroTokens(nn.Module):
 			torch.stack([present.float(), ours.float(), F.damage_factor(attack - other(defense)), F.damage_factor(other(attack) - defense)], dim=-1),
 			F.scales(x["h_power"], F.COUNT_SCALES),
 			F.scales(x["h_knowledge"], F.COUNT_SCALES),
+			F.scales(F.hero_levels(x), F.COUNT_SCALES),
 			F.fraction(mana, pool)[..., None],
 			F.scales(mana, F.MANA_SCALES),
 			F.scales(pool, F.MANA_SCALES),
+			F.fraction(F.hero_assets(x, RewardConfig()), (x["g_start_army"].float().sum(dim=-1, keepdim=True) + F.hero_assets(x, RewardConfig()).sum(dim=-1, keepdim=True)))[..., None],
 			x["h_skills"].float().clamp(0, 3) / 3,
 			(x["h_spells"] != 0).float(),
 		], dim=-1)
