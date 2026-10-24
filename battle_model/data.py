@@ -13,6 +13,9 @@ From it we compute, for every decision:
 	advantage     GAE advantage (losses.battle_returns_and_advantages), with V (the final-reward head)
 	value_labels  labels of all value heads (losses.value_targets), on the -1..1 scale
 	forced        replayed from a prefix (play.Game.prefix), not chosen by the model: not trained on
+	search        for a decision the search played (ALPHA_BATTLE_SEARCH_SIMULATIONS): its improved policy over the
+	              root actions, (actions [K, len(ACTION_FIELDS)], probabilities [K]), from the record's "search"
+	              event; None otherwise (no search, or it failed and the network's action was played)
 and per battle a BattleSummary with the reward (reward.py) and the outcome.
 
 A sent record is ~190 KB a decision, in memory only. Keeping data across epochs will want a compact format
@@ -137,11 +140,14 @@ def summarize(events, hero_value=0.0, fresh_hero_value=0.0, config=RewardConfig(
 	# it, so it also counts as fully destroyed. The real value of an enemy surrender depends on the game:
 	# this is right for a 2-player zero-sum game; with more players a surrender might even beat a retreat,
 	# which needs information from outside the battle.
+	# Units summoned for good (Pit Lords' demons) join the army after the battle; the casualties count those killed
+	# again, so what a side keeps is its start - casualties + what it summoned
+	summoned = end.get("summoned", [[], []])
 	if outcome == Outcome.WIN and end["result"] in (RESULT_ESCAPE, RESULT_SURRENDER):
 		enemy_lost = enemy_army_start
 	else:
-		enemy_lost = army_value(end["casualties"][enemy])
-	own_army_end = own_army_start - army_value(end["casualties"][our])
+		enemy_lost = army_value(end["casualties"][enemy]) - army_value(summoned[enemy])
+	own_army_end = own_army_start - army_value(end["casualties"][our]) + army_value(summoned[our])
 	kept = own_kept_value(outcome, own_army_end, hero_value, fresh_hero_value, surrender["cost"] if surrender else 0.0)
 	rounds = end["round"]  # VCMI numbering: the first round is 1
 	reward = terminal_reward(outcome, own_start, kept, enemy_army_start, enemy_lost, rounds, mana_used(end.get(mana_key, 0)), config)
@@ -257,22 +263,35 @@ def battle_examples(record, reward_config=RewardConfig(), advantage_config=Advan
 	enemy = army_values(record.tensors, 1 - summary.our_side) / max(summary.enemy_start_value, 1.0)
 	summary.credit = list(zip(-np.diff(own), -np.diff(enemy), np.diff(values.numpy()).tolist()))
 
+	searches = {e["decision"]: (torch.tensor(e["actions"], dtype=torch.long).view(-1, len(ACTION_FIELDS)), torch.tensor(e["policy"], dtype=torch.float32)) for e in record.events if e["event"] == "search"}
 	examples = [
-		{"inputs": d[0], "action": d[2], "old_log_prob": old_log_prob[i], "advantage": advantages[i], "value_labels": labels[i], "forced": bool(d[2].get("forced", False))}
+		{"inputs": d[0], "action": d[2], "old_log_prob": old_log_prob[i], "advantage": advantages[i], "value_labels": labels[i], "forced": bool(d[2].get("forced", False)), "search": searches.get(i)}
 		for i, d in enumerate(decisions)
 	]
 	return examples, summary
 
 
 def collate(examples):
-	"""List of examples -> one batch: inputs as model-ready tensors, the rest stacked."""
-	return {
+	"""List of examples -> one batch: inputs as model-ready tensors, the rest stacked. When any example has a search
+	policy: "search" = {"action": {field: [B, K]}, "probs": [B, K]}, padded to the longest with probability 0 (and
+	all fields -1); an example without one has all probabilities 0."""
+	batch = {
 		"inputs": {s.name: torch.from_numpy(np.stack([e["inputs"][s.name] for e in examples])) for s in INPUTS},
 		"action": {f: torch.tensor([e["action"][f] for e in examples], dtype=torch.long) for f in ACTION_FIELDS},
 		"old_log_prob": torch.stack([e["old_log_prob"] for e in examples]),
 		"advantage": torch.stack([e["advantage"] for e in examples]),
 		"value_labels": torch.stack([e["value_labels"] for e in examples]),
 	}
+	searches = [e.get("search") for e in examples]
+	if any(s is not None for s in searches):
+		k = max(len(s[1]) for s in searches if s is not None)
+		actions = torch.full((len(examples), k, len(ACTION_FIELDS)), -1, dtype=torch.long)
+		probs = torch.zeros(len(examples), k)
+		for i, s in enumerate(searches):
+			if s is not None:
+				actions[i, : len(s[1])], probs[i, : len(s[1])] = s
+		batch["search"] = {"action": {f: actions[..., j] for j, f in enumerate(ACTION_FIELDS)}, "probs": probs}
+	return batch
 
 
 def make_dataloader(records, batch_size=64, shuffle=True, reward_config=RewardConfig(), advantage_config=AdvantageConfig()):

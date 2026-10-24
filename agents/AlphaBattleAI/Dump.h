@@ -31,6 +31,7 @@ public:
 	BattleRecord();
 	void addEvent(const std::string & json);
 	void addDecision(const AlphaSchema::InputTensors & in, const AlphaSchema::OutputTensors & out, const ChosenAction & action);
+	int size() const { return decisions; } // decisions so far
 	std::string serialize() const;
 	/// Connects to socketPath and sends the key (u32 length + bytes) and then serialize(); throws on failure
 	void send(const std::string & socketPath, const std::string & key) const;

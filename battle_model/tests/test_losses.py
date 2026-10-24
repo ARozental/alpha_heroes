@@ -1,6 +1,11 @@
+import numpy as np
 import torch
 
-from battle_model.losses import AdvantageConfig, battle_returns_and_advantages
+from battle_model.data import collate
+from battle_model.distributions import ACTION_FIELDS, enumerate_actions, log_prob, log_prob_at, stack_actions
+from battle_model.losses import AdvantageConfig, battle_returns_and_advantages, search_loss
+from battle_model.model import BattleModel
+from battle_model.schema import INPUTS, random_inputs
 
 R = 2.5  # terminal reward of a won battle
 VALUES = [1.0, 1.5, 0.5, 2.0]
@@ -93,3 +98,57 @@ def test_policy_follows_only_the_heads_switched_on():
 	assert torch.allclose(both, final + (labels[:, 2] - values[:, 2]))
 	only_v2 = policy_advantages(final, labels, values, AdvantageConfig(policy_heads=(0, 0, 1, 0)))
 	assert torch.allclose(only_v2, labels[:, 2] - values[:, 2])
+
+
+def search_examples(seed=0, batch=3):
+	"""Examples of random decisions, each with a search policy over a few of its legal actions (the last one none)."""
+	x = random_inputs(batch=batch, seed=seed)
+	rng = np.random.default_rng(seed)
+	examples = []
+	for b in range(batch):
+		actions = enumerate_actions(x, b)
+		picked = [actions[i] for i in rng.choice(len(actions), size=min(len(actions), 2 + b), replace=False)]
+		probs = rng.random(len(picked))
+		search = (torch.tensor([[a[f] for f in ACTION_FIELDS] for a in picked]), torch.tensor(probs / probs.sum(), dtype=torch.float32))
+		examples.append({"inputs": {s.name: x[s.name][b] for s in INPUTS}, "action": picked[0], "old_log_prob": torch.tensor(0.0), "advantage": torch.tensor(0.0), "value_labels": torch.zeros(4), "search": search if b < batch - 1 else None})
+	return examples
+
+
+def test_log_prob_at_scores_actions_under_any_row():
+	torch.manual_seed(0)
+	examples = search_examples()
+	batch = collate(examples)
+	with torch.no_grad():
+		out = BattleModel()(batch["inputs"])
+	for b, e in enumerate(examples[:-1]):
+		actions = {f: e["search"][0][:, j] for j, f in enumerate(ACTION_FIELDS)}
+		alone = log_prob({k: v[b : b + 1].expand((len(e["search"][1]),) + v.shape[1:]) for k, v in out.items()}, actions)
+		assert torch.allclose(log_prob_at(out, torch.full_like(actions["type"], b), actions), alone)
+
+
+def test_search_loss_is_the_cross_entropy_to_the_search_policy():
+	"""Padding (probability 0, fields -1) and a decision without a search add nothing; the loss is finite with finite
+	gradients, and descending it moves the network toward the search's policy."""
+	torch.manual_seed(0)
+	examples = search_examples()
+	batch = collate(examples)
+	assert batch["search"]["probs"].shape == (3, 3) and batch["search"]["probs"][-1].sum() == 0
+	model = BattleModel()
+	out = model(batch["inputs"])
+	loss, parts = search_loss(out, batch["search"], batch["value_labels"])
+	expected = []
+	for b, e in enumerate(examples[:-1]):
+		actions, probs = e["search"]
+		lp = log_prob({k: v[b : b + 1].expand((len(probs),) + v.shape[1:]) for k, v in out.items()}, {f: actions[:, j] for j, f in enumerate(ACTION_FIELDS)})
+		expected.append(-(probs * lp).sum())
+	assert torch.allclose(parts["policy"], torch.stack(expected).mean())
+	kl_before = float(parts["approx_kl"])
+	loss.backward()
+	assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+	optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+	for _ in range(30):
+		optimizer.zero_grad()
+		loss, parts = search_loss(model(batch["inputs"]), batch["search"], batch["value_labels"])
+		loss.backward()
+		optimizer.step()
+	assert float(parts["approx_kl"]) < 0.5 * kl_before

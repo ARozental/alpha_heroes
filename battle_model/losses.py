@@ -70,7 +70,7 @@ import torch
 import torch.nn.functional as F
 
 from .constants import N_VALUE_HORIZONS
-from .distributions import entropy, log_prob
+from .distributions import entropy, log_prob, log_prob_at
 from .reward import RewardConfig, to_scale
 
 
@@ -220,4 +220,38 @@ def ppo_loss(out, action, old_log_prob, advantage, value_labels, config=PPOConfi
 		"ratio": ratio.mean().detach(),
 		"approx_kl": (old_log_prob - new_log_prob).mean().detach(),
 		"clip_fraction": ((ratio - 1).abs() > config.clip_range).float().mean().detach(),
+	}
+
+
+def search_loss(out, search, value_labels, config=PPOConfig()):
+	"""AlphaZero's loss, for decisions a search played (Gumbel AlphaZero, agents/AlphaBattleAI/GumbelSearch.h): the
+	policy's cross-entropy against the search's improved policy over the root actions (softmax of the network's
+	logits plus the completed Q-values), instead of PPO's policy loss; the value loss and the entropy bonus as in
+	ppo_loss (the value heads learn the battle's outcome either way).
+
+	search: {"action": {field: [B, K]}, "probs": [B, K]} (data.collate), padding at probability 0. Rows without a
+	search (it failed) train only the value. approx_kl here is KL(search policy || network): how far the network is
+	from what the search found; clip_fraction is 0 (nothing is clipped).
+	"""
+	probs = search["probs"]
+	b, k = probs.shape
+	rows = torch.arange(b, device=probs.device)[:, None].expand(b, k).reshape(-1)
+	logp = log_prob_at(out, rows, {f: v.reshape(-1) for f, v in search["action"].items()}).view(b, k)
+	used = probs > 0
+	cross = -(probs * torch.where(used, logp, torch.zeros_like(logp))).sum(dim=-1)  # 0 * -inf would be NaN
+	own = -(probs * torch.where(used, probs.clamp(min=1e-12).log(), torch.zeros_like(probs))).sum(dim=-1)
+	searched = used.any(dim=-1).float()
+	count = searched.sum().clamp(min=1.0)
+	policy = (cross * searched).sum() / count
+	value, per_head = value_loss(out, value_labels, config)
+	bonus = entropy(out).mean()
+	total = policy + config.value_weight * value - config.entropy_weight * bonus
+	return total, {
+		"policy": policy.detach(),
+		"value": value.detach(),
+		"value_per_head": per_head,
+		"entropy": bonus.detach(),
+		"ratio": torch.ones((), device=probs.device),
+		"approx_kl": (((cross - own) * searched).sum() / count).detach(),
+		"clip_fraction": torch.zeros((), device=probs.device),
 	}

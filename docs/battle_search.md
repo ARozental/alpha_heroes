@@ -1,6 +1,6 @@
 # Battle search (MCTS): how to try moves and take them back
 
-Status: stages 1-3 done and tested (see "Results" and "Stage 3"); stage 4 (training from search) to do. Written 2026-10-23.
+Status: stages 1-4 done and tested (see "Results", "Stage 3" and "Stage 4"). Written 2026-10-23.
 
 ## What search needs
 
@@ -129,7 +129,7 @@ The original sketch follows.
 1. **`IBattleServer` refactor.** No behaviour change; the regression test is identical records. DONE.
 2. **`BattleSimulation`** (a copy of the game state, the server's rules, the copy's own dice), checked against the real game. DONE.
 3. **Search in C++, next to the model**, with a readable Python copy checked against it. DONE (below).
-4. **AlphaZero-style training** from search targets: the record must then carry the search's improved policy.
+4. **AlphaZero-style training** from search targets: the record carries the search's improved policy. DONE (below).
 
 ## Stage 3: the search (2026-10-23)
 
@@ -151,3 +151,14 @@ The original sketch follows.
 - **Cost (with two training runs loading the CPU):** 16 simulations ~130 ms a decision: copies ~70 ms (4 ms each),
   network ~40 ms (17 calls), encoding ~7 ms, actions ~2 ms. The copy is the first thing to make cheaper
   (battle-only copies, TODO in `BattleSim.h`).
+
+## Stage 4: training from the search (2026-10-23)
+
+- **Target:** at every searched decision the record gets a `search` event: every legal root action and the improved
+  policy softmax(logits + sigma(completed Q)) over them (`AlphaBattleAI::searchAction`). The record's outputs stay
+  the network's own.
+- **Loss** (`losses.search_loss`, `TrainConfig.search_simulations > 0`): the policy's cross-entropy against that
+  policy, instead of PPO's; the value loss and the entropy bonus as in `ppo_loss`. A decision whose search failed
+  trains only the value. `approx_kl` is then KL(search policy || network).
+- **Play:** the training battles search every decision (`ALPHA_BATTLE_SEARCH_SIMULATIONS`); with temperature 1 the
+  root's Gumbel noise explores. Eval stays greedy without search.

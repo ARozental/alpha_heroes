@@ -25,7 +25,7 @@ double msSince(std::chrono::steady_clock::time_point start)
 
 // An action id: the type in bits 0-3, then three 20-bit fields, each value + 1 (0: not used).
 // MOVE: hex. MELEE: target unit id, hex. SHOOT: target unit id. HERO_SPELL: spell, first and second target,
-// a target being a unit id or HEX_TARGET + hex.
+// a target being a unit id or HEX_TARGET + hex. CREATURE_SPELL: spell, target.
 constexpr int64_t FIELD_BITS = 20;
 constexpr int64_t FIELD_MASK = (1 << FIELD_BITS) - 1;
 constexpr int HEX_TARGET = 1 << 18;
@@ -68,6 +68,7 @@ ChosenAction unpack(int64_t id)
 			a.unit = field(id, 0);
 			break;
 		case ActionType::HERO_SPELL:
+		case ActionType::CREATURE_SPELL:
 			a.spell = field(id, 0);
 			target(field(id, 1), a.targetUnit, a.targetHex);
 			target(field(id, 2), a.target2Unit, a.target2Hex);
@@ -87,11 +88,16 @@ double armyValue(const CCreatureSet & army)
 	return value;
 }
 
+bool keptAfterBattle(const CStack * unit)
+{
+	return !unit->isClone() && !unit->summoned && (unit->unitSlot().validSlot() || unit->unitSlot() == SlotID::SUMMONED_SLOT_PLACEHOLDER);
+}
+
 double aliveArmyValue(const CBattleInfoCallback & battle, BattleSide side)
 {
 	double value = 0;
 	for(const auto * s : battle.battleGetAllStacks(true))
-		if(s->unitSide() == side && s->alive() && !s->isClone() && !s->summoned && s->unitSlot().validSlot())
+		if(s->unitSide() == side && s->alive() && keptAfterBattle(s))
 			value += creatureValue(s->unitType()) * s->getCount();
 	return value;
 }
@@ -117,6 +123,7 @@ int64_t BattleSearchEnv::actionId(const EncodedBattle & e, const ChosenAction & 
 		case ActionType::SHOOT:
 			return pack(a.type, unit(a.unit));
 		case ActionType::HERO_SPELL:
+		case ActionType::CREATURE_SPELL:
 		{
 			auto target = [&](int slot, int hex) { return slot >= 0 ? unit(slot) : hex >= 0 ? HEX_TARGET + hex : -1; };
 			return pack(a.type, a.spell, target(a.targetUnit, a.targetHex), target(a.target2Unit, a.target2Hex));

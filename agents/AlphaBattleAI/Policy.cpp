@@ -73,6 +73,12 @@ ChosenAction chooseAction(const OutputTensors & out, std::mt19937 & rng, float t
 			}
 			break;
 		}
+		case ActionType::CREATURE_SPELL: // its spell is the acting unit's (g_creature_spell): the caller fills it in
+			if(anyLegal(out.row(Out::logp_creature_spell_unit, 0), out.rowSize(Out::logp_creature_spell_unit)))
+				a.targetUnit = pick(Out::logp_creature_spell_unit, 0, "creature spell unit target");
+			else
+				a.targetHex = pick(Out::logp_creature_spell_hex, 0, "creature spell hex target");
+			break;
 		default:
 			break;
 	}
@@ -94,6 +100,8 @@ double logProb(const OutputTensors & out, const ChosenAction & a)
 		case ActionType::HERO_SPELL:
 			return lp + at(Out::logp_spell, 0, a.spell) + at(Out::logp_spell_unit, a.spell, a.targetUnit) + at(Out::logp_spell_hex, a.spell, a.targetHex)
 				+ (a.targetUnit >= 0 ? at(Out::logp_spell2_hex, a.targetUnit, a.target2Hex) + at(Out::logp_spell2_unit, a.targetUnit, a.target2Unit) : 0.0);
+		case ActionType::CREATURE_SPELL:
+			return lp + at(Out::logp_creature_spell_unit, 0, a.targetUnit) + at(Out::logp_creature_spell_hex, 0, a.targetHex);
 		default:
 			return lp;
 	}

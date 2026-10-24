@@ -90,6 +90,7 @@ class AlphaBattleAI : public CBattleGameInterface
 	int recordedDecisions = 0;
 	void recordEvent(const std::string & json);
 	std::string aliveArmies(const BattleID & battleID) const;
+	std::string summonedArmies(const BattleID & battleID) const;
 	int ourMana(const BattleID & battleID) const;
 	int enemyMana(const BattleID & battleID) const; // the enemy hero's spell points, as a player sees them in battle
 
@@ -125,6 +126,9 @@ class AlphaBattleAI : public CBattleGameInterface
 	int searchConsidered = 16;
 	AlphaReward::BattleEnd battleStartValues; // armies and mana at the start of the battle, as the reward counts them
 	double surrenderCostPaid = 0;
+	/// The last search's root actions and improved policy (JSON fields), recorded with its decision for training
+	/// toward the search's policy (battle_model/data.py: the "search" event)
+	std::string searchTarget;
 	/// The searched action in the slots of encoded, or nothing if the search failed
 	std::optional<ChosenAction> searchAction(const BattleID & battleID, const EncodedBattle & encoded, const AlphaSchema::OutputTensors & outputs);
 

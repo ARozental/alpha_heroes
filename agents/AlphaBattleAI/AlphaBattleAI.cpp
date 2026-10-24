@@ -24,6 +24,7 @@
 #include "lib/mapObjects/army/CStackInstance.h"
 
 #include <atomic>
+#include <map>
 #include <filesystem>
 #include <fstream>
 #include <chrono>
@@ -192,14 +193,27 @@ void AlphaBattleAI::recordEvent(const std::string & json)
 
 std::string AlphaBattleAI::aliveArmies(const BattleID & battleID) const
 {
-	// Army units only: summoned units and clones vanish after the battle and are worth nothing
+	// Units kept after the battle only (keptAfterBattle): summoned units and clones vanish and are worth nothing
 	std::array<std::string, 2> sides = {"[", "["};
 	for(const auto * s : cb->getBattle(battleID)->battleGetAllStacks(true))
 	{
-		if(!s->alive() || s->isClone() || s->summoned || !s->unitSlot().validSlot())
+		if(!s->alive() || !keptAfterBattle(s))
 			continue;
 		auto & json = sides[static_cast<int>(s->unitSide())];
 		json += std::string(json.size() > 1 ? ", " : "") + "[" + std::to_string(s->creatureId().getNum()) + ", " + std::to_string(s->getCount()) + "]";
+	}
+	return "[" + sides[0] + "], " + sides[1] + "]]";
+}
+
+std::string AlphaBattleAI::summonedArmies(const BattleID & battleID) const
+{
+	// Units each side summoned for good (Pit Lords' demons; the engine adds the living ones to the army), with the
+	// number summoned: the battle's casualties count the ones killed again, so kept = start - casualties + these
+	std::array<std::string, 2> sides = {"[", "["};
+	for(const auto * s : cb->getBattle(battleID)->battleGetStacksIf([](const CStack * s) { return keptAfterBattle(s) && s->unitSlot() == SlotID::SUMMONED_SLOT_PLACEHOLDER; }))
+	{
+		auto & json = sides[static_cast<int>(s->unitSide())];
+		json += std::string(json.size() > 1 ? ", " : "") + "[" + std::to_string(s->creatureId().getNum()) + ", " + std::to_string(s->unitBaseAmount()) + "]";
 	}
 	return "[" + sides[0] + "], " + sides[1] + "]]";
 }
@@ -249,7 +263,7 @@ void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br
 		end.surrenderCost[static_cast<int>(cb->getBattle(battleID)->battleGetMySide())] = surrenderCostPaid;
 		char rewards[64];
 		std::snprintf(rewards, sizeof(rewards), "[%.17g, %.17g]", AlphaReward::reward(end, 0), AlphaReward::reward(end, 1));
-		recordEvent("{\"event\": \"end\", \"round\": " + std::to_string(cb->getBattle(battleID)->battleGetRound()) + ", \"winner\": " + std::to_string(static_cast<int>(br->winner)) + ", \"result\": " + std::to_string(static_cast<int>(br->result)) + ", \"casualties\": [" + casualties(BattleSide::ATTACKER) + ", " + casualties(BattleSide::DEFENDER) + "], \"alive\": " + aliveArmies(battleID) + ", \"our_mana\": " + std::to_string(ourMana(battleID)) + ", \"enemy_mana\": " + std::to_string(enemyMana(battleID)) + ", \"cpp_rewards\": " + rewards + "}");
+		recordEvent("{\"event\": \"end\", \"round\": " + std::to_string(cb->getBattle(battleID)->battleGetRound()) + ", \"winner\": " + std::to_string(static_cast<int>(br->winner)) + ", \"result\": " + std::to_string(static_cast<int>(br->result)) + ", \"casualties\": [" + casualties(BattleSide::ATTACKER) + ", " + casualties(BattleSide::DEFENDER) + "], \"alive\": " + aliveArmies(battleID) + ", \"summoned\": " + summonedArmies(battleID) + ", \"our_mana\": " + std::to_string(ourMana(battleID)) + ", \"enemy_mana\": " + std::to_string(enemyMana(battleID)) + ", \"cpp_rewards\": " + rewards + "}");
 
 		if(!recordSocket.empty())
 		{
@@ -410,7 +424,10 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 
 		const auto outputs = model->run(encoded.tensors);
 		auto action = chooseAction(outputs, rng, temperature);
-		// The record keeps the network's outputs: training on searched actions (stage 4) needs the search's policy in it
+		if(action.type == static_cast<int>(ActionType::CREATURE_SPELL))
+			action.spell = static_cast<int>(encoded.tensors.get(In::g_creature_spell));
+		// The record keeps the network's outputs, and a "search" event with the search's policy (searchTarget)
+		searchTarget.clear();
 		if(searchSimulations > 0 && prefixPlayed >= prefix.size() && faults.empty() && rejected.empty())
 			if(auto searched = searchAction(battleID, encoded, outputs))
 				action = *searched;
@@ -457,6 +474,8 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 
 		if(record)
 		{
+			if(!searchTarget.empty())
+				recordEvent("{\"event\": \"search\", \"decision\": " + std::to_string(record->size()) + ", " + searchTarget + "}");
 			record->addDecision(encoded.tensors, outputs, action);
 			if(!recordDir.empty())
 			{
@@ -503,13 +522,30 @@ std::optional<ChosenAction> AlphaBattleAI::searchAction(const BattleID & battleI
 		const auto result = search.run(static_cast<uint64_t>(rng()) << 32 | rng());
 
 		std::optional<ChosenAction> chosen; // the search's action in the slots of this decision's encoding
+		std::map<int64_t, ChosenAction> byId;
 		for(const auto & a : legalActions(encoded))
-			if(BattleSearchEnv::actionId(encoded, a) == result.action)
-				chosen = a;
+			byId[BattleSearchEnv::actionId(encoded, a)] = a;
+		if(byId.count(result.action))
+			chosen = byId.at(result.action);
 		if(!chosen)
 			throw std::runtime_error("the searched action is not legal in the real battle");
+		if(record) // the improved policy over every root action, in the slots of this decision
+		{
+			std::string actions = "[", policy = "[";
+			char probability[32];
+			for(size_t i = 0; i < result.actions.size(); ++i)
+			{
+				const auto & a = byId.at(result.actions[i]);
+				actions += std::string(i ? ", " : "") + "[" + std::to_string(a.type) + ", " + std::to_string(a.hex) + ", " + std::to_string(a.unit) + ", " + std::to_string(a.spell) + ", " + std::to_string(a.targetUnit) + ", " + std::to_string(a.targetHex) + ", " + std::to_string(a.target2Hex) + ", " + std::to_string(a.target2Unit) + "]";
+				std::snprintf(probability, sizeof(probability), "%.6g", result.policy[i]);
+				policy += std::string(i ? ", " : "") + probability;
+			}
+			searchTarget = "\"actions\": " + actions + "], \"policy\": " + policy + "]";
+		}
 		std::mt19937 noRandomness;
-		const auto networkBest = chooseAction(outputs, noRandomness, 0.0f);
+		auto networkBest = chooseAction(outputs, noRandomness, 0.0f);
+		if(networkBest.type == static_cast<int>(ActionType::CREATURE_SPELL))
+			networkBest.spell = static_cast<int>(encoded.tensors.get(In::g_creature_spell));
 		++stats.searched;
 		stats.searchChanged += BattleSearchEnv::actionId(encoded, networkBest) != result.action;
 		stats.searchEvaluations += game.evaluations;

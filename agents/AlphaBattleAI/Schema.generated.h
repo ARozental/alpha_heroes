@@ -6,8 +6,8 @@
 
 namespace AlphaSchema
 {
-constexpr int SCHEMA_VERSION = 8;
-constexpr const char * CONTRACT_HASH = "f521e29fa3a6b531";
+constexpr int SCHEMA_VERSION = 9;
+constexpr const char * CONTRACT_HASH = "4acbc39cc2620ed9";
 
 constexpr int N_HEXES = 187;
 constexpr int FIELD_WIDTH = 17;
@@ -37,7 +37,7 @@ enum class ActionType : int
 	TACTICS_END = 12,
 };
 
-constexpr std::array<ActionType, 5> RESERVED_ACTION_TYPES = {ActionType::CREATURE_SPELL, ActionType::CATAPULT, ActionType::HEAL, ActionType::TACTICS_MOVE, ActionType::TACTICS_END};
+constexpr std::array<ActionType, 4> RESERVED_ACTION_TYPES = {ActionType::CATAPULT, ActionType::HEAL, ActionType::TACTICS_MOVE, ActionType::TACTICS_END};
 
 enum class TargetKind : int
 {
@@ -83,6 +83,7 @@ enum class In : int
 	g_active_unit,
 	g_hero_can_cast,
 	g_gate_state,
+	g_creature_spell,
 	u_present,
 	u_alive,
 	u_creature,
@@ -139,6 +140,8 @@ enum class In : int
 	m_spell_hex,
 	m_spell2_hex,
 	m_spell2_unit,
+	m_creature_spell_unit,
+	m_creature_spell_hex,
 	COUNT
 };
 
@@ -150,6 +153,7 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"g_active_unit", DType::INT64, 0, {0, 0}, 0},
 	TensorSpec{"g_hero_can_cast", DType::INT64, 0, {0, 0}, 0},
 	TensorSpec{"g_gate_state", DType::INT64, 0, {0, 0}, 0},
+	TensorSpec{"g_creature_spell", DType::INT64, 0, {0, 0}, -1},
 	TensorSpec{"u_present", DType::INT64, 1, {20, 0}, 0},
 	TensorSpec{"u_alive", DType::INT64, 1, {20, 0}, 0},
 	TensorSpec{"u_creature", DType::INT64, 1, {20, 0}, -1},
@@ -206,6 +210,8 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"m_spell_hex", DType::BOOL, 2, {70, 187}, 0},
 	TensorSpec{"m_spell2_hex", DType::BOOL, 2, {20, 187}, 0},
 	TensorSpec{"m_spell2_unit", DType::BOOL, 2, {20, 20}, 0},
+	TensorSpec{"m_creature_spell_unit", DType::BOOL, 1, {20, 0}, 0},
+	TensorSpec{"m_creature_spell_hex", DType::BOOL, 1, {187, 0}, 0},
 }};
 
 enum class Out : int
@@ -220,6 +226,8 @@ enum class Out : int
 	logp_spell_hex,
 	logp_spell2_hex,
 	logp_spell2_unit,
+	logp_creature_spell_unit,
+	logp_creature_spell_hex,
 	value,
 	COUNT
 };
@@ -235,6 +243,8 @@ constexpr std::array<TensorSpec, static_cast<int>(Out::COUNT)> OUTPUTS = {{
 	TensorSpec{"logp_spell_hex", DType::FLOAT32, 2, {70, 187}, 0},
 	TensorSpec{"logp_spell2_hex", DType::FLOAT32, 2, {20, 187}, 0},
 	TensorSpec{"logp_spell2_unit", DType::FLOAT32, 2, {20, 20}, 0},
+	TensorSpec{"logp_creature_spell_unit", DType::FLOAT32, 1, {20, 0}, 0},
+	TensorSpec{"logp_creature_spell_hex", DType::FLOAT32, 1, {187, 0}, 0},
 	TensorSpec{"value", DType::FLOAT32, 1, {4, 0}, 0},
 }};
 

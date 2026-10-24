@@ -59,6 +59,7 @@ INPUTS = (
 	_i("g_active_unit", (), "index into the unit slots of the unit that acts now"),
 	_i("g_hero_can_cast", (), "1 if our hero may cast a spell right now"),
 	_i("g_gate_state", (), "EGateState of the town gate, 0 (NONE) outside sieges"),
+	_i("g_creature_spell", (), "the spell the acting unit can cast now (CREATURE_SPELL), -1 if none, or for a Master Genie, whose spell the engine draws when it casts", fill=-1),
 	# Units, one slot each, ordered by VCMI unit id; unused slots have u_present = 0
 	_i("u_present", (U,), "1 if the slot holds a unit"),
 	_i("u_alive", (U,), "1 if alive (dead stacks are kept: resurrection can target them)"),
@@ -119,11 +120,14 @@ INPUTS = (
 	_m("m_spell_hex", (S, H), "HERO_SPELL: legal hex first targets per spell"),
 	_m("m_spell2_hex", (U, H), "HERO_SPELL (Teleport): legal destination hex per first-target unit"),
 	_m("m_spell2_unit", (U, U), "HERO_SPELL (Sacrifice): legal second unit per first-target unit"),
+	_m("m_creature_spell_unit", (U,), "CREATURE_SPELL: legal unit targets"),
+	_m("m_creature_spell_hex", (H,), "CREATURE_SPELL: legal hex targets"),
 )
 
 # Every output is float32 masked log-probabilities, conditional on the previous choices:
 #   type -> MOVE: hex | MELEE: target -> from hex | SHOOT: target
 #        -> HERO_SPELL: spell -> first target (unit | hex | none) -> second target (Teleport, Sacrifice)
+#        -> CREATURE_SPELL: target (unit | hex)
 OUTPUTS = (
 	TensorSpec("logp_type", "float32", (T,), 0, "log p(action type)"),
 	TensorSpec("logp_move_hex", "float32", (H,), 0, "log p(hex | MOVE)"),
@@ -135,6 +139,8 @@ OUTPUTS = (
 	TensorSpec("logp_spell_hex", "float32", (S, H), 0, "log p(hex target | spell)"),
 	TensorSpec("logp_spell2_hex", "float32", (U, H), 0, "log p(second hex | first unit)  (Teleport)"),
 	TensorSpec("logp_spell2_unit", "float32", (U, U), 0, "log p(second unit | first unit)  (Sacrifice)"),
+	TensorSpec("logp_creature_spell_unit", "float32", (U,), 0, "log p(unit target | CREATURE_SPELL)"),
+	TensorSpec("logp_creature_spell_hex", "float32", (H,), 0, "log p(hex target | CREATURE_SPELL)"),
 	TensorSpec("value", "float32", (N_VALUE_HORIZONS + 1,), 0, "expected reward formula at the end of this round, the next round, ... (N_VALUE_HORIZONS of them), then at the end of the battle; each in -1..1 (reward.to_scale)"),
 )
 
@@ -231,6 +237,12 @@ def random_inputs(batch=1, seed=0, n_units=14):
 				else:
 					x["m_spell2_unit"][b, u] = pick(U, 0.3) & (x["u_present"][b] == 1)
 		x["m_spell"][b] = spells
+		if rng.random() < 0.3:  # the acting unit casts a spell, on units or on hexes
+			x["g_creature_spell"][b] = rng.integers(-1, EFFECT_VOCAB)
+			if rng.random() < 0.7:
+				x["m_creature_spell_unit"][b] = pick(U, 0.3) & (x["u_present"][b] == 1)
+			else:
+				x["m_creature_spell_hex"][b] = pick(H, 0.3)
 		finalize_masks(x, b)
 	return x
 
@@ -261,3 +273,5 @@ def finalize_masks(x, b):
 	t[ActionType.MELEE] = x["m_melee_target"][b].any()
 	t[ActionType.SHOOT] = x["m_shoot_target"][b].any()
 	t[ActionType.HERO_SPELL] = bool(x["g_hero_can_cast"][b]) and x["m_spell"][b].any()
+	# Creature spells without a target are not offered (the core game has none)
+	t[ActionType.CREATURE_SPELL] = x["m_creature_spell_unit"][b].any() or x["m_creature_spell_hex"][b].any()

@@ -24,6 +24,16 @@ def test_win_counts_survivors_and_enemy_losses():
 	assert s.rounds == 3 and abs(s.mana_used_fraction - 0.4) < 1e-9
 
 
+def test_demons_summoned_for_good_are_kept():
+	"""Pit Lords turn our 4 dead Pikemen into 2 demons (id 55), one of which dies again: the engine's casualties count
+	the 4 Pikemen and the dead demon, the end event the 2 summoned; we keep the army but the Pikemen, plus one demon.
+	The enemy's own summons offset its losses the same way."""
+	end = {"round": 3, "winner": 0, "result": RESULT_NORMAL, "casualties": [[[0, 4], [55, 1]], [[42, 20], [55, 1]]], "alive": [[], []], "summoned": [[[55, 2]], [[55, 1]]]}
+	s = summarize(events(0, end))
+	assert abs(s.own_kept - (army_value(OURS) - army_value([[0, 4]]) + army_value([[55, 1]]))) < 1e-9
+	assert abs(s.enemy_lost - army_value(THEIRS)) < 1e-9
+
+
 def test_our_retreat_and_surrender():
 	retreat = summarize(events(1, {"round": 2, "winner": 0, "result": RESULT_ESCAPE, "casualties": [[], [[0, 1]]], "alive": [[], []]}))
 	assert retreat.outcome == Outcome.RETREAT and retreat.own_kept == 0  # level-1 hero: worth nothing

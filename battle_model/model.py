@@ -23,7 +23,8 @@ How a choice is scored (ActionHeads): its logit is the sum of
   - biases (priors.py, files in priors/): the type head's, each spell's, and each spell's by our hero's mastery of its
     school;
   - the value of its best follow-up: the largest logit among the legal choices it leads to (a type gets its best
-    target's or hex's, a melee target its best hex's, a spell its best target's). So an attack the rules like lifts its
+    target's or hex's, a melee target its best hex's, a spell its best target's; a creature spell, cast by the acting
+    unit, its best target's, by a pointer from the spell's own query). So an attack the rules like lifts its
     type, not just itself, and many poor options (most hexes are threatened) do not sink a type with one good one, as
     an average would (the first version averaged, log-mean-exp, and the untrained model stopped moving). With all
     follow-ups equal it adds nothing, so the untrained types keep the type head's starting odds.
@@ -230,8 +231,8 @@ class Trunk(nn.Module):
 class ActionHeads(nn.Module):
 	"""Every choice's logit: pointer score + rule score + the value of its follow-ups (see the top of this file)."""
 
-	POINTERS = ("move", "melee", "melee_from", "shoot", "spell", "spell2")
-	KEYS = ("move_hex", "melee_unit", "melee_from_unit", "melee_from_hex", "shoot_unit", "spell_unit", "spell_hex", "spell2_from_unit", "spell2_hex", "spell2_unit")
+	POINTERS = ("move", "melee", "melee_from", "shoot", "spell", "spell2", "creature_spell")
+	KEYS = ("move_hex", "melee_unit", "melee_from_unit", "melee_from_hex", "shoot_unit", "spell_unit", "spell_hex", "spell2_from_unit", "spell2_hex", "spell2_unit", "creature_spell_unit", "creature_spell_hex")
 
 	def __init__(self, dim):
 		super().__init__()
@@ -239,6 +240,7 @@ class ActionHeads(nn.Module):
 		self.type_rules = nn.Linear(len(F.TYPE_FEATURES), N_ACTION_TYPES, bias=False)
 		self.spell_head = nn.Linear(dim, N_SPELLS)
 		self.spell_query = small_embedding(N_SPELLS, dim)
+		self.creature_spell_query = small_embedding(EFFECT_VOCAB + 1, dim)  # by the acting unit's spell (g_creature_spell)
 		self.queries = nn.ModuleDict({name: nn.Linear(dim, dim) for name in self.POINTERS})
 		self.keys = nn.ModuleDict({name: nn.Linear(dim, dim) for name in self.KEYS})
 		names = {"melee_target": F.ATTACK_FEATURES, "melee_from": F.FROM_FEATURES, "shoot_target": F.SHOT_FEATURES, "move": F.MOVE_FEATURES}
@@ -261,6 +263,7 @@ class ActionHeads(nn.Module):
 			self.spell_head.weight.zero_()
 			self.spell_head.bias.copy_(priors.spells())
 			self.spell_query.weight.zero_()
+			self.creature_spell_query.weight.zero_()
 
 	def mastery_bias(self, x):
 		"""[B, N_SPELLS]: each spell's bias for our hero's mastery of its school (the best of its schools: none, basic,
@@ -295,8 +298,13 @@ class ActionHeads(nn.Module):
 		first_targets = torch.cat([spell_unit, spell_hex], dim=-1)
 		spell = self.spell_head(context) + self.mastery_bias(x) + best_of(first_targets, torch.cat([x["m_spell_unit"], x["m_spell_hex"]], dim=-1))
 
+		creature_q = q["creature_spell"] + self.creature_spell_query(vocab_index(x["g_creature_spell"], EFFECT_VOCAB))
+		creature_unit = point(creature_q, units, "creature_spell_unit")
+		creature_hex = point(creature_q, hexes, "creature_spell_hex")
+		creature_targets = (torch.cat([creature_unit, creature_hex], dim=-1), torch.cat([x["m_creature_spell_unit"], x["m_creature_spell_hex"]], dim=-1))
+
 		follow = torch.zeros_like(self.type_head(context))
-		for action, logits, legal in ((ActionType.MOVE, move, x["m_move_hex"]), (ActionType.MELEE, melee_target, x["m_melee_target"]), (ActionType.SHOOT, shoot_target, x["m_shoot_target"]), (ActionType.HERO_SPELL, spell, x["m_spell"])):
+		for action, logits, legal in ((ActionType.MOVE, move, x["m_move_hex"]), (ActionType.MELEE, melee_target, x["m_melee_target"]), (ActionType.SHOOT, shoot_target, x["m_shoot_target"]), (ActionType.HERO_SPELL, spell, x["m_spell"]), (ActionType.CREATURE_SPELL, *creature_targets)):
 			follow = follow + best_of(logits, legal)[:, None] * self.type_one_hot[action]
 		kind = self.type_head(context) + self.type_rules(actions["type"]) + follow
 		return {
@@ -310,6 +318,8 @@ class ActionHeads(nn.Module):
 			"logp_spell_hex": masked_log_softmax(spell_hex, x["m_spell_hex"]),
 			"logp_spell2_hex": masked_log_softmax(spell2_hex, x["m_spell2_hex"]),
 			"logp_spell2_unit": masked_log_softmax(spell2_unit, x["m_spell2_unit"]),
+			"logp_creature_spell_unit": masked_log_softmax(creature_unit, x["m_creature_spell_unit"]),
+			"logp_creature_spell_hex": masked_log_softmax(creature_hex, x["m_creature_spell_hex"]),
 		}
 
 

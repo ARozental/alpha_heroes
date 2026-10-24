@@ -204,6 +204,8 @@ class StupidAI(nn.Module):
 			"logp_spell_hex": uniform("m_spell_hex"),
 			"logp_spell2_hex": uniform("m_spell2_hex"),
 			"logp_spell2_unit": uniform("m_spell2_unit"),
+			"logp_creature_spell_unit": uniform("m_creature_spell_unit"),
+			"logp_creature_spell_hex": uniform("m_creature_spell_hex"),
 			"value": torch.zeros(1, N_VALUE_HORIZONS + 1, device=kind.device) * kind[:, None],  # [B, heads], no notion of value
 		}
 

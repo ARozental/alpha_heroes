@@ -43,7 +43,7 @@ def test_output_shapes(model):
 def test_illegal_entries_are_neg_inf_and_rows_normalised(model):
 	x = random_inputs(batch=2, seed=7)
 	out = run(model, x)
-	pairs = [("logp_type", "m_type"), ("logp_move_hex", "m_move_hex"), ("logp_melee_target", "m_melee_target"), ("logp_melee_from", "m_melee_from"), ("logp_shoot_target", "m_shoot_target"), ("logp_spell", "m_spell"), ("logp_spell_unit", "m_spell_unit"), ("logp_spell_hex", "m_spell_hex"), ("logp_spell2_hex", "m_spell2_hex"), ("logp_spell2_unit", "m_spell2_unit")]
+	pairs = [("logp_type", "m_type"), ("logp_move_hex", "m_move_hex"), ("logp_melee_target", "m_melee_target"), ("logp_melee_from", "m_melee_from"), ("logp_shoot_target", "m_shoot_target"), ("logp_spell", "m_spell"), ("logp_spell_unit", "m_spell_unit"), ("logp_spell_hex", "m_spell_hex"), ("logp_spell2_hex", "m_spell2_hex"), ("logp_spell2_unit", "m_spell2_unit"), ("logp_creature_spell_unit", "m_creature_spell_unit"), ("logp_creature_spell_hex", "m_creature_spell_hex")]
 	for logp_name, mask_name in pairs:
 		logp, mask = out[logp_name].numpy(), x[mask_name]
 		assert np.isneginf(logp[~mask]).all(), logp_name
@@ -75,6 +75,36 @@ def _batched(out, actions):
 	n = len(actions)
 	rep = {k: v.expand((n,) + v.shape[1:]) for k, v in out.items()}
 	return log_prob(rep, stack_actions(actions))
+
+
+SUMMON_DEMONS = 102  # past the hero spells' ids (N_SPELLS)
+
+
+@pytest.mark.parametrize("on_hexes", (False, True))
+def test_creature_spells_are_full_actions(model, on_hexes):
+	"""CREATURE_SPELL and its targets (units or hexes) sum to one with every other action, the entropy stays exact,
+	and samples are legal; the spell is the acting unit's, so it only informs."""
+	x = small_masks(2)
+	x["g_creature_spell"][0] = SUMMON_DEMONS
+	x["m_creature_spell_unit"][0] = False
+	x["m_creature_spell_hex"][0] = False
+	if on_hexes:
+		x["m_creature_spell_hex"][0, [20, 40, 60]] = True
+	else:
+		x["m_creature_spell_unit"][0, [1, 3]] = True
+	finalize_masks(x, 0)
+	assert x["m_type"][0, ActionType.CREATURE_SPELL]
+	out = run(model, x)
+	actions = enumerate_actions(x)
+	casts = [a for a in actions if a["type"] == ActionType.CREATURE_SPELL]
+	assert len(casts) == (3 if on_hexes else 2) and all(a["spell"] == SUMMON_DEMONS for a in casts)
+	lp = _batched(out, actions)
+	assert np.isclose(float(lp.exp().sum()), 1.0, atol=1e-4)
+	assert np.isclose(float(entropy(out)[0]), float(-(lp.exp() * lp).sum()), atol=1e-4)
+	rng = np.random.default_rng(0)
+	samples = [sample(out, rng=rng) for _ in range(300)]
+	assert all(is_legal(a, x) for a in samples)
+	assert any(a["type"] == ActionType.CREATURE_SPELL for a in samples)
 
 
 def test_samples_are_legal_and_match_log_prob(model):

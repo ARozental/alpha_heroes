@@ -3,6 +3,8 @@
 An action is a dict of int64 tensors [B], -1 where a field does not apply:
 	type, hex (MOVE destination / MELEE from-hex), unit (MELEE / SHOOT target),
 	spell, target_unit / target_hex (spell first target), target2_hex / target2_unit (second target).
+A creature spell (CREATURE_SPELL) uses target_unit / target_hex; its spell is the acting unit's (g_creature_spell), not
+a choice, so its spell field only informs.
 
 log p(action) = log p(type) + log p(arguments | type), each argument conditional on the previous ones.
 sample() is the reference for the C++ sampler in agents/AlphaBattleAI.
@@ -20,38 +22,36 @@ for _spell, _kind in SECOND_TARGET_KIND.items():
 	_SECOND_KIND[_spell] = int(_kind)
 
 
-def _take(table, index):
-	"""table[b, index[b]] for a [B, N] table; index -1 gives 0 (field unused)."""
-	picked = table.gather(1, index.clamp(min=0).unsqueeze(1)).squeeze(1)
-	return torch.where(index >= 0, picked, torch.zeros_like(picked))
-
-
-def _row(table, index):
-	"""table[b, index[b], :] for a [B, N, M] table."""
-	return table[torch.arange(table.shape[0], device=table.device), index.clamp(min=0)]
-
-
 def log_prob(out, action):
-	"""log p(action) for a batch, shape [B]."""
+	"""log p(action) for a batch, one action per row, shape [B]."""
+	return log_prob_at(out, torch.arange(action["type"].shape[0], device=action["type"].device), action)
+
+
+def log_prob_at(out, rows, action):
+	"""log p(action) of actions [P] (dict of int64 tensors), each under the outputs of its batch row rows[p]; [P].
+
+	Gathers straight from the outputs, so scoring many actions of one decision (a search's policy) copies nothing.
+	"""
+	def at(name, *index):
+		"""out[name][rows, index...], 0 where an index is -1 (the field is not used)."""
+		used = torch.ones_like(rows, dtype=torch.bool)
+		for i in index:
+			used = used & (i >= 0)
+		return torch.where(used, out[name][(rows, *(i.clamp(min=0) for i in index))], torch.zeros_like(rows, dtype=out[name].dtype))
+
 	t = action["type"]
-	lp = _take(out["logp_type"], t)
-	is_move = t == ActionType.MOVE
-	is_melee = t == ActionType.MELEE
-	is_shoot = t == ActionType.SHOOT
-	is_spell = t == ActionType.HERO_SPELL
-
-	lp = lp + torch.where(is_move, _take(out["logp_move_hex"], action["hex"]), 0.0)
-	melee = _take(out["logp_melee_target"], action["unit"]) + _take(_row(out["logp_melee_from"], action["unit"]), action["hex"])
-	lp = lp + torch.where(is_melee, melee, 0.0)
-	lp = lp + torch.where(is_shoot, _take(out["logp_shoot_target"], action["unit"]), 0.0)
-
-	spell = action["spell"]
-	spell_lp = _take(out["logp_spell"], spell)
-	spell_lp = spell_lp + _take(_row(out["logp_spell_unit"], spell), action["target_unit"])
-	spell_lp = spell_lp + _take(_row(out["logp_spell_hex"], spell), action["target_hex"])
-	spell_lp = spell_lp + _take(_row(out["logp_spell2_hex"], action["target_unit"]), action["target2_hex"])
-	spell_lp = spell_lp + _take(_row(out["logp_spell2_unit"], action["target_unit"]), action["target2_unit"])
-	return lp + torch.where(is_spell, spell_lp, 0.0)
+	lp = at("logp_type", t)
+	lp = lp + torch.where(t == ActionType.MOVE, at("logp_move_hex", action["hex"]), 0.0)
+	melee = at("logp_melee_target", action["unit"]) + at("logp_melee_from", action["unit"], action["hex"])
+	lp = lp + torch.where(t == ActionType.MELEE, melee, 0.0)
+	lp = lp + torch.where(t == ActionType.SHOOT, at("logp_shoot_target", action["unit"]), 0.0)
+	unit = action["target_unit"]
+	spell = torch.where(t == ActionType.HERO_SPELL, action["spell"], -1)  # a creature spell's id can be past N_SPELLS
+	spell_lp = at("logp_spell", spell) + at("logp_spell_unit", spell, unit) + at("logp_spell_hex", spell, action["target_hex"])
+	spell_lp = spell_lp + at("logp_spell2_hex", unit, action["target2_hex"]) + at("logp_spell2_unit", unit, action["target2_unit"])
+	lp = lp + torch.where(t == ActionType.HERO_SPELL, spell_lp, 0.0)
+	creature_lp = at("logp_creature_spell_unit", unit) + at("logp_creature_spell_hex", action["target_hex"])
+	return lp + torch.where(t == ActionType.CREATURE_SPELL, creature_lp, 0.0)
 
 
 def _entropy(logp):
@@ -84,7 +84,9 @@ def entropy(out):
 	h2 = torch.where(second_kind[None, :, None] == TargetKind.HEX, h2_hex[:, None, :], torch.where(second_kind[None, :, None] == TargetKind.UNIT, h2_unit[:, None, :], 0.0))  # [B, S, U]
 	per_spell = _entropy(out["logp_spell_unit"]) + _entropy(out["logp_spell_hex"]) + _expect(out["logp_spell_unit"], h2)
 	h_spell = _entropy(out["logp_spell"]) + _expect(out["logp_spell"], per_spell)
-	return h + p_type[:, ActionType.HERO_SPELL] * h_spell
+	h = h + p_type[:, ActionType.HERO_SPELL] * h_spell
+	h_creature = _entropy(out["logp_creature_spell_unit"]) + _entropy(out["logp_creature_spell_hex"])  # one of them is empty
+	return h + p_type[:, ActionType.CREATURE_SPELL] * h_creature
 
 
 def _choose(logp, rng, greedy):
@@ -122,6 +124,11 @@ def sample(out, b=0, rng=None, greedy=False):
 				a["target2_unit"] = _choose(o["logp_spell2_unit"][u], rng, greedy)
 		elif np.isfinite(o["logp_spell_hex"][s]).any():
 			a["target_hex"] = _choose(o["logp_spell_hex"][s], rng, greedy)
+	elif t == ActionType.CREATURE_SPELL:
+		if np.isfinite(o["logp_creature_spell_unit"]).any():
+			a["target_unit"] = _choose(o["logp_creature_spell_unit"], rng, greedy)
+		else:
+			a["target_hex"] = _choose(o["logp_creature_spell_hex"], rng, greedy)
 	return a
 
 
@@ -149,6 +156,10 @@ def is_legal(action, masks, b=0):
 			return False
 		if action["target2_unit"] >= 0 and not m["m_spell2_unit"][action["target_unit"], action["target2_unit"]]:
 			return False
+	if t == ActionType.CREATURE_SPELL:
+		if action["target_unit"] >= 0:
+			return bool(m["m_creature_spell_unit"][action["target_unit"]])
+		return action["target_hex"] >= 0 and bool(m["m_creature_spell_hex"][action["target_hex"]])
 	return True
 
 
@@ -189,6 +200,10 @@ def enumerate_actions(masks, b=0):
 					actions += [{**base, "target_hex": int(h)} for h in np.flatnonzero(m["m_spell_hex"][s])]
 				else:
 					actions.append(base)
+		elif t == ActionType.CREATURE_SPELL:
+			spell = int(m["g_creature_spell"]) if "g_creature_spell" in m else -1
+			actions += [{**blank, "type": t, "spell": spell, "target_unit": int(u)} for u in np.flatnonzero(m["m_creature_spell_unit"])]
+			actions += [{**blank, "type": t, "spell": spell, "target_hex": int(h)} for h in np.flatnonzero(m["m_creature_spell_hex"])]
 		else:
 			actions.append({**blank, "type": t})
 	return actions

@@ -61,6 +61,9 @@ def mask_problems(x):
 				expect(m["m_spell2_hex"][u].any(), f"spell {s} target {u} has no second hex")
 			elif second == TargetKind.UNIT:
 				expect(m["m_spell2_unit"][u].any(), f"spell {s} target {u} has no second unit")
+	creature_units, creature_hexes = m["m_creature_spell_unit"], m["m_creature_spell_hex"]
+	expect(not (creature_units.any() and creature_hexes.any()), "creature spell has both unit and hex targets")
+	expect(t[ActionType.CREATURE_SPELL] == (creature_units.any() or creature_hexes.any()), "CREATURE_SPELL legality disagrees with its target masks")
 	active = int(x["g_active_unit"][0])
 	expect(x["u_present"][0, active] == 1, "active unit slot is empty")
 	return problems

@@ -4,6 +4,7 @@
 #include "Policy.h"
 
 #include "lib/CCreatureHandler.h"
+#include "lib/CRandomGenerator.h"
 #include "lib/CStack.h"
 #include "lib/battle/BattleAction.h"
 #include "lib/battle/CObstacleInstance.h"
@@ -246,6 +247,20 @@ void encodeUnitMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, co
 	}
 }
 
+// The engine aims a creature-targeted spell at the unit's hex and picks the unit there by the spell's own rules
+// (BattleSpellMechanics::transformSpellTarget, UnitEffect::transformTargetByRange): a slot is a legal target only if
+// the cast really affects that unit. A corpse under a living unit is then no alias for the living one (Lightning Bolt
+// would hit the living one), Resurrection and Animate Dead cannot revive a corpse any unit stands on
+// (Heal::isValidTarget), and Sacrifice can still revive one an enemy stands on but not one under our own living unit
+// (that one is picked instead).
+bool castAffects(const spells::Mechanics & mechanics, const battle::Target & target, const CStack * unit)
+{
+	if(!mechanics.canBeCastAt(target))
+		return false;
+	const auto affected = mechanics.getAffectedStacks(target);
+	return std::find(affected.begin(), affected.end(), unit) != affected.end();
+}
+
 void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, const CGHeroInstance * hero)
 {
 	auto & t = e.tensors;
@@ -281,19 +296,7 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 		}
 		else if(aims[0] == spells::AimType::CREATURE)
 		{
-			// The engine aims a creature spell at the unit's hex and picks the unit there by the spell's own
-			// rules (BattleSpellMechanics::transformSpellTarget, UnitEffect::transformTargetByRange): a slot is
-			// a legal target only if the cast really affects that unit. A corpse under a living unit is then
-			// no alias for the living one (Lightning Bolt would hit the living one), Resurrection and Animate
-			// Dead cannot revive a corpse any unit stands on (Heal::isValidTarget), and Sacrifice can still
-			// revive one an enemy stands on but not one under our own living unit (that one is picked instead).
-			auto castAffects = [&](const battle::Target & target, const CStack * unit)
-			{
-				if(!mechanics->canBeCastAt(target))
-					return false;
-				const auto affected = mechanics->getAffectedStacks(target);
-				return std::find(affected.begin(), affected.end(), unit) != affected.end();
-			};
+			auto affects = [&](const battle::Target & target, const CStack * unit) { return castAffects(*mechanics, target, unit); };
 			for(int u = 0; u < MAX_UNITS; ++u)
 			{
 				const CStack * unit = e.units[u];
@@ -302,7 +305,7 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 				const battle::Destination first(unit);
 				if(second == TargetKind::NONE)
 				{
-					if(castAffects({first}, unit))
+					if(affects({first}, unit))
 						t.set(In::m_spell_unit, s, u, 1);
 					continue;
 				}
@@ -312,7 +315,7 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 				if(second == TargetKind::HEX && aims[1] == spells::AimType::LOCATION)
 				{
 					for(int h = 0; h < N_HEXES; ++h)
-						if(castAffects({first, battle::Destination(BattleHex(h))}, unit))
+						if(affects({first, battle::Destination(BattleHex(h))}, unit))
 						{
 							t.set(In::m_spell2_hex, u, h, 1);
 							anySecond = true;
@@ -321,7 +324,7 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 				else if(second == TargetKind::UNIT && aims[1] == spells::AimType::CREATURE)
 				{
 					for(int v = 0; v < MAX_UNITS; ++v)
-						if(e.units[v] && castAffects({first, battle::Destination(e.units[v])}, unit))
+						if(e.units[v] && affects({first, battle::Destination(e.units[v])}, unit))
 						{
 							t.set(In::m_spell2_unit, u, v, 1);
 							anySecond = true;
@@ -336,6 +339,83 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 		}
 		if(t.anyInRow(In::m_spell_unit, s) || t.anyInRow(In::m_spell_hex, s))
 			t.set(In::m_spell, s, 1);
+	}
+}
+}
+
+namespace
+{
+/// The acting unit's legal targets for a spell it casts as its action (CREATURE_SPELL), at the level the server casts
+/// it (doUnitSpellAction: its SPELLCASTER value). Only spells with one unit or hex target: creature spells without a
+/// target or with two (none in the core game) are not offered. True if it has any.
+bool encodeCreatureSpellTargets(EncodedBattle & e, const CPlayerBattleCallback & battle, const CStack * active, SpellID id)
+{
+	auto & t = e.tensors;
+	const auto * spell = id.toSpell();
+	if(!spell || !spell->canBeCast(&battle, spells::Mode::CREATURE_ACTIVE, active))
+		return false;
+	spells::BattleCast cast(&battle, active, spells::Mode::CREATURE_ACTIVE, spell);
+	const auto caster = active->getBonus(Selector::typeSubtype(BonusType::SPELLCASTER, BonusSubtypeID(id)));
+	cast.setSpellLevel(caster ? caster->val : 0);
+	auto mechanics = spell->battleMechanics(&cast);
+	const auto aims = mechanics->getTargetTypes();
+	if(aims.size() != 1)
+		return false;
+	bool any = false;
+	if(aims[0] == spells::AimType::LOCATION)
+	{
+		for(int h = 0; h < N_HEXES; ++h)
+			if(mechanics->canBeCastAt({battle::Destination(BattleHex(h))}))
+			{
+				t.set(In::m_creature_spell_hex, h, 1);
+				any = true;
+			}
+	}
+	else if(aims[0] == spells::AimType::CREATURE)
+	{
+		for(int u = 0; u < MAX_UNITS; ++u)
+			if(e.units[u] && castAffects(*mechanics, {battle::Destination(e.units[u])}, e.units[u]))
+			{
+				t.set(In::m_creature_spell_unit, u, 1);
+				any = true;
+			}
+	}
+	return any;
+}
+
+/// What the acting unit can cast as its action, as the client offers it (BattleActionsController,
+/// tryActivateStackSpellcasting and actionIsLegal): its first fixed spell (SPELLCASTER without a weight) that has a
+/// legal target; else the one of its weighted spells drawn for this turn (Faerie Dragons: the client and BattleAI draw
+/// it, the server would accept any; drawn here from the round, the unit and whether it waited, so every encoding of
+/// the same turn draws the same); else, for a random caster (Master Genie), any other living unit of ours that some
+/// beneficial spell suits (the server draws the spell when it casts: g_creature_spell -1).
+void encodeCreatureSpell(EncodedBattle & e, const CPlayerBattleCallback & battle, const CStack * active, PlayerColor player)
+{
+	auto & t = e.tensors;
+	if(!active->canCast())
+		return;
+	std::vector<SpellID> spells;
+	for(const auto & bonus : *active->getBonusesOfType(BonusType::SPELLCASTER))
+		if(!bonus->parameters && bonus->subtype.as<SpellID>().hasValue())
+			spells.push_back(bonus->subtype.as<SpellID>());
+	CRandomGenerator draw(battle.battleGetRound() * 4096 + static_cast<int>(active->unitId()) * 2 + active->waitedThisTurn);
+	const auto drawn = battle.getRandomCastedSpell(draw, active);
+	if(drawn.hasValue())
+		spells.push_back(drawn);
+	for(const auto id : spells)
+		if(encodeCreatureSpellTargets(e, battle, active, id))
+		{
+			t.set(In::g_creature_spell, id.getNum());
+			return;
+		}
+	if(!active->hasBonusOfType(BonusType::RANDOM_SPELLCASTER))
+		return;
+	CRandomGenerator unused(0);
+	for(int u = 0; u < MAX_UNITS; ++u)
+	{
+		const CStack * unit = e.units[u];
+		if(unit && unit != active && unit->alive() && unit->unitOwner() == player && battle.getRandomBeneficialSpell(unused, active, unit) != SpellID::NONE)
+			t.set(In::m_creature_spell_unit, u, 1);
 	}
 }
 }
@@ -369,6 +449,7 @@ EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * 
 	encodeUnitMasks(e, battle, active, stopping);
 	if(heroCanCast)
 		encodeSpellMasks(e, battle, hero);
+	encodeCreatureSpell(e, battle, active, player);
 
 	auto type = [&](ActionType a, bool legal) { t.set(In::m_type, static_cast<int>(a), legal); };
 	type(ActionType::WAIT, !active->waitedThisTurn);
@@ -404,6 +485,7 @@ void refreshDerivedMasks(EncodedBattle & e)
 	type(ActionType::MELEE, t.any(In::m_melee_target));
 	type(ActionType::SHOOT, t.any(In::m_shoot_target));
 	type(ActionType::HERO_SPELL, t.get(In::m_type, static_cast<int>(ActionType::HERO_SPELL)) && t.any(In::m_spell));
+	type(ActionType::CREATURE_SPELL, t.any(In::m_creature_spell_unit) || t.any(In::m_creature_spell_hex));
 }
 
 void excludeAction(EncodedBattle & e, const ChosenAction & a)
@@ -430,6 +512,10 @@ void excludeAction(EncodedBattle & e, const ChosenAction & a)
 				clear(In::m_spell_hex, a.spell, a.targetHex);
 			else
 				clear(In::m_spell, a.spell);
+			break;
+		case ActionType::CREATURE_SPELL:
+			clear(In::m_creature_spell_unit, a.targetUnit);
+			clear(In::m_creature_spell_hex, a.targetHex);
 			break;
 		default:
 			if(a.type >= 0 && a.type < N_ACTION_TYPES)
@@ -468,6 +554,12 @@ bool isLegal(const EncodedBattle & e, const ChosenAction & a)
 				return in(a.target2Unit, MAX_UNITS) && t.get(In::m_spell2_unit, a.targetUnit, a.target2Unit);
 			return a.target2Hex < 0 && a.target2Unit < 0;
 		}
+		case ActionType::CREATURE_SPELL:
+			if(a.spell != t.get(In::g_creature_spell) || a.target2Hex >= 0 || a.target2Unit >= 0)
+				return false;
+			if(a.targetUnit >= 0)
+				return a.targetHex < 0 && in(a.targetUnit, MAX_UNITS) && t.get(In::m_creature_spell_unit, a.targetUnit);
+			return in(a.targetHex, N_HEXES) && t.get(In::m_creature_spell_hex, a.targetHex);
 		default:
 			return true;
 	}
@@ -562,6 +654,17 @@ std::vector<ChosenAction> legalActions(const EncodedBattle & e)
 						actions.push_back(spell);
 				}
 				break;
+			case ActionType::CREATURE_SPELL:
+			{
+				const int spell = static_cast<int>(t.get(In::g_creature_spell));
+				for(int u = 0; u < MAX_UNITS; ++u)
+					if(t.get(In::m_creature_spell_unit, u))
+						actions.push_back(ChosenAction{.type = type, .spell = spell, .targetUnit = u});
+				for(int h = 0; h < N_HEXES; ++h)
+					if(t.get(In::m_creature_spell_hex, h))
+						actions.push_back(ChosenAction{.type = type, .spell = spell, .targetHex = h});
+				break;
+			}
 			default:
 				actions.push_back(base);
 				break;
@@ -607,6 +710,22 @@ std::optional<ChosenAction> chosenAction(const EncodedBattle & e, const BattleAc
 			a.type = static_cast<int>(ActionType::SHOOT);
 			a.unit = slotOf(targets[0]);
 			return a.unit >= 0 ? std::optional(a) : std::nullopt;
+		case EActionType::MONSTER_SPELL: // another spell than the one encoded (another Faerie Dragon draw) has no model action
+			if(targets.empty() || action.spell.getNum() != e.tensors.get(In::g_creature_spell))
+				return std::nullopt;
+			a.type = static_cast<int>(ActionType::CREATURE_SPELL);
+			a.spell = action.spell.getNum();
+			if(e.tensors.any(In::m_creature_spell_unit))
+			{
+				a.targetUnit = slotOf(targets[0]);
+				// Aimed at a hex only: the legal target there, a corpse included (Resurrection)
+				for(int u = 0; u < MAX_UNITS && a.targetUnit < 0; ++u)
+					if(e.tensors.get(In::m_creature_spell_unit, u) && e.units[u]->coversPos(targets[0].hexValue))
+						a.targetUnit = u;
+			}
+			else
+				a.targetHex = targets[0].hexValue.toInt();
+			return isLegal(e, a) ? std::optional(a) : std::nullopt;
 		default:
 			return std::nullopt;
 	}
@@ -656,6 +775,15 @@ BattleAction engineAction(BattleSide side, const CStack * active, const ChosenAc
 			cast.stackNumber = -1;
 			cast.setTarget(destinations);
 			return cast;
+		}
+		case ActionType::CREATURE_SPELL: // spell -1: a random caster's, which the server draws
+		{
+			battle::Target destinations;
+			if(a.targetUnit >= 0)
+				destinations.emplace_back(target(a.targetUnit));
+			else
+				destinations.emplace_back(BattleHex(a.targetHex));
+			return BattleAction::makeCreatureSpellcast(active, destinations, SpellID(a.spell));
 		}
 		default:
 			throw std::runtime_error("model chose action type " + std::to_string(a.type) + ", which is not supported");

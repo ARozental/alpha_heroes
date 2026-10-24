@@ -1,4 +1,4 @@
-"""Training loop: play battles against a fixed opponent, learn from them with PPO, repeat.
+"""Training loop: play battles against a fixed opponent, learn from them with PPO (or from a search, search_simulations), repeat.
 
 	.venv/bin/python -m battle_model.train [--epochs N] [--run NAME] [--resume] [--set games_per_side=8 ppo.entropy_weight=0.02 ...]
 	.venv/bin/python -m battle_model.train --follow NAME   # mirror a running run's progress.csv into TensorBoard
@@ -57,7 +57,7 @@ from torch.utils.tensorboard import SummaryWriter
 from . import play
 from .data import collate, credit_check, make_dataloader, summarize
 from .export import export
-from .losses import AdvantageConfig, PPOConfig, ppo_loss
+from .losses import AdvantageConfig, PPOConfig, ppo_loss, search_loss
 from .constants import ActionType
 from .model import build_model
 from .trace import trace
@@ -93,6 +93,9 @@ class TrainConfig:
 	# Play the next epoch's battles while this epoch trains (Producer): the battles are then one update older than the
 	# model they train, which PPO handles (each record holds the probabilities of the model that played it)
 	prefetch: bool = True
+	# > 0: the training battles search every decision with this many simulations (Gumbel AlphaZero, C++) and the
+	# policy learns the search's improved policy (losses.search_loss) instead of PPO's; eval stays greedy, no search
+	search_simulations: int = 0
 	model_architecture: str = "v2"  # "v2": model.BattleModel (rules and features); "v1": model_v1.BattleModelV1
 	model_dim: int = 64
 	model_layers: int = 2
@@ -135,7 +138,7 @@ def run_dir(config, new=False):
 
 
 # Action types whose share of each side's decisions is logged every epoch (actions_<side>/<type> in TensorBoard)
-ACTION_KINDS = ("WAIT", "DEFEND", "MOVE", "MELEE", "SHOOT", "HERO_SPELL", "RETREAT", "SURRENDER")
+ACTION_KINDS = ("WAIT", "DEFEND", "MOVE", "MELEE", "SHOOT", "HERO_SPELL", "CREATURE_SPELL", "RETREAT", "SURRENDER")
 
 
 COLUMNS = [
@@ -454,16 +457,18 @@ def train(config, resume=False):
 
 	if config.eval_every and first_epoch == 1:
 		evaluate_now(0)  # the untrained model
+	settings = (("ALPHA_BATTLE_SEARCH_SIMULATIONS", str(config.search_simulations)),) if config.search_simulations > 0 else ()
+
 	def epoch_games(epoch):
 		seeds = random.Random(epoch)
 		seed_for = lambda side: seeds.randrange(1, 2**31) if config.random_seeds else config.game_seeds[side]
 		if config.opponent == play.SELF_PLAY:  # each battle records both sides: half the battles with each side's seed
 			return [
-				play.Game(config.scenario, our_side=0, opponent=play.SELF_PLAY, game_seed=seed_for(g % 2), sampler_seed=2 * epoch * config.games_per_side + g, ai=config.ai, map=battle_map)
+				play.Game(config.scenario, our_side=0, opponent=play.SELF_PLAY, game_seed=seed_for(g % 2), sampler_seed=2 * epoch * config.games_per_side + g, ai=config.ai, map=battle_map, settings=settings)
 				for g in range(config.games_per_side)
 			]
 		return [
-			play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=seed_for(side), sampler_seed=(2 * epoch + side) * config.games_per_side + g, ai=config.ai, map=battle_map)
+			play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=seed_for(side), sampler_seed=(2 * epoch + side) * config.games_per_side + g, ai=config.ai, map=battle_map, settings=settings)
 			for side in (0, 1)
 			for g in range(config.games_per_side)
 		]
@@ -503,7 +508,10 @@ def train(config, resume=False):
 			for first in range(0, len(examples), config.batch_size):
 				batch = select(epoch_data, order[first : first + config.batch_size])
 				out_batch = model(batch["inputs"], batch["facts"]) if "facts" in batch else model(batch["inputs"])
-				loss, parts = ppo_loss(out_batch, batch["action"], batch["old_log_prob"], batch["advantage"], batch["value_labels"], ppo_config)
+				if config.search_simulations > 0 and "search" in batch:
+					loss, parts = search_loss(out_batch, batch["search"], batch["value_labels"], ppo_config)
+				else:
+					loss, parts = ppo_loss(out_batch, batch["action"], batch["old_log_prob"], batch["advantage"], batch["value_labels"], ppo_config)
 				optimizer.zero_grad()
 				loss.backward()
 				torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)

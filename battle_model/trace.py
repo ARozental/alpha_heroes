@@ -30,6 +30,10 @@ def describe_action(x, action):
 	if kind == "HERO_SPELL":
 		target = unit(action["target_unit"]) if action["target_unit"] >= 0 else (f"hex {action['target_hex']}" if action["target_hex"] >= 0 else "-")
 		return f"SPELL {vocab.name('spells', action['spell'])} on {target}"
+	if kind == "CREATURE_SPELL":
+		target = unit(action["target_unit"]) if action["target_unit"] >= 0 else f"hex {action['target_hex']}"
+		spell = vocab.name("spells", action["spell"]) if action["spell"] >= 0 else "random spell"
+		return f"CAST {spell} on {target}"
 	return kind
 
 

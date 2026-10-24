@@ -9,7 +9,7 @@ Bump SCHEMA_VERSION on any change to sizes, enums, input or output definitions.
 """
 from enum import IntEnum
 
-SCHEMA_VERSION = 8  # 8: 20 unit slots (10 per side) instead of 40
+SCHEMA_VERSION = 9  # 8: 20 unit slots (10 per side) instead of 40; 9: CREATURE_SPELL (g_creature_spell, its masks and outputs)
 
 # Battlefield: VCMI BattleHex indices 0..186 are used as-is (17 columns x 11 rows,
 # columns 0 and 16 are the unplayable side columns). No remapping on the C++ side.
@@ -64,9 +64,9 @@ class ActionType(IntEnum):
 	HERO_SPELL = 5  # + spell, + first target (unit / hex / none), + second target for two-target spells
 	RETREAT = 6
 	SURRENDER = 7
+	CREATURE_SPELL = 8  # the acting unit casts its spell (g_creature_spell): + target unit / hex
 	# Reserved: part of the contract so models stay compatible when they get enabled.
 	# The C++ side always masks them out for now (war machines and tactics are scripted).
-	CREATURE_SPELL = 8
 	CATAPULT = 9
 	HEAL = 10
 	TACTICS_MOVE = 11
@@ -75,7 +75,6 @@ class ActionType(IntEnum):
 
 N_ACTION_TYPES = len(ActionType)
 RESERVED_ACTION_TYPES = (
-	ActionType.CREATURE_SPELL,
 	ActionType.CATAPULT,
 	ActionType.HEAL,
 	ActionType.TACTICS_MOVE,

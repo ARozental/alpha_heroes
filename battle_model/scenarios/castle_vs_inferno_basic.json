@@ -1,0 +1,118 @@
+{
+	"name": "castle_vs_inferno_basic",
+	"_about": "One week of basic (non-upgraded) creatures each; the default scenario until 2026-10-23, primary skills 5/5/5/5, no secondary skills, no war machines, the same 10 spells (drawn once from the level 1-3 combat spells with random.Random(7)). Heroes with non-combat specialties (Caitlin: gold, Calid: sulfur). sides[0] attacks from the left, sides[1] defends on the right.",
+	"terrain": "grass",
+	"seed": 1,
+	"sides": [
+		{
+			"faction": "castle",
+			"hero": "caitlin",
+			"primary_skills": [
+				5,
+				5,
+				5,
+				5
+			],
+			"secondary_skills": [],
+			"army": [
+				[
+					"pikeman",
+					14
+				],
+				[
+					"archer",
+					9
+				],
+				[
+					"griffin",
+					7
+				],
+				[
+					"swordsman",
+					4
+				],
+				[
+					"monk",
+					3
+				],
+				[
+					"cavalier",
+					2
+				],
+				[
+					"angel",
+					1
+				]
+			],
+			"spellbook": true,
+			"spells": [
+				"bless",
+				"blind",
+				"cure",
+				"destroyUndead",
+				"forgetfulness",
+				"hypnotize",
+				"lightningBolt",
+				"mirth",
+				"protectEarth",
+				"slow"
+			],
+			"war_machines": false
+		},
+		{
+			"faction": "inferno",
+			"hero": "calid",
+			"primary_skills": [
+				5,
+				5,
+				5,
+				5
+			],
+			"secondary_skills": [],
+			"army": [
+				[
+					"imp",
+					15
+				],
+				[
+					"gog",
+					8
+				],
+				[
+					"hellHound",
+					5
+				],
+				[
+					"demon",
+					4
+				],
+				[
+					"pitFiend",
+					3
+				],
+				[
+					"efreet",
+					2
+				],
+				[
+					"devil",
+					1
+				]
+			],
+			"spellbook": true,
+			"spells": [
+				"bless",
+				"blind",
+				"cure",
+				"destroyUndead",
+				"forgetfulness",
+				"hypnotize",
+				"lightningBolt",
+				"mirth",
+				"protectEarth",
+				"slow"
+			],
+			"war_machines": false
+		}
+	]
+}

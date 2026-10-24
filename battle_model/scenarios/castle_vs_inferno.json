@@ -1,6 +1,6 @@
 {
 	"name": "castle_vs_inferno",
-	"_about": "One week of basic creatures each, primary skills 5/5/5/5, no secondary skills, no war machines, the same 10 spells (drawn once from the level 1-3 combat spells with random.Random(7)). Heroes with non-combat specialties (Caitlin: gold, Calid: sulfur). sides[0] attacks from the left, sides[1] defends on the right.",
+	"_about": "One week of upgraded creatures each (the basic version: castle_vs_inferno_basic.json), primary skills 5/5/5/5, no secondary skills, no war machines, the same 10 spells (drawn once from the level 1-3 combat spells with random.Random(7)). Heroes with non-combat specialties (Caitlin: gold, Calid: sulfur). sides[0] attacks from the left, sides[1] defends on the right. Archangels can resurrect and Pit Lords raise demons (creature spells: CREATURE_SPELL); Cerberi attack three hexes, Magogs' shots hit an area.",
 	"terrain": "grass",
 	"seed": 1,
 	"sides": [
@@ -16,31 +16,31 @@
 			"secondary_skills": [],
 			"army": [
 				[
-					"pikeman",
+					"halberdier",
 					14
 				],
 				[
-					"archer",
+					"marksman",
 					9
 				],
 				[
-					"griffin",
+					"royalGriffin",
 					7
 				],
 				[
-					"swordsman",
+					"crusader",
 					4
 				],
 				[
-					"monk",
+					"zealot",
 					3
 				],
 				[
-					"cavalier",
+					"champion",
 					2
 				],
 				[
-					"angel",
+					"archangel",
 					1
 				]
 			],
@@ -71,31 +71,31 @@
 			"secondary_skills": [],
 			"army": [
 				[
-					"imp",
+					"familiar",
 					15
 				],
 				[
-					"gog",
+					"magog",
 					8
 				],
 				[
-					"hellHound",
+					"cerberus",
 					5
 				],
 				[
-					"demon",
+					"hornedDemon",
 					4
 				],
 				[
-					"pitFiend",
+					"pitLord",
 					3
 				],
 				[
-					"efreet",
+					"efreetSultan",
 					2
 				],
 				[
-					"devil",
+					"archDevil",
 					1
 				]
 			],

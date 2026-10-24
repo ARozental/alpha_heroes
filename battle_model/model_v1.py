@@ -297,6 +297,9 @@ class BattleModelV1(nn.Module):
 			"logp_spell_hex": masked_log_softmax(spell_hex, x["m_spell_hex"]),
 			"logp_spell2_hex": masked_log_softmax(spell2_hex, x["m_spell2_hex"]),
 			"logp_spell2_unit": masked_log_softmax(spell2_unit, x["m_spell2_unit"]),
+			# (from before creature spells: every legal target equally likely)
+			"logp_creature_spell_unit": masked_log_softmax(torch.zeros_like(x["m_creature_spell_unit"], dtype=context.dtype), x["m_creature_spell_unit"]),
+			"logp_creature_spell_hex": masked_log_softmax(torch.zeros_like(x["m_creature_spell_hex"], dtype=context.dtype), x["m_creature_spell_hex"]),
 			**self._values(context),
 		}
 
