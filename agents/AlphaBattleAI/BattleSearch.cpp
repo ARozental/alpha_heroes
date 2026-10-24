@@ -189,7 +189,8 @@ EncodedBattle BattleSearchEnv::encode(const State & s)
 	const auto player = battle.battleGetOwner(stack);
 	const CPlayerBattleCallback view(battle.getBattle(), player);
 	const auto side = battle.playerToSide(player);
-	auto encoded = encodeBattle(view, stack, env, player, battle.battleGetFightingHero(side == BattleSide::ATTACKER ? BattleSide::DEFENDER : BattleSide::ATTACKER));
+	auto encoded = encodeBattle(view, stack, env, player, battle.battleGetFightingHero(side == BattleSide::ATTACKER ? BattleSide::DEFENDER : BattleSide::ATTACKER), start);
+	encodeAttackValues(encoded, s.sim->gameState(), BattleID(s.sim->battleId()), player, attackValues);
 	encodeMs += msSince(started);
 	return encoded;
 }

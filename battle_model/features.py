@@ -1,10 +1,14 @@
-"""Bounded, scale-free features of a battle, computed from the raw inputs with the game's own rules (rules.py): the
+"""Bounded, scale-free features of a battle, computed from the raw inputs with the game's own rules (rules.py) and
+the engine's own predictions (damage estimates p_*, attacks played on a copy of the battle a_*, spells s_*/c_*): the
 numbers a hand-written battle AI works with, for the model (model.py). No parameters.
 
 Every feature is bounded (0..1, a few -1..1) and built only from this battle: ratios of quantities of the same kind
 (hit points to hit points, value to value, damage to the health it hits), never raw counts or hit points. So the
 features stay about the same if every stack is ten times larger (hero spells, whose damage does not grow with the
 stacks, are the exception), and nothing needs batch statistics, which a real battle would not match anyway.
+A quantity that has no such partner (a hero's spell power, mana, a stack's attack, the round) and can be anything from
+1 to 1000 comes at several scales (scales: x / (x + c) for c a few powers of 4 apart), so that 4 and 10 mana differ as
+much as 400 and 1000 do, and nothing saturates.
 
 	read_battle       the raw inputs as unit fields: the acting unit, who controls what, values, health
 	stack_features    per unit: health, value shares, damage, attack and defence, speed, ammunition, morale, turn, ...
@@ -36,6 +40,30 @@ def fraction(part, whole):
 def relative(a, b):
 	"""a / (a + b) for two quantities of the same kind, in 0..1: 0.5 when they are equal."""
 	return a / (a + b).clamp(min=EPS)
+
+
+def scales(x, cs):
+	"""[..., len(cs)]: x / (x + c) for each scale c, each 0..1 (x >= 0): the same quantity seen at each scale."""
+	x = x.float().clamp(min=0)[..., None]
+	return x / (x + torch.tensor(cs, dtype=torch.float32, device=x.device))
+
+
+def signed_scales(x, cs):
+	"""The same for a quantity of either sign: x / (|x| + c), each -1..1."""
+	x = x.float()[..., None]
+	return x / (x.abs() + torch.tensor(cs, dtype=torch.float32, device=x.device))
+
+
+def damage_factor(advantage):
+	"""log of the damage formula's factor for attack minus defence (DamageCalculator: +5% a point above, at most +400%;
+	-2.5% a point below, at most -70%): -1.2..1.6, 0 even."""
+	a = advantage.float()
+	return torch.log1p((0.05 * a.clamp(min=0)).clamp(max=4.0)) + torch.log1p(-(0.025 * (-a).clamp(min=0)).clamp(max=0.7))
+
+
+STAT_SCALES = (5, 20, 80)  # attack and defence: a level-1 creature has ~5, a high-level hero adds 50 and more
+COUNT_SCALES = (2, 8, 32)  # shots, rounds, spell power, ...
+MANA_SCALES = (5, 25, 125)  # a cheap spell costs ~5, a pool runs to the hundreds
 
 
 @dataclass
@@ -119,28 +147,39 @@ def damage_spread(b):
 	return fraction(high - low, high + low)
 
 
-@stack_feature
+def multi_stack_feature(name, cs, signed=False):
+	"""Registers one stack feature per scale (name_c): f(b) [B, U] at each of the scales cs."""
+
+	def register(f):
+		for i, c in enumerate(cs):
+			STACK[f"{name}_{c}"] = (lambda i: lambda b: (signed_scales if signed else scales)(f(b), cs)[..., i])(i)
+		return f
+
+	return register
+
+
+@multi_stack_feature("attack", STAT_SCALES)
 def attack(b):
-	"""Attack against 20 points, the 5%-a-point scale of the damage formula: 0.5 at 20."""
-	return relative(b.units["attack"].float(), torch.full_like(b.health, 20, dtype=torch.float32))
+	"""Attack, at several scales."""
+	return b.units["attack"]
 
 
-@stack_feature
+@multi_stack_feature("defense", STAT_SCALES)
 def defense(b):
-	"""Defence against 40 points, the 2.5%-a-point scale: 0.5 at 40."""
-	return relative(b.units["defense"].float(), torch.full_like(b.health, 40, dtype=torch.float32))
+	"""Defence, at several scales."""
+	return b.units["defense"]
 
 
-@stack_feature
+@multi_stack_feature("attack_buff", STAT_SCALES, signed=True)
 def attack_buff(b):
-	"""What its attack bonuses (hero, spells) are worth in damage: tanh of 5% a point over the creature's own."""
-	return torch.tanh(0.05 * (b.units["attack"] - b.units["base_attack"]).float())
+	"""Its attack over the creature's own (hero, spells), at several scales: -1..1."""
+	return b.units["attack"] - b.units["base_attack"]
 
 
-@stack_feature
+@multi_stack_feature("defense_buff", STAT_SCALES, signed=True)
 def defense_buff(b):
-	"""The same for defence, 2.5% a point."""
-	return torch.tanh(0.025 * (b.units["defense"] - b.units["base_defense"]).float())
+	"""The same for defence."""
+	return b.units["defense"] - b.units["base_defense"]
 
 
 @stack_feature
@@ -157,14 +196,15 @@ def creature_style(b):
 
 @stack_feature
 def speed(b):
-	"""Hexes it moves this round, of 15 (the battlefield's playable width): 1 reaches anything."""
+	"""Hexes it moves this round, of 15: the battlefield's playable width, so 1 reaches any hex and more speed than
+	that changes nothing (a fixed scale on purpose)."""
 	return fraction(b.units["speed"].float(), torch.full_like(b.health, 15, dtype=torch.float32))
 
 
-@stack_feature
+@multi_stack_feature("ammunition", COUNT_SCALES)
 def ammunition(b):
-	"""Shots left, of 12 (a full quiver for most shooters)."""
-	return fraction(b.x["u_shots"].float(), torch.full_like(b.health, 12, dtype=torch.float32))
+	"""Shots left, at several scales."""
+	return b.x["u_shots"]
 
 
 @stack_feature
@@ -177,10 +217,10 @@ def retaliations(b):
 	return fraction(b.x["u_retaliations"].float(), torch.full_like(b.health, MAX_RETALIATIONS, dtype=torch.float32))
 
 
-@stack_feature
+@multi_stack_feature("casts", (1, 4))
 def casts(b):
-	"""Creature spell casts left, of 5."""
-	return fraction(b.x["u_casts"].float(), torch.full_like(b.health, 5, dtype=torch.float32))
+	"""Creature spell casts left, at two scales."""
+	return b.x["u_casts"]
 
 
 @stack_feature
@@ -326,22 +366,45 @@ def can_attack_at(b, reach):
 
 # ---- The acting unit's attacks ----
 
-ATTACK_FEATURES = ("damage", "kills", "wipe_chance", "value_destroyed", "threat_removed", "retaliation", "value_lost", "net_value")
+ATTACK_FEATURES = ("damage", "kills", "wipe_chance", "value_destroyed", "threat_removed", "retaliation", "value_lost", "net_value", "versus_best")
 
 
-def _average_damage(attacker, target, shooting, tables):
-	"""The engine's average damage of attacker on target, all its attacks (Marksmen shoot twice), [broadcast]."""
-	low, high = rules.damage_range(attacker, target, shooting, tables, dtype=torch.float32)
-	attacks = (1 + attacker["extra_attacks"]).float()
-	return (low + high).float() / 2 * attacks, low.float() * attacks, high.float() * attacks
+def pair_damage(b, shooting):
+	"""The engine's damage estimate of every unit hitting every unit as they stand now (inputs p_*: every damage bonus,
+	the heroes' skills and artifacts included; no luck, no charge), with all its attacks (Marksmen shoot twice):
+	(average, low, high), [B, attacker, target] each; a shot where shooting (broadcast against that), else melee."""
+	x = b.x
+	low = torch.where(shooting, x["p_shot_min"], x["p_melee_min"]).float()
+	high = torch.where(shooting, x["p_shot_max"], x["p_melee_max"]).float()
+	attacks = (1 + b.units["extra_attacks"]).float()[:, :, None]
+	return (low + high) / 2 * attacks, low * attacks, high * attacks
+
+
+def best_damage(b):
+	"""[B, attacker, target]: the average damage of each unit's attack on each unit, a shot if it can shoot."""
+	return pair_damage(b, b.units["can_shoot"][:, :, None])[0]
 
 
 def threat_share(b):
 	"""[B, U]: each enemy's share of the damage the enemies could do to the acting unit (each capped at its health)."""
-	shooting = b.units["can_shoot"]
-	average, _, _ = _average_damage(b.units, b.me, shooting, b.tables)
-	to_me = torch.minimum(average, b.mine(b.health).float()[:, None]) * b.enemy
+	to_me = torch.minimum(b.mine(best_damage(b).transpose(1, 2)), b.mine(b.health).float()[:, None]) * b.enemy
 	return fraction(to_me, to_me.sum(dim=1, keepdim=True))
+
+
+def attack_values(b):
+	"""The engine's value of each legal attack of the acting unit (inputs a_*: played on a copy of the battle by the
+	game's own rules, dice at their expectation), our gain of both armies' value, -1..1: (melee [B, U, H], shot [B, U])."""
+	x = b.x
+	sign = (1 - 2 * x["g_our_side"].clamp(0, 1)).float()  # +1 when we attack
+	both = (b.our_value + b.enemy_value).clamp(min=EPS)
+	norm = lambda value, legal: (value.float() * legal * sign.view(-1, *[1] * (value.dim() - 1)) / both.view(-1, *[1] * (value.dim() - 1))).clamp(-1, 1)
+	return norm(x["a_melee_value"], x["m_melee_from"]), norm(x["a_shoot_value"], x["m_shoot_target"])
+
+
+def versus_best(values, legal):
+	"""values [B, n] against the largest gain or loss among the legal ones: -1..1, 1 for the best."""
+	best = (values.abs() * legal).amax(dim=-1, keepdim=True)
+	return values * legal / best.clamp(min=EPS)
 
 
 def attack_features(b, shooting):
@@ -356,11 +419,14 @@ def attack_features(b, shooting):
 	                 reduce": half for creatures killed, half for health)
 	retaliation      of the acting unit's health, the target's retaliation after the hit (melee)
 	value_lost       the share of our army's value that retaliation removes
-	net_value        value destroyed minus value lost, of both armies' value: -1..1
+	net_value        what the engine says the attack gains us (attack_values: everything included, retaliation, area
+	                 attacks, Fire Shield, life drain, ...), of both armies' value, -1..1; for melee from its best hex
+	versus_best      net_value against the best legal target's: -1..1, 1 for the best
+	The others come from the engine's damage estimates of the attack on the target alone.
 	"""
 	units, me = b.units, b.me
 	shots = (torch.ones_like if shooting else torch.zeros_like)(b.enemy)
-	average, low, high = _average_damage(me, units, shots, b.tables)
+	average, low, high = (b.mine(t) for t in pair_damage(b, shots[:, None, :]))  # [B, U] each: the acting unit's row
 	hp = b.health.float()
 	damage = fraction(average, hp)
 	killed = fraction(rules.kills(average.long(), units).float(), units["count"].float())
@@ -372,14 +438,18 @@ def attack_features(b, shooting):
 	if shooting:
 		retaliation = torch.zeros_like(damage)
 	else:
+		# The target's melee estimate on the acting unit, for the creatures left after the hit
 		hurt = rules.after_damage(units, average.long())
-		r_low, r_high = rules.damage_range(hurt, me, torch.zeros_like(shots), b.tables, dtype=torch.float32)
+		their = (b.x["p_melee_min"] + b.x["p_melee_max"]).float() / 2  # [B, attacker, target]
+		on_me = their[torch.arange(their.shape[0], device=their.device), :, b.acting]  # [B, U]: each unit on the acting unit
 		retaliates = (hurt["count"] > 0) & (b.x["u_retaliations"] > 0) & ~me["blocks_retaliation"]
-		retaliation = fraction((r_low + r_high).float() / 2 * retaliates, my_health)
+		retaliation = fraction(on_me * fraction(hurt["count"].float(), units["count"].float()) * retaliates, my_health)
 	my_value = b.mine(b.value)[:, None]
 	value_lost = fraction(my_value * retaliation, b.our_value[:, None])
-	net = (b.value * damage - my_value * retaliation) / (b.our_value + b.enemy_value)[:, None].clamp(min=EPS)
-	features = torch.stack([damage, killed, wipe, value_destroyed, threat_removed, retaliation, value_lost, net.clamp(-1, 1)], dim=-1)
+	melee_values, shot_values = attack_values(b)
+	legal = b.x["m_shoot_target"] if shooting else b.x["m_melee_target"]
+	net = shot_values if shooting else melee_values.masked_fill(~b.x["m_melee_from"], -2.0).amax(dim=-1).clamp(min=-1) * legal
+	features = torch.stack([damage, killed, wipe, value_destroyed, threat_removed, retaliation, value_lost, net, versus_best(net, legal)], dim=-1)
 	return features * b.enemy[..., None]
 
 
@@ -412,7 +482,7 @@ def threat_maps(b, reach, to_enemy):
 	threat_value = (value * can).sum(dim=1) / enemy_value
 	melee_threat_value = (value * melee).sum(dim=1) / enemy_value
 	shooting = b.units["can_shoot"]
-	average, _, _ = _average_damage(b.units, b.me, shooting, b.tables)
+	average = b.mine(best_damage(b).transpose(1, 2))  # [B, U]: each unit on the acting unit
 	danger = fraction((average[..., None] * can).sum(dim=1), b.mine(b.health).float()[:, None])
 
 	hexes = torch.arange(N_HEXES, device=reach.device)
@@ -447,10 +517,7 @@ def unit_summaries(b, can_attack):
 	hit_by_me  of its health, what the acting unit's best attack (melee or shot) would take
 	hits_me    of the acting unit's health, what its attack would take
 	"""
-	attacker = {k: v[:, :, None] for k, v in b.units.items()}  # [B, U, 1]
-	target = {k: v[:, None, :] for k, v in b.units.items()}  # [B, 1, U]
-	average, _, _ = _average_damage(attacker, target, b.units["can_shoot"][:, :, None].expand(-1, -1, b.health.shape[1]), b.tables)
-	share = fraction(average, b.health.float()[:, None, :])  # [B, attacker, target]
+	share = fraction(best_damage(b), b.health.float()[:, None, :])  # [B, attacker, target]
 	controller = b.x["u_owner_side"]
 	opposed = (controller[:, :, None] != controller[:, None, :]) & b.units["alive"][:, :, None] & b.units["alive"][:, None, :]
 	in_reach = can_attack_at_units(b, can_attack)  # [B, attacker, target]
@@ -468,23 +535,66 @@ def can_attack_at_units(b, can_attack):
 
 # ---- The battle ----
 
-BATTLE_FEATURES = ("strength", "round", "tactics", "hero_can_cast", "danger_here", "threat_here", "my_share")
+BATTLE_FEATURES = ("strength", *(f"round_{c}" for c in COUNT_SCALES), "tactics", "hero_can_cast", "danger_here", "threat_here", "my_share", "score_now")
 
 
-def battle_features(b, maps):
-	"""[B, len(BATTLE_FEATURES)]: our army's value against both (0.5 even), the round of 20, the tactics phase, whether
-	our hero may cast, the acting unit's danger and threat where it stands, its share of our army's value."""
+def battle_features(b, maps, outcomes):
+	"""[B, len(BATTLE_FEATURES)]: our army's value against both (0.5 even), the round at several scales, the tactics
+	phase (of 7 columns, the most the Tactics skill gives: a fixed scale on purpose), whether our hero may cast, the
+	acting unit's danger and threat where it stands, its share of our army's value, and the reward if the battle were
+	scored now (outcome_features)."""
 	here = b.me["hex"].clamp(min=0)[:, :, None].expand(-1, -1, maps.shape[-1])
 	at_my_hex = maps.gather(1, here)[:, 0]  # [B, HEX_FEATURES]
-	return torch.stack([
-		relative(b.our_value, b.enemy_value),
-		fraction(b.x["g_round"].float(), torch.full_like(b.our_value, 20)),
-		fraction(b.x["g_tactic_distance"].float(), torch.full_like(b.our_value, 7)),
-		(b.x["g_hero_can_cast"] != 0).float(),
-		at_my_hex[:, HEX_FEATURES.index("danger")],
-		at_my_hex[:, HEX_FEATURES.index("threat_value")],
-		b.mine(value_in_army(b)),
+	return torch.cat([
+		relative(b.our_value, b.enemy_value)[:, None],
+		scales(b.x["g_round"], COUNT_SCALES),
+		torch.stack([
+			fraction(b.x["g_tactic_distance"].float(), torch.full_like(b.our_value, 7)),
+			(b.x["g_hero_can_cast"] != 0).float(),
+			at_my_hex[:, HEX_FEATURES.index("danger")],
+			at_my_hex[:, HEX_FEATURES.index("threat_value")],
+			b.mine(value_in_army(b)),
+			outcomes[:, OUTCOME_FEATURES.index("score_now")],
+		], dim=-1),
 	], dim=-1)
+
+
+# ---- What ending the battle now would score ----
+
+OUTCOME_FEATURES = ("score_now", "retreat_reward", "surrender_reward")
+
+
+def outcome_features(b, config=None):
+	"""[B, len(OUTCOME_FEATURES)], each -1..1: the reward (reward.py, zero-sum, from each side's assets) of
+	score_now         the battle scored as it stands (round_score: both heroes there, the armies they would keep)
+	retreat_reward    our retreating now: our army is lost, the enemy wins with what it has
+	surrender_reward  our surrendering now: we keep the army and pay the surrender cost and the hero's rehire (0 when we
+	                  cannot surrender: the mask forbids it anyway)
+	Assets as summarize() counts them: the kept creatures (u_kept) at their value, mana at mana_value x spell power;
+	hero values 0, as there."""
+	from .reward import HERO_HIRE_COST, RewardConfig
+
+	config = config or RewardConfig()
+	x = b.x
+	price = b.tables["value"][b.units["creature"]]  # [B, U]
+	sides = torch.arange(2, device=price.device)
+	on_side = (x["u_side"][:, None, :] == sides[None, :, None]).float()  # [B, side, U]
+	army = (on_side * (x["u_kept"].float() * price)[:, None, :]).sum(dim=-1)  # [B, side]
+	power = x["h_power"].float().clamp(min=0) * (x["h_present"] != 0)
+	mana = config.mana_value * power * x["h_mana"].float().clamp(min=0)
+	start = x["g_start_army"].float() + config.mana_value * power * x["g_start_mana"].float().clamp(min=0)
+	our = x["g_our_side"].clamp(0, 1)
+	batch = torch.arange(our.shape[0], device=our.device)
+	pick = lambda t, side: t[batch, side]
+	own_start, enemy_start = pick(start, our), pick(start, 1 - our)
+	enemy_end = pick(army, 1 - our) + pick(mana, 1 - our)
+
+	def zero_sum(own_end, enemy_end):
+		return (((enemy_start - enemy_end) - (own_start - own_end)) / (own_start + enemy_start).clamp(min=EPS)).clamp(-1, 1)
+
+	cost = x["g_surrender_cost"].float()
+	surrender = zero_sum(pick(army, our) + pick(mana, our) - cost.clamp(min=0) - HERO_HIRE_COST, enemy_end) * (cost >= 0)
+	return torch.stack([zero_sum(pick(army, our) + pick(mana, our), pick(army, 1 - our) + pick(mana, 1 - our)), zero_sum(pick(mana, our), enemy_end), surrender], dim=-1)
 
 
 # ---- Per action ----
@@ -492,18 +602,20 @@ def battle_features(b, maps):
 # A move's (and an attack's hex's) features are changes from where the unit stands: staying (wait, defend) is the
 # baseline, a hex is better or worse than that, -1..1. Progress toward the enemy is split by whether the unit can shoot
 # (a melee unit closes in to hit, a shooter keeps away to shoot), with "next to an enemy" for shooters (cannot shoot).
-FROM_FEATURES = ("threat_change", "melee_threat_change", "danger_change", "blocked_change", "new_targets")
+FROM_FEATURES = ("threat_change", "melee_threat_change", "danger_change", "blocked_change", "new_targets", "hex_value")
 MOVE_FEATURES = ("threat_change", "melee_threat_change", "danger_change", "blocked_change", "new_targets", "progress", "shooter_progress", "shooter_next_to_enemy")
 SHOT_FEATURES = tuple(f for f in ATTACK_FEATURES if f not in ("retaliation", "value_lost"))
-TYPE_FEATURES = ("danger_here", "threat_here", "strength")
+TYPE_FEATURES = ("danger_here", "threat_here", "strength", "score_now", "retreat_reward", "surrender_reward")
 
 
-def action_features(b, melee, shot, maps, can_attack, battle):
+def action_features(b, melee, shot, maps, can_attack, battle, outcomes):
 	"""Each action's own features, in the shape of its logits:
 
 	melee_target [B, U, ATTACK_FEATURES]
 	melee_from   [B, U, H, FROM_FEATURES]   where it stands after the attack, against where it stands now; the threat
-	                                        counts the target as it is after the attack (what it loses no longer threatens)
+	                                        counts the target as it is after the attack (what it loses no longer threatens);
+	                                        hex_value: the engine's value of the attack from this hex against its best
+	                                        hex (jousting, which units an area attack hits, obstacles): <= 0
 	shoot_target [B, U, SHOT_FEATURES]
 	move         [B, H, MOVE_FEATURES]      the hex against where it stands now
 	type         [B, TYPE_FEATURES]
@@ -522,20 +634,25 @@ def action_features(b, melee, shot, maps, can_attack, battle):
 		change("threat_value"), change("melee_threat_value"), change("danger"), change("blocked_shooters"), column("new_targets"),
 		column("progress") * (1 - shooter), column("progress") * shooter, column("next_to_enemy") * shooter,
 	], dim=-1)  # MOVE_FEATURES
-	per_target = hexes[:, None, :, : len(FROM_FEATURES)].expand(-1, b.health.shape[1], -1, -1)
-	melee_from = torch.cat([(threat_after - here("threat_value")[..., None])[..., None], per_target[..., 1:]], dim=-1)
+	per_target = hexes[:, None, :, : FROM_FEATURES.index("hex_value")].expand(-1, b.health.shape[1], -1, -1)
+	melee_values, _ = attack_values(b)
+	legal = b.x["m_melee_from"]
+	best_hex = melee_values.masked_fill(~legal, -2.0).amax(dim=-1, keepdim=True)
+	hex_value = ((melee_values - best_hex) * legal).clamp(-1, 0)
+	melee_from = torch.cat([(threat_after - here("threat_value")[..., None])[..., None], per_target[..., 1:], hex_value[..., None]], dim=-1)
+	type_features = torch.cat([pick(TYPE_FEATURES[:3], battle, BATTLE_FEATURES), outcomes], dim=-1)
 	return {
 		"melee_target": melee,
 		"melee_from": melee_from,
 		"shoot_target": pick(SHOT_FEATURES, shot, ATTACK_FEATURES),
 		"move": hexes,
-		"type": pick(TYPE_FEATURES, battle, BATTLE_FEATURES),
+		"type": type_features,
 	}
 
 
 # ---- Spells: what each cast would do ----
 
-SPELL_FEATURES = ("net_value", "versus_best", "changes_health")
+SPELL_FEATURES = ("net_value", "versus_best", "changes_health", "target_value")
 
 
 def spell_features(b):
@@ -547,25 +664,32 @@ def spell_features(b):
 	versus_best     our gain against the most this spell gains or costs us at any legal target: -1..1 (1: the best one)
 	changes_health  1 if the spell changes any health at any legal target (damage, healing, resurrection, summons);
 	                for the others (Slow, Bless, ...) versus_best is 0 here and the model puts a learned value instead
+	target_value    the value of the unit it targets (on the hex, for a hex), of both armies' value: what a buff or a
+	                curse is cast on (which unit is worth it, and why, is for the model to learn)
 
-	spell_unit [B, S, U, 3], spell_hex [B, S, H, 3], creature_spell_unit [B, U, 3], creature_spell_hex [B, H, 3].
+	spell_unit [B, S, U, 4], spell_hex [B, S, H, 4], creature_spell_unit [B, U, 4], creature_spell_hex [B, H, 4].
 	"""
 	x = b.x
 	sign = (1 - 2 * x["g_our_side"].clamp(0, 1)).float()  # +1 when we attack
 	both = (b.our_value + b.enemy_value).clamp(min=EPS)
+	unit_value = b.value * b.units["alive"] / both[:, None]  # [B, U]
+	hexes = torch.arange(N_HEXES, device=unit_value.device)
+	on = (b.units["hex"][..., None] == hexes) | (b.units["rear"][..., None] == hexes)  # [B, U, H]
+	hex_value = (unit_value[..., None] * on).sum(dim=1).clamp(0, 1)  # [B, H]
 
-	def per_spell(value, legal):  # value, legal [B, ..., targets]
+	def per_spell(value, legal, target):  # value, legal [B, ..., targets]; target [B, targets]
 		ours = value.float() * sign.view(-1, *[1] * (value.dim() - 1)) * legal
 		best = ours.abs().amax(dim=-1, keepdim=True)
 		net = (ours / both.view(-1, *[1] * (value.dim() - 1))).clamp(-1, 1)
 		changes = (best > 0).float().expand_as(ours)
-		return torch.stack([net, ours / best.clamp(min=EPS), changes], dim=-1)
+		target = target.view(target.shape[0], *[1] * (value.dim() - 2), target.shape[-1]).expand_as(ours) * legal
+		return torch.stack([net, ours / best.clamp(min=EPS), changes, target], dim=-1)
 
 	return {
-		"spell_unit": per_spell(x["s_unit_value"], x["m_spell_unit"]),
-		"spell_hex": per_spell(x["s_hex_value"], x["m_spell_hex"]),
-		"creature_spell_unit": per_spell(x["c_unit_value"], x["m_creature_spell_unit"]),
-		"creature_spell_hex": per_spell(x["c_hex_value"], x["m_creature_spell_hex"]),
+		"spell_unit": per_spell(x["s_unit_value"], x["m_spell_unit"], unit_value),
+		"spell_hex": per_spell(x["s_hex_value"], x["m_spell_hex"], hex_value),
+		"creature_spell_unit": per_spell(x["c_unit_value"], x["m_creature_spell_unit"], unit_value),
+		"creature_spell_hex": per_spell(x["c_hex_value"], x["m_creature_spell_hex"], hex_value),
 	}
 
 
@@ -590,15 +714,12 @@ def side_strengths(b):
 	our health over theirs and of our damage per round over theirs (each -10..10), so the model's share
 	sigmoid(a log H + b log D) has a learned exponent per term, starting at 1 (the law itself).
 
-	Health: the living units' hit points. Damage per round: each unit's engine-average damage (all its attacks, a shot
-	if it can shoot) on each living unit of the other side, capped at that unit's health and weighted by its share of
+	Health: the living units' hit points. Damage per round: each unit's engine-estimated average damage (all its
+	attacks, a shot if it can shoot) on each living unit of the other side, capped at that unit's health and weighted by its share of
 	its side's health; summed over the variant's units: all, those still to act this round, melee units, shooters.
 	"""
-	attacker = {k: v[:, :, None] for k, v in b.units.items()}
-	target = {k: v[:, None, :] for k, v in b.units.items()}
-	average, _, _ = _average_damage(attacker, target, b.units["can_shoot"][:, :, None].expand(-1, -1, b.health.shape[1]), b.tables)
 	hp = b.health.float()
-	capped = torch.minimum(average, hp[:, None, :])  # [B, attacker, target]
+	capped = torch.minimum(best_damage(b), hp[:, None, :])  # [B, attacker, target]
 	ours, enemy = b.ours.float(), b.enemy.float()
 
 	def onto(other):  # [B, U]: each unit's damage per round on the `other` side's units, by their health share

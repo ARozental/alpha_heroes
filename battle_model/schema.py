@@ -60,6 +60,9 @@ INPUTS = (
 	_i("g_hero_can_cast", (), "1 if our hero may cast a spell right now"),
 	_i("g_gate_state", (), "EGateState of the town gate, 0 (NONE) outside sieges"),
 	_i("g_creature_spell", (), "the spell the acting unit can cast now (CREATURE_SPELL), -1 if none, or for a Master Genie, whose spell the engine draws when it casts", fill=-1),
+	_i("g_surrender_cost", (), "gold our side would pay to surrender now (battleGetSurrenderCost), -1 if it cannot", fill=-1),
+	_i("g_start_army", (N_SIDES,), "army value of each battle side at the start of the battle, in gold as the reward counts it"),
+	_i("g_start_mana", (N_SIDES,), "mana of each battle side's hero at the start of the battle (0 without a hero)"),
 	# Units, one slot each, ordered by VCMI unit id; unused slots have u_present = 0
 	_i("u_present", (U,), "1 if the slot holds a unit"),
 	_i("u_alive", (U,), "1 if alive (dead stacks are kept: resurrection can target them)"),
@@ -86,6 +89,7 @@ INPUTS = (
 	_i("u_defending", (U,), "1 if in defensive stance"),
 	_i("u_is_clone", (U,), "1 for clones (vanish after battle)"),
 	_i("u_is_summoned", (U,), "1 for summoned units (vanish after battle)"),
+	_i("u_kept", (U,), "creatures its side would keep if the battle ended now (remainingAfterBattle: not summoned units, clones, war machines, nor creatures only raised for the battle)"),
 	_i("u_queue_now", (U,), "position in the remaining turn order of this round (0 = acting now), -1 if not in it", fill=-1),
 	_i("u_queue_next", (U,), "position in next round's turn order, -1 if not in it", fill=-1),
 	_i("u_effect_id", (U, K), "active effect: SpellID 0..81, -1 = empty slot", fill=-1),
@@ -130,6 +134,18 @@ INPUTS = (
 	_i("s_hex_value", (S, H), "HERO_SPELL: predicted value change (attacker - defender, gold) of the cast at this hex"),
 	_i("c_unit_value", (U,), "CREATURE_SPELL: predicted value change (attacker - defender, gold) of the cast at this unit"),
 	_i("c_hex_value", (H,), "CREATURE_SPELL: predicted value change (attacker - defender, gold) of the cast at this hex"),
+	# What each legal attack would do, as the engine's own rules play it on a copy of the battle (AttackValues.cpp):
+	# everything counts (retaliation, area attacks, Fire Shield, life drain, death stare, jousting, rebirth, spells
+	# after an attack, hero skills, ...), dice at their expectation; priced as s_unit_value.
+	_i("a_melee_value", (U, H), "MELEE: predicted value change (attacker - defender, gold) of attacking the unit from the hex"),
+	_i("a_shoot_value", (U,), "SHOOT: predicted value change (attacker - defender, gold) of shooting the unit"),
+	# The engine's damage estimate (battleEstimateDamage: every damage bonus, hero skills and artifacts included, as
+	# the game shows a player) of one attack of unit i on unit j as they stand now, without luck or charge; 0 for
+	# pairs that cannot fight (same controller, dead, a shooter without shots)
+	_i("p_melee_min", (U, U), "min damage of unit i hitting unit j in melee"),
+	_i("p_melee_max", (U, U), "max damage of unit i hitting unit j in melee"),
+	_i("p_shot_min", (U, U), "min damage of unit i shooting unit j"),
+	_i("p_shot_max", (U, U), "max damage of unit i shooting unit j"),
 )
 
 # Every output is float32 masked log-probabilities, conditional on the previous choices:
@@ -257,6 +273,16 @@ def random_inputs(batch=1, seed=0, n_units=14):
 		x["s_hex_value"][b] = value((S, H)) * x["m_spell_hex"][b]
 		x["c_unit_value"][b] = value(U) * x["m_creature_spell_unit"][b]
 		x["c_hex_value"][b] = value(H) * x["m_creature_spell_hex"][b]
+		x["a_melee_value"][b] = value((U, H)) * x["m_melee_from"][b]
+		x["a_shoot_value"][b] = value(U) * x["m_shoot_target"][b]
+		x["g_surrender_cost"][b] = rng.integers(-1, 5000)
+		x["g_start_army"][b] = rng.integers(1000, 50000, N_SIDES)
+		x["g_start_mana"][b] = rng.integers(0, 100, N_SIDES)
+		x["u_kept"][b] = x["u_count"][b] * x["u_alive"][b]
+		low = rng.integers(0, 2000, (U, U)) * (x["u_alive"][b][:, None] == 1) * (x["u_side"][b][:, None] != x["u_side"][b][None, :])
+		x["p_melee_min"][b], x["p_melee_max"][b] = low, low + rng.integers(0, 500, (U, U)) * (low > 0)
+		shooter = rng.random(U)[:, None] < 0.3
+		x["p_shot_min"][b], x["p_shot_max"][b] = x["p_melee_min"][b] * shooter, x["p_melee_max"][b] * shooter
 	return x
 
 

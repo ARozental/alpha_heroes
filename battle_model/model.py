@@ -22,7 +22,15 @@ What the model must learn first is made easy to learn:
   - Ally and enemy. Each attention head has a learned bias for pairs of tokens on the same side and on opposite sides.
   - Forward is forward. Positions also come in our frame (features.our_frame): the same numbers for both sides.
   - What a spell does. Each spell target gets the engine's prediction of the cast (features.spell_features); a spell
-    that changes no health (Slow, Bless, ...) gets a learned value per spell instead of versus_best, starting at 0.5.
+    that changes no health (Slow, Bless, ...) gets a learned value per spell instead of versus_best, starting at 0.5,
+    and every target its value (target_value): whom a buff or a curse is worth casting on is for the model to learn.
+  - What an attack does. Each legal attack gets its value as the engine's own rules play it on a copy of the battle
+    (features.attack_values: retaliation, area attacks, Fire Shield, life drain, jousting, ... all included), and
+    every damage feature comes from the engine's damage estimates (hero skills and artifacts included).
+  - What a creature is. Besides its own embedding, each ability it has (rules.ABILITIES) adds an embedding shared by
+    all creatures with it, so an ability learned on one holds for the others.
+  - Retreat and surrender. Their exact reward now, and the score if the battle ended now, go into the type logits
+    (features.outcome_features).
 
 Each token is a gated MLP (SwiGLU) over [its embeddings summed, its numbers], then RMSNorm; the trunk is pre-norm
 attention blocks with RMSNorm and SwiGLU. A choice's logit is as in v2 (ActionHeads): a pointer score (the context's
@@ -43,20 +51,18 @@ from .constants import (
 	CREATURE_VOCAB,
 	EFFECT_VOCAB,
 	GATE_STATE_VOCAB,
-	HERO_TYPE_VOCAB,
 	MASKED_LOGIT,
 	N_ACTION_TYPES,
 	N_HEXES,
 	N_SECONDARY_SKILLS,
 	N_SIDES,
 	N_SPELLS,
-	OBSTACLE_ID_VOCAB,
 	OBSTACLE_TYPE_VOCAB,
 	SECOND_TARGET_KIND,
 	WALL_STATE_VOCAB,
 	ActionType,
 )
-from .layers import ActionScore, ValueHeads, best_of, masked_log_softmax, small_embedding, vocab_index
+from .layers import EMBEDDING_STD, ActionScore, ValueHeads, best_of, masked_log_softmax, small_embedding, vocab_index
 
 __all__ = ["BattleModel", "best_of", "build_model"]
 
@@ -88,15 +94,16 @@ class SwiGLU(nn.Module):
 
 class Tokenizer(nn.Module):
 	"""[embeddings summed, numbers] -> a token: a small gated MLP (half the token's width inside: the numbers and the
-	embeddings combine nonlinearly, v2 only added a linear projection of the numbers), then RMSNorm."""
+	embeddings combine nonlinearly, v2 only added a linear projection of the numbers), then RMSNorm. embedded=False:
+	numbers only (forward's embedded is None)."""
 
-	def __init__(self, numbers, dim):
+	def __init__(self, numbers, dim, embedded=True):
 		super().__init__()
-		self.mlp = SwiGLU(dim + numbers, dim // 2, dim)
+		self.mlp = SwiGLU((dim if embedded else 0) + numbers, dim // 2, dim)
 		self.norm = RMSNorm(dim)
 
 	def forward(self, embedded, numbers):
-		return self.norm(self.mlp(torch.cat([embedded, numbers], dim=-1)))
+		return self.norm(self.mlp(numbers if embedded is None else torch.cat([embedded, numbers], dim=-1)))
 
 
 def signed(tokens, team):
@@ -129,81 +136,97 @@ class BattleTokens(nn.Module):
 
 
 class HeroTokens(nn.Module):
-	"""One token per side's hero, signed by team: its type; whether it is ours, primary skills (x / (x + 10)), mana
-	(left of its pool, the pool against 50), secondary skill levels (of 3) and spellbook (both 0 for the enemy's hero,
-	which a player cannot see)."""
+	"""One token per side's hero, signed by team: whether it is ours; its attack against the other hero's defence and
+	the other's attack against its defence, as the damage formula's factor (F.damage_factor: no hero is 0 and 0);
+	spell power and knowledge at several scales (F.COUNT_SCALES); mana left of its pool, mana and the pool at several
+	scales (F.MANA_SCALES); secondary skill levels (of 3) and spellbook (both 0 for the enemy's hero, which a player
+	cannot see). No embedding of the hero's type: what a hero is shows in these, and its specialty in its units'
+	numbers and its spells' predicted values."""
 
-	NUMBERS = 8 + N_SECONDARY_SKILLS + N_SPELLS
+	NUMBERS = 4 + 2 * len(F.COUNT_SCALES) + 1 + 2 * len(F.MANA_SCALES) + N_SECONDARY_SKILLS + N_SPELLS
 
 	def __init__(self, dim):
 		super().__init__()
-		self.hero_type = small_embedding(HERO_TYPE_VOCAB + 1, dim)
-		self.tokens = Tokenizer(self.NUMBERS, dim)
+		self.tokens = Tokenizer(self.NUMBERS, dim, embedded=False)
 
 	def forward(self, b):
 		x = b.x
-		skill = lambda name: F.relative(x[name].float(), torch.full_like(x[name], 10, dtype=torch.float32))
+		present = x["h_present"] != 0
+		attack, defense = x["h_attack"] * present, x["h_defense"] * present
 		mana, pool = x["h_mana"].float(), x["h_mana_max"].float()
 		sides = torch.arange(N_SIDES, device=mana.device)[None, :].expand_as(x["h_present"])
 		ours = sides == x["g_our_side"][:, None]
+		other = lambda t: t.flip(-1)  # the other side's hero
 		numbers = torch.cat([
-			torch.stack([(x["h_present"] != 0).float(), ours.float(), skill("h_attack"), skill("h_defense"), skill("h_power"), skill("h_knowledge"), F.fraction(mana, pool), F.relative(pool, torch.full_like(pool, 50))], dim=-1),
+			torch.stack([present.float(), ours.float(), F.damage_factor(attack - other(defense)), F.damage_factor(other(attack) - defense)], dim=-1),
+			F.scales(x["h_power"], F.COUNT_SCALES),
+			F.scales(x["h_knowledge"], F.COUNT_SCALES),
+			F.fraction(mana, pool)[..., None],
+			F.scales(mana, F.MANA_SCALES),
+			F.scales(pool, F.MANA_SCALES),
 			x["h_skills"].float().clamp(0, 3) / 3,
 			(x["h_spells"] != 0).float(),
 		], dim=-1)
-		team = torch.where(x["h_present"] != 0, 2 * ours.long() - 1, torch.zeros_like(sides))
-		return signed(self.tokens(self.hero_type(vocab_index(x["h_type"], HERO_TYPE_VOCAB)), numbers), team), team
+		team = torch.where(present, 2 * ours.long() - 1, torch.zeros_like(sides))
+		return signed(self.tokens(None, numbers), team), team
 
 
 class UnitTokens(nn.Module):
-	"""One token per unit slot, signed by team: its creature, its spell effects (each with its turns left and strength,
-	through a small gated MLP), where it stands (both hexes of a two-hex unit), and its numbers: stack_features,
-	unit_summaries and its position in our frame."""
+	"""One token per unit slot, signed by team: its creature and its abilities (one embedding per ability it has,
+	rules.ABILITIES, summed: what is learned about an ability on one creature holds for all with it), its spell effects
+	(each with its turns left and strength at several scales, through a small gated MLP), where it stands (both hexes
+	of a two-hex unit), and its numbers: stack_features, unit_summaries and its position in our frame."""
+
+	EFFECT_TURNS = (1, 3, 9)  # rounds an effect has left
+	EFFECT_STRENGTH = (2, 10, 50)  # its bonus's value: a few points of a skill, or tens of percent
 
 	def __init__(self, dim):
 		super().__init__()
 		self.creature = small_embedding(CREATURE_VOCAB + 1, dim)
+		self.abilities = nn.Linear(len(rules.ABILITIES), dim, bias=False)
+		nn.init.normal_(self.abilities.weight, std=EMBEDDING_STD)
 		self.position = small_embedding(N_HEXES + 1, dim)  # the extra row: no second hex
 		self.effect = small_embedding(EFFECT_VOCAB + 1, dim)
-		self.effect_mlp = SwiGLU(dim + 2, 16, dim)
+		self.effect_mlp = SwiGLU(dim + len(self.EFFECT_TURNS) + len(self.EFFECT_STRENGTH), 16, dim)
 		self.tokens = Tokenizer(len(F.STACK_FEATURES) + len(F.SUMMARY_FEATURES) + 2, dim)
 
 	def forward(self, b, facts):
 		x = b.x
 		has_effect = (x["u_effect_id"] >= 0).float()[..., None]
-		strength = x["u_effect_value"].float()
-		effect_numbers = torch.stack([x["u_effect_turns"].float().clamp(0, 10) / 10, strength / (strength.abs() + 10)], dim=-1)
+		effect_numbers = torch.cat([F.scales(x["u_effect_turns"], self.EFFECT_TURNS), F.signed_scales(x["u_effect_value"], self.EFFECT_STRENGTH)], dim=-1)
 		effects = (self.effect_mlp(torch.cat([self.effect(vocab_index(x["u_effect_id"], EFFECT_VOCAB)), effect_numbers], dim=-1)) * has_effect).sum(dim=2)
 		where = self.position(vocab_index(b.units["hex"], N_HEXES)) + self.position(vocab_index(b.units["rear"], N_HEXES))
-		embedded = self.creature(vocab_index(x["u_creature"], CREATURE_VOCAB)) + effects + where
+		abilities = self.abilities(b.tables["abilities"][b.units["creature"]])
+		embedded = self.creature(vocab_index(x["u_creature"], CREATURE_VOCAB)) + abilities + effects + where
 		numbers = torch.cat([facts["stack"], facts["summaries"], F.our_frame(b.units["hex"], x["g_our_side"])], dim=-1)
 		team = teams(b)
 		return signed(self.tokens(embedded, numbers), team), team
 
 
 class HexTokens(nn.Module):
-	"""One token per hex: its position (also in our frame), accessibility, obstacle and wall, the side and turns of a
-	spell obstacle, and the acting unit's maps there (features.threat_maps)."""
+	"""One token per hex: its position (also in our frame), accessibility, obstacle type and wall, the side and turns
+	(at two scales) of a spell obstacle, and the acting unit's maps there (features.threat_maps). No embedding of the
+	obstacle's id: its type and the accessibility say what it does."""
+
+	OBSTACLE_TURNS = (1, 4)
 
 	def __init__(self, dim):
 		super().__init__()
 		self.position = small_embedding(N_HEXES, dim)
 		self.access = small_embedding(ACCESSIBILITY_VOCAB + 1, dim)
 		self.obstacle_type = small_embedding(OBSTACLE_TYPE_VOCAB + 1, dim)
-		self.obstacle_id = small_embedding(OBSTACLE_ID_VOCAB + 1, dim)
 		self.wall = small_embedding(WALL_STATE_VOCAB + 1, dim)
-		self.tokens = Tokenizer(4 + len(F.HEX_FEATURES) + 2, dim)
+		self.tokens = Tokenizer(3 + len(self.OBSTACLE_TURNS) + len(F.HEX_FEATURES) + 2, dim)
 
 	def forward(self, b, facts):
 		x = b.x
 		side, our = x["x_obstacle_side"], x["g_our_side"][:, None]
-		obstacle = torch.stack([(side == our).float(), ((side >= 0) & (side != our)).float(), x["x_obstacle_turns"].float().clamp(0, 10) / 10, (x["x_obstacle_type"] >= 0).float()], dim=-1)
+		obstacle = torch.cat([torch.stack([(side == our).float(), ((side >= 0) & (side != our)).float(), (x["x_obstacle_type"] >= 0).float()], dim=-1), F.scales(x["x_obstacle_turns"], self.OBSTACLE_TURNS)], dim=-1)
 		hexes = torch.arange(N_HEXES, device=side.device)[None, :].expand_as(side)
 		embedded = (
 			self.position(hexes)
 			+ self.access(vocab_index(x["x_access"], ACCESSIBILITY_VOCAB))
 			+ self.obstacle_type(vocab_index(x["x_obstacle_type"], OBSTACLE_TYPE_VOCAB))
-			+ self.obstacle_id(vocab_index(x["x_obstacle_id"], OBSTACLE_ID_VOCAB))
 			+ self.wall(vocab_index(x["x_wall_state"], WALL_STATE_VOCAB))
 		)
 		return self.tokens(embedded, torch.cat([obstacle, facts["maps"], F.our_frame(hexes, x["g_our_side"])], dim=-1))
@@ -460,6 +483,7 @@ class BattleModel(nn.Module):
 			b = F.read_battle(x, self.tables())
 			reach, to_enemy = F.distance_maps(b)
 			maps, can_attack = F.threat_maps(b, reach, to_enemy)
+			outcomes = F.outcome_features(b)
 			return {
 				"melee": F.attack_features(b, shooting=False),
 				"shot": F.attack_features(b, shooting=True),
@@ -467,7 +491,8 @@ class BattleModel(nn.Module):
 				"can_attack": can_attack,
 				"stack": F.stack_features(b),
 				"summaries": F.unit_summaries(b, can_attack),
-				"battle": F.battle_features(b, maps),
+				"battle": F.battle_features(b, maps, outcomes),
+				"outcomes": outcomes,
 				"strength": F.side_strengths(b),
 				**{f"spell:{k}": v for k, v in F.spell_features(b).items()},
 			}
@@ -480,7 +505,7 @@ class BattleModel(nn.Module):
 		glob, heroes, units, hexes = self.trunk(self.battle(b, facts), heroes, units, self.hexes(b, facts), hero_team, unit_team, x["h_present"] != 0, x["u_present"] != 0)
 		strength = self.strength(facts["strength"])
 		context = self.context(b, glob, heroes, units, strength)
-		actions = F.action_features(b, facts["melee"], facts["shot"], facts["maps"], facts["can_attack"], facts["battle"])
+		actions = F.action_features(b, facts["melee"], facts["shot"], facts["maps"], facts["can_attack"], facts["battle"], facts["outcomes"])
 		actions.update({k.split(":", 1)[1]: v for k, v in facts.items() if k.startswith("spell:")})
 		return {**self.actions(context, units, hexes, actions, x, strength), **self.values(context, self.value_strength(strength))}
 

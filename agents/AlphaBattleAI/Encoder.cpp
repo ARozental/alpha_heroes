@@ -7,6 +7,7 @@
 #include "lib/CRandomGenerator.h"
 #include "lib/CStack.h"
 #include "lib/battle/BattleAction.h"
+#include "lib/battle/BattleAttackInfo.h"
 #include "lib/battle/CObstacleInstance.h"
 #include "lib/battle/CPlayerBattleCallback.h"
 #include "lib/bonuses/Bonus.h"
@@ -474,9 +475,38 @@ void encodeCreatureSpell(EncodedBattle & e, const CPlayerBattleCallback & battle
 			t.set(In::m_creature_spell_unit, u, 1);
 	}
 }
+
+/// The engine's damage estimate of one attack of each unit on each other (schema.py p_*), as the game shows a player
+void encodePairDamage(EncodedBattle & e, const CPlayerBattleCallback & battle)
+{
+	auto & t = e.tensors;
+	for(int i = 0; i < MAX_UNITS; ++i)
+	{
+		const CStack * a = e.units[i];
+		if(!a || !a->alive())
+			continue;
+		for(int j = 0; j < MAX_UNITS; ++j)
+		{
+			const CStack * b = e.units[j];
+			if(!b || !b->alive() || battle.battleGetOwner(a) == battle.battleGetOwner(b))
+				continue;
+			for(const bool shooting : {false, true})
+			{
+				if(shooting && !a->canShoot())
+					continue;
+				BattleAttackInfo info(a, b, 0, shooting);
+				info.attackerPos = a->getPosition();
+				info.defenderPos = b->getPosition();
+				const auto range = battle.battleEstimateDamage(info).damage;
+				t.set(shooting ? In::p_shot_min : In::p_melee_min, i, j, range.min);
+				t.set(shooting ? In::p_shot_max : In::p_melee_max, i, j, range.max);
+			}
+		}
+	}
+}
 }
 
-EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * active, const Environment & env, PlayerColor player, const CGHeroInstance * enemyHero)
+EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * active, const Environment & env, PlayerColor player, const CGHeroInstance * enemyHero, const AlphaReward::BattleEnd & start)
 {
 	EncodedBattle e;
 	auto & t = e.tensors;
@@ -498,6 +528,16 @@ EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * 
 	t.set(In::g_active_unit, e.activeSlot);
 	t.set(In::g_hero_can_cast, heroCanCast);
 	t.set(In::g_gate_state, static_cast<int>(battle.battleGetGateState()));
+	t.set(In::g_surrender_cost, battle.battleGetSurrenderCost());
+	for(int s = 0; s < N_SIDES; ++s)
+	{
+		t.set(In::g_start_army, s, std::llround(start.armyStart[s]));
+		t.set(In::g_start_mana, s, start.manaStart[s]);
+	}
+	for(int u = 0; u < MAX_UNITS; ++u)
+		if(e.units[u])
+			t.set(In::u_kept, u, remainingAfterBattle(e.units[u]));
+	encodePairDamage(e, battle);
 	encodeHeroes(t, battle, mySide, enemyHero);
 
 	std::array<bool, N_HEXES> stopping{};

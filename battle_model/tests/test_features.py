@@ -9,25 +9,32 @@ from battle_model import rules
 from battle_model import vocab
 from battle_model.model import BattleModel, best_of
 from battle_model.schema import finalize_masks, random_inputs
-from battle_model.tests.test_rules import allow_melee, battle, melee_position
+from battle_model.tests.test_rules import allow_melee, battle, melee_position, with_engine
 
 pytestmark = pytest.mark.skipif(not vocab.VOCAB_PATH.exists(), reason="run scripts/export_vocab.sh to generate the vocabulary")
 
-BOUNDS = {"net_value": (-1, 1), "progress": (-1, 1), "shooter_progress": (-1, 1), "threat_change": (-1, 1), "melee_threat_change": (-1, 1), "danger_change": (-1, 1), "blocked_change": (-1, 1), "attack_buff": (-1, 1), "defense_buff": (-1, 1), "morale": (np.log1p(-6 / 24), np.log1p(3 / 24)), "luck": (np.log1p(-0.5 * 3 / 24), np.log1p(3 / 24))}
+BOUNDS = {
+	"net_value": (-1, 1), "versus_best": (-1, 1), "hex_value": (-1, 0), "progress": (-1, 1), "shooter_progress": (-1, 1), "threat_change": (-1, 1), "melee_threat_change": (-1, 1), "danger_change": (-1, 1), "blocked_change": (-1, 1),
+	**{f"{name}_{c}": (-1, 1) for name in ("attack_buff", "defense_buff") for c in F.STAT_SCALES},
+	**{name: (-1, 1) for name in F.OUTCOME_FEATURES},
+	"morale": (np.log1p(-6 / 24), np.log1p(3 / 24)), "luck": (np.log1p(-0.5 * 3 / 24), np.log1p(3 / 24)),
+}
 
 
 def everything(x):
 	"""Every feature of the inputs, by name: {name: tensor}."""
 	model = BattleModel()
-	b = F.read_battle({k: torch.as_tensor(v) for k, v in x.items()}, model.tables())
+	b = F.read_battle({k: torch.as_tensor(v) for k, v in with_engine(x).items()}, model.tables())
 	reach, to_enemy = F.distance_maps(b)
 	maps, can = F.threat_maps(b, reach, to_enemy)
 	melee, shot = F.attack_features(b, False), F.attack_features(b, True)
+	outcomes = F.outcome_features(b)
+	battle_features = F.battle_features(b, maps, outcomes)
 	out = {}
-	for names, values in ((F.STACK_FEATURES, F.stack_features(b)), (F.ATTACK_FEATURES, melee), (F.ATTACK_FEATURES, shot), (F.HEX_FEATURES, maps), (F.SUMMARY_FEATURES, F.unit_summaries(b, can)), (F.BATTLE_FEATURES, F.battle_features(b, maps))):
+	for names, values in ((F.STACK_FEATURES, F.stack_features(b)), (F.ATTACK_FEATURES, melee), (F.ATTACK_FEATURES, shot), (F.HEX_FEATURES, maps), (F.SUMMARY_FEATURES, F.unit_summaries(b, can)), (F.BATTLE_FEATURES, battle_features), (F.OUTCOME_FEATURES, outcomes)):
 		for i, name in enumerate(names):
 			out.setdefault(name, []).append(values[..., i].flatten())
-	actions = F.action_features(b, melee, shot, maps, can, F.battle_features(b, maps))
+	actions = F.action_features(b, melee, shot, maps, can, battle_features, outcomes)
 	for name, names in (("melee_from", F.FROM_FEATURES), ("move", F.MOVE_FEATURES), ("type", F.TYPE_FEATURES)):
 		for i, n in enumerate(names):
 			out.setdefault(n, []).append(actions[name][..., i].flatten())
@@ -82,14 +89,15 @@ def test_each_action_scores_its_own_logit():
 	allow_melee(x, 1, 64)
 	x["m_move_hex"][0, [97, 98, 99]] = True
 	finalize_masks(x, 0)
-	t = {k: torch.from_numpy(v) for k, v in x.items()}
+	t = {k: torch.from_numpy(v) for k, v in with_engine(x).items()}
 	model = BattleModel().eval()
 	with torch.no_grad():
 		model.set_rule_weights("melee_from", threat_change=-3.0, blocked_change=2.0, new_targets=0.5)
 		out = model(t)
 		b = F.read_battle(t, model.tables())
 		maps, can = F.threat_maps(b, *F.distance_maps(b))
-		actions = F.action_features(b, F.attack_features(b, False), F.attack_features(b, True), maps, can, F.battle_features(b, maps))
+		outcomes = F.outcome_features(b)
+		actions = F.action_features(b, F.attack_features(b, False), F.attack_features(b, True), maps, can, F.battle_features(b, maps, outcomes), outcomes)
 		rules = model.actions.rules
 		from_logits = (actions["melee_from"] * rules["melee_from"].linear).sum(-1)
 		target_logits = (actions["melee_target"] * rules["melee_target"].linear).sum(-1) + best_of(from_logits, t["m_melee_from"])
@@ -111,7 +119,7 @@ def test_a_better_attack_lifts_its_type():
 	torch.manual_seed(0)
 	x = melee_position()
 	finalize_masks(x, 0)
-	t = {k: torch.from_numpy(v) for k, v in x.items()}
+	t = {k: torch.from_numpy(v) for k, v in with_engine(x).items()}
 	model = BattleModel().eval()
 	with torch.no_grad():
 		before = model(t)["logp_type"][0].exp()
@@ -139,7 +147,7 @@ def test_unit_summaries_cover_both_sides():
 	"""Regression: the summaries once saw only the enemies' reach, so our units' best hit read 0."""
 	x = melee_position()
 	finalize_masks(x, 0)
-	t = {k: torch.from_numpy(v) for k, v in x.items()}
+	t = {k: torch.from_numpy(v) for k, v in with_engine(x).items()}
 	b = F.read_battle(t, BattleModel().tables())
 	maps, can = F.threat_maps(b, *F.distance_maps(b))
 	summaries = F.unit_summaries(b, can)

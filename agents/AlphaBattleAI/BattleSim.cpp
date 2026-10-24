@@ -6,6 +6,7 @@
 #include "server/battles/IBattleServer.h"
 
 #include "lib/CRandomGenerator.h"
+#include "lib/IGameSettings.h"
 #include "lib/battle/BattleAction.h"
 #include "lib/battle/BattleInfo.h"
 #include "lib/callback/GameRandomizer.h"
@@ -14,8 +15,76 @@
 #include "lib/networkPacks/SetStackEffect.h"
 #include "lib/spells/ISpellMechanics.h"
 
+namespace
+{
+/// Uniform draws at the middle of their range (damage: the engine's average, as in its estimates), alternately rounded
+/// down and up so that the sum of several (a stack's ten damage rolls) has the exact mean; binomials at their mean
+class MeanRandom final : public vstd::RNG
+{
+	bool up = false;
+
+	int64_t middle(int64_t lower, int64_t upper)
+	{
+		up = !up;
+		return lower + (upper - lower + (up ? 1 : 0)) / 2;
+	}
+
+public:
+	int nextInt(int lower, int upper) override { return static_cast<int>(middle(lower, upper)); }
+	int64_t nextInt64(int64_t lower, int64_t upper) override { return middle(lower, upper); }
+	double nextDouble(double lower, double upper) override { return (lower + upper) / 2; }
+	int nextInt(int upper) override { return nextInt(0, upper); }
+	int64_t nextInt64(int64_t upper) override { return nextInt64(0, upper); }
+	double nextDouble(double upper) override { return upper / 2; }
+	int nextInt() override { return 0; }
+	int nextBinomialInt(int coinsCount, double coinChance) override { return static_cast<int>(std::lround(coinsCount * coinChance)); }
+};
+
+/// Luck, morale and ability rolls as a script says (see BattleSimulation::scriptDice), with the chance of each
+/// (the game's settings for luck and morale, as GameRandomizer; without its bias, which only evens out a series)
+class ScriptedRolls final : public IBattleRandomizer
+{
+	const IGameInfoCallback & game;
+
+	double moraleLuckChance(int value, EGameSettings chances, EGameSettings diceSize) const
+	{
+		const auto vector = game.getSettings().getVector(chances);
+		if(value <= 0 || vector.empty())
+			return 0.0;
+		return vector[std::min<size_t>(vector.size(), value) - 1] / static_cast<double>(game.getSettings().getInteger(diceSize));
+	}
+
+	bool roll(double chance)
+	{
+		chance = std::clamp(chance, 0.0, 1.0);
+		if(chance <= 0.0 || chance >= 1.0)
+			return chance >= 1.0; // certain: not a branch
+		const bool success = chances.size() < script.size() && script[chances.size()];
+		chances.push_back(chance);
+		outcomes.push_back(success);
+		return success;
+	}
+
+public:
+	std::vector<bool> script;
+	std::vector<double> chances;
+	std::vector<bool> outcomes;
+
+	explicit ScriptedRolls(const IGameInfoCallback & game)
+		: game(game)
+	{
+	}
+	bool rollGoodMorale(ObjectInstanceID, int value) override { return roll(moraleLuckChance(value, EGameSettings::COMBAT_GOOD_MORALE_CHANCE, EGameSettings::COMBAT_MORALE_DICE_SIZE)); }
+	bool rollBadMorale(ObjectInstanceID, int value) override { return roll(moraleLuckChance(value, EGameSettings::COMBAT_BAD_MORALE_CHANCE, EGameSettings::COMBAT_MORALE_DICE_SIZE)); }
+	bool rollGoodLuck(ObjectInstanceID, int value) override { return roll(moraleLuckChance(value, EGameSettings::COMBAT_GOOD_LUCK_CHANCE, EGameSettings::COMBAT_LUCK_DICE_SIZE)); }
+	bool rollBadLuck(ObjectInstanceID, int value) override { return roll(moraleLuckChance(value, EGameSettings::COMBAT_BAD_LUCK_CHANCE, EGameSettings::COMBAT_LUCK_DICE_SIZE)); }
+	bool rollCombatAbility(ObjectInstanceID, int percentageChance) override { return roll(percentageChance / 100.0); }
+};
+}
+
 /// The game, for the battle rules of a simulation: packs go to the copy's game state, dice to its own
-/// generators, nothing to clients. Also the battle the rules call back (end of battle, automatic actions).
+/// generators (or scripted ones), nothing to clients. Also the battle the rules call back (end of battle, automatic
+/// actions).
 class BattleSimulation::Server final : public IBattleServer, public IBattleOwner
 {
 	/// For spells: the same packs and dice; adventure-map effects do not happen in a battle
@@ -30,7 +99,7 @@ class BattleSimulation::Server final : public IBattleServer, public IBattleOwner
 		}
 		void complain(const std::string & problem) override { server.complain(problem); }
 		bool describeChanges() const override { return false; } // no battle log texts
-		vstd::RNG * getRNG() override { return &server.rng; }
+		vstd::RNG * getRNG() override { return &server.getRandomGenerator(); }
 		void apply(CPackForClient & pack) override { server.sendAndApply(pack); }
 		void apply(BattleLogMessage & pack) override { server.sendAndApply(pack); }
 		void apply(BattleStackMoved & pack) override { server.sendAndApply(pack); }
@@ -51,6 +120,9 @@ public:
 	BattleSimulation & sim;
 	CRandomGenerator rng;
 	GameRandomizer randomizer;
+	MeanRandom mean;
+	ScriptedRolls scripted;
+	bool scripting = false;
 	SpellEnvironment spells;
 	std::string complaint;
 	bool ended = false;
@@ -61,6 +133,7 @@ public:
 		: sim(sim)
 		, rng(seed)
 		, randomizer(*sim.game)
+		, scripted(*sim.game)
 		, spells(*this)
 	{
 		randomizer.setSeed(seed);
@@ -78,8 +151,8 @@ public:
 	}
 	ServerCallback * spellcastEnvironment() const override { return const_cast<SpellEnvironment *>(&spells); }
 	SpellCastEnvironment & obstacleSpellEnvironment() override { return spells; }
-	vstd::RNG & getRandomGenerator() override { return rng; }
-	GameRandomizer & battleRandomizer() override { return randomizer; }
+	vstd::RNG & getRandomGenerator() override { return scripting ? static_cast<vstd::RNG &>(mean) : rng; }
+	IBattleRandomizer & battleRandomizer() override { return scripting ? static_cast<IBattleRandomizer &>(scripted) : randomizer; }
 	IGameInfoCallback & gameInfo() override { return *sim.game; }
 	void giveResource(PlayerColor, GameResID, int) override {}
 	void useChargeBasedSpell(const ObjectInstanceID &, const SpellID &) override {}
@@ -137,6 +210,40 @@ std::unique_ptr<BattleSimulation> BattleSimulation::clone(int seed) const
 const CBattleInfoCallback & BattleSimulation::battle() const
 {
 	return *game->getBattle(BattleID(battleNumber));
+}
+
+const CGameState & BattleSimulation::gameState() const
+{
+	return *game;
+}
+
+void BattleSimulation::restoreBattle(const CGameState & source, const BattleID & battleID)
+{
+	const BattleInfo * from = source.getBattle(battleID);
+	if(!from)
+		throw std::runtime_error("restoreBattle: no battle " + std::to_string(battleID.getNum()));
+	game->restoreBattle(*from);
+	server->ended = false;
+	server->winner.reset();
+	server->result = EBattleResult::NORMAL;
+}
+
+void BattleSimulation::scriptDice(std::optional<std::vector<bool>> script)
+{
+	server->scripting = script.has_value();
+	server->scripted.script = script.value_or(std::vector<bool>());
+	server->scripted.chances.clear();
+	server->scripted.outcomes.clear();
+}
+
+const std::vector<double> & BattleSimulation::rollChances() const
+{
+	return server->scripted.chances;
+}
+
+const std::vector<bool> & BattleSimulation::rollOutcomes() const
+{
+	return server->scripted.outcomes;
 }
 
 bool BattleSimulation::applyActionOnly(PlayerColor player, const BattleAction & action)

@@ -1,7 +1,7 @@
 # Built as part of VCMI via its EXTRA_AI_DIRS option
 set(ALPHA_BATTLE_AI_SOURCES
-	AlphaBattleAI.cpp BattleSearch.cpp BattleSim.cpp Dump.cpp Encoder.cpp Model.cpp Policy.cpp Tensors.cpp main.cpp
-	AlphaBattleAI.h BattleSearch.h BattleSim.h Dump.h Encoder.h GumbelSearch.h Model.h Policy.h Reward.h Schema.generated.h StdInc.h Tensors.h
+	AlphaBattleAI.cpp AttackValues.cpp BattleSearch.cpp BattleSim.cpp Dump.cpp Encoder.cpp Model.cpp Policy.cpp Tensors.cpp main.cpp
+	AlphaBattleAI.h AttackValues.h BattleSearch.h BattleSim.h Dump.h Encoder.h GumbelSearch.h Model.h Policy.h Reward.h Schema.generated.h StdInc.h Tensors.h
 )
 find_package(onnxruntime CONFIG REQUIRED)
 # AlphaBattleAIDev: the same AI under another name, to try C++ changes while training runs keep using

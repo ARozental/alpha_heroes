@@ -10,7 +10,7 @@ from battle_model import vocab
 from battle_model.constants import FIELD_WIDTH, N_HEXES, ActionType
 from battle_model.distributions import sample
 from battle_model.model_v1 import BattleModelV1
-from battle_model.rules import creature_tables, cross_stack_features, hex_distance, least_damage
+from battle_model.rules import creature_tables, cross_stack_features, damage_range, hex_distance, least_damage, total_health, units_of
 from battle_model.schema import empty_inputs, finalize_masks
 
 ROWS = N_HEXES // FIELD_WIDTH
@@ -90,6 +90,43 @@ def battle(units, active=0, our_side=0):
 		for key, value in values.items():
 			x[key][0, slot] = value
 	x["m_move_hex"][0, 100] = True
+	return x
+
+
+def with_engine(x):
+	"""A copy of hand-made inputs with what the engine would add (AttackValues.cpp, Encoder.cpp encodePairDamage): the
+	damage estimates p_* from rules.damage_range (the engine's formula; these battles have no hero skills or
+	artifacts), and the acting unit's attack values a_* as its damage's value minus the retaliation's (no area
+	attacks or other abilities here), in gold, attacker minus defender."""
+	x = {k: v.copy() for k, v in x.items()}
+	t = {k: torch.from_numpy(v) for k, v in x.items()}
+	tables = creature_tables()
+	units = units_of(t, tables)
+	attacker = {k: v[:, :, None] for k, v in units.items()}
+	target = {k: v[:, None, :] for k, v in units.items()}
+	opposed = (t["u_owner_side"][:, :, None] != t["u_owner_side"][:, None, :]) & units["alive"][:, :, None] & units["alive"][:, None, :]
+	for name, shooting in (("melee", False), ("shot", True)):
+		low, high = damage_range(attacker, target, torch.full(opposed.shape, shooting), tables)
+		can = opposed & (units["shooter"] & (t["u_shots"] > 0))[:, :, None] if shooting else opposed
+		x[f"p_{name}_min"], x[f"p_{name}_max"] = (low * can).numpy(), (high * can).numpy()
+	price = tables["value"][units["creature"]].double() / units["max_hp"].clamp(min=1).double()  # gold per hit point
+	health = total_health(units).double()
+	for b in range(x["u_count"].shape[0]):
+		me = int(x["g_active_unit"][b])
+		sign = 1 if x["u_side"][b, me] == 0 else -1
+		attacks = 1 + int(units["extra_attacks"][b, me])
+		for u in range(x["u_count"].shape[1]):
+			for shooting, legal in ((True, x["m_shoot_target"][b, u]), (False, x["m_melee_target"][b, u])):
+				if not legal:
+					continue
+				name = "shot" if shooting else "melee"
+				dealt = min(attacks * (x[f"p_{name}_min"][b, me, u] + x[f"p_{name}_max"][b, me, u]) / 2, float(health[b, u]))
+				back = 0.0 if shooting else min(float(x["p_melee_min"][b, u, me] + x["p_melee_max"][b, u, me]) / 2 * (1 - dealt / max(float(health[b, u]), 1)), float(health[b, me]))
+				value = sign * (dealt * float(price[b, u]) - back * float(price[b, me]))
+				if shooting:
+					x["a_shoot_value"][b, u] = round(value)
+				else:
+					x["a_melee_value"][b, u] = np.where(x["m_melee_from"][b, u], round(value), 0)
 	return x
 
 

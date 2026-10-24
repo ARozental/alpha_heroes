@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 VCMI_LIB_NAMESPACE_BEGIN
 class BattleAction;
@@ -40,6 +41,23 @@ public:
 	~BattleSimulation();
 
 	const CBattleInfoCallback & battle() const;
+	const CGameState & gameState() const;
+	int battleId() const { return battleNumber; }
+
+	/// Puts battle battleID of game (the battle this simulation was copied from, in any later state) back in place of
+	/// this simulation's battle, and clears the end of the battle. Much cheaper than a new copy: the game state around
+	/// the battle (heroes, armies) stays, which is right as long as the actions in between change only the battle
+	/// (attacks; not hero spells, which spend mana).
+	void restoreBattle(const CGameState & game, const BattleID & battleID);
+
+	/// Dice for an expected outcome instead of random ones: every damage roll and other uniform draw at its middle,
+	/// a binomial at its mean, and the luck, morale and creature ability rolls as `script` says, in the order they
+	/// come (past its end: no success). Each roll's chance of success is kept (rollChances), so that a caller can
+	/// weight the outcome and try the other branches. An empty optional: random dice again.
+	void scriptDice(std::optional<std::vector<bool>> script);
+	/// The chances of success of the scripted rolls made since scriptDice, and what each one rolled
+	const std::vector<double> & rollChances() const;
+	const std::vector<bool> & rollOutcomes() const;
 
 	/// Plays an action the way the server does when player sends it: the rules apply it (or reject it: false,
 	/// see complaint()), then, unless the battle ended, the next unit is activated (morale, new round, ...)

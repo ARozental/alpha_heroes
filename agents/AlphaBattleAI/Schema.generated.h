@@ -6,8 +6,8 @@
 
 namespace AlphaSchema
 {
-constexpr int SCHEMA_VERSION = 10;
-constexpr const char * CONTRACT_HASH = "aefe4c5c84e0ac89";
+constexpr int SCHEMA_VERSION = 11;
+constexpr const char * CONTRACT_HASH = "698eb70741fcf68a";
 
 constexpr int N_HEXES = 187;
 constexpr int FIELD_WIDTH = 17;
@@ -84,6 +84,9 @@ enum class In : int
 	g_hero_can_cast,
 	g_gate_state,
 	g_creature_spell,
+	g_surrender_cost,
+	g_start_army,
+	g_start_mana,
 	u_present,
 	u_alive,
 	u_creature,
@@ -109,6 +112,7 @@ enum class In : int
 	u_defending,
 	u_is_clone,
 	u_is_summoned,
+	u_kept,
 	u_queue_now,
 	u_queue_next,
 	u_effect_id,
@@ -146,6 +150,12 @@ enum class In : int
 	s_hex_value,
 	c_unit_value,
 	c_hex_value,
+	a_melee_value,
+	a_shoot_value,
+	p_melee_min,
+	p_melee_max,
+	p_shot_min,
+	p_shot_max,
 	COUNT
 };
 
@@ -158,6 +168,9 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"g_hero_can_cast", DType::INT64, 0, {0, 0}, 0},
 	TensorSpec{"g_gate_state", DType::INT64, 0, {0, 0}, 0},
 	TensorSpec{"g_creature_spell", DType::INT64, 0, {0, 0}, -1},
+	TensorSpec{"g_surrender_cost", DType::INT64, 0, {0, 0}, -1},
+	TensorSpec{"g_start_army", DType::INT64, 1, {2, 0}, 0},
+	TensorSpec{"g_start_mana", DType::INT64, 1, {2, 0}, 0},
 	TensorSpec{"u_present", DType::INT64, 1, {20, 0}, 0},
 	TensorSpec{"u_alive", DType::INT64, 1, {20, 0}, 0},
 	TensorSpec{"u_creature", DType::INT64, 1, {20, 0}, -1},
@@ -183,6 +196,7 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"u_defending", DType::INT64, 1, {20, 0}, 0},
 	TensorSpec{"u_is_clone", DType::INT64, 1, {20, 0}, 0},
 	TensorSpec{"u_is_summoned", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"u_kept", DType::INT64, 1, {20, 0}, 0},
 	TensorSpec{"u_queue_now", DType::INT64, 1, {20, 0}, -1},
 	TensorSpec{"u_queue_next", DType::INT64, 1, {20, 0}, -1},
 	TensorSpec{"u_effect_id", DType::INT64, 2, {20, 8}, -1},
@@ -220,6 +234,12 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"s_hex_value", DType::INT64, 2, {70, 187}, 0},
 	TensorSpec{"c_unit_value", DType::INT64, 1, {20, 0}, 0},
 	TensorSpec{"c_hex_value", DType::INT64, 1, {187, 0}, 0},
+	TensorSpec{"a_melee_value", DType::INT64, 2, {20, 187}, 0},
+	TensorSpec{"a_shoot_value", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"p_melee_min", DType::INT64, 2, {20, 20}, 0},
+	TensorSpec{"p_melee_max", DType::INT64, 2, {20, 20}, 0},
+	TensorSpec{"p_shot_min", DType::INT64, 2, {20, 20}, 0},
+	TensorSpec{"p_shot_max", DType::INT64, 2, {20, 20}, 0},
 }};
 
 enum class Out : int

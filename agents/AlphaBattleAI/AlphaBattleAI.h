@@ -2,6 +2,7 @@
 
 #include "lib/callback/CBattleGameInterface.h"
 
+#include "AttackValues.h"
 #include "BattleSim.h"
 #include "Dump.h"
 #include "Encoder.h"
@@ -120,6 +121,7 @@ class AlphaBattleAI : public CBattleGameInterface
 		int searchChanged = 0; // the search played another action than the network's most likely one
 		int searchEvaluations = 0;
 		double searchMs = 0, searchCopyMs = 0, searchEncodeMs = 0, searchModelMs = 0, searchApplyMs = 0;
+		AttackValueStats attackValues;
 	} stats;
 
 	int searchSimulations = 0;

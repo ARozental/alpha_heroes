@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AttackValues.h"
 #include "BattleSim.h"
 #include "GumbelSearch.h"
 #include "Reward.h"
@@ -65,6 +66,7 @@ private:
 	const BattleModel & model;
 	const Environment & env;
 	AlphaReward::BattleEnd start;
+	AttackValueStats attackValues;
 	int roundCap;
 
 	const CStack * active(const State & s) const;

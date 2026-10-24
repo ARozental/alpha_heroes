@@ -91,14 +91,37 @@ CREATURE_TABLES = {
 }
 
 
+# The creature abilities (VCMI bonus types) of the vocabulary that some creatures have and others do not (every one
+# has damage, primary skills, speed and health): one learned embedding each in the model's unit tokens (an ability
+# learned on one creature carries over to every creature with it). Fixed here, so that the model's shape does not
+# change with the vocabulary; abilities not listed are left out.
+ABILITIES = (
+	"ACID_BREATH", "ADDITIONAL_ATTACK", "ADDITIONAL_RETALIATION", "ATTACKS_ALL_ADJACENT", "BLOCKS_RANGED_RETALIATION",
+	"BLOCKS_RETALIATION", "CASTS", "CATAPULT", "CATAPULT_EXTRA_SHOTS", "CHANGES_SPELL_COST_FOR_ALLY",
+	"CHANGES_SPELL_COST_FOR_ENEMY", "CHARGE_IMMUNITY", "CPU_CONTROLLED", "CREATURE_ENCHANT_POWER",
+	"CREATURE_SPELL_POWER", "DEATH_STARE", "DOUBLE_DAMAGE_CHANCE", "DRAGON_NATURE", "ENCHANTER",
+	"ENEMY_DEFENCE_REDUCTION", "FEARFUL", "FIRE_SHIELD", "FLYING", "GARGOYLE", "HATE", "HEALER", "HP_REGENERATION",
+	"JOUSTING", "KING", "LEVEL_SPELL_IMMUNITY", "LIFE_DRAIN", "LIVING", "LUCK", "MAGIC_MIRROR", "MAGIC_RESISTANCE",
+	"MANA_CHANNELING", "MANA_DRAIN", "MIND_IMMUNITY", "MORALE", "MORE_DAMAGE_FROM_SPELL", "NON_LIVING", "NOT_ACTIVE",
+	"NO_DISTANCE_PENALTY", "NO_LUCK", "NO_MELEE_PENALTY", "NO_TERRAIN_PENALTY", "NO_WALL_PENALTY",
+	"RANDOM_SPELLCASTER", "REBIRTH", "RETURN_AFTER_STRIKE", "SHOOTER", "SHOTS", "SIEGE_WEAPON",
+	"SKELETON_TRANSFORMER_TARGET", "SPECIAL_CRYSTAL_GENERATION", "SPECIFIC_SPELL_POWER", "SPELLCASTER",
+	"SPELL_AFTER_ATTACK", "SPELL_DAMAGE_REDUCTION", "SPELL_IMMUNITY", "SPELL_LIKE_ATTACK", "SPELL_RESISTANCE_AURA",
+	"SPELL_SCHOOL_IMMUNITY", "THREE_HEADED_ATTACK", "TWO_HEX_ATTACK_BREATH", "UNDEAD", "UNLIMITED_RETALIATIONS",
+	"VISIONS",
+)
+
+
 def creature_tables(path=vocab.VOCAB_PATH):
 	"""Per creature id, from the vocabulary: its value in gold (reward.py prices) and the abilities the rules use
-	(CREATURE_TABLES), [CREATURE_VOCAB + 1] each; and "hate": [attacker, target] its HATE percentage.
+	(CREATURE_TABLES), [CREATURE_VOCAB + 1] each; "hate": [attacker, target] its HATE percentage; and "abilities":
+	[creature, ABILITIES] 1 where it has the ability.
 
 	The last row (and every row without a vocabulary) is a creature worth 0 with no abilities.
 	"""
 	tables = {name: torch.zeros(CREATURE_VOCAB + 1, dtype=dtype) for name, (dtype, _) in CREATURE_TABLES.items()}
 	tables["hate"] = torch.zeros(CREATURE_VOCAB + 1, CREATURE_VOCAB + 1, dtype=torch.int64)
+	tables["abilities"] = torch.zeros(CREATURE_VOCAB + 1, len(ABILITIES))
 	if not path.exists():
 		return tables
 	for row in vocab.tables(path)["creatures"].values():
@@ -108,6 +131,9 @@ def creature_tables(path=vocab.VOCAB_PATH):
 			for target, percent in row.get("ability_values", {}).get("HATE", ()):
 				if 0 <= target < CREATURE_VOCAB:
 					tables["hate"][row["id"], target] += percent
+			for ability in row.get("abilities", ()):
+				if ability in ABILITIES:
+					tables["abilities"][row["id"], ABILITIES.index(ability)] = 1.0
 	return tables
 
 

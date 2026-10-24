@@ -299,6 +299,7 @@ class BattleModelV2(nn.Module):
 			b = F.read_battle(x, self.tables())
 			reach, to_enemy = F.distance_maps(b)
 			maps, can_attack = F.threat_maps(b, reach, to_enemy)
+			outcomes = F.outcome_features(b)
 			return {
 				"melee": F.attack_features(b, shooting=False),
 				"shot": F.attack_features(b, shooting=True),
@@ -306,7 +307,8 @@ class BattleModelV2(nn.Module):
 				"can_attack": can_attack,
 				"stack": F.stack_features(b),
 				"summaries": F.unit_summaries(b, can_attack),
-				"battle": F.battle_features(b, maps),
+				"battle": F.battle_features(b, maps, outcomes),
+				"outcomes": outcomes,
 			}
 
 	def forward(self, x, facts=None):
@@ -315,7 +317,7 @@ class BattleModelV2(nn.Module):
 		heroes, hero_valid = self.heroes(b)
 		units, unit_valid = self.units(b, facts)
 		context, units, hexes = self.trunk(b, self.battle(b, facts), heroes, units, self.hexes(b, facts), hero_valid, unit_valid)
-		actions = F.action_features(b, facts["melee"], facts["shot"], facts["maps"], facts["can_attack"], facts["battle"])
+		actions = F.action_features(b, facts["melee"], facts["shot"], facts["maps"], facts["can_attack"], facts["battle"], facts["outcomes"])
 		return {**self.actions(context, units, hexes, actions, x), **self.values(context)}
 
 	def set_rule_weights(self, head, **weights):

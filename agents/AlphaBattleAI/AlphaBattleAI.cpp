@@ -1,5 +1,6 @@
 #include "StdInc.h"
 #include "AlphaBattleAI.h"
+#include "AttackValues.h"
 
 #include "BattleSearch.h"
 #include "Dump.h"
@@ -285,6 +286,11 @@ void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br
 		types += std::to_string(stats.types[t]) + (t + 1 < N_ACTION_TYPES ? "," : "");
 	const auto & st = stats.spellTargets;
 	logAi->info("AlphaBattleAI: battle summary: decisions=%d fallbacks=%d errors=%d types=[%s] spell_targets(none,unit,hex,two)=[%d,%d,%d,%d] siege=%d walls=%d server_rejections=%d presend_rejections=%d faults=%d avg_model_ms=%.2f", stats.decisions, stats.fallbacks, stats.errors, types, st[0], st[1], st[2], st[3], stats.siege, stats.walls, stats.serverRejections, stats.preSendRejections, stats.faultsInjected, stats.decisions ? stats.modelMs / stats.decisions : 0.0);
+	{
+		const auto & av = stats.attackValues;
+		const double n = std::max(1, av.calls);
+		logAi->info("AlphaBattleAI: attack values: decisions=%d avg_attacks=%.1f avg_played=%.1f avg_runs=%.1f avg_ms=%.2f", av.calls, av.attacks / n, av.played / n, av.runs / n, av.ms / n);
+	}
 	if(searchSimulations > 0)
 	{
 		const double n = std::max(1, stats.searched);
@@ -349,7 +355,8 @@ void AlphaBattleAI::activeStack(const BattleID & battleID, const CStack * stack)
 		if(record)
 		{
 			const auto player = cb->getPlayerID().value_or(PlayerColor::NEUTRAL);
-			delegatePending = std::make_unique<EncodedBattle>(encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(battle->battleGetMySide())]));
+			delegatePending = std::make_unique<EncodedBattle>(encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(battle->battleGetMySide())], battleStartValues));
+			encodeAttackValues(*delegatePending, env->game()->gameState(), battleID, player, stats.attackValues);
 			delegateStack = stack->unitId();
 		}
 		fallback->activeStack(battleID, stack);
@@ -399,7 +406,8 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 	for(int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt)
 	{
 		const auto start = std::chrono::steady_clock::now();
-		auto encoded = encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(battle->battleGetMySide())]);
+		auto encoded = encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(battle->battleGetMySide())], battleStartValues);
+		encodeAttackValues(encoded, env->game()->gameState(), battleID, player, stats.attackValues);
 		for(const auto & action : rejected)
 			excludeAction(encoded, action);
 		if(!encoded.tensors.any(In::m_type))

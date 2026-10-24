@@ -59,7 +59,7 @@ def test_spell_features_are_our_gain_and_against_the_best_target(our_side):
 	x = lightning_battle(our_side)
 	b = F.read_battle(x, BattleModel().tables())
 	spell = F.spell_features(b)["spell_unit"][0]  # [S, U, features]
-	net, versus, changes = (spell[..., F.SPELL_FEATURES.index(n)] for n in F.SPELL_FEATURES)
+	net, versus, changes = (spell[..., F.SPELL_FEATURES.index(n)] for n in ("net_value", "versus_best", "changes_health"))
 	sign = 1 if our_side == 0 else -1
 	assert torch.sign(net[LIGHTNING_BOLT, 1]) == sign and torch.sign(net[LIGHTNING_BOLT, 0]) == -sign
 	# against the largest gain or loss at any target: the attacker's best bolt is the best of all (1), the defender's
@@ -95,3 +95,86 @@ def test_our_frame_counts_columns_from_our_starting_side():
 	attacker = F.our_frame(hexes, torch.tensor([0]))[0, :, 0]
 	defender = F.our_frame(hexes, torch.tensor([1]))[0, :, 0]
 	assert torch.allclose(attacker, torch.tensor([1 / 16, 15 / 16])) and torch.allclose(defender, torch.tensor([15 / 16, 1 / 16]))
+
+
+# ---- v11: what the engine predicts, what ending the battle now would score, abilities, scales ----
+
+
+def ending_battle(our_side, cost=1000):
+	"""Angels x2 (attacker) against Devils x3, both heroes with mana; 30 000 and 40 000 gold of armies at the start."""
+	x = battle([("Angel", 2, 0, 86, 20, 20), ("Devil", 3, 1, 100, 10, 10)], our_side=our_side)
+	x["u_kept"][0, :2] = x["u_count"][0, :2]
+	x["g_start_army"][0] = (30_000, 40_000)
+	x["g_start_mana"][0] = (20, 10)
+	x["h_present"][0], x["h_power"][0], x["h_mana"][0] = (1, 1), (3, 2), (12, 10)
+	x["g_surrender_cost"][0] = cost
+	return x
+
+
+@pytest.mark.parametrize("our_side", (0, 1))
+def test_ending_now_scores_as_the_reward_would(our_side):
+	"""score_now, retreat_reward and surrender_reward are reward.py's zero-sum on the assets summarize() counts."""
+	from battle_model.reward import HERO_HIRE_COST, Outcome, assets_after, mana_value, zero_sum
+
+	x = ending_battle(our_side)
+	b = F.read_battle(tensors(x), BattleModel().tables())
+	got = dict(zip(F.OUTCOME_FEATURES, F.outcome_features(b)[0].tolist()))
+	army = [2 * vocab.creature_value(int(x["u_creature"][0, 0])), 3 * vocab.creature_value(int(x["u_creature"][0, 1]))]
+	mana = [mana_value(12, 3), mana_value(10, 2)]
+	start = [30_000 + mana_value(20, 3), 40_000 + mana_value(10, 2)]
+	us, them = our_side, 1 - our_side
+	expect = {
+		"score_now": zero_sum(start[us], army[us] + mana[us], start[them], army[them] + mana[them]),
+		"retreat_reward": zero_sum(start[us], assets_after(Outcome.RETREAT, army[us], 0, mana[us]), start[them], army[them] + mana[them]),
+		"surrender_reward": zero_sum(start[us], assets_after(Outcome.SURRENDER, army[us], 0, mana[us], 1000), start[them], army[them] + mana[them]),
+	}
+	assert got == pytest.approx(expect, abs=1e-5)
+	assert expect["surrender_reward"] > expect["retreat_reward"]  # paying 1000 + rehire keeps the Angels
+	x = ending_battle(our_side, cost=-1)  # cannot surrender
+	assert F.outcome_features(F.read_battle(tensors(x), BattleModel().tables()))[0, 2] == 0
+
+
+@pytest.mark.parametrize("our_side", (0, 1))
+def test_attack_values_are_our_gain_and_the_best_hex_scores_zero(our_side):
+	"""a_* are attacker minus defender, like s_*: our gain either way; from-hex values against the target's best hex."""
+	them = 1 - our_side
+	x = battle([("Champion", 2, our_side, 86, 16, 16), ("Devil", 1, them, 88, 26, 28), ("Imp", 5, them, 70, 3, 3)], our_side=our_side)
+	sign = 1 if our_side == 0 else -1
+	x["m_melee_target"][0, 1] = True
+	x["m_melee_from"][0, 1, [87, 104]] = True
+	x["a_melee_value"][0, 1, 87], x["a_melee_value"][0, 1, 104] = 900 * sign, 1200 * sign  # jousting: a longer charge
+	x["m_shoot_target"][0, 2] = True
+	x["a_shoot_value"][0, 2] = -300 * sign
+	finalize_masks(x, 0)
+	b = F.read_battle(tensors(x), BattleModel().tables())
+	melee, shot = F.attack_features(b, False), F.attack_features(b, True)
+	net = F.ATTACK_FEATURES.index("net_value")
+	assert melee[0, 1, net] > 0 and shot[0, 2, net] < 0
+	assert torch.isclose(melee[0, 1, F.ATTACK_FEATURES.index("versus_best")], torch.tensor(1.0))
+	maps, can = F.threat_maps(b, *F.distance_maps(b))
+	outcomes = F.outcome_features(b)
+	actions = F.action_features(b, melee, shot, maps, can, F.battle_features(b, maps, outcomes), outcomes)
+	hex_value = actions["melee_from"][0, 1, :, F.FROM_FEATURES.index("hex_value")]
+	assert hex_value[104] == 0 and hex_value[87] < 0
+
+
+def test_the_damage_factor_is_the_formulas():
+	"""+5% a point of attack over defence up to +400%, -2.5% a point under it down to -70%."""
+	f = F.damage_factor(torch.tensor([0, 10, 80, 200, -10, -28, -100]))
+	assert torch.allclose(f.exp(), torch.tensor([1.0, 1.5, 5.0, 5.0, 0.75, 0.3, 0.3]))
+
+
+def test_abilities_are_shared_between_creatures():
+	from battle_model.rules import ABILITIES, creature_tables
+
+	tables = creature_tables()["abilities"]
+	ids = {vocab.name("creatures", i): i for i in range(150)}
+	assert tables[ids["Champion"], ABILITIES.index("JOUSTING")] == 1 and tables[ids["Cavalier"], ABILITIES.index("JOUSTING")] == 1
+	assert tables[ids["Efreet Sultan"], ABILITIES.index("FIRE_SHIELD")] == 1 and tables[ids["Imp"], ABILITIES.index("FIRE_SHIELD")] == 0
+	assert tables[ids["Cerberus"], ABILITIES.index("THREE_HEADED_ATTACK")] == 1
+
+
+def test_multi_scale_features_tell_small_numbers_apart_and_do_not_saturate():
+	"""4 and 10 mana differ as much as 400 and 1000 do, somewhere among the scales."""
+	small, large = F.scales(torch.tensor([4.0, 10.0]), F.MANA_SCALES), F.scales(torch.tensor([400.0, 1000.0]), F.MANA_SCALES)
+	assert (small[1] - small[0]).max() > 0.2 and (large[1] - large[0]).max() > 0.1
