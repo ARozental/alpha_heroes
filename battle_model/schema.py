@@ -108,7 +108,7 @@ INPUTS = (
 	_i("h_spells", (N_SIDES, S), "1 if the spell is in the spellbook; all 0 for the enemy hero (hidden from a player)"),
 	_i("h_level", (N_SIDES,), "hero level; 0 for the enemy hero (a player's view of an enemy hero, InfoAboutHero, has no level)"),
 	_i("h_level_progress", (N_SIDES,), "of the way from its level to the next, in thousandths; 0 for the enemy hero (its experience is hidden)"),
-	_i("h_artifacts", (N_SIDES,), "market price in gold of the artifacts a winner would take from the hero (reward.py); 0 for the enemy hero (hidden)"),
+	_i("h_artifacts", (N_SIDES,), "market price in gold of the artifacts a winner would take from the hero (reward.py; not war machines); 0 for the enemy hero (hidden)"),
 	# Hexes, BattleHex index 0..186
 	_i("x_access", (H,), "EAccessibility"),
 	_i("x_obstacle_type", (H,), "EObstacleType of an obstacle on the hex, -1 if none", fill=-1),

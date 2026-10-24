@@ -30,12 +30,12 @@ def everything(x):
 	maps, can = F.threat_maps(b, reach, to_enemy)
 	melee, shot = F.attack_features(b, False), F.attack_features(b, True)
 	outcomes = F.outcome_features(b)
-	battle_features = F.battle_features(b, maps, outcomes)
+	battle_features = F.battle_features(b, maps)
 	out = {}
 	for names, values in ((F.STACK_FEATURES, F.stack_features(b)), (F.ATTACK_FEATURES, melee), (F.ATTACK_FEATURES, shot), (F.HEX_FEATURES, maps), (F.SUMMARY_FEATURES, F.unit_summaries(b, can)), (F.BATTLE_FEATURES, battle_features), (F.OUTCOME_FEATURES, outcomes)):
 		for i, name in enumerate(names):
 			out.setdefault(name, []).append(values[..., i].flatten())
-	actions = F.action_features(b, melee, shot, maps, can, battle_features, outcomes)
+	actions = F.action_features(b, melee, shot, maps, can, battle_features)
 	for name, names in (("melee_from", F.FROM_FEATURES), ("move", F.MOVE_FEATURES), ("type", F.TYPE_FEATURES)):
 		for i, n in enumerate(names):
 			out.setdefault(n, []).append(actions[name][..., i].flatten())
@@ -98,7 +98,7 @@ def test_each_action_scores_its_own_logit():
 		b = F.read_battle(t, model.tables())
 		maps, can = F.threat_maps(b, *F.distance_maps(b))
 		outcomes = F.outcome_features(b)
-		actions = F.action_features(b, F.attack_features(b, False), F.attack_features(b, True), maps, can, F.battle_features(b, maps, outcomes), outcomes)
+		actions = F.action_features(b, F.attack_features(b, False), F.attack_features(b, True), maps, can, F.battle_features(b, maps))
 		rules = model.actions.rules
 		from_logits = (actions["melee_from"] * rules["melee_from"].linear).sum(-1)
 		target_logits = (actions["melee_target"] * rules["melee_target"].linear).sum(-1) + best_of(from_logits, t["m_melee_from"])

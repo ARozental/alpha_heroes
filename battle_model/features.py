@@ -591,14 +591,18 @@ def can_attack_at_units(b, can_attack):
 
 # ---- The battle ----
 
-BATTLE_FEATURES = ("strength", *(f"round_{c}" for c in COUNT_SCALES), "tactics", "hero_can_cast", "danger_here", "threat_here", "my_share", "score_now")
+BATTLE_FEATURES = ("strength", *(f"round_{c}" for c in COUNT_SCALES), "tactics", "hero_can_cast", "danger_here", "threat_here", "my_share")
 
 
-def battle_features(b, maps, outcomes):
+def battle_features(b, maps):
 	"""[B, len(BATTLE_FEATURES)]: our army's value against both (0.5 even), the round at several scales, the tactics
 	phase (of 7 columns, the most the Tactics skill gives: a fixed scale on purpose), whether our hero may cast, the
-	acting unit's danger and threat where it stands, its share of our army's value, and the reward if the battle were
-	scored now (outcome_features)."""
+	acting unit's danger and threat where it stands, its share of our army's value.
+
+	Not the score if the battle ended now (the zero-sum on the assets as they stand): given to the whole model (v11),
+	the value heads took it as the answer, and the defence learned to run from every fight, which delays its losses
+	in that score but loses the battle all the same (seed 2: it killed 20% of the attacker instead of 60%; without it
+	73%, 2026-10-24)."""
 	here = b.me["hex"].clamp(min=0)[:, :, None].expand(-1, -1, maps.shape[-1])
 	at_my_hex = maps.gather(1, here)[:, 0]  # [B, HEX_FEATURES]
 	return torch.cat([
@@ -610,24 +614,21 @@ def battle_features(b, maps, outcomes):
 			at_my_hex[:, HEX_FEATURES.index("danger")],
 			at_my_hex[:, HEX_FEATURES.index("threat_value")],
 			b.mine(value_in_army(b)),
-			outcomes[:, OUTCOME_FEATURES.index("score_now")],
 		], dim=-1),
 	], dim=-1)
 
 
 # ---- What ending the battle now would score ----
 
-OUTCOME_FEATURES = ("score_now", "retreat_reward", "surrender_reward", "hero_stake")
+OUTCOME_FEATURES = ("retreat_reward", "surrender_reward")
 
 
 def outcome_features(b, config=None):
-	"""[B, len(OUTCOME_FEATURES)], each -1..1: the reward (reward.py, zero-sum, from each side's assets) of
-	score_now         the battle scored as it stands (round_score: both heroes there, the armies they would keep)
+	"""[B, len(OUTCOME_FEATURES)], each -1..1, for the RETREAT and SURRENDER logits only: the exact reward (reward.py,
+	zero-sum, from each side's assets) of
 	retreat_reward    our retreating now: our army is lost, the enemy wins with what it has
 	surrender_reward  our surrendering now: we keep the army and pay the surrender cost and the hero's rehire (0 when we
 	                  cannot surrender: the mask forbids it anyway)
-	hero_stake        what our hero is worth (reward.hero_asset: levels and artifacts), of both sides' assets at the
-	                  start: what losing the battle costs on top of the army, and what retreating or surrendering keeps
 	Assets as summarize() counts them: the kept creatures (u_kept) at their value, mana at mana_value x spell power,
 	heroes as reward.hero_asset; the enemy hero's level and artifacts are hidden (0 in the inputs), so its hero counts 0
 	here (the true reward counts it)."""
@@ -656,9 +657,7 @@ def outcome_features(b, config=None):
 	own_hero = pick(hero, our)
 	cost = x["g_surrender_cost"].float()
 	surrender = zero_sum(pick(army, our) + own_hero + pick(mana, our) - cost.clamp(min=0) - HERO_HIRE_COST, enemy_end) * (cost >= 0)
-	now = zero_sum(pick(army, our) + own_hero + pick(mana, our), enemy_end)
-	stake = fraction(own_hero, own_start + enemy_start)
-	return torch.stack([now, zero_sum(own_hero + pick(mana, our), enemy_end), surrender, stake], dim=-1)
+	return torch.stack([zero_sum(own_hero + pick(mana, our), enemy_end), surrender], dim=-1)
 
 
 def hero_levels(x):
@@ -680,10 +679,10 @@ def hero_assets(x, config):
 MOVE_FEATURES = ("threat_change", "melee_threat_change", "danger_change", "blocked_change", "new_targets", "allies_next_to_change", "enemies_next_to_change", "progress", "shooter_progress", "shooter_next_to_enemy")
 FROM_FEATURES = (*MOVE_FEATURES[:7], "hex_value", *HIT_FEATURES)
 SHOT_FEATURES = tuple(f for f in ATTACK_FEATURES if f not in ("retaliation", "value_lost"))
-TYPE_FEATURES = ("danger_here", "threat_here", "strength", *OUTCOME_FEATURES)
+TYPE_FEATURES = ("danger_here", "threat_here", "strength")
 
 
-def action_features(b, melee, shot, maps, can_attack, battle, outcomes):
+def action_features(b, melee, shot, maps, can_attack, battle):
 	"""Each action's own features, in the shape of its logits:
 
 	melee_target [B, U, ATTACK_FEATURES]
@@ -718,13 +717,12 @@ def action_features(b, melee, shot, maps, can_attack, battle, outcomes):
 	hex_value = ((melee_values - best_hex) * legal).clamp(-1, 0)
 	hit = hits(b.x["a_melee_enemies"], b.x["a_melee_allies"]) * legal[..., None]
 	melee_from = torch.cat([(threat_after - here("threat_value")[..., None])[..., None], per_target[..., 1:], hex_value[..., None], hit], dim=-1)
-	type_features = torch.cat([pick(TYPE_FEATURES[:3], battle, BATTLE_FEATURES), outcomes], dim=-1)
 	return {
 		"melee_target": melee,
 		"melee_from": melee_from,
 		"shoot_target": pick(SHOT_FEATURES, shot, ATTACK_FEATURES),
 		"move": hexes,
-		"type": type_features,
+		"type": pick(TYPE_FEATURES, battle, BATTLE_FEATURES),
 	}
 
 

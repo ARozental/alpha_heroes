@@ -114,7 +114,7 @@ def ending_battle(our_side, cost=1000):
 
 @pytest.mark.parametrize("our_side", (0, 1))
 def test_ending_now_scores_as_the_reward_would(our_side):
-	"""score_now, retreat_reward and surrender_reward are reward.py's zero-sum on the assets summarize() counts."""
+	"""retreat_reward and surrender_reward are reward.py's zero-sum on the assets summarize() counts."""
 	from battle_model.reward import Outcome, assets_after, hero_asset, mana_value, zero_sum
 
 	x = ending_battle(our_side)
@@ -128,15 +128,13 @@ def test_ending_now_scores_as_the_reward_would(our_side):
 	start = [30_000 + hero[0] + mana_value(20, 3), 40_000 + hero[1] + mana_value(10, 2)]
 	theirs = army[them] + hero[them] + mana[them]
 	expect = {
-		"score_now": zero_sum(start[us], army[us] + hero[us] + mana[us], start[them], theirs),
 		"retreat_reward": zero_sum(start[us], assets_after(Outcome.RETREAT, army[us], hero[us], mana[us]), start[them], theirs),
 		"surrender_reward": zero_sum(start[us], assets_after(Outcome.SURRENDER, army[us], hero[us], mana[us], 1000), start[them], theirs),
-		"hero_stake": hero[us] / (start[0] + start[1]),
 	}
 	assert got == pytest.approx(expect, abs=1e-5)
 	assert expect["surrender_reward"] > expect["retreat_reward"]  # paying 1000 + rehire keeps the Angels
 	x = ending_battle(our_side, cost=-1)  # cannot surrender
-	assert F.outcome_features(F.read_battle(tensors(x), BattleModel().tables()))[0, 2] == 0
+	assert F.outcome_features(F.read_battle(tensors(x), BattleModel().tables()))[0, 1] == 0
 
 
 @pytest.mark.parametrize("our_side", (0, 1))
@@ -158,7 +156,7 @@ def test_attack_values_are_our_gain_and_the_best_hex_scores_zero(our_side):
 	assert torch.isclose(melee[0, 1, F.ATTACK_FEATURES.index("versus_best")], torch.tensor(1.0))
 	maps, can = F.threat_maps(b, *F.distance_maps(b))
 	outcomes = F.outcome_features(b)
-	actions = F.action_features(b, melee, shot, maps, can, F.battle_features(b, maps, outcomes), outcomes)
+	actions = F.action_features(b, melee, shot, maps, can, F.battle_features(b, maps))
 	hex_value = actions["melee_from"][0, 1, :, F.FROM_FEATURES.index("hex_value")]
 	assert hex_value[104] == 0 and hex_value[87] < 0
 
@@ -198,3 +196,12 @@ def test_grouped_units_see_their_neighbours():
 	maps, _ = F.threat_maps(b, *F.distance_maps(b))
 	near = maps[0, :, F.HEX_FEATURES.index("allies_next_to")]
 	assert near[88] > 0 and near[100] == 0  # next to the Pikemen (87), and nowhere near anyone
+
+
+def test_escapes_are_about_never_unless_we_are_much_weaker():
+	"""The escapes' prior bias (-6) holds while the armies are about even and lifts when the enemy is far stronger."""
+	from battle_model import priors
+
+	relief = lambda ratio: float(priors.escape_relief(torch.tensor(np.log(ratio))))
+	assert relief(1.0) < 0.02 and relief(4.0) < 0.02 and relief(1 / 4) < 0.2  # even, stronger, the enemy 2x our army
+	assert relief(1 / 25) > 0.85  # the enemy 5x our army: about as likely as waiting

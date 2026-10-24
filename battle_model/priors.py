@@ -36,6 +36,20 @@ def action_types():
 	return biases("action_types.csv", N_ACTION_TYPES)
 
 
+# RETREAT and SURRENDER start at about never (action_types.csv: -6), and that bias lifts as our side gets much weaker:
+# by escape_relief(z) of it, z the log of our health x damage per round over the enemy's (features.side_strengths,
+# all units; Lanchester's square law: an army twice the size has 4x). Even or stronger, it stays ~-6; at 2x the enemy's
+# army ~-5; at 3x (9x) half (-3); at 5x (25x) ~-0.7, about as likely as waiting. Considered then, never forced; the
+# learned type head adds to it.
+ESCAPE_AT = -2.2  # log(1 / 9)
+ESCAPE_WIDTH = 0.5
+
+
+def escape_relief(z):
+	"""The share (0..1) of the escapes' bias lifted at strength log-ratio z (above)."""
+	return torch.sigmoid((ESCAPE_AT - z) / ESCAPE_WIDTH)
+
+
 def spells():
 	return biases("spells.csv", N_SPELLS)
 

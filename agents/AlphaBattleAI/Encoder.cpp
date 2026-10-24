@@ -709,12 +709,15 @@ double heroArtifacts(const CGHeroInstance * hero)
 	if(!hero)
 		return 0.0;
 	double price = 0;
+	// War machines left out: one destroyed in the battle is removed before the winner takes the rest, and the reward
+	// counts neither side's war machines (keptAfterBattle)
+	auto counts = [](const CArtifactInstance * art) { return art && art->getTypeId() != ArtifactID::GRAIL && art->getType()->getWarMachine() == CreatureID::NONE; };
 	for(const auto & slot : ArtifactUtils::commonWornSlots())
-		if(const auto worn = hero->artifactsWorn.find(slot); worn != hero->artifactsWorn.end() && ArtifactUtils::isArtRemovable(*worn))
+		if(const auto worn = hero->artifactsWorn.find(slot); worn != hero->artifactsWorn.end() && ArtifactUtils::isArtRemovable(*worn) && counts(worn->second.getArt()))
 			price += worn->second.getArt()->getType()->getPrice();
 	for(const auto & slot : hero->artifactsInBackpack)
-		if(const auto * art = slot.getArt(); art && art->getTypeId() != ArtifactID::GRAIL)
-			price += art->getType()->getPrice();
+		if(counts(slot.getArt()))
+			price += slot.getArt()->getType()->getPrice();
 	return price;
 }
 

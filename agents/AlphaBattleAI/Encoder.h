@@ -58,7 +58,7 @@ double creatureValue(const CCreature * creature);
 double heroLevel(const CGHeroInstance * hero);
 
 /// The market price in gold of the artifacts a winner takes from a defeated hero (BattleResultProcessor: its removable
-/// worn artifacts and its backpack, not the Grail); 0 without a hero
+/// worn artifacts and its backpack, not the Grail), war machines left out; 0 without a hero
 double heroArtifacts(const CGHeroInstance * hero);
 
 /// True for a unit the side keeps after the battle if it is alive then: its army's stacks and permanently summoned

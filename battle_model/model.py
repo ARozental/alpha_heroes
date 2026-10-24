@@ -346,6 +346,13 @@ class ActionHeads(nn.Module):
 		self.type_head = nn.Linear(dim, N_ACTION_TYPES)
 		self.type_rules = nn.Linear(len(F.TYPE_FEATURES), N_ACTION_TYPES, bias=False)
 		self.type_strength = nn.Linear(len(F.STRENGTH_VARIANTS), N_ACTION_TYPES, bias=False)  # the strength shares' log-odds
+		# The escapes: their exact reward now (features.outcome_features), one weight each, starting at 0; and their prior
+		# bias lifted when we are much weaker (priors.escape_relief)
+		self.escape_rules = nn.Parameter(torch.zeros(len(F.OUTCOME_FEATURES)))
+		escapes = torch.zeros(len(F.OUTCOME_FEATURES), N_ACTION_TYPES)
+		escapes[0, ActionType.RETREAT] = escapes[1, ActionType.SURRENDER] = 1.0
+		self.register_buffer("escape_types", escapes, persistent=False)  # [outcome feature, type]
+		self.register_buffer("escape_bias", -priors.action_types() * escapes.sum(dim=0), persistent=False)  # what relief lifts
 		self.spell_head = nn.Linear(dim, N_SPELLS)
 		self.spell_query = small_embedding(N_SPELLS, dim)
 		self.creature_spell_query = small_embedding(EFFECT_VOCAB + 1, dim)  # by the acting unit's spell
@@ -398,7 +405,7 @@ class ActionHeads(nn.Module):
 			out[head] = torch.cat([f[..., :best], versus[..., None], f[..., best + 1 :]], dim=-1)
 		return out
 
-	def forward(self, context, units, hexes, actions, x, strength):
+	def forward(self, context, units, hexes, actions, x, strength, outcomes, ratios):
 		scale = 1.0 / math.sqrt(context.shape[-1])
 		q = {name: layer(context) for name, layer in self.queries.items()}
 		k = self.keys
@@ -439,7 +446,9 @@ class ActionHeads(nn.Module):
 		#   TACTICS_*       (reserved) time spent, no value moved
 		#   HERO_SPELL      mana spent is destroyed, not won by the enemy (zero-sum prices it as a gain for them)
 		#   and outcomes behind any action: experience and Necromancy for the winner, Eagle Eye, more than two players
-		kind = self.type_head(context) + self.type_rules(actions["type"]) + self.type_strength(strength) + follow
+		relief = priors.escape_relief(ratios[:, F.STRENGTH_VARIANTS.index("all")].sum(dim=-1))  # [B]
+		escape = relief[:, None] * self.escape_bias + (outcomes * self.escape_rules) @ self.escape_types
+		kind = self.type_head(context) + self.type_rules(actions["type"]) + self.type_strength(strength) + follow + escape
 		return {
 			"logp_type": masked_log_softmax(kind, x["m_type"]),
 			"logp_move_hex": masked_log_softmax(move, x["m_move_hex"]),
@@ -495,7 +504,7 @@ class BattleModel(nn.Module):
 				"can_attack": can_attack,
 				"stack": F.stack_features(b),
 				"summaries": F.unit_summaries(b, can_attack),
-				"battle": F.battle_features(b, maps, outcomes),
+				"battle": F.battle_features(b, maps),
 				"outcomes": outcomes,
 				"strength": F.side_strengths(b),
 				**{f"spell:{k}": v for k, v in F.spell_features(b).items()},
@@ -509,9 +518,9 @@ class BattleModel(nn.Module):
 		glob, heroes, units, hexes = self.trunk(self.battle(b, facts), heroes, units, self.hexes(b, facts), hero_team, unit_team, x["h_present"] != 0, x["u_present"] != 0)
 		strength = self.strength(facts["strength"])
 		context = self.context(b, glob, heroes, units, strength)
-		actions = F.action_features(b, facts["melee"], facts["shot"], facts["maps"], facts["can_attack"], facts["battle"], facts["outcomes"])
+		actions = F.action_features(b, facts["melee"], facts["shot"], facts["maps"], facts["can_attack"], facts["battle"])
 		actions.update({k.split(":", 1)[1]: v for k, v in facts.items() if k.startswith("spell:")})
-		return {**self.actions(context, units, hexes, actions, x, strength), **self.values(context, self.value_strength(strength))}
+		return {**self.actions(context, units, hexes, actions, x, strength, facts["outcomes"], facts["strength"]), **self.values(context, self.value_strength(strength))}
 
 	def set_rule_weights(self, head, **weights):
 		"""Set a head's linear feature weights by name, e.g. set_rule_weights("melee_target", wipe_chance=2.0)."""
