@@ -169,7 +169,11 @@ def test_untrained_model_picks_types_with_the_prior_odds():
 	prior = np.array([ACTION_TYPE_PRIOR.get(ActionType(t), 0.0) for t in legal])
 	expected = np.exp(prior) / np.exp(prior).sum()
 	assert np.allclose(out["logp_type"][0, legal].exp().numpy(), expected, atol=1e-5)
-	assert np.allclose(out["value"].numpy(), 0.0)  # all heads start mid-range
+	# The round heads start mid-range; the final one at the strength prior, V = 2 share - 1 = tanh(z / 2), z the
+	# "all units" Lanchester share's log-odds (exponents 1: log health ratio + log damage ratio)
+	assert np.allclose(out["value"][:, :-1].numpy(), 0.0)
+	ratios = m.facts({k: torch.from_numpy(v) for k, v in x.items()})["strength"][:, 0]
+	assert np.allclose(out["value"][:, -1].numpy(), torch.tanh(ratios.sum(dim=-1) / 2).numpy(), atol=1e-6)
 
 
 def test_values_stay_in_the_unit_range():

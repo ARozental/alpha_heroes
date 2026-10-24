@@ -135,10 +135,11 @@ class ValueHeads(nn.Module):
 				head.weight.zero_()
 				head.bias.zero_()
 
-	def forward(self, context):
+	def forward(self, context, extra=None):
+		"""extra: [B, heads] added to each head's own logit (model.py: the side strengths' direct path)."""
 		logits, previous = [], None
 		for i, head in enumerate(self.heads):
-			logit = head(context).squeeze(-1)
+			logit = head(context).squeeze(-1) + (extra[:, i] if extra is not None else 0)
 			if previous is not None and i < len(self.heads) - 1:
 				logit = logit + (previous.detach() if self.boost_stop_gradient else previous)
 			logits.append(logit)

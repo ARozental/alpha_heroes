@@ -262,12 +262,23 @@ bool castAffects(const spells::Mechanics & mechanics, const battle::Target & tar
 	return std::find(affected.begin(), affected.end(), unit) != affected.end();
 }
 
+/// True if what the spell heals at this level only lasts the battle (basic Resurrection: its "healPower" is "oneBattle")
+bool healsForOneBattle(const CSpell & spell, int level)
+{
+	for(const auto & [name, effect] : spell.getLevelInfo(level).battleEffects.Struct())
+		if(effect["healPower"].String() == "oneBattle")
+			return true;
+	return false;
+}
+
 /// What a cast aimed at `aim` would do, as the engine predicts it: each affected unit's health change by every unit
 /// effect of the spell (UnitEffect::getHealthChange, the rules the cast itself uses), priced as the reward prices
-/// armies: hit points at the creature's value per hit point, raised or summoned creatures at their value, nothing
-/// for units the side does not keep after the battle. The value for the attacker minus for the defender, in gold.
-int64_t castValue(const CPlayerBattleCallback & battle, const spells::Mechanics & mechanics, const battle::Target & aim)
+/// armies: hit points at the creature's value per hit point, raised or summoned creatures at their value; nothing for
+/// units the side does not keep after the battle, nor for health that only lasts the battle (healsForOneBattle).
+/// The value for the attacker minus for the defender, in gold.
+int64_t castValue(const CPlayerBattleCallback & battle, const CSpell & spell, const spells::Mechanics & mechanics, const battle::Target & aim)
 {
+	const bool temporary = healsForOneBattle(spell, mechanics.getEffectLevel()); // the caster's mastery (getSpellLevel is the spell's circle)
 	const auto canonical = mechanics.canonicalizeTarget(aim);
 	double value = 0;
 	mechanics.forEachEffect([&](const spells::effects::Effect & effect)
@@ -290,7 +301,7 @@ int64_t castValue(const CPlayerBattleCallback & battle, const spells::Mechanics 
 			const double sign = stack->unitSide() == BattleSide::ATTACKER ? 1.0 : -1.0;
 			if(now.unitType != CreatureID::NONE && now.unitType != stack->creatureId()) // a new creature (Pit Lords' demons)
 				value += sign * units * creatureValue(now.unitType.toCreature());
-			else if(keptAfterBattle(stack))
+			else if(keptAfterBattle(stack) && !(temporary && hp > 0))
 				value += sign * hp * creatureValue(stack->unitType()) / std::max(1, static_cast<int>(stack->getMaxHealth()));
 		}
 		return false;
@@ -331,7 +342,7 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 				if(mechanics->canBeCastAt({battle::Destination(BattleHex(h))}))
 				{
 					t.set(In::m_spell_hex, s, h, 1);
-					t.set(In::s_hex_value, s, h, castValue(battle, *mechanics, {battle::Destination(BattleHex(h))}));
+					t.set(In::s_hex_value, s, h, castValue(battle, *spell, *mechanics, {battle::Destination(BattleHex(h))}));
 				}
 		}
 		else if(aims[0] == spells::AimType::CREATURE)
@@ -348,7 +359,7 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 					if(affects({first}, unit))
 					{
 						t.set(In::m_spell_unit, s, u, 1);
-						t.set(In::s_unit_value, s, u, castValue(battle, *mechanics, {first}));
+						t.set(In::s_unit_value, s, u, castValue(battle, *spell, *mechanics, {first}));
 					}
 					continue;
 				}
@@ -411,7 +422,7 @@ bool encodeCreatureSpellTargets(EncodedBattle & e, const CPlayerBattleCallback &
 			if(mechanics->canBeCastAt({battle::Destination(BattleHex(h))}))
 			{
 				t.set(In::m_creature_spell_hex, h, 1);
-				t.set(In::c_hex_value, h, castValue(battle, *mechanics, {battle::Destination(BattleHex(h))}));
+				t.set(In::c_hex_value, h, castValue(battle, *spell, *mechanics, {battle::Destination(BattleHex(h))}));
 				any = true;
 			}
 	}
@@ -421,7 +432,7 @@ bool encodeCreatureSpellTargets(EncodedBattle & e, const CPlayerBattleCallback &
 			if(e.units[u] && castAffects(*mechanics, {battle::Destination(e.units[u])}, e.units[u]))
 			{
 				t.set(In::m_creature_spell_unit, u, 1);
-				t.set(In::c_unit_value, u, castValue(battle, *mechanics, {battle::Destination(e.units[u])}));
+				t.set(In::c_unit_value, u, castValue(battle, *spell, *mechanics, {battle::Destination(e.units[u])}));
 				any = true;
 			}
 	}

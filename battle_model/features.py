@@ -577,3 +577,41 @@ def our_frame(hexes, our_side):
 	row = (hexes // 17).float() / 10
 	defender = (our_side.view(-1, *[1] * (hexes.dim() - 1)) == 1)
 	return torch.stack([torch.where(defender, 1 - column, column), row], dim=-1) * (hexes >= 0)[..., None]
+
+
+# ---- Each side's fighting strength ----
+
+STRENGTH_VARIANTS = ("all", "acts_this_round", "melee", "shooting")
+
+
+def side_strengths(b):
+	"""Lanchester's square law: in a fight of attrition, the side with the larger health x damage per round wins, and
+	our share of the fight is about (H D)_ours / ((H D)_ours + (H D)_theirs). Per variant, [B, variants, 2]: the logs of
+	our health over theirs and of our damage per round over theirs (each -10..10), so the model's share
+	sigmoid(a log H + b log D) has a learned exponent per term, starting at 1 (the law itself).
+
+	Health: the living units' hit points. Damage per round: each unit's engine-average damage (all its attacks, a shot
+	if it can shoot) on each living unit of the other side, capped at that unit's health and weighted by its share of
+	its side's health; summed over the variant's units: all, those still to act this round, melee units, shooters.
+	"""
+	attacker = {k: v[:, :, None] for k, v in b.units.items()}
+	target = {k: v[:, None, :] for k, v in b.units.items()}
+	average, _, _ = _average_damage(attacker, target, b.units["can_shoot"][:, :, None].expand(-1, -1, b.health.shape[1]), b.tables)
+	hp = b.health.float()
+	capped = torch.minimum(average, hp[:, None, :])  # [B, attacker, target]
+	ours, enemy = b.ours.float(), b.enemy.float()
+
+	def onto(other):  # [B, U]: each unit's damage per round on the `other` side's units, by their health share
+		weight = hp * other
+		return (capped * (weight / weight.sum(dim=1, keepdim=True).clamp(min=EPS))[:, None, :]).sum(dim=2)
+
+	damage = onto(enemy) * ours + onto(ours) * enemy  # each unit on its opponents
+	health = torch.log((hp * ours).sum(dim=1) + 1) - torch.log((hp * enemy).sum(dim=1) + 1)
+	shooters = b.units["can_shoot"].float()
+	subsets = (torch.ones_like(hp), (b.x["u_queue_now"] >= 0).float(), 1 - shooters, shooters)
+	rows = []
+	for subset in subsets:
+		ours_d, theirs_d = (damage * ours * subset).sum(dim=1), (damage * enemy * subset).sum(dim=1)
+		floor = 0.01 * (ours_d + theirs_d) + EPS  # a side without such units: a large, not an infinite, ratio
+		rows.append(torch.stack([health, torch.log(ours_d + floor) - torch.log(theirs_d + floor)], dim=-1))
+	return torch.stack(rows, dim=1).clamp(-10, 10)

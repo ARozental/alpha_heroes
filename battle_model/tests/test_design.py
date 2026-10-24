@@ -36,7 +36,7 @@ def test_untrained_strength_shares_are_our_share_of_value_and_health():
 	b = F.read_battle(x, model.tables())
 	value = F.relative(b.our_value, b.enemy_value)
 	health = F.relative((b.health * b.ours).sum(1), (b.health * b.enemy).sum(1))
-	shares = captured["input"][:, -2 * model.context.strengths :]
+	shares = captured["input"][:, -2 * model.context.strengths - len(F.STRENGTH_VARIANTS) : -len(F.STRENGTH_VARIANTS)]
 	assert torch.allclose(shares[:, 0], value) and torch.allclose(shares[:, -1], health.float())
 
 

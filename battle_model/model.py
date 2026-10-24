@@ -13,9 +13,12 @@ What the model must learn first is made easy to learn:
     enemy's (ours: whoever controls it now, so a hypnotized enemy is ours). The other half is the same on either side
     ("an Archangel is on the field"). So "a strong stack is good if ours, bad if theirs" is one linear readout, and
     summing the units' tokens gives ours minus theirs. RMSNorm (no mean subtraction) keeps the signed half signed.
-  - The balance of power. Context sums each side's strength over its living units, as their value and their health
-    times learned per-unit factors that start at 1 (exp of a zero layer), and gives our share, ours / (ours + theirs):
-    untrained, our share of the armies' value and health; trained, of whatever makes a side strong.
+  - The balance of power. Strength: Lanchester's square law (features.side_strengths), our share of health x damage
+    per round, in four variants, each with a learned exponent per term (starting at 1, the law itself): 8 parameters.
+    The shares go into the context and, through their own small layers, straight into the value heads (the final one
+    starting at V = 2 share - 1, the "all units" share: a sane prior, not 0) and the type head (starting at 0), so a
+    few very informative numbers are not drowned among the context's hundreds. Context also sums each side's value
+    and health times learned per-unit factors that start at 1 (exp of a zero layer), and gives our share of those.
   - Ally and enemy. Each attention head has a learned bias for pairs of tokens on the same side and on opposite sides.
   - Forward is forward. Positions also come in our frame (features.our_frame): the same numbers for both sides.
   - What a spell does. Each spell target gets the engine's prediction of the cast (features.spell_features); a spell
@@ -267,19 +270,31 @@ class Context(nn.Module):
 		self.factor = nn.Linear(dim, 2 * strengths)
 		nn.init.zeros_(self.factor.weight)
 		nn.init.zeros_(self.factor.bias)
-		self.mlp = SwiGLU(4 * dim + 2 * strengths, dim // 2, dim)
+		self.mlp = SwiGLU(4 * dim + 2 * strengths + len(F.STRENGTH_VARIANTS), dim // 2, dim)
 		self.norm = RMSNorm(dim)
 
-	def forward(self, b, glob, heroes, units):
+	def forward(self, b, glob, heroes, units, strength):
 		living = b.units["alive"].float()[..., None]
 		mean = (units * living).sum(dim=1) / living.sum(dim=1).clamp(min=1)
 		base = torch.cat([b.value[..., None].expand(-1, -1, self.strengths), b.health.float()[..., None].expand(-1, -1, self.strengths)], dim=-1)
-		strength = base * self.factor(units).clamp(-5, 5).exp()
-		ours = (strength * b.ours[..., None]).sum(dim=1)
-		theirs = (strength * b.enemy[..., None]).sum(dim=1)
+		weighted = base * self.factor(units).clamp(-5, 5).exp()
+		ours = (weighted * b.ours[..., None]).sum(dim=1)
+		theirs = (weighted * b.enemy[..., None]).sum(dim=1)
 		batch = torch.arange(glob.shape[0], device=glob.device)
 		our_hero = heroes[batch, b.x["g_our_side"].clamp(0, N_SIDES - 1)]
-		return self.norm(self.mlp(torch.cat([glob, units[batch, b.acting], our_hero, mean, F.relative(ours, theirs)], dim=-1)))
+		return self.norm(self.mlp(torch.cat([glob, units[batch, b.acting], our_hero, mean, F.relative(ours, theirs), torch.sigmoid(strength)], dim=-1)))
+
+
+class Strength(nn.Module):
+	"""Our share of each Lanchester variant's strength (features.side_strengths), as log-odds:
+	z = a log(H ours / H theirs) + b log(D ours / D theirs), share = sigmoid(z); a and b start at 1."""
+
+	def __init__(self):
+		super().__init__()
+		self.exponents = nn.Parameter(torch.ones(len(F.STRENGTH_VARIANTS), 2))
+
+	def forward(self, ratios):
+		return (ratios * self.exponents).sum(dim=-1)  # [B, variants]
 
 
 class ActionHeads(nn.Module):
@@ -303,6 +318,7 @@ class ActionHeads(nn.Module):
 		super().__init__()
 		self.type_head = nn.Linear(dim, N_ACTION_TYPES)
 		self.type_rules = nn.Linear(len(F.TYPE_FEATURES), N_ACTION_TYPES, bias=False)
+		self.type_strength = nn.Linear(len(F.STRENGTH_VARIANTS), N_ACTION_TYPES, bias=False)  # the strength shares' log-odds
 		self.spell_head = nn.Linear(dim, N_SPELLS)
 		self.spell_query = small_embedding(N_SPELLS, dim)
 		self.creature_spell_query = small_embedding(EFFECT_VOCAB + 1, dim)  # by the acting unit's spell
@@ -324,6 +340,7 @@ class ActionHeads(nn.Module):
 			self.type_head.weight.zero_()
 			self.type_head.bias.copy_(priors.action_types())
 			self.type_rules.weight.zero_()
+			self.type_strength.weight.zero_()
 			for layer in (*self.queries.values(), self.keys["melee_from_unit"], self.keys["spell2_from_unit"]):
 				layer.weight.zero_()
 				layer.bias.zero_()
@@ -354,7 +371,7 @@ class ActionHeads(nn.Module):
 			out[head] = torch.cat([f[..., :best], versus[..., None], f[..., best + 1 :]], dim=-1)
 		return out
 
-	def forward(self, context, units, hexes, actions, x):
+	def forward(self, context, units, hexes, actions, x, strength):
 		scale = 1.0 / math.sqrt(context.shape[-1])
 		q = {name: layer(context) for name, layer in self.queries.items()}
 		k = self.keys
@@ -386,7 +403,7 @@ class ActionHeads(nn.Module):
 		follow = torch.zeros_like(self.type_head(context))
 		for action, logits, legal in ((ActionType.MOVE, move, x["m_move_hex"]), (ActionType.MELEE, melee_target, x["m_melee_target"]), (ActionType.SHOOT, shoot_target, x["m_shoot_target"]), (ActionType.HERO_SPELL, spell, x["m_spell"]), (ActionType.CREATURE_SPELL, *creature)):
 			follow = follow + best_of(logits, legal)[:, None] * self.type_one_hot[action]
-		kind = self.type_head(context) + self.type_rules(actions["type"]) + follow
+		kind = self.type_head(context) + self.type_rules(actions["type"]) + self.type_strength(strength) + follow
 		return {
 			"logp_type": masked_log_softmax(kind, x["m_type"]),
 			"logp_move_hex": masked_log_softmax(move, x["m_move_hex"]),
@@ -414,8 +431,15 @@ class BattleModel(nn.Module):
 		self.hexes = HexTokens(dim)
 		self.trunk = Trunk(dim, layers, heads)
 		self.context = Context(dim)
+		self.strength = Strength()
 		self.actions = ActionHeads(dim)
 		self.values = ValueHeads(dim, boost_stop_gradient)
+		# The strengths' direct path into the value heads: the final one starts at V = tanh(z / 2) = 2 sigmoid(z) - 1,
+		# z the "all units" share's log-odds; the round heads at 0
+		self.value_strength = nn.Linear(len(F.STRENGTH_VARIANTS), len(self.values.heads), bias=False)
+		with torch.no_grad():
+			self.value_strength.weight.zero_()
+			self.value_strength.weight[-1, F.STRENGTH_VARIANTS.index("all")] = 0.5
 
 	def tables(self):
 		return {name[len("table_"):]: buffer for name, buffer in self.named_buffers() if name.startswith("table_")}
@@ -435,6 +459,7 @@ class BattleModel(nn.Module):
 				"stack": F.stack_features(b),
 				"summaries": F.unit_summaries(b, can_attack),
 				"battle": F.battle_features(b, maps),
+				"strength": F.side_strengths(b),
 				**{f"spell:{k}": v for k, v in F.spell_features(b).items()},
 			}
 
@@ -444,10 +469,11 @@ class BattleModel(nn.Module):
 		heroes, hero_team = self.heroes(b)
 		units, unit_team = self.units(b, facts)
 		glob, heroes, units, hexes = self.trunk(self.battle(b, facts), heroes, units, self.hexes(b, facts), hero_team, unit_team, x["h_present"] != 0, x["u_present"] != 0)
-		context = self.context(b, glob, heroes, units)
+		strength = self.strength(facts["strength"])
+		context = self.context(b, glob, heroes, units, strength)
 		actions = F.action_features(b, facts["melee"], facts["shot"], facts["maps"], facts["can_attack"], facts["battle"])
 		actions.update({k.split(":", 1)[1]: v for k, v in facts.items() if k.startswith("spell:")})
-		return {**self.actions(context, units, hexes, actions, x), **self.values(context)}
+		return {**self.actions(context, units, hexes, actions, x, strength), **self.values(context, self.value_strength(strength))}
 
 	def set_rule_weights(self, head, **weights):
 		"""Set a head's linear feature weights by name, e.g. set_rule_weights("melee_target", wipe_chance=2.0)."""
