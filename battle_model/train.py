@@ -526,7 +526,7 @@ def train(config, resume=False):
 			order = torch.randperm(len(examples)).to(device)
 			if len(examples) >= config.batch_size:
 				order = order[: len(examples) - len(examples) % config.batch_size]
-			for first in range(0, len(examples), config.batch_size):
+			for first in range(0, len(order), config.batch_size):
 				batch = select(epoch_data, order[first : first + config.batch_size])
 				out_batch = model(batch["inputs"], batch["facts"]) if "facts" in batch else model(batch["inputs"])
 				if config.search_simulations > 0 and "search" in batch:
