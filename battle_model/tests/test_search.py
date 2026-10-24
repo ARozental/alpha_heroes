@@ -39,7 +39,7 @@ class ToyGame:
 	"""The toy game of tools/SearchSelfTest.cpp: a stochastic general-sum race. Each player moves its counter
 	forward by its action (0..4) plus a die (0..2); a 2 lets the same player move again (like good morale). Which
 	actions are legal depends on the position, so on the dice. The first to 12 wins; after 10 moves nobody does.
-	Some positions are leaves the search does not go beyond. The rewards are not zero-sum. The "network" is a
+	Some positions are leaves the search does not go beyond. The rewards are not zero-sum (the search must not assume it). The "network" is a
 	hash of the position."""
 
 	@staticmethod
@@ -193,19 +193,20 @@ def battle_end_cases(n=300, seed=0):
 		mana_max = rng.integers(0, 3, 2) * rng.integers(1, 60, 2)
 		mana_start = np.array([rng.integers(0, m + 1) for m in mana_max])
 		mana_end = np.array([rng.integers(0, s + 1) for s in mana_start])
+		power = rng.integers(0, 10, 2)
 		winner = int(rng.choice([0, 1, -1]))
 		result = int(rng.choice([RESULT_NORMAL, RESULT_ESCAPE, RESULT_SURRENDER])) if winner >= 0 else RESULT_NORMAL
 		cost = [0, 0]
 		if result == RESULT_SURRENDER:
 			cost[1 - winner] = int(rng.integers(0, 4000))
-		yield dict(start=start.tolist(), end=end.tolist(), mana_start=mana_start.tolist(), mana_max=mana_max.tolist(), mana_end=mana_end.tolist(), winner=winner, result=result, rounds=int(rng.integers(1, 130)), cost=cost)
+		yield dict(start=start.tolist(), end=end.tolist(), mana_start=mana_start.tolist(), mana_max=mana_max.tolist(), mana_end=mana_end.tolist(), power=power.tolist(), winner=winner, result=result, rounds=int(rng.integers(1, 130)), cost=cost)
 
 
 def python_reward(case, side):
 	"""Training's reward for side: data.summarize over the events the battle would record from that side."""
 	armies = [[[CREATURE, case["start"][s]]] for s in (0, 1)]
 	casualties = [[[CREATURE, case["start"][s] - case["end"][s]]] for s in (0, 1)]
-	start = {"event": "start", "our_side": side, "armies": armies, "our_mana": case["mana_start"][side], "our_mana_max": case["mana_max"][side], "enemy_mana": case["mana_start"][1 - side], "enemy_mana_max": case["mana_max"][1 - side]}
+	start = {"event": "start", "our_side": side, "armies": armies, "our_mana": case["mana_start"][side], "our_mana_max": case["mana_max"][side], "enemy_mana": case["mana_start"][1 - side], "enemy_mana_max": case["mana_max"][1 - side], "powers": case["power"]}
 	end = {"event": "end", "round": case["rounds"], "winner": case["winner"], "result": case["result"], "casualties": casualties, "alive": [[], []], "our_mana": case["mana_end"][side], "enemy_mana": case["mana_end"][1 - side]}
 	events = [start, end]
 	if case["result"] == RESULT_SURRENDER and case["winner"] == 1 - side:
@@ -215,17 +216,18 @@ def python_reward(case, side):
 
 @pytest.mark.skipif(not vocab.VOCAB_PATH.exists(), reason="run scripts/export_vocab.sh to generate the vocabulary")
 def test_cpp_reward_matches_training_reward(selftest):
+	"""Each side as its own AI scores it: it knows what it paid to surrender, not what the enemy paid (0)."""
 	value = vocab.creature_value(CREATURE)
-	cases = list(battle_end_cases())
+	cases = [(c, side) for c in battle_end_cases() for side in (0, 1)]
 	commands = []
-	for c in cases:
-		numbers = [c["start"][0] * value, c["start"][1] * value, c["end"][0] * value, c["end"][1] * value, *c["mana_start"], *c["mana_max"], *c["mana_end"], c["winner"], c["result"], c["rounds"], *c["cost"]]
+	for c, side in cases:
+		cost = [c["cost"][s] if s == side else 0 for s in (0, 1)]
+		numbers = [c["start"][0] * value, c["start"][1] * value, c["end"][0] * value, c["end"][1] * value, *c["mana_start"], *c["power"], *c["mana_end"], c["winner"], c["result"], c["rounds"], *cost]
 		commands.append("reward " + " ".join(str(x) for x in numbers))
-	for c, cpp in zip(cases, selftest(commands), strict=True):
-		for side in (0, 1):
-			expected = python_reward(c, side)
-			assert math.isclose(cpp["rewards"][side], expected, rel_tol=0, abs_tol=1e-12), (c, side, cpp, expected)
-			assert math.isclose(cpp["scaled"][side], to_scale(expected), rel_tol=0, abs_tol=1e-12), (c, side, cpp)
+	for (c, side), cpp in zip(cases, selftest(commands), strict=True):
+		expected = python_reward(c, side)
+		assert math.isclose(cpp["rewards"][side], expected, rel_tol=0, abs_tol=1e-12), (c, side, cpp, expected)
+		assert math.isclose(cpp["scaled"][side], to_scale(expected), rel_tol=0, abs_tol=1e-12), (c, side, cpp)
 
 
 def test_cpp_other_side_value_matches_python(selftest):

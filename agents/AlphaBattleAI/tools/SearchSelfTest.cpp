@@ -2,7 +2,7 @@
 // battle_model/tests/test_search.py, which checks that the readable Python copies (battle_model/search.py,
 // battle_model/reward.py) give the same results. Reads commands from stdin, one per line, and prints one JSON line each:
 //   search SEED SIMULATIONS MAX_CONSIDERED GUMBEL_SCALE
-//   reward ARMY_START0 ARMY_START1 ARMY_END0 ARMY_END1 MANA_START0 MANA_START1 MANA_MAX0 MANA_MAX1 MANA_END0 MANA_END1 WINNER RESULT ROUNDS SURRENDER_COST0 SURRENDER_COST1
+//   reward ARMY_START0 ARMY_START1 ARMY_END0 ARMY_END1 MANA_START0 MANA_START1 POWER0 POWER1 MANA_END0 MANA_END1 WINNER RESULT ROUNDS SURRENDER_COST0 SURRENDER_COST1
 //   other_side_value VALUE
 #include "GumbelSearch.h"
 #include "Reward.h"
@@ -140,7 +140,7 @@ int main()
 		else if(command == "reward")
 		{
 			AlphaReward::BattleEnd e;
-			in >> e.armyStart[0] >> e.armyStart[1] >> e.armyEnd[0] >> e.armyEnd[1] >> e.manaStart[0] >> e.manaStart[1] >> e.manaMax[0] >> e.manaMax[1] >> e.manaEnd[0] >> e.manaEnd[1] >> e.winner >> e.result >> e.rounds >> e.surrenderCost[0] >> e.surrenderCost[1];
+			in >> e.armyStart[0] >> e.armyStart[1] >> e.armyEnd[0] >> e.armyEnd[1] >> e.manaStart[0] >> e.manaStart[1] >> e.power[0] >> e.power[1] >> e.manaEnd[0] >> e.manaEnd[1] >> e.winner >> e.result >> e.rounds >> e.surrenderCost[0] >> e.surrenderCost[1];
 			std::cout << "{\"rewards\": [" << number(AlphaReward::reward(e, 0)) << ", " << number(AlphaReward::reward(e, 1)) << "], \"scaled\": [" << number(AlphaReward::toScale(AlphaReward::reward(e, 0))) << ", " << number(AlphaReward::toScale(AlphaReward::reward(e, 1))) << "]}" << std::endl;
 		}
 		else if(command == "other_side_value")

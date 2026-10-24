@@ -33,7 +33,7 @@ import torch
 from . import vocab
 from .distributions import ACTION_FIELDS, log_prob, stack_actions
 from .losses import AdvantageConfig, battle_returns_and_advantages, normalize_advantages, policy_advantages, value_targets
-from .reward import Outcome, RewardConfig, own_kept_value, round_score, terminal_reward, to_scale
+from .reward import Outcome, RewardConfig, assets_after, hero_asset, mana_value, round_score, terminal_reward, to_scale
 from .schema import INPUTS, OUTPUTS
 
 # EBattleResult
@@ -44,14 +44,18 @@ RESULT_NORMAL, RESULT_ESCAPE, RESULT_SURRENDER = 0, 1, 2
 class BattleSummary:
 	our_side: int
 	outcome: Outcome
-	reward: float  # terminal reward, reward units
+	reward: float  # terminal reward, -1..1 (reward.py: zero-sum)
 	rounds: int
-	own_start_value: float
+	own_start_value: float  # assets at the start: army + hero + mana (reward.py)
 	enemy_start_value: float
-	own_kept: float
-	enemy_lost: float
+	own_kept: float  # assets after the battle
+	enemy_lost: float  # the enemy's assets lost
 	mana_used_fraction: float
-	round_scores: dict = field(default_factory=dict)  # {round: round_score at its end} while the battle went on
+	round_scores: dict = field(default_factory=dict)
+	# Outcome measures that do not depend on the reward's definition (to compare runs across reward changes): the
+	# share of our army we keep after the battle, and of the enemy's army it loses
+	army_kept: float = 0.0
+	army_killed: float = 0.0  # {round: round_score at its end} while the battle went on
 	decisions: int = 0
 	advantage_std: float = 0.0  # std of the raw (not normalised) advantages, -1..1 scale: how much there is to learn
 	value_error: float = 0.0  # mean |V - final reward| over the decisions, -1..1 scale, V from the model that played
@@ -78,9 +82,10 @@ def credit_check(summaries):
 	of our army lost, change of V per fraction of the enemy army killed), by least squares over every step between
 	two decisions. These changes of V are what GAE turns into the advantages (losses.battle_returns_and_advantages).
 
-	On a lost battle the reward counts only kills (about +0.47 on the -1..1 scale per whole enemy army), so an
-	honest V changes by ~0 when we lose units and positively when we kill; a negative kill coefficient or a strongly
-	negative loss one means the advantages teach the wrong thing."""
+	The reward is zero-sum (reward.py): killing a whole enemy army is worth its share of both armies' assets, losing
+	ours costs our share. But an honest V only moves on what it did not expect: if every battle ends alike, kills that
+	were coming anyway move it by ~0. A least-squares fit over steps also mixes kills with the exchanges they come
+	in; an intervention (remove part of a stack in the inputs, see V change) measures the sign without that."""
 	values = np.array([v for s in summaries for v in s.values])
 	rewards = np.array([to_scale(s.reward) for s in summaries for _ in s.values])
 	ev = float(1 - np.var(rewards - values) / np.var(rewards)) if len(values) > 1 and np.var(rewards) > 1e-12 else float("nan")
@@ -96,14 +101,12 @@ def read_events(record_dir):
 
 
 def summarize(events, hero_value=0.0, fresh_hero_value=0.0, config=RewardConfig(), side=None):
-	"""The reward and outcome of one battle, from our side's events.
+	"""The reward and outcome of one battle, from our side's events (reward.py: zero-sum, from each side's assets).
 
-	hero_value: our hero's value (reward.hero_value); 0 for level-1 heroes without artifacts, as in the
-	current scenarios (not recorded yet). The enemy hero's value is not counted either.
-	side: score the battle for this battle side instead of the recording one (e.g. to check the C++ reward,
-	Reward.h, of both sides: the end event's cpp_rewards).
-	For the enemy, the mana used comes from enemy_mana in the events (0 when missing), and the cost of a
-	surrender it made is unknown to us (taken as 0).
+	hero_value: our hero's value (reward.hero_value); 0 for level-1 heroes without artifacts, as in the current
+	scenarios (not recorded yet), and the enemy hero's is not known: 0. side: score the battle for this battle side
+	instead of the recording one (e.g. to check the C++ reward, Reward.h, of both sides: the end event's cpp_rewards).
+	The cost of a surrender the enemy made is unknown to us (taken as 0).
 	"""
 	errors = [e["message"] for e in events if e["event"] == "error"]
 	if errors:
@@ -114,52 +117,43 @@ def summarize(events, hero_value=0.0, fresh_hero_value=0.0, config=RewardConfig(
 	recorder = start["our_side"]
 	our = recorder if side is None else side
 	enemy = 1 - our
-	if our != recorder:
-		surrender = None
-	mana_key = "our_mana" if our == recorder else "enemy_mana"
-	own_army_start = army_value(start["armies"][our])
-	enemy_army_start = army_value(start["armies"][enemy])
-	own_start = own_army_start + hero_value
+	powers = start.get("powers", [0, 0])  # each battle side's hero's spell power
+	heroes = {our: hero_asset(hero_value, fresh_hero_value), enemy: 0.0}
 
-	def mana_used(mana):
-		start_mana, mana_max = start.get(mana_key, 0), start.get(mana_key + "_max", 0)
-		return (start_mana - mana) / mana_max if mana_max > 0 else 0.0
+	def mana(event, s):  # the mana value of side s's hero in an event
+		return mana_value(event.get("our_mana" if s == recorder else "enemy_mana", 0), powers[s], config)
 
-	if end["winner"] == our:
-		outcome = Outcome.WIN
-	elif end["winner"] not in (0, 1):  # no winner: both armies destroyed
-		outcome = Outcome.DRAW
-	elif end["result"] == RESULT_ESCAPE:
-		outcome = Outcome.RETREAT
-	elif end["result"] == RESULT_SURRENDER:
-		outcome = Outcome.SURRENDER
-	else:
-		outcome = Outcome.LOSS
+	def outcome_of(s):
+		if end["winner"] not in (0, 1):  # no winner: both armies destroyed
+			return Outcome.DRAW
+		if end["winner"] == s:
+			return Outcome.WIN
+		return {RESULT_ESCAPE: Outcome.RETREAT, RESULT_SURRENDER: Outcome.SURRENDER}.get(end["result"], Outcome.LOSS)
 
-	# An enemy that retreated has lost its whole army. One that surrendered keeps its army but pays us for
-	# it, so it also counts as fully destroyed. The real value of an enemy surrender depends on the game:
-	# this is right for a 2-player zero-sum game; with more players a surrender might even beat a retreat,
-	# which needs information from outside the battle.
-	# Units summoned for good (Pit Lords' demons) join the army after the battle; the casualties count those killed
-	# again, so what a side keeps is its start - casualties + what it summoned
+	# What each side keeps of its army: its start - the engine's casualties (creatures raised for the battle only count
+	# as lost) + units summoned for good (Pit Lords' demons join the army; the casualties count those killed again)
 	summoned = end.get("summoned", [[], []])
-	if outcome == Outcome.WIN and end["result"] in (RESULT_ESCAPE, RESULT_SURRENDER):
-		enemy_lost = enemy_army_start
-	else:
-		enemy_lost = army_value(end["casualties"][enemy]) - army_value(summoned[enemy])
-	own_army_end = own_army_start - army_value(end["casualties"][our]) + army_value(summoned[our])
-	kept = own_kept_value(outcome, own_army_end, hero_value, fresh_hero_value, surrender["cost"] if surrender else 0.0)
-	rounds = end["round"]  # VCMI numbering: the first round is 1
-	reward = terminal_reward(outcome, own_start, kept, enemy_army_start, enemy_lost, rounds, mana_used(end.get(mana_key, 0)), config)
+	army_start = {s: army_value(start["armies"][s]) for s in (our, enemy)}
+	army_end = {s: army_start[s] - army_value(end["casualties"][s]) + army_value(summoned[s]) for s in (our, enemy)}
+	assets_start = {s: army_start[s] + heroes[s] + mana(start, s) for s in (our, enemy)}
+	cost = {s: surrender["cost"] if surrender and s == recorder else 0.0 for s in (our, enemy)}  # only the recorder's is known
+	assets_end = {s: assets_after(outcome_of(s), army_end[s], heroes[s], mana(end, s), cost[s]) for s in (our, enemy)}
+	reward = terminal_reward(assets_start[our], assets_end[our], assets_start[enemy], assets_end[enemy])
 
 	scores = {}
 	for e in events:
 		if e["event"] == "round_end" and e["round"] >= 1:  # round 0 is the start of the battle
-			own_alive = army_value(e["alive"][our]) + hero_value
-			enemy_lost_so_far = enemy_army_start - army_value(e["alive"][enemy])
-			scores[e["round"]] = round_score(own_start, own_alive, enemy_army_start, enemy_lost_so_far, e["round"], mana_used(e.get(mana_key, 0)), config)
+			now = {s: army_value(e["alive"][s]) + heroes[s] + mana(e, s) for s in (our, enemy)}
+			scores[e["round"]] = round_score(assets_start[our], now[our], assets_start[enemy], now[enemy])
 
-	return BattleSummary(our, outcome, reward, rounds, own_start, enemy_army_start, kept, enemy_lost, mana_used(end.get(mana_key, 0)), scores)
+	mana_key = "our_mana" if our == recorder else "enemy_mana"
+	pool = start.get(mana_key + "_max", 0)
+	mana_used = (start.get(mana_key, 0) - end.get(mana_key, 0)) / pool if pool > 0 else 0.0
+	keeps_army = lambda s: outcome_of(s) in (Outcome.WIN, Outcome.SURRENDER)
+	share = lambda part, whole: part / whole if whole > 0 else 0.0
+	army_kept = share(army_end[our] if keeps_army(our) else 0.0, army_start[our])
+	army_killed = share(army_start[enemy] - (army_end[enemy] if keeps_army(enemy) else 0.0), army_start[enemy])
+	return BattleSummary(our, outcome_of(our), reward, end["round"], assets_start[our], assets_start[enemy], assets_end[our], assets_start[enemy] - assets_end[enemy], mana_used, scores, army_kept=army_kept, army_killed=army_killed)
 
 
 @dataclass
@@ -254,7 +248,7 @@ def battle_examples(record, reward_config=RewardConfig(), advantage_config=Advan
 	rewards[-1] = to_scale(summary.reward, reward_config)
 	_, final_advantages = battle_returns_and_advantages(values, rewards, advantage_config)
 	rounds = [int(d[0]["g_round"]) for d in decisions]
-	labels = value_targets(rounds, summary.round_scores, summary.reward, reward_config=reward_config)
+	labels = value_targets(rounds, summary.round_scores, summary.reward)
 	advantages = policy_advantages(final_advantages, labels, outputs["value"], advantage_config)
 	summary.advantage_std = float(advantages.std()) if len(advantages) > 1 else 0.0
 	summary.value_error = float((values - rewards[-1]).abs().mean())

@@ -6,8 +6,8 @@ PPO = Proximal Policy Optimization: improve the policy from games it played itse
 Plan: PPO now, AlphaZero-style search (MCTS) later as an upgrade reusing this network; the vcmi-gym
 author dropped MCTS because VCMI cannot copy and restore a battle state, which search needs.
 
-Every value, label and reward below is on the -1..1 scale (reward.to_scale: -1 = worst possible
-reward, +1 = best possible). Value heads are tanh outputs trained with cross-entropy; tanh(z) is
+Every value, label and reward below is on the -1..1 scale of the reward (reward.py: zero-sum, -1 = we lost
+everything and the enemy nothing, +1 the reverse). Value heads are tanh outputs trained with cross-entropy; tanh(z) is
 2 * sigmoid(2z) - 1, so this is the same model and loss as a sigmoid on 0..1, just easier to read.
 
 From reward to loss, for one battle seen by one side:
@@ -17,12 +17,12 @@ From reward to loss, for one battle seen by one side:
    environment. Turns played by the scripted fallback (war machines, tactics, round 30+) are not
    decisions of the model, but they do affect the outcome.
 
-2. Reward. reward.py gives one number R when the battle ends: +-1 for the outcome, the value fractions
-   and the round and mana penalties. Every earlier decision gets reward 0. Per-decision rewards, if we
+2. Reward. reward.py gives one number R when the battle ends: the assets (army, hero, mana) the enemy lost
+   minus those we lost, of both sides' assets at the start. Every earlier decision gets reward 0. Per-decision rewards, if we
    ever add some, would simply go into the same `rewards` array.
 
 3. Return. The return G_t of decision t is the reward that followed it: G_t = gamma^(T-1-t) * R.
-   With gamma = 1 (our choice: battles are short, and the round penalty already prices slowness)
+   With gamma = 1 (our choice: battles are short)
    every decision of a battle has the same return R.
 
 4. Value. The value heads predict, from the state of decision t (played in battle round r_t):
@@ -71,7 +71,6 @@ import torch.nn.functional as F
 
 from .constants import N_VALUE_HORIZONS
 from .distributions import entropy, log_prob, log_prob_at
-from .reward import RewardConfig, to_scale
 
 
 @dataclass(frozen=True)
@@ -94,13 +93,13 @@ class PPOConfig:
 	value_head_weights: tuple = (1.0,) * (N_VALUE_HORIZONS + 1)  # step 4: share of each value head (V0, V1, V2, V) in the value loss
 
 
-def value_targets(decision_rounds, round_scores, final_reward, horizons=N_VALUE_HORIZONS, reward_config=RewardConfig()):
+def value_targets(decision_rounds, round_scores, final_reward, horizons=N_VALUE_HORIZONS):
 	"""Step 4: the labels of the value heads for every decision of one battle seen by one side.
 
 	decision_rounds: [T] battle round of each decision
 	round_scores:    {round: reward.round_score at the end of that round} for every round that ended
-	                 with the battle still going on (reward units)
-	final_reward:    reward.terminal_reward of the battle (reward units)
+	                 with the battle still going on (-1..1)
+	final_reward:    reward.terminal_reward of the battle (-1..1)
 	Returns [T, horizons + 1] on the -1..1 scale: column k < horizons is the score at the end of round
 	r_t + k, or the final reward if the battle ended before that; the last column is the final reward.
 	"""
@@ -109,14 +108,14 @@ def value_targets(decision_rounds, round_scores, final_reward, horizons=N_VALUE_
 		for k in range(horizons):
 			if r + k in round_scores:
 				labels[t, k] = round_scores[r + k]
-	return to_scale(labels, reward_config)
+	return labels
 
 
 def battle_returns_and_advantages(values, rewards, config=AdvantageConfig()):
 	"""Steps 3-5 for one battle seen by one side.
 
 	values:  [T] V(s_t), the final-reward head (-1..1), from the model that played the battle (recorded while playing)
-	rewards: [T] reward right after each decision: 0, except the last, which is reward.to_scale(terminal reward)
+	rewards: [T] reward right after each decision: 0, except the last, which is the terminal reward
 	Returns (returns [T], advantages [T]). returns is the GAE(lambda) return (G_t for lambda = 1); the
 	value heads are trained on value_targets instead, where V's label is the final reward itself.
 	The battle is over after the last decision, so its next value is 0.

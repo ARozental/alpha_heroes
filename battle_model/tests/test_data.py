@@ -2,7 +2,7 @@ import pytest
 
 from battle_model import vocab
 from battle_model.data import RESULT_ESCAPE, RESULT_NORMAL, RESULT_SURRENDER, army_value, summarize
-from battle_model.reward import Outcome
+from battle_model.reward import HERO_HIRE_COST, Outcome
 
 pytestmark = pytest.mark.skipif(not vocab.VOCAB_PATH.exists(), reason="run scripts/export_vocab.sh to generate the vocabulary")
 
@@ -60,9 +60,11 @@ def test_refused_model_makes_the_record_unusable():
 		summarize([{"event": "error", "message": "cannot use model: x"}] + events(0, {"round": 1, "winner": 0, "result": 0, "casualties": [[], []], "alive": [[], []]}))
 
 
-def test_enemy_surrender_counts_as_full_destruction():
+def test_an_enemy_that_surrendered_keeps_its_army_and_pays_the_rehire():
+	"""Zero-sum assets: a surrender keeps the army, so it costs the enemy only what it lost before, the rehire (and a
+	payment unknown to us: 0)."""
 	s = summarize(events(0, {"round": 2, "winner": 0, "result": RESULT_SURRENDER, "casualties": [[], [[42, 2]]], "alive": [[], []]}))
-	assert s.outcome == Outcome.WIN and s.enemy_lost == army_value(THEIRS)
+	assert s.outcome == Outcome.WIN and s.enemy_lost == army_value([[42, 2]]) + HERO_HIRE_COST
 
 
 def test_no_winner_is_a_draw():

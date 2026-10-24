@@ -1,13 +1,9 @@
-from battle_model.reward import HERO_HIRE_COST, Outcome, hero_value, own_kept_value, resources_value, retreat_value, terminal_reward
+"""reward.py: zero-sum from each side's assets."""
+import itertools
 
-ARMY = 50_000
-ENEMY = 40_000
-FRESH_HERO = 3_000
+from battle_model.reward import HERO_HIRE_COST, Outcome, RewardConfig, assets_after, hero_asset, hero_value, mana_value, other_side_value, resources_value, round_score, terminal_reward, zero_sum
 
-
-def reward(outcome, army_end, hero, enemy_lost, rounds=8, mana=0.3, surrender_cost=0):
-	kept = own_kept_value(outcome, army_end, hero, FRESH_HERO, surrender_cost)
-	return terminal_reward(outcome, ARMY + hero, kept, ENEMY, enemy_lost, rounds, mana)
+ARMY, ENEMY = 50_000, 40_000
 
 
 def test_resource_prices():
@@ -15,84 +11,45 @@ def test_resource_prices():
 	assert resources_value({"wood": 2, "ore": 2}) == 1000
 
 
-def test_hero_value_is_artifacts_plus_experience():
+def test_hero_value_is_artifacts_plus_experience_and_counts_above_a_fresh_hero():
 	assert hero_value([2000, 5000], 14700) == 21700  # level 10 = 14700 XP
+	assert hero_asset(2_000, 3_000) == 0 and hero_asset(30_000, 3_000) == 27_000
 
 
-def test_retreat_value_floor():
-	assert retreat_value(2_000, FRESH_HERO) == 0
-	assert retreat_value(30_000, FRESH_HERO) == 27_000
+def test_the_two_sides_rewards_always_sum_to_zero():
+	for own_end, enemy_end in itertools.product((0, 10_000, ARMY), (0, 5_000, ENEMY)):
+		ours = terminal_reward(ARMY, own_end, ENEMY, enemy_end)
+		theirs = terminal_reward(ENEMY, enemy_end, ARMY, own_end)
+		assert abs(ours + theirs) < 1e-12 and -1 <= ours <= 1
+	assert other_side_value(0.3) == -0.3
 
 
-def test_any_win_beats_any_other_outcome():
-	hero = 20_000
-	worst_win = reward(Outcome.WIN, army_end=0, hero=hero, enemy_lost=ENEMY, rounds=60, mana=1.0)
-	best_other = max(
-		reward(Outcome.RETREAT, 0, 500_000, ENEMY, rounds=1, mana=0),
-		reward(Outcome.SURRENDER, ARMY, 500_000, ENEMY, rounds=1, mana=0, surrender_cost=1_000),
-		reward(Outcome.LOSS, 0, hero, ENEMY, rounds=1, mana=0),
-	)
-	assert worst_win > best_other
+def test_every_kill_helps_the_killer_and_hurts_the_victim():
+	before = terminal_reward(ARMY, 20_000, ENEMY, 10_000)
+	assert terminal_reward(ARMY, 20_000, ENEMY, 9_000) > before  # we killed more
+	assert terminal_reward(ARMY, 19_000, ENEMY, 10_000) < before  # we lost more
 
 
-def test_scenario_ordering():
-	hero = 20_000
-	cheap_win = reward(Outcome.WIN, ARMY * 0.9, hero, ENEMY)
-	costly_win = reward(Outcome.WIN, ARMY * 0.2, hero, ENEMY)
-	surrender = reward(Outcome.SURRENDER, ARMY * 0.8, hero, ENEMY * 0.3, surrender_cost=20_000)
-	retreat = reward(Outcome.RETREAT, 0, hero, ENEMY * 0.3)
-	death = reward(Outcome.LOSS, 0, hero, ENEMY * 0.3)
-	assert cheap_win > costly_win > surrender > retreat > death
+def test_a_loss_that_traded_well_beats_a_win_that_did_not():
+	"""No win term: what counts is what each side lost."""
+	costly_win = terminal_reward(ARMY, 1_000, ENEMY, assets_after(Outcome.LOSS, 0, 0, 0))  # we lost 49k, they 40k
+	good_loss = terminal_reward(20_000, assets_after(Outcome.LOSS, 0, 0, 0), ENEMY, 5_000)  # we lost 20k, they 35k
+	assert good_loss > 0 > costly_win
 
 
-def test_weak_hero_retreat_is_death_plus_the_mana_bill():
-	weak = 1_000  # below a fresh tavern hero: worth nothing after retreating
-	retreat, death = reward(Outcome.RETREAT, 0, weak, 10_000, mana=0.3), reward(Outcome.LOSS, 0, weak, 10_000, mana=0.3)
-	assert abs(death - retreat - 0.05 * 0.3) < 1e-9  # the dead hero pays no mana penalty
+def test_what_each_outcome_leaves():
+	hero, mana = 10_000, 600
+	assert assets_after(Outcome.WIN, 30_000, hero, mana) == 30_000 + hero + mana
+	assert assets_after(Outcome.LOSS, 30_000, hero, mana) == 0 == assets_after(Outcome.DRAW, 30_000, hero, mana)
+	assert assets_after(Outcome.RETREAT, 30_000, hero, mana) == hero + mana  # the army is lost
+	assert assets_after(Outcome.SURRENDER, 30_000, hero, mana, 6_000) == 30_000 + hero + mana - 6_000 - HERO_HIRE_COST
 
 
-def test_surrender_pays_cost_and_rehire():
-	kept = own_kept_value(Outcome.SURRENDER, army_end_value=30_000, hero_value_=10_000, surrender_cost=6_000)
-	assert kept == 30_000 + 10_000 - 6_000 - HERO_HIRE_COST
+def test_mana_is_worth_its_value_times_spell_power():
+	assert mana_value(50, 5, RewardConfig(mana_value=2.0)) == 500
+	spent = terminal_reward(ARMY + mana_value(50, 5), ARMY + mana_value(10, 5), ENEMY, ENEMY)
+	assert spent < 0  # spending mana and achieving nothing costs its value
 
 
-def test_penalties_reduce_reward():
-	base = reward(Outcome.WIN, ARMY, 0, ENEMY, rounds=0, mana=0)
-	assert reward(Outcome.WIN, ARMY, 0, ENEMY, rounds=10, mana=0) < base
-	assert reward(Outcome.WIN, ARMY, 0, ENEMY, rounds=0, mana=0.5) < base
-
-
-def test_bounds_cover_every_reward_and_round_score():
-	from battle_model.reward import MAX_PENALIZED_ROUNDS, reward_bounds, round_score
-	low, high = reward_bounds()
-	worst = terminal_reward(Outcome.RETREAT, 1, 0, 1, 0, rounds=10 * MAX_PENALIZED_ROUNDS, mana_used_fraction=1.0)  # hero alive: pays for mana
-	best = terminal_reward(Outcome.WIN, 1, 1, 1, 1, rounds=0, mana_used_fraction=0.0)
-	assert worst == low and best == high
-	assert low <= round_score(10, 0, 10, 0, rounds=500, mana_used_fraction=1.0) <= round_score(10, 10, 10, 10, 0, 0) <= high
-
-
-def test_round_score_is_the_reward_without_the_outcome_term():
-	from battle_model.reward import round_score
-	args = (ARMY, ARMY * 0.7, ENEMY, ENEMY * 0.4, 3, 0.2)
-	assert abs(round_score(*args) - (terminal_reward(Outcome.WIN, *args) - 1.0)) < 1e-9
-
-
-def test_scale_maps_the_reward_range_to_minus_1_1():
-	from battle_model.reward import from_scale, reward_bounds, to_scale
-	low, high = reward_bounds()
-	assert to_scale(low) == -1.0 and to_scale(high) == 1.0
-	assert abs(from_scale(to_scale(1.7)) - 1.7) < 1e-12
-
-
-def test_draw_is_worth_minus_half_and_better_than_a_loss():
-	kept, lost = 0, ENEMY
-	draw = terminal_reward(Outcome.DRAW, ARMY, kept, ENEMY, lost, rounds=1, mana_used_fraction=0.5)
-	loss = terminal_reward(Outcome.LOSS, ARMY, kept, ENEMY, lost, rounds=1, mana_used_fraction=0.5)
-	assert abs(draw - (-0.5 + 1.0 - 0.002)) < 1e-9 and draw > loss
-
-
-def test_no_mana_penalty_when_our_hero_dies():
-	for outcome in (Outcome.LOSS, Outcome.DRAW):
-		assert terminal_reward(outcome, ARMY, 0, ENEMY, 100, 1, 1.0) == terminal_reward(outcome, ARMY, 0, ENEMY, 100, 1, 0.0)
-	for outcome in (Outcome.WIN, Outcome.RETREAT, Outcome.SURRENDER):
-		assert terminal_reward(outcome, ARMY, ARMY, ENEMY, 100, 1, 1.0) < terminal_reward(outcome, ARMY, ARMY, ENEMY, 100, 1, 0.0)
+def test_round_score_is_the_same_formula_on_the_assets_as_they_stand():
+	assert round_score(ARMY, 30_000, ENEMY, 25_000) == zero_sum(ARMY, 30_000, ENEMY, 25_000)

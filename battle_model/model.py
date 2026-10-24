@@ -403,6 +403,15 @@ class ActionHeads(nn.Module):
 		follow = torch.zeros_like(self.type_head(context))
 		for action, logits, legal in ((ActionType.MOVE, move, x["m_move_hex"]), (ActionType.MELEE, melee_target, x["m_melee_target"]), (ActionType.SHOOT, shoot_target, x["m_shoot_target"]), (ActionType.HERO_SPELL, spell, x["m_spell"]), (ActionType.CREATURE_SPELL, *creature)):
 			follow = follow + best_of(logits, legal)[:, None] * self.type_one_hot[action]
+		# TODO(non-zero-sum): the reward (reward.py) is zero-sum, so the value heads and these logits see every loss of
+		# one side as the other's gain. These actions create or destroy value nobody else gets, and their logits should
+		# get a per-side correction (a small separate head, from what the action really costs or earns) once they matter:
+		#   SURRENDER       the payment disappears (the winner gets nothing) and the enemy's payment is unknown to us
+		#   RETREAT         the army is destroyed without the winner owning it; the rehire is paid to nobody
+		#   CATAPULT        (reserved) walls and towers destroyed: a loss to the town's owner, no gain to the attacker
+		#   TACTICS_*       (reserved) time spent, no value moved
+		#   HERO_SPELL      mana spent is destroyed, not won by the enemy (zero-sum prices it as a gain for them)
+		#   and outcomes behind any action: experience and Necromancy for the winner, Eagle Eye, more than two players
 		kind = self.type_head(context) + self.type_rules(actions["type"]) + self.type_strength(strength) + follow
 		return {
 			"logp_type": masked_log_softmax(kind, x["m_type"]),

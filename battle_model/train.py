@@ -170,7 +170,11 @@ TENSORBOARD_TAGS = {
 EVAL_COLUMNS = [
 	"epoch", "attack_win_rate", "defence_win_rate", "attack_reward", "defence_reward", "mean_reward", "attack_outcome", "defence_outcome",
 	"attack_vs_baseline", "defence_vs_baseline", "mean_vs_baseline", "attack_baseline_reward", "defence_baseline_reward", "seconds",
-]  # eval.csv, greedy battles per side: win rate, mean reward -1..1, outcomes; and minus the eval opponent's own reward on the same seeds
+	"attack_army_kept", "attack_army_killed", "defence_army_kept", "defence_army_killed",
+	"attack_baseline_army_kept", "attack_baseline_army_killed", "defence_baseline_army_kept", "defence_baseline_army_killed",
+]  # eval.csv, greedy battles per side: win rate, mean reward -1..1, outcomes; and minus the eval opponent's own reward on
+# the same seeds. army_kept / army_killed: shares of our army kept and of the enemy's lost (data.BattleSummary), ours
+# and the eval opponent's on the same seeds: the same whatever the reward's definition
 
 # The eval battles' VCMI seeds: fixed random numbers, the same for every eval round of every run
 _eval_rng = random.Random(20261023)
@@ -184,6 +188,10 @@ def log_eval_tensorboard(writer, row):
 			writer.add_scalar(f"eval/won/{name}", float(row[f"{name}_win_rate"]), epoch)
 		writer.add_scalar(f"eval/reward/{name}", float(row[f"{name}_reward"]), epoch)
 		writer.add_scalar(f"eval/vs_baseline/{name}", float(row[f"{name}_vs_baseline"]), epoch)
+		if name != "mean":
+			for measure in ("army_kept", "army_killed"):
+				writer.add_scalar(f"eval/{measure}/{name}", float(row[f"{name}_{measure}"]), epoch)
+				writer.add_scalar(f"eval/{measure}_vs_baseline/{name}", float(row[f"{name}_{measure}"]) - float(row[f"{name}_baseline_{measure}"]), epoch)
 	writer.flush()
 
 
@@ -276,22 +284,23 @@ def eval_games(config, battle_map):
 
 
 def eval_baseline(model, out, battle_map, config):
-	"""The eval opponent's own scaled rewards on the eval battles (it plays our side too: ALPHA_BATTLE_DELEGATE),
-	{(side, seed): reward}; computed once per run, kept in <run dir>/eval_baseline.csv."""
+	"""The eval opponent's own results on the eval battles (it plays our side too: ALPHA_BATTLE_DELEGATE),
+	{(side, seed): (reward, army kept, army killed)}; computed once per run, kept in <run dir>/eval_baseline.csv."""
 	path = out / "eval_baseline.csv"
 	games = eval_games(config, battle_map)
 	if path.exists():
-		rows = {(int(r["side"]), int(r["seed"])): float(r["reward"]) for r in csv.DictReader(path.open())}
+		rows = {(int(r["side"]), int(r["seed"])): (float(r["reward"]), float(r.get("army_kept") or "nan"), float(r.get("army_killed") or "nan")) for r in csv.DictReader(path.open())}
 		if all((g.our_side, g.game_seed) in rows for g in games):
 			return rows
 	model_path = out / "eval.onnx"
 	export(cpu_copy(model), model_path)  # loaded but not used: the delegate plays
 	records = play_in_groups([replace(g, settings=(("ALPHA_BATTLE_DELEGATE", config.eval_opponent),)) for g in games], model_path, config, "eval baseline")
-	rows = {(g.our_side, g.game_seed): to_scale(summarize(r.events).reward, config.reward) for g, r in zip(games, records)}
+	summaries = {(g.our_side, g.game_seed): summarize(r.events) for g, r in zip(games, records)}
+	rows = {key: (s.reward, s.army_kept, s.army_killed) for key, s in summaries.items()}
 	with path.open("w", newline="") as f:
 		writer = csv.writer(f)
-		writer.writerow(["side", "seed", "reward"])
-		writer.writerows([side, seed, round(reward, 6)] for (side, seed), reward in rows.items())
+		writer.writerow(["side", "seed", "reward", "army_kept", "army_killed"])
+		writer.writerows([side, seed, *(round(v, 6) for v in values)] for (side, seed), values in rows.items())
 	return rows
 
 
@@ -308,8 +317,12 @@ def eval_round(model, epoch, out, battle_map, config, baseline):
 	rewards, baselines = [], []
 	for side, name in ((0, "attack"), (1, "defence")):
 		ours = [(g, s) for g, s in zip(games, summaries) if g.our_side == side]
-		reward = [to_scale(s.reward, config.reward) for _, s in ours]
-		base = [baseline[(side, g.game_seed)] for g, _ in ours]
+		reward = [s.reward for _, s in ours]
+		base = [baseline[(side, g.game_seed)][0] for g, _ in ours]
+		mean = lambda values: round(sum(values) / len(values), 4)
+		row[f"{name}_army_kept"], row[f"{name}_army_killed"] = mean([s.army_kept for _, s in ours]), mean([s.army_killed for _, s in ours])
+		row[f"{name}_baseline_army_kept"] = mean([baseline[(side, g.game_seed)][1] for g, _ in ours])
+		row[f"{name}_baseline_army_killed"] = mean([baseline[(side, g.game_seed)][2] for g, _ in ours])
 		rewards += reward
 		baselines += base
 		row[f"{name}_win_rate"] = round(sum(s.outcome == Outcome.WIN for _, s in ours) / len(ours), 4)

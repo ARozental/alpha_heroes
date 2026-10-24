@@ -165,7 +165,7 @@ void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * 
 	{
 		battleStartValues.armyStart[s] = armyValue(*(s == 0 ? army1 : army2));
 		battleStartValues.manaStart[s] = heroes[s] ? heroes[s]->mana : 0;
-		battleStartValues.manaMax[s] = heroes[s] ? heroes[s]->manaLimit() : 0;
+		battleStartValues.power[s] = heroes[s] ? heroes[s]->getPrimSkillLevel(PrimarySkill::SPELL_POWER) : 0; // a player sees both
 	}
 
 	if(record)
@@ -179,7 +179,7 @@ void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * 
 		};
 		const auto * hero = cb->getBattle(battleID)->battleGetMyHero();
 		const auto * enemyHero = heroes[1 - static_cast<int>(side)];
-		recordEvent("{\"event\": \"start\", \"our_side\": " + std::to_string(static_cast<int>(side)) + ", \"armies\": [" + army(army1) + ", " + army(army2) + "], \"our_mana\": " + std::to_string(hero ? hero->mana : 0) + ", \"our_mana_max\": " + std::to_string(hero ? hero->manaLimit() : 0) + ", \"enemy_mana\": " + std::to_string(enemyHero ? enemyHero->mana : 0) + ", \"enemy_mana_max\": " + std::to_string(enemyHero ? enemyHero->manaLimit() : 0) + "}");
+		recordEvent("{\"event\": \"start\", \"our_side\": " + std::to_string(static_cast<int>(side)) + ", \"armies\": [" + army(army1) + ", " + army(army2) + "], \"our_mana\": " + std::to_string(hero ? hero->mana : 0) + ", \"our_mana_max\": " + std::to_string(hero ? hero->manaLimit() : 0) + ", \"enemy_mana\": " + std::to_string(enemyHero ? enemyHero->mana : 0) + ", \"enemy_mana_max\": " + std::to_string(enemyHero ? enemyHero->manaLimit() : 0) + ", \"powers\": [" + std::to_string(battleStartValues.power[0]) + ", " + std::to_string(battleStartValues.power[1]) + "]}");
 	}
 	fallback->battleStart(battleID, army1, army2, tile, hero1, hero2, side, replayAllowed);
 }
