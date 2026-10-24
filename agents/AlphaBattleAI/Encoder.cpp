@@ -18,6 +18,7 @@
 #include "lib/mapObjects/CGHeroInstance.h"
 #include "lib/spells/CSpellHandler.h"
 #include "lib/spells/ISpellMechanics.h"
+#include "lib/spells/effects/UnitEffect.h"
 
 #include <vcmi/Environment.h>
 #include <vcmi/spells/Magic.h>
@@ -261,6 +262,42 @@ bool castAffects(const spells::Mechanics & mechanics, const battle::Target & tar
 	return std::find(affected.begin(), affected.end(), unit) != affected.end();
 }
 
+/// What a cast aimed at `aim` would do, as the engine predicts it: each affected unit's health change by every unit
+/// effect of the spell (UnitEffect::getHealthChange, the rules the cast itself uses), priced as the reward prices
+/// armies: hit points at the creature's value per hit point, raised or summoned creatures at their value, nothing
+/// for units the side does not keep after the battle. The value for the attacker minus for the defender, in gold.
+int64_t castValue(const CPlayerBattleCallback & battle, const spells::Mechanics & mechanics, const battle::Target & aim)
+{
+	const auto canonical = mechanics.canonicalizeTarget(aim);
+	double value = 0;
+	mechanics.forEachEffect([&](const spells::effects::Effect & effect)
+	{
+		const auto * unitEffect = dynamic_cast<const spells::effects::UnitEffect *>(&effect);
+		if(!unitEffect)
+			return false;
+		// Unit by unit, each with the targets before it: a chain's damage depends on the target's place in it
+		spells::EffectTarget before;
+		spells::effects::SpellEffectValue total;
+		for(const auto & destination : unitEffect->transformTarget(&mechanics, aim, canonical))
+		{
+			before.push_back(destination);
+			const auto now = unitEffect->getHealthChange(&mechanics, before);
+			const int64_t hp = now.hpDelta - total.hpDelta, units = now.unitsDelta - total.unitsDelta;
+			total = now;
+			const auto * stack = destination.unitValue ? battle.battleGetStackByID(destination.unitValue->unitId(), false) : nullptr;
+			if(!stack)
+				continue;
+			const double sign = stack->unitSide() == BattleSide::ATTACKER ? 1.0 : -1.0;
+			if(now.unitType != CreatureID::NONE && now.unitType != stack->creatureId()) // a new creature (Pit Lords' demons)
+				value += sign * units * creatureValue(now.unitType.toCreature());
+			else if(keptAfterBattle(stack))
+				value += sign * hp * creatureValue(stack->unitType()) / std::max(1, static_cast<int>(stack->getMaxHealth()));
+		}
+		return false;
+	});
+	return std::llround(value);
+}
+
 void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, const CGHeroInstance * hero)
 {
 	auto & t = e.tensors;
@@ -292,7 +329,10 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 		{
 			for(int h = 0; h < N_HEXES; ++h)
 				if(mechanics->canBeCastAt({battle::Destination(BattleHex(h))}))
+				{
 					t.set(In::m_spell_hex, s, h, 1);
+					t.set(In::s_hex_value, s, h, castValue(battle, *mechanics, {battle::Destination(BattleHex(h))}));
+				}
 		}
 		else if(aims[0] == spells::AimType::CREATURE)
 		{
@@ -306,7 +346,10 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 				if(second == TargetKind::NONE)
 				{
 					if(affects({first}, unit))
+					{
 						t.set(In::m_spell_unit, s, u, 1);
+						t.set(In::s_unit_value, s, u, castValue(battle, *mechanics, {first}));
+					}
 					continue;
 				}
 				if(spell2Owner[u] >= 0)
@@ -368,6 +411,7 @@ bool encodeCreatureSpellTargets(EncodedBattle & e, const CPlayerBattleCallback &
 			if(mechanics->canBeCastAt({battle::Destination(BattleHex(h))}))
 			{
 				t.set(In::m_creature_spell_hex, h, 1);
+				t.set(In::c_hex_value, h, castValue(battle, *mechanics, {battle::Destination(BattleHex(h))}));
 				any = true;
 			}
 	}
@@ -377,6 +421,7 @@ bool encodeCreatureSpellTargets(EncodedBattle & e, const CPlayerBattleCallback &
 			if(e.units[u] && castAffects(*mechanics, {battle::Destination(e.units[u])}, e.units[u]))
 			{
 				t.set(In::m_creature_spell_unit, u, 1);
+				t.set(In::c_unit_value, u, castValue(battle, *mechanics, {battle::Destination(e.units[u])}));
 				any = true;
 			}
 	}
@@ -563,6 +608,16 @@ bool isLegal(const EncodedBattle & e, const ChosenAction & a)
 		default:
 			return true;
 	}
+}
+
+bool keptAfterBattle(const CStack * unit)
+{
+	return !unit->isClone() && !unit->summoned && (unit->unitSlot().validSlot() || unit->unitSlot() == SlotID::SUMMONED_SLOT_PLACEHOLDER);
+}
+
+int remainingAfterBattle(const CStack * unit)
+{
+	return keptAfterBattle(unit) ? std::max(0, static_cast<int>(unit->unitBaseAmount()) - unit->getKilled()) : 0;
 }
 
 double creatureValue(const CCreature * creature)

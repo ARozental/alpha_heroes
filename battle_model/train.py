@@ -96,7 +96,7 @@ class TrainConfig:
 	# > 0: the training battles search every decision with this many simulations (Gumbel AlphaZero, C++) and the
 	# policy learns the search's improved policy (losses.search_loss) instead of PPO's; eval stays greedy, no search
 	search_simulations: int = 0
-	model_architecture: str = "v2"  # "v2": model.BattleModel (rules and features); "v1": model_v1.BattleModelV1
+	model_architecture: str = "v3"  # "v3": model.BattleModel; "v2": model_v2.BattleModelV2; "v1": model_v1.BattleModelV1
 	model_dim: int = 64
 	model_layers: int = 2
 	model_mask_features: bool = False  # v1 only: BattleModelV1(mask_features=...)
@@ -402,8 +402,8 @@ class Producer:
 
 def model_kwargs(config):
 	"""The model's constructor arguments, saved in checkpoints (model.build_model rebuilds the model from them)."""
-	if config.model_architecture == "v2":
-		return {"architecture": "v2", "dim": config.model_dim, "layers": config.model_layers}
+	if config.model_architecture in ("v2", "v3"):
+		return {"architecture": config.model_architecture, "dim": config.model_dim, "layers": config.model_layers}
 	return {"architecture": "v1", "dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features, "chain_final_value": config.model_chain_final_value, "kill_rule": config.model_kill_rule}
 
 

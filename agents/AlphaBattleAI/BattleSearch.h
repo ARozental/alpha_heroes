@@ -19,11 +19,7 @@ struct EncodedBattle;
 
 /// Value of an army in gold (reward.py), as data.py army_value
 double armyValue(const CCreatureSet & army);
-/// True for a unit the side keeps after the battle if it is alive then: its army's stacks and permanently summoned
-/// units (Pit Lords' demons: the engine adds them to the army, BattleResultProcessor); not summoned units and clones,
-/// which vanish, nor war machines and arrow towers
-bool keptAfterBattle(const CStack * unit);
-/// Value of a side's units alive in a battle that it keeps after the battle (keptAfterBattle)
+/// Value of what a side would keep if the battle ended now (remainingAfterBattle of its units, Encoder.h)
 double aliveArmyValue(const CBattleInfoCallback & battle, BattleSide side);
 
 /// A battle as a game for GumbelSearch: a state is a BattleSimulation (a copy of the battle with its own dice),

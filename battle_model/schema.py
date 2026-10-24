@@ -122,6 +122,14 @@ INPUTS = (
 	_m("m_spell2_unit", (U, U), "HERO_SPELL (Sacrifice): legal second unit per first-target unit"),
 	_m("m_creature_spell_unit", (U,), "CREATURE_SPELL: legal unit targets"),
 	_m("m_creature_spell_hex", (H,), "CREATURE_SPELL: legal hex targets"),
+	# What each legal cast would do, as the engine predicts it (its spell effects' own health change, the same rules
+	# as the cast): the change of army value in gold, as the reward counts it, for the attacker minus for the defender.
+	# Damage to a side's units counts against it, healing, resurrection and permanent summons for it. 0 for casts
+	# that change no health (Slow, Bless, ...) and for two-target spells (Teleport, Sacrifice).
+	_i("s_unit_value", (S, U), "HERO_SPELL: predicted value change (attacker - defender, gold) of the cast at this unit"),
+	_i("s_hex_value", (S, H), "HERO_SPELL: predicted value change (attacker - defender, gold) of the cast at this hex"),
+	_i("c_unit_value", (U,), "CREATURE_SPELL: predicted value change (attacker - defender, gold) of the cast at this unit"),
+	_i("c_hex_value", (H,), "CREATURE_SPELL: predicted value change (attacker - defender, gold) of the cast at this hex"),
 )
 
 # Every output is float32 masked log-probabilities, conditional on the previous choices:
@@ -244,6 +252,11 @@ def random_inputs(batch=1, seed=0, n_units=14):
 			else:
 				x["m_creature_spell_hex"][b] = pick(H, 0.3)
 		finalize_masks(x, b)
+		value = lambda shape: rng.integers(-3000, 3000, shape) * (rng.random(shape) < 0.7)  # 0: casts that change no health
+		x["s_unit_value"][b] = value((S, U)) * x["m_spell_unit"][b]
+		x["s_hex_value"][b] = value((S, H)) * x["m_spell_hex"][b]
+		x["c_unit_value"][b] = value(U) * x["m_creature_spell_unit"][b]
+		x["c_hex_value"][b] = value(H) * x["m_creature_spell_hex"][b]
 	return x
 
 

@@ -6,8 +6,8 @@
 
 namespace AlphaSchema
 {
-constexpr int SCHEMA_VERSION = 9;
-constexpr const char * CONTRACT_HASH = "4acbc39cc2620ed9";
+constexpr int SCHEMA_VERSION = 10;
+constexpr const char * CONTRACT_HASH = "aefe4c5c84e0ac89";
 
 constexpr int N_HEXES = 187;
 constexpr int FIELD_WIDTH = 17;
@@ -142,6 +142,10 @@ enum class In : int
 	m_spell2_unit,
 	m_creature_spell_unit,
 	m_creature_spell_hex,
+	s_unit_value,
+	s_hex_value,
+	c_unit_value,
+	c_hex_value,
 	COUNT
 };
 
@@ -212,6 +216,10 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"m_spell2_unit", DType::BOOL, 2, {20, 20}, 0},
 	TensorSpec{"m_creature_spell_unit", DType::BOOL, 1, {20, 0}, 0},
 	TensorSpec{"m_creature_spell_hex", DType::BOOL, 1, {187, 0}, 0},
+	TensorSpec{"s_unit_value", DType::INT64, 2, {70, 20}, 0},
+	TensorSpec{"s_hex_value", DType::INT64, 2, {70, 187}, 0},
+	TensorSpec{"c_unit_value", DType::INT64, 1, {20, 0}, 0},
+	TensorSpec{"c_hex_value", DType::INT64, 1, {187, 0}, 0},
 }};
 
 enum class Out : int

@@ -1,11 +1,11 @@
-"""Building blocks shared by the battle models (model.py, model_v1.py)."""
+"""Building blocks shared by the battle models (model.py, model_v2.py, model_v1.py)."""
 import math
 
 import torch
 from torch import nn
 
 from . import priors
-from .constants import MASKED_LOGIT, ActionType
+from .constants import MASKED_LOGIT, N_VALUE_HORIZONS, ActionType
 from .schema import INPUT_NAMES, OUTPUT_NAMES
 
 # Starting preference between action types, as type-head logits: priors/action_types.csv (priors.py). The head's
@@ -67,3 +67,81 @@ class OnnxWrapper(nn.Module):
 	def forward(self, *tensors):
 		outputs = self.model(dict(zip(INPUT_NAMES, tensors)))
 		return tuple(outputs[name] for name in OUTPUT_NAMES)
+
+
+EMBEDDING_STD = 0.1
+
+
+def small_embedding(count, dim):
+	embedding = nn.Embedding(count, dim)
+	nn.init.normal_(embedding.weight, std=EMBEDDING_STD)
+	return embedding
+
+
+def best_of(logits, legal):
+	"""The largest legal entry of the last axis; 0 where none is legal."""
+	return torch.where(legal.any(dim=-1), logits.masked_fill(~legal, MASKED_LOGIT).amax(dim=-1), torch.zeros_like(logits[..., 0]))
+
+
+def zero_output(layer):
+	nn.init.zeros_(layer.weight)
+	nn.init.zeros_(layer.bias)
+	return layer
+
+
+class ActionScore(nn.Module):
+	"""How a choice's own features [B, *choices, features] move its logit: linear (one weight per feature), own (a tiny
+	layer from the choice's features to 1) and wide (a wider layer from the choice's features, the context and a
+	summary of all legal choices' features: their mean and max). All start at 0. linear_only: only the first part
+	(for choices with few features and very many entries, such as every spell at every hex)."""
+
+	def __init__(self, names, dim, tiny=8, wide=32, linear_only=False):
+		super().__init__()
+		self.names = tuple(names)
+		n = len(self.names)
+		self.linear = nn.Parameter(torch.zeros(n))
+		self.linear_only = linear_only
+		if linear_only:
+			return
+		self.own = nn.Sequential(nn.Linear(n, tiny), nn.GELU(), zero_output(nn.Linear(tiny, 1)))
+		self.wide_choice = nn.Linear(n, wide)  # per choice
+		self.wide_rest = nn.Linear(dim + 2 * n, wide)  # per decision: the context and the summary
+		self.wide_out = zero_output(nn.Linear(wide, 1))
+
+	def forward(self, features, legal, context):
+		linear = (features * self.linear).sum(dim=-1)
+		if self.linear_only:
+			return linear
+		own = self.own(features).squeeze(-1)
+		flat, flat_legal = features.flatten(1, -2), legal.flatten(1)[..., None].float()
+		count = flat_legal.sum(dim=1)
+		mean = (flat * flat_legal).sum(dim=1) / count.clamp(min=1)
+		top = flat.masked_fill(flat_legal == 0, -2.0).amax(dim=1) * (count > 0)  # features are >= -1
+		rest = self.wide_rest(torch.cat([context, mean, top], dim=-1))  # [B, wide]
+		hidden = nn.functional.gelu(self.wide_choice(features) + rest.view(rest.shape[0], *([1] * (features.dim() - 2)), -1))
+		return linear + own + self.wide_out(hidden).squeeze(-1)
+
+
+class ValueHeads(nn.Module):
+	"""V0..V2: the reward formula at the end of this round and the next two, boosted (each adds to the previous logit,
+	detached); V: the final reward, standing alone. Each tanh(logit), -1..1 (reward.to_scale); all start at 0."""
+
+	def __init__(self, dim, boost_stop_gradient=True):
+		super().__init__()
+		self.boost_stop_gradient = boost_stop_gradient
+		self.heads = nn.ModuleList(nn.Linear(dim, 1) for _ in range(N_VALUE_HORIZONS + 1))
+		with torch.no_grad():
+			for head in self.heads:
+				head.weight.zero_()
+				head.bias.zero_()
+
+	def forward(self, context):
+		logits, previous = [], None
+		for i, head in enumerate(self.heads):
+			logit = head(context).squeeze(-1)
+			if previous is not None and i < len(self.heads) - 1:
+				logit = logit + (previous.detach() if self.boost_stop_gradient else previous)
+			logits.append(logit)
+			previous = logit
+		value_logit = torch.stack(logits, dim=-1)
+		return {"value": torch.tanh(value_logit), "value_logit": value_logit}  # value_logit: for the loss only

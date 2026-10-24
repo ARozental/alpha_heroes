@@ -531,3 +531,49 @@ def action_features(b, melee, shot, maps, can_attack, battle):
 		"move": hexes,
 		"type": pick(TYPE_FEATURES, battle, BATTLE_FEATURES),
 	}
+
+
+# ---- Spells: what each cast would do ----
+
+SPELL_FEATURES = ("net_value", "versus_best", "changes_health")
+
+
+def spell_features(b):
+	"""Per spell target, from the engine's prediction of the cast (inputs s_*_value, c_*_value: the value change, in
+	gold as the reward counts it, for the attacker minus for the defender; damage to a side's own units counts
+	against it):
+
+	net_value       our gain, of both armies' value: -1..1
+	versus_best     our gain against the most this spell gains or costs us at any legal target: -1..1 (1: the best one)
+	changes_health  1 if the spell changes any health at any legal target (damage, healing, resurrection, summons);
+	                for the others (Slow, Bless, ...) versus_best is 0 here and the model puts a learned value instead
+
+	spell_unit [B, S, U, 3], spell_hex [B, S, H, 3], creature_spell_unit [B, U, 3], creature_spell_hex [B, H, 3].
+	"""
+	x = b.x
+	sign = (1 - 2 * x["g_our_side"].clamp(0, 1)).float()  # +1 when we attack
+	both = (b.our_value + b.enemy_value).clamp(min=EPS)
+
+	def per_spell(value, legal):  # value, legal [B, ..., targets]
+		ours = value.float() * sign.view(-1, *[1] * (value.dim() - 1)) * legal
+		best = ours.abs().amax(dim=-1, keepdim=True)
+		net = (ours / both.view(-1, *[1] * (value.dim() - 1))).clamp(-1, 1)
+		changes = (best > 0).float().expand_as(ours)
+		return torch.stack([net, ours / best.clamp(min=EPS), changes], dim=-1)
+
+	return {
+		"spell_unit": per_spell(x["s_unit_value"], x["m_spell_unit"]),
+		"spell_hex": per_spell(x["s_hex_value"], x["m_spell_hex"]),
+		"creature_spell_unit": per_spell(x["c_unit_value"], x["m_creature_spell_unit"]),
+		"creature_spell_hex": per_spell(x["c_hex_value"], x["m_creature_spell_hex"]),
+	}
+
+
+def our_frame(hexes, our_side):
+	"""Where hexes [B, ...] are, seen from our starting side: (column toward the enemy's side, row), each 0..1. The
+	attacker starts on the left, so for the defender the columns count from the right: "forward" is the same number
+	for both."""
+	column = (hexes % 17).float() / 16
+	row = (hexes // 17).float() / 10
+	defender = (our_side.view(-1, *[1] * (hexes.dim() - 1)) == 1)
+	return torch.stack([torch.where(defender, 1 - column, column), row], dim=-1) * (hexes >= 0)[..., None]

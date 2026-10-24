@@ -193,14 +193,16 @@ void AlphaBattleAI::recordEvent(const std::string & json)
 
 std::string AlphaBattleAI::aliveArmies(const BattleID & battleID) const
 {
-	// Units kept after the battle only (keptAfterBattle): summoned units and clones vanish and are worth nothing
+	// What each side would keep if the battle ended now (remainingAfterBattle): summoned units and clones vanish,
+	// creatures raised only for the battle too
 	std::array<std::string, 2> sides = {"[", "["};
 	for(const auto * s : cb->getBattle(battleID)->battleGetAllStacks(true))
 	{
-		if(!s->alive() || !keptAfterBattle(s))
+		const int remaining = remainingAfterBattle(s);
+		if(remaining <= 0)
 			continue;
 		auto & json = sides[static_cast<int>(s->unitSide())];
-		json += std::string(json.size() > 1 ? ", " : "") + "[" + std::to_string(s->creatureId().getNum()) + ", " + std::to_string(s->getCount()) + "]";
+		json += std::string(json.size() > 1 ? ", " : "") + "[" + std::to_string(s->creatureId().getNum()) + ", " + std::to_string(remaining) + "]";
 	}
 	return "[" + sides[0] + "], " + sides[1] + "]]";
 }

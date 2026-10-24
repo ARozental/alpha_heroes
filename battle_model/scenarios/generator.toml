@@ -1,0 +1,259 @@
+# How to sample a random battle: a distribution, not code. A sampler (not written yet) draws the groups in the order
+# of this file; later groups may depend on earlier draws (marked "by phase", "by battle type", ...).
+#
+# Every choice is { p = probability, desc = "a few words" }. The p of a group sum to 1 (the sampler normalises anyway).
+# Ranges are { min, max } (inclusive), drawn uniformly unless the group says otherwise. Names are VCMI's identifiers.
+#
+# What the engine already gets right by itself, so nothing here models it: creature stats on their native terrain,
+# artifact and skill bonuses, morale from mixed armies, special battlefield effects. The encoder reads every unit's
+# current stats from the engine. What the model can NOT see today is noted at the group concerned.
+#
+# Numbers marked CALIBRATE are guesses, to be replaced by statistics from the campaign AI's own games.
+
+# ---------------------------------------------------------------------------------------------------------------------
+# 1. Map: trivial, two armies and nothing else (a town only for sieges, section 3)
+
+[map]
+size = 10  # tiles; the battle-only map the tool builds (alpha_make_battle_map)
+
+# ---------------------------------------------------------------------------------------------------------------------
+# 2. Terrain under the battle. It decides (a) which creatures are native (+1 attack, defence, speed: the engine applies
+# it), (b) the default battlefield (the engine picks one of the terrain's own at random). Rock is impassable: no battles.
+
+[terrain]
+dirt     = { p = 0.13, desc = "dirt (Necropolis)" }
+sand     = { p = 0.08, desc = "sand" }
+grass    = { p = 0.20, desc = "grass (Castle, Rampart, Conflux)" }
+snow     = { p = 0.09, desc = "snow (Tower)" }
+swamp    = { p = 0.09, desc = "swamp (Fortress)" }
+rough    = { p = 0.11, desc = "rough (Stronghold)" }
+subterra = { p = 0.13, desc = "underground (Dungeon)" }
+lava     = { p = 0.09, desc = "lava (Inferno)" }
+water    = { p = 0.08, desc = "boat battle" }  # only with battle_type hero_vs_hero; else redrawn
+
+# A special battlefield replaces the terrain's own: its rules change the battle (the engine applies them).
+# Model gap: the model sees the battlefield id but its spell-mastery bias reads the hero's skills, so on magic plains
+# (every spell expert) and the elemental fields it uses the wrong mastery. Fix before using these: encode each school's
+# effective level from the engine (getSpellSchoolLevel) instead of the skills.
+[battlefield]
+special_probability = 0.12  # else the terrain's own battlefield
+
+[battlefield.special]
+magic_plains  = { p = 0.20, desc = "all spells expert" }
+cursed_ground = { p = 0.20, desc = "no morale, luck, high spells" }
+holy_ground   = { p = 0.12, desc = "good +1, evil -1 morale" }
+evil_fog      = { p = 0.12, desc = "evil +1, good -1 morale" }
+clover_field  = { p = 0.10, desc = "neutral +2 luck" }
+fiery_fields  = { p = 0.07, desc = "fire spells expert" }
+rocklands     = { p = 0.07, desc = "earth spells expert" }
+magic_clouds  = { p = 0.06, desc = "air spells expert" }
+lucid_pools   = { p = 0.06, desc = "water spells expert" }
+
+# ---------------------------------------------------------------------------------------------------------------------
+# 3. Battle type
+
+[battle_type]
+hero_vs_hero     = { p = 0.40, desc = "two heroes" }
+hero_vs_neutrals = { p = 0.40, desc = "wandering monsters" }
+siege            = { p = 0.17, desc = "town assault" }
+creature_bank    = { p = 0.03, desc = "bank guards" }  # needs the bank's own layout (guards around the hero)
+
+# Sieges: the defender's town. Its faction is the defending army's main faction (section 4.2) with this probability,
+# else any other faction (a captured town).
+[siege]
+town_is_defender_faction = 0.80
+
+[siege.fortifications]
+none    = { p = 0.15, desc = "no fort" }
+fort    = { p = 0.30, desc = "walls only" }
+citadel = { p = 0.30, desc = "walls, moat, keep" }
+castle  = { p = 0.25, desc = "plus two towers" }
+
+[siege.defender]
+garrison_hero = { p = 0.60, desc = "hero in town" }
+no_hero       = { p = 0.40, desc = "garrison only" }
+
+# ---------------------------------------------------------------------------------------------------------------------
+# 4. Game phase: the day of the game, which sets the size and kind of the armies and the heroes.
+# CALIBRATE: army values (gold, as the reward prices them) and levels are guesses for a normal-difficulty game.
+
+[phase.week1]
+p = 0.15
+desc = "first week"
+days = { min = 1, max = 7 }
+army_value_median = 6000       # the stronger side's army; each army is lognormal around it (army_value_sigma)
+top_tier = { min = 3, max = 5 }  # highest creature level that can be in the armies
+upgraded = 0.10                  # chance a stack is upgraded
+hero_level = { min = 1, max = 4 }
+artifacts = { min = 0, max = 2 }
+mage_guild = { min = 1, max = 2 }
+
+[phase.week2]
+p = 0.15
+desc = "second week"
+days = { min = 8, max = 14 }
+army_value_median = 15000
+top_tier = { min = 4, max = 6 }
+upgraded = 0.25
+hero_level = { min = 3, max = 7 }
+artifacts = { min = 0, max = 3 }
+mage_guild = { min = 1, max = 3 }
+
+[phase.month1_end]
+p = 0.20
+desc = "weeks 3-4"
+days = { min = 15, max = 28 }
+army_value_median = 35000
+top_tier = { min = 5, max = 7 }
+upgraded = 0.40
+hero_level = { min = 5, max = 11 }
+artifacts = { min = 1, max = 5 }
+mage_guild = { min = 2, max = 4 }
+
+[phase.month2]
+p = 0.20
+desc = "second month"
+days = { min = 29, max = 56 }
+army_value_median = 80000
+top_tier = { min = 6, max = 7 }
+upgraded = 0.60
+hero_level = { min = 9, max = 16 }
+artifacts = { min = 2, max = 8 }
+mage_guild = { min = 3, max = 5 }
+
+[phase.month3]
+p = 0.15
+desc = "third month"
+days = { min = 57, max = 84 }
+army_value_median = 160000
+top_tier = { min = 7, max = 7 }
+upgraded = 0.75
+hero_level = { min = 13, max = 22 }
+artifacts = { min = 4, max = 12 }
+mage_guild = { min = 4, max = 5 }
+
+[phase.late]
+p = 0.15
+desc = "late game"
+days = { min = 85, max = 200 }
+army_value_median = 350000
+top_tier = { min = 7, max = 7 }
+upgraded = 0.85
+hero_level = { min = 18, max = 35 }
+artifacts = { min = 6, max = 16 }
+mage_guild = { min = 5, max = 5 }
+
+[army]
+value_sigma = 0.35  # lognormal sigma of the stronger army's value around the phase's median
+
+# 4.1 Force ratio: the stronger army's value over the weaker's, as log10 (0 = equal, 1 = 10:1).
+# Army value only: a strong hero changes the real balance a lot (section 4.3), which is part of the variety.
+[ratio]
+even     = { p = 0.60, desc = "up to 1.25:1", log10 = { min = 0.0, max = 0.1 } }
+favoured = { p = 0.28, desc = "up to 3:1",    log10 = { min = 0.1, max = 0.5 } }
+lopsided = { p = 0.12, desc = "up to 10:1",   log10 = { min = 0.5, max = 1.0 } }
+
+# Who is stronger. Neutrals are mostly weaker: in real games a hero attacks what it can beat (and our ratio above is
+# "even" most of the time, which is rare against neutrals in real games).
+[ratio.stronger_side]
+hero_vs_hero     = { attacker = 0.55, defender = 0.45 }
+hero_vs_neutrals = { attacker = 0.85, defender = 0.15 }
+siege            = { attacker = 0.70, defender = 0.30 }  # the defender has walls and towers on its side
+creature_bank    = { attacker = 0.80, defender = 0.20 }
+
+# 4.2 Army composition (heroes' armies; neutrals below)
+[composition.stacks]  # number of creature stacks (war machines not counted)
+s7 = { p = 0.40, desc = "full army" }
+s6 = { p = 0.20, desc = "six stacks" }
+s5 = { p = 0.15, desc = "five stacks" }
+s4 = { p = 0.10, desc = "four stacks" }
+s3 = { p = 0.08, desc = "three stacks" }
+s2 = { p = 0.05, desc = "two stacks" }
+s1 = { p = 0.02, desc = "one stack" }
+
+[composition.main_faction]  # the army's main town
+castle     = { p = 0.112, desc = "Castle" }
+rampart    = { p = 0.111, desc = "Rampart" }
+tower      = { p = 0.111, desc = "Tower" }
+inferno    = { p = 0.111, desc = "Inferno" }
+necropolis = { p = 0.111, desc = "Necropolis" }
+dungeon    = { p = 0.111, desc = "Dungeon" }
+stronghold = { p = 0.111, desc = "Stronghold" }
+fortress   = { p = 0.111, desc = "Fortress" }
+conflux    = { p = 0.111, desc = "Conflux" }
+
+[composition.stack_origin]  # where each stack's creature comes from
+main_faction  = { p = 0.85, desc = "own town" }
+other_faction = { p = 0.10, desc = "another town" }
+neutral       = { p = 0.05, desc = "neutral creature" }  # gold golem, enchanter, faerie dragon, troll, ...
+
+# How the army's value is spread over creature levels 1..top_tier: each stack's level is drawn with these weights,
+# then the value is split between stacks in proportion to their level's weight (so high levels hold more value).
+[composition.level_weights]
+weights = [1.0, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]  # level 1 .. 7
+
+[composition.war_machines]  # each independently, heroes only; sieges always give the attacker a catapult
+ballista       = { p = 0.30, desc = "ballista" }
+first_aid_tent = { p = 0.20, desc = "first aid tent" }
+ammo_cart      = { p = 0.20, desc = "ammo cart" }
+
+# Neutrals: one creature type (the engine splits it into stacks); its level is drawn as for an army stack.
+[neutrals]
+upgraded_stack = 0.15  # chance of one extra stack of the upgraded creature, as on real maps
+
+[neutrals.creature_origin]
+any_faction = { p = 0.85, desc = "a town's creature" }
+neutral     = { p = 0.15, desc = "neutral creature" }
+
+# 4.3 Heroes. Level by phase; primary and secondary skills either grow as the engine grows them, or are drawn freely
+# (out of distribution on purpose).
+[hero.faction]
+army_faction = { p = 0.85, desc = "as its army" }
+other        = { p = 0.15, desc = "any faction" }
+
+[hero.class]
+might = { p = 0.50, desc = "might hero" }
+magic = { p = 0.50, desc = "magic hero" }
+
+[hero.growth]
+engine_level_ups = { p = 0.80, desc = "class probabilities" }  # primary skills and offered secondary skills, as levelling up
+random           = { p = 0.20, desc = "free draw" }            # skills drawn uniformly within the level's budget
+
+[hero.spellbook]  # might heroes may not have one
+magic = 1.0
+might = 0.75
+
+[hero.spells]  # the hero's town's mage guild (phase's mage_guild levels), plus a few random spells
+extra_random = { min = 0, max = 3 }
+
+[hero.mana]  # at the start of the battle
+full    = { p = 0.70, desc = "full mana" }
+partial = { p = 0.30, desc = "20-100% mana", fraction = { min = 0.2, max = 1.0 } }
+
+# Artifacts: count by phase, each drawn by class (the engine's slots decide where it goes; a second one for a full
+# slot is redrawn). Model gap: artifacts whose effect is not in any stat (Orb of Tempestuous Fire, Orb of
+# Vulnerability, Recanter's Cloak, ...) are invisible to the model; it needs an input of our hero's artifacts.
+[hero.artifact_class]
+treasure = { p = 0.50, desc = "treasure" }
+minor    = { p = 0.30, desc = "minor" }
+major    = { p = 0.15, desc = "major" }
+relic    = { p = 0.05, desc = "relic" }
+
+# Tactics: our AI ends the tactics phase at once (it is scripted), so a hero with Tactics against it is an unfair
+# advantage for BattleAI and a free one for us. Keep the skill out until our model plays tactics.
+[hero.excluded_secondary_skills]
+skills = ["tactics"]
+
+# ---------------------------------------------------------------------------------------------------------------------
+# 5. Everything else
+
+[side]  # which side our model plays (self-play plays both)
+attacker = { p = 0.50, desc = "we attack" }
+defender = { p = 0.50, desc = "we defend" }  # hero_vs_neutrals: we always attack
+
+[gold]  # the player's gold: surrender needs cost + hero hire
+enough = { p = 0.70, desc = "can surrender" }
+broke  = { p = 0.30, desc = "cannot surrender" }
+
+[seed]  # VCMI's random seed: dice, obstacles, neutrals' stack split
+random = true

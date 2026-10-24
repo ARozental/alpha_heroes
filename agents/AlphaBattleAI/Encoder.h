@@ -50,6 +50,16 @@ bool isLegal(const EncodedBattle & e, const ChosenAction & action);
 /// A creature's value in gold (reward.py prices: gold and resources), as the reward counts it
 double creatureValue(const CCreature * creature);
 
+/// True for a unit the side keeps after the battle if it is alive then: its army's stacks and permanently summoned
+/// units (Pit Lords' demons: the engine adds them to the army, BattleResultProcessor); not summoned units and clones,
+/// which vanish, nor war machines and arrow towers
+bool keptAfterBattle(const CStack * unit);
+
+/// The creatures of a unit its side would keep if the battle ended now: its count minus the ones only raised for the
+/// battle (a temporary Resurrection), as the engine's casualties count them (CUnitState::getKilled); 0 for units
+/// not kept after the battle. The reward counts what remains, never what was killed.
+int remainingAfterBattle(const CStack * unit);
+
 /// Every legal full action, from the masks alone, in the order of battle_model/distributions.py enumerate_actions
 std::vector<ChosenAction> legalActions(const EncodedBattle & e);
 

@@ -88,17 +88,12 @@ double armyValue(const CCreatureSet & army)
 	return value;
 }
 
-bool keptAfterBattle(const CStack * unit)
-{
-	return !unit->isClone() && !unit->summoned && (unit->unitSlot().validSlot() || unit->unitSlot() == SlotID::SUMMONED_SLOT_PLACEHOLDER);
-}
-
 double aliveArmyValue(const CBattleInfoCallback & battle, BattleSide side)
 {
 	double value = 0;
 	for(const auto * s : battle.battleGetAllStacks(true))
-		if(s->unitSide() == side && s->alive() && keptAfterBattle(s))
-			value += creatureValue(s->unitType()) * s->getCount();
+		if(s->unitSide() == side)
+			value += creatureValue(s->unitType()) * remainingAfterBattle(s);
 	return value;
 }
 
