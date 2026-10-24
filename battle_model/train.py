@@ -516,11 +516,16 @@ def train(config, resume=False):
 		model.train()
 		examples = loader.dataset
 		epoch_data = to_device(collate(examples), device) if examples else None  # every decision of the epoch, moved to the GPU once
+		# Every tensor shape on the GPU is fixed: MPS keeps a compiled graph per shape (~100 MB each, never freed), so
+		# a last batch of a new size every epoch filled memory and swap. The last chunk repeats its last decision;
+		# each pass leaves out its last partial batch (a different one each pass).
 		if epoch_data is not None and hasattr(model, "facts"):  # the features: once per decision, not once per pass
-			chunks = [model.facts(select(epoch_data["inputs"], torch.arange(i, min(i + 256, len(examples)), device=device))) for i in range(0, len(examples), 256)]
-			epoch_data["facts"] = {key: torch.cat([c[key] for c in chunks]) for key in chunks[0]}
+			chunks = [model.facts(select(epoch_data["inputs"], torch.arange(i, i + 256, device=device).clamp(max=len(examples) - 1))) for i in range(0, len(examples), 256)]
+			epoch_data["facts"] = {key: torch.cat([c[key] for c in chunks])[: len(examples)] for key in chunks[0]}
 		for _ in range(config.ppo_passes if examples else 0):
 			order = torch.randperm(len(examples)).to(device)
+			if len(examples) >= config.batch_size:
+				order = order[: len(examples) - len(examples) % config.batch_size]
 			for first in range(0, len(examples), config.batch_size):
 				batch = select(epoch_data, order[first : first + config.batch_size])
 				out_batch = model(batch["inputs"], batch["facts"]) if "facts" in batch else model(batch["inputs"])
