@@ -140,9 +140,12 @@ void encodeHeroes(InputTensors & t, const CPlayerBattleCallback & battle, Battle
 		t.set(In::h_mana_max, my, hero->manaLimit());
 		for(int skill = 0; skill < N_SECONDARY_SKILLS; ++skill)
 			t.set(In::h_skills, my, skill, hero->getSecSkillLevel(SecondarySkill(skill)));
-		if(hero->hasSpellbook())
-			for(int spell = 0; spell < N_SPELLS; ++spell)
-				t.set(In::h_spells, my, spell, hero->spellbookContainsSpell(SpellID(spell)));
+		for(int spell = 0; spell < N_SPELLS; ++spell)
+			if(const auto * s = SpellID(spell).toSpell())
+			{
+				t.set(In::h_spells, my, spell, hero->canCastThisSpell(s)); // the spellbook's, and tomes' and scrolls'
+				t.set(In::h_spell_mastery, my, spell, hero->getSpellSchoolLevel(s));
+			}
 		const double level = heroLevel(hero);
 		t.set(In::h_level, my, static_cast<int64_t>(hero->level));
 		t.set(In::h_level_progress, my, std::llround(1000 * (level - hero->level)));

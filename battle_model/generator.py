@@ -4,8 +4,7 @@ builds) from the distribution in battle_model/scenarios/generator.toml, in the o
 Everything the engine knows (creatures, heroes and their classes, spells and mage guilds, artifacts and their slots,
 the experience per level) comes from the exported vocab (scripts/export_vocab.sh), so the draws are the engine's
 own identifiers and numbers. What the map tool cannot build yet is redrawn or left out, and noted where it happens
-(UNSUPPORTED): neutrals and creature banks (battle-only mode starts hero-vs-hero or siege battles only), boats,
-special battlefields, a hero's mana below full and the player's gold.
+(UNSUPPORTED): creature banks, boats, special battlefields, a hero's mana below full and the player's gold.
 
 Usage: .venv/bin/python -m battle_model.generator [--count N] [--seed S] [--out DIR]  (writes N scenario files)
 """
@@ -21,7 +20,7 @@ from . import vocab
 from .reward import resources_value
 
 CONFIG_PATH = Path(__file__).resolve().parent / "scenarios" / "generator.toml"
-UNSUPPORTED_BATTLE_TYPES = ("hero_vs_neutrals", "creature_bank")  # redrawn (UNSUPPORTED: needs an engine change)
+UNSUPPORTED_BATTLE_TYPES = ("creature_bank",)  # redrawn (UNSUPPORTED: the bank's own layout)
 UNSUPPORTED_TERRAINS = ("water",)  # redrawn (UNSUPPORTED: boats)
 FORTIFICATIONS = ("none", "fort", "citadel", "castle")
 WAR_MACHINES = {"ballista": "ballista", "first_aid_tent": "firstAidTent", "ammo_cart": "ammoCart"}
@@ -29,7 +28,6 @@ GUILD_SPELLS = (5, 4, 3, 2, 1)  # spells a mage guild offers at levels 1-5 (CGTo
 LEARNABLE = (2, 3, 4, 5)  # the highest spell level a hero can learn, by Wisdom mastery (none, basic, advanced, expert)
 MAX_SECONDARY = 8
 BACKPACK_START = 19  # ArtifactPosition::BACKPACK_START
-RINGS, MISC = (7, 8), (9, 10, 11, 12, 18)  # ArtifactPosition: LEFT_RING, RIGHT_RING; MISC1-4 and MISC5
 
 
 def short(key):
@@ -120,15 +118,31 @@ def draw_army(rng, value, faction, phase, cfg, w):
 	stacks = int(choose(rng, comp["stacks"])[1:])
 	weights = comp["level_weights"]["weights"][: between(rng, phase["top_tier"])]  # up to the army's highest level
 	chosen = []
-	for _ in range(stacks * 4):  # redraw when a level has no creature or the creature is already in the army
+	for attempt in range(stacks * 4):  # redraw when a level has no creature or the creature is already in the army
 		if len(chosen) == stacks:
 			break
-		level = rng.choices(range(1, len(weights) + 1), weights=weights)[0]
+		# the first stack is of the army's top level (an army that size carries its best creature), the others drawn
+		level = len(weights) if not chosen and attempt < 4 else rng.choices(range(1, len(weights) + 1), weights=weights)[0]
 		key = draw_creature(rng, level, faction, choose(rng, comp["stack_origin"]), phase["upgraded"], w)
-		if key and key not in [k for k, _ in chosen]:
-			chosen.append((key, weights[level - 1]))
-	total = sum(weight for _, weight in chosen)
-	return [[key, max(1, round(value * weight / total / creature_value(key, w)))] for key, weight in chosen]
+		if key and key not in chosen:
+			chosen.append(key)
+	# As an army bought from the towns' growth: every stack the same number of weeks of its creature's growth
+	growth = {key: max(1, w["creature"][key]["growth"]) for key in chosen}
+	weeks = value / sum(growth[key] * creature_value(key, w) for key in chosen)
+	return [[key, max(1, round(weeks * growth[key]))] for key in chosen]
+
+
+def draw_neutrals(rng, value, phase, cfg, w):
+	"""Wandering monsters worth about `value` gold: one creature type, its level drawn as for an army stack (the engine
+	splits it into stacks when the hero attacks), sometimes with one stack of its upgrade."""
+	n = cfg["neutrals"]
+	weights = cfg["composition"]["level_weights"]["weights"][: between(rng, phase["top_tier"])]
+	key = None
+	while key is None:
+		level = rng.choices(range(1, len(weights) + 1), weights=weights)[0]
+		origin = "neutral" if choose(rng, n["creature_origin"]) == "neutral" else "main_faction"
+		key = draw_creature(rng, level, rng.choice(w["factions"]), origin, phase["upgraded"], w)
+	return {"creature": key, "count": max(1, round(value / creature_value(key, w))), "upgraded_stack": rng.random() < n["upgraded_stack"]}
 
 
 def army_value(army, w):
@@ -243,13 +257,18 @@ def sample(rng, cfg=None, w=None):
 	values = [strong, strong / ratio] if stronger == 0 else [strong / ratio, strong]
 
 	sides, factions = [], []
-	for side in (0, 1):
+	for side in (0, 1) if battle_type != "hero_vs_neutrals" else (0,):
 		faction = choose(rng, cfg["composition"]["main_faction"])
 		army = draw_army(rng, values[side], faction, phase, cfg, w)
 		sides.append({"faction": faction, **draw_hero(rng, faction, phase, cfg, w), "army": army})
 		factions.append(faction)
 	scenario = {"name": "generated", "terrain": terrain, "seed": rng.randrange(1, 2**31), "sides": sides}
-	about = f"{battle_type}, {phase_name}, {terrain}, armies {army_value(sides[0]['army'], w):.0f} vs {army_value(sides[1]['army'], w):.0f} gold"
+	if battle_type == "hero_vs_neutrals":
+		scenario["neutrals"] = draw_neutrals(rng, values[1], phase, cfg, w)
+		enemy = creature_value(scenario["neutrals"]["creature"], w) * scenario["neutrals"]["count"]
+		about = f"{battle_type}, {phase_name}, {terrain}, army {army_value(sides[0]['army'], w):.0f} vs {scenario['neutrals']['count']} {scenario['neutrals']['creature']} ({enemy:.0f} gold)"
+	else:
+		about = f"{battle_type}, {phase_name}, {terrain}, armies {army_value(sides[0]['army'], w):.0f} vs {army_value(sides[1]['army'], w):.0f} gold"
 	if battle_type == "siege":
 		s = cfg["siege"]
 		town = factions[1] if rng.random() < s["town_is_defender_faction"] else rng.choice([f for f in w["factions"] if f != factions[1]])

@@ -105,7 +105,8 @@ INPUTS = (
 	_i("h_mana", (N_SIDES,), "mana points left"),
 	_i("h_mana_max", (N_SIDES,), "mana limit"),
 	_i("h_skills", (N_SIDES, N_SECONDARY_SKILLS), "secondary skill levels 0..3; all 0 for the enemy hero (hidden from a player)"),
-	_i("h_spells", (N_SIDES, S), "1 if the spell is in the spellbook; all 0 for the enemy hero (hidden from a player)"),
+	_i("h_spells", (N_SIDES, S), "1 if the hero can cast the spell (canCastThisSpell: in its spellbook, or from a tome or scroll); all 0 for the enemy hero (hidden from a player)"),
+	_i("h_spell_mastery", (N_SIDES, S), "the hero's mastery of each spell as the engine casts it, 0 (none) .. 3 (expert): getSpellSchoolLevel, so its school skills, artifacts (tomes), specialty and the battlefield (magic plains, elemental fields); all 0 for the enemy hero (hidden)"),
 	_i("h_level", (N_SIDES,), "hero level; 0 for the enemy hero (a player's view of an enemy hero, InfoAboutHero, has no level)"),
 	_i("h_level_progress", (N_SIDES,), "of the way from its level to the next, in thousandths; 0 for the enemy hero (its experience is hidden)"),
 	_i("h_artifacts", (N_SIDES,), "market price in gold of the artifacts a winner would take from the hero (reward.py; not war machines); 0 for the enemy hero (hidden)"),
@@ -253,6 +254,7 @@ def random_inputs(batch=1, seed=0, n_units=14):
 			x["h_mana_max"][b, side] = 100
 			x["h_skills"][b, side] = rng.integers(0, 4, N_SECONDARY_SKILLS)
 		x["h_spells"][b, x["g_our_side"][b]] = rng.integers(0, 2, S)
+		x["h_spell_mastery"][b, x["g_our_side"][b]] = rng.integers(0, 4, S)
 		x["x_access"][b] = rng.integers(0, 7, H)
 
 		def pick(n, p=0.3):

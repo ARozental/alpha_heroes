@@ -5,7 +5,9 @@
 //
 // Per side: hero, primary_skills, secondary_skills, army, spellbook, spells, war_machines (true: all three, or a
 // list of artifact keys), and optionally experience (sets the level) and artifacts ([[ArtifactPosition, key], ...]).
-// Optional top level: town = {faction, fortification: none | fort | citadel | castle}.
+// Optional top level: town = {faction, fortification: none | fort | citadel | castle}; or neutrals = {creature, count,
+// upgraded_stack} instead of sides[1]: wandering monsters that always fight (savage, never flee, as the engine splits
+// them into stacks against this hero), which the hero attacks.
 //
 // Usage: VCMI_USER_DIR=... build/bin/alpha_make_battle_map <scenario.json> <out.vmap>
 #include "StdInc.h"
@@ -23,6 +25,7 @@
 #include "lib/mapObjectConstructors/CObjectClassesHandler.h"
 #include "lib/mapObjects/CGHeroInstance.h"
 #include "lib/mapObjects/CGTownInstance.h"
+#include "lib/mapObjects/CGCreature.h"
 #include "lib/entities/faction/CTown.h"
 #include "lib/entities/building/CBuilding.h"
 #include "lib/mapping/CMap.h"
@@ -156,14 +159,30 @@ int main(int argc, const char * argv[])
 
 	map->players[0].canComputerPlay = true;
 	map->players[0].canHumanPlay = true;
-	map->players[1] = map->players[0];
+	if(scenario["neutrals"].isNull()) // against neutrals only the attacker is a player
+		map->players[1] = map->players[0];
 
 	const auto & sides = scenario["sides"].Vector();
-	if(sides.size() != 2)
-		throw std::runtime_error("a scenario needs exactly 2 sides");
+	const auto & neutrals = scenario["neutrals"];
+	if(sides.size() != (neutrals.isNull() ? 2 : 1))
+		throw std::runtime_error("a scenario needs exactly 2 sides, or 1 and neutrals");
 	addHero(*map, cb, sides[0], PlayerColor(0), int3(5, 6, 0)); // attacker
 	const auto & town = scenario["town"];
-	if(town.isNull())
+	if(!neutrals.isNull())
+	{
+		const CreatureID creature(lookup("creature", neutrals["creature"].String()));
+		auto factory = LIBRARY->objtypeh->getHandlerFor(Obj::MONSTER, creature);
+		auto object = factory->create(&cb, factory->getTemplates().front());
+		auto monster = std::dynamic_pointer_cast<CGCreature>(object);
+		object->pos = int3(5, 5, 0);
+		monster->setCreature(SlotID(0), creature, neutrals["count"].Integer());
+		monster->initialCharacter = CGCreature::Character::SAVAGE;
+		monster->neverFlees = true;
+		monster->notGrowingTeam = true;
+		monster->upgradedStackPresence = neutrals["upgraded_stack"].Bool() ? CGCreature::UpgradedStackPresence::ALWAYS : CGCreature::UpgradedStackPresence::NEVER;
+		map->getEditManager()->insertObject(object);
+	}
+	else if(town.isNull())
 		addHero(*map, cb, sides[1], PlayerColor(1), int3(5, 5, 0)); // defender
 	else
 	{

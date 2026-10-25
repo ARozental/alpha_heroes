@@ -209,3 +209,19 @@ def test_final_value_head_stands_alone():
 	chained = BattleModelV1(boost_stop_gradient=False, chain_final_value=True)
 	chained.load_state_dict(m.state_dict())
 	assert not torch.allclose(chained(x)["value_logit"][:, -1], out["value_logit"][:, -1])
+
+
+def test_training_with_precomputed_facts_matches_the_exported_forward():
+	"""train.py computes model.facts once per epoch and trains on model(x, facts): it must be the forward that the
+	ONNX plays (else PPO's ratio to the recorded policy is off from the first step)."""
+	torch.manual_seed(1)
+	m = BattleModel()
+	x = {k: torch.from_numpy(v) for k, v in random_inputs(batch=6, seed=3).items()}
+	with torch.no_grad():
+		played = m.eval()(x)
+		trained = m.train()(x, m.facts(x))
+	for spec in OUTPUTS:
+		a, b = played[spec.name], trained[spec.name]
+		assert torch.equal(torch.isneginf(a), torch.isneginf(b)), spec.name
+		finite = torch.isfinite(a)
+		assert torch.allclose(a[finite], b[finite], atol=1e-6), spec.name

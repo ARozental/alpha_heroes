@@ -4,8 +4,8 @@ review and edit: the models' bias parameters start at these values and are learn
 	action_types.csv   per action type, the type head's bias: e.g. -6 for retreat and surrender (giving up is offered
 	                   at every decision: at -6 it ends ~4% of untrained battles, at -2 two in three)
 	spells.csv         per spell, the spell head's bias: some spells are usually better than others
-	MASTERY_BIAS       per spell, by our hero's mastery of the spell's school (none, basic, advanced, expert; the best of
-	                   its schools): added to that spell's logit, learned per spell and mastery, starting the same for all
+	MASTERY_BIAS       per spell, by our hero's mastery of the spell (none, basic, advanced, expert, as the engine casts
+	                   it): added to that spell's logit, learned per spell and mastery, starting the same for all
 
 tests/test_priors.py checks the files: every id once, names as the engine's.
 """

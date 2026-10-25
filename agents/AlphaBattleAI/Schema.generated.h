@@ -6,8 +6,8 @@
 
 namespace AlphaSchema
 {
-constexpr int SCHEMA_VERSION = 12;
-constexpr const char * CONTRACT_HASH = "5a2b4a7d2ef7bd67";
+constexpr int SCHEMA_VERSION = 13;
+constexpr const char * CONTRACT_HASH = "e559dfe527991548";
 
 constexpr int N_HEXES = 187;
 constexpr int FIELD_WIDTH = 17;
@@ -128,6 +128,7 @@ enum class In : int
 	h_mana_max,
 	h_skills,
 	h_spells,
+	h_spell_mastery,
 	h_level,
 	h_level_progress,
 	h_artifacts,
@@ -227,6 +228,7 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"h_mana_max", DType::INT64, 1, {2, 0}, 0},
 	TensorSpec{"h_skills", DType::INT64, 2, {2, 28}, 0},
 	TensorSpec{"h_spells", DType::INT64, 2, {2, 70}, 0},
+	TensorSpec{"h_spell_mastery", DType::INT64, 2, {2, 70}, 0},
 	TensorSpec{"h_level", DType::INT64, 1, {2, 0}, 0},
 	TensorSpec{"h_level_progress", DType::INT64, 1, {2, 0}, 0},
 	TensorSpec{"h_artifacts", DType::INT64, 1, {2, 0}, 0},

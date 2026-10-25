@@ -29,14 +29,15 @@ def test_the_model_starts_at_the_files_biases():
 
 
 @pytest.mark.skipif(not vocab.VOCAB_PATH.exists(), reason="run scripts/export_vocab.sh to generate the vocabulary")
-def test_mastery_bias_follows_our_heros_skill_in_the_spells_school():
-	"""Expert Air Magic: Lightning Bolt (air) gets the expert bias; Slow (earth) none; Magic Arrow (all four) expert."""
+def test_mastery_bias_follows_our_heros_mastery_of_the_spell():
+	"""Lightning Bolt at expert gets the expert bias; Slow (no mastery) none; the enemy hero's masteries don't count."""
 	x = {k: torch.from_numpy(v) for k, v in empty_inputs().items()}
-	x["g_our_side"][0] = 1
-	x["h_skills"][0, 1, rules.SCHOOL_SKILLS[rules.SCHOOLS.index("air")]] = 3
-	x["h_skills"][0, 0, rules.SCHOOL_SKILLS[rules.SCHOOLS.index("earth")]] = 3  # the enemy's: does not count
-	bias = BattleModel().actions.mastery_bias(x)[0]
 	spell = lambda key: next(i for i, r in vocab.tables()["spells"].items() if r["key"] == "core:" + key)
+	x["g_our_side"][0] = 1
+	x["h_spell_mastery"][0, 1, spell("lightningBolt")] = 3
+	x["h_spell_mastery"][0, 1, spell("magicArrow")] = 3
+	x["h_spell_mastery"][0, 0, spell("slow")] = 3  # the enemy's: does not count
+	bias = BattleModel().actions.mastery_bias(x)[0]
 	assert bias[spell("lightningBolt")] == priors.MASTERY_BIAS[3]
 	assert bias[spell("slow")] == priors.MASTERY_BIAS[0]
 	assert bias[spell("magicArrow")] == priors.MASTERY_BIAS[3]

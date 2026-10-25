@@ -9,7 +9,7 @@ Bump SCHEMA_VERSION on any change to sizes, enums, input or output definitions.
 """
 from enum import IntEnum
 
-SCHEMA_VERSION = 12  # 8: 20 unit slots (10 per side) instead of 40; 9: CREATURE_SPELL (g_creature_spell, its masks and outputs); 10: spells' predicted value change (s_*_value, c_*_value); 11: engine-played attack values (a_*), engine damage estimates (p_*), surrender cost, start assets, kept counts; 12: hero level and artifacts, units hit by each cast and attack
+SCHEMA_VERSION = 13  # 8: 20 unit slots (10 per side) instead of 40; 9: CREATURE_SPELL (g_creature_spell, its masks and outputs); 10: spells' predicted value change (s_*_value, c_*_value); 11: engine-played attack values (a_*), engine damage estimates (p_*), surrender cost, start assets, kept counts; 12: hero level and artifacts, units hit by each cast and attack; 13: spell mastery from the engine (h_spell_mastery), h_spells with tomes and scrolls
 
 # Battlefield: VCMI BattleHex indices 0..186 are used as-is (17 columns x 11 rows,
 # columns 0 and 16 are the unplayable side columns). No remapping on the C++ side.

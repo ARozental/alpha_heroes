@@ -79,6 +79,8 @@ def test_force_ratio(drawn):
 	ratios = []
 	for s in scenarios:
 		values = [generator.army_value(side["army"], w) for side in s["sides"]]
+		if "neutrals" in s:
+			values.append(generator.creature_value(s["neutrals"]["creature"], w) * s["neutrals"]["count"])
 		ratios.append(max(values) / min(values))
 	ratios.sort()
 	assert ratios[len(ratios) // 2] < 1.6  # mostly even (counts are whole creatures and stacks are redrawn)
@@ -93,4 +95,8 @@ def test_battle_types(drawn):
 	assert all(s["town"]["fortification"] in generator.FORTIFICATIONS for s in sieges)
 	assert any("hero" not in s["sides"][1] for s in sieges)  # garrisons
 	assert all("hero" in s["sides"][0] for s in scenarios)
+	neutrals = [s for s in scenarios if "neutrals" in s]
+	assert 0.25 < len(neutrals) / len(scenarios) < 0.55
+	assert all(len(s["sides"]) == 1 and "town" not in s and s["neutrals"]["count"] >= 1 for s in neutrals)
+	assert all(len(s["sides"]) == 2 for s in scenarios if "neutrals" not in s)
 	assert all(s["terrain"] not in generator.UNSUPPORTED_TERRAINS for s in scenarios)

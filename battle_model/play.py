@@ -8,6 +8,7 @@ data.py turns into training examples.
 
 Each game runs through scripts/headless.sh, so it has a time limit, a disk limit and stall detection.
 """
+import functools
 import itertools
 import json
 import os
@@ -49,9 +50,25 @@ class Game:
 	settings: tuple = ()
 
 	@property
+	def neutrals(self):
+		"""Wandering monsters defend (the scenario's "neutrals"): our model plays the hero, the monsters are played
+		by the opponent (NEUTRAL_AI in self-play), as VCMI's neutral battle AI."""
+		return has_neutrals(self.scenario)
+
+	@property
 	def recorded_sides(self):
 		"""The sides our model plays, each with its own record."""
+		if self.neutrals:
+			return (0,)
 		return (0, 1) if self.opponent == SELF_PLAY else (self.our_side,)
+
+
+NEUTRAL_AI = "BattleAI"  # plays wandering monsters in self-play
+
+
+@functools.lru_cache(maxsize=4096)
+def has_neutrals(scenario_path):
+	return "neutrals" in json.loads(Path(scenario_path).read_text())
 
 
 def record_dirs(game, record_dir):
@@ -141,7 +158,7 @@ def start(game, model_path, records, max_seconds=120, max_mb=200):
 	env.update(
 		ALPHA_BATTLE_MODEL=str(Path(model_path).resolve()),
 		ALPHA_BATTLE_TEMPERATURE=str(game.temperature),
-		SETTINGS=json.dumps({"server": {"seed": game.game_seed}}),
+		SETTINGS=json.dumps({"server": {"seed": game.game_seed}, **({"ai": {"combatNeutralAI": NEUTRAL_AI if game.opponent == SELF_PLAY else game.opponent}} if game.neutrals else {})}),
 	)
 	env.update(dict(game.settings))
 	for side, color in enumerate(COLORS):

@@ -364,7 +364,6 @@ class ActionHeads(nn.Module):
 		self.spell_mastery = nn.Parameter(priors.mastery())  # [spell, our hero's mastery of its school]
 		self.spell_value = nn.Parameter(torch.full((N_SPELLS,), self.NO_HEALTH_VALUE))  # spells that change no health
 		self.creature_spell_value = nn.Parameter(torch.full((EFFECT_VOCAB + 1,), self.NO_HEALTH_VALUE))
-		self.register_buffer("spell_schools", rules.spell_schools(), persistent=False)
 		second = torch.zeros(N_SPELLS, dtype=torch.long)
 		for spell, kind in SECOND_TARGET_KIND.items():
 			second[spell] = int(kind)
@@ -384,12 +383,10 @@ class ActionHeads(nn.Module):
 			self.creature_spell_query.weight.zero_()
 
 	def mastery_bias(self, x):
-		"""[B, N_SPELLS]: each spell's bias for our hero's mastery of its school (the best of its schools: none, basic,
-		advanced, expert), learned per spell and mastery from priors.MASTERY_BIAS."""
+		"""[B, N_SPELLS]: each spell's bias for our hero's mastery of it (none, basic, advanced, expert: the engine's,
+		h_spell_mastery), learned per spell and mastery from priors.MASTERY_BIAS."""
 		our = x["g_our_side"].clamp(0, N_SIDES - 1)
-		skills = x["h_skills"][torch.arange(our.shape[0], device=our.device), our]
-		levels = skills[:, list(rules.SCHOOL_SKILLS)].clamp(0, 3)
-		level = (levels[:, None, :] * self.spell_schools[None, :, :]).amax(dim=-1)
+		level = x["h_spell_mastery"][torch.arange(our.shape[0], device=our.device), our].long().clamp(0, 3)
 		spells = torch.arange(self.spell_mastery.shape[0], device=level.device)
 		return self.spell_mastery[spells[None, :], level]
 
