@@ -78,7 +78,7 @@ class TrainConfig:
 	eval_neutral_scenarios: int = 0  # generator evals: also this many battles against wandering monsters, from both sides
 	eval_real_scenarios: int = 0  # generator evals: also the first this many battles of real games (REAL_EVAL), both sides
 	eval_castle_seeds: int = 0  # generator evals: also castle_vs_inferno (`scenario`) on this many EVAL_SEEDS: regressions
-	eval_extra_opponents: tuple = ()  # also evaluated against these (eval_<name>.csv), e.g. ("MMAI",)
+	eval_extra_opponents: tuple = ()  # also evaluated against these (eval_<name>.csv); the measure is eval_opponent (BattleAI)
 	# Training in updates from many battles at once (actors.py) instead of epochs of games_per_side battles: an
 	# "epoch" is then one update of decisions_per_update decisions, taken from the actors' buffer
 	actors: bool = False
@@ -90,8 +90,10 @@ class TrainConfig:
 	max_record_age: int = 3  # model versions: older records are dropped
 	buffer_decisions: int = 8000  # at most this many decisions wait in the buffer (the oldest go first)
 	decisions_per_update: int = 400
-	league: tuple = (0.7, 0.15, 0.15)  # generated battles: self-play, a past version, a fixed AI (league_ais)
-	league_ais: tuple = ("BattleAI", "MMAI")
+	# Generated battles: our current model against itself, against a past version of itself (a self-play blind spot that
+	# only the current version shares cannot last), and against a fixed AI (league_ais; none: we train against ourselves)
+	league: tuple = (0.85, 0.15, 0.0)
+	league_ais: tuple = ("BattleAI",)
 	run: str = "castle_vs_inferno"
 	epochs: int = 1000
 	opponent: str = "BattleAI"  # who we train against; "self" (play.SELF_PLAY): our model on both sides, learning from both
@@ -206,6 +208,7 @@ EVAL_COLUMNS = [
 	"attack_army_kept", "attack_army_killed", "defence_army_kept", "defence_army_killed",
 	"attack_baseline_army_kept", "attack_baseline_army_killed", "defence_baseline_army_kept", "defence_baseline_army_killed",
 	"escape_while_ahead", "shooter_not_shooting", "worthless_cast", "mana_left_on_loss",
+	"score_generated", "score_neutrals", "score_real", "score_castle",
 ]  # eval.csv, greedy battles per side: win rate, mean reward -1..1, outcomes; and minus the eval opponent's own reward on
 # the same seeds. army_kept / army_killed: shares of our army kept and of the enemy's lost (data.BattleSummary), ours
 # and the eval opponent's on the same seeds: the same whatever the reward's definition. total_score: THE measure of a
@@ -216,9 +219,19 @@ _eval_rng = random.Random(20261023)
 EVAL_SEEDS = tuple(_eval_rng.randrange(1, 2**31) for _ in range(256))
 
 
-def log_eval_tensorboard(writer, row):
+def log_eval_tensorboard(writer, row, opponent=""):
+	"""An eval row as TensorBoard scalars, under eval/ (the main opponent) or eval_<opponent>/."""
 	epoch = int(row["epoch"])
+	if opponent:
+		for column in ("total_score", *(f"score_{k}" for k in EVAL_SETS), "escape_while_ahead", "shooter_not_shooting", "worthless_cast", "mana_left_on_loss"):
+			if row.get(column) not in (None, "") and row[column] == row[column]:
+				writer.add_scalar(f"eval_{opponent}/{column}", float(row[column]), epoch)
+		writer.flush()
+		return
 	writer.add_scalar("eval/total_score", float(row["total_score"]), epoch)
+	for column in (*(f"score_{k}" for k in EVAL_SETS), "escape_while_ahead", "shooter_not_shooting", "worthless_cast", "mana_left_on_loss"):
+		if row.get(column) not in (None, "") and row[column] == row[column]:  # skip nan: a set or a case that never came up
+			writer.add_scalar(f"eval/{column}", float(row[column]), epoch)
 	for name in ("attack", "defence", "mean"):
 		if name != "mean":
 			writer.add_scalar(f"eval/won/{name}", float(row[f"{name}_win_rate"]), epoch)
@@ -360,6 +373,15 @@ def eval_name(config, main_opponent):
 	return "" if config.eval_opponent == main_opponent else f"_{config.eval_opponent}"
 
 
+EVAL_SETS = ("generated", "neutrals", "real", "castle")
+
+
+def eval_set(game):
+	"""Which eval set a game is of: real battles, castle_vs_inferno, generated against neutrals, other generated."""
+	about = play.scenario_of(game.scenario).get("_about", "")
+	return "real" if about.startswith("real") else "castle" if about.startswith("castle") else "neutrals" if about.startswith("hero_vs_neutrals") else "generated"
+
+
 def failure_modes(records):
 	"""Signs of dumb play in a set of battle records (eval), each a share 0..1 (nan when it never came up):
 	escape_while_ahead    retreats and surrenders while our value head thought we were winning (V > 0)
@@ -455,6 +477,14 @@ def eval_round(model, epoch, out, battle_map, config, baseline):
 		row[f"{name}_vs_baseline"] = round((sum(reward) - sum(base)) / len(reward), 4)
 	row["mean_reward"] = round(sum(rewards) / len(rewards), 4)
 	row["total_score"] = row["mean_reward"]
+	# The score of each eval set (our reward minus the eval opponent's own on the same battles): a gain on one must not
+	# hide a loss on another
+	by_set = {}
+	for g, s in zip(games, summaries):
+		key = eval_set(g)
+		by_set.setdefault(key, []).append(s.reward - baseline[(g.our_side, g.game_seed)][0])
+	for key in EVAL_SETS:
+		row[f"score_{key}"] = round(sum(by_set[key]) / len(by_set[key]), 4) if key in by_set else float("nan")
 	row["mean_vs_baseline"] = round((sum(rewards) - sum(baselines)) / len(rewards), 4)
 	row.update(failure_modes(records))
 	row["seconds"] = round(time.time() - started, 1)
@@ -600,9 +630,9 @@ def train(config, resume=False):
 		row = eval_round(model, epoch, out, battle_map, config_for, baseline)
 		with (out / f"eval{eval_name(config_for, config.eval_opponent)}.csv").open("a", newline="") as f:
 			csv.writer(f).writerow([row[c] for c in EVAL_COLUMNS])
-		if config_for is opponents[0]:
-			log_eval_tensorboard(writer, row)
+		log_eval_tensorboard(writer, row, "" if config_for is opponents[0] else config_for.eval_opponent)
 		print(f"eval  {epoch:4d}  total score {row['total_score']:+.3f}  vs {config_for.eval_opponent}, greedy: attack won {row['attack_win_rate']:.2f} {row['attack_reward']:+.3f} ({row['attack_vs_baseline']:+.3f} vs its own)  defence won {row['defence_win_rate']:.2f} {row['defence_reward']:+.3f} ({row['defence_vs_baseline']:+.3f} vs its own)  {row['seconds']}s"
+			f"  | sets: " + ", ".join(f"{k} {row[f'score_{k}']:+.3f}" for k in EVAL_SETS if row[f"score_{k}"] == row[f"score_{k}"]) +
 			f"  | failures: escape ahead {row['escape_while_ahead']}, shooter idle {row['shooter_not_shooting']}, worthless cast {row['worthless_cast']}, mana left on loss {row['mana_left_on_loss']}", flush=True)
 
 	if config.eval_every and first_epoch == 1:
