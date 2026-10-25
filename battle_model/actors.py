@@ -10,6 +10,10 @@ actors=true), so the examples of an update come from many games instead of one g
 	                   from the other source when one is short), at most game_share of them from any one game, newest
 	                   first; each battle is used by one update (its PPO passes), then dropped
 
+TODO(hard cases): battles where a person beat the model (exported as scenarios by AlphaBattleAI's "scenario" event)
+kept in a pool of their own, a small share of every update's generated battles and of every eval, so an exploit found
+by playing against the model is trained away and checked from then on.
+
 The model is published as versions (models/model_<v>.onnx) behind the link models/current.onnx: a battle starts with
 the newest (AlphaBattleAI resolves the link, and reloads it at a battle's start when it changed), and its record says
 which version played (the start event's "model"), so stale records can be dropped.
@@ -93,9 +97,10 @@ class ActorPool:
 	def _add(self, records, source, game):
 		with self.lock:
 			for r in records:
-				if any(e.get("event") == "error" for e in r.events):
+				if any(e.get("event") == "error" for e in r.events):  # a battle the model did not play: never trained on
 					self.stats["failures"] += 1
-					self.stats["last_failure"] = next(e for e in r.events if e.get("event") == "error").get("message", "")[:200]
+					self.stats["last_failure"] = message = next(e for e in r.events if e.get("event") == "error").get("message", "")[:300]
+					print(f"actors: a {source} battle had an error ({game}): {message}", flush=True)
 					continue
 				self.buffer.append({"record": r, "source": source, "game": game, "version": self.version_of(r), "decisions": r.decisions})
 				self.stats["battles"][source] += 1

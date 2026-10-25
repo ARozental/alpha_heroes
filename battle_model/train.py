@@ -77,6 +77,8 @@ class TrainConfig:
 	eval_scenarios: int = 10
 	eval_neutral_scenarios: int = 0  # generator evals: also this many battles against wandering monsters, from both sides
 	eval_real_scenarios: int = 0  # generator evals: also the first this many battles of real games (REAL_EVAL), both sides
+	eval_castle_seeds: int = 0  # generator evals: also castle_vs_inferno (`scenario`) on this many EVAL_SEEDS: regressions
+	eval_extra_opponents: tuple = ()  # also evaluated against these (eval_<name>.csv), e.g. ("MMAI",)
 	# Training in updates from many battles at once (actors.py) instead of epochs of games_per_side battles: an
 	# "epoch" is then one update of decisions_per_update decisions, taken from the actors' buffer
 	actors: bool = False
@@ -129,6 +131,16 @@ class TrainConfig:
 	ppo: PPOConfig = field(default_factory=PPOConfig)
 
 
+def _parse_item(text):
+	"""A tuple item of an override: an int, a float, else the text (e.g. an AI's name)."""
+	for kind in (int, float):
+		try:
+			return kind(text)
+		except ValueError:
+			pass
+	return text
+
+
 def with_overrides(config, assignments):
 	"""config with "name=value" assignments applied; "ppo.name", "advantage.name", "reward.name" set the sub-configs."""
 	for assignment in assignments:
@@ -136,7 +148,7 @@ def with_overrides(config, assignments):
 		target, name = key.split(".", 1) if "." in key else (None, key)
 		owner = getattr(config, target) if target else config
 		kind = {f.name: f.type for f in fields(owner)}[name]
-		kind = {"int": int, "float": float, "str": str, "bool": lambda v: v.lower() in ("1", "true", "yes"), "tuple": lambda v: tuple(int(x) if x.lstrip("-").isdigit() else float(x) for x in v.split(","))}.get(getattr(kind, "__name__", kind), kind)
+		kind = {"int": int, "float": float, "str": str, "bool": lambda v: v.lower() in ("1", "true", "yes"), "tuple": lambda v: tuple(_parse_item(x) for x in v.split(",") if x)}.get(getattr(kind, "__name__", kind), kind)
 		owner = replace(owner, **{name: kind(value)})
 		config = replace(config, **{target: owner}) if target else owner
 	return config
@@ -335,10 +347,17 @@ _generated_eval = {}  # run -> its eval games (the maps are built once a run)
 
 
 def _generated_eval_games(config):
-	if config.run not in _generated_eval:
+	key = (config.run, config.eval_opponent)
+	if key not in _generated_eval:
 		real = json.loads(REAL_EVAL.read_text())[: config.eval_real_scenarios] if config.eval_real_scenarios else []
-		_generated_eval[config.run] = generated_games(eval_scenarios(config) + real, "eval", config, our_sides=(0, 1), opponent=config.eval_opponent, temperature=0.0)[0]
-	return _generated_eval[config.run]
+		castle = [{**json.loads(Path(config.scenario).read_text()), "seed": seed, "_about": "castle_vs_inferno"} for seed in EVAL_SEEDS[: config.eval_castle_seeds]]
+		_generated_eval[key] = generated_games(eval_scenarios(config) + real + castle, f"eval_{config.eval_opponent}", config, our_sides=(0, 1), opponent=config.eval_opponent, temperature=0.0)[0]
+	return _generated_eval[key]
+
+
+def eval_name(config, main_opponent):
+	"""The eval files' suffix of an opponent: none for the main one."""
+	return "" if config.eval_opponent == main_opponent else f"_{config.eval_opponent}"
 
 
 def failure_modes(records):
@@ -360,9 +379,10 @@ def failure_modes(records):
 				counts["shooter_not_shooting"][0] += kind in (ActionType.MOVE, ActionType.WAIT, ActionType.DEFEND)
 				counts["shooter_not_shooting"][1] += 1
 			if kind == ActionType.HERO_SPELL and a["spell"] >= 0:
-				values = [t["s_unit_value"][i][t["m_spell_unit"][i] != 0], t["s_hex_value"][i][t["m_spell_hex"][i] != 0]]
+				sign = 1.0 if int(t["g_our_side"][i]) == 0 else -1.0  # the values are the attacker's gain minus the defender's
+				values = [sign * t["s_unit_value"][i][t["m_spell_unit"][i] != 0], sign * t["s_hex_value"][i][t["m_spell_hex"][i] != 0]]
 				best = max((float(v.max()) for v in values if v.size), default=0.0)
-				chosen = float(t["s_unit_value"][i, a["spell"], a["target_unit"]]) if a["target_unit"] >= 0 else float(t["s_hex_value"][i, a["spell"], a["target_hex"]]) if a["target_hex"] >= 0 else None
+				chosen = sign * float(t["s_unit_value"][i, a["spell"], a["target_unit"]]) if a["target_unit"] >= 0 else sign * float(t["s_hex_value"][i, a["spell"], a["target_hex"]]) if a["target_hex"] >= 0 else None
 				if chosen is not None and best > 0:
 					counts["worthless_cast"][0] += chosen <= 0
 					counts["worthless_cast"][1] += 1
@@ -386,10 +406,10 @@ def eval_games(config, battle_map):
 	]
 
 
-def eval_baseline(model, out, battle_map, config):
+def eval_baseline(model, out, battle_map, config, suffix=""):
 	"""The eval opponent's own results on the eval battles (it plays our side too: ALPHA_BATTLE_DELEGATE),
-	{(side, seed): (reward, army kept, army killed)}; computed once per run, kept in <run dir>/eval_baseline.csv."""
-	path = out / "eval_baseline.csv"
+	{(side, seed): (reward, army kept, army killed)}; computed once per run, kept in <run dir>/eval_baseline<suffix>.csv."""
+	path = out / f"eval_baseline{suffix}.csv"
 	games = eval_games(config, battle_map)
 	if path.exists():
 		rows = {(int(r["side"]), int(r["seed"])): (float(r["reward"]), float(r.get("army_kept") or "nan"), float(r.get("army_killed") or "nan")) for r in csv.DictReader(path.open())}
@@ -564,14 +584,25 @@ def train(config, resume=False):
 	else:
 		upgrade_csv(eval_csv, EVAL_COLUMNS)
 
-	baseline = eval_baseline(model, out, battle_map, config) if config.eval_every else None
+	opponents = [replace(config, eval_opponent=name) for name in (config.eval_opponent, *config.eval_extra_opponents)]
+	baselines = [eval_baseline(model, out, battle_map, c, eval_name(c, config.eval_opponent)) for c in opponents] if config.eval_every else []
+	for c in opponents[1:]:
+		path = out / f"eval{eval_name(c, config.eval_opponent)}.csv"
+		if not path.exists() or not resume:
+			with path.open("w", newline="") as f:
+				csv.writer(f).writerow(EVAL_COLUMNS)
 
 	def evaluate_now(epoch):
-		row = eval_round(model, epoch, out, battle_map, config, baseline)
-		with eval_csv.open("a", newline="") as f:
+		for c, baseline in zip(opponents, baselines):
+			evaluate_against(epoch, c, baseline)
+
+	def evaluate_against(epoch, config_for, baseline):
+		row = eval_round(model, epoch, out, battle_map, config_for, baseline)
+		with (out / f"eval{eval_name(config_for, config.eval_opponent)}.csv").open("a", newline="") as f:
 			csv.writer(f).writerow([row[c] for c in EVAL_COLUMNS])
-		log_eval_tensorboard(writer, row)
-		print(f"eval  {epoch:4d}  total score {row['total_score']:+.3f}  vs {config.eval_opponent}, greedy: attack won {row['attack_win_rate']:.2f} {row['attack_reward']:+.3f} ({row['attack_vs_baseline']:+.3f} vs its own)  defence won {row['defence_win_rate']:.2f} {row['defence_reward']:+.3f} ({row['defence_vs_baseline']:+.3f} vs its own)  {row['seconds']}s"
+		if config_for is opponents[0]:
+			log_eval_tensorboard(writer, row)
+		print(f"eval  {epoch:4d}  total score {row['total_score']:+.3f}  vs {config_for.eval_opponent}, greedy: attack won {row['attack_win_rate']:.2f} {row['attack_reward']:+.3f} ({row['attack_vs_baseline']:+.3f} vs its own)  defence won {row['defence_win_rate']:.2f} {row['defence_reward']:+.3f} ({row['defence_vs_baseline']:+.3f} vs its own)  {row['seconds']}s"
 			f"  | failures: escape ahead {row['escape_while_ahead']}, shooter idle {row['shooter_not_shooting']}, worthless cast {row['worthless_cast']}, mana left on loss {row['mana_left_on_loss']}", flush=True)
 
 	if config.eval_every and first_epoch == 1:

@@ -31,7 +31,7 @@ def start_game(map_name, model_path, socket_path, game_key, seed, temperature=1.
 	env = dict(os.environ)
 	ai = "AlphaBattleAI"
 	env.update(
-		ALPHA_BATTLE_MODEL=str(Path(model_path).resolve()),
+		ALPHA_BATTLE_MODEL=str(Path(model_path).absolute()),  # not resolved: a link (actors.py) is followed at each battle
 		ALPHA_BATTLE_TEMPERATURE=str(temperature),
 		ALPHA_BATTLE_RECORD_SOCKET=str(socket_path),
 		SETTINGS=json.dumps({"server": {"seed": seed}, "ai": {"combatEnemyAI": ai, "combatAlliedAI": ai, "combatNeutralAI": ai}}),
