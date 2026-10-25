@@ -1,6 +1,11 @@
 // Builds a "battle only" map from a battle_model scenario file: two heroes next to each other, so
 // the game starts directly with their battle and ends right after it (VCMI's Battle Only mode).
-// Hero 0 attacks hero 1. Built with the same engine code as the lobby's Battle Only mode.
+// Hero 0 attacks hero 1, or the town (a siege) when the scenario has one: defended by hero 1 inside it, or by its
+// garrison (sides[1] with no "hero"). Built with the same engine code as the lobby's Battle Only mode.
+//
+// Per side: hero, primary_skills, secondary_skills, army, spellbook, spells, war_machines (true: all three, or a
+// list of artifact keys), and optionally experience (sets the level) and artifacts ([[ArtifactPosition, key], ...]).
+// Optional top level: town = {faction, fortification: none | fort | citadel | castle}.
 //
 // Usage: VCMI_USER_DIR=... build/bin/alpha_make_battle_map <scenario.json> <out.vmap>
 #include "StdInc.h"
@@ -17,6 +22,9 @@
 #include "lib/mapObjectConstructors/AObjectTypeHandler.h"
 #include "lib/mapObjectConstructors/CObjectClassesHandler.h"
 #include "lib/mapObjects/CGHeroInstance.h"
+#include "lib/mapObjects/CGTownInstance.h"
+#include "lib/entities/faction/CTown.h"
+#include "lib/entities/building/CBuilding.h"
 #include "lib/mapping/CMap.h"
 #include "lib/mapping/CMapEditManager.h"
 #include "lib/mapping/CMapService.h"
@@ -70,12 +78,33 @@ void addHero(CMap & map, EditorCallback & cb, const JsonNode & side, PlayerColor
 	for(const auto & spell : side["spells"].Vector())
 		hero->addSpellToSpellbook(SpellID(lookup("spell", spell.String())));
 
-	if(side["war_machines"].Bool())
+	if(side["war_machines"].isVector())
+	{
+		for(const auto & machine : side["war_machines"].Vector())
+		{
+			const ArtifactID id(lookup("artifact", machine.String()));
+			hero->putArtifact(id.toArtifact()->getPossibleSlots().at(ArtBearer::HERO).front(), map.createArtifact(id));
+		}
+	}
+	else if(side["war_machines"].Bool())
 	{
 		hero->putArtifact(ArtifactPosition::MACH1, map.createArtifact(ArtifactID::BALLISTA));
 		hero->putArtifact(ArtifactPosition::MACH2, map.createArtifact(ArtifactID::AMMO_CART));
 		hero->putArtifact(ArtifactPosition::MACH3, map.createArtifact(ArtifactID::FIRST_AID_TENT));
 	}
+	for(const auto & artifact : side["artifacts"].Vector())
+	{
+		const ArtifactPosition slot(static_cast<si32>(artifact.Vector()[0].Integer()));
+		const ArtifactID id(lookup("artifact", artifact.Vector()[1].String()));
+		if(!hero->getArt(slot) || slot.num >= ArtifactPosition::BACKPACK_START)
+			hero->putArtifact(slot, map.createArtifact(id));
+		else
+			throw std::runtime_error("two artifacts in slot " + std::to_string(slot.num));
+	}
+	// The level follows the experience when the map loads (CGHeroInstance::serializeCommonOptions), without the
+	// skills of the levels: the scenario lists them
+	if(!side["experience"].isNull())
+		hero->exp = side["experience"].Integer();
 
 	for(const auto & skill : side["secondary_skills"].Vector())
 		hero->setSecSkillLevel(SecondarySkill(lookup("skill", skill.Vector()[0].String())), static_cast<MasteryLevel::Type>(skill.Vector()[1].Integer()), ChangeValueMode::ABSOLUTE);
@@ -133,7 +162,39 @@ int main(int argc, const char * argv[])
 	if(sides.size() != 2)
 		throw std::runtime_error("a scenario needs exactly 2 sides");
 	addHero(*map, cb, sides[0], PlayerColor(0), int3(5, 6, 0)); // attacker
-	addHero(*map, cb, sides[1], PlayerColor(1), int3(5, 5, 0)); // defender
+	const auto & town = scenario["town"];
+	if(town.isNull())
+		addHero(*map, cb, sides[1], PlayerColor(1), int3(5, 5, 0)); // defender
+	else
+	{
+		const FactionID faction(lookup("faction", town["faction"].String()));
+		auto factory = LIBRARY->objtypeh->getHandlerFor(Obj::TOWN, faction);
+		auto object = factory->create(&cb, factory->getTemplates().front());
+		auto townObj = std::dynamic_pointer_cast<CGTownInstance>(object);
+		object->setOwner(PlayerColor(1));
+		object->pos = int3(5, 5, 0);
+		// Every building (as the lobby's Battle Only mode builds the town: their battle effects count), but the
+		// fortifications only up to the scenario's
+		const std::map<std::string, int> levels = {{"none", 0}, {"fort", 1}, {"citadel", 2}, {"castle", 3}};
+		const int fortification = levels.at(town["fortification"].String());
+		const std::vector<BuildingID> forts = {BuildingID(BuildingID::FORT), BuildingID(BuildingID::CITADEL), BuildingID(BuildingID::CASTLE)};
+		for(const auto & building : townObj->getTown()->getAllBuildings())
+		{
+			const auto fort = std::find_if(forts.begin(), forts.end(), [&](const BuildingID & f) { return f.num == static_cast<si32>(building); });
+			if(fort == forts.end() || fort - forts.begin() < fortification)
+				townObj->addBuilding(BuildingID(building));
+		}
+		const auto & defender = sides[1];
+		if(defender["hero"].isNull())
+		{
+			int slot = 0;
+			for(const auto & stack : defender["army"].Vector())
+				townObj->getArmy()->setCreature(SlotID(slot++), CreatureID(lookup("creature", stack.Vector()[0].String())), stack.Vector()[1].Integer());
+		}
+		else
+			addHero(*map, cb, defender, PlayerColor(1), int3(5, 5, 0)); // in the town: its visiting hero defends it
+		map->getEditManager()->insertObject(object);
+	}
 
 	CMapService mapService;
 	mapService.saveMap(map, out);

@@ -1,6 +1,8 @@
 // Writes the id -> name/stats tables of everything the battle model sees as an id
 // (creatures, spells and effects, heroes, secondary skills, artifacts, battlefields, obstacles).
 // The ids are the engine's own: exactly the values the C++ side puts into the model inputs.
+// Also what the battle generator (battle_model/generator.py) samples from: upgrades, artifact classes and slots,
+// hero classes and their level-up chances, factions, the mage guild's spell chances, the experience per level.
 //
 // Usage (scripts/export_vocab.sh sets this up): VCMI_USER_DIR=... build/bin/alpha_export_vocab <out.json>
 #include "StdInc.h"
@@ -12,8 +14,14 @@
 #include "lib/CSkillHandler.h"
 #include "lib/GameLibrary.h"
 #include "lib/ObstacleHandler.h"
+#include "lib/TerrainHandler.h"
 #include "lib/VCMIDirs.h"
 #include "lib/entities/artifact/CArtHandler.h"
+#include "lib/entities/artifact/CArtifact.h"
+#include "lib/entities/faction/CFaction.h"
+#include "lib/entities/faction/CTown.h"
+#include "lib/entities/hero/CHero.h"
+#include "lib/entities/hero/CHeroClassHandler.h"
 #include "lib/entities/faction/CTownHandler.h"
 #include "lib/entities/hero/CHeroClass.h"
 #include "lib/entities/hero/CHeroHandler.h"
@@ -72,6 +80,9 @@ JsonNode creatures()
 		node["ai_value"].Integer() = c->getAIValue();
 		node["fight_value"].Integer() = c->getFightValue();
 		node["double_wide"].Bool() = c->isDoubleWide();
+		node["special"].Bool() = c->special; // not recruitable: war machines, commanders, unused creatures
+		for(const auto & upgrade : c->upgrades)
+			node["upgrades"].Vector().emplace_back(upgrade.toEntity(LIBRARY)->getJsonKey());
 		for(int r = 0; r < static_cast<int>(RESOURCES.size()); ++r)
 			if(int amount = c->getRecruitCost(GameResID(r)))
 				node["cost"][RESOURCES[r]].Integer() = amount;
@@ -111,6 +122,9 @@ JsonNode spellTable()
 		node["creature_ability"].Bool() = s->isCreatureAbility();
 		node["positive"].Bool() = s->isPositive();
 		node["negative"].Bool() = s->isNegative();
+		for(const auto & faction : LIBRARY->townh->objects) // the weight of being in a town's mage guild, by faction
+			if(faction && faction->town)
+				node["guild_chance"][faction->getJsonKey()].Integer() = s->getProbability(faction->getId());
 		for(int level = 0; level < 4; ++level)
 		{
 			JsonNode cost;
@@ -141,6 +155,7 @@ JsonNode heroes()
 			node["class"].String() = h->heroClass->getJsonKey();
 			node["faction"].String() = h->heroClass->faction.hasValue() ? h->heroClass->faction.toEntity(LIBRARY)->getJsonKey() : "";
 		}
+		node["special"].Bool() = h->special; // campaign heroes, never in a normal game
 		list.Vector().push_back(node);
 	}
 	return list;
@@ -155,8 +170,67 @@ JsonNode artifacts()
 			continue;
 		auto node = entry(*a);
 		node["price"].Integer() = a->getPrice();
+		const std::map<EArtifactClass, std::string> classes = {{EArtifactClass::ART_SPECIAL, "special"}, {EArtifactClass::ART_TREASURE, "treasure"}, {EArtifactClass::ART_MINOR, "minor"}, {EArtifactClass::ART_MAJOR, "major"}, {EArtifactClass::ART_RELIC, "relic"}};
+		node["class"].String() = classes.count(a->aClass) ? classes.at(a->aClass) : "special";
+		node["combined"].Bool() = a->isCombined();
+		if(a->getPossibleSlots().count(ArtBearer::HERO))
+			for(const auto & slot : a->getPossibleSlots().at(ArtBearer::HERO))
+				node["slots"].Vector().emplace_back(static_cast<si64>(slot.num)); // ArtifactPosition (encode names them wrongly)
 		list.Vector().push_back(node);
 	}
+	return list;
+}
+
+JsonNode heroClasses()
+{
+	JsonNode list;
+	for(const auto & c : LIBRARY->heroclassesh->objects)
+	{
+		if(!c)
+			continue;
+		auto node = entry(*c);
+		node["faction"].String() = c->faction.hasValue() ? c->faction.toEntity(LIBRARY)->getJsonKey() : "";
+		node["magic"].Bool() = c->affinity == CHeroClass::MAGIC;
+		auto ints = [](const std::vector<int> & values)
+		{
+			JsonNode vector;
+			for(const auto value : values)
+				vector.Vector().emplace_back(static_cast<si64>(value));
+			return vector;
+		};
+		node["primary_initial"] = ints(c->primarySkillInitial);
+		node["primary_low"] = ints(c->primarySkillLowLevel); // % chance of each primary skill at a level up, levels 2-9
+		node["primary_high"] = ints(c->primarySkillHighLevel); // from level 10
+		for(const auto & [skill, weight] : c->secSkillProbability)
+			node["secondary_weights"][skill.toEntity(LIBRARY)->getJsonKey()].Integer() = weight;
+		list.Vector().push_back(node);
+	}
+	return list;
+}
+
+JsonNode factions()
+{
+	JsonNode list;
+	for(const auto & f : LIBRARY->townh->objects)
+	{
+		if(!f)
+			continue;
+		auto node = entry(*f);
+		node["town"].Bool() = f->town != nullptr;
+		node["special"].Bool() = f->special;
+		node["native_terrain"].String() = f->nativeTerrain.hasValue() ? f->nativeTerrain.toEntity(LIBRARY)->getJsonKey() : "";
+		if(f->town)
+			node["mage_guild"].Integer() = f->town->mageLevel;
+		list.Vector().push_back(node);
+	}
+	return list;
+}
+
+JsonNode experience()
+{
+	JsonNode list; // the experience a hero needs for level 1, 2, ...
+	for(ui32 level = 1; level <= LIBRARY->heroh->maxSupportedLevel(); ++level)
+		list.Vector().emplace_back(static_cast<si64>(LIBRARY->heroh->reqExp(level)));
 	return list;
 }
 
@@ -198,6 +272,9 @@ int main(int argc, const char * argv[])
 	vocab["artifacts"] = artifacts();
 	vocab["battlefields"] = simple(LIBRARY->battlefieldsHandler->objects);
 	vocab["obstacles"] = simple(LIBRARY->obstacleHandler->objects);
+	vocab["hero_classes"] = heroClasses();
+	vocab["factions"] = factions();
+	vocab["experience"] = experience();
 	std::ofstream(out) << vocab.toString();
 	std::cout << "wrote " << out << "\n";
 

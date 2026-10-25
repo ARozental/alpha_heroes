@@ -519,7 +519,9 @@ void encodePairDamage(EncodedBattle & e, const CPlayerBattleCallback & battle)
 		for(int j = 0; j < MAX_UNITS; ++j)
 		{
 			const CStack * b = e.units[j];
-			if(!b || !b->alive() || battle.battleGetOwner(a) == battle.battleGetOwner(b))
+			// Arrow towers stand off the field (BattleHex::CASTLE_*_TOWER) and can't be attacked: the wall penalty
+			// of a shot at one throws (battleHasPenaltyOnLine)
+			if(!b || !b->alive() || battle.battleGetOwner(a) == battle.battleGetOwner(b) || !b->getPosition().isAvailable())
 				continue;
 			for(const bool shooting : {false, true})
 			{

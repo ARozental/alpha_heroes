@@ -1,0 +1,96 @@
+"""The battle generator (battle_model/generator.py): its draws are valid engine data and follow generator.toml."""
+import random
+
+import pytest
+
+from battle_model import generator
+
+N = 300
+
+
+@pytest.fixture(scope="module")
+def drawn():
+	cfg, w = generator.load_config(), generator.world()
+	rng = random.Random(0)
+	return cfg, w, [generator.sample(rng, cfg, w) for _ in range(N)]
+
+
+def test_reproducible():
+	assert generator.sample(random.Random(5)) == generator.sample(random.Random(5))
+
+
+def test_probabilities_sum_to_one():
+	cfg = generator.load_config()
+
+	def groups(node, path=""):
+		if isinstance(node, dict):
+			choices = [v for v in node.values() if isinstance(v, dict) and "p" in v and "desc" in v]
+			if choices and path != "composition.war_machines":  # drawn independently
+				yield path, sum(c["p"] for c in choices)
+			for k, v in node.items():
+				yield from groups(v, f"{path}.{k}" if path else k)
+
+	for path, total in groups(cfg):
+		assert total == pytest.approx(1.0, abs=1e-6), path
+	assert sum(p["p"] for p in cfg["phase"].values()) == pytest.approx(1.0)
+
+
+def test_identifiers_exist(drawn):
+	_, w, scenarios = drawn
+	import json
+	from battle_model import vocab
+	v = json.loads(vocab.VOCAB_PATH.read_text())
+	known = {kind: {generator.short(e["key"]) for e in v[kind]} for kind in ("creatures", "heroes", "spells", "artifacts", "secondary_skills")}
+	for s in scenarios:
+		for side in s["sides"]:
+			assert all(c in known["creatures"] and n >= 1 for c, n in side["army"])
+			assert 1 <= len(side["army"]) <= 7 and len({c for c, _ in side["army"]}) == len(side["army"])
+			if "hero" not in side:
+				continue
+			assert side["hero"] in known["heroes"]
+			assert set(side["spells"]) <= known["spells"]
+			assert all(a in known["artifacts"] for _, a in side["artifacts"])
+			assert all(k in known["secondary_skills"] and 1 <= m <= 3 for k, m in side["secondary_skills"])
+
+
+def test_heroes(drawn):
+	cfg, w, scenarios = drawn
+	levels = []
+	for s in scenarios:
+		for side in s["sides"]:
+			if "hero" not in side:
+				continue
+			skills = dict(side["secondary_skills"])
+			assert "tactics" not in skills and len(skills) <= generator.MAX_SECONDARY
+			slots = [slot for slot, _ in side["artifacts"]]
+			assert len(slots) == len(set(slots))
+			assert side["spellbook"] or not side["spells"]
+			top = generator.LEARNABLE[skills.get("wisdom", 0)]
+			level_of = {generator.short(e["key"]): e["level"] for e in w["spells"]}
+			assert all(level_of[sp] <= top for sp in side["spells"])
+			level = sum(1 for e in w["experience"] if e <= side["experience"])
+			levels.append(level)
+			assert sum(side["primary_skills"]) >= level - 1  # a point per level up, above the class's initial ones
+	assert min(levels) >= 1 and max(levels) <= 35
+
+
+def test_force_ratio(drawn):
+	cfg, w, scenarios = drawn
+	ratios = []
+	for s in scenarios:
+		values = [generator.army_value(side["army"], w) for side in s["sides"]]
+		ratios.append(max(values) / min(values))
+	ratios.sort()
+	assert ratios[len(ratios) // 2] < 1.6  # mostly even (counts are whole creatures and stacks are redrawn)
+	assert ratios[-1] < 30
+	assert sum(r > 3 for r in ratios) / len(ratios) > 0.04  # but lopsided at times
+
+
+def test_battle_types(drawn):
+	_, _, scenarios = drawn
+	sieges = [s for s in scenarios if "town" in s]
+	assert 0.1 < len(sieges) / len(scenarios) < 0.4
+	assert all(s["town"]["fortification"] in generator.FORTIFICATIONS for s in sieges)
+	assert any("hero" not in s["sides"][1] for s in sieges)  # garrisons
+	assert all("hero" in s["sides"][0] for s in scenarios)
+	assert all(s["terrain"] not in generator.UNSUPPORTED_TERRAINS for s in scenarios)

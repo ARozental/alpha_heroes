@@ -1,5 +1,8 @@
-# How to sample a random battle: a distribution, not code. A sampler (not written yet) draws the groups in the order
+# How to sample a random battle: a distribution, not code. battle_model/generator.py draws the groups in the order
 # of this file; later groups may depend on earlier draws (marked "by phase", "by battle type", ...).
+# Not built yet, so the sampler redraws or skips them: hero_vs_neutrals and creature_bank (battle-only mode starts
+# only hero-vs-hero battles and sieges: needs an engine change), water (boats), special battlefields, partial mana
+# (the engine fills a map hero's mana), gold (surrender).
 #
 # Every choice is { p = probability, desc = "a few words" }. The p of a group sum to 1 (the sampler normalises anyway).
 # Ranges are { min, max } (inclusive), drawn uniformly unless the group says otherwise. Names are VCMI's identifiers.
