@@ -38,6 +38,9 @@ using namespace AlphaSchema;
 namespace
 {
 constexpr int ROUND_CAP = 30;
+// StupidAI does not always end a battle (a siege whose walls stand and whose sides can't reach each other goes on
+// forever: VCMI has no round limit), so from this round on we retreat whenever we can
+constexpr int STALEMATE_ROUND = ROUND_CAP + 20;
 constexpr int MAX_ATTEMPTS = 8; // choices per unit turn before StupidAI takes over
 
 std::string envString(const char * name)
@@ -362,6 +365,13 @@ void AlphaBattleAI::activeStack(const BattleID & battleID, const CStack * stack)
 			delegateStack = stack->unitId();
 		}
 		fallback->activeStack(battleID, stack);
+		return;
+	}
+	if(battle->battleGetRound() >= STALEMATE_ROUND && battle->battleCanFlee())
+	{
+		++stats.fallbacks;
+		logAi->info("AlphaBattleAI: round %d, no end in sight: retreating", battle->battleGetRound());
+		cb->battleMakeUnitAction(battleID, BattleAction::makeRetreat(battle->battleGetMySide()));
 		return;
 	}
 	if(!model || stack->hasBonusOfType(BonusType::SIEGE_WEAPON) || battle->battleGetTacticDist() || battle->battleGetRound() >= ROUND_CAP)

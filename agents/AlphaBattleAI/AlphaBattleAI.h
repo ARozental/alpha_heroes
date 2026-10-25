@@ -45,7 +45,8 @@ class BattleModel;
 /// same unit again: that choice is excluded and the next best legal action is taken.
 ///
 /// War machines and the tactics phase are scripted (StupidAI), as is everything from round
-/// ROUND_CAP on, so a battle cannot go on forever. Any error falls back to StupidAI for that decision.
+/// ROUND_CAP on; from STALEMATE_ROUND on we retreat when we can, so a battle cannot go on forever (StupidAI can
+/// stalemate a siege). Any error falls back to StupidAI for that decision.
 class AlphaBattleAI : public CBattleGameInterface
 {
 	std::shared_ptr<CBattleCallback> cb;
