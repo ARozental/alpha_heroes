@@ -43,6 +43,7 @@ on the seeds being fixed: the same training has to work on real, ever-different 
 import argparse
 import copy
 import csv
+import json
 import random
 import shutil
 import threading
@@ -54,7 +55,7 @@ from pathlib import Path
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from . import play
+from . import generator, play
 from .data import collate, credit_check, make_dataloader, summarize
 from .export import export
 from .losses import AdvantageConfig, PPOConfig, ppo_loss, search_loss
@@ -69,6 +70,11 @@ ROOT = Path(__file__).resolve().parent.parent
 @dataclass
 class TrainConfig:
 	scenario: str = str(ROOT / "battle_model" / "scenarios" / "castle_vs_inferno.json")
+	# Random battles instead of `scenario`: every training battle is a new one drawn by battle_model/generator.py, and
+	# the eval battles are a fixed set of eval_scenarios generated two-sided battles (hero vs hero, sieges), each
+	# played from both sides by us and by the eval opponent (the eval opponent's own results: eval_baseline)
+	generator: bool = False
+	eval_scenarios: int = 10
 	run: str = "castle_vs_inferno"
 	epochs: int = 1000
 	opponent: str = "BattleAI"  # who we train against; "self" (play.SELF_PLAY): our model on both sides, learning from both
@@ -276,8 +282,50 @@ def play_in_groups(games, model_path, config, label):
 	return [r for i in range(0, len(games), n) for r in play_with_retries(games[i : i + n], model_path, None, config, label)]
 
 
+GENERATED_ROOT = ROOT / "runtime" / "generated"  # generated scenarios of running training epochs, deleted after each
+EVAL_GENERATOR_SEED = 20261025  # the generated eval battles: the same for every run
+
+
+def generated_games(scenarios, label, config, our_sides=(0,), **game):
+	"""Games of generated scenarios: each written to GENERATED_ROOT/<run>/<label>_<i>.json and built into its map.
+	our_sides: the sides we play in each (with SELF_PLAY: (0,), both are ours). Returns (games, files to delete)."""
+	folder = GENERATED_ROOT / config.run
+	folder.mkdir(parents=True, exist_ok=True)
+	games, files = [], []
+	for i, scenario in enumerate(scenarios):
+		path = folder / f"{label}_{i}.json"
+		path.write_text(json.dumps(scenario))
+		name = play.build_map(path, variant=config.run)
+		files += [path, play.USER_DIR / (name + ".vmap")]
+		games += [play.Game(str(path), our_side=side, game_seed=scenario["seed"], ai=config.ai, map=name, **game) for side in our_sides]
+	return games, files
+
+
+def eval_scenarios(config):
+	"""The generated eval battles: the first config.eval_scenarios two-sided ones (no neutrals: we can't play the
+	monsters) drawn from EVAL_GENERATOR_SEED."""
+	rng, chosen = random.Random(EVAL_GENERATOR_SEED), []
+	while len(chosen) < config.eval_scenarios:
+		scenario = generator.sample(rng)
+		if "neutrals" not in scenario:
+			chosen.append(scenario)
+	return chosen
+
+
+_generated_eval = {}  # run -> its eval games (the maps are built once a run)
+
+
+def _generated_eval_games(config):
+	if config.run not in _generated_eval:
+		_generated_eval[config.run] = generated_games(eval_scenarios(config), "eval", config, our_sides=(0, 1), opponent=config.eval_opponent, temperature=0.0)[0]
+	return _generated_eval[config.run]
+
+
 def eval_games(config, battle_map):
-	"""The eval battles: greedy, one per side on each of the first config.eval_seeds EVAL_SEEDS."""
+	"""The eval battles: greedy, one per side on each of the first config.eval_seeds EVAL_SEEDS (generator: each
+	eval scenario from both sides)."""
+	if config.generator:
+		return list(_generated_eval_games(config))
 	return [
 		play.Game(config.scenario, our_side=side, opponent=config.eval_opponent, game_seed=seed, temperature=0.0, ai=config.ai, map=battle_map)
 		for side in (0, 1)
@@ -446,7 +494,7 @@ def train(config, resume=False):
 		first_epoch = state["epoch"] + 1
 		print(f"resuming after epoch {state['epoch']}")
 
-	battle_map = play.build_map(config.scenario, variant=config.run)
+	battle_map = None if config.generator else play.build_map(config.scenario, variant=config.run)
 	reward_config, advantage_config, ppo_config = config.reward, config.advantage, config.ppo
 	progress = out / "progress.csv"
 	if not progress.exists() or not resume:
@@ -476,22 +524,34 @@ def train(config, resume=False):
 	settings = (("ALPHA_BATTLE_SEARCH_SIMULATIONS", str(config.search_simulations)),) if config.search_simulations > 0 else ()
 
 	def epoch_games(epoch):
+		"""(the epoch's games, files to delete after they are played)"""
+		if config.generator:  # new random battles every epoch, the same for a given (seed, epoch)
+			rng = random.Random(1_000_003 * (config.seed + 1) + epoch)
+			scenarios = [generator.sample(rng) for _ in range(config.games_per_side)]
+			sides = (0,) if config.opponent == play.SELF_PLAY else (0, 1)
+			games, files = generated_games(scenarios, f"epoch_{epoch}", config, our_sides=sides, opponent=config.opponent, settings=settings)
+			return [replace(g, sampler_seed=2 * epoch * config.games_per_side + i) for i, g in enumerate(games)], files
 		seeds = random.Random(epoch)
 		seed_for = lambda side: seeds.randrange(1, 2**31) if config.random_seeds else config.game_seeds[side]
 		if config.opponent == play.SELF_PLAY:  # each battle records both sides: half the battles with each side's seed
 			return [
 				play.Game(config.scenario, our_side=0, opponent=play.SELF_PLAY, game_seed=seed_for(g % 2), sampler_seed=2 * epoch * config.games_per_side + g, ai=config.ai, map=battle_map, settings=settings)
 				for g in range(config.games_per_side)
-			]
+			], []
 		return [
 			play.Game(config.scenario, our_side=side, opponent=config.opponent, game_seed=seed_for(side), sampler_seed=(2 * epoch + side) * config.games_per_side + g, ai=config.ai, map=battle_map, settings=settings)
 			for side in (0, 1)
 			for g in range(config.games_per_side)
-		]
+		], []
 
 	def play_epoch(epoch, model_path):
 		record_root = out / "records" / f"epoch_{epoch}" if config.keep_records else None
-		return play_with_retries(epoch_games(epoch), model_path, record_root, config, f"epoch {epoch}")
+		games, files = epoch_games(epoch)
+		try:
+			return play_with_retries(games, model_path, record_root, config, f"epoch {epoch}")
+		finally:
+			for path in files:
+				path.unlink(missing_ok=True)
 
 	# The model plays from one of two ONNX files: while battles run with one, the next export goes to the other
 	model_files = [out / "model_a.onnx", out / "model_b.onnx"]
@@ -548,7 +608,7 @@ def train(config, resume=False):
 		train_seconds = time.time() - trained
 
 		by_side = [[s for s in summaries if s.our_side == side] for side in (0, 1)]
-		average = lambda values: sum(values) / len(values)
+		average = lambda values: sum(values) / len(values) if values else float("nan")  # a side can be absent (generator: all battles against neutrals)
 		mean = {key: float(value) / max(batches, 1) for key, value in parts_sum.items()}
 		row = {
 			"epoch": epoch,
