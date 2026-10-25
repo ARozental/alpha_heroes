@@ -143,7 +143,11 @@ class HeroTokens(nn.Module):
 	several scales (F.MANA_SCALES); what it is worth (reward.hero_asset) of both sides' start assets; secondary skill
 	levels (of 3) and spellbook. The enemy hero's level, artifacts, skills and spellbook are 0: a player cannot see
 	them. No embedding of the hero's type: what a hero is shows in these, and its specialty in its units' numbers and
-	its spells' predicted values."""
+	its spells' predicted values.
+
+	TODO(hero identity): a small hero-type embedding (a few dims) can matter for specialties the numbers miss, but
+	keep it out until training data is varied: campaign games give many consecutive battles of the same heroes, and
+	an identity input then lets the model memorise "this hero's battles" instead of learning the battle (overfitting)."""
 
 	NUMBERS = 4 + 3 * len(F.COUNT_SCALES) + 1 + 2 * len(F.MANA_SCALES) + 1 + N_SECONDARY_SKILLS + N_SPELLS
 
