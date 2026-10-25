@@ -173,6 +173,11 @@ JsonNode artifacts()
 		const std::map<EArtifactClass, std::string> classes = {{EArtifactClass::ART_SPECIAL, "special"}, {EArtifactClass::ART_TREASURE, "treasure"}, {EArtifactClass::ART_MINOR, "minor"}, {EArtifactClass::ART_MAJOR, "major"}, {EArtifactClass::ART_RELIC, "relic"}};
 		node["class"].String() = classes.count(a->aClass) ? classes.at(a->aClass) : "special";
 		node["combined"].Bool() = a->isCombined();
+		std::set<std::string> bonuses; // what it does (battle_model/rules.py picks the ones that change rules)
+		for(const auto & bonus : a->getExportedBonusList())
+			bonuses.insert(bonusName(bonus->type));
+		for(const auto & name : bonuses)
+			node["bonuses"].Vector().emplace_back(name);
 		if(a->getPossibleSlots().count(ArtBearer::HERO))
 			for(const auto & slot : a->getPossibleSlots().at(ArtBearer::HERO))
 				node["slots"].Vector().emplace_back(static_cast<si64>(slot.num)); // ArtifactPosition (encode names them wrongly)

@@ -20,6 +20,7 @@ from .constants import (
 	EFFECT_VOCAB,
 	N_HEXES,
 	N_SECONDARY_SKILLS,
+	N_WORN_SLOTS,
 	N_SIDES,
 	N_SPELLS,
 	N_VALUE_HORIZONS,
@@ -109,6 +110,7 @@ INPUTS = (
 	_i("h_spell_mastery", (N_SIDES, S), "the hero's mastery of each spell as the engine casts it, 0 (none) .. 3 (expert): getSpellSchoolLevel, so its school skills, artifacts (tomes), specialty and the battlefield (magic plains, elemental fields); all 0 for the enemy hero (hidden)"),
 	_i("h_level", (N_SIDES,), "hero level; 0 for the enemy hero (a player's view of an enemy hero, InfoAboutHero, has no level)"),
 	_i("h_level_progress", (N_SIDES,), "of the way from its level to the next, in thousandths; 0 for the enemy hero (its experience is hidden)"),
+	_i("h_worn_artifacts", (N_SIDES, N_WORN_SLOTS), "artifact id worn in each slot (ArtifactPosition 0..18), -1 if none; all -1 for the enemy hero (hidden)", fill=-1),
 	_i("h_artifacts", (N_SIDES,), "market price in gold of the artifacts a winner would take from the hero (reward.py; not war machines); 0 for the enemy hero (hidden)"),
 	# Hexes, BattleHex index 0..186
 	_i("x_access", (H,), "EAccessibility"),
@@ -287,6 +289,7 @@ def random_inputs(batch=1, seed=0, n_units=14):
 			else:
 				x["m_creature_spell_hex"][b] = pick(H, 0.3)
 		finalize_masks(x, b)
+		special_mode(x, b, rng.random())
 		value = lambda shape: rng.integers(-3000, 3000, shape) * (rng.random(shape) < 0.7)  # 0: casts that change no health
 		x["s_unit_value"][b] = value((S, U)) * x["m_spell_unit"][b]
 		x["s_hex_value"][b] = value((S, H)) * x["m_spell_hex"][b]
@@ -302,6 +305,7 @@ def random_inputs(batch=1, seed=0, n_units=14):
 		x["h_level"][b] = rng.integers(1, 30, N_SIDES)
 		x["h_level_progress"][b] = rng.integers(0, 1000, N_SIDES)
 		x["h_artifacts"][b] = rng.integers(0, 20000, N_SIDES) * (rng.random(N_SIDES) < 0.5)
+		x["h_worn_artifacts"][b, x["g_our_side"][b]] = np.where(rng.random(N_WORN_SLOTS) < 0.3, rng.integers(0, 140, N_WORN_SLOTS), -1)
 		x["g_surrender_cost"][b] = rng.integers(-1, 5000)
 		x["g_start_army"][b] = rng.integers(1000, 50000, N_SIDES)
 		x["g_start_mana"][b] = rng.integers(0, 100, N_SIDES)
@@ -341,3 +345,22 @@ def finalize_masks(x, b):
 	t[ActionType.HERO_SPELL] = bool(x["g_hero_can_cast"][b]) and x["m_spell"][b].any()
 	# Creature spells without a target are not offered (the core game has none)
 	t[ActionType.CREATURE_SPELL] = x["m_creature_spell_unit"][b].any() or x["m_creature_spell_hex"][b].any()
+
+
+def special_mode(x, b, roll):
+	"""Turn some random decisions into the engine's special ones (as the C++ encoder makes them): the tactics phase
+	(TACTICS_MOVE on the move hexes, or TACTICS_END), a catapult (CATAPULT on hexes) or a First Aid Tent (HEAL on
+	targets, or DEFEND). Only the argument mask the mode uses stays."""
+	modes = ((0.1, (ActionType.TACTICS_MOVE, ActionType.TACTICS_END), "m_move_hex"), (0.15, (ActionType.CATAPULT,), "m_move_hex"), (0.2, (ActionType.HEAL, ActionType.DEFEND), "m_shoot_target"))
+	for threshold, types, kept in modes:
+		if roll < threshold:
+			for name in ("m_move_hex", "m_melee_target", "m_melee_from", "m_shoot_target", "m_spell", "m_spell_unit", "m_spell_hex", "m_spell2_hex", "m_spell2_unit", "m_creature_spell_unit", "m_creature_spell_hex"):
+				if name != kept:
+					x[name][b] = False
+			if not x[kept][b].any():
+				x[kept][b].flat[0] = True
+			t = x["m_type"][b]
+			t[:] = False
+			for a in types:
+				t[a] = True
+			return

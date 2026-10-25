@@ -11,6 +11,7 @@
 
 #include "lib/battle/BattleAction.h"
 
+#include <filesystem>
 #include <optional>
 #include <random>
 #include <vector>
@@ -44,15 +45,26 @@ class BattleModel;
 /// the model chooses again. If the server still rejects a hero spell, retreat or surrender, it asks the
 /// same unit again: that choice is excluded and the next best legal action is taken.
 ///
-/// War machines and the tactics phase are scripted (StupidAI), as is everything from round
-/// ROUND_CAP on; from STALEMATE_ROUND on we retreat when we can, so a battle cannot go on forever (StupidAI can
-/// stalemate a siege). Any error falls back to StupidAI for that decision.
+/// The model plays every decision: units, our war machines when the hero controls them (CATAPULT, HEAL, the ballista's
+/// SHOOT), and the tactics phase (TACTICS_MOVE one unit after another, TACTICS_END). An attacker retreats when it can
+/// after STALEMATE_ROUNDS rounds in a row with no damage done (VCMI has no round limit). An error is counted and the
+/// unit defends (playDefault); errors must stay at 0.
 class AlphaBattleAI : public CBattleGameInterface
 {
 	std::shared_ptr<CBattleCallback> cb;
 	std::shared_ptr<Environment> env;
-	std::shared_ptr<CBattleGameInterface> fallback;
+	std::shared_ptr<CBattleGameInterface> fallback; // only ALPHA_BATTLE_DELEGATE's AI (baseline evals): no StupidAI
 	std::shared_ptr<BattleModel> model;
+	std::string modelPath; // ALPHA_BATTLE_MODEL; reloaded at a battle's start when the file changed (training updates it)
+	std::filesystem::file_time_type modelTime{};
+	void loadModel();
+	// Tactics phase: our units still to place, one at a time (each from the board the last placement left)
+	std::vector<uint32_t> tacticsQueue;
+	bool tacticsPending = false; // a TACTICS_MOVE was sent: the next placement waits for it to be applied
+	void placeNextTactic(const BattleID & battleID);
+	int lastDamageRound = 0; // the last round any unit took damage (the stalemate rule)
+	void playDefault(const BattleID & battleID, const CStack * stack);
+	std::string scenarioJson(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2) const;
 	std::array<const CGHeroInstance *, 2> heroes{}; // per battle side, from battleStart
 	std::mt19937 rng;
 	float temperature = 1.0f;
@@ -148,7 +160,6 @@ class AlphaBattleAI : public CBattleGameInterface
 	void playWithModel(const BattleID & battleID, const CStack * stack);
 	BattleAction toBattleAction(const BattleID & battleID, const CStack * stack, const EncodedBattle & encoded, const ChosenAction & action) const;
 	void execute(const BattleID & battleID, const CStack * stack, const EncodedBattle & encoded, const ChosenAction & action);
-	void useFallback(const BattleID & battleID, const CStack * stack);
 
 public:
 	~AlphaBattleAI() override;
@@ -163,5 +174,6 @@ public:
 	void battleSpellCast(const BattleID & battleID, const BattleSpellCast * sc) override;
 	void battleNewRoundFirst(const BattleID & battleID) override;
 	void activeStack(const BattleID & battleID, const CStack * stack) override;
+	void battleStacksAttacked(const BattleID & battleID, const std::vector<BattleStackAttacked> & bsa, bool ranged) override;
 	void yourTacticPhase(const BattleID & battleID, int distance) override;
 };

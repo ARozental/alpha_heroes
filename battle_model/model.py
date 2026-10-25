@@ -51,6 +51,7 @@ from .constants import (
 	CREATURE_VOCAB,
 	EFFECT_VOCAB,
 	GATE_STATE_VOCAB,
+	HEX_TYPES,
 	MASKED_LOGIT,
 	N_ACTION_TYPES,
 	N_HEXES,
@@ -59,6 +60,7 @@ from .constants import (
 	N_SPELLS,
 	OBSTACLE_TYPE_VOCAB,
 	SECOND_TARGET_KIND,
+	TARGET_TYPES,
 	WALL_STATE_VOCAB,
 	ActionType,
 )
@@ -149,11 +151,27 @@ class HeroTokens(nn.Module):
 	keep it out until training data is varied: campaign games give many consecutive battles of the same heroes, and
 	an identity input then lets the model memorise "this hero's battles" instead of learning the battle (overfitting)."""
 
-	NUMBERS = 4 + 3 * len(F.COUNT_SCALES) + 1 + 2 * len(F.MANA_SCALES) + 1 + N_SECONDARY_SKILLS + N_SPELLS
+	RULE_SLOTS = 48  # rule artifacts the bag has room for (rules.rule_artifacts finds ~40)
+	RULE_DIMS = 4  # what they become before meeting anything else: an edge case, kept small
+
+	NUMBERS = 4 + 3 * len(F.COUNT_SCALES) + 1 + 2 * len(F.MANA_SCALES) + 1 + N_SECONDARY_SKILLS + N_SPELLS + RULE_DIMS
 
 	def __init__(self, dim):
 		super().__init__()
 		self.tokens = Tokenizer(self.NUMBERS, dim, embedded=False)
+		# Our hero's rule-changing artifacts (rules.RULE_ARTIFACT_BONUSES: Orb of Vulnerability, Recanter's Cloak, ...):
+		# a bag mapped to RULE_DIMS numbers first, starting at 0. The enemy's artifacts are hidden.
+		table, _ = rules.rule_artifacts()
+		self.register_buffer("rule_index", table.clamp(max=self.RULE_SLOTS - 1), persistent=False)
+		self.rule_artifacts = nn.Linear(self.RULE_SLOTS, self.RULE_DIMS, bias=False)
+		nn.init.zeros_(self.rule_artifacts.weight)
+
+	def rule_bag(self, worn):
+		"""[B, side, RULE_SLOTS]: 1 for each rule artifact the hero wears (worn: [B, side, N_WORN_SLOTS] ids, -1 none)."""
+		ids = worn.long()
+		index = self.rule_index[torch.where((ids >= 0) & (ids < self.rule_index.shape[0] - 1), ids, torch.full_like(ids, self.rule_index.shape[0] - 1))]
+		slots = torch.arange(self.RULE_SLOTS, device=worn.device)
+		return ((index[..., None] == slots) & (index[..., None] >= 0)).any(dim=-2).float()
 
 	def forward(self, b):
 		x = b.x
@@ -174,6 +192,7 @@ class HeroTokens(nn.Module):
 			F.fraction(F.hero_assets(x, RewardConfig()), (x["g_start_army"].float().sum(dim=-1, keepdim=True) + F.hero_assets(x, RewardConfig()).sum(dim=-1, keepdim=True)))[..., None],
 			x["h_skills"].float().clamp(0, 3) / 3,
 			(x["h_spells"] != 0).float(),
+			self.rule_artifacts(self.rule_bag(x["h_worn_artifacts"])),
 		], dim=-1)
 		team = torch.where(present, 2 * ours.long() - 1, torch.zeros_like(sides))
 		return signed(self.tokens(None, numbers), team), team
@@ -355,6 +374,7 @@ class ActionHeads(nn.Module):
 		self.escape_rules = nn.Parameter(torch.zeros(len(F.OUTCOME_FEATURES)))
 		escapes = torch.zeros(len(F.OUTCOME_FEATURES), N_ACTION_TYPES)
 		escapes[0, ActionType.RETREAT] = escapes[1, ActionType.SURRENDER] = 1.0
+		escapes[2:, ActionType.RETREAT] = escapes[2:, ActionType.SURRENDER] = 1.0  # the exposure features: both escapes
 		self.register_buffer("escape_types", escapes, persistent=False)  # [outcome feature, type]
 		self.register_buffer("escape_bias", -priors.action_types() * escapes.sum(dim=0), persistent=False)  # what relief lifts
 		self.spell_head = nn.Linear(dim, N_SPELLS)
@@ -436,15 +456,16 @@ class ActionHeads(nn.Module):
 		creature = (torch.cat([creature_unit, creature_hex], dim=-1), torch.cat([x["m_creature_spell_unit"], x["m_creature_spell_hex"]], dim=-1))
 
 		follow = torch.zeros_like(self.type_head(context))
-		for action, logits, legal in ((ActionType.MOVE, move, x["m_move_hex"]), (ActionType.MELEE, melee_target, x["m_melee_target"]), (ActionType.SHOOT, shoot_target, x["m_shoot_target"]), (ActionType.HERO_SPELL, spell, x["m_spell"]), (ActionType.CREATURE_SPELL, *creature)):
+		hex_types = [(a, move, x["m_move_hex"]) for a in HEX_TYPES]  # MOVE, TACTICS_MOVE and CATAPULT choose their hex there
+		target_types = [(a, shoot_target, x["m_shoot_target"]) for a in TARGET_TYPES]  # SHOOT and HEAL their unit
+		for action, logits, legal in (*hex_types, (ActionType.MELEE, melee_target, x["m_melee_target"]), *target_types, (ActionType.HERO_SPELL, spell, x["m_spell"]), (ActionType.CREATURE_SPELL, *creature)):
 			follow = follow + best_of(logits, legal)[:, None] * self.type_one_hot[action]
 		# TODO(non-zero-sum): the reward (reward.py) is zero-sum, so the value heads and these logits see every loss of
 		# one side as the other's gain. These actions create or destroy value nobody else gets, and their logits should
 		# get a per-side correction (a small separate head, from what the action really costs or earns) once they matter:
 		#   SURRENDER       the payment disappears (the winner gets nothing) and the enemy's payment is unknown to us
 		#   RETREAT         the army is destroyed without the winner owning it; the rehire is paid to nobody
-		#   CATAPULT        (reserved) walls and towers destroyed: a loss to the town's owner, no gain to the attacker
-		#   TACTICS_*       (reserved) time spent, no value moved
+		#   CATAPULT        walls and towers destroyed: a loss to the town's owner, no gain to the attacker
 		#   HERO_SPELL      mana spent is destroyed, not won by the enemy (zero-sum prices it as a gain for them)
 		#   and outcomes behind any action: experience and Necromancy for the winner, Eagle Eye, more than two players
 		relief = priors.escape_relief(ratios[:, F.STRENGTH_VARIANTS.index("all")].sum(dim=-1))  # [B]

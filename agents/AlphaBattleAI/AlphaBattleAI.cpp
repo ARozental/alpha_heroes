@@ -23,6 +23,15 @@
 #include "lib/mapObjects/CGHeroInstance.h"
 #include "lib/mapObjects/army/CCreatureSet.h"
 #include "lib/mapObjects/army/CStackInstance.h"
+#include "lib/mapObjects/CGTownInstance.h"
+#include "lib/entities/artifact/CArtifact.h"
+#include "lib/entities/hero/CHero.h"
+#include "lib/entities/faction/CFaction.h"
+#include "lib/CSkillHandler.h"
+#include "lib/TerrainHandler.h"
+#include "lib/BattleFieldHandler.h"
+#include "lib/CCreatureHandler.h"
+#include "lib/GameLibrary.h"
 
 #include <atomic>
 #include <map>
@@ -37,11 +46,12 @@ using namespace AlphaSchema;
 
 namespace
 {
-constexpr int ROUND_CAP = 30;
-// StupidAI does not always end a battle (a siege whose walls stand and whose sides can't reach each other goes on
-// forever: VCMI has no round limit), so from this round on we retreat whenever we can
-constexpr int STALEMATE_ROUND = ROUND_CAP + 20;
-constexpr int MAX_ATTEMPTS = 8; // choices per unit turn before StupidAI takes over
+constexpr int SEARCH_ROUND_CAP = 30; // the search's horizon (BattleSearchEnv)
+// A battle where nothing is damaged for this many rounds in a row ends with the attacker retreating, when it can (a
+// siege whose catapult is gone, no towers, walls standing and no side able to reach the other: VCMI has no round limit)
+constexpr int STALEMATE_ROUNDS = 30;
+constexpr int MAX_ATTEMPTS = 8; // choices per unit turn before the unit defends (playDefault)
+std::atomic<int> recordsSent{0}; // per process: each battle's record gets its own key (a game has many battles)
 
 std::string envString(const char * name)
 {
@@ -53,9 +63,10 @@ std::string envString(const char * name)
 /// so that two AlphaBattleAIs in one game (self-play) can use their own model, seed and record folder
 std::string playerSetting(const CBattleCallback & cb, const std::string & name)
 {
-	if(const auto player = cb.getPlayerID(); player && player->isValidPlayer())
+	if(const auto player = cb.getPlayerID(); player && (player->isValidPlayer() || *player == PlayerColor::NEUTRAL))
 	{
-		auto perPlayer = envString((name + "_" + boost::to_upper_copy(player->toString())).c_str());
+		const std::string color = player->isValidPlayer() ? boost::to_upper_copy(player->toString()) : std::string("NEUTRAL"); // wandering monsters
+		auto perPlayer = envString((name + "_" + color).c_str());
 		if(!perPlayer.empty())
 			return perPlayer;
 	}
@@ -78,8 +89,11 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 	// Save before the fallback touches the callback, both restore the same original value
 	wasWaitingForRealize = CB->waitTillRealize;
 	delegated = !playerSetting(*CB, "ALPHA_BATTLE_DELEGATE").empty();
-	fallback = CDynLibHandler::getNewBattleAI(delegated ? playerSetting(*CB, "ALPHA_BATTLE_DELEGATE") : "StupidAI");
-	fallback->initBattleInterface(ENV, CB);
+	if(delegated) // the baseline evals: another AI plays, we record what it does
+	{
+		fallback = CDynLibHandler::getNewBattleAI(playerSetting(*CB, "ALPHA_BATTLE_DELEGATE"));
+		fallback->initBattleInterface(ENV, CB);
+	}
 	CB->waitTillRealize = false;
 
 	const auto seed = playerSetting(*CB, "ALPHA_BATTLE_SEED");
@@ -128,19 +142,25 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 	if(!recordDir.empty() || !recordSocket.empty())
 		record = std::make_unique<BattleRecord>();
 
-	const auto path = playerSetting(*CB, "ALPHA_BATTLE_MODEL");
+	modelPath = playerSetting(*CB, "ALPHA_BATTLE_MODEL");
+	loadModel();
+}
+
+void AlphaBattleAI::loadModel()
+{
 	try
 	{
-		if(path.empty())
+		if(modelPath.empty())
 			throw std::runtime_error("ALPHA_BATTLE_MODEL is not set");
-		model = BattleModel::load(path);
+		const auto time = std::filesystem::last_write_time(modelPath); // follows a symlink: training replaces its target
+		model = BattleModel::load(modelPath);
+		modelTime = time;
 	}
 	catch(const std::exception & e)
 	{
-		static std::atomic<bool> reported{false};
-		if(!reported.exchange(true))
-			logAi->error("AlphaBattleAI: cannot use model '%s': %s. StupidAI plays instead.", path, e.what());
-		if(record) // a training record must never silently contain StupidAI's battle
+		model.reset();
+		logAi->error("AlphaBattleAI: cannot use model '%s': %s. Every unit defends.", modelPath, e.what());
+		if(record) // a training record must never silently contain a battle the model did not play
 		{
 			std::string message = e.what();
 			std::replace(message.begin(), message.end(), '"', '\'');
@@ -157,7 +177,17 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2, int3 tile, const CGHeroInstance * hero1, const CGHeroInstance * hero2, BattleSide side, bool replayAllowed)
 {
 	stats = Stats(); // the neutral player's battle AI is reused for every battle
+	if(!delegated && !modelPath.empty())
+	{
+		std::error_code error;
+		const auto time = std::filesystem::last_write_time(modelPath, error);
+		if(!model || (!error && time != modelTime)) // a newer model (training), e.g. for the reused neutral AI
+			loadModel();
+	}
 	heroes = {hero1, hero2};
+	tacticsQueue.clear();
+	tacticsPending = false;
+	lastDamageRound = 0;
 	lastTurn.reset();
 	rejected.clear();
 	faultsDoneThisBattle.clear();
@@ -185,9 +215,20 @@ void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * 
 		};
 		const auto * hero = cb->getBattle(battleID)->battleGetMyHero();
 		const auto * enemyHero = heroes[1 - static_cast<int>(side)];
-		recordEvent("{\"event\": \"start\", \"our_side\": " + std::to_string(static_cast<int>(side)) + ", \"armies\": [" + army(army1) + ", " + army(army2) + "], \"our_mana\": " + std::to_string(hero ? hero->mana : 0) + ", \"our_mana_max\": " + std::to_string(hero ? hero->manaLimit() : 0) + ", \"enemy_mana\": " + std::to_string(enemyHero ? enemyHero->mana : 0) + ", \"enemy_mana_max\": " + std::to_string(enemyHero ? enemyHero->manaLimit() : 0) + ", \"powers\": [" + std::to_string(battleStartValues.power[0]) + ", " + std::to_string(battleStartValues.power[1]) + "], \"heroes\": [[" + std::to_string(battleStartValues.heroLevel[0]) + ", " + std::to_string(battleStartValues.artifacts[0]) + "], [" + std::to_string(battleStartValues.heroLevel[1]) + ", " + std::to_string(battleStartValues.artifacts[1]) + "]]}");
+		std::error_code error;
+		const auto played = std::filesystem::weakly_canonical(modelPath, error).string(); // which model version played
+		recordEvent("{\"event\": \"start\", \"model\": \"" + played + "\", \"our_side\": " + std::to_string(static_cast<int>(side)) + ", \"armies\": [" + army(army1) + ", " + army(army2) + "], \"our_mana\": " + std::to_string(hero ? hero->mana : 0) + ", \"our_mana_max\": " + std::to_string(hero ? hero->manaLimit() : 0) + ", \"enemy_mana\": " + std::to_string(enemyHero ? enemyHero->mana : 0) + ", \"enemy_mana_max\": " + std::to_string(enemyHero ? enemyHero->manaLimit() : 0) + ", \"powers\": [" + std::to_string(battleStartValues.power[0]) + ", " + std::to_string(battleStartValues.power[1]) + "], \"heroes\": [[" + std::to_string(battleStartValues.heroLevel[0]) + ", " + std::to_string(battleStartValues.artifacts[0]) + "], [" + std::to_string(battleStartValues.heroLevel[1]) + ", " + std::to_string(battleStartValues.artifacts[1]) + "]]}");
+		try
+		{
+			recordEvent("{\"event\": \"scenario\", \"scenario\": " + scenarioJson(battleID, army1, army2) + "}");
+		}
+		catch(const std::exception & e)
+		{
+			logAi->warn("AlphaBattleAI: cannot export the battle as a scenario: %s", e.what());
+		}
 	}
-	fallback->battleStart(battleID, army1, army2, tile, hero1, hero2, side, replayAllowed);
+	if(fallback)
+		fallback->battleStart(battleID, army1, army2, tile, hero1, hero2, side, replayAllowed);
 }
 
 void AlphaBattleAI::recordEvent(const std::string & json)
@@ -243,7 +284,8 @@ void AlphaBattleAI::battleNewRoundFirst(const BattleID & battleID)
 	// Called before the new round's changes: the state here is the end of the previous round
 	if(record)
 		recordEvent("{\"event\": \"round_end\", \"round\": " + std::to_string(cb->getBattle(battleID)->battleGetRound()) + ", \"alive\": " + aliveArmies(battleID) + ", \"our_mana\": " + std::to_string(ourMana(battleID)) + ", \"enemy_mana\": " + std::to_string(enemyMana(battleID)) + "}");
-	fallback->battleNewRoundFirst(battleID);
+	if(fallback)
+		fallback->battleNewRoundFirst(battleID);
 }
 
 void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br, QueryID queryID)
@@ -277,7 +319,7 @@ void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br
 		{
 			try
 			{
-				record->send(recordSocket, recordKey);
+				record->send(recordSocket, recordKey + "#" + std::to_string(recordsSent++)); // RecordServer keeps every battle of a key
 			}
 			catch(const std::exception & e)
 			{
@@ -303,14 +345,16 @@ void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br
 	}
 	if(simCheckEnabled)
 		logAi->info("AlphaBattleAI: simulation check: checks=%d rejected=%d exact_mismatches=%d dice_mismatches=%d avg_copy_ms=%.3f avg_apply_ms=%.3f", stats.simChecks, stats.simRejected, stats.simExactMismatches, stats.simDiceMismatches, stats.simChecks ? stats.simCopyMs / stats.simChecks : 0.0, stats.simChecks ? stats.simApplyMs / stats.simChecks : 0.0);
-	fallback->battleEnd(battleID, br, queryID);
+	if(fallback)
+		fallback->battleEnd(battleID, br, queryID);
 }
 
 void AlphaBattleAI::battleSpellCast(const BattleID & battleID, const BattleSpellCast * sc)
 {
 	if(sc->side == cb->getBattle(battleID)->battleGetMySide())
 		spellCastSeen = true;
-	fallback->battleSpellCast(battleID, sc);
+	if(fallback)
+		fallback->battleSpellCast(battleID, sc);
 }
 
 bool AlphaBattleAI::previousActionRejected(const CPlayerBattleCallback & battle) const
@@ -343,13 +387,84 @@ void AlphaBattleAI::yourTacticPhase(const BattleID & battleID, int distance)
 		fallback->yourTacticPhase(battleID, distance);
 		return;
 	}
-	cb->battleMakeTacticAction(battleID, BattleAction::makeEndOFTacticPhase(cb->getBattle(battleID)->battleGetTacticsSide()));
+	// Our units, most valuable first, each placed once (or the model ends the phase); each placement is chosen from
+	// the board the previous one left (actionFinished continues), as this is called once, before anything moves
+	auto battle = cb->getBattle(battleID);
+	auto ours = battle->battleGetStacksIf([&](const CStack * s) { return s->alive() && s->unitSide() == battle->battleGetMySide() && !s->hasBonusOfType(BonusType::SIEGE_WEAPON); });
+	std::stable_sort(ours.begin(), ours.end(), [](const CStack * a, const CStack * b) { return creatureValue(a->unitType()) * a->getCount() > creatureValue(b->unitType()) * b->getCount(); });
+	tacticsQueue.clear();
+	for(auto it = ours.rbegin(); it != ours.rend(); ++it) // popped from the back
+		tacticsQueue.push_back((*it)->unitId());
+	placeNextTactic(battleID);
 }
 
-void AlphaBattleAI::useFallback(const BattleID & battleID, const CStack * stack)
+void AlphaBattleAI::placeNextTactic(const BattleID & battleID)
+{
+	auto battle = cb->getBattle(battleID);
+	const auto side = battle->battleGetMySide();
+	const auto player = cb->getPlayerID().value_or(PlayerColor::NEUTRAL);
+	while(model && !tacticsQueue.empty() && battle->battleGetTacticDist())
+	{
+		const CStack * stack = battle->battleGetStackByID(tacticsQueue.back());
+		tacticsQueue.pop_back();
+		if(!stack || !stack->alive())
+			continue;
+		try
+		{
+			auto encoded = encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(side)], battleStartValues);
+			if(encoded.mode != EncodedBattle::Mode::TACTICS || !encoded.tensors.get(In::m_type, static_cast<int>(ActionType::TACTICS_MOVE)))
+				continue; // a unit with nowhere to go in the tactics zone
+			const auto outputs = model->run(encoded.tensors);
+			const auto action = chooseAction(outputs, rng, temperature);
+			if(!isLegal(encoded, action))
+				throw std::runtime_error("chosen tactics action " + action.toJson() + " is not legal under the masks");
+			++stats.decisions;
+			++stats.types[action.type];
+			if(record)
+				record->addDecision(encoded.tensors, outputs, action);
+			if(action.type == static_cast<int>(ActionType::TACTICS_END))
+				break;
+			tacticsPending = true; // actionFinished places the next unit
+			cb->battleMakeTacticAction(battleID, toBattleAction(battleID, stack, encoded, action));
+			return;
+		}
+		catch(const std::exception & e)
+		{
+			++stats.errors;
+			logAi->error("AlphaBattleAI: tactics: %s; the phase ends", e.what());
+			break;
+		}
+	}
+	tacticsQueue.clear();
+	tacticsPending = false;
+	if(battle->battleGetTacticDist())
+		cb->battleMakeTacticAction(battleID, BattleAction::makeEndOFTacticPhase(side));
+}
+
+void AlphaBattleAI::battleStacksAttacked(const BattleID & battleID, const std::vector<BattleStackAttacked> & bsa, bool ranged)
+{
+	for(const auto & attacked : bsa)
+		if(attacked.damageAmount > 0)
+			lastDamageRound = cb->getBattle(battleID)->battleGetRound();
+	if(fallback)
+		fallback->battleStacksAttacked(battleID, bsa, ranged);
+}
+
+void AlphaBattleAI::playDefault(const BattleID & battleID, const CStack * stack)
 {
 	++stats.fallbacks;
-	fallback->activeStack(battleID, stack);
+	auto battle = cb->getBattle(battleID);
+	if(stack->creatureId() == CreatureID::CATAPULT) // a catapult has no "defend": aim at the first wall part it can hit
+	{
+		const auto parts = battle->getAttackableWallParts();
+		if(!parts.empty())
+		{
+			ChosenAction a{.type = static_cast<int>(ActionType::CATAPULT), .hex = parts.front().toInt()};
+			cb->battleMakeUnitAction(battleID, engineAction(battle->battleGetMySide(), stack, a, [](int) { return nullptr; }));
+			return;
+		}
+	}
+	cb->battleMakeUnitAction(battleID, BattleAction::makeDefend(stack));
 }
 
 void AlphaBattleAI::activeStack(const BattleID & battleID, const CStack * stack)
@@ -367,16 +482,16 @@ void AlphaBattleAI::activeStack(const BattleID & battleID, const CStack * stack)
 		fallback->activeStack(battleID, stack);
 		return;
 	}
-	if(battle->battleGetRound() >= STALEMATE_ROUND && battle->battleCanFlee())
+	if(battle->battleGetMySide() == BattleSide::ATTACKER && battle->battleGetRound() - lastDamageRound >= STALEMATE_ROUNDS && battle->battleCanFlee())
 	{
 		++stats.fallbacks;
-		logAi->info("AlphaBattleAI: round %d, no end in sight: retreating", battle->battleGetRound());
+		logAi->info("AlphaBattleAI: no damage for %d rounds: the attacker retreats", battle->battleGetRound() - lastDamageRound);
 		cb->battleMakeUnitAction(battleID, BattleAction::makeRetreat(battle->battleGetMySide()));
 		return;
 	}
-	if(!model || stack->hasBonusOfType(BonusType::SIEGE_WEAPON) || battle->battleGetTacticDist() || battle->battleGetRound() >= ROUND_CAP)
+	if(!model)
 	{
-		useFallback(battleID, stack);
+		playDefault(battleID, stack);
 		return;
 	}
 	try
@@ -386,8 +501,8 @@ void AlphaBattleAI::activeStack(const BattleID & battleID, const CStack * stack)
 	catch(const std::exception & e)
 	{
 		++stats.errors;
-		logAi->error("AlphaBattleAI: %s; StupidAI plays this action", e.what());
-		useFallback(battleID, stack);
+		logAi->error("AlphaBattleAI: %s; the unit defends", e.what());
+		playDefault(battleID, stack);
 	}
 }
 
@@ -535,7 +650,7 @@ std::optional<ChosenAction> AlphaBattleAI::searchAction(const BattleID & battleI
 	try
 	{
 		const auto root = BattleSimulation::copyOf(env->game()->gameState(), battleID, 0); // its dice are replaced in every simulation
-		BattleSearchEnv game(*root, *model, *env, battleStartValues, ROUND_CAP);
+		BattleSearchEnv game(*root, *model, *env, battleStartValues, SEARCH_ROUND_CAP);
 		GumbelSearch::Config config;
 		config.simulations = searchSimulations;
 		config.maxConsidered = searchConsidered;
@@ -632,14 +747,21 @@ void AlphaBattleAI::actionStarted(const BattleID & battleID, const BattleAction 
 			logAi->warn("AlphaBattleAI: the delegate's action %s has no model action; not recorded", action.toString());
 		delegatePending.reset();
 	}
-	fallback->actionStarted(battleID, action);
+	if(fallback)
+		fallback->actionStarted(battleID, action);
 }
 
 void AlphaBattleAI::actionFinished(const BattleID & battleID, const BattleAction & action)
 {
 	if(simCheck && simCheckAction && action.actionType == simCheckAction->actionType && action.stackNumber == simCheckAction->stackNumber && action.side == simCheckAction->side)
 		compareWithSimulation(battleID);
-	fallback->actionFinished(battleID, action);
+	if(tacticsPending && action.side == cb->getBattle(battleID)->battleGetMySide() && cb->getBattle(battleID)->battleGetTacticDist())
+	{
+		tacticsPending = false;
+		placeNextTactic(battleID);
+	}
+	if(fallback)
+		fallback->actionFinished(battleID, action);
 }
 
 void AlphaBattleAI::compareWithSimulation(const BattleID & battleID)
@@ -696,4 +818,96 @@ void AlphaBattleAI::compareWithSimulation(const BattleID & battleID)
 	}
 	simCheck.reset();
 	simCheckAction.reset();
+}
+
+std::string AlphaBattleAI::scenarioJson(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2) const
+{
+	// This battle as a battle_model scenario (MakeBattleMap's format), so a battle of a real game can be played again
+	// as a battle-only game (eval sets, calibrating the generator, hard cases). What the game state shows the client.
+	auto battle = cb->getBattle(battleID);
+	auto key = [](const auto & entity) { auto k = entity->getJsonKey(); return k.substr(k.find(':') + 1); };
+	auto armyNode = [&](const CCreatureSet * set)
+	{
+		JsonNode army;
+		for(const auto & [slot, stack] : set->Slots())
+		{
+			JsonNode pair;
+			pair.Vector().emplace_back(key(stack->getCreatureID().toCreature()));
+			pair.Vector().emplace_back(static_cast<si64>(stack->getCount()));
+			army.Vector().push_back(pair);
+		}
+		return army;
+	};
+	JsonNode scenario;
+	scenario["name"].String() = "exported";
+	scenario["terrain"].String() = key(battle->battleTerrainType().toEntity(LIBRARY));
+	scenario["battlefield"].String() = battle->battleGetBattlefieldType().getInfo()->getJsonKey();
+	scenario["seed"].Integer() = 0;
+	for(int s = 0; s < 2; ++s)
+	{
+		const auto * hero = heroes[s];
+		const auto * army = s == 0 ? army1 : army2;
+		JsonNode side;
+		side["army"] = armyNode(army);
+		if(hero)
+		{
+			side["hero"].String() = key(hero->getHeroTypeID().toHeroType());
+			for(int p = 0; p < GameConstants::PRIMARY_SKILLS; ++p)
+				side["primary_skills"].Vector().emplace_back(static_cast<si64>(hero->getBasePrimarySkillValue(PrimarySkill(p))));
+			for(const auto & [skill, level] : hero->secSkills)
+			{
+				JsonNode pair;
+				pair.Vector().emplace_back(key(skill.toSkill()));
+				pair.Vector().emplace_back(static_cast<si64>(level));
+				side["secondary_skills"].Vector().push_back(pair);
+			}
+			side["secondary_skills"].setType(JsonNode::JsonType::DATA_VECTOR);
+			side["experience"].Integer() = hero->exp;
+			side["spellbook"].Bool() = hero->hasSpellbook();
+			for(const auto & spell : hero->getSpellsInSpellbook())
+				side["spells"].Vector().emplace_back(key(spell.toSpell()));
+			side["spells"].setType(JsonNode::JsonType::DATA_VECTOR);
+			side["war_machines"].setType(JsonNode::JsonType::DATA_VECTOR);
+			side["artifacts"].setType(JsonNode::JsonType::DATA_VECTOR);
+			for(const auto & [slot, info] : hero->artifactsWorn)
+			{
+				const auto * art = info.getArt();
+				if(!art || info.locked || slot == ArtifactPosition::SPELLBOOK || slot == ArtifactPosition::MACH4)
+					continue;
+				if(art->getType()->getWarMachine() != CreatureID::NONE)
+					side["war_machines"].Vector().emplace_back(key(art->getType()));
+				else
+				{
+					JsonNode pair;
+					pair.Vector().emplace_back(static_cast<si64>(slot.num));
+					pair.Vector().emplace_back(key(art->getType()));
+					side["artifacts"].Vector().push_back(pair);
+				}
+			}
+		}
+		scenario["sides"].Vector().push_back(side);
+	}
+	if(const auto * town = battle->battleGetDefendedTown())
+	{
+		scenario["town"]["faction"].String() = key(town->getFactionID().toFaction());
+		scenario["town"]["fortification"].String() = town->hasBuilt(BuildingID::CASTLE) ? "castle" : town->hasBuilt(BuildingID::CITADEL) ? "citadel" : town->hasBuilt(BuildingID::FORT) ? "fort" : "none";
+	}
+	else if(!heroes[1] && battle->sideToPlayer(BattleSide::DEFENDER) == PlayerColor::NEUTRAL)
+	{
+		// Wandering monsters: one creature (split into stacks), sometimes with one stack of its upgrade
+		std::map<CreatureID, int> counts;
+		for(const auto & [slot, stack] : army2->Slots())
+			counts[stack->getCreatureID()] += stack->getCount();
+		const auto main = std::max_element(counts.begin(), counts.end(), [](const auto & a, const auto & b) { return a.second < b.second; });
+		int total = 0;
+		for(const auto & [creature, count] : counts)
+			total += count;
+		scenario["neutrals"]["creature"].String() = key(main->first.toCreature());
+		scenario["neutrals"]["count"].Integer() = total;
+		scenario["neutrals"]["upgraded_stack"].Bool() = counts.size() > 1;
+		scenario["sides"].Vector().pop_back();
+	}
+	auto json = scenario.toCompactString(); // one line in events.jsonl: VCMI's "compact" output still has line breaks
+	json.erase(std::remove_if(json.begin(), json.end(), [](char c) { return c == '\n' || c == '\r' || c == '\t'; }), json.end());
+	return json;
 }

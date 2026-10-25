@@ -132,7 +132,15 @@ def battle_returns_and_advantages(values, rewards, config=AdvantageConfig()):
 	return advantages + values, advantages
 
 
-def value_loss(out, targets, config=PPOConfig()):
+def weighted_mean(values, weight):
+	"""Mean of values [B] (or [B, ...] over the first axis) with weights [B] (None: plain mean)."""
+	if weight is None:
+		return values.mean(dim=0)
+	w = weight.reshape(-1, *([1] * (values.dim() - 1)))
+	return (values * w).sum(dim=0) / weight.sum().clamp(min=1e-8)
+
+
+def value_loss(out, targets, config=PPOConfig(), weight=None):
 	"""Step 4 for a batch: weighted cross-entropy of each value head against its -1..1 label.
 
 	A head's output is tanh(z) = 2 * sigmoid(2z) - 1, so its cross-entropy is the one of sigmoid(2z)
@@ -140,7 +148,7 @@ def value_loss(out, targets, config=PPOConfig()):
 	Returns (loss, per-head losses [heads]).
 	"""
 	probabilities = ((targets + 1) / 2).clamp(0.0, 1.0)
-	per_head = F.binary_cross_entropy_with_logits(2 * out["value_logit"], probabilities, reduction="none").mean(dim=0)
+	per_head = weighted_mean(F.binary_cross_entropy_with_logits(2 * out["value_logit"], probabilities, reduction="none"), weight)
 	weights = torch.tensor(config.value_head_weights, dtype=per_head.dtype, device=per_head.device)
 	return (per_head * weights).sum() / weights.sum(), per_head.detach()
 
@@ -194,8 +202,9 @@ def normalize_advantages(advantages, groups, battles, config=AdvantageConfig()):
 	return out
 
 
-def ppo_loss(out, action, old_log_prob, advantage, value_labels, config=PPOConfig()):
-	"""Steps 4-7 for a batch of decisions. out: model outputs for the batch inputs.
+def ppo_loss(out, action, old_log_prob, advantage, value_labels, config=PPOConfig(), weight=None):
+	"""Steps 4-7 for a batch of decisions. out: model outputs for the batch inputs. weight: [B] how much each decision
+	counts (data.example_weight: a battle that hardly matters counts little), or None for all alike.
 
 	advantage: [B] from battle_returns_and_advantages (using V, the final-reward head, as values), already
 	           normalised per side over the epoch by normalize_advantages
@@ -207,9 +216,9 @@ def ppo_loss(out, action, old_log_prob, advantage, value_labels, config=PPOConfi
 	new_log_prob = log_prob(out, action)
 	ratio = torch.exp(new_log_prob - old_log_prob)
 	clipped = ratio.clamp(1 - config.clip_range, 1 + config.clip_range)
-	policy = -torch.min(ratio * advantage, clipped * advantage).mean()
-	value, per_head = value_loss(out, value_labels, config)
-	bonus = entropy(out).mean()
+	policy = -weighted_mean(torch.min(ratio * advantage, clipped * advantage), weight)
+	value, per_head = value_loss(out, value_labels, config, weight)
+	bonus = weighted_mean(entropy(out), weight)
 	total = policy + config.value_weight * value - config.entropy_weight * bonus
 	return total, {
 		"policy": policy.detach(),

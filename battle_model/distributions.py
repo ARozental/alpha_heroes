@@ -4,7 +4,8 @@ An action is a dict of int64 tensors [B], -1 where a field does not apply:
 	type, hex (MOVE destination / MELEE from-hex), unit (MELEE / SHOOT target),
 	spell, target_unit / target_hex (spell first target), target2_hex / target2_unit (second target).
 A creature spell (CREATURE_SPELL) uses target_unit / target_hex; its spell is the acting unit's (g_creature_spell), not
-a choice, so its spell field only informs.
+a choice, so its spell field only informs. TACTICS_MOVE and CATAPULT choose their hex in the move-hex output, HEAL its
+unit in the shoot-target output (constants.HEX_TYPES, TARGET_TYPES).
 
 log p(action) = log p(type) + log p(arguments | type), each argument conditional on the previous ones.
 sample() is the reference for the C++ sampler in agents/AlphaBattleAI.
@@ -12,7 +13,7 @@ sample() is the reference for the C++ sampler in agents/AlphaBattleAI.
 import numpy as np
 import torch
 
-from .constants import N_SPELLS, SECOND_TARGET_KIND, ActionType, TargetKind
+from .constants import HEX_TYPES, N_SPELLS, SECOND_TARGET_KIND, TARGET_TYPES, ActionType, TargetKind
 
 ACTION_FIELDS = ("type", "hex", "unit", "spell", "target_unit", "target_hex", "target2_hex", "target2_unit")
 
@@ -20,6 +21,11 @@ ACTION_FIELDS = ("type", "hex", "unit", "spell", "target_unit", "target_hex", "t
 _SECOND_KIND = torch.zeros(N_SPELLS, dtype=torch.long)
 for _spell, _kind in SECOND_TARGET_KIND.items():
 	_SECOND_KIND[_spell] = int(_kind)
+
+
+def _one_of(t, types):
+	"""t (a tensor of types) is one of `types`."""
+	return torch.stack([t == a for a in types]).any(dim=0)
 
 
 def log_prob(out, action):
@@ -41,10 +47,10 @@ def log_prob_at(out, rows, action):
 
 	t = action["type"]
 	lp = at("logp_type", t)
-	lp = lp + torch.where(t == ActionType.MOVE, at("logp_move_hex", action["hex"]), 0.0)
+	lp = lp + torch.where(_one_of(t, HEX_TYPES), at("logp_move_hex", action["hex"]), 0.0)
 	melee = at("logp_melee_target", action["unit"]) + at("logp_melee_from", action["unit"], action["hex"])
 	lp = lp + torch.where(t == ActionType.MELEE, melee, 0.0)
-	lp = lp + torch.where(t == ActionType.SHOOT, at("logp_shoot_target", action["unit"]), 0.0)
+	lp = lp + torch.where(_one_of(t, TARGET_TYPES), at("logp_shoot_target", action["unit"]), 0.0)
 	unit = action["target_unit"]
 	spell = torch.where(t == ActionType.HERO_SPELL, action["spell"], -1)  # a creature spell's id can be past N_SPELLS
 	spell_lp = at("logp_spell", spell) + at("logp_spell_unit", spell, unit) + at("logp_spell_hex", spell, action["target_hex"])
@@ -72,9 +78,9 @@ def entropy(out):
 	"""Exact entropy of the full action distribution, shape [B]."""
 	p_type = out["logp_type"].exp()
 	h = _entropy(out["logp_type"])
-	h = h + p_type[:, ActionType.MOVE] * _entropy(out["logp_move_hex"])
+	h = h + p_type[:, list(HEX_TYPES)].sum(dim=-1) * _entropy(out["logp_move_hex"])
 	h = h + p_type[:, ActionType.MELEE] * (_entropy(out["logp_melee_target"]) + _expect(out["logp_melee_target"], _entropy(out["logp_melee_from"])))
-	h = h + p_type[:, ActionType.SHOOT] * _entropy(out["logp_shoot_target"])
+	h = h + p_type[:, list(TARGET_TYPES)].sum(dim=-1) * _entropy(out["logp_shoot_target"])
 
 	# Per spell: entropy of its first target (one of the two rows is empty) plus, for
 	# two-target spells, the expected entropy of the second target given the first.
@@ -106,12 +112,12 @@ def sample(out, b=0, rng=None, greedy=False):
 	o = {k: (v.detach().cpu().numpy() if torch.is_tensor(v) else np.asarray(v))[b] for k, v in out.items()}
 	a = dict.fromkeys(ACTION_FIELDS, -1)
 	a["type"] = t = _choose(o["logp_type"], rng, greedy)
-	if t == ActionType.MOVE:
+	if t in HEX_TYPES:
 		a["hex"] = _choose(o["logp_move_hex"], rng, greedy)
 	elif t == ActionType.MELEE:
 		a["unit"] = u = _choose(o["logp_melee_target"], rng, greedy)
 		a["hex"] = _choose(o["logp_melee_from"][u], rng, greedy)
-	elif t == ActionType.SHOOT:
+	elif t in TARGET_TYPES:
 		a["unit"] = _choose(o["logp_shoot_target"], rng, greedy)
 	elif t == ActionType.HERO_SPELL:
 		a["spell"] = s = _choose(o["logp_spell"], rng, greedy)
@@ -138,11 +144,11 @@ def is_legal(action, masks, b=0):
 	t = action["type"]
 	if t < 0 or not m["m_type"][t]:
 		return False
-	if t == ActionType.MOVE:
+	if t in HEX_TYPES:
 		return bool(m["m_move_hex"][action["hex"]])
 	if t == ActionType.MELEE:
 		return bool(m["m_melee_target"][action["unit"]] and m["m_melee_from"][action["unit"], action["hex"]])
-	if t == ActionType.SHOOT:
+	if t in TARGET_TYPES:
 		return bool(m["m_shoot_target"][action["unit"]])
 	if t == ActionType.HERO_SPELL:
 		s = action["spell"]
@@ -175,12 +181,12 @@ def enumerate_actions(masks, b=0):
 	actions = []
 	for t in np.flatnonzero(m["m_type"]):
 		t = int(t)
-		if t == ActionType.MOVE:
+		if t in HEX_TYPES:
 			actions += [{**blank, "type": t, "hex": int(h)} for h in np.flatnonzero(m["m_move_hex"])]
 		elif t == ActionType.MELEE:
 			for u in np.flatnonzero(m["m_melee_target"]):
 				actions += [{**blank, "type": t, "unit": int(u), "hex": int(h)} for h in np.flatnonzero(m["m_melee_from"][u])]
-		elif t == ActionType.SHOOT:
+		elif t in TARGET_TYPES:
 			actions += [{**blank, "type": t, "unit": int(u)} for u in np.flatnonzero(m["m_shoot_target"])]
 		elif t == ActionType.HERO_SPELL:
 			for s in np.flatnonzero(m["m_spell"]):

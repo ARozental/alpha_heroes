@@ -131,7 +131,7 @@ def test_ending_now_scores_as_the_reward_would(our_side):
 		"retreat_reward": zero_sum(start[us], assets_after(Outcome.RETREAT, army[us], hero[us], mana[us]), start[them], theirs),
 		"surrender_reward": zero_sum(start[us], assets_after(Outcome.SURRENDER, army[us], hero[us], mana[us], 1000), start[them], theirs),
 	}
-	assert got == pytest.approx(expect, abs=1e-5)
+	assert {k: got[k] for k in expect} == pytest.approx(expect, abs=1e-5)
 	assert expect["surrender_reward"] > expect["retreat_reward"]  # paying 1000 + rehire keeps the Angels
 	x = ending_battle(our_side, cost=-1)  # cannot surrender
 	assert F.outcome_features(F.read_battle(tensors(x), BattleModel().tables()))[0, 1] == 0
@@ -205,3 +205,31 @@ def test_escapes_are_about_never_unless_we_are_much_weaker():
 	relief = lambda ratio: float(priors.escape_relief(torch.tensor(np.log(ratio))))
 	assert relief(1.0) < 0.01 and relief(4.0) < 0.01 and relief(1 / 9) < 0.15  # even, stronger, the enemy 3x our army
 	assert relief(1 / 100) > 0.9  # the enemy 10x our army: about as likely as waiting
+
+
+def test_example_weight_counts_battles_by_what_is_at_stake():
+	from battle_model.data import BattleSummary, example_weight
+	from battle_model.reward import Outcome
+	even = BattleSummary(our_side=0, outcome=Outcome.WIN, reward=0.0, rounds=1, own_start_value=50_000, enemy_start_value=45_000, own_kept=0, enemy_lost=0, mana_used_fraction=0)
+	crush = BattleSummary(our_side=0, outcome=Outcome.WIN, reward=0.0, rounds=1, own_start_value=100_000, enemy_start_value=2_000, own_kept=0, enemy_lost=0, mana_used_fraction=0)
+	assert example_weight(even) == 1.0
+	assert 0.05 <= example_weight(crush) < 0.25
+
+
+@pytest.mark.skipif(not vocab.VOCAB_PATH.exists(), reason="run scripts/export_vocab.sh to generate the vocabulary")
+def test_rule_artifacts_reach_our_hero_and_plain_stats_do_not():
+	"""Orb of Vulnerability (it negates immunities) is in our hero's bag; Centaur's Axe (+2 attack) is not."""
+	from battle_model.model import HeroTokens
+	ids = {r["key"]: i for i, r in vocab.tables()["artifacts"].items()}
+	heroes = HeroTokens(16)
+	worn = torch.full((1, 2, 19), -1)
+	worn[0, 0, 0], worn[0, 0, 1] = ids["core:orbOfVulnerability"], ids["core:centaurAxe"]
+	bag = heroes.rule_bag(worn)
+	assert bag[0, 0].sum() == 1 and bag[0, 1].sum() == 0
+
+
+def test_exposure_features_are_shares():
+	x = {k: torch.from_numpy(v) for k, v in random_inputs(batch=8, seed=4).items()}
+	b = F.read_battle(x, BattleModel().tables())
+	e = F.exposure_features(b)
+	assert e.shape == (8, len(F.EXPOSURE_FEATURES)) and (e >= 0).all() and (e <= 1).all()

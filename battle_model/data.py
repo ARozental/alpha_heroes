@@ -234,6 +234,21 @@ def read_decisions(record):
 	]
 
 
+MIN_WEIGHT, FULL_WEIGHT_SHARE = 0.05, 0.1
+
+
+def example_weight(summary):
+	"""How much a battle's decisions count in training: its smaller side's share of both sides' assets over
+	FULL_WEIGHT_SHARE, in MIN_WEIGHT..1 (an even fight 1; a 100k hero crushing 2k of monsters 0.2: its outcome was never
+	in doubt, so its decisions teach little and would flood the data, as real games' battles mostly are).
+
+	TODO(stake): an initial guess. Weigh by what the battle risks of the player's whole empire (the value of the
+	forces fighting over all of the player's assets) once the campaign AI computes the empire's value."""
+	own, enemy = max(summary.own_start_value, 0.0), max(summary.enemy_start_value, 0.0)
+	share = min(own, enemy) / max(own + enemy, 1.0)
+	return min(1.0, max(MIN_WEIGHT, share / FULL_WEIGHT_SHARE))
+
+
 def battle_examples(record, reward_config=RewardConfig(), advantage_config=AdvantageConfig()):
 	"""(examples, summary) for one recorded battle (a Record, or a record folder). Each example is a dict as described at the top."""
 	record = as_record(record)
@@ -261,8 +276,10 @@ def battle_examples(record, reward_config=RewardConfig(), advantage_config=Advan
 	summary.credit = list(zip(-np.diff(own), -np.diff(enemy), np.diff(values.numpy()).tolist()))
 
 	searches = {e["decision"]: (torch.tensor(e["actions"], dtype=torch.long).view(-1, len(ACTION_FIELDS)), torch.tensor(e["policy"], dtype=torch.float32)) for e in record.events if e["event"] == "search"}
+	weight = example_weight(summary)
+	summary.weight = weight
 	examples = [
-		{"inputs": d[0], "action": d[2], "old_log_prob": old_log_prob[i], "advantage": advantages[i], "value_labels": labels[i], "forced": bool(d[2].get("forced", False)), "search": searches.get(i)}
+		{"inputs": d[0], "action": d[2], "old_log_prob": old_log_prob[i], "advantage": advantages[i], "value_labels": labels[i], "weight": torch.tensor(weight, dtype=torch.float32), "forced": bool(d[2].get("forced", False)), "search": searches.get(i)}
 		for i, d in enumerate(decisions)
 	]
 	return examples, summary
@@ -278,6 +295,7 @@ def collate(examples):
 		"old_log_prob": torch.stack([e["old_log_prob"] for e in examples]),
 		"advantage": torch.stack([e["advantage"] for e in examples]),
 		"value_labels": torch.stack([e["value_labels"] for e in examples]),
+		"weight": torch.stack([e.get("weight", torch.tensor(1.0)) for e in examples]),
 	}
 	searches = [e.get("search") for e in examples]
 	if any(s is not None for s in searches):

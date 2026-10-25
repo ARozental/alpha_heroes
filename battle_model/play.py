@@ -18,7 +18,7 @@ import socket
 import struct
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -51,24 +51,31 @@ class Game:
 
 	@property
 	def neutrals(self):
-		"""Wandering monsters defend (the scenario's "neutrals"): our model plays the hero, the monsters are played
-		by the opponent (NEUTRAL_AI in self-play), as VCMI's neutral battle AI."""
+		"""Wandering monsters defend (the scenario's "neutrals"): side 1 is VCMI's neutral player, whose battle AI is the
+		setting combatNeutralAI (our AI in self-play and when we play the monsters, else the opponent)."""
 		return has_neutrals(self.scenario)
+
+	@property
+	def colors(self):
+		"""The player colour of battle side 0 and side 1."""
+		return (COLORS[0], NEUTRAL) if self.neutrals else COLORS
 
 	@property
 	def recorded_sides(self):
 		"""The sides our model plays, each with its own record."""
-		if self.neutrals:
-			return (0,)
 		return (0, 1) if self.opponent == SELF_PLAY else (self.our_side,)
 
 
-NEUTRAL_AI = "BattleAI"  # plays wandering monsters in self-play
+NEUTRAL = "NEUTRAL"  # the wandering monsters' player (AlphaBattleAI reads ALPHA_BATTLE_<NAME>_NEUTRAL)
 
 
 @functools.lru_cache(maxsize=4096)
+def scenario_of(scenario_path):
+	return json.loads(Path(scenario_path).read_text())
+
+
 def has_neutrals(scenario_path):
-	return "neutrals" in json.loads(Path(scenario_path).read_text())
+	return "neutrals" in scenario_of(scenario_path)
 
 
 def record_dirs(game, record_dir):
@@ -104,7 +111,8 @@ class RecordServer:
 	"""Receives battle records from AlphaBattleAI over a Unix socket, so training data never touches the disk.
 
 	Each AI connects at the end of its battle and sends a key (u32 length + bytes) and the record
-	(agents/AlphaBattleAI/Dump.h BattleRecord); records: {key: bytes}. Use as a context manager: leaving it
+	(agents/AlphaBattleAI/Dump.h BattleRecord); records: {key: [bytes, ...]}, every battle sent with the key in the
+	order received (a battle-only game sends one, a real game one per battle). Use as a context manager: leaving it
 	reads what is still queued, then closes the socket.
 	"""
 
@@ -115,6 +123,7 @@ class RecordServer:
 			raise RuntimeError(f"socket path too long: {self.path}")
 		self.path.unlink(missing_ok=True)
 		self.records = {}
+		self._lock = threading.Lock()
 		self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 		self._socket.bind(str(self.path))
 		self._socket.listen(128)
@@ -132,9 +141,17 @@ class RecordServer:
 					while chunk := connection.recv(1 << 20):
 						data += chunk
 				(key_length,) = struct.unpack_from("<I", data, 0)
-				self.records[bytes(data[4 : 4 + key_length]).decode()] = bytes(data[4 + key_length :])
+				key = bytes(data[4 : 4 + key_length]).decode().split("#", 1)[0]  # AlphaBattleAI numbers each battle: key#n
+				with self._lock:
+					self.records.setdefault(key, []).append(bytes(data[4 + key_length :]))
 			elif self._stop.is_set():
 				return
+
+	def drain(self):
+		"""The records received since the last drain ({key: [bytes, ...]}), removed from records."""
+		with self._lock:
+			records, self.records = self.records, {}
+		return records
 
 	def __enter__(self):
 		return self
@@ -158,13 +175,18 @@ def start(game, model_path, records, max_seconds=120, max_mb=200):
 	env.update(
 		ALPHA_BATTLE_MODEL=str(Path(model_path).resolve()),
 		ALPHA_BATTLE_TEMPERATURE=str(game.temperature),
-		SETTINGS=json.dumps({"server": {"seed": game.game_seed}, **({"ai": {"combatNeutralAI": NEUTRAL_AI if game.opponent == SELF_PLAY else game.opponent}} if game.neutrals else {})}),
+		SETTINGS=json.dumps({"server": {"seed": game.game_seed}, **({"ai": {"combatNeutralAI": game.ai if 1 in game.recorded_sides else game.opponent}} if game.neutrals else {})}),
 	)
 	env.update(dict(game.settings))
-	for side, color in enumerate(COLORS):
+	for side, color in enumerate(game.colors):
 		env[f"VCMI_BATTLE_AI_{color}"] = game.ai if side in game.recorded_sides else game.opponent
+	for side, setup in zip(game.colors, scenario_of(game.scenario).get("sides", [])):  # what a map cannot set
+		if "gold" in setup:
+			env[f"VCMI_BATTLE_GOLD_{side}"] = str(int(setup["gold"]))
+		if "mana_fraction" in setup:
+			env[f"VCMI_BATTLE_MANA_{side}"] = str(setup["mana_fraction"])
 	for i, (side, target) in enumerate(zip(game.recorded_sides, records)):
-		color = COLORS[side]
+		color = game.colors[side]
 		if target.get("socket"):
 			env[f"ALPHA_BATTLE_RECORD_SOCKET_{color}"] = str(target["socket"])
 			env[f"ALPHA_BATTLE_RECORD_KEY_{color}"] = target["key"]
@@ -176,7 +198,7 @@ def start(game, model_path, records, max_seconds=120, max_mb=200):
 		PREFIX_DIR.mkdir(parents=True, exist_ok=True)
 		prefix = PREFIX_DIR / f"{os.getpid()}-{next(_server_numbers)}.jsonl"  # a few KB, deleted by finish()
 		prefix.write_text("".join(json.dumps(action) + "\n" for action in game.prefix))
-		env[f"ALPHA_BATTLE_PREFIX_{COLORS[game.our_side]}"] = str(prefix)
+		env[f"ALPHA_BATTLE_PREFIX_{game.colors[game.our_side]}"] = str(prefix)
 	command = [str(ROOT / "scripts" / "headless.sh"), game.map or map_name(game.scenario), str(max_seconds), str(max_mb), "20"]
 	process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 	process.prefix_file = prefix
@@ -237,4 +259,4 @@ def play(games, model_path, record_root=None):
 	missing = [(i, report) for i, (report, ok) in enumerate(zip(reports, recorded)) if report and not ok]
 	if missing:
 		raise RuntimeError("no record received from " + ", ".join(f"game {i} (run {report.get('run')})" for i, report in missing))
-	return [parse_record(received[t["key"]]) for game_targets in targets for t in game_targets]
+	return [parse_record(received[t["key"]][-1]) for game_targets in targets for t in game_targets]

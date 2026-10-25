@@ -1,0 +1,4955 @@
+[
+	{
+		"battlefield": "core:grass_pines",
+		"name": "exported",
+		"seed": 1232704446,
+		"sides": [
+			{
+				"army": [
+					[
+						"behemoth",
+						2
+					],
+					[
+						"roc",
+						9
+					],
+					[
+						"ogreMage",
+						8
+					],
+					[
+						"orcChieftain",
+						14
+					],
+					[
+						"hobgoblinWolfRider",
+						18
+					],
+					[
+						"hobgoblin",
+						38
+					],
+					[
+						"cyclop",
+						5
+					]
+				],
+				"artifacts": [],
+				"experience": 54,
+				"hero": "vey",
+				"primary_skills": [
+					2,
+					1,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						1
+					],
+					[
+						"leadership",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"viewEarth",
+					"magicArrow",
+					"protectFire",
+					"stoneSkin",
+					"haste"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"goblin",
+						1
+					]
+				],
+				"artifacts": [],
+				"experience": 3371,
+				"hero": "cragHack",
+				"primary_skills": [
+					8,
+					1,
+					1,
+					2
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"armorer",
+						2
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"shield",
+					"protectWater",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": [
+					"ammoCart"
+				]
+			}
+		],
+		"terrain": "grass",
+		"_about": "real heroes 0"
+	},
+	{
+		"battlefield": "core:grass_hills",
+		"name": "exported",
+		"seed": 753574531,
+		"sides": [
+			{
+				"army": [
+					[
+						"hobgoblinWolfRider",
+						18
+					],
+					[
+						"hobgoblin",
+						38
+					]
+				],
+				"artifacts": [],
+				"experience": 54,
+				"hero": "vey",
+				"primary_skills": [
+					2,
+					1,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						1
+					],
+					[
+						"leadership",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"viewEarth",
+					"magicArrow",
+					"protectFire",
+					"stoneSkin",
+					"haste"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"wraith",
+						1
+					]
+				],
+				"artifacts": [],
+				"experience": 1425,
+				"hero": "xsi",
+				"primary_skills": [
+					1,
+					0,
+					2,
+					3
+				],
+				"secondary_skills": [
+					[
+						"necromancy",
+						2
+					],
+					[
+						"learning",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"protectFire",
+					"dispel",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "grass",
+		"_about": "real heroes 1"
+	},
+	{
+		"battlefield": "core:grass_pines",
+		"name": "exported",
+		"seed": 1146977645,
+		"sides": [
+			{
+				"army": [
+					[
+						"ogreMage",
+						25
+					],
+					[
+						"behemoth",
+						4
+					],
+					[
+						"roc",
+						12
+					],
+					[
+						"orcChieftain",
+						35
+					],
+					[
+						"hobgoblinWolfRider",
+						17
+					],
+					[
+						"hobgoblin",
+						37
+					]
+				],
+				"artifacts": [],
+				"experience": 23850,
+				"hero": "yog",
+				"primary_skills": [
+					14,
+					10,
+					3,
+					6
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"ballistics",
+						2
+					],
+					[
+						"airMagic",
+						3
+					],
+					[
+						"sorcery",
+						1
+					],
+					[
+						"wisdom",
+						2
+					],
+					[
+						"logistics",
+						2
+					],
+					[
+						"luck",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"summonBoat",
+					"viewEarth",
+					"earthquake",
+					"magicArrow",
+					"shield",
+					"protectFire",
+					"protectWater",
+					"dispel",
+					"cure",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"goblin",
+						1
+					]
+				],
+				"artifacts": [
+					[
+						1,
+						"dragonWingTabard"
+					],
+					[
+						2,
+						"collarOfConjuring"
+					],
+					[
+						3,
+						"blackshardOfTheDeadKnight"
+					],
+					[
+						6,
+						"ringOfVitality"
+					],
+					[
+						8,
+						"dragonboneGreaves"
+					],
+					[
+						9,
+						"badgeOfCourage"
+					],
+					[
+						10,
+						"bowOfElvenCherrywood"
+					],
+					[
+						11,
+						"glyphOfGallantry"
+					],
+					[
+						12,
+						"emblemOfCognizance"
+					]
+				],
+				"experience": 35292,
+				"hero": "krellion",
+				"primary_skills": [
+					13,
+					3,
+					2,
+					5
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"resistance",
+						3
+					],
+					[
+						"airMagic",
+						3
+					],
+					[
+						"fireMagic",
+						2
+					],
+					[
+						"wisdom",
+						3
+					],
+					[
+						"intelligence",
+						1
+					],
+					[
+						"logistics",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"earthquake",
+					"magicArrow",
+					"dispel",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "grass",
+		"_about": "real heroes 2"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 1256437083,
+		"sides": [
+			{
+				"army": [
+					[
+						"roc",
+						12
+					],
+					[
+						"ogreMage",
+						17
+					],
+					[
+						"behemoth",
+						2
+					],
+					[
+						"goblin",
+						42
+					],
+					[
+						"goblinWolfRider",
+						43
+					],
+					[
+						"orc",
+						28
+					]
+				],
+				"artifacts": [],
+				"experience": 19820,
+				"hero": "yog",
+				"primary_skills": [
+					14,
+					9,
+					3,
+					5
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"ballistics",
+						2
+					],
+					[
+						"airMagic",
+						3
+					],
+					[
+						"sorcery",
+						1
+					],
+					[
+						"wisdom",
+						2
+					],
+					[
+						"logistics",
+						2
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"summonBoat",
+					"earthquake",
+					"magicArrow",
+					"shield",
+					"protectWater",
+					"dispel",
+					"cure",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"roc",
+						1
+					]
+				],
+				"artifacts": [],
+				"experience": 6514,
+				"hero": "gretchin",
+				"primary_skills": [
+					7,
+					4,
+					1,
+					3
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"pathfinding",
+						2
+					],
+					[
+						"airMagic",
+						2
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"dispel",
+					"cure",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "rough",
+		"_about": "real heroes 3"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 875262510,
+		"sides": [
+			{
+				"army": [
+					[
+						"goblin",
+						52
+					],
+					[
+						"goblinWolfRider",
+						46
+					],
+					[
+						"orc",
+						9
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"pendantOfCourage"
+					],
+					[
+						3,
+						"centaurAxe"
+					],
+					[
+						6,
+						"stillEyeOfTheDragon"
+					],
+					[
+						9,
+						"birdOfPerception"
+					]
+				],
+				"experience": 3577,
+				"hero": "yog",
+				"primary_skills": [
+					8,
+					2,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"ballistics",
+						1
+					],
+					[
+						"airMagic",
+						1
+					],
+					[
+						"sorcery",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"goblin",
+						63
+					],
+					[
+						"pikeman",
+						4
+					],
+					[
+						"archer",
+						4
+					]
+				],
+				"artifacts": [
+					[
+						8,
+						"dragonboneGreaves"
+					],
+					[
+						9,
+						"badgeOfCourage"
+					]
+				],
+				"experience": 3914,
+				"hero": "gretchin",
+				"primary_skills": [
+					6,
+					2,
+					1,
+					2
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"pathfinding",
+						1
+					],
+					[
+						"airMagic",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"dispel",
+					"cure",
+					"stoneSkin",
+					"haste"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "rough",
+		"_about": "real heroes 4"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 1254671179,
+		"sides": [
+			{
+				"army": [
+					[
+						"roc",
+						16
+					],
+					[
+						"behemoth",
+						5
+					],
+					[
+						"goblin",
+						188
+					],
+					[
+						"orc",
+						52
+					],
+					[
+						"ogreMage",
+						8
+					],
+					[
+						"goblinWolfRider",
+						41
+					],
+					[
+						"ogre",
+						1
+					]
+				],
+				"artifacts": [
+					[
+						1,
+						"dragonWingTabard"
+					],
+					[
+						2,
+						"collarOfConjuring"
+					],
+					[
+						6,
+						"ringOfVitality"
+					],
+					[
+						9,
+						"bowOfElvenCherrywood"
+					],
+					[
+						10,
+						"glyphOfGallantry"
+					],
+					[
+						11,
+						"emblemOfCognizance"
+					]
+				],
+				"experience": 14208,
+				"hero": "krellion",
+				"primary_skills": [
+					11,
+					2,
+					1,
+					3
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"resistance",
+						3
+					],
+					[
+						"airMagic",
+						3
+					],
+					[
+						"fireMagic",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste"
+				],
+				"war_machines": [
+					"ballista"
+				]
+			},
+			{
+				"army": [
+					[
+						"ancientBehemoth",
+						1
+					],
+					[
+						"roc",
+						7
+					],
+					[
+						"troglodyte",
+						68
+					],
+					[
+						"orc",
+						14
+					],
+					[
+						"goblinWolfRider",
+						18
+					],
+					[
+						"goblin",
+						30
+					],
+					[
+						"harpy",
+						3
+					]
+				],
+				"artifacts": [],
+				"experience": 103,
+				"hero": "dessa",
+				"primary_skills": [
+					2,
+					2,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						1
+					],
+					[
+						"logistics",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"dispel",
+					"cure",
+					"stoneSkin",
+					"haste"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "rough",
+		"_about": "real heroes 5"
+	},
+	{
+		"battlefield": "core:grass_hills",
+		"name": "exported",
+		"seed": 499046147,
+		"sides": [
+			{
+				"army": [
+					[
+						"goblin",
+						265
+					],
+					[
+						"roc",
+						15
+					],
+					[
+						"orc",
+						76
+					],
+					[
+						"ogre",
+						20
+					],
+					[
+						"goblinWolfRider",
+						59
+					],
+					[
+						"harpy",
+						49
+					],
+					[
+						"behemoth",
+						1
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"pendantOfCourage"
+					],
+					[
+						3,
+						"blackshardOfTheDeadKnight"
+					],
+					[
+						6,
+						"stillEyeOfTheDragon"
+					],
+					[
+						9,
+						"birdOfPerception"
+					]
+				],
+				"experience": 2616,
+				"hero": "ignissa",
+				"primary_skills": [
+					4,
+					2,
+					2,
+					1
+				],
+				"secondary_skills": [
+					[
+						"artillery",
+						2
+					],
+					[
+						"offence",
+						2
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"shield",
+					"protectWater",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"behemoth",
+						5
+					],
+					[
+						"roc",
+						15
+					],
+					[
+						"goblin",
+						183
+					],
+					[
+						"goblinWolfRider",
+						58
+					],
+					[
+						"ogre",
+						12
+					],
+					[
+						"orc",
+						21
+					]
+				],
+				"artifacts": [
+					[
+						1,
+						"dragonWingTabard"
+					],
+					[
+						2,
+						"collarOfConjuring"
+					],
+					[
+						6,
+						"ringOfVitality"
+					],
+					[
+						9,
+						"bowOfElvenCherrywood"
+					],
+					[
+						10,
+						"glyphOfGallantry"
+					],
+					[
+						11,
+						"emblemOfCognizance"
+					]
+				],
+				"experience": 9401,
+				"hero": "krellion",
+				"primary_skills": [
+					8,
+					2,
+					1,
+					3
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"resistance",
+						2
+					],
+					[
+						"airMagic",
+						3
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste"
+				],
+				"war_machines": [
+					"ballista"
+				]
+			}
+		],
+		"terrain": "grass",
+		"_about": "real heroes 6"
+	},
+	{
+		"battlefield": "core:grass_pines",
+		"name": "exported",
+		"seed": 1941758521,
+		"sides": [
+			{
+				"army": [
+					[
+						"goblin",
+						77
+					],
+					[
+						"goblinWolfRider",
+						36
+					],
+					[
+						"orcChieftain",
+						28
+					],
+					[
+						"ogreMage",
+						16
+					],
+					[
+						"cyclopKing",
+						4
+					],
+					[
+						"ancientBehemoth",
+						4
+					],
+					[
+						"roc",
+						11
+					]
+				],
+				"artifacts": [],
+				"experience": 7264,
+				"hero": "saurug",
+				"primary_skills": [
+					5,
+					3,
+					3,
+					3
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						2
+					],
+					[
+						"resistance",
+						1
+					],
+					[
+						"earthMagic",
+						3
+					],
+					[
+						"offence",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"shield",
+					"protectWater",
+					"dispel",
+					"cure",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"hobgoblin",
+						1
+					],
+					[
+						"behemoth",
+						2
+					],
+					[
+						"roc",
+						6
+					],
+					[
+						"ogre",
+						8
+					],
+					[
+						"orc",
+						14
+					],
+					[
+						"goblinWolfRider",
+						18
+					],
+					[
+						"goblin",
+						38
+					]
+				],
+				"artifacts": [],
+				"experience": 2148,
+				"hero": "kalt",
+				"primary_skills": [
+					5,
+					2,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"tactics",
+						1
+					],
+					[
+						"learning",
+						1
+					],
+					[
+						"logistics",
+						2
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"shield",
+					"protectWater",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "grass",
+		"_about": "real heroes 7"
+	},
+	{
+		"battlefield": "core:grass_hills",
+		"name": "exported",
+		"seed": 723197350,
+		"sides": [
+			{
+				"army": [
+					[
+						"ancientBehemoth",
+						6
+					],
+					[
+						"ogreMage",
+						33
+					],
+					[
+						"thunderbird",
+						20
+					],
+					[
+						"hobgoblin",
+						269
+					],
+					[
+						"hobgoblinWolfRider",
+						87
+					],
+					[
+						"orcChieftain",
+						63
+					],
+					[
+						"cyclopKing",
+						8
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"pendantOfCourage"
+					],
+					[
+						3,
+						"redDragonFlameTongue"
+					],
+					[
+						6,
+						"stillEyeOfTheDragon"
+					],
+					[
+						9,
+						"birdOfPerception"
+					],
+					[
+						10,
+						"inexhaustibleCartOfLumber"
+					],
+					[
+						11,
+						"armsOfLegion"
+					],
+					[
+						12,
+						"mysticOrbOfMana"
+					]
+				],
+				"experience": 4022,
+				"hero": "zubin",
+				"primary_skills": [
+					6,
+					4,
+					1,
+					2
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						2
+					],
+					[
+						"artillery",
+						1
+					],
+					[
+						"pathfinding",
+						3
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"protectFire",
+					"dispel",
+					"cure",
+					"bloodlust",
+					"precision",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"ancientBehemoth",
+						2
+					],
+					[
+						"roc",
+						6
+					],
+					[
+						"ogreMage",
+						8
+					],
+					[
+						"orc",
+						14
+					],
+					[
+						"goblinWolfRider",
+						18
+					],
+					[
+						"goblin",
+						30
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"pendantOfHoliness"
+					],
+					[
+						9,
+						"charmOfMana"
+					],
+					[
+						10,
+						"endlessPurseOfGold"
+					]
+				],
+				"experience": 726,
+				"hero": "kyrre",
+				"primary_skills": [
+					1,
+					4,
+					1,
+					2
+				],
+				"secondary_skills": [
+					[
+						"archery",
+						1
+					],
+					[
+						"logistics",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [],
+				"war_machines": []
+			}
+		],
+		"terrain": "grass",
+		"_about": "real heroes 8"
+	},
+	{
+		"battlefield": "core:subterranean",
+		"name": "exported",
+		"seed": 1464545482,
+		"sides": [
+			{
+				"army": [
+					[
+						"archMage",
+						6
+					],
+					[
+						"devil",
+						1
+					],
+					[
+						"ironGolem",
+						11
+					],
+					[
+						"gremlin",
+						45
+					],
+					[
+						"masterGremlin",
+						38
+					],
+					[
+						"redDragon",
+						1
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"collarOfConjuring"
+					],
+					[
+						4,
+						"bucklerOfTheGnollKing"
+					],
+					[
+						9,
+						"cardsOfProphecy"
+					],
+					[
+						10,
+						"crestOfValor"
+					]
+				],
+				"experience": 6566,
+				"hero": "rissa",
+				"primary_skills": [
+					3,
+					5,
+					3,
+					4
+				],
+				"secondary_skills": [
+					[
+						"mysticism",
+						2
+					],
+					[
+						"offence",
+						3
+					],
+					[
+						"airMagic",
+						1
+					],
+					[
+						"armorer",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"quicksand",
+					"magicArrow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"roc",
+						1
+					]
+				],
+				"artifacts": [
+					[
+						6,
+						"ringOfConjuring"
+					]
+				],
+				"experience": 4149,
+				"hero": "gretchin",
+				"primary_skills": [
+					6,
+					2,
+					2,
+					2
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						2
+					],
+					[
+						"pathfinding",
+						2
+					],
+					[
+						"armorer",
+						1
+					]
+				],
+				"spellbook": false,
+				"spells": [
+					"removeObstacle"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "subterra",
+		"_about": "real heroes 9"
+	},
+	{
+		"battlefield": "core:dirt_hills",
+		"name": "exported",
+		"seed": 1966516900,
+		"sides": [
+			{
+				"army": [
+					[
+						"roc",
+						9
+					],
+					[
+						"goblin",
+						126
+					],
+					[
+						"goblinWolfRider",
+						54
+					],
+					[
+						"orc",
+						27
+					],
+					[
+						"fireDragonFly",
+						14
+					]
+				],
+				"artifacts": [
+					[
+						0,
+						"crownOfTheSupremeMagi"
+					],
+					[
+						2,
+						"necklaceOfSwiftness"
+					],
+					[
+						4,
+						"shieldOfTheYawningDead"
+					],
+					[
+						5,
+						"breastplateOfPetrifiedWood"
+					]
+				],
+				"experience": 83,
+				"hero": "cragHack",
+				"primary_skills": [
+					4,
+					0,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						2
+					]
+				],
+				"spellbook": true,
+				"spells": [],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"gog",
+						16
+					],
+					[
+						"imp",
+						14
+					],
+					[
+						"dreadKnight",
+						1
+					],
+					[
+						"demon",
+						2
+					],
+					[
+						"walkingDead",
+						5
+					]
+				],
+				"artifacts": [
+					[
+						1,
+						"dragonWingTabard"
+					],
+					[
+						6,
+						"ringOfVitality"
+					],
+					[
+						8,
+						"bootsOfSpeed"
+					],
+					[
+						9,
+						"ladybirdOfLuck"
+					],
+					[
+						10,
+						"bowOfElvenCherrywood"
+					],
+					[
+						11,
+						"badgeOfCourage"
+					],
+					[
+						12,
+						"glyphOfGallantry"
+					]
+				],
+				"experience": 6133,
+				"hero": "olema",
+				"primary_skills": [
+					4,
+					5,
+					4,
+					2
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						2
+					],
+					[
+						"ballistics",
+						2
+					],
+					[
+						"pathfinding",
+						3
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"deathRipple",
+					"weakness",
+					"removeObstacle"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "dirt",
+		"_about": "real heroes 10"
+	},
+	{
+		"battlefield": "core:dirt_birches",
+		"name": "exported",
+		"seed": 1994895493,
+		"sides": [
+			{
+				"army": [
+					[
+						"efreet",
+						4
+					],
+					[
+						"pitFiend",
+						7
+					],
+					[
+						"demon",
+						6
+					],
+					[
+						"gremlin",
+						30
+					],
+					[
+						"gog",
+						6
+					],
+					[
+						"gremlin",
+						1
+					],
+					[
+						"gremlin",
+						1
+					]
+				],
+				"artifacts": [],
+				"experience": 687,
+				"hero": "josephine",
+				"primary_skills": [
+					1,
+					3,
+					2,
+					2
+				],
+				"secondary_skills": [
+					[
+						"mysticism",
+						1
+					],
+					[
+						"sorcery",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"viewEarth",
+					"viewAir",
+					"magicArrow",
+					"dispel",
+					"cure",
+					"curse",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"goblinWolfRider",
+						19
+					],
+					[
+						"goblin",
+						15
+					]
+				],
+				"artifacts": [],
+				"experience": 1043,
+				"hero": "shiva",
+				"primary_skills": [
+					5,
+					1,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						1
+					],
+					[
+						"scouting",
+						1
+					],
+					[
+						"earthMagic",
+						1
+					]
+				],
+				"spellbook": false,
+				"spells": [],
+				"war_machines": []
+			}
+		],
+		"terrain": "dirt",
+		"_about": "real heroes 11"
+	},
+	{
+		"battlefield": "core:grass_pines",
+		"name": "exported",
+		"seed": 61547673,
+		"sides": [
+			{
+				"army": [
+					[
+						"ancientBehemoth",
+						10
+					],
+					[
+						"ogreMage",
+						49
+					],
+					[
+						"hobgoblin",
+						334
+					],
+					[
+						"hobgoblinWolfRider",
+						121
+					],
+					[
+						"cyclopKing",
+						16
+					],
+					[
+						"thunderbird",
+						20
+					],
+					[
+						"orcChieftain",
+						91
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"pendantOfCourage"
+					],
+					[
+						3,
+						"redDragonFlameTongue"
+					],
+					[
+						6,
+						"stillEyeOfTheDragon"
+					],
+					[
+						9,
+						"birdOfPerception"
+					],
+					[
+						10,
+						"inexhaustibleCartOfLumber"
+					],
+					[
+						11,
+						"armsOfLegion"
+					],
+					[
+						12,
+						"mysticOrbOfMana"
+					],
+					[
+						18,
+						"charmOfMana"
+					]
+				],
+				"experience": 4303,
+				"hero": "dessa",
+				"primary_skills": [
+					3,
+					5,
+					2,
+					2
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						2
+					],
+					[
+						"logistics",
+						2
+					],
+					[
+						"earthMagic",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"protectFire",
+					"dispel",
+					"cure",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"goblin",
+						431
+					],
+					[
+						"goblinWolfRider",
+						116
+					],
+					[
+						"orc",
+						29
+					],
+					[
+						"ogre",
+						12
+					],
+					[
+						"ogreMage",
+						22
+					],
+					[
+						"behemoth",
+						6
+					],
+					[
+						"roc",
+						17
+					]
+				],
+				"artifacts": [
+					[
+						1,
+						"dragonWingTabard"
+					],
+					[
+						2,
+						"collarOfConjuring"
+					],
+					[
+						3,
+						"blackshardOfTheDeadKnight"
+					],
+					[
+						6,
+						"ringOfVitality"
+					],
+					[
+						8,
+						"dragonboneGreaves"
+					],
+					[
+						9,
+						"badgeOfCourage"
+					],
+					[
+						10,
+						"bowOfElvenCherrywood"
+					],
+					[
+						11,
+						"glyphOfGallantry"
+					],
+					[
+						12,
+						"emblemOfCognizance"
+					]
+				],
+				"experience": 35292,
+				"hero": "krellion",
+				"primary_skills": [
+					13,
+					3,
+					2,
+					5
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"resistance",
+						3
+					],
+					[
+						"airMagic",
+						3
+					],
+					[
+						"fireMagic",
+						2
+					],
+					[
+						"wisdom",
+						3
+					],
+					[
+						"intelligence",
+						1
+					],
+					[
+						"logistics",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"earthquake",
+					"magicArrow",
+					"dispel",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste"
+				],
+				"war_machines": [
+					"ballista"
+				]
+			}
+		],
+		"terrain": "grass",
+		"_about": "real heroes 12"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 1839106217,
+		"sides": [
+			{
+				"army": [
+					[
+						"goblin",
+						56
+					],
+					[
+						"goblinWolfRider",
+						21
+					],
+					[
+						"skeleton",
+						16
+					],
+					[
+						"wight",
+						2
+					],
+					[
+						"marksman",
+						15
+					],
+					[
+						"goblin",
+						1
+					],
+					[
+						"goblin",
+						1
+					]
+				],
+				"artifacts": [
+					[
+						6,
+						"ringOfVitality"
+					],
+					[
+						9,
+						"bowOfElvenCherrywood"
+					],
+					[
+						10,
+						"glyphOfGallantry"
+					]
+				],
+				"experience": 3662,
+				"hero": "krellion",
+				"primary_skills": [
+					5,
+					2,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"resistance",
+						1
+					],
+					[
+						"airMagic",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste"
+				],
+				"war_machines": [
+					"ballista"
+				]
+			},
+			{
+				"army": [
+					[
+						"goblinWolfRider",
+						6
+					],
+					[
+						"goblin",
+						15
+					]
+				]
+			}
+		],
+		"terrain": "rough",
+		"town": {
+			"faction": "stronghold",
+			"fortification": "fort"
+		},
+		"_about": "real siege 13"
+	},
+	{
+		"battlefield": "core:grass_hills",
+		"name": "exported",
+		"seed": 600620470,
+		"sides": [
+			{
+				"army": [
+					[
+						"roc",
+						8
+					],
+					[
+						"goblinWolfRider",
+						54
+					],
+					[
+						"behemoth",
+						2
+					],
+					[
+						"orc",
+						19
+					],
+					[
+						"goblin",
+						47
+					],
+					[
+						"goblin",
+						1
+					],
+					[
+						"goblin",
+						1
+					]
+				],
+				"artifacts": [
+					[
+						0,
+						"crownOfTheSupremeMagi"
+					],
+					[
+						2,
+						"necklaceOfSwiftness"
+					],
+					[
+						4,
+						"shieldOfTheYawningDead"
+					],
+					[
+						5,
+						"breastplateOfPetrifiedWood"
+					]
+				],
+				"experience": 4063,
+				"hero": "cragHack",
+				"primary_skills": [
+					7,
+					0,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"leadership",
+						2
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"protectFire",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"efreet",
+						4
+					],
+					[
+						"pitFiend",
+						7
+					],
+					[
+						"demon",
+						6
+					],
+					[
+						"gremlin",
+						31
+					],
+					[
+						"gog",
+						6
+					],
+					[
+						"gremlin",
+						1
+					]
+				],
+				"artifacts": [],
+				"experience": 687,
+				"hero": "josephine",
+				"primary_skills": [
+					1,
+					3,
+					2,
+					2
+				],
+				"secondary_skills": [
+					[
+						"mysticism",
+						1
+					],
+					[
+						"sorcery",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"viewEarth",
+					"viewAir",
+					"magicArrow",
+					"dispel",
+					"cure",
+					"curse",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "grass",
+		"town": {
+			"faction": "castle",
+			"fortification": "none"
+		},
+		"_about": "real siege 14"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 2128134059,
+		"sides": [
+			{
+				"army": [
+					[
+						"goblin",
+						236
+					],
+					[
+						"goblin",
+						1
+					],
+					[
+						"goblin",
+						1
+					],
+					[
+						"goblinWolfRider",
+						104
+					],
+					[
+						"orc",
+						54
+					],
+					[
+						"behemoth",
+						5
+					],
+					[
+						"roc",
+						23
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"pendantOfHoliness"
+					],
+					[
+						9,
+						"charmOfMana"
+					],
+					[
+						10,
+						"endlessPurseOfGold"
+					]
+				],
+				"experience": 2412,
+				"hero": "arlach",
+				"primary_skills": [
+					3,
+					4,
+					1,
+					2
+				],
+				"secondary_skills": [
+					[
+						"artillery",
+						1
+					],
+					[
+						"offence",
+						3
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"shield",
+					"protectWater",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"wight",
+						1
+					],
+					[
+						"ogre",
+						4
+					],
+					[
+						"skeleton",
+						13
+					]
+				]
+			}
+		],
+		"terrain": "rough",
+		"town": {
+			"faction": "stronghold",
+			"fortification": "castle"
+		},
+		"_about": "real siege 15"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 1300986885,
+		"sides": [
+			{
+				"army": [
+					[
+						"goblin",
+						393
+					],
+					[
+						"goblinWolfRider",
+						95
+					],
+					[
+						"orc",
+						47
+					],
+					[
+						"ogre",
+						9
+					],
+					[
+						"ogreMage",
+						22
+					],
+					[
+						"behemoth",
+						7
+					],
+					[
+						"roc",
+						36
+					]
+				],
+				"artifacts": [
+					[
+						1,
+						"dragonWingTabard"
+					],
+					[
+						2,
+						"collarOfConjuring"
+					],
+					[
+						3,
+						"blackshardOfTheDeadKnight"
+					],
+					[
+						6,
+						"ringOfVitality"
+					],
+					[
+						8,
+						"dragonboneGreaves"
+					],
+					[
+						9,
+						"badgeOfCourage"
+					],
+					[
+						10,
+						"bowOfElvenCherrywood"
+					],
+					[
+						11,
+						"glyphOfGallantry"
+					],
+					[
+						12,
+						"emblemOfCognizance"
+					]
+				],
+				"experience": 29332,
+				"hero": "krellion",
+				"primary_skills": [
+					12,
+					3,
+					2,
+					5
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"resistance",
+						3
+					],
+					[
+						"airMagic",
+						3
+					],
+					[
+						"fireMagic",
+						2
+					],
+					[
+						"wisdom",
+						3
+					],
+					[
+						"intelligence",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"earthquake",
+					"magicArrow",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste"
+				],
+				"war_machines": [
+					"ballista"
+				]
+			},
+			{
+				"army": [
+					[
+						"goblin",
+						114
+					],
+					[
+						"orc",
+						34
+					],
+					[
+						"ogre",
+						12
+					],
+					[
+						"goblinWolfRider",
+						12
+					],
+					[
+						"cyclop",
+						2
+					]
+				],
+				"artifacts": [],
+				"experience": 1050,
+				"hero": "terek",
+				"primary_skills": [
+					2,
+					1,
+					2,
+					1
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						1
+					],
+					[
+						"tactics",
+						1
+					],
+					[
+						"earthMagic",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"protectFire",
+					"dispel",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "rough",
+		"town": {
+			"faction": "stronghold",
+			"fortification": "castle"
+		},
+		"_about": "real siege 16"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 1441548951,
+		"sides": [
+			{
+				"army": [
+					[
+						"goblin",
+						362
+					],
+					[
+						"goblinWolfRider",
+						124
+					],
+					[
+						"orc",
+						41
+					],
+					[
+						"ogre",
+						1
+					],
+					[
+						"ogreMage",
+						24
+					],
+					[
+						"behemoth",
+						5
+					],
+					[
+						"roc",
+						30
+					]
+				],
+				"artifacts": [
+					[
+						1,
+						"dragonWingTabard"
+					],
+					[
+						2,
+						"collarOfConjuring"
+					],
+					[
+						6,
+						"ringOfVitality"
+					],
+					[
+						8,
+						"dragonboneGreaves"
+					],
+					[
+						9,
+						"badgeOfCourage"
+					],
+					[
+						10,
+						"bowOfElvenCherrywood"
+					],
+					[
+						11,
+						"glyphOfGallantry"
+					],
+					[
+						12,
+						"emblemOfCognizance"
+					]
+				],
+				"experience": 25662,
+				"hero": "krellion",
+				"primary_skills": [
+					12,
+					3,
+					2,
+					4
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"resistance",
+						3
+					],
+					[
+						"airMagic",
+						3
+					],
+					[
+						"fireMagic",
+						2
+					],
+					[
+						"wisdom",
+						3
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste"
+				],
+				"war_machines": [
+					"ballista"
+				]
+			},
+			{
+				"army": [
+					[
+						"roc",
+						7
+					],
+					[
+						"behemoth",
+						2
+					],
+					[
+						"orc",
+						28
+					],
+					[
+						"cyclopKing",
+						2
+					],
+					[
+						"goblinWolfRider",
+						18
+					],
+					[
+						"goblin",
+						38
+					]
+				],
+				"artifacts": [
+					[
+						3,
+						"blackshardOfTheDeadKnight"
+					]
+				],
+				"experience": 5344,
+				"hero": "ignissa",
+				"primary_skills": [
+					5,
+					4,
+					2,
+					2
+				],
+				"secondary_skills": [
+					[
+						"artillery",
+						3
+					],
+					[
+						"offence",
+						3
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"shield",
+					"protectFire",
+					"protectWater",
+					"dispel",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "rough",
+		"town": {
+			"faction": "stronghold",
+			"fortification": "castle"
+		},
+		"_about": "real siege 17"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 1493715332,
+		"sides": [
+			{
+				"army": [
+					[
+						"hobgoblin",
+						106
+					],
+					[
+						"hobgoblinWolfRider",
+						101
+					],
+					[
+						"orcChieftain",
+						104
+					],
+					[
+						"ogreMage",
+						61
+					],
+					[
+						"cyclopKing",
+						18
+					],
+					[
+						"ancientBehemoth",
+						12
+					],
+					[
+						"thunderbird",
+						18
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"pendantOfCourage"
+					],
+					[
+						3,
+						"redDragonFlameTongue"
+					],
+					[
+						5,
+						"breastplateOfPetrifiedWood"
+					],
+					[
+						6,
+						"stillEyeOfTheDragon"
+					],
+					[
+						9,
+						"birdOfPerception"
+					],
+					[
+						10,
+						"inexhaustibleCartOfLumber"
+					],
+					[
+						11,
+						"armsOfLegion"
+					],
+					[
+						12,
+						"mysticOrbOfMana"
+					],
+					[
+						18,
+						"charmOfMana"
+					]
+				],
+				"experience": 50,
+				"hero": "xsi",
+				"primary_skills": [
+					1,
+					0,
+					2,
+					2
+				],
+				"secondary_skills": [
+					[
+						"necromancy",
+						1
+					],
+					[
+						"learning",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"protectFire",
+					"dispel",
+					"bloodlust",
+					"stoneSkin",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"goblin",
+						77
+					],
+					[
+						"goblinWolfRider",
+						37
+					],
+					[
+						"ogre",
+						1
+					],
+					[
+						"orc",
+						1
+					]
+				]
+			}
+		],
+		"terrain": "rough",
+		"town": {
+			"faction": "stronghold",
+			"fortification": "castle"
+		},
+		"_about": "real siege 18"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 350253772,
+		"sides": [
+			{
+				"army": [
+					[
+						"goblin",
+						77
+					],
+					[
+						"goblinWolfRider",
+						36
+					],
+					[
+						"orcChieftain",
+						28
+					],
+					[
+						"ogreMage",
+						16
+					],
+					[
+						"cyclopKing",
+						10
+					],
+					[
+						"ancientBehemoth",
+						4
+					],
+					[
+						"roc",
+						12
+					]
+				],
+				"artifacts": [],
+				"experience": 6557,
+				"hero": "saurug",
+				"primary_skills": [
+					5,
+					3,
+					3,
+					3
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						2
+					],
+					[
+						"resistance",
+						1
+					],
+					[
+						"earthMagic",
+						3
+					],
+					[
+						"offence",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"shield",
+					"protectWater",
+					"dispel",
+					"cure",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"waterElemental",
+						5
+					],
+					[
+						"pixie",
+						19
+					]
+				]
+			}
+		],
+		"terrain": "rough",
+		"town": {
+			"faction": "stronghold",
+			"fortification": "castle"
+		},
+		"_about": "real siege 19"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 1500266160,
+		"sides": [
+			{
+				"army": [
+					[
+						"orcChieftain",
+						77
+					],
+					[
+						"ogreMage",
+						49
+					],
+					[
+						"cyclop",
+						9
+					],
+					[
+						"cyclopKing",
+						4
+					],
+					[
+						"behemoth",
+						8
+					],
+					[
+						"ancientBehemoth",
+						4
+					],
+					[
+						"roc",
+						32
+					]
+				],
+				"artifacts": [],
+				"experience": 27570,
+				"hero": "yog",
+				"primary_skills": [
+					15,
+					11,
+					3,
+					6
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"ballistics",
+						3
+					],
+					[
+						"airMagic",
+						3
+					],
+					[
+						"sorcery",
+						1
+					],
+					[
+						"wisdom",
+						2
+					],
+					[
+						"logistics",
+						2
+					],
+					[
+						"luck",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"summonBoat",
+					"viewEarth",
+					"earthquake",
+					"magicArrow",
+					"shield",
+					"protectFire",
+					"protectWater",
+					"dispel",
+					"cure",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"behemoth",
+						4
+					],
+					[
+						"ogreMage",
+						16
+					],
+					[
+						"thunderbird",
+						9
+					],
+					[
+						"hobgoblinWolfRider",
+						18
+					],
+					[
+						"orcChieftain",
+						14
+					],
+					[
+						"hobgoblin",
+						38
+					]
+				],
+				"artifacts": [
+					[
+						1,
+						"dragonWingTabard"
+					],
+					[
+						2,
+						"collarOfConjuring"
+					],
+					[
+						3,
+						"blackshardOfTheDeadKnight"
+					],
+					[
+						6,
+						"ringOfVitality"
+					],
+					[
+						8,
+						"dragonboneGreaves"
+					],
+					[
+						9,
+						"badgeOfCourage"
+					],
+					[
+						10,
+						"bowOfElvenCherrywood"
+					],
+					[
+						11,
+						"glyphOfGallantry"
+					],
+					[
+						12,
+						"emblemOfCognizance"
+					]
+				],
+				"experience": 37207,
+				"hero": "krellion",
+				"primary_skills": [
+					14,
+					3,
+					2,
+					5
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"resistance",
+						3
+					],
+					[
+						"airMagic",
+						3
+					],
+					[
+						"fireMagic",
+						2
+					],
+					[
+						"wisdom",
+						3
+					],
+					[
+						"intelligence",
+						1
+					],
+					[
+						"logistics",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"earthquake",
+					"magicArrow",
+					"iceBolt",
+					"lightningBolt",
+					"frostRing",
+					"fireball",
+					"protectAir",
+					"dispel",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"mirth",
+					"haste",
+					"removeObstacle"
+				],
+				"war_machines": [
+					"ballista",
+					"ammoCart",
+					"firstAidTent"
+				]
+			}
+		],
+		"terrain": "rough",
+		"town": {
+			"faction": "stronghold",
+			"fortification": "castle"
+		},
+		"_about": "real siege 20"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 1848205030,
+		"sides": [
+			{
+				"army": [
+					[
+						"roc",
+						10
+					],
+					[
+						"goblinWolfRider",
+						75
+					],
+					[
+						"goblin",
+						144
+					],
+					[
+						"orc",
+						33
+					],
+					[
+						"ogre",
+						12
+					],
+					[
+						"gremlin",
+						35
+					],
+					[
+						"stoneGargoyle",
+						4
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"pendantOfCourage"
+					],
+					[
+						3,
+						"centaurAxe"
+					],
+					[
+						6,
+						"stillEyeOfTheDragon"
+					],
+					[
+						9,
+						"birdOfPerception"
+					]
+				],
+				"experience": 8110,
+				"hero": "yog",
+				"primary_skills": [
+					10,
+					3,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"ballistics",
+						2
+					],
+					[
+						"airMagic",
+						1
+					],
+					[
+						"sorcery",
+						1
+					],
+					[
+						"wisdom",
+						2
+					]
+				],
+				"spellbook": true,
+				"spells": [],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"goblin",
+						28
+					],
+					[
+						"orc",
+						7
+					],
+					[
+						"griffin",
+						1
+					]
+				],
+				"artifacts": [],
+				"experience": 2048,
+				"hero": "ciele",
+				"primary_skills": [
+					1,
+					0,
+					4,
+					4
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						2
+					],
+					[
+						"waterMagic",
+						1
+					],
+					[
+						"diplomacy",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"shield",
+					"protectWater",
+					"dispel",
+					"cure",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "rough",
+		"town": {
+			"faction": "stronghold",
+			"fortification": "castle"
+		},
+		"_about": "real siege 21"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 700917800,
+		"sides": [
+			{
+				"army": [
+					[
+						"goblin",
+						180
+					],
+					[
+						"goblinWolfRider",
+						40
+					],
+					[
+						"orcChieftain",
+						56
+					],
+					[
+						"ogreMage",
+						25
+					],
+					[
+						"cyclop",
+						4
+					],
+					[
+						"ancientBehemoth",
+						4
+					],
+					[
+						"roc",
+						14
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"pendantOfCourage"
+					],
+					[
+						3,
+						"redDragonFlameTongue"
+					],
+					[
+						6,
+						"stillEyeOfTheDragon"
+					],
+					[
+						9,
+						"birdOfPerception"
+					],
+					[
+						10,
+						"inexhaustibleCartOfLumber"
+					]
+				],
+				"experience": 12499,
+				"hero": "gird",
+				"primary_skills": [
+					8,
+					5,
+					2,
+					3
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						3
+					],
+					[
+						"sorcery",
+						2
+					],
+					[
+						"diplomacy",
+						1
+					],
+					[
+						"fireMagic",
+						2
+					],
+					[
+						"leadership",
+						2
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"shield",
+					"protectFire",
+					"protectWater",
+					"dispel",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"goblin",
+						1
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"amuletOfTheUndertaker"
+					]
+				],
+				"experience": 18710,
+				"hero": "yog",
+				"primary_skills": [
+					14,
+					9,
+					3,
+					4
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"ballistics",
+						2
+					],
+					[
+						"airMagic",
+						3
+					],
+					[
+						"sorcery",
+						1
+					],
+					[
+						"wisdom",
+						2
+					],
+					[
+						"logistics",
+						2
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"summonBoat",
+					"earthquake",
+					"magicArrow",
+					"shield",
+					"protectWater",
+					"dispel",
+					"cure",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "rough",
+		"town": {
+			"faction": "stronghold",
+			"fortification": "castle"
+		},
+		"_about": "real siege 22"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 2071533473,
+		"sides": [
+			{
+				"army": [
+					[
+						"goblin",
+						180
+					],
+					[
+						"goblinWolfRider",
+						39
+					],
+					[
+						"orcChieftain",
+						49
+					],
+					[
+						"ogreMage",
+						25
+					],
+					[
+						"cyclop",
+						4
+					],
+					[
+						"ancientBehemoth",
+						4
+					],
+					[
+						"roc",
+						14
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"pendantOfCourage"
+					],
+					[
+						3,
+						"redDragonFlameTongue"
+					],
+					[
+						6,
+						"stillEyeOfTheDragon"
+					],
+					[
+						9,
+						"birdOfPerception"
+					],
+					[
+						10,
+						"inexhaustibleCartOfLumber"
+					]
+				],
+				"experience": 15279,
+				"hero": "gird",
+				"primary_skills": [
+					9,
+					5,
+					2,
+					3
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						3
+					],
+					[
+						"sorcery",
+						2
+					],
+					[
+						"diplomacy",
+						1
+					],
+					[
+						"fireMagic",
+						3
+					],
+					[
+						"leadership",
+						2
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"shield",
+					"protectFire",
+					"protectWater",
+					"dispel",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"hobgoblin",
+						23
+					],
+					[
+						"goblinWolfRider",
+						18
+					],
+					[
+						"orc",
+						21
+					],
+					[
+						"cyclop",
+						2
+					]
+				]
+			}
+		],
+		"terrain": "rough",
+		"town": {
+			"faction": "stronghold",
+			"fortification": "fort"
+		},
+		"_about": "real siege 23"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 1163433498,
+		"sides": [
+			{
+				"army": [
+					[
+						"goblin",
+						431
+					],
+					[
+						"goblinWolfRider",
+						116
+					],
+					[
+						"orc",
+						40
+					],
+					[
+						"ogre",
+						12
+					],
+					[
+						"ogreMage",
+						22
+					],
+					[
+						"behemoth",
+						7
+					],
+					[
+						"roc",
+						29
+					]
+				],
+				"artifacts": [
+					[
+						1,
+						"dragonWingTabard"
+					],
+					[
+						2,
+						"collarOfConjuring"
+					],
+					[
+						3,
+						"blackshardOfTheDeadKnight"
+					],
+					[
+						6,
+						"ringOfVitality"
+					],
+					[
+						8,
+						"dragonboneGreaves"
+					],
+					[
+						9,
+						"badgeOfCourage"
+					],
+					[
+						10,
+						"bowOfElvenCherrywood"
+					],
+					[
+						11,
+						"glyphOfGallantry"
+					],
+					[
+						12,
+						"emblemOfCognizance"
+					]
+				],
+				"experience": 33152,
+				"hero": "krellion",
+				"primary_skills": [
+					12,
+					3,
+					2,
+					5
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"resistance",
+						3
+					],
+					[
+						"airMagic",
+						3
+					],
+					[
+						"fireMagic",
+						2
+					],
+					[
+						"wisdom",
+						3
+					],
+					[
+						"intelligence",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"earthquake",
+					"magicArrow",
+					"dispel",
+					"bless",
+					"bloodlust",
+					"stoneSkin",
+					"haste"
+				],
+				"war_machines": [
+					"ballista"
+				]
+			},
+			{
+				"army": [
+					[
+						"behemoth",
+						2
+					],
+					[
+						"roc",
+						6
+					],
+					[
+						"ogre",
+						8
+					],
+					[
+						"orc",
+						14
+					],
+					[
+						"goblinWolfRider",
+						18
+					],
+					[
+						"goblin",
+						38
+					]
+				]
+			}
+		],
+		"terrain": "rough",
+		"town": {
+			"faction": "stronghold",
+			"fortification": "castle"
+		},
+		"_about": "real siege 24"
+	},
+	{
+		"battlefield": "core:rough",
+		"name": "exported",
+		"seed": 1942819828,
+		"sides": [
+			{
+				"army": [
+					[
+						"ancientBehemoth",
+						10
+					],
+					[
+						"ogreMage",
+						45
+					],
+					[
+						"orcChieftain",
+						76
+					],
+					[
+						"cyclopKing",
+						10
+					],
+					[
+						"hobgoblinWolfRider",
+						65
+					],
+					[
+						"thunderbird",
+						6
+					],
+					[
+						"hobgoblin",
+						30
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"pendantOfCourage"
+					],
+					[
+						3,
+						"redDragonFlameTongue"
+					],
+					[
+						5,
+						"breastplateOfPetrifiedWood"
+					],
+					[
+						6,
+						"stillEyeOfTheDragon"
+					],
+					[
+						9,
+						"birdOfPerception"
+					],
+					[
+						10,
+						"inexhaustibleCartOfLumber"
+					],
+					[
+						11,
+						"armsOfLegion"
+					],
+					[
+						12,
+						"mysticOrbOfMana"
+					],
+					[
+						18,
+						"charmOfMana"
+					]
+				],
+				"experience": 13063,
+				"hero": "dessa",
+				"primary_skills": [
+					7,
+					7,
+					3,
+					2
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						3
+					],
+					[
+						"logistics",
+						3
+					],
+					[
+						"earthMagic",
+						3
+					],
+					[
+						"offence",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"shield",
+					"protectFire",
+					"protectWater",
+					"dispel",
+					"cure",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			},
+			{
+				"army": [
+					[
+						"goblin",
+						15
+					],
+					[
+						"hobgoblinWolfRider",
+						18
+					],
+					[
+						"ogre",
+						8
+					],
+					[
+						"roc",
+						3
+					],
+					[
+						"behemoth",
+						2
+					]
+				]
+			}
+		],
+		"terrain": "rough",
+		"town": {
+			"faction": "stronghold",
+			"fortification": "fort"
+		},
+		"_about": "real siege 25"
+	},
+	{
+		"battlefield": "core:dirt_hills",
+		"name": "exported",
+		"neutrals": {
+			"count": 13,
+			"creature": "vampire",
+			"upgraded_stack": true
+		},
+		"seed": 1228265304,
+		"sides": [
+			{
+				"army": [
+					[
+						"pikeman",
+						89
+					],
+					[
+						"swordsman",
+						12
+					],
+					[
+						"archer",
+						16
+					],
+					[
+						"troglodyte",
+						30
+					],
+					[
+						"harpy",
+						2
+					]
+				],
+				"artifacts": [
+					[
+						9,
+						"cardsOfProphecy"
+					]
+				],
+				"experience": 7134,
+				"hero": "christian",
+				"primary_skills": [
+					4,
+					5,
+					3,
+					1
+				],
+				"secondary_skills": [
+					[
+						"leadership",
+						3
+					],
+					[
+						"artillery",
+						2
+					],
+					[
+						"armorer",
+						1
+					],
+					[
+						"diplomacy",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"magicArrow",
+					"cure",
+					"bless",
+					"haste",
+					"slow"
+				],
+				"war_machines": [
+					"ballista"
+				]
+			}
+		],
+		"terrain": "dirt",
+		"_about": "real neutrals 26"
+	},
+	{
+		"battlefield": "core:subterranean",
+		"name": "exported",
+		"neutrals": {
+			"count": 25,
+			"creature": "waterElemental",
+			"upgraded_stack": true
+		},
+		"seed": 1222149064,
+		"sides": [
+			{
+				"army": [
+					[
+						"gog",
+						20
+					],
+					[
+						"imp",
+						54
+					],
+					[
+						"dreadKnight",
+						1
+					],
+					[
+						"demon",
+						4
+					],
+					[
+						"skeleton",
+						14
+					],
+					[
+						"wight",
+						2
+					],
+					[
+						"walkingDead",
+						5
+					]
+				],
+				"artifacts": [
+					[
+						6,
+						"ringOfVitality"
+					],
+					[
+						8,
+						"bootsOfSpeed"
+					],
+					[
+						9,
+						"ladybirdOfLuck"
+					],
+					[
+						10,
+						"bowOfElvenCherrywood"
+					],
+					[
+						11,
+						"badgeOfCourage"
+					]
+				],
+				"experience": 3814,
+				"hero": "olema",
+				"primary_skills": [
+					2,
+					1,
+					4,
+					2
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						2
+					],
+					[
+						"ballistics",
+						1
+					],
+					[
+						"pathfinding",
+						3
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"deathRipple",
+					"weakness"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "subterra",
+		"_about": "real neutrals 27"
+	},
+	{
+		"battlefield": "core:subterranean",
+		"name": "exported",
+		"neutrals": {
+			"count": 3,
+			"creature": "devil",
+			"upgraded_stack": false
+		},
+		"seed": 223501089,
+		"sides": [
+			{
+				"army": [
+					[
+						"archMage",
+						8
+					],
+					[
+						"stoneGargoyle",
+						11
+					],
+					[
+						"ironGolem",
+						11
+					],
+					[
+						"gremlin",
+						45
+					],
+					[
+						"masterGremlin",
+						38
+					],
+					[
+						"redDragon",
+						1
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"collarOfConjuring"
+					],
+					[
+						4,
+						"bucklerOfTheGnollKing"
+					],
+					[
+						9,
+						"cardsOfProphecy"
+					],
+					[
+						10,
+						"crestOfValor"
+					]
+				],
+				"experience": 6086,
+				"hero": "rissa",
+				"primary_skills": [
+					2,
+					5,
+					3,
+					4
+				],
+				"secondary_skills": [
+					[
+						"mysticism",
+						2
+					],
+					[
+						"offence",
+						3
+					],
+					[
+						"airMagic",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"quicksand",
+					"magicArrow"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "subterra",
+		"_about": "real neutrals 28"
+	},
+	{
+		"battlefield": "core:dirt_hills",
+		"name": "exported",
+		"neutrals": {
+			"count": 9,
+			"creature": "monk",
+			"upgraded_stack": false
+		},
+		"seed": 1532910376,
+		"sides": [
+			{
+				"army": [
+					[
+						"halberdier",
+						97
+					],
+					[
+						"crusader",
+						14
+					],
+					[
+						"royalGriffin",
+						14
+					],
+					[
+						"marksman",
+						32
+					]
+				],
+				"artifacts": [
+					[
+						1,
+						"capeOfConjuring"
+					],
+					[
+						2,
+						"pendantOfLife"
+					],
+					[
+						9,
+						"bowstringOfTheUnicornsMane"
+					],
+					[
+						10,
+						"speculum"
+					]
+				],
+				"experience": 6163,
+				"hero": "sirMullich",
+				"primary_skills": [
+					3,
+					7,
+					3,
+					1
+				],
+				"secondary_skills": [
+					[
+						"leadership",
+						2
+					],
+					[
+						"resistance",
+						2
+					],
+					[
+						"armorer",
+						2
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"iceBolt"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "dirt",
+		"_about": "real neutrals 29"
+	},
+	{
+		"battlefield": "core:dirt_birches",
+		"name": "exported",
+		"neutrals": {
+			"count": 22,
+			"creature": "halberdier",
+			"upgraded_stack": false
+		},
+		"seed": 1407699564,
+		"sides": [
+			{
+				"army": [
+					[
+						"sprite",
+						2
+					]
+				],
+				"artifacts": [],
+				"experience": 877,
+				"hero": "pyre",
+				"primary_skills": [
+					2,
+					2,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"artillery",
+						1
+					],
+					[
+						"logistics",
+						1
+					]
+				],
+				"spellbook": false,
+				"spells": [],
+				"war_machines": []
+			}
+		],
+		"terrain": "dirt",
+		"_about": "real neutrals 30"
+	},
+	{
+		"battlefield": "core:dirt_birches",
+		"name": "exported",
+		"neutrals": {
+			"count": 45,
+			"creature": "fireDragonFly",
+			"upgraded_stack": false
+		},
+		"seed": 453387453,
+		"sides": [
+			{
+				"army": [
+					[
+						"roc",
+						7
+					],
+					[
+						"goblinWolfRider",
+						33
+					],
+					[
+						"behemoth",
+						2
+					],
+					[
+						"orc",
+						19
+					],
+					[
+						"goblin",
+						30
+					]
+				],
+				"artifacts": [
+					[
+						0,
+						"crownOfTheSupremeMagi"
+					],
+					[
+						2,
+						"necklaceOfSwiftness"
+					],
+					[
+						4,
+						"shieldOfTheYawningDead"
+					],
+					[
+						5,
+						"breastplateOfPetrifiedWood"
+					]
+				],
+				"experience": 6154,
+				"hero": "cragHack",
+				"primary_skills": [
+					8,
+					0,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"leadership",
+						2
+					],
+					[
+						"armorer",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"protectFire",
+					"bloodlust",
+					"stoneSkin",
+					"haste",
+					"slow"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "dirt",
+		"_about": "real neutrals 31"
+	},
+	{
+		"battlefield": "core:grass_hills",
+		"name": "exported",
+		"neutrals": {
+			"count": 14,
+			"creature": "stoneGolem",
+			"upgraded_stack": false
+		},
+		"seed": 1359305407,
+		"sides": [
+			{
+				"army": [
+					[
+						"centaur",
+						75
+					],
+					[
+						"dwarf",
+						3
+					]
+				],
+				"artifacts": [
+					[
+						3,
+						"centaurAxe"
+					],
+					[
+						9,
+						"spyglass"
+					],
+					[
+						10,
+						"crestOfValor"
+					]
+				],
+				"experience": 805,
+				"hero": "jenova",
+				"primary_skills": [
+					1,
+					5,
+					2,
+					1
+				],
+				"secondary_skills": [
+					[
+						"archery",
+						2
+					]
+				],
+				"spellbook": true,
+				"spells": [],
+				"war_machines": []
+			}
+		],
+		"terrain": "grass",
+		"_about": "real neutrals 32"
+	},
+	{
+		"battlefield": "core:grass_pines",
+		"name": "exported",
+		"neutrals": {
+			"count": 90,
+			"creature": "fireDragonFly",
+			"upgraded_stack": false
+		},
+		"seed": 1785864418,
+		"sides": [
+			{
+				"army": [
+					[
+						"roc",
+						9
+					],
+					[
+						"goblin",
+						130
+					],
+					[
+						"goblinWolfRider",
+						44
+					],
+					[
+						"ogre",
+						12
+					],
+					[
+						"orc",
+						15
+					],
+					[
+						"gremlin",
+						35
+					],
+					[
+						"harpy",
+						50
+					]
+				],
+				"artifacts": [
+					[
+						2,
+						"pendantOfCourage"
+					],
+					[
+						3,
+						"blackshardOfTheDeadKnight"
+					],
+					[
+						6,
+						"stillEyeOfTheDragon"
+					],
+					[
+						9,
+						"birdOfPerception"
+					]
+				],
+				"experience": 13110,
+				"hero": "yog",
+				"primary_skills": [
+					11,
+					4,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						3
+					],
+					[
+						"ballistics",
+						2
+					],
+					[
+						"airMagic",
+						3
+					],
+					[
+						"sorcery",
+						1
+					],
+					[
+						"wisdom",
+						2
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"earthquake"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "grass",
+		"_about": "real neutrals 33"
+	},
+	{
+		"battlefield": "core:lava",
+		"name": "exported",
+		"neutrals": {
+			"count": 200,
+			"creature": "imp",
+			"upgraded_stack": true
+		},
+		"seed": 2121868538,
+		"sides": [
+			{
+				"army": [
+					[
+						"efreet",
+						4
+					],
+					[
+						"pitFiend",
+						6
+					],
+					[
+						"demon",
+						8
+					],
+					[
+						"imp",
+						70
+					],
+					[
+						"gog",
+						16
+					],
+					[
+						"hellHound",
+						5
+					]
+				],
+				"artifacts": [],
+				"experience": 1075,
+				"hero": "axsis",
+				"primary_skills": [
+					3,
+					2,
+					4,
+					1
+				],
+				"secondary_skills": [
+					[
+						"wisdom",
+						2
+					],
+					[
+						"mysticism",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"summonBoat",
+					"magicArrow",
+					"protectAir",
+					"curse",
+					"bloodlust",
+					"stoneSkin"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "lava",
+		"_about": "real neutrals 34"
+	},
+	{
+		"battlefield": "core:snow_mountains",
+		"name": "exported",
+		"neutrals": {
+			"count": 42,
+			"creature": "gnoll",
+			"upgraded_stack": true
+		},
+		"seed": 1231651358,
+		"sides": [
+			{
+				"army": [
+					[
+						"goblin",
+						34
+					],
+					[
+						"goblinWolfRider",
+						14
+					],
+					[
+						"skeleton",
+						20
+					],
+					[
+						"wight",
+						4
+					],
+					[
+						"walkingDead",
+						4
+					]
+				],
+				"artifacts": [
+					[
+						9,
+						"bowOfElvenCherrywood"
+					]
+				],
+				"experience": 1270,
+				"hero": "krellion",
+				"primary_skills": [
+					5,
+					0,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"offence",
+						2
+					],
+					[
+						"resistance",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [],
+				"war_machines": [
+					"ballista"
+				]
+			}
+		],
+		"terrain": "snow",
+		"_about": "real neutrals 35"
+	},
+	{
+		"battlefield": "core:grass_hills",
+		"name": "exported",
+		"neutrals": {
+			"count": 31,
+			"creature": "fireElemental",
+			"upgraded_stack": false
+		},
+		"seed": 573560470,
+		"sides": [
+			{
+				"army": [
+					[
+						"centaurCaptain",
+						87
+					],
+					[
+						"unicorn",
+						6
+					],
+					[
+						"pegasus",
+						16
+					],
+					[
+						"dendroidSoldier",
+						8
+					],
+					[
+						"grandElf",
+						16
+					],
+					[
+						"dwarf",
+						32
+					],
+					[
+						"woodElf",
+						13
+					]
+				],
+				"artifacts": [
+					[
+						3,
+						"greaterGnollsFlail"
+					],
+					[
+						9,
+						"spyglass"
+					],
+					[
+						10,
+						"crestOfValor"
+					],
+					[
+						11,
+						"mysticOrbOfMana"
+					]
+				],
+				"experience": 11515,
+				"hero": "jenova",
+				"primary_skills": [
+					7,
+					7,
+					2,
+					1
+				],
+				"secondary_skills": [
+					[
+						"archery",
+						3
+					],
+					[
+						"waterMagic",
+						3
+					],
+					[
+						"logistics",
+						2
+					],
+					[
+						"leadership",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"weakness"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "grass",
+		"_about": "real neutrals 36"
+	},
+	{
+		"battlefield": "core:swamp_trees",
+		"name": "exported",
+		"neutrals": {
+			"count": 14,
+			"creature": "airElemental",
+			"upgraded_stack": false
+		},
+		"seed": 611941495,
+		"sides": [
+			{
+				"army": [
+					[
+						"wight",
+						18
+					],
+					[
+						"basilisk",
+						4
+					],
+					[
+						"gnoll",
+						34
+					],
+					[
+						"pikeman",
+						16
+					],
+					[
+						"stoneGargoyle",
+						23
+					],
+					[
+						"skeleton",
+						1
+					],
+					[
+						"walkingDead",
+						3
+					]
+				],
+				"artifacts": [
+					[
+						8,
+						"bootsOfSpeed"
+					],
+					[
+						9,
+						"legsOfLegion"
+					],
+					[
+						10,
+						"loinsOfLegion"
+					]
+				],
+				"experience": 1337,
+				"hero": "edric",
+				"primary_skills": [
+					4,
+					2,
+					2,
+					2
+				],
+				"secondary_skills": [
+					[
+						"leadership",
+						1
+					],
+					[
+						"armorer",
+						1
+					],
+					[
+						"offence",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"iceBolt"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "swamp",
+		"_about": "real neutrals 37"
+	},
+	{
+		"battlefield": "core:dirt_birches",
+		"name": "exported",
+		"neutrals": {
+			"count": 22,
+			"creature": "halberdier",
+			"upgraded_stack": false
+		},
+		"seed": 267221779,
+		"sides": [
+			{
+				"army": [
+					[
+						"imp",
+						75
+					],
+					[
+						"pikeman",
+						10
+					],
+					[
+						"griffin",
+						2
+					],
+					[
+						"archer",
+						5
+					]
+				],
+				"artifacts": [],
+				"experience": 65,
+				"hero": "ignatius",
+				"primary_skills": [
+					2,
+					2,
+					1,
+					1
+				],
+				"secondary_skills": [
+					[
+						"tactics",
+						1
+					],
+					[
+						"resistance",
+						1
+					]
+				],
+				"spellbook": false,
+				"spells": [],
+				"war_machines": [
+					"ballista"
+				]
+			}
+		],
+		"terrain": "dirt",
+		"_about": "real neutrals 38"
+	},
+	{
+		"battlefield": "core:grass_hills",
+		"name": "exported",
+		"neutrals": {
+			"count": 19,
+			"creature": "silverPegasus",
+			"upgraded_stack": false
+		},
+		"seed": 136280546,
+		"sides": [
+			{
+				"army": [
+					[
+						"centaurCaptain",
+						95
+					],
+					[
+						"grandElf",
+						18
+					],
+					[
+						"dendroidSoldier",
+						2
+					],
+					[
+						"dwarf",
+						8
+					],
+					[
+						"centaur",
+						5
+					]
+				],
+				"artifacts": [
+					[
+						3,
+						"centaurAxe"
+					],
+					[
+						9,
+						"spyglass"
+					],
+					[
+						10,
+						"crestOfValor"
+					],
+					[
+						11,
+						"mysticOrbOfMana"
+					]
+				],
+				"experience": 6345,
+				"hero": "jenova",
+				"primary_skills": [
+					5,
+					6,
+					2,
+					1
+				],
+				"secondary_skills": [
+					[
+						"archery",
+						3
+					],
+					[
+						"waterMagic",
+						3
+					],
+					[
+						"logistics",
+						1
+					]
+				],
+				"spellbook": true,
+				"spells": [
+					"weakness"
+				],
+				"war_machines": []
+			}
+		],
+		"terrain": "grass",
+		"_about": "real neutrals 39"
+	}
+]

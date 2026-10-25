@@ -28,6 +28,16 @@ struct ChosenAction;
 /// Raw battle state and legality masks for the acting unit, as the model's input tensors
 struct EncodedBattle
 {
+	/// What the acting unit is asked: a normal turn, or one of the engine's special decisions (constants.py ActionType):
+	/// placing a unit in the tactics phase, aiming our catapult, healing with our First Aid Tent
+	enum class Mode
+	{
+		NORMAL,
+		TACTICS, // TACTICS_MOVE on m_move_hex (the tactics zone), TACTICS_END
+		CATAPULT, // CATAPULT on m_move_hex (the wall parts it can hit)
+		HEAL // HEAL on m_shoot_target (our hurt units), DEFEND
+	};
+	Mode mode = Mode::NORMAL;
 	AlphaSchema::InputTensors tensors;
 	std::array<const CStack *, AlphaSchema::MAX_UNITS> units{}; // unit slot -> stack
 	std::array<AlphaSchema::TargetKind, AlphaSchema::N_SPELLS> spellTargetKind{}; // first destination per spell

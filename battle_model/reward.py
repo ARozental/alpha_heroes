@@ -14,7 +14,8 @@ wants. Losing the hero loses its mana; spending mana in battle costs its value (
 What each outcome leaves a side (assets_after):
 	WIN        its surviving army, its hero, its mana, and the artifacts it takes from a hero it defeated
 	LOSS/DRAW  nothing: army, hero and mana are gone (the winner takes the hero's artifacts)
-	RETREAT    its hero (back in the tavern) and its mana; the army is lost
+	RETREAT    its hero (back in the tavern) and its mana, minus the cost of rehiring the hero (at least 0); the army
+	           is lost
 	SURRENDER  its army, hero and mana, minus the surrender payment and the cost of rehiring the hero
 
 The same formula scores a battle still going on at the end of a round (round_score): both heroes still there, the
@@ -26,7 +27,8 @@ correction, learned by a small separate head, once they matter:
 	- SURRENDER: the payment disappears (the server takes it, the winner gets nothing; BattleActionProcessor), and the
 	  enemy's surrender cost is unknown to us
 	- RETREAT: the army is destroyed without the winner owning it; the hero's rehire is paid to nobody
-	- experience: the winner gains experience (levels, skills) for what it kills, which the loser does not pay
+	- experience: left out on purpose (2026-10-25): the reward stays battle-local and zero-sum, as the campaign-map gains
+	  a battle opens (towns, mines, time) are not counted either
 	- Necromancy and similar: raising creatures after the battle from the enemy's dead
 	- war machines: destroyed ones are lost (their artifact is removed), but neither side's assets count them yet
 	- Eagle Eye: learning the enemy's spells; Learning, Scholar-like effects
@@ -97,8 +99,10 @@ def assets_after(outcome, army_end, hero, mana, surrender_cost=0.0, captured=0.0
 	price of that hero's artifacts, which the winner takes."""
 	if outcome == Outcome.WIN:
 		return army_end + hero + mana + captured
+	# A hero worth less than its rehire is just not rehired: never below losing it. TODO: an approximation; an unwanted
+	# retreated hero can still cost more (it takes the tavern place of a better hero), so the true value can be lower
 	if outcome == Outcome.RETREAT:
-		return hero + mana
+		return max(0.0, hero + mana - HERO_HIRE_COST)
 	if outcome == Outcome.SURRENDER:
 		return army_end + hero + mana - surrender_cost - HERO_HIRE_COST
 	return 0.0

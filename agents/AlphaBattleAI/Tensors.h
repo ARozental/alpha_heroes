@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include "Schema.generated.h"
 
 #include <array>
@@ -36,6 +38,7 @@ public:
 	int64_t get(In in, int i = 0, int j = 0) const;
 	bool anyInRow(In in, int i) const; // rank-2 tensors: any non-zero entry in row i
 	bool any(In in) const;
+	void clear(In in) { std::fill(values[static_cast<int>(in)].begin(), values[static_cast<int>(in)].end(), 0); } // all 0 (masks)
 
 	const std::vector<int64_t> & data(In in) const { return values[static_cast<int>(in)]; }
 };

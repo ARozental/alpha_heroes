@@ -146,6 +146,9 @@ void encodeHeroes(InputTensors & t, const CPlayerBattleCallback & battle, Battle
 				t.set(In::h_spells, my, spell, hero->canCastThisSpell(s)); // the spellbook's, and tomes' and scrolls'
 				t.set(In::h_spell_mastery, my, spell, hero->getSpellSchoolLevel(s));
 			}
+		for(int slot = 0; slot < N_WORN_SLOTS; ++slot)
+			if(const auto * art = hero->getArt(ArtifactPosition(slot)))
+				t.set(In::h_worn_artifacts, my, slot, art->getTypeId().getNum());
 		const double level = heroLevel(hero);
 		t.set(In::h_level, my, static_cast<int64_t>(hero->level));
 		t.set(In::h_level_progress, my, std::llround(1000 * (level - hero->level)));
@@ -584,6 +587,31 @@ EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * 
 	encodeCreatureSpell(e, battle, active, player);
 
 	auto type = [&](ActionType a, bool legal) { t.set(In::m_type, static_cast<int>(a), legal); };
+	// The engine's special decisions: only the masks of the mode's own choices stay
+	if(battle.battleGetTacticDist() && battle.battleGetTacticsSide() == mySide)
+		e.mode = EncodedBattle::Mode::TACTICS; // m_move_hex is already the tactics zone (battleGetAvailableHexes)
+	else if(active->creatureId() == CreatureID::CATAPULT)
+		e.mode = EncodedBattle::Mode::CATAPULT;
+	else if(active->creatureId() == CreatureID::FIRST_AID_TENT)
+		e.mode = EncodedBattle::Mode::HEAL;
+	if(e.mode != EncodedBattle::Mode::NORMAL)
+	{
+		const auto keepHexes = e.mode == EncodedBattle::Mode::TACTICS;
+		for(const In mask : {In::m_move_hex, In::m_melee_target, In::m_melee_from, In::m_shoot_target, In::m_spell, In::m_spell_unit, In::m_spell_hex, In::m_spell2_hex, In::m_spell2_unit, In::m_creature_spell_unit, In::m_creature_spell_hex})
+			if(!(keepHexes && mask == In::m_move_hex))
+				t.clear(mask);
+		if(e.mode == EncodedBattle::Mode::CATAPULT)
+			for(const auto & hex : battle.getAttackableWallParts())
+				if(hex.toInt() >= 0 && hex.toInt() < N_HEXES)
+					t.set(In::m_move_hex, hex.toInt(), 1);
+		if(e.mode == EncodedBattle::Mode::HEAL)
+			for(int u = 0; u < MAX_UNITS; ++u)
+				if(e.units[u] && e.units[u]->alive() && e.units[u]->unitOwner() == active->unitOwner() && e.units[u]->canBeHealed())
+					t.set(In::m_shoot_target, u, 1);
+		type(ActionType::DEFEND, e.mode == EncodedBattle::Mode::HEAL);
+		refreshDerivedMasks(e);
+		return e;
+	}
 	type(ActionType::WAIT, !active->waitedThisTurn);
 	type(ActionType::DEFEND, true);
 	type(ActionType::HERO_SPELL, heroCanCast);
@@ -613,6 +641,21 @@ void refreshDerivedMasks(EncodedBattle & e)
 		t.set(In::m_melee_target, u, t.anyInRow(In::m_melee_from, u));
 
 	auto type = [&](ActionType a, bool legal) { t.set(In::m_type, static_cast<int>(a), legal); };
+	switch(e.mode)
+	{
+		case EncodedBattle::Mode::TACTICS:
+			type(ActionType::TACTICS_MOVE, t.any(In::m_move_hex));
+			type(ActionType::TACTICS_END, true);
+			return;
+		case EncodedBattle::Mode::CATAPULT:
+			type(ActionType::CATAPULT, t.any(In::m_move_hex));
+			return;
+		case EncodedBattle::Mode::HEAL:
+			type(ActionType::HEAL, t.any(In::m_shoot_target));
+			return;
+		case EncodedBattle::Mode::NORMAL:
+			break;
+	}
 	type(ActionType::MOVE, t.any(In::m_move_hex));
 	type(ActionType::MELEE, t.any(In::m_melee_target));
 	type(ActionType::SHOOT, t.any(In::m_shoot_target));
@@ -630,9 +673,12 @@ void excludeAction(EncodedBattle & e, const ChosenAction & a)
 	};
 	switch(static_cast<ActionType>(a.type))
 	{
-		case ActionType::MOVE: clear(In::m_move_hex, a.hex); break;
+		case ActionType::MOVE:
+		case ActionType::TACTICS_MOVE:
+		case ActionType::CATAPULT: clear(In::m_move_hex, a.hex); break;
 		case ActionType::MELEE: clear(In::m_melee_from, a.unit, a.hex); break;
-		case ActionType::SHOOT: clear(In::m_shoot_target, a.unit); break;
+		case ActionType::SHOOT:
+		case ActionType::HEAL: clear(In::m_shoot_target, a.unit); break;
 		case ActionType::HERO_SPELL:
 			if(a.target2Hex >= 0)
 				clear(In::m_spell2_hex, a.targetUnit, a.target2Hex);
@@ -665,9 +711,12 @@ bool isLegal(const EncodedBattle & e, const ChosenAction & a)
 		return false;
 	switch(static_cast<ActionType>(a.type))
 	{
-		case ActionType::MOVE: return in(a.hex, N_HEXES) && t.get(In::m_move_hex, a.hex);
+		case ActionType::MOVE:
+		case ActionType::TACTICS_MOVE:
+		case ActionType::CATAPULT: return in(a.hex, N_HEXES) && t.get(In::m_move_hex, a.hex);
 		case ActionType::MELEE: return in(a.unit, MAX_UNITS) && in(a.hex, N_HEXES) && t.get(In::m_melee_target, a.unit) && t.get(In::m_melee_from, a.unit, a.hex);
-		case ActionType::SHOOT: return in(a.unit, MAX_UNITS) && t.get(In::m_shoot_target, a.unit);
+		case ActionType::SHOOT:
+		case ActionType::HEAL: return in(a.unit, MAX_UNITS) && t.get(In::m_shoot_target, a.unit);
 		case ActionType::HERO_SPELL:
 		{
 			if(!in(a.spell, N_SPELLS) || !t.get(In::m_spell, a.spell))
@@ -756,6 +805,8 @@ std::vector<ChosenAction> legalActions(const EncodedBattle & e)
 		switch(static_cast<ActionType>(type))
 		{
 			case ActionType::MOVE:
+			case ActionType::TACTICS_MOVE:
+			case ActionType::CATAPULT:
 				for(int h = 0; h < N_HEXES; ++h)
 					if(t.get(In::m_move_hex, h))
 						actions.push_back(ChosenAction{.type = type, .hex = h});
@@ -768,6 +819,7 @@ std::vector<ChosenAction> legalActions(const EncodedBattle & e)
 								actions.push_back(ChosenAction{.type = type, .hex = h, .unit = u});
 				break;
 			case ActionType::SHOOT:
+			case ActionType::HEAL:
 				for(int u = 0; u < MAX_UNITS; ++u)
 					if(t.get(In::m_shoot_target, u))
 						actions.push_back(ChosenAction{.type = type, .unit = u});
@@ -881,6 +933,18 @@ std::optional<ChosenAction> chosenAction(const EncodedBattle & e, const BattleAc
 			a.type = static_cast<int>(ActionType::SHOOT);
 			a.unit = slotOf(targets[0]);
 			return a.unit >= 0 ? std::optional(a) : std::nullopt;
+		case EActionType::CATAPULT:
+			if(targets.empty())
+				return std::nullopt;
+			a.type = static_cast<int>(ActionType::CATAPULT);
+			a.hex = targets[0].hexValue.toInt();
+			return isLegal(e, a) ? std::optional(a) : std::nullopt;
+		case EActionType::STACK_HEAL:
+			if(targets.empty())
+				return std::nullopt;
+			a.type = static_cast<int>(ActionType::HEAL);
+			a.unit = slotOf(targets[0]);
+			return isLegal(e, a) ? std::optional(a) : std::nullopt;
 		case EActionType::MONSTER_SPELL: // another spell than the one encoded (another Faerie Dragon draw) has no model action
 			if(targets.empty() || action.spell.getNum() != e.tensors.get(In::g_creature_spell))
 				return std::nullopt;
@@ -928,6 +992,21 @@ BattleAction engineAction(BattleSide side, const CStack * active, const ChosenAc
 			return BattleAction::makeRetreat(side);
 		case ActionType::SURRENDER:
 			return BattleAction::makeSurrender(side);
+		case ActionType::TACTICS_MOVE: // sent with battleMakeTacticAction
+			return BattleAction::makeMove(active, BattleHex(a.hex));
+		case ActionType::TACTICS_END:
+			return BattleAction::makeEndOFTacticPhase(side);
+		case ActionType::CATAPULT:
+		{
+			BattleAction attack; // BattleFlowProcessor: aimed at a wall part's hex
+			attack.actionType = EActionType::CATAPULT;
+			attack.side = side;
+			attack.stackNumber = active->unitId();
+			attack.aimToHex(BattleHex(a.hex));
+			return attack;
+		}
+		case ActionType::HEAL:
+			return BattleAction::makeHeal(active, target(a.unit));
 		case ActionType::HERO_SPELL:
 		{
 			battle::Target destinations;

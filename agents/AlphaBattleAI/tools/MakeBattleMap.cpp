@@ -5,7 +5,9 @@
 //
 // Per side: hero, primary_skills, secondary_skills, army, spellbook, spells, war_machines (true: all three, or a
 // list of artifact keys), and optionally experience (sets the level) and artifacts ([[ArtifactPosition, key], ...]).
-// Optional top level: town = {faction, fortification: none | fort | citadel | castle}; or neutrals = {creature, count,
+// Optional top level: battlefield_object = a terrain patch's object name (magicPlains, cursedGround, holyGround, evilFog,
+// cloverField, fieryFields, rocklands, magicClouds, lucidPools): placed over the battle, it makes the battlefield
+// special. town = {faction, fortification: none | fort | citadel | castle}; or neutrals = {creature, count,
 // upgraded_stack} instead of sides[1]: wandering monsters that always fight (savage, never flee, as the engine splits
 // them into stacks against this hero), which the hero attacks.
 //
@@ -213,6 +215,17 @@ int main(int argc, const char * argv[])
 		else
 			addHero(*map, cb, defender, PlayerColor(1), int3(5, 5, 0)); // in the town: its visiting hero defends it
 		map->getEditManager()->insertObject(object);
+	}
+
+	if(!scenario["battlefield_object"].isNull())
+	{
+		const auto type = LIBRARY->identifiers()->getIdentifier("core", "object", scenario["battlefield_object"].String(), true);
+		if(!type)
+			throw std::runtime_error("unknown object '" + scenario["battlefield_object"].String() + "'");
+		auto factory = LIBRARY->objtypeh->getHandlerFor(MapObjectID(*type), 0);
+		auto patch = factory->create(&cb, factory->getTemplates().front());
+		patch->pos = int3(6, 6, 0); // its bottom right corner: the patch covers the heroes' tiles (5,5) and (5,6)
+		map->getEditManager()->insertObject(patch);
 	}
 
 	CMapService mapService;

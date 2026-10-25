@@ -4,7 +4,8 @@ builds) from the distribution in battle_model/scenarios/generator.toml, in the o
 Everything the engine knows (creatures, heroes and their classes, spells and mage guilds, artifacts and their slots,
 the experience per level) comes from the exported vocab (scripts/export_vocab.sh), so the draws are the engine's
 own identifiers and numbers. What the map tool cannot build yet is redrawn or left out, and noted where it happens
-(UNSUPPORTED): creature banks, boats, special battlefields, a hero's mana below full and the player's gold.
+(UNSUPPORTED): creature banks and boats. A side's gold and its hero's mana (the scenario's "gold" and "mana_fraction")
+are set by the engine when a battle-only game starts (play.start passes them as VCMI_BATTLE_GOLD/MANA_<COLOR>).
 
 Usage: .venv/bin/python -m battle_model.generator [--count N] [--seed S] [--out DIR]  (writes N scenario files)
 """
@@ -24,6 +25,8 @@ UNSUPPORTED_BATTLE_TYPES = ("creature_bank",)  # redrawn (UNSUPPORTED: the bank'
 UNSUPPORTED_TERRAINS = ("water",)  # redrawn (UNSUPPORTED: boats)
 FORTIFICATIONS = ("none", "fort", "citadel", "castle")
 WAR_MACHINES = {"ballista": "ballista", "first_aid_tent": "firstAidTent", "ammo_cart": "ammoCart"}
+# A special battlefield is a terrain patch object over the battle (MakeBattleMap's battlefield_object)
+BATTLEFIELD_OBJECTS = {"magic_plains": "magicPlains", "cursed_ground": "cursedGround", "holy_ground": "holyGround", "evil_fog": "evilFog", "clover_field": "cloverField", "fiery_fields": "fieryFields", "rocklands": "rocklands", "magic_clouds": "magicClouds", "lucid_pools": "lucidPools"}
 GUILD_SPELLS = (5, 4, 3, 2, 1)  # spells a mage guild offers at levels 1-5 (CGTownInstance::spellsAtLevel, no Library)
 LEARNABLE = (2, 3, 4, 5)  # the highest spell level a hero can learn, by Wisdom mastery (none, basic, advanced, expert)
 MAX_SECONDARY = 8
@@ -44,7 +47,7 @@ def world(path=vocab.VOCAB_PATH):
 	"""The engine's tables, grouped for sampling."""
 	v = json.loads(Path(path).read_text())
 	factions = [short(f["key"]) for f in v["factions"] if f.get("town") and not f.get("special")]
-	creatures = [c for c in v["creatures"] if not c.get("special") and 1 <= c["level"] <= 7 and c.get("cost")]
+	creatures = [dict(c, level=min(c["level"], 7)) for c in v["creatures"] if not c.get("special") and c["level"] >= 1 and c.get("cost")]  # the neutral dragons (8, 10) are level 7
 	upgraded = {short(u) for c in creatures for u in c.get("upgrades", [])}
 	by_key = {short(c["key"]): c for c in creatures}
 	# A faction's creatures by level: (base, upgrade) pairs; neutrals (no faction town) on their own
@@ -218,6 +221,9 @@ def draw_hero(rng, army_faction, phase, cfg, w):
 	hero, class_key = rng.choice(w["heroes"][(faction, magic)])
 	hero_class = w["classes"][class_key]
 	level = between(rng, phase["hero_level"])
+	if rng.random() < h["level_tail"]["p"]:
+		level += between(rng, h["level_tail"]["extra"])
+	level = min(level, len(w["experience"]) - 2)
 	primary, secondary = level_ups(rng, hero_class, level, choose(rng, h["growth"]) == "random", cfg)
 	experience = w["experience"]
 	progress = rng.random()  # its way to the next level
@@ -250,6 +256,8 @@ def sample(rng, cfg=None, w=None):
 	phase = cfg["phase"][phase_name]
 
 	strong = phase["army_value_median"] * math.exp(rng.gauss(0, cfg["army"]["value_sigma"]))
+	if rng.random() < cfg["army"]["value_tail"]["p"]:
+		strong *= 10 ** rng.uniform(cfg["army"]["value_tail"]["log10"]["min"], cfg["army"]["value_tail"]["log10"]["max"])
 	ratio_name = choose(rng, cfg["ratio"])
 	ratio = 10 ** rng.uniform(cfg["ratio"][ratio_name]["log10"]["min"], cfg["ratio"][ratio_name]["log10"]["max"])
 	odds = cfg["ratio"]["stronger_side"][battle_type]
@@ -260,21 +268,30 @@ def sample(rng, cfg=None, w=None):
 	for side in (0, 1) if battle_type != "hero_vs_neutrals" else (0,):
 		faction = choose(rng, cfg["composition"]["main_faction"])
 		army = draw_army(rng, values[side], faction, phase, cfg, w)
-		sides.append({"faction": faction, **draw_hero(rng, faction, phase, cfg, w), "army": army})
+		gold = cfg["gold"][choose(rng, cfg["gold"])]
+		mana = cfg["hero"]["mana"]
+		mana_fraction = rng.uniform(mana["partial"]["fraction"]["min"], mana["partial"]["fraction"]["max"]) if choose(rng, mana) == "partial" else 1.0
+		sides.append({"faction": faction, **draw_hero(rng, faction, phase, cfg, w), "army": army,
+			"gold": int(rng.uniform(gold["army_share"]["min"], gold["army_share"]["max"]) * army_value(army, w)) + 2500, "mana_fraction": round(mana_fraction, 3)})
 		factions.append(faction)
 	scenario = {"name": "generated", "terrain": terrain, "seed": rng.randrange(1, 2**31), "sides": sides}
+	special = rng.random() < cfg["battlefield"]["special_probability"] and battle_type != "siege"  # a town has its own
+	if special:
+		scenario["battlefield_object"] = BATTLEFIELD_OBJECTS[choose(rng, cfg["battlefield"]["special"])]
 	if battle_type == "hero_vs_neutrals":
 		scenario["neutrals"] = draw_neutrals(rng, values[1], phase, cfg, w)
 		enemy = creature_value(scenario["neutrals"]["creature"], w) * scenario["neutrals"]["count"]
 		about = f"{battle_type}, {phase_name}, {terrain}, army {army_value(sides[0]['army'], w):.0f} vs {scenario['neutrals']['count']} {scenario['neutrals']['creature']} ({enemy:.0f} gold)"
 	else:
 		about = f"{battle_type}, {phase_name}, {terrain}, armies {army_value(sides[0]['army'], w):.0f} vs {army_value(sides[1]['army'], w):.0f} gold"
+	if special:
+		about += f", {scenario['battlefield_object']}"
 	if battle_type == "siege":
 		s = cfg["siege"]
 		town = factions[1] if rng.random() < s["town_is_defender_faction"] else rng.choice([f for f in w["factions"] if f != factions[1]])
 		scenario["town"] = {"faction": town, "fortification": choose(rng, s["fortifications"])}
 		if choose(rng, s["defender"]) == "no_hero":
-			sides[1] = {"faction": sides[1]["faction"], "army": sides[1]["army"]}  # the town's garrison defends
+			sides[1] = {"faction": sides[1]["faction"], "army": sides[1]["army"], "gold": sides[1]["gold"]}  # the town's garrison defends
 		about += f", {scenario['town']['fortification']} {town}" + ("" if "hero" in sides[1] else ", garrison only")
 	scenario["_about"] = about
 	return scenario

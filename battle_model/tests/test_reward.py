@@ -25,7 +25,8 @@ def test_a_hero_is_worth_its_levels_above_the_first_few_and_its_artifacts():
 def test_the_winner_over_a_hero_takes_its_artifacts():
 	assert assets_after(Outcome.WIN, 30_000, 10_000, 0, captured=4000) == 44_000
 	assert assets_after(Outcome.LOSS, 30_000, 10_000, 0) == 0
-	assert assets_after(Outcome.RETREAT, 30_000, 10_000, 600) == 10_600  # the hero and its artifacts escape
+	assert assets_after(Outcome.RETREAT, 30_000, 10_000, 600) == 10_600 - HERO_HIRE_COST  # the hero and its artifacts escape, to be rehired
+	assert assets_after(Outcome.RETREAT, 30_000, 0, 600) == 0  # a hero worth less than its rehire: as if lost
 
 
 def test_the_two_sides_rewards_always_sum_to_zero():
@@ -53,7 +54,7 @@ def test_what_each_outcome_leaves():
 	hero, mana = 10_000, 600
 	assert assets_after(Outcome.WIN, 30_000, hero, mana) == 30_000 + hero + mana
 	assert assets_after(Outcome.LOSS, 30_000, hero, mana) == 0 == assets_after(Outcome.DRAW, 30_000, hero, mana)
-	assert assets_after(Outcome.RETREAT, 30_000, hero, mana) == hero + mana  # the army is lost
+	assert assets_after(Outcome.RETREAT, 30_000, hero, mana) == hero + mana - HERO_HIRE_COST  # the army is lost, the hero rehired
 	assert assets_after(Outcome.SURRENDER, 30_000, hero, mana, 6_000) == 30_000 + hero + mana - 6_000 - HERO_HIRE_COST
 
 

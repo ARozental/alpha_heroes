@@ -34,10 +34,8 @@ subterra = { p = 0.13, desc = "underground (Dungeon)" }
 lava     = { p = 0.09, desc = "lava (Inferno)" }
 water    = { p = 0.08, desc = "boat battle" }  # only with battle_type hero_vs_hero; else redrawn
 
-# A special battlefield replaces the terrain's own: its rules change the battle (the engine applies them).
-# Model gap: the model sees the battlefield id but its spell-mastery bias reads the hero's skills, so on magic plains
-# (every spell expert) and the elemental fields it uses the wrong mastery. Fix before using these: encode each school's
-# effective level from the engine (getSpellSchoolLevel) instead of the skills.
+# A special battlefield replaces the terrain's own: its rules change the battle (the engine applies them; the model
+# sees the battlefield id and the engine's spell mastery, h_spell_mastery). Not for sieges: a town has its own.
 [battlefield]
 special_probability = 0.12  # else the terrain's own battlefield
 
@@ -149,6 +147,11 @@ mage_guild = { min = 5, max = 5 }
 [army]
 value_sigma = 0.35  # lognormal sigma of the stronger army's value around the phase's median
 
+# Out of distribution on purpose: a few battles with both armies far larger than their phase's
+[army.value_tail]
+p = 0.03
+log10 = { min = 0.5, max = 1.0 }  # both armies x 3 .. x 10
+
 # 4.1 Force ratio: the stronger army's value over the weaker's, as log10 (0 = equal, 1 = 10:1).
 # Army value only: a strong hero changes the real balance a lot (section 4.3), which is part of the variety.
 [ratio]
@@ -186,9 +189,9 @@ fortress   = { p = 0.111, desc = "Fortress" }
 conflux    = { p = 0.111, desc = "Conflux" }
 
 [composition.stack_origin]  # where each stack's creature comes from
-main_faction  = { p = 0.85, desc = "own town" }
+main_faction  = { p = 0.88, desc = "own town" }
 other_faction = { p = 0.10, desc = "another town" }
-neutral       = { p = 0.05, desc = "neutral creature" }  # gold golem, enchanter, faerie dragon, troll, ...
+neutral       = { p = 0.02, desc = "neutral creature" }  # gold golem, enchanter, troll, ...; the dragons count as level 7
 
 # Which creature levels 1..top_tier the stacks are: the first stack is of the top tier, each other stack's level is
 # drawn with these weights. The counts are as
@@ -237,17 +240,21 @@ partial = { p = 0.30, desc = "20-100% mana", fraction = { min = 0.2, max = 1.0 }
 
 # Artifacts: count by phase, each drawn by class (the engine's slots decide where it goes; a second one for a full
 # slot is redrawn). Model gap: artifacts whose effect is not in any stat (Orb of Tempestuous Fire, Orb of
-# Vulnerability, Recanter's Cloak, ...) are invisible to the model; it needs an input of our hero's artifacts.
+# Vulnerability, Recanter's Cloak, ...) reach the model as our hero's rule-artifact bag (model.HeroTokens).
 [hero.artifact_class]
 treasure = { p = 0.50, desc = "treasure" }
 minor    = { p = 0.30, desc = "minor" }
 major    = { p = 0.15, desc = "major" }
 relic    = { p = 0.05, desc = "relic" }
 
-# Tactics: our AI ends the tactics phase at once (it is scripted), so a hero with Tactics against it is an unfair
-# advantage for BattleAI and a free one for us. Keep the skill out until our model plays tactics.
+# Skills never drawn. None since our model plays the tactics phase (contract v14); BattleAI ends it at once.
 [hero.excluded_secondary_skills]
-skills = ["tactics"]
+skills = []
+
+# Out of distribution on purpose: a few heroes far above their phase's levels
+[hero.level_tail]
+p = 0.03
+extra = { min = 5, max = 15 }  # levels above the phase's highest
 
 # ---------------------------------------------------------------------------------------------------------------------
 # 5. Everything else
@@ -256,9 +263,9 @@ skills = ["tactics"]
 attacker = { p = 0.50, desc = "we attack" }
 defender = { p = 0.50, desc = "we defend" }  # hero_vs_neutrals: we always attack
 
-[gold]  # the player's gold: surrender needs cost + hero hire
-enough = { p = 0.70, desc = "can surrender" }
-broke  = { p = 0.30, desc = "cannot surrender" }
+[gold]  # the player's gold (the scenario's "gold"): surrender needs its cost (about the army's price) + the hero's hire
+enough = { p = 0.70, desc = "can surrender", army_share = { min = 1.0, max = 2.0 } }  # this x the army's value + 2500
+broke  = { p = 0.30, desc = "cannot surrender", army_share = { min = 0.0, max = 0.3 } }
 
 [seed]  # VCMI's random seed: dice, obstacles, neutrals' stack split
 random = true

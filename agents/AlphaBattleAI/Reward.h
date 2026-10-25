@@ -57,7 +57,7 @@ inline double assetsAfter(Outcome outcome, double army, double hero, double mana
 	switch(outcome)
 	{
 		case Outcome::WIN: return army + hero + mana + captured;
-		case Outcome::RETREAT: return hero + mana;
+		case Outcome::RETREAT: return std::max(0.0, hero + mana - HERO_HIRE_COST); // rehired from the tavern; not below losing it
 		case Outcome::SURRENDER: return army + hero + mana - surrenderCost - HERO_HIRE_COST;
 		default: return 0.0;
 	}

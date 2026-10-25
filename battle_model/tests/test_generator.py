@@ -61,7 +61,7 @@ def test_heroes(drawn):
 			if "hero" not in side:
 				continue
 			skills = dict(side["secondary_skills"])
-			assert "tactics" not in skills and len(skills) <= generator.MAX_SECONDARY
+			assert not set(skills) & set(cfg["hero"]["excluded_secondary_skills"]["skills"]) and len(skills) <= generator.MAX_SECONDARY
 			slots = [slot for slot, _ in side["artifacts"]]
 			assert len(slots) == len(set(slots))
 			assert side["spellbook"] or not side["spells"]
@@ -71,7 +71,8 @@ def test_heroes(drawn):
 			level = sum(1 for e in w["experience"] if e <= side["experience"])
 			levels.append(level)
 			assert sum(side["primary_skills"]) >= level - 1  # a point per level up, above the class's initial ones
-	assert min(levels) >= 1 and max(levels) <= 35
+	top = max(p["hero_level"]["max"] for p in cfg["phase"].values()) + cfg["hero"]["level_tail"]["extra"]["max"]
+	assert min(levels) >= 1 and max(levels) <= top
 
 
 def test_force_ratio(drawn):

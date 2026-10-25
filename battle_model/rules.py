@@ -112,6 +112,30 @@ ABILITIES = (
 )
 
 
+# Artifact bonuses that change a battle's rules in a way no other input shows (stats show in the units and heroes,
+# spells in h_spells, the surrender price in g_surrender_cost): an artifact with any of them is a "rule artifact"
+RULE_ARTIFACT_BONUSES = (
+	"BATTLE_NO_FLEEING", "BLOCK_ALL_MAGIC", "BLOCK_MAGIC_ABOVE", "FREE_SHOOTING", "HP_REGENERATION", "IMPROVED_NECROMANCY",
+	"LEVEL_SPELL_IMMUNITY", "MAGIC_RESISTANCE", "MIND_IMMUNITY", "NEGATE_ALL_NATURAL_IMMUNITIES", "NO_DISTANCE_PENALTY",
+	"NO_WALL_PENALTY", "OPENING_BATTLE_SPELL", "PERCENTAGE_DAMAGE_BOOST", "SPELL_DAMAGE", "SPELL_DURATION", "SPELL_IMMUNITY",
+	"SPELL_RESISTANCE_AURA", "UNDEAD_RAISE_PERCENTAGE",
+)
+ARTIFACT_IDS = 256  # artifact ids the rule table covers (the core game has ~144)
+
+
+def rule_artifacts(path=vocab.VOCAB_PATH):
+	"""(table [ARTIFACT_IDS + 1]: an artifact id's index among the rule artifacts, -1 for the others; their count).
+	The last row is for ids out of range."""
+	table = torch.full((ARTIFACT_IDS + 1,), -1, dtype=torch.long)
+	count = 0
+	if path.exists():
+		for row in sorted(vocab.tables(path)["artifacts"].values(), key=lambda r: r["id"]):
+			if 0 <= row["id"] < ARTIFACT_IDS and set(row.get("bonuses", ())) & set(RULE_ARTIFACT_BONUSES):
+				table[row["id"]] = count
+				count += 1
+	return table, count
+
+
 def creature_tables(path=vocab.VOCAB_PATH):
 	"""Per creature id, from the vocabulary: its value in gold (reward.py prices) and the abilities the rules use
 	(CREATURE_TABLES), [CREATURE_VOCAB + 1] each; "hate": [attacker, target] its HATE percentage; and "abilities":

@@ -589,9 +589,47 @@ def can_attack_at_units(b, can_attack):
 	return at(b.units["hex"]) | at(b.units["rear"])
 
 
+# ---- What the next exchange can cost or win ----
+
+EXPOSURE_FEATURES = ("loss_next_turn", "kill_next_turn", "best_stack_share", "enemy_spell_threat")
+SPELL_THREAT_MANA = 20.0  # enemy mana at which half of enemy_spell_threat is reached (about two Blinds or Lightning Bolts)
+
+
+def exposure_features(b):
+	"""[B, len(EXPOSURE_FEATURES)], each 0..1, for the escapes and the battle token: facts, not a rule; the model learns
+	what they are worth.
+	loss_next_turn      of our army's value, the most the enemy units could destroy before we act again: each enemy's
+	                    best attack on any one of our units (the engine's high damage estimate, valued by the hit points
+	                    it takes), summed (every enemy acts at most once a round: an upper bound; no spells, no
+	                    retaliation)
+	kill_next_turn      the same for our units on the enemy's army
+	best_stack_share    our most valuable unit's share of our army: what one Blind plus shooting can take at once
+	enemy_spell_threat  whether the enemy hero can hurt us with spells, from what a player sees: its mana (we cannot see
+	                    its spellbook), mana / (mana + SPELL_THREAT_MANA)
+	"""
+	x = b.x
+	high = pair_damage(b, b.units["can_shoot"][:, :, None])[2]  # [B, attacker, target]
+	per_hp = (b.value / b.health.float().clamp(min=1))[:, None, :]  # a target's value per hit point
+	destroyed = torch.minimum(high, b.health.float()[:, None, :]) * per_hp  # [B, attacker, target], by hit points
+
+	def exposure(attackers, targets, army):
+		best = (destroyed * targets[:, None, :]).amax(dim=-1) * attackers  # [B, attacker]
+		return fraction(best.sum(dim=-1), army).clamp(max=1)
+
+	our_side = x["g_our_side"].clamp(0, 1)
+	batch = torch.arange(our_side.shape[0], device=our_side.device)
+	enemy_mana = (x["h_mana"].float() * (x["h_present"] != 0))[batch, 1 - our_side]
+	return torch.stack([
+		exposure(b.enemy.float(), b.ours.float(), b.our_value),
+		exposure(b.ours.float(), b.enemy.float(), b.enemy_value),
+		fraction((b.value * b.ours).amax(dim=-1), b.our_value),
+		fraction(enemy_mana, torch.full_like(enemy_mana, SPELL_THREAT_MANA)),
+	], dim=-1)
+
+
 # ---- The battle ----
 
-BATTLE_FEATURES = ("strength", *(f"round_{c}" for c in COUNT_SCALES), "tactics", "hero_can_cast", "danger_here", "threat_here", "my_share")
+BATTLE_FEATURES = ("strength", *(f"round_{c}" for c in COUNT_SCALES), "tactics", "hero_can_cast", "danger_here", "threat_here", "my_share", *EXPOSURE_FEATURES)
 
 
 def battle_features(b, maps):
@@ -615,18 +653,19 @@ def battle_features(b, maps):
 			at_my_hex[:, HEX_FEATURES.index("threat_value")],
 			b.mine(value_in_army(b)),
 		], dim=-1),
+		exposure_features(b),
 	], dim=-1)
 
 
 # ---- What ending the battle now would score ----
 
-OUTCOME_FEATURES = ("retreat_reward", "surrender_reward")
+OUTCOME_FEATURES = ("retreat_reward", "surrender_reward", *EXPOSURE_FEATURES)  # the exposure: for both escapes
 
 
 def outcome_features(b, config=None):
 	"""[B, len(OUTCOME_FEATURES)], each -1..1, for the RETREAT and SURRENDER logits only: the exact reward (reward.py,
 	zero-sum, from each side's assets) of
-	retreat_reward    our retreating now: our army is lost, the enemy wins with what it has
+	retreat_reward    our retreating now: our army is lost, the hero is rehired, the enemy wins with what it has
 	surrender_reward  our surrendering now: we keep the army and pay the surrender cost and the hero's rehire (0 when we
 	                  cannot surrender: the mask forbids it anyway)
 	Assets as summarize() counts them: the kept creatures (u_kept) at their value, mana at mana_value x spell power,
@@ -657,7 +696,8 @@ def outcome_features(b, config=None):
 	own_hero = pick(hero, our)
 	cost = x["g_surrender_cost"].float()
 	surrender = zero_sum(pick(army, our) + own_hero + pick(mana, our) - cost.clamp(min=0) - HERO_HIRE_COST, enemy_end) * (cost >= 0)
-	return torch.stack([zero_sum(own_hero + pick(mana, our), enemy_end), surrender], dim=-1)
+	retreat = zero_sum((own_hero + pick(mana, our) - HERO_HIRE_COST).clamp(min=0), enemy_end)  # rehired from the tavern
+	return torch.cat([torch.stack([retreat, surrender], dim=-1), exposure_features(b)], dim=-1)
 
 
 def hero_levels(x):

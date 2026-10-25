@@ -108,8 +108,8 @@ std::vector<uint32_t> attacked(const CBattleInfoCallback & battle, const CStack 
 void encodeAttackValues(EncodedBattle & e, const CGameState & game, const BattleID & battleID, PlayerColor player, AttackValueStats & stats)
 {
 	auto & t = e.tensors;
-	if(!t.any(In::m_melee_target) && !t.any(In::m_shoot_target))
-		return;
+	if(e.mode != EncodedBattle::Mode::NORMAL || (!t.any(In::m_melee_target) && !t.any(In::m_shoot_target)))
+		return; // the special decisions (tactics, catapult, heal) have no attacks
 	const auto started = std::chrono::steady_clock::now();
 	++stats.calls;
 	const CBattleInfoCallback & battle = *game.getBattle(battleID);
