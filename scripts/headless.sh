@@ -9,7 +9,7 @@
 #                e.g. SETTINGS='{"ai":{"combatEnemyAI":"UpLeftAI"}}'
 #
 # The game is killed when it exceeds max_seconds, when its run directory exceeds max_mb,
-# when its log stops growing for stall_seconds (a stack sample is saved first),
+# when its log stops growing for stall_seconds while it does not compute either (a stack sample is saved first),
 # or when this script exits for any reason. Prints run size and data rate at the end.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -67,14 +67,25 @@ STATUS="finished"
 START=$SECONDS
 LAST_LOG_SIZE=-1
 LAST_LOG_CHANGE=$SECONDS
+cpu_seconds() { ps -o time= -p "$PID" 2>/dev/null | awk -F: '{ s = 0; for (i = 1; i <= NF; i++) s = s * 60 + $i; printf "%d", s }'; }
+CPU_AT_CHANGE=$(cpu_seconds)
 while kill -0 "$PID" 2>/dev/null; do
 	sleep 1
 	LOG_SIZE=$(stat -f %z "$RUN_DIR/logs/VCMI_Client_log.txt" 2>/dev/null || echo 0)
 	if [ "$LOG_SIZE" != "$LAST_LOG_SIZE" ]; then
 		LAST_LOG_SIZE=$LOG_SIZE
 		LAST_LOG_CHANGE=$SECONDS
+		CPU_AT_CHANGE=$(cpu_seconds)
+	elif (( SECONDS - LAST_LOG_CHANGE >= STALL_SECONDS )) && (( $(cpu_seconds) - CPU_AT_CHANGE >= STALL_SECONDS / 4 )); then
+		# silent but computing (e.g. BattleAI thinking for minutes in a big battle): not a stall; the time limit still holds
+		LAST_LOG_CHANGE=$SECONDS
+		CPU_AT_CHANGE=$(cpu_seconds)
 	elif (( SECONDS - LAST_LOG_CHANGE >= STALL_SECONDS )); then
-		sample "$PID" 3 -file "$RUN_DIR/stall_sample.txt" > /dev/null 2>&1
+		# sample itself can hang on a stuck client (it did, for hours, blocking an eval and two real-game actors)
+		sample "$PID" 3 -file "$RUN_DIR/stall_sample.txt" > /dev/null 2>&1 &
+		SAMPLER=$!
+		for _ in {1..20}; do kill -0 "$SAMPLER" 2>/dev/null || break; sleep 1; done
+		kill -KILL "$SAMPLER" 2>/dev/null
 		STATUS="killed: no log output for ${STALL_SECONDS}s, stack sample in stall_sample.txt"
 		break
 	fi
