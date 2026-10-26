@@ -100,6 +100,9 @@ class TrainConfig:
 	# only the current version shares cannot last), and against a fixed AI (league_ais; none: we train against ourselves)
 	league: tuple = (0.85, 0.15, 0.0)
 	league_ais: tuple = ("BattleAI",)
+	inference: str = "server"  # actors: "server" (one process runs the model for every game, live weights) or "onnx" (actors.py)
+	inference_device: str = "auto"  # the server's: "auto" = CUDA if there is one, else the CPU; or e.g. "cpu", "cuda"
+	inference_threads: int = 4  # the server's torch threads on the CPU
 	run: str = "castle_vs_inferno"
 	epochs: int = 1000
 	opponent: str = "BattleAI"  # who we train against; "self" (play.SELF_PLAY): our model on both sides, learning from both
@@ -597,14 +600,16 @@ def train(config, resume=False):
 	(out / "config.txt").write_text("\n".join(f"{k} = {v}" for k, v in asdict(config).items()) + "\n")
 	torch.manual_seed(config.seed)
 	device = resolve_device(config.device)
-	model = build_model(model_kwargs(config)).to(device)
+	architecture = model_kwargs(config)
+	model = build_model(architecture).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 	first_epoch = 1
 	elapsed_before = 0.0
 	latest = out / "checkpoint_latest.pt"
 	if resume and latest.exists():
 		state = torch.load(latest, map_location=device)
-		model = build_model(state.get("model_kwargs", {})).to(device)  # the architecture the run was started with
+		architecture = state.get("model_kwargs", {})
+		model = build_model(architecture).to(device)  # the architecture the run was started with
 		optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 		model.load_state_dict(state["model"])
 		optimizer.load_state_dict(state["optimizer"])
@@ -703,8 +708,8 @@ def train(config, resume=False):
 	pool = None
 	if config.actors:  # actors play all the time; each update takes its battles from their buffer
 		from .actors import ActorPool
-		pool = ActorPool(config, out, generated_games)
-		pool.publish(lambda path: export(cpu_copy(model), path))
+		pool = ActorPool(config, out, generated_games, architecture)
+		pool.publish(model, lambda path: export(cpu_copy(model), path))
 		pool.start()
 	else:
 		export(cpu_copy(model), model_files[current])
@@ -763,7 +768,7 @@ def train(config, resume=False):
 					batches += 1
 			model.eval()
 			if pool:
-				pool.publish(lambda path: export(cpu_copy(model), path))
+				pool.publish(model, lambda path: export(cpu_copy(model), path))
 			else:
 				current = 1 - current
 				export(cpu_copy(model), model_files[current])

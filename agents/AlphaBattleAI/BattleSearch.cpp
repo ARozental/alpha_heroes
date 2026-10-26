@@ -97,7 +97,7 @@ double aliveArmyValue(const CBattleInfoCallback & battle, BattleSide side)
 	return value;
 }
 
-BattleSearchEnv::BattleSearchEnv(const BattleSimulation & root, const BattleModel & model, const Environment & env, const AlphaReward::BattleEnd & start, int roundCap)
+BattleSearchEnv::BattleSearchEnv(const BattleSimulation & root, const IBattleModel & model, const Environment & env, const AlphaReward::BattleEnd & start, int roundCap)
 	: rootSim(root)
 	, model(model)
 	, env(env)

@@ -143,6 +143,10 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 		record = std::make_unique<BattleRecord>();
 
 	modelPath = playerSetting(*CB, "ALPHA_BATTLE_MODEL");
+	inferenceSocket = playerSetting(*CB, "ALPHA_BATTLE_INFERENCE_SOCKET");
+	inferenceName = playerSetting(*CB, "ALPHA_BATTLE_INFERENCE_MODEL");
+	if(inferenceName.empty())
+		inferenceName = "current";
 	loadModel();
 }
 
@@ -150,6 +154,13 @@ void AlphaBattleAI::loadModel()
 {
 	try
 	{
+		if(!inferenceSocket.empty()) // one connection for the AI's lifetime; the server always has the newest weights
+		{
+			if(!model)
+				model = std::make_shared<RemoteBattleModel>(inferenceSocket, inferenceName);
+			modelFile = "remote:" + inferenceName + "@" + std::to_string(dynamic_cast<const RemoteBattleModel &>(*model).version());
+			return;
+		}
 		if(modelPath.empty())
 			throw std::runtime_error("ALPHA_BATTLE_MODEL is not set");
 		const auto time = std::filesystem::last_write_time(modelPath); // follows a symlink: training replaces its target
@@ -179,7 +190,9 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2, int3 tile, const CGHeroInstance * hero1, const CGHeroInstance * hero2, BattleSide side, bool replayAllowed)
 {
 	stats = Stats(); // the neutral player's battle AI is reused for every battle
-	if(!delegated && !modelPath.empty())
+	if(!delegated && !inferenceSocket.empty())
+		loadModel(); // the version this battle starts with, for its record
+	else if(!delegated && !modelPath.empty())
 	{
 		std::error_code error;
 		const auto time = std::filesystem::last_write_time(modelPath, error);

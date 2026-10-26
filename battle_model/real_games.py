@@ -26,10 +26,12 @@ def maps():
 	return sorted("Maps/" + p.stem for p in (play.USER_DIR / "Maps").glob("*.h3m"))
 
 
-def start_game(map_name, model_path, socket_path, game_key, seed, temperature=1.0, max_seconds=MAX_GAME_SECONDS):
+def start_game(map_name, model_path, socket_path, game_key, seed, temperature=1.0, max_seconds=MAX_GAME_SECONDS, settings=()):
 	"""Start one real game in the background; returns the process. Every player's and the monsters' battles are
-	played by our model (sampling at temperature), each side with its own sampling seed, and recorded."""
+	played by our model (sampling at temperature), each side with its own sampling seed, and recorded. settings: more
+	env pairs (e.g. the inference server's socket)."""
 	env = dict(os.environ)
+	env.update(dict(settings))
 	ai = "AlphaBattleAI"
 	env.update(
 		ALPHA_BATTLE_MODEL=str(Path(model_path).absolute()),  # not resolved: a link (actors.py) is followed at each battle

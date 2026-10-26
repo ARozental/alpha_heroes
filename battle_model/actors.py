@@ -14,9 +14,14 @@ TODO(hard cases): battles where a person beat the model (exported as scenarios b
 kept in a pool of their own, a small share of every update's generated battles and of every eval, so an exploit found
 by playing against the model is trained away and checked from then on.
 
-The model is published as versions (models/model_<v>.onnx) behind the link models/current.onnx: a battle starts with
-the newest (AlphaBattleAI resolves the link, and reloads it at a battle's start when it changed), and its record says
-which version played (the start event's "model"), so stale records can be dropped.
+Inference (config.inference):
+	"server"   the default: one inference process (inference.py) runs the model for every game, batched, with the
+	           learner's weights sent in memory after each update (no export); a game creates no ONNX session (1.1 s of
+	           CPU a battle) and spends no CPU core on the model. Past versions for the league are kept by it as "v<n>"
+	           (and saved as models/snapshot_<n>.pt, so a resumed run has them).
+	"onnx"     each version exported (models/model_<v>.onnx) behind the link models/current.onnx, which a battle loads
+	           at its start.
+Either way a record says which version played (the start event's "model"), so stale records can be dropped.
 """
 import json
 import os
@@ -29,34 +34,56 @@ from pathlib import Path
 
 from . import generator, play, real_games
 from .data import parse_record
+from .inference import InferenceServer
 
 KEEP_VERSIONS = 6  # the newest model versions kept for the actors (older ones are deleted unless a league snapshot)
 LEAGUE_EVERY = 50  # every this many versions one is kept for good, as a past opponent
 
 
 class ActorPool:
-	def __init__(self, config, out, generated_games):
+	def __init__(self, config, out, generated_games, model_kwargs=None):
 		self.config = config
 		self.models = out / "models"
 		self.models.mkdir(parents=True, exist_ok=True)
 		self.link = self.models / "current.onnx"
 		self.generated_games = generated_games  # train.generated_games
 		# A resumed run goes on numbering from its newest model (else it would overwrite its league snapshots)
-		self.version = max((int(p.stem.split("_")[1]) for p in self.models.glob("model_*.onnx")), default=-1)
+		self.version = max((int(p.stem.split("_")[1]) for p in [*self.models.glob("model_*.onnx"), *self.models.glob("snapshot_*.pt")]), default=-1)
+		self.server = None
+		if config.inference == "server":
+			play.SOCKET_DIR.mkdir(parents=True, exist_ok=True)
+			self.socket = play.SOCKET_DIR / f"infer-{os.getpid()}.sock"
+			self.server = InferenceServer(self.socket, device=inference_device(config.inference_device), model_kwargs=model_kwargs, threads=config.inference_threads)
+			import torch
+
+			for path in sorted(self.models.glob("snapshot_*.pt")):  # the league of a resumed run
+				self.server.set_model(path.stem.replace("snapshot_", "v"), int(path.stem.split("_")[1]), torch.load(path, map_location="cpu"))
 		self.buffer = []  # dicts: record, source, game, version, decisions
 		self.lock = threading.Condition()
 		self.stop = threading.Event()
 		self.running = threading.Event()  # cleared while the learner evaluates: generated actors start no new battle
 		self.running.set()
 		self.stats = {"failures": 0, "dropped_stale": 0, "battles": {"generated": 0, "real": 0}, "last_failure": ""}
-		self.server = play.RecordServer()
+		self.records = play.RecordServer()
 		self.threads = []
 
 	# ---- models ----
 
-	def publish(self, export_to):
-		"""A new model version: export_to(path) writes it; the link is switched to it atomically."""
+	def publish(self, model, export_to):
+		"""A new model version: the server gets the weights of model, or export_to(path) writes it and the link is
+		switched to it atomically."""
 		self.version += 1
+		if self.server:
+			self.server.set_model("current", self.version, model)
+			if self.version % LEAGUE_EVERY == 0:  # kept for good, as a past opponent
+				import torch
+
+				state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+				torch.save(state, self.models / f"snapshot_{self.version:05d}.pt")
+				self.server.set_model(f"v{self.version}", self.version, state)
+			with self.lock:
+				self.lock.notify_all()
+			return
 		path = self.models / f"model_{self.version:05d}.onnx"
 		export_to(path)
 		temporary = self.models / f".current-{self.version}.onnx"
@@ -71,13 +98,21 @@ class ActorPool:
 			self.lock.notify_all()
 
 	def past_versions(self):
+		"""The league's past versions: server model names ("v350") or ONNX files."""
+		if self.server:
+			return [f"v{int(p.stem.split('_')[1])}" for p in sorted(self.models.glob("snapshot_*.pt")) if int(p.stem.split("_")[1]) < self.version]
 		return sorted(p for p in self.models.glob("model_*.onnx") if int(p.stem.split("_")[1]) % LEAGUE_EVERY == 0 and int(p.stem.split("_")[1]) < self.version)
 
 	@staticmethod
 	def version_of(record):
+		"""The version that played: "model_<v>.onnx" (ONNX) or "remote:<name>@<v>" (the inference server)."""
 		start = next((e for e in record.events if e.get("event") == "start"), {})
-		match = re.search(r"model_(\d+)\.onnx", start.get("model", ""))
-		return int(match.group(1)) if match else -1
+		match = re.search(r"model_(\d+)\.onnx|@(\d+)$", start.get("model", ""))
+		return int(match.group(1) or match.group(2)) if match else -1
+
+	def inference_settings(self):
+		"""The settings (env) that send a game's battles to the inference server, if there is one."""
+		return (("ALPHA_BATTLE_INFERENCE_SOCKET", str(self.socket)),) if self.server else ()
 
 	# ---- actors ----
 
@@ -95,7 +130,9 @@ class ActorPool:
 		self.stop.set()
 		for t in self.threads:
 			t.join(timeout=60)
-		self.server.__exit__(None, None, None)
+		self.records.__exit__(None, None, None)
+		if self.server:
+			self.server.close()
 
 	def _add(self, records, source, game):
 		with self.lock:
@@ -145,9 +182,10 @@ class ActorPool:
 			files = []
 			try:
 				games, files = self.generated_games([scenario], f"actor{index}_{n}", self.config, our_sides=(our_side,), opponent=opponent, temperature=1.0)
-				game = games[0]
+				game = play.replace(games[0], settings=games[0].settings + self.inference_settings())
 				if past_model is not None:  # the other side is our AI with an older model, not recorded
-					game = play.replace(game, settings=game.settings + ((f"ALPHA_BATTLE_MODEL_{game.colors[1 - our_side]}", str(past_model)),))
+					key = "ALPHA_BATTLE_INFERENCE_MODEL" if self.server else "ALPHA_BATTLE_MODEL"
+					game = play.replace(game, settings=game.settings + ((f"{key}_{game.colors[1 - our_side]}", str(past_model)),))
 				game = play.replace(game, sampler_seed=rng.randrange(2**31))
 				records = play.play([game], self.link)
 				self._add(records, "generated", f"g{index}_{n}")
@@ -166,7 +204,7 @@ class ActorPool:
 				time.sleep(1)
 				continue
 			n += 1
-			process = real_games.start_game(rng.choice(maps), self.link, self.server.path, f"r{index}_{n}", rng.randrange(2**31), max_seconds=self.config.real_game_seconds)
+			process = real_games.start_game(rng.choice(maps), self.link, self.records.path, f"r{index}_{n}", rng.randrange(2**31), max_seconds=self.config.real_game_seconds, settings=self.inference_settings())
 			while process.poll() is None and not self.stop.is_set():
 				time.sleep(1)
 			if process.poll() is None:  # training is over
@@ -184,7 +222,7 @@ class ActorPool:
 	def _collector(self):
 		while not self.stop.is_set():
 			time.sleep(1)
-			for key, records in self.server.drain().items():
+			for key, records in self.records.drain().items():
 				parsed = []
 				for data in records:
 					try:
@@ -251,3 +289,13 @@ class ActorPool:
 		pick("real", decisions)  # one source short: the other fills the update
 		pick("generated", decisions)
 		return chosen, per_game, taken
+
+
+def inference_device(name):
+	"""The inference server's device: "auto" is CUDA when there is one, else the CPU (on Apple's GPU this model's many
+	small operations run slower than on a few CPU threads, and it cannot be shared with the learner's thread)."""
+	if name != "auto":
+		return name
+	import torch
+
+	return "cuda" if torch.cuda.is_available() else "cpu"

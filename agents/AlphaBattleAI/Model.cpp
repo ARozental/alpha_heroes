@@ -1,9 +1,12 @@
 #include "StdInc.h"
 #include "Model.h"
+#include "InferenceClient.h"
 
 #include <onnxruntime_cxx_api.h>
 
+#include <climits>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -192,5 +195,66 @@ OutputTensors BattleModel::run(const InputTensors & inputs) const
 			if(std::isnan(v))
 				throw std::runtime_error(std::string("model output '") + OUTPUTS[o].name + "' contains NaN");
 	}
+	return out;
+}
+
+RemoteBattleModel::RemoteBattleModel(const std::string & socketPath, const std::string & name)
+	: client(std::make_unique<InferenceClient>(socketPath, "battle", CONTRACT_HASH))
+	, name(name)
+{
+}
+
+RemoteBattleModel::~RemoteBattleModel() = default;
+
+uint32_t RemoteBattleModel::version() const
+{
+	std::string none;
+	return client->request(name, 0, std::string(), none);
+}
+
+OutputTensors RemoteBattleModel::run(const InputTensors & inputs) const
+{
+	// The wire encoding (inference.py): every input of the contract in order, a bool as one byte, an int64 as an int32
+	std::string encoded;
+	for(int i = 0; i < static_cast<int>(In::COUNT); ++i)
+	{
+		const auto in = static_cast<In>(i);
+		const auto & data = inputs.data(in);
+		if(spec(in).dtype == DType::BOOL)
+		{
+			for(const auto v : data)
+				encoded.push_back(static_cast<char>(v != 0));
+			continue;
+		}
+		const auto start = encoded.size();
+		encoded.resize(start + 4 * data.size());
+		for(size_t k = 0; k < data.size(); ++k)
+		{
+			if(data[k] < INT32_MIN || data[k] > INT32_MAX)
+				throw std::runtime_error(std::string("input '") + spec(in).name + "' is out of the int32 range of the inference wire");
+			const auto v = static_cast<int32_t>(data[k]);
+			std::memcpy(encoded.data() + start + 4 * k, &v, 4);
+		}
+	}
+	std::string reply;
+	client->request(name, 1, encoded, reply);
+
+	OutputTensors out;
+	size_t offset = 0;
+	for(int o = 0; o < static_cast<int>(Out::COUNT); ++o)
+	{
+		const auto n = static_cast<size_t>(numel(OUTPUTS[o]));
+		if(reply.size() < offset + 4 * n)
+			throw std::runtime_error("inference server: the reply is shorter than the contract's outputs");
+		auto & dst = out.data(static_cast<Out>(o));
+		dst.resize(n);
+		std::memcpy(dst.data(), reply.data() + offset, 4 * n);
+		offset += 4 * n;
+		for(float v : dst)
+			if(std::isnan(v))
+				throw std::runtime_error(std::string("model output '") + OUTPUTS[o].name + "' contains NaN");
+	}
+	if(offset != reply.size())
+		throw std::runtime_error("inference server: the reply is longer than the contract's outputs");
 	return out;
 }

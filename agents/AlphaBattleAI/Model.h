@@ -11,9 +11,20 @@ namespace Ort
 struct Session;
 }
 
-/// An ONNX battle model that implements the contract in Schema.generated.h.
+class InferenceClient;
+
+/// A battle model of the contract in Schema.generated.h: an ONNX file (BattleModel) or the training's inference server
+/// (RemoteBattleModel)
+class IBattleModel
+{
+public:
+	virtual ~IBattleModel() = default;
+	virtual AlphaSchema::OutputTensors run(const AlphaSchema::InputTensors & inputs) const = 0;
+};
+
+/// An ONNX battle model.
 /// load() rejects files whose schema version, contract hash, inputs or outputs differ.
-class BattleModel
+class BattleModel : public IBattleModel
 {
 	std::unique_ptr<Ort::Session> session;
 	std::vector<std::string> inputNames; // inputs the model declares, all from the contract
@@ -28,5 +39,21 @@ public:
 	/// it points at now is the one returned. Throws std::runtime_error on mismatch
 	static std::shared_ptr<BattleModel> load(const std::string & path);
 
-	AlphaSchema::OutputTensors run(const AlphaSchema::InputTensors & inputs) const;
+	AlphaSchema::OutputTensors run(const AlphaSchema::InputTensors & inputs) const override;
+};
+
+/// The named model of the inference server (battle_model/inference.py, family "battle"): the trainer's live weights
+/// ("current") or a version it keeps (e.g. "v350"), run for every game in batches. No ONNX session in the game.
+class RemoteBattleModel : public IBattleModel
+{
+	std::unique_ptr<InferenceClient> client;
+	std::string name;
+
+public:
+	RemoteBattleModel(const std::string & socketPath, const std::string & name);
+	~RemoteBattleModel();
+
+	AlphaSchema::OutputTensors run(const AlphaSchema::InputTensors & inputs) const override;
+	/// The version of the weights the server runs under this name now
+	uint32_t version() const;
 };

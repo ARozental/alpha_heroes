@@ -20,7 +20,7 @@ VCMI_LIB_NAMESPACE_BEGIN
 class CPlayerBattleCallback;
 VCMI_LIB_NAMESPACE_END
 
-class BattleModel;
+class IBattleModel;
 
 /// Battle AI that plays with an ONNX model implementing battle_model's contract.
 ///
@@ -54,7 +54,9 @@ class AlphaBattleAI : public CBattleGameInterface
 	std::shared_ptr<CBattleCallback> cb;
 	std::shared_ptr<Environment> env;
 	std::shared_ptr<CBattleGameInterface> fallback; // only ALPHA_BATTLE_DELEGATE's AI (baseline evals): no StupidAI
-	std::shared_ptr<BattleModel> model;
+	std::shared_ptr<IBattleModel> model;
+	std::string inferenceSocket; // ALPHA_BATTLE_INFERENCE_SOCKET: the training's inference server plays instead of an ONNX file
+	std::string inferenceName; // ALPHA_BATTLE_INFERENCE_MODEL: which of its models ("current", the default, or e.g. "v350")
 	std::string modelPath; // ALPHA_BATTLE_MODEL; reloaded at a battle's start when the file changed (training updates it)
 	std::filesystem::file_time_type modelTime{};
 	std::string modelFile; // the file modelPath pointed at when the model was loaded: the version that plays

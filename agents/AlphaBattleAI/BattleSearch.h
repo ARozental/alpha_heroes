@@ -14,7 +14,7 @@ class CStack;
 class Environment;
 VCMI_LIB_NAMESPACE_END
 
-class BattleModel;
+class IBattleModel;
 struct ChosenAction;
 struct EncodedBattle;
 
@@ -41,7 +41,7 @@ public:
 
 	/// root: the battle at the decision (its dice are replaced in every simulation); start: the start of the
 	/// battle as the reward counts it (army values and mana; armyEnd, manaEnd, winner and result are unused)
-	BattleSearchEnv(const BattleSimulation & root, const BattleModel & model, const Environment & env, const AlphaReward::BattleEnd & start, int roundCap);
+	BattleSearchEnv(const BattleSimulation & root, const IBattleModel & model, const Environment & env, const AlphaReward::BattleEnd & start, int roundCap);
 
 	State root(uint64_t seed);
 	bool terminal(const State & s) const;
@@ -63,7 +63,7 @@ public:
 
 private:
 	const BattleSimulation & rootSim;
-	const BattleModel & model;
+	const IBattleModel & model;
 	const Environment & env;
 	AlphaReward::BattleEnd start;
 	AttackValueStats attackValues;
