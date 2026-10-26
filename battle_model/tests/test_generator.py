@@ -101,3 +101,16 @@ def test_battle_types(drawn):
 	assert all(len(s["sides"]) == 1 and "town" not in s and s["neutrals"]["count"] >= 1 for s in neutrals)
 	assert all(len(s["sides"]) == 2 for s in scenarios if "neutrals" not in s)
 	assert all(s["terrain"] not in generator.UNSUPPORTED_TERRAINS for s in scenarios)
+
+
+def test_hard_cases(drawn):
+	cfg, w, scenarios = drawn
+	hard = [s for s in scenarios if s["_about"].startswith("hard one_big_stack")]
+	assert 0.03 < len(hard) / len(scenarios) < 0.2  # cfg hard.p of them
+	h = cfg["hard"]["one_big_stack"]
+	for s in hard:
+		side = s["sides"][0]
+		assert s["neutrals"]["upgraded_stack"] is False and side["spellbook"] and side["mana_fraction"] == 1.0
+		ratio = generator.creature_value(s["neutrals"]["creature"], w) * s["neutrals"]["count"] / generator.army_value(side["army"], w)
+		assert h["value_ratio"]["min"] * 0.8 < ratio < h["value_ratio"]["max"] * 1.2  # counts are whole creatures
+		assert set(side["spells"]) & set(h["spells"])

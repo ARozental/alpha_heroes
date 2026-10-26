@@ -243,14 +243,21 @@ def draw_hero(rng, army_faction, phase, cfg, w):
 
 
 def sample(rng, cfg=None, w=None):
-	"""One random battle: a scenario dict, with "_about" saying what was drawn."""
+	"""One random battle: a scenario dict, with "_about" saying what was drawn; a share of them (cfg "hard") are hard
+	cases."""
 	cfg = cfg or load_config()
 	w = w or world()
+	if rng.random() < cfg["hard"]["p"]:
+		return HARD_KINDS[choose(rng, cfg["hard"]["kinds"])](rng, cfg, w)
+	return sample_type(rng, cfg, w)
+
+
+def sample_type(rng, cfg, w, battle_type=None):
+	"""sample's ordinary battle, of battle_type if given."""
 	terrain = choose(rng, cfg["terrain"])
 	while terrain in UNSUPPORTED_TERRAINS:
 		terrain = choose(rng, cfg["terrain"])
-	battle_type = choose(rng, cfg["battle_type"])
-	while battle_type in UNSUPPORTED_BATTLE_TYPES:
+	while battle_type is None or battle_type in UNSUPPORTED_BATTLE_TYPES:
 		battle_type = choose(rng, cfg["battle_type"])
 	phase_name = rng.choices([k for k in cfg["phase"]], weights=[p["p"] for p in cfg["phase"].values()])[0]
 	phase = cfg["phase"][phase_name]
@@ -295,6 +302,30 @@ def sample(rng, cfg=None, w=None):
 		about += f", {scenario['town']['fortification']} {town}" + ("" if "hero" in sides[1] else ", garrison only")
 	scenario["_about"] = about
 	return scenario
+
+
+def hard_one_big_stack(rng, cfg, w):
+	"""A hero against one big stack (cfg hard.one_big_stack): an ordinary hero-vs-neutrals battle, then the monsters
+	replaced by many of one low or middle level creature about as strong as the army, and the hero given a spellbook,
+	full mana and a few of the spells that decide such a fight."""
+	h = cfg["hard"]["one_big_stack"]
+	scenario = sample_type(rng, cfg, w, "hero_vs_neutrals")
+	side = scenario["sides"][0]
+	key = None
+	while key is None:
+		key = draw_creature(rng, between(rng, h["level"]), rng.choice(w["factions"]), "main_faction", 0.5, w)
+	value = army_value(side["army"], w) * rng.uniform(h["value_ratio"]["min"], h["value_ratio"]["max"])
+	scenario["neutrals"] = {"creature": key, "count": max(1, round(value / creature_value(key, w))), "upgraded_stack": False}
+	level_of = {short(s["key"]): s["level"] for s in w["spells"]}
+	top = LEARNABLE[dict(side["secondary_skills"]).get("wisdom", 0)]
+	pool = [s for s in h["spells"] if level_of[s] <= top]
+	extra = rng.sample(pool, min(len(pool), between(rng, h["extra_spells"])))
+	side.update(spellbook=True, spells=sorted(set(side.get("spells", [])) | set(extra)), mana_fraction=1.0)
+	scenario["_about"] = f"hard one_big_stack, army {army_value(side['army'], w):.0f} vs {scenario['neutrals']['count']} {key} ({value:.0f} gold), spells {', '.join(extra)}"
+	return scenario
+
+
+HARD_KINDS = {"one_big_stack": hard_one_big_stack}
 
 
 def main():
