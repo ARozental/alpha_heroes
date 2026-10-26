@@ -192,14 +192,14 @@ COLUMNS = [
 ] + [f"{side}_share_{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS] + [
 	f"{side}_{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")
 ] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "learning_rate"] + [
-	f"train_{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "mana_left_on_loss")
+	f"train_{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")
 ]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
 # error. decisions: all decisions of the epoch; rounds: attack + defence battle rounds, averaged over the games.
 
 # progress.csv column -> TensorBoard tag
 TENSORBOARD_TAGS = {
-	**{f"train_{name}": f"train_failures/{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "mana_left_on_loss")},
+	**{f"train_{name}": f"train_failures/{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")},
 	**{name: f"actors/{name}" for name in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures")},
 	"learning_rate": "stability/learning_rate",
 	**{f"{side}_share_{kind.lower()}": f"actions_{side}/{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS},
@@ -221,7 +221,7 @@ EVAL_COLUMNS = [
 	"attack_vs_baseline", "defence_vs_baseline", "mean_vs_baseline", "attack_baseline_reward", "defence_baseline_reward", "seconds",
 	"attack_army_kept", "attack_army_killed", "defence_army_kept", "defence_army_killed",
 	"attack_baseline_army_kept", "attack_baseline_army_killed", "defence_baseline_army_kept", "defence_baseline_army_killed",
-	"escape_while_ahead", "shooter_not_shooting", "worthless_cast", "mana_left_on_loss",
+	"escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss",
 	"score_generated", "score_neutrals", "score_real", "score_castle",
 ]  # eval.csv, greedy battles per side: win rate, mean reward -1..1, outcomes; and minus the eval opponent's own reward on
 # the same seeds. army_kept / army_killed: shares of our army kept and of the enemy's lost (data.BattleSummary), ours
@@ -242,7 +242,7 @@ def log_eval_tensorboard(writer, row, opponent=""):
 		writer.add_scalar(f"{prefix}/total_score", float(row["total_score"]), epoch)
 	else:  # (old runs: one opponent, its score is the total)
 		writer.add_scalar("eval/total_score", float(row["total_score"]), epoch)
-	for column in (*(f"score_{k}" for k in EVAL_SETS), "escape_while_ahead", "shooter_not_shooting", "worthless_cast", "mana_left_on_loss"):
+	for column in (*(f"score_{k}" for k in EVAL_SETS), "escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss"):
 		if row.get(column) not in (None, "") and row[column] == row[column]:  # skip nan: a set or a case that never came up
 			writer.add_scalar(f"{prefix}/{column}", float(row[column]), epoch)
 	for name in ("attack", "defence", "mean"):
@@ -403,9 +403,11 @@ def failure_modes(records):
 	shooter_not_shooting  decisions of a unit that could shoot where it moved, waited or defended instead
 	worthless_cast        hero casts at a unit or hex that lose us value (predicted value < 0: e.g. a Frost Ring on our own
 	                      stacks); 0 is no sign: buffs, debuffs and summons change no health when cast (Slow, Shield)
-	mana_left_on_loss     the share of our mana left unspent in battles we lost"""
+	cast_skipped_on_loss  in battles we lost, the share of the rounds our hero could cast in (one of our decisions had a
+	                      hero spell legal) where it cast nothing: a hero that died early counts only the rounds it was
+	                      there for (the share of mana left unspent counted those too)"""
 	from .data import summarize
-	counts = {name: [0, 0] for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "mana_left_on_loss")}
+	counts = {name: [0, 0] for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")}
 	for r in records:
 		t = r.tensors
 		for i, a in enumerate(r.actions):
@@ -422,11 +424,15 @@ def failure_modes(records):
 				if chosen is not None:
 					counts["worthless_cast"][0] += chosen < 0
 					counts["worthless_cast"][1] += 1
-		s = summarize(r.events)
-		start = next((e for e in r.events if e.get("event") == "start"), {})
-		if s.outcome == Outcome.LOSS and start.get("our_mana_max", 0) > 0:
-			counts["mana_left_on_loss"][0] += min(1.0, r.events[-1].get("our_mana", 0) / start["our_mana_max"])
-			counts["mana_left_on_loss"][1] += 1
+		if summarize(r.events).outcome == Outcome.LOSS:
+			could, cast = set(), set()
+			for i, a in enumerate(r.actions):
+				if t["m_type"][i, ActionType.HERO_SPELL]:
+					could.add(int(t["g_round"][i]))
+				if a["type"] == ActionType.HERO_SPELL:
+					cast.add(int(t["g_round"][i]))
+			counts["cast_skipped_on_loss"][0] += len(could - cast)
+			counts["cast_skipped_on_loss"][1] += len(could)
 	return {name: round(hit / n, 4) if n else float("nan") for name, (hit, n) in counts.items()}
 
 
@@ -665,7 +671,7 @@ def train(config, resume=False):
 		log_eval_tensorboard(writer, row, config_for.eval_opponent)
 		print(f"eval  {epoch:4d}  total score {row['total_score']:+.3f}  vs {config_for.eval_opponent}, greedy: attack won {row['attack_win_rate']:.2f} {row['attack_reward']:+.3f} ({row['attack_vs_baseline']:+.3f} vs its own)  defence won {row['defence_win_rate']:.2f} {row['defence_reward']:+.3f} ({row['defence_vs_baseline']:+.3f} vs its own)  {row['seconds']}s"
 			f"  | sets: " + ", ".join(f"{k} {row[f'score_{k}']:+.3f}" for k in EVAL_SETS if row[f"score_{k}"] == row[f"score_{k}"]) +
-			f"  | failures: escape ahead {row['escape_while_ahead']}, shooter idle {row['shooter_not_shooting']}, worthless cast {row['worthless_cast']}, mana left on loss {row['mana_left_on_loss']}", flush=True)
+			f"  | failures: escape ahead {row['escape_while_ahead']}, shooter idle {row['shooter_not_shooting']}, worthless cast {row['worthless_cast']}, cast skipped on loss {row['cast_skipped_on_loss']}", flush=True)
 		return row
 
 	if config.eval_every and first_epoch == 1:
