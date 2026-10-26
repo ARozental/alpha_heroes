@@ -78,7 +78,7 @@ class TrainConfig:
 	eval_neutral_scenarios: int = 0  # generator evals: also this many battles against wandering monsters, from both sides
 	eval_real_scenarios: int = 0  # generator evals: also the first this many battles of real games (REAL_EVAL), both sides
 	eval_castle_seeds: int = 0  # generator evals: also castle_vs_inferno (`scenario`) on this many EVAL_SEEDS: regressions
-	eval_extra_opponents: tuple = ()  # also evaluated against these (eval_<name>.csv); the measure is eval_opponent (BattleAI)
+	eval_extra_opponents: tuple = ("MMAI",)  # also evaluated against these (eval_<name>.csv, TensorBoard eval_<name>/)
 	# Training in updates from many battles at once (actors.py) instead of epochs of games_per_side battles: an
 	# "epoch" is then one update of decisions_per_update decisions, taken from the actors' buffer
 	actors: bool = False
