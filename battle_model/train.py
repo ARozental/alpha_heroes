@@ -123,6 +123,12 @@ class TrainConfig:
 	ppo_passes: int = 2  # optimisation passes over each epoch's decisions; PPO reuses its data a few times
 	batch_size: int = 256  # minibatch of decisions: on the GPU 1.15 ms a decision at 512, 1.8 at 64 (2026-10-26)
 	grad_clip: float = 0.5  # max gradient norm, the usual PPO value
+	# KL control, so the step size does not hang on a hand-picked learning rate: an update stops its steps once its KL
+	# (old against new policy) passes 1.5x target_kl, and after each update the learning rate's scale is cut by 1.5 when
+	# its KL was over 2x target_kl and raised by 1.5 when under half of it (within 0.1..10x). 0 = off. With a fixed
+	# rate, v15-base-lr2 (2e-4, 3200-decision updates) went from KL 0.008 to 0.03-0.09 as its policy sharpened, its
+	# entropy rose and its evals fell.
+	target_kl: float = 0.015
 	checkpoint_every: int = 0  # also keep checkpoint_<epoch>.pt every this many epochs; 0 = only checkpoint_latest.pt
 	attempts: int = 3  # tries per epoch when a battle fails or stalls before the run stops
 	keep_records: bool = False  # also write every battle record to <run dir>/records (debugging; ~0.3 MB a decision on disk)
@@ -194,7 +200,7 @@ COLUMNS = [
 	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds",
 ] + [f"{side}_share_{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS] + [
 	f"{side}_{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")
-] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "learning_rate"] + [
+] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "learning_rate", "ppo_steps"] + [
 	f"train_{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")
 ]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
@@ -205,6 +211,7 @@ TENSORBOARD_TAGS = {
 	**{f"train_{name}": f"train_failures/{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")},
 	**{name: f"actors/{name}" for name in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures")},
 	"learning_rate": "stability/learning_rate",
+	"ppo_steps": "stability/ppo_steps",  # fewer than the passes' when the KL control stopped the update
 	**{f"{side}_share_{kind.lower()}": f"actions_{side}/{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS},
 	**{f"{side}_{name}": f"credit_{side}/{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")},
 	"mean_reward": "reward/mean", "attack_reward": "reward/attack", "defence_reward": "reward/defence",
@@ -602,9 +609,9 @@ def model_kwargs(config):
 	return {"architecture": "v1", "dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features, "chain_final_value": config.model_chain_final_value, "kill_rule": config.model_kill_rule}
 
 
-def save_checkpoint(path, model, optimizer, epoch, config, elapsed=0.0):
-	"""elapsed: the training's seconds so far (run_hours counts them across resumes)."""
-	torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "model_kwargs": model_kwargs(config), "elapsed": elapsed}, path)
+def save_checkpoint(path, model, optimizer, epoch, config, elapsed=0.0, lr_scale=1.0):
+	"""elapsed: the training's seconds so far (run_hours counts them across resumes); lr_scale: the KL control's."""
+	torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "model_kwargs": model_kwargs(config), "elapsed": elapsed, "lr_scale": lr_scale}, path)
 
 
 def train(config, resume=False):
@@ -618,6 +625,7 @@ def train(config, resume=False):
 	optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 	first_epoch = 1
 	elapsed_before = 0.0
+	lr_scale = 1.0  # the KL control's (target_kl)
 	latest = out / "checkpoint_latest.pt"
 	if resume and latest.exists():
 		state = torch.load(latest, map_location=device)
@@ -628,6 +636,7 @@ def train(config, resume=False):
 		optimizer.load_state_dict(state["optimizer"])
 		first_epoch = state["epoch"] + 1
 		elapsed_before = state.get("elapsed", 0.0)
+		lr_scale = state.get("lr_scale", 1.0)
 		print(f"resuming after epoch {state['epoch']} ({elapsed_before / 3600:.2f} h)")
 
 	battle_map = None if config.generator else play.build_map(config.scenario, variant=config.run)
@@ -738,7 +747,10 @@ def train(config, resume=False):
 			if config.lr_schedule == "linear":
 				done = min(1.0, elapsed() / (config.run_hours * 3600)) if config.run_hours else (epoch - 1) / config.epochs
 				for group in optimizer.param_groups:
-					group["lr"] = config.learning_rate * (1 - (1 - config.lr_final_fraction) * done)
+					group["lr"] = config.learning_rate * (1 - (1 - config.lr_final_fraction) * done) * lr_scale
+			elif config.target_kl:
+				for group in optimizer.param_groups:
+					group["lr"] = config.learning_rate * lr_scale
 			actor_stats = {}
 			if pool:
 				records, actor_stats = pool.take(config.decisions_per_update)
@@ -761,7 +773,10 @@ def train(config, resume=False):
 			if epoch_data is not None and hasattr(model, "facts"):  # the features: once per decision, not once per pass
 				chunks = [model.facts(select(epoch_data["inputs"], torch.arange(i, i + 256, device=device).clamp(max=len(examples) - 1))) for i in range(0, len(examples), 256)]
 				epoch_data["facts"] = {key: torch.cat([c[key] for c in chunks])[: len(examples)] for key in chunks[0]}
+			stopped = False
 			for _ in range(config.ppo_passes if examples else 0):
+				if stopped:
+					break
 				order = torch.randperm(len(examples)).to(device)
 				if len(examples) >= config.batch_size:
 					order = order[: len(examples) - len(examples) % config.batch_size]
@@ -779,7 +794,13 @@ def train(config, resume=False):
 					for key in parts_sum:
 						parts_sum[key] += parts[key]  # summed on the device: no sync each step
 					batches += 1
+					if config.target_kl and float(parts["approx_kl"]) > 1.5 * config.target_kl:
+						stopped = True  # this update has moved the policy far enough
+						break
 			model.eval()
+			if config.target_kl and batches:
+				kl = float(parts_sum["approx_kl"]) / batches
+				lr_scale = min(10.0, lr_scale * 1.5) if kl < config.target_kl / 2 else max(0.1, lr_scale / 1.5) if kl > 2 * config.target_kl else lr_scale
 			if pool:
 				pool.publish(model, lambda path: export(cpu_copy(model), path))
 			else:
@@ -809,6 +830,7 @@ def train(config, resume=False):
 				"train_seconds": round(train_seconds, 1),
 				**{k: actor_stats.get(k, "") for k in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures")},
 				"learning_rate": round(optimizer.param_groups[0]["lr"], 8),
+				"ppo_steps": batches,
 				**{f"train_{k}": v for k, v in failure_modes(records).items()},  # the same signs of dumb play, in training
 			}
 			for side, name in ((0, "attack"), (1, "defence")):
@@ -846,10 +868,10 @@ def train(config, resume=False):
 				if pool:
 					pool.resume()
 				last_eval = time.time()
-				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed())  # every evaluated model
-			save_checkpoint(latest, model, optimizer, epoch, config, elapsed())
+				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale)  # every evaluated model
+			save_checkpoint(latest, model, optimizer, epoch, config, elapsed(), lr_scale)
 			if config.checkpoint_every and epoch % config.checkpoint_every == 0:
-				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed())
+				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale)
 	finally:
 		if pool:
 			pool.close()
