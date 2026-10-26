@@ -77,6 +77,7 @@ class TrainConfig:
 	generator: bool = False
 	eval_scenarios: int = 10
 	eval_neutral_scenarios: int = 0  # generator evals: also this many battles against wandering monsters, from both sides
+	eval_hard_scenarios: int = 8  # generator evals: also this many hard cases (generator.HARD_KINDS in turn), both sides
 	eval_real_scenarios: int = 0  # generator evals: also the first this many battles of real games (REAL_EVAL), both sides
 	eval_castle_seeds: int = 0  # generator evals: also castle_vs_inferno (`scenario`) on this many EVAL_SEEDS: regressions
 	eval_extra_opponents: tuple = ("MMAI",)  # also evaluated against these (eval_<name>.csv, TensorBoard eval_<name>/)
@@ -359,15 +360,19 @@ def generated_games(scenarios, label, config, our_sides=(0,), **game):
 
 def eval_scenarios(config):
 	"""The generated eval battles, drawn from EVAL_GENERATOR_SEED: the first config.eval_scenarios two-sided ones,
-	then the first config.eval_neutral_scenarios against wandering monsters; each is played from both sides."""
+	then the first config.eval_neutral_scenarios against wandering monsters (both ordinary battles: the same as before
+	the generator had hard cases), then config.eval_hard_scenarios hard cases; each is played from both sides."""
+	cfg, w = generator.load_config(), generator.world()
 	rng, two_sided, neutral = random.Random(EVAL_GENERATOR_SEED), [], []
 	while len(two_sided) < config.eval_scenarios or len(neutral) < config.eval_neutral_scenarios:
-		scenario = generator.sample(rng)
+		scenario = generator.sample_type(rng, cfg, w)
 		if "neutrals" in scenario and len(neutral) < config.eval_neutral_scenarios:
 			neutral.append(scenario)
 		elif "neutrals" not in scenario and len(two_sided) < config.eval_scenarios:
 			two_sided.append(scenario)
-	return two_sided + neutral
+	kinds, hard_rng = sorted(generator.HARD_KINDS), random.Random(EVAL_GENERATOR_SEED + 1)
+	hard = [generator.HARD_KINDS[kinds[i % len(kinds)]](hard_rng, cfg, w) for i in range(config.eval_hard_scenarios)]
+	return two_sided + neutral + hard
 
 
 REAL_EVAL = ROOT / "battle_model" / "scenarios" / "real_eval.json"  # battles of real games (real_games.py --collect)
@@ -388,13 +393,13 @@ def eval_name(config, main_opponent):
 	return "" if config.eval_opponent == main_opponent else f"_{config.eval_opponent}"
 
 
-EVAL_SETS = ("generated", "neutrals", "real", "castle")
+EVAL_SETS = ("generated", "neutrals", "real", "castle", "hard")
 
 
 def eval_set(game):
 	"""Which eval set a game is of: real battles, castle_vs_inferno, generated against neutrals, other generated."""
 	about = play.scenario_of(game.scenario).get("_about", "")
-	return "real" if about.startswith("real") else "castle" if about.startswith("castle") else "neutrals" if about.startswith("hero_vs_neutrals") else "generated"
+	return "real" if about.startswith("real") else "castle" if about.startswith("castle") else "hard" if about.startswith("hard") else "neutrals" if about.startswith("hero_vs_neutrals") else "generated"
 
 
 def failure_modes(records):
