@@ -238,3 +238,26 @@ def test_training_with_precomputed_facts_matches_the_exported_forward():
 		assert torch.equal(torch.isneginf(a), torch.isneginf(b)), spec.name
 		finite = torch.isfinite(a)
 		assert torch.allclose(a[finite], b[finite], atol=1e-6), spec.name
+
+
+def test_history_reaches_the_outputs():
+	"""The event log and the enemy hero's seen spells change the model's outputs; an empty log is fine. With random
+	weights: an untrained model's heads start from their rule priors, the trunk's part at 0, so nothing reaches them."""
+	torch.manual_seed(1)
+	model = BattleModel().eval()
+	with torch.no_grad():
+		for p in model.parameters():
+			p.add_(0.05 * torch.randn_like(p))
+	x = random_inputs(batch=1, seed=3)
+	base = run(model, x)
+	no_events = dict(x, e_present=np.zeros_like(x["e_present"]))
+	assert all(np.isfinite(run(model, no_events)["value"]).all() for _ in (0,))
+	enemy = 1 - int(x["g_our_side"][0])
+	seen = {k: v.copy() for k, v in x.items()}
+	seen["h_seen_spells"][0, enemy] = 0
+	seen["h_seen_spells"][0, enemy, 15] = 2
+	finite = lambda t: torch.nan_to_num(t, neginf=0.0)
+	for changed in (no_events, seen):
+		out = run(model, changed)
+		assert not torch.allclose(finite(out["logp_move_hex"]), finite(base["logp_move_hex"])), "history did not reach the policy"
+		assert not torch.allclose(out["value"], base["value"]), "history did not reach the value"

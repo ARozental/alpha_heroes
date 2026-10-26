@@ -6,6 +6,7 @@
 #include "BattleSim.h"
 #include "Dump.h"
 #include "Encoder.h"
+#include "History.h"
 #include "Policy.h"
 #include "Reward.h"
 
@@ -55,6 +56,7 @@ class AlphaBattleAI : public CBattleGameInterface
 	std::shared_ptr<Environment> env;
 	std::shared_ptr<CBattleGameInterface> fallback; // only ALPHA_BATTLE_DELEGATE's AI (baseline evals): no StupidAI
 	std::shared_ptr<IBattleModel> model;
+	BattleHistory history; // what the battle showed so far (History.h), for the encoder
 	std::string inferenceSocket; // ALPHA_BATTLE_INFERENCE_SOCKET: the training's inference server plays instead of an ONNX file
 	std::string inferenceName; // ALPHA_BATTLE_INFERENCE_MODEL: which of its models ("current", the default, or e.g. "v350")
 	std::string modelPath; // ALPHA_BATTLE_MODEL; reloaded at a battle's start when the file changed (training updates it)

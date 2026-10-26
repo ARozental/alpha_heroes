@@ -1,5 +1,6 @@
 #include "StdInc.h"
 #include "Encoder.h"
+#include "History.h"
 
 #include "Policy.h"
 
@@ -545,7 +546,61 @@ void encodePairDamage(EncodedBattle & e, const CPlayerBattleCallback & battle)
 }
 }
 
-EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * active, const Environment & env, PlayerColor player, const CGHeroInstance * enemyHero, const AlphaReward::BattleEnd & start)
+void encodeHistory(EncodedBattle & e, const BattleHistory & history)
+{
+	auto & t = e.tensors;
+	std::map<int64_t, int> slotOf; // unit id -> slot of this decision
+	for(int u = 0; u < MAX_UNITS; ++u)
+		if(e.units[u])
+			slotOf[e.units[u]->unitId()] = u;
+	auto slot = [&](int64_t id, int absent) { auto it = slotOf.find(id); return it == slotOf.end() ? absent : it->second; };
+	for(int u = 0; u < MAX_UNITS; ++u)
+	{
+		if(!e.units[u])
+			continue;
+		auto it = history.units.find(e.units[u]->unitId());
+		if(it == history.units.end())
+		{
+			t.set(In::u_start_count, u, e.units[u]->getCount()); // appeared since the last event
+			continue;
+		}
+		const auto & h = it->second;
+		t.set(In::u_start_count, u, h.startCount >= 0 ? h.startCount : e.units[u]->getCount());
+		t.set(In::u_dealt, u, h.dealt);
+		t.set(In::u_taken, u, h.taken);
+		t.set(In::u_kills, u, h.kills);
+		t.set(In::u_last_target, u, h.lastTarget >= 0 ? slot(h.lastTarget, -1) : -1);
+		t.set(In::u_last_round, u, h.lastRound);
+	}
+	for(int s = 0; s < N_SIDES; ++s)
+	{
+		for(int spell = 0; spell < N_SPELLS; ++spell)
+			t.set(In::h_seen_spells, s, spell, history.seenSpells[s][spell]);
+		t.set(In::h_casts, s, history.casts[s]);
+		t.set(In::h_last_cast_round, s, history.lastCastRound[s]);
+	}
+	int i = 0;
+	for(const auto & event : history.events)
+	{
+		if(i >= N_EVENTS)
+			break;
+		t.set(In::e_present, i, 1);
+		t.set(In::e_round, i, event.round);
+		t.set(In::e_side, i, event.side);
+		t.set(In::e_actor, i, event.actor == BattleHistory::HERO ? -1 : slot(event.actor, -2));
+		t.set(In::e_type, i, event.type);
+		t.set(In::e_target, i, event.target >= 0 ? slot(event.target, -1) : -1);
+		t.set(In::e_hex, i, event.hex);
+		t.set(In::e_spell, i, event.spell);
+		t.set(In::e_dealt, i, event.dealt);
+		t.set(In::e_taken, i, event.taken);
+		t.set(In::e_kills, i, event.kills);
+		t.set(In::e_lost, i, event.lost);
+		++i;
+	}
+}
+
+EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * active, const Environment & env, PlayerColor player, const CGHeroInstance * enemyHero, const AlphaReward::BattleEnd & start, const BattleHistory * history)
 {
 	EncodedBattle e;
 	auto & t = e.tensors;
@@ -578,6 +633,12 @@ EncodedBattle encodeBattle(const CPlayerBattleCallback & battle, const CStack * 
 			t.set(In::u_kept, u, remainingAfterBattle(e.units[u]));
 	encodePairDamage(e, battle);
 	encodeHeroes(t, battle, mySide, enemyHero);
+	if(history)
+		encodeHistory(e, *history);
+	else
+		for(int u = 0; u < MAX_UNITS; ++u) // no history (a search's simulated state): as if each unit was just seen
+			if(e.units[u])
+				t.set(In::u_start_count, u, e.units[u]->getCount());
 
 	std::array<bool, N_HEXES> stopping{};
 	encodeHexes(t, battle, mySide, stopping);

@@ -17,6 +17,7 @@ from .constants import (
 	MAX_EFFECTS,
 	MAX_UNITS,
 	N_ACTION_TYPES,
+	N_EVENTS,
 	EFFECT_VOCAB,
 	N_HEXES,
 	N_SECONDARY_SKILLS,
@@ -96,6 +97,13 @@ INPUTS = (
 	_i("u_effect_id", (U, K), "active effect: SpellID 0..81, -1 = empty slot", fill=-1),
 	_i("u_effect_turns", (U, K), "rounds the effect has left"),
 	_i("u_effect_value", (U, K), "raw value of the effect's first bonus"),
+	# What the battle showed of each unit so far (History.h)
+	_i("u_start_count", (U,), "creatures when first seen: at the battle's start, or when it appeared (summoned, cloned)"),
+	_i("u_dealt", (U,), "hit points of damage it dealt this battle"),
+	_i("u_taken", (U,), "hit points of damage it took this battle"),
+	_i("u_kills", (U,), "creatures it killed this battle"),
+	_i("u_last_target", (U,), "slot of the unit it last attacked or cast at, -1 if none or not among the slots", fill=-1),
+	_i("u_last_round", (U,), "round it last acted, -1 if not yet", fill=-1),
 	# Heroes, indexed by battle side
 	_i("h_present", (N_SIDES,), "1 if that side has a hero"),
 	_i("h_type", (N_SIDES,), "hero type id", fill=-1),
@@ -112,6 +120,23 @@ INPUTS = (
 	_i("h_level_progress", (N_SIDES,), "of the way from its level to the next, in thousandths; 0 for the enemy hero (its experience is hidden)"),
 	_i("h_worn_artifacts", (N_SIDES, N_WORN_SLOTS), "artifact id worn in each slot (ArtifactPosition 0..18), -1 if none; all -1 for the enemy hero (hidden)", fill=-1),
 	_i("h_artifacts", (N_SIDES,), "market price in gold of the artifacts a winner would take from the hero (reward.py; not war machines); 0 for the enemy hero (hidden)"),
+	# What the battle showed of each hero so far: an enemy hero's spells are hidden (h_spells) until it casts them
+	_i("h_seen_spells", (N_SIDES, S), "times the hero was seen casting each spell this battle"),
+	_i("h_casts", (N_SIDES,), "the hero's spell casts this battle"),
+	_i("h_last_cast_round", (N_SIDES,), "round of the hero's last cast, -1 if none yet", fill=-1),
+	# The event log: the battle's last N_EVENTS actions of both sides, newest first (History.h); e_present = 0 past them
+	_m("e_present", (N_EVENTS,), "1 if the entry holds an event"),
+	_i("e_round", (N_EVENTS,), "round of the event"),
+	_i("e_side", (N_EVENTS,), "battle side of the actor"),
+	_i("e_actor", (N_EVENTS,), "slot of the acting unit; -1 for a hero, -2 for a unit not among the slots", fill=-2),
+	_i("e_type", (N_EVENTS,), "ActionType of the action, -1 for an other one (e.g. a turn lost to bad morale)", fill=-1),
+	_i("e_target", (N_EVENTS,), "slot of the unit it attacked or cast at, -1 if none or not among the slots", fill=-1),
+	_i("e_hex", (N_EVENTS,), "its target hex, -1 if none", fill=-1),
+	_i("e_spell", (N_EVENTS,), "the spell cast (hero or creature), -1 if none", fill=-1),
+	_i("e_dealt", (N_EVENTS,), "hit points of damage the actor's side dealt in it"),
+	_i("e_taken", (N_EVENTS,), "hit points of damage the actor's side took in it (retaliation, Fire Shield, ...)"),
+	_i("e_kills", (N_EVENTS,), "creatures of the other side killed in it"),
+	_i("e_lost", (N_EVENTS,), "creatures of the actor's side lost in it"),
 	# Hexes, BattleHex index 0..186
 	_i("x_access", (H,), "EAccessibility"),
 	_i("x_obstacle_type", (H,), "EObstacleType of an obstacle on the hex, -1 if none", fill=-1),
@@ -256,6 +281,27 @@ def random_inputs(batch=1, seed=0, n_units=14):
 			x["h_mana_max"][b, side] = 100
 			x["h_skills"][b, side] = rng.integers(0, 4, N_SECONDARY_SKILLS)
 		x["h_spells"][b, x["g_our_side"][b]] = rng.integers(0, 2, S)
+		# What the battle showed so far
+		for u in range(n_units):
+			x["u_start_count"][b, u] = x["u_count"][b, u] + rng.integers(0, 500)
+			x["u_dealt"][b, u], x["u_taken"][b, u], x["u_kills"][b, u] = rng.integers(0, 5000), rng.integers(0, 5000), rng.integers(0, 100)
+			x["u_last_target"][b, u] = rng.integers(-1, n_units)
+			x["u_last_round"][b, u] = rng.integers(-1, x["g_round"][b] + 1)
+		for side in range(N_SIDES):
+			x["h_seen_spells"][b, side] = rng.integers(0, 2, S) * (rng.random(S) < 0.05)
+			x["h_casts"][b, side] = x["h_seen_spells"][b, side].sum()
+			x["h_last_cast_round"][b, side] = rng.integers(0, x["g_round"][b] + 1) if x["h_casts"][b, side] else -1
+		for e in range(rng.integers(0, N_EVENTS + 1)):
+			x["e_present"][b, e] = 1
+			x["e_round"][b, e] = rng.integers(0, x["g_round"][b] + 1)
+			x["e_side"][b, e] = rng.integers(0, 2)
+			x["e_actor"][b, e] = rng.integers(-2, n_units)
+			x["e_type"][b, e] = rng.integers(-1, T)
+			x["e_target"][b, e] = rng.integers(-1, n_units)
+			x["e_hex"][b, e] = rng.integers(-1, H)
+			x["e_spell"][b, e] = rng.integers(-1, S)
+			x["e_dealt"][b, e], x["e_taken"][b, e] = rng.integers(0, 3000), rng.integers(0, 300)
+			x["e_kills"][b, e], x["e_lost"][b, e] = rng.integers(0, 50), rng.integers(0, 10)
 		x["h_spell_mastery"][b, x["g_our_side"][b]] = rng.integers(0, 4, S)
 		x["x_access"][b] = rng.integers(0, 7, H)
 

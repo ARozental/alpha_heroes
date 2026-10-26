@@ -6,8 +6,8 @@
 
 namespace AlphaSchema
 {
-constexpr int SCHEMA_VERSION = 14;
-constexpr const char * CONTRACT_HASH = "661746b5661d42cc";
+constexpr int SCHEMA_VERSION = 15;
+constexpr const char * CONTRACT_HASH = "3f3430b67a127953";
 
 constexpr int N_HEXES = 187;
 constexpr int FIELD_WIDTH = 17;
@@ -18,6 +18,7 @@ constexpr int N_SIDES = 2;
 constexpr int N_SPELLS = 70;
 constexpr int N_SECONDARY_SKILLS = 28;
 constexpr int N_WORN_SLOTS = 19;
+constexpr int N_EVENTS = 16;
 constexpr int MAX_RETALIATIONS = 3;
 constexpr int N_ACTION_TYPES = 13;
 
@@ -119,6 +120,12 @@ enum class In : int
 	u_effect_id,
 	u_effect_turns,
 	u_effect_value,
+	u_start_count,
+	u_dealt,
+	u_taken,
+	u_kills,
+	u_last_target,
+	u_last_round,
 	h_present,
 	h_type,
 	h_attack,
@@ -134,6 +141,21 @@ enum class In : int
 	h_level_progress,
 	h_worn_artifacts,
 	h_artifacts,
+	h_seen_spells,
+	h_casts,
+	h_last_cast_round,
+	e_present,
+	e_round,
+	e_side,
+	e_actor,
+	e_type,
+	e_target,
+	e_hex,
+	e_spell,
+	e_dealt,
+	e_taken,
+	e_kills,
+	e_lost,
 	x_access,
 	x_obstacle_type,
 	x_obstacle_id,
@@ -220,6 +242,12 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"u_effect_id", DType::INT64, 2, {28, 8}, -1},
 	TensorSpec{"u_effect_turns", DType::INT64, 2, {28, 8}, 0},
 	TensorSpec{"u_effect_value", DType::INT64, 2, {28, 8}, 0},
+	TensorSpec{"u_start_count", DType::INT64, 1, {28, 0}, 0},
+	TensorSpec{"u_dealt", DType::INT64, 1, {28, 0}, 0},
+	TensorSpec{"u_taken", DType::INT64, 1, {28, 0}, 0},
+	TensorSpec{"u_kills", DType::INT64, 1, {28, 0}, 0},
+	TensorSpec{"u_last_target", DType::INT64, 1, {28, 0}, -1},
+	TensorSpec{"u_last_round", DType::INT64, 1, {28, 0}, -1},
 	TensorSpec{"h_present", DType::INT64, 1, {2, 0}, 0},
 	TensorSpec{"h_type", DType::INT64, 1, {2, 0}, -1},
 	TensorSpec{"h_attack", DType::INT64, 1, {2, 0}, 0},
@@ -235,6 +263,21 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"h_level_progress", DType::INT64, 1, {2, 0}, 0},
 	TensorSpec{"h_worn_artifacts", DType::INT64, 2, {2, 19}, -1},
 	TensorSpec{"h_artifacts", DType::INT64, 1, {2, 0}, 0},
+	TensorSpec{"h_seen_spells", DType::INT64, 2, {2, 70}, 0},
+	TensorSpec{"h_casts", DType::INT64, 1, {2, 0}, 0},
+	TensorSpec{"h_last_cast_round", DType::INT64, 1, {2, 0}, -1},
+	TensorSpec{"e_present", DType::BOOL, 1, {16, 0}, 0},
+	TensorSpec{"e_round", DType::INT64, 1, {16, 0}, 0},
+	TensorSpec{"e_side", DType::INT64, 1, {16, 0}, 0},
+	TensorSpec{"e_actor", DType::INT64, 1, {16, 0}, -2},
+	TensorSpec{"e_type", DType::INT64, 1, {16, 0}, -1},
+	TensorSpec{"e_target", DType::INT64, 1, {16, 0}, -1},
+	TensorSpec{"e_hex", DType::INT64, 1, {16, 0}, -1},
+	TensorSpec{"e_spell", DType::INT64, 1, {16, 0}, -1},
+	TensorSpec{"e_dealt", DType::INT64, 1, {16, 0}, 0},
+	TensorSpec{"e_taken", DType::INT64, 1, {16, 0}, 0},
+	TensorSpec{"e_kills", DType::INT64, 1, {16, 0}, 0},
+	TensorSpec{"e_lost", DType::INT64, 1, {16, 0}, 0},
 	TensorSpec{"x_access", DType::INT64, 1, {187, 0}, 0},
 	TensorSpec{"x_obstacle_type", DType::INT64, 1, {187, 0}, -1},
 	TensorSpec{"x_obstacle_id", DType::INT64, 1, {187, 0}, -1},

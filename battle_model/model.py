@@ -54,6 +54,7 @@ from .constants import (
 	HEX_TYPES,
 	MASKED_LOGIT,
 	N_ACTION_TYPES,
+	N_EVENTS,
 	N_HEXES,
 	N_SECONDARY_SKILLS,
 	N_SIDES,
@@ -143,8 +144,8 @@ class HeroTokens(nn.Module):
 	the other's attack against its defence, as the damage formula's factor (F.damage_factor: no hero is 0 and 0);
 	spell power, knowledge and level at several scales (F.COUNT_SCALES); mana left of its pool, mana and the pool at
 	several scales (F.MANA_SCALES); what it is worth (reward.hero_asset) of both sides' start assets; secondary skill
-	levels (of 3) and spellbook. The enemy hero's level, artifacts, skills and spellbook are 0: a player cannot see
-	them. No embedding of the hero's type: what a hero is shows in these, and its specialty in its units' numbers and
+	levels (of 3) and spellbook; how often it has cast this battle and how long ago. The enemy hero's level, artifacts,
+	skills and spellbook are 0: a player cannot see them; of its spells, those it was seen casting count as known. No embedding of the hero's type: what a hero is shows in these, and its specialty in its units' numbers and
 	its spells' predicted values.
 
 	TODO(hero identity): a small hero-type embedding (a few dims) can matter for specialties the numbers miss, but
@@ -154,7 +155,7 @@ class HeroTokens(nn.Module):
 	RULE_SLOTS = 48  # rule artifacts the bag has room for (rules.rule_artifacts finds ~40)
 	RULE_DIMS = 4  # what they become before meeting anything else: an edge case, kept small
 
-	NUMBERS = 4 + 3 * len(F.COUNT_SCALES) + 1 + 2 * len(F.MANA_SCALES) + 1 + N_SECONDARY_SKILLS + N_SPELLS + RULE_DIMS
+	NUMBERS = 4 + 3 * len(F.COUNT_SCALES) + 1 + 2 * len(F.MANA_SCALES) + 1 + N_SECONDARY_SKILLS + N_SPELLS + RULE_DIMS + 2 * len(F.COUNT_SCALES) + 1
 
 	def __init__(self, dim):
 		super().__init__()
@@ -191,8 +192,13 @@ class HeroTokens(nn.Module):
 			F.scales(pool, F.MANA_SCALES),
 			F.fraction(F.hero_assets(x, RewardConfig()), (x["g_start_army"].float().sum(dim=-1, keepdim=True) + F.hero_assets(x, RewardConfig()).sum(dim=-1, keepdim=True)))[..., None],
 			x["h_skills"].float().clamp(0, 3) / 3,
-			(x["h_spells"] != 0).float(),
+			# The spells it has: all of ours; of the enemy's (hidden, h_spells 0) those it was seen casting this battle
+			((x["h_spells"] != 0) | (x["h_seen_spells"] > 0)).float(),
 			self.rule_artifacts(self.rule_bag(x["h_worn_artifacts"])),
+			# How it has cast so far: how often, and how long ago (a hero that has not cast in rounds has little to cast)
+			F.scales(x["h_casts"], F.COUNT_SCALES),
+			(x["h_last_cast_round"] < 0).float()[..., None],
+			F.scales((x["g_round"][:, None] - x["h_last_cast_round"]).clamp(min=0) * (x["h_last_cast_round"] >= 0), F.COUNT_SCALES),
 		], dim=-1)
 		team = torch.where(present, 2 * ours.long() - 1, torch.zeros_like(sides))
 		return signed(self.tokens(None, numbers), team), team
@@ -202,10 +208,29 @@ class UnitTokens(nn.Module):
 	"""One token per unit slot, signed by team: its creature and its abilities (one embedding per ability it has,
 	rules.ABILITIES, summed: what is learned about an ability on one creature holds for all with it), its spell effects
 	(each with its turns left and strength at several scales, through a small gated MLP), where it stands (both hexes
-	of a two-hex unit), and its numbers: stack_features, unit_summaries and its position in our frame."""
+	of a two-hex unit), and its numbers: stack_features, unit_summaries, its position in our frame, and what the battle
+	showed of it (history)."""
 
 	EFFECT_TURNS = (1, 3, 9)  # rounds an effect has left
 	EFFECT_STRENGTH = (2, 10, 50)  # its bonus's value: a few points of a skill, or tens of percent
+	HISTORY_RATIOS = (0.25, 1, 4)  # damage dealt or taken this battle, of the stack's own hit points at the start
+	HISTORY_NUMBERS = 1 + 2 * len(HISTORY_RATIOS) + len(F.COUNT_SCALES) + 1 + len(F.COUNT_SCALES)
+
+	@classmethod
+	def history(cls, x):
+		"""[B, U, HISTORY_NUMBERS]: what the battle showed of each unit (u_start_count .. u_last_round): the share of its
+		creatures lost, the damage it dealt and took of its start hit points, its kills, and how long since it acted."""
+		start = x["u_start_count"].float().clamp(min=1)
+		health = start * x["u_max_hp"].float().clamp(min=1)
+		acted = x["u_last_round"] >= 0
+		return torch.cat([
+			F.fraction(start - x["u_count"].float(), start)[..., None],
+			F.scales(x["u_dealt"].float() / health, cls.HISTORY_RATIOS),
+			F.scales(x["u_taken"].float() / health, cls.HISTORY_RATIOS),
+			F.scales(x["u_kills"], F.COUNT_SCALES),
+			(~acted).float()[..., None],
+			F.scales((x["g_round"][:, None] - x["u_last_round"]).clamp(min=0) * acted, F.COUNT_SCALES),
+		], dim=-1)
 
 	def __init__(self, dim):
 		super().__init__()
@@ -215,7 +240,7 @@ class UnitTokens(nn.Module):
 		self.position = small_embedding(N_HEXES + 1, dim)  # the extra row: no second hex
 		self.effect = small_embedding(EFFECT_VOCAB + 1, dim)
 		self.effect_mlp = SwiGLU(dim + len(self.EFFECT_TURNS) + len(self.EFFECT_STRENGTH), 16, dim)
-		self.tokens = Tokenizer(len(F.STACK_FEATURES) + len(F.SUMMARY_FEATURES) + 2, dim)
+		self.tokens = Tokenizer(len(F.STACK_FEATURES) + len(F.SUMMARY_FEATURES) + 2 + self.HISTORY_NUMBERS, dim)
 
 	def forward(self, b, facts):
 		x = b.x
@@ -225,7 +250,7 @@ class UnitTokens(nn.Module):
 		where = self.position(vocab_index(b.units["hex"], N_HEXES)) + self.position(vocab_index(b.units["rear"], N_HEXES))
 		abilities = self.abilities(b.tables["abilities"][b.units["creature"]])
 		embedded = self.creature(vocab_index(x["u_creature"], CREATURE_VOCAB)) + abilities + effects + where
-		numbers = torch.cat([facts["stack"], facts["summaries"], F.our_frame(b.units["hex"], x["g_our_side"])], dim=-1)
+		numbers = torch.cat([facts["stack"], facts["summaries"], F.our_frame(b.units["hex"], x["g_our_side"]), self.history(x)], dim=-1)
 		team = teams(b)
 		return signed(self.tokens(embedded, numbers), team), team
 
@@ -257,6 +282,56 @@ class HexTokens(nn.Module):
 			+ self.wall(vocab_index(x["x_wall_state"], WALL_STATE_VOCAB))
 		)
 		return self.tokens(embedded, torch.cat([obstacle, facts["maps"], F.our_frame(hexes, x["g_our_side"])], dim=-1))
+
+
+class EventTokens(nn.Module):
+	"""One token per entry of the event log (e_*: the battle's last actions of both sides), signed by the actor's team:
+	the action's type, spell and target hex (embeddings), the acting unit's and the target's own tokens (or the
+	acting hero's), each through its own projection, so attention can tie an event to the units in it; how many rounds
+	ago, and the damage and creatures each side lost in it at several scales. What the present state cannot say: who
+	has been going for whom, what the enemy hero casts, how hard each blow landed (history, as AlphaGo's input has
+	the last positions)."""
+
+	AGE_SCALES = (1, 3, 9)  # rounds ago
+	HP_SCALES = (30, 300, 3000)  # hit points of damage
+	NUMBERS = len(AGE_SCALES) + 2 * len(HP_SCALES) + 2 * len(F.COUNT_SCALES)
+
+	def __init__(self, dim):
+		super().__init__()
+		self.action = small_embedding(N_ACTION_TYPES + 1, dim)  # the extra row: an other action (not .type: nn.Module's)
+		self.spell = small_embedding(N_SPELLS + 1, dim)  # no spell
+		self.hex = small_embedding(N_HEXES + 1, dim)  # no hex
+		self.actor = nn.Linear(dim, dim, bias=False)
+		self.target = nn.Linear(dim, dim, bias=False)
+		self.tokens = Tokenizer(self.NUMBERS, dim)
+
+	def forward(self, b, units, heroes):
+		"""units, heroes: their tokens before the trunk ([B, U, dim], [B, side, dim])."""
+		x = b.x
+		present = x["e_present"] != 0
+
+		def pick(tokens, index):  # tokens[index] per event, 0 where index < 0
+			rows = torch.gather(tokens, 1, index.clamp(min=0)[..., None].expand(-1, -1, tokens.shape[-1]))
+			return rows * (index >= 0)[..., None].float()
+
+		hero = pick(heroes, x["e_side"].clamp(0, N_SIDES - 1)) * (x["e_actor"] == -1)[..., None].float()
+		embedded = (
+			self.action(vocab_index(x["e_type"], N_ACTION_TYPES))
+			+ self.spell(vocab_index(x["e_spell"], N_SPELLS))
+			+ self.hex(vocab_index(x["e_hex"], N_HEXES))
+			+ self.actor(pick(units, x["e_actor"]) + hero)
+			+ self.target(pick(units, x["e_target"]))
+		)
+		numbers = torch.cat([
+			F.scales((x["g_round"][:, None] - x["e_round"]).clamp(min=0), self.AGE_SCALES),
+			F.scales(x["e_dealt"], self.HP_SCALES),
+			F.scales(x["e_taken"], self.HP_SCALES),
+			F.scales(x["e_kills"], F.COUNT_SCALES),
+			F.scales(x["e_lost"], F.COUNT_SCALES),
+		], dim=-1)
+		ours = x["e_side"] == x["g_our_side"][:, None]
+		team = torch.where(present, torch.where(ours, 1, -1), 0)
+		return signed(self.tokens(embedded, numbers), team), team
 
 
 class Block(nn.Module):
@@ -292,26 +367,27 @@ class Block(nn.Module):
 
 
 class Trunk(nn.Module):
-	"""Attention over all tokens (the battle, heroes, units, hexes; a learned kind embedding each)."""
+	"""Attention over all tokens (the battle, heroes, units, events, hexes; a learned kind embedding each)."""
 
 	def __init__(self, dim, layers, heads):
 		super().__init__()
-		self.kind = small_embedding(4, dim)  # battle, hero, unit, hex
+		self.kind = small_embedding(5, dim)  # battle, hero, unit, hex, event
 		self.blocks = nn.ModuleList(Block(dim, heads) for _ in range(layers))
 		self.norm = RMSNorm(dim)
 
-	def forward(self, glob, heroes, units, hexes, hero_team, unit_team, hero_valid, unit_valid):
+	def forward(self, glob, heroes, units, hexes, hero_team, unit_team, hero_valid, unit_valid, events, event_team, event_valid):
 		k = self.kind.weight
-		tokens = torch.cat([(glob + k[0])[:, None, :], heroes + k[1], units + k[2], hexes + k[3]], dim=1)
+		tokens = torch.cat([(glob + k[0])[:, None, :], heroes + k[1], units + k[2], events + k[4], hexes + k[3]], dim=1)
 		none = torch.zeros_like(unit_team[:, :1])
-		team = torch.cat([none, hero_team, unit_team, none.expand(-1, N_HEXES)], dim=1)
+		team = torch.cat([none, hero_team, unit_team, event_team, none.expand(-1, N_HEXES)], dim=1)
 		relation = (team[:, :, None] * team[:, None, :]).sign() + 1  # 0 opposite sides, 1 either has none, 2 same side
 		always = torch.ones_like(unit_valid[:, :1])
-		valid = torch.cat([always, hero_valid, unit_valid, always.expand(-1, N_HEXES)], dim=1)
+		valid = torch.cat([always, hero_valid, unit_valid, event_valid, always.expand(-1, N_HEXES)], dim=1)
 		for block in self.blocks:
 			tokens = block(tokens, valid, relation)
 		tokens = self.norm(tokens)
-		return tokens[:, 0], tokens[:, 1 : 1 + N_SIDES], tokens[:, 1 + N_SIDES : -N_HEXES], tokens[:, -N_HEXES:]
+		units_end = 1 + N_SIDES + units.shape[1]
+		return tokens[:, 0], tokens[:, 1 : 1 + N_SIDES], tokens[:, 1 + N_SIDES : units_end], tokens[:, -N_HEXES:]
 
 
 class Context(nn.Module):
@@ -503,6 +579,7 @@ class BattleModel(nn.Module):
 		self.battle = BattleTokens(dim)
 		self.heroes = HeroTokens(dim)
 		self.units = UnitTokens(dim)
+		self.events = EventTokens(dim)
 		self.hexes = HexTokens(dim)
 		self.trunk = Trunk(dim, layers, heads)
 		self.context = Context(dim)
@@ -545,7 +622,8 @@ class BattleModel(nn.Module):
 		b = F.read_battle(x, self.tables())
 		heroes, hero_team = self.heroes(b)
 		units, unit_team = self.units(b, facts)
-		glob, heroes, units, hexes = self.trunk(self.battle(b, facts), heroes, units, self.hexes(b, facts), hero_team, unit_team, x["h_present"] != 0, x["u_present"] != 0)
+		events, event_team = self.events(b, units, heroes)
+		glob, heroes, units, hexes = self.trunk(self.battle(b, facts), heroes, units, self.hexes(b, facts), hero_team, unit_team, x["h_present"] != 0, x["u_present"] != 0, events, event_team, x["e_present"] != 0)
 		strength = self.strength(facts["strength"])
 		context = self.context(b, glob, heroes, units, strength)
 		actions = F.action_features(b, facts["melee"], facts["shot"], facts["maps"], facts["can_attack"], facts["battle"])

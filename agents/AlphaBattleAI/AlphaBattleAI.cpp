@@ -190,6 +190,8 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2, int3 tile, const CGHeroInstance * hero1, const CGHeroInstance * hero2, BattleSide side, bool replayAllowed)
 {
 	stats = Stats(); // the neutral player's battle AI is reused for every battle
+	history.reset();
+	history.seeUnits(*cb->getBattle(battleID));
 	if(!delegated && !inferenceSocket.empty())
 		loadModel(); // the version this battle starts with, for its record
 	else if(!delegated && !modelPath.empty())
@@ -365,6 +367,7 @@ void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br
 
 void AlphaBattleAI::battleSpellCast(const BattleID & battleID, const BattleSpellCast * sc)
 {
+	history.spellCast(*cb->getBattle(battleID), *sc);
 	if(sc->side == cb->getBattle(battleID)->battleGetMySide())
 		spellCastSeen = true;
 	if(fallback)
@@ -425,7 +428,7 @@ void AlphaBattleAI::placeNextTactic(const BattleID & battleID)
 			continue;
 		try
 		{
-			auto encoded = encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(side)], battleStartValues);
+			auto encoded = encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(side)], battleStartValues, &history);
 			if(encoded.mode != EncodedBattle::Mode::TACTICS || !encoded.tensors.get(In::m_type, static_cast<int>(ActionType::TACTICS_MOVE)))
 				continue; // a unit with nowhere to go in the tactics zone
 			const auto outputs = model->run(encoded.tensors);
@@ -457,6 +460,7 @@ void AlphaBattleAI::placeNextTactic(const BattleID & battleID)
 
 void AlphaBattleAI::battleStacksAttacked(const BattleID & battleID, const std::vector<BattleStackAttacked> & bsa, bool ranged)
 {
+	history.stacksAttacked(*cb->getBattle(battleID), bsa);
 	for(const auto & attacked : bsa)
 		if(attacked.damageAmount > 0)
 			lastDamageRound = cb->getBattle(battleID)->battleGetRound();
@@ -489,7 +493,7 @@ void AlphaBattleAI::activeStack(const BattleID & battleID, const CStack * stack)
 		if(record)
 		{
 			const auto player = cb->getPlayerID().value_or(PlayerColor::NEUTRAL);
-			delegatePending = std::make_unique<EncodedBattle>(encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(battle->battleGetMySide())], battleStartValues));
+			delegatePending = std::make_unique<EncodedBattle>(encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(battle->battleGetMySide())], battleStartValues, &history));
 			encodeAttackValues(*delegatePending, env->game()->gameState(), battleID, player, stats.attackValues);
 			delegateStack = stack->unitId();
 		}
@@ -547,7 +551,7 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 	for(int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt)
 	{
 		const auto start = std::chrono::steady_clock::now();
-		auto encoded = encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(battle->battleGetMySide())], battleStartValues);
+		auto encoded = encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(battle->battleGetMySide())], battleStartValues, &history);
 		encodeAttackValues(encoded, env->game()->gameState(), battleID, player, stats.attackValues);
 		for(const auto & action : rejected)
 			excludeAction(encoded, action);
@@ -745,6 +749,7 @@ void AlphaBattleAI::execute(const BattleID & battleID, const CStack * stack, con
 
 void AlphaBattleAI::actionStarted(const BattleID & battleID, const BattleAction & action)
 {
+	history.actionStarted(*cb->getBattle(battleID), action);
 	// ALPHA_BATTLE_DELEGATE: the action the other AI took for the state it was asked about
 	if(delegatePending && action.stackNumber == static_cast<int>(delegateStack) && action.side == cb->getBattle(battleID)->battleGetMySide())
 	{
@@ -767,6 +772,7 @@ void AlphaBattleAI::actionStarted(const BattleID & battleID, const BattleAction 
 
 void AlphaBattleAI::actionFinished(const BattleID & battleID, const BattleAction & action)
 {
+	history.actionFinished();
 	if(simCheck && simCheckAction && action.actionType == simCheckAction->actionType && action.stackNumber == simCheckAction->stackNumber && action.side == simCheckAction->side)
 		compareWithSimulation(battleID);
 	if(tacticsPending && action.side == cb->getBattle(battleID)->battleGetMySide() && cb->getBattle(battleID)->battleGetTacticDist())
