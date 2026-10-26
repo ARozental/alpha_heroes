@@ -639,6 +639,8 @@ def train(config, resume=False):
 	def evaluate_now(epoch):
 		"""Every eval opponent's eval round; the score of the model is their mean, each opponent counting the same
 		(eval/total_score in TensorBoard, eval_total.csv; each opponent's own rows under eval_<opponent>/)."""
+		if any(c.eval_opponent == "MMAI" for c in opponents) and "mmai" not in play.active_mods():  # it would play as BattleAI
+			raise RuntimeError(f"the MMAI mod is not active ({play.USER_DIR / 'config' / 'modSettings.json'}): MMAI would fall back to BattleAI")
 		scores = {c.eval_opponent: evaluate_against(epoch, c, baseline)["total_score"] for c, baseline in zip(opponents, baselines)}
 		total = round(sum(scores.values()) / len(scores), 4)
 		path = out / "eval_total.csv"

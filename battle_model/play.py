@@ -93,6 +93,12 @@ def map_name(scenario_path, variant=""):
 	return "Maps/alpha/" + Path(scenario_path).stem + (f"-{variant}" if variant else "")
 
 
+def active_mods():
+	"""The mods every game starts with (the shared user data folder's preset; headless.sh copies it into each run)."""
+	settings = json.loads((USER_DIR / "config" / "modSettings.json").read_text())
+	return settings["presets"][settings.get("activePreset", "default")]["mods"]
+
+
 def _map_builder_dir():
 	"""This thread's own VCMI user data folder for alpha_make_battle_map (the shared one's game data, linked). VCMI
 	rewrites config/modSettings.json at every start (truncates it, then writes), so map builds running in parallel on
