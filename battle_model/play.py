@@ -18,6 +18,7 @@ import socket
 import struct
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -198,20 +199,17 @@ class RecordServer:
 		self.path.unlink(missing_ok=True)
 
 
-def start(game, model_path, records, max_seconds=300, max_mb=200):
-	"""Start one battle in the background; returns the process.
+def game_setup(game, model_path, records):
+	"""(map name, env, VCMI settings, prefix file or None) of one battle: what start() gives a new VCMI process, and a
+	BattleProcess sends its running one as the next game.
 
 	records: per side in game.recorded_sides, where its record goes: "socket" and "key" (a RecordServer: sent
 	at the end of the battle, no files) and/or "dir" (written there for debugging; must not exist yet). Each
 	side our model plays gets its own settings (AlphaBattleAI reads ALPHA_BATTLE_<NAME>_<COLOR> before
 	ALPHA_BATTLE_<NAME>): its record and its sampling seed.
 	"""
-	env = dict(os.environ)
-	env.update(
-		ALPHA_BATTLE_MODEL=str(Path(model_path).resolve()),
-		ALPHA_BATTLE_TEMPERATURE=str(game.temperature),
-		SETTINGS=json.dumps({"server": {"seed": game.game_seed}, **({"ai": {"combatNeutralAI": game.ai if 1 in game.recorded_sides else game.opponent}} if game.neutrals else {})}),
-	)
+	env = {"ALPHA_BATTLE_MODEL": str(Path(model_path).resolve()), "ALPHA_BATTLE_TEMPERATURE": str(game.temperature)}
+	settings = {"server": {"seed": game.game_seed}, **({"ai": {"combatNeutralAI": game.ai if 1 in game.recorded_sides else game.opponent}} if game.neutrals else {})}
 	env.update(dict(game.settings))
 	for side, color in enumerate(game.colors):
 		env[f"VCMI_BATTLE_AI_{color}"] = game.ai if side in game.recorded_sides else game.opponent
@@ -234,11 +232,133 @@ def start(game, model_path, records, max_seconds=300, max_mb=200):
 		prefix = PREFIX_DIR / f"{os.getpid()}-{next(_server_numbers)}.jsonl"  # a few KB, deleted by finish()
 		prefix.write_text("".join(json.dumps(action) + "\n" for action in game.prefix))
 		env[f"ALPHA_BATTLE_PREFIX_{game.colors[game.our_side]}"] = str(prefix)
+	return game.map or map_name(game.scenario), env, settings, prefix
+
+
+def start(game, model_path, records, max_seconds=300, max_mb=200):
+	"""Start one battle in a new VCMI process in the background; returns the process (records: as game_setup)."""
+	name, setup, settings, prefix = game_setup(game, model_path, records)
+	env = {**os.environ, **setup, "SETTINGS": json.dumps(settings)}
 	# A big late-game battle on a busy machine can go a while without a log line: a stall is 60s of silence
-	command = [str(ROOT / "scripts" / "headless.sh"), game.map or map_name(game.scenario), str(max_seconds), str(max_mb), "60"]
+	command = [str(ROOT / "scripts" / "headless.sh"), name, str(max_seconds), str(max_mb), "60"]
 	process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 	process.prefix_file = prefix
 	return process
+
+
+QUEUE_ENV_PREFIXES = ("ALPHA_BATTLE_", "VCMI_BATTLE_")  # a queued game's env replaces the previous game's
+
+
+class BattleProcess:
+	"""One VCMI client that plays battle after battle (the client's test queue, vcmi client/TestQueue.h): its start-up
+	(~0.6 s of CPU, more than the rest of a short battle) once every max_battles, not once a battle. play() is play()
+	for one game; a battle that fails or stalls kills the process (the next play starts a new one) and raises."""
+
+	def __init__(self, battle_seconds=300, max_battles=300, max_mb=300):
+		self.battle_seconds, self.max_battles, self.max_mb = battle_seconds, max_battles, max_mb
+		self.records = RecordServer()
+		self.process = self.conn = None
+		self.battles = 0
+		self.pending = b""
+
+	def _start(self):
+		self.close_process()
+		SOCKET_DIR.mkdir(parents=True, exist_ok=True)
+		path = SOCKET_DIR / f"queue-{os.getpid()}-{next(_server_numbers)}.sock"
+		listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		listener.bind(str(path))
+		listener.listen(1)
+		env = {**os.environ, "VCMI_TEST_QUEUE": str(path)}
+		# The process lives for many battles: its watchdog's limits are the whole run's; a stall (60 s without a log
+		# line while idle, e.g. waiting for its next battle during an eval) ends it, and the next battle starts another
+		command = [str(ROOT / "scripts" / "headless.sh"), "queue", str(24 * 3600), str(self.max_mb), "60"]
+		self.process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+		listener.settimeout(120)
+		try:
+			self.conn, _ = listener.accept()
+		except socket.timeout:
+			self.close_process()
+			raise RuntimeError("the VCMI battle process did not connect to its queue")
+		finally:
+			listener.close()
+			path.unlink(missing_ok=True)
+		self.battles, self.pending = 0, b""
+
+	def _line(self, timeout):
+		"""The client's next line ("ready" for the next game), or None if it did not come in time or the client ended."""
+		deadline = time.time() + timeout
+		while b"\n" not in self.pending:
+			left = deadline - time.time()
+			if left <= 0 or self.process.poll() is not None:
+				return None
+			ready, _, _ = select.select([self.conn], [], [], min(left, 1.0))
+			if ready:
+				chunk = self.conn.recv(4096)
+				if not chunk:
+					return None
+				self.pending += chunk
+		line, self.pending = self.pending.split(b"\n", 1)
+		return line
+
+	def play(self, game, model_path):
+		"""Play one game; its records (data.Record), one per side in game.recorded_sides."""
+		from .data import parse_record
+
+		if self.process is None or self.process.poll() is not None or self.battles >= self.max_battles:
+			self._start()
+		if self._line(120) is None:  # the client asks for its next game when the last one is over
+			self._start()
+			if self._line(120) is None:
+				self.close_process()
+				raise RuntimeError("the VCMI battle process did not ask for a game")
+		self.battles += 1
+		keys = [f"{os.getpid()}-{next(_server_numbers)}:{side}" for side in game.recorded_sides]
+		name, env, settings, prefix = game_setup(game, model_path, [{"socket": self.records.path, "key": key} for key in keys])
+		try:
+			job = {"map": name, "env": env, "settings": settings, "clear_env": list(QUEUE_ENV_PREFIXES)}
+			self.conn.sendall((json.dumps(job) + "\n").encode())
+			deadline = time.time() + self.battle_seconds
+			while True:
+				with self.records._lock:
+					done = all(key.split("#")[0] in self.records.records for key in keys)
+				if done:
+					break
+				if time.time() > deadline or self.process.poll() is not None:
+					status = "stalled" if self.process.poll() is None else f"exited ({self.process.poll()})"
+					self.close_process()
+					raise RuntimeError(f"battle did not finish cleanly ({status} in a battle process, map {name})")
+				time.sleep(0.02)
+		finally:
+			if prefix:
+				prefix.unlink(missing_ok=True)
+		with self.records._lock:
+			received = {key: self.records.records.pop(key) for key in keys}
+		return [parse_record(received[key][-1]) for key in keys]
+
+	def close_process(self):
+		if self.conn:
+			try:
+				self.conn.sendall(b"{}\n")  # no more games
+			except OSError:
+				pass
+			self.conn.close()
+			self.conn = None
+		if self.process and self.process.poll() is None:
+			try:
+				self.process.wait(timeout=10)
+			except subprocess.TimeoutExpired:
+				self.process.terminate()
+				self.process.communicate()
+		if self.process:
+			output = self.process.communicate()[0] if self.process.stdout and not self.process.stdout.closed else ""
+			run = next((line.split(":", 1)[1].strip() for line in (output or "").splitlines() if line.startswith("run:")), "")
+			if run:
+				shutil.rmtree(run, ignore_errors=True)
+		self.process = None
+
+	def close(self):
+		self.close_process()
+		self.records.__exit__(None, None, None)
 
 
 def finish(process, keep_run=False):

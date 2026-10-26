@@ -105,6 +105,7 @@ class TrainConfig:
 	inference_device: str = "auto"  # the server's: "auto" = CUDA if there is one, else the CPU; or e.g. "cpu", "cuda"
 	inference_threads: int = 1  # each server process's torch threads on the CPU (more threads barely help at small batches)
 	inference_processes: int = 0  # server processes; 0: one on a GPU, a fifth of the cores on the CPU
+	persistent_battles: bool = True  # each generated actor plays its battles in one VCMI process (play.BattleProcess)
 	run: str = "castle_vs_inferno"
 	epochs: int = 1000
 	opponent: str = "BattleAI"  # who we train against; "self" (play.SELF_PLAY): our model on both sides, learning from both

@@ -174,6 +174,7 @@ class ActorPool:
 	def _generated_actor(self, index):
 		rng = random.Random(1_000_003 * (self.config.seed + 1) + 7919 * index)
 		n = 0
+		process = play.BattleProcess() if self.config.persistent_battles else None  # one VCMI client for its battles
 		while not self.stop.is_set():
 			if self.version < 0 or not self.running.wait(timeout=1):
 				continue
@@ -189,13 +190,15 @@ class ActorPool:
 					key = "ALPHA_BATTLE_INFERENCE_MODEL" if self.server else "ALPHA_BATTLE_MODEL"
 					game = play.replace(game, settings=game.settings + ((f"{key}_{game.colors[1 - our_side]}", str(past_model)),))
 				game = play.replace(game, sampler_seed=rng.randrange(2**31))
-				records = play.play([game], self.link)
+				records = process.play(game, self.link) if process else play.play([game], self.link)
 				self._add(records, "generated", f"g{index}_{n}")
 			except Exception as error:  # one failed battle (its runner folder is kept) does not stop training
 				self._failed(error)
 			finally:
 				for path in files:
 					path.unlink(missing_ok=True)
+		if process:
+			process.close()
 
 	def _real_actor(self, index):
 		rng = random.Random(7 * (self.config.seed + 1) + 104729 * index)
