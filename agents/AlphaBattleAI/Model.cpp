@@ -4,6 +4,7 @@
 #include <onnxruntime_cxx_api.h>
 
 #include <cmath>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -118,22 +119,26 @@ std::shared_ptr<BattleModel> BattleModel::load(const std::string & path)
 	static std::mutex mutex;
 	static std::map<std::string, std::shared_ptr<BattleModel>> cache;
 	static std::map<std::string, std::string> failures; // a refused file is not retried every battle
+	// By the file a link points at: keyed by the link, a game kept its first model however often training replaced it
+	// (a real game for its whole 15 minutes, while its records named the newest)
+	const auto file = std::filesystem::weakly_canonical(path).string();
 	std::scoped_lock lock(mutex);
-	if(auto failed = failures.find(path); failed != failures.end())
+	if(auto failed = failures.find(file); failed != failures.end())
 		throw std::runtime_error(failed->second);
-	auto & model = cache[path];
+	auto & model = cache[file];
 	if(!model)
 	{
 		try
 		{
-			model.reset(new BattleModel(path));
+			model.reset(new BattleModel(file));
 		}
 		catch(const std::exception & e)
 		{
-			cache.erase(path);
-			failures[path] = e.what();
+			cache.erase(file);
+			failures[file] = e.what();
 			throw;
 		}
+		std::erase_if(cache, [&](const auto & entry) { return entry.first != file && entry.second.use_count() == 1; }); // older versions nobody plays
 	}
 	return model;
 }

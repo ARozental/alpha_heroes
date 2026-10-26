@@ -153,8 +153,10 @@ void AlphaBattleAI::loadModel()
 		if(modelPath.empty())
 			throw std::runtime_error("ALPHA_BATTLE_MODEL is not set");
 		const auto time = std::filesystem::last_write_time(modelPath); // follows a symlink: training replaces its target
-		model = BattleModel::load(modelPath);
+		const auto file = std::filesystem::weakly_canonical(modelPath).string();
+		model = BattleModel::load(file);
 		modelTime = time;
+		modelFile = file;
 	}
 	catch(const std::exception & e)
 	{
@@ -215,8 +217,7 @@ void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * 
 		};
 		const auto * hero = cb->getBattle(battleID)->battleGetMyHero();
 		const auto * enemyHero = heroes[1 - static_cast<int>(side)];
-		std::error_code error;
-		const auto played = std::filesystem::weakly_canonical(modelPath, error).string(); // which model version played
+		const auto & played = modelFile; // which model version plays (the link may point at a newer one by now)
 		recordEvent("{\"event\": \"start\", \"model\": \"" + played + "\", \"our_side\": " + std::to_string(static_cast<int>(side)) + ", \"armies\": [" + army(army1) + ", " + army(army2) + "], \"our_mana\": " + std::to_string(hero ? hero->mana : 0) + ", \"our_mana_max\": " + std::to_string(hero ? hero->manaLimit() : 0) + ", \"enemy_mana\": " + std::to_string(enemyHero ? enemyHero->mana : 0) + ", \"enemy_mana_max\": " + std::to_string(enemyHero ? enemyHero->manaLimit() : 0) + ", \"powers\": [" + std::to_string(battleStartValues.power[0]) + ", " + std::to_string(battleStartValues.power[1]) + "], \"heroes\": [[" + std::to_string(battleStartValues.heroLevel[0]) + ", " + std::to_string(battleStartValues.artifacts[0]) + "], [" + std::to_string(battleStartValues.heroLevel[1]) + ", " + std::to_string(battleStartValues.artifacts[1]) + "]]}");
 		try
 		{

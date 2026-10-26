@@ -57,6 +57,7 @@ class AlphaBattleAI : public CBattleGameInterface
 	std::shared_ptr<BattleModel> model;
 	std::string modelPath; // ALPHA_BATTLE_MODEL; reloaded at a battle's start when the file changed (training updates it)
 	std::filesystem::file_time_type modelTime{};
+	std::string modelFile; // the file modelPath pointed at when the model was loaded: the version that plays
 	void loadModel();
 	// Tactics phase: our units still to place, one at a time (each from the board the last placement left)
 	std::vector<uint32_t> tacticsQueue;

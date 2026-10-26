@@ -24,7 +24,8 @@ class BattleModel
 public:
 	~BattleModel();
 
-	/// Loaded once per path and shared by all battles; throws std::runtime_error on mismatch
+	/// Loaded once per file and shared by all battles; a link (training's current.onnx) is resolved first, so the model
+	/// it points at now is the one returned. Throws std::runtime_error on mismatch
 	static std::shared_ptr<BattleModel> load(const std::string & path);
 
 	AlphaSchema::OutputTensors run(const AlphaSchema::InputTensors & inputs) const;
