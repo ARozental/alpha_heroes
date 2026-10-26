@@ -27,6 +27,7 @@ COLORS = ("RED", "BLUE")  # battle side 0 (attacker) and 1 (defender)
 SELF_PLAY = "self"  # Game.opponent for our model against itself
 SOCKET_DIR = ROOT / "runtime" / "sockets"  # RecordServer sockets: only addresses, no data on disk
 PREFIX_DIR = ROOT / "runtime" / "prefixes"  # Game.prefix files, deleted after each battle
+MAP_BUILDER_DIR = ROOT / "runtime" / "map-builders"  # the map builder's user data folders, one per process and thread
 _server_numbers = itertools.count()
 
 
@@ -92,6 +93,34 @@ def map_name(scenario_path, variant=""):
 	return "Maps/alpha/" + Path(scenario_path).stem + (f"-{variant}" if variant else "")
 
 
+def _map_builder_dir():
+	"""This thread's own VCMI user data folder for alpha_make_battle_map (the shared one's game data, linked). VCMI
+	rewrites config/modSettings.json at every start (truncates it, then writes), so map builds running in parallel on
+	the shared folder now and then read it half-written, fell back to the default mods and saved that: the MMAI mod was
+	switched off for every game after (the eval against MMAI was played by BattleAI, MMAI's fallback)."""
+	path = MAP_BUILDER_DIR / f"{os.getpid()}-{threading.get_ident()}"
+	if not (path / "config" / "modSettings.json").exists():
+		_remove_dead_map_builder_dirs()
+		(path / "config").mkdir(parents=True, exist_ok=True)
+		for name in ("Data", "Mods"):
+			if not (path / name).is_symlink():
+				(path / name).symlink_to(USER_DIR / name)
+		(path / "config" / "settings.json").write_text(json.dumps({"logging": {"loggers": [{"domain": "global", "level": "info"}]}}))  # trace logs: 1 MB a map
+		shutil.copy(USER_DIR / "config" / "modSettings.json", path / "config" / "modSettings.json")
+		(path / "config" / "modSettings.json").chmod(0o644)
+	return path
+
+
+def _remove_dead_map_builder_dirs():
+	for path in MAP_BUILDER_DIR.glob("*-*"):
+		try:
+			os.kill(int(path.name.split("-")[0]), 0)
+		except ProcessLookupError:
+			shutil.rmtree(path, ignore_errors=True)
+		except (ValueError, PermissionError):
+			pass
+
+
 def build_map(scenario_path, variant=""):
 	"""Write the scenario's battle-only map into the VCMI user data folder (overwrites); returns its map name.
 
@@ -100,7 +129,7 @@ def build_map(scenario_path, variant=""):
 	name = map_name(scenario_path, variant)
 	out = USER_DIR / (name + ".vmap")
 	out.parent.mkdir(parents=True, exist_ok=True)
-	env = {**os.environ, "VCMI_USER_DIR": str(USER_DIR)}
+	env = {**os.environ, "VCMI_USER_DIR": str(_map_builder_dir())}
 	result = subprocess.run([str(ROOT / "build" / "bin" / "alpha_make_battle_map"), str(scenario_path), str(out)], env=env, capture_output=True, text=True)
 	if result.returncode != 0 or not out.exists():
 		raise RuntimeError(f"building the map failed:\n{result.stdout[-2000:]}\n{result.stderr[-2000:]}")
