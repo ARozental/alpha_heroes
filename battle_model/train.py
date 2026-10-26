@@ -84,7 +84,7 @@ class TrainConfig:
 	# Training in updates from many battles at once (actors.py) instead of epochs of games_per_side battles: an
 	# "epoch" is then one update of decisions_per_update decisions, taken from the actors' buffer
 	actors: bool = False
-	generated_actors: int = 6  # generated battles played at once
+	generated_actors: int = 10  # generated battles played at once (on 14 cores: 16 starved the learner, 6 left it waiting)
 	real_games: int = 0  # real games played at once (real_games.py); their battles are real_share of each update
 	real_share: float = 0.5
 	real_game_seconds: int = 900

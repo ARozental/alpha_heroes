@@ -247,6 +247,7 @@ def start(game, model_path, records, max_seconds=300, max_mb=200):
 
 
 QUEUE_ENV_PREFIXES = ("ALPHA_BATTLE_", "VCMI_BATTLE_")  # a queued game's env replaces the previous game's
+BATTLE_NICENESS = 10  # BattleProcess's (the actors' generated battles; real games run at 15)
 
 
 class BattleProcess:
@@ -271,7 +272,9 @@ class BattleProcess:
 		env = {**os.environ, "VCMI_TEST_QUEUE": str(path)}
 		# The process lives for many battles: its watchdog's limits are the whole run's; a stall (60 s without a log
 		# line while idle, e.g. waiting for its next battle during an eval) ends it, and the next battle starts another
-		command = [str(ROOT / "scripts" / "headless.sh"), "queue", str(24 * 3600), str(self.max_mb), "60"]
+		# At low priority: the actors make more battles than the learner takes, and the learner (and the inference
+		# server) starved for CPU (a learner update took 15 s in a run, 9.4 s alone)
+		command = ["nice", "-n", str(BATTLE_NICENESS), str(ROOT / "scripts" / "headless.sh"), "queue", str(24 * 3600), str(self.max_mb), "60"]
 		self.process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 		listener.settimeout(120)
 		try:
