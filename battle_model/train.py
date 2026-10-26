@@ -220,27 +220,26 @@ EVAL_SEEDS = tuple(_eval_rng.randrange(1, 2**31) for _ in range(256))
 
 
 def log_eval_tensorboard(writer, row, opponent=""):
-	"""An eval row as TensorBoard scalars, under eval/ (the main opponent) or eval_<opponent>/."""
+	"""An eval row as TensorBoard scalars under eval_<opponent>/ (eval/total_score is the mean over the opponents,
+	evaluate_now), or under eval/ for a run with a single, unnamed opponent."""
 	epoch = int(row["epoch"])
+	prefix = f"eval_{opponent}" if opponent else "eval"
 	if opponent:
-		for column in ("total_score", *(f"score_{k}" for k in EVAL_SETS), "escape_while_ahead", "shooter_not_shooting", "worthless_cast", "mana_left_on_loss"):
-			if row.get(column) not in (None, "") and row[column] == row[column]:
-				writer.add_scalar(f"eval_{opponent}/{column}", float(row[column]), epoch)
-		writer.flush()
-		return
-	writer.add_scalar("eval/total_score", float(row["total_score"]), epoch)
+		writer.add_scalar(f"{prefix}/total_score", float(row["total_score"]), epoch)
+	else:  # (old runs: one opponent, its score is the total)
+		writer.add_scalar("eval/total_score", float(row["total_score"]), epoch)
 	for column in (*(f"score_{k}" for k in EVAL_SETS), "escape_while_ahead", "shooter_not_shooting", "worthless_cast", "mana_left_on_loss"):
 		if row.get(column) not in (None, "") and row[column] == row[column]:  # skip nan: a set or a case that never came up
-			writer.add_scalar(f"eval/{column}", float(row[column]), epoch)
+			writer.add_scalar(f"{prefix}/{column}", float(row[column]), epoch)
 	for name in ("attack", "defence", "mean"):
 		if name != "mean":
-			writer.add_scalar(f"eval/won/{name}", float(row[f"{name}_win_rate"]), epoch)
-		writer.add_scalar(f"eval/reward/{name}", float(row[f"{name}_reward"]), epoch)
-		writer.add_scalar(f"eval/vs_baseline/{name}", float(row[f"{name}_vs_baseline"]), epoch)
+			writer.add_scalar(f"{prefix}/won/{name}", float(row[f"{name}_win_rate"]), epoch)
+		writer.add_scalar(f"{prefix}/reward/{name}", float(row[f"{name}_reward"]), epoch)
+		writer.add_scalar(f"{prefix}/vs_baseline/{name}", float(row[f"{name}_vs_baseline"]), epoch)
 		if name != "mean":
 			for measure in ("army_kept", "army_killed"):
-				writer.add_scalar(f"eval/{measure}/{name}", float(row[f"{name}_{measure}"]), epoch)
-				writer.add_scalar(f"eval/{measure}_vs_baseline/{name}", float(row[f"{name}_{measure}"]) - float(row[f"{name}_baseline_{measure}"]), epoch)
+				writer.add_scalar(f"{prefix}/{measure}/{name}", float(row[f"{name}_{measure}"]), epoch)
+				writer.add_scalar(f"{prefix}/{measure}_vs_baseline/{name}", float(row[f"{name}_{measure}"]) - float(row[f"{name}_baseline_{measure}"]), epoch)
 	writer.flush()
 
 
@@ -623,17 +622,29 @@ def train(config, resume=False):
 				csv.writer(f).writerow(EVAL_COLUMNS)
 
 	def evaluate_now(epoch):
-		for c, baseline in zip(opponents, baselines):
-			evaluate_against(epoch, c, baseline)
+		"""Every eval opponent's eval round; the score of the model is their mean, each opponent counting the same
+		(eval/total_score in TensorBoard, eval_total.csv; each opponent's own rows under eval_<opponent>/)."""
+		scores = {c.eval_opponent: evaluate_against(epoch, c, baseline)["total_score"] for c, baseline in zip(opponents, baselines)}
+		total = round(sum(scores.values()) / len(scores), 4)
+		path = out / "eval_total.csv"
+		new = not path.exists()
+		with path.open("a", newline="") as f:
+			if new:
+				csv.writer(f).writerow(["epoch", "total_score", *(f"vs_{name}" for name in scores)])
+			csv.writer(f).writerow([epoch, total, *scores.values()])
+		writer.add_scalar("eval/total_score", total, epoch)
+		writer.flush()
+		print(f"eval  {epoch:4d}  TOTAL SCORE {total:+.3f}  (" + ", ".join(f"vs {name} {score:+.3f}" for name, score in scores.items()) + ")", flush=True)
 
 	def evaluate_against(epoch, config_for, baseline):
 		row = eval_round(model, epoch, out, battle_map, config_for, baseline)
 		with (out / f"eval{eval_name(config_for, config.eval_opponent)}.csv").open("a", newline="") as f:
 			csv.writer(f).writerow([row[c] for c in EVAL_COLUMNS])
-		log_eval_tensorboard(writer, row, "" if config_for is opponents[0] else config_for.eval_opponent)
+		log_eval_tensorboard(writer, row, config_for.eval_opponent)
 		print(f"eval  {epoch:4d}  total score {row['total_score']:+.3f}  vs {config_for.eval_opponent}, greedy: attack won {row['attack_win_rate']:.2f} {row['attack_reward']:+.3f} ({row['attack_vs_baseline']:+.3f} vs its own)  defence won {row['defence_win_rate']:.2f} {row['defence_reward']:+.3f} ({row['defence_vs_baseline']:+.3f} vs its own)  {row['seconds']}s"
 			f"  | sets: " + ", ".join(f"{k} {row[f'score_{k}']:+.3f}" for k in EVAL_SETS if row[f"score_{k}"] == row[f"score_{k}"]) +
 			f"  | failures: escape ahead {row['escape_while_ahead']}, shooter idle {row['shooter_not_shooting']}, worthless cast {row['worthless_cast']}, mana left on loss {row['mana_left_on_loss']}", flush=True)
+		return row
 
 	if config.eval_every and first_epoch == 1:
 		evaluate_now(0)  # the untrained model
