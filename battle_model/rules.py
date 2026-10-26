@@ -277,6 +277,10 @@ _wide = {
 	ATTACKER: lambda h: [_step(h, d) for d in range(5)] + [_step(h - 1, d) if h - 1 >= 0 else -1 for d in (BOTTOM_LEFT, LEFT, TOP_LEFT)],
 	DEFENDER: lambda h: [_step(h, TOP_LEFT)] + [_step(h + 1, d) if h + 1 < N_HEXES else -1 for d in range(5)] + [_step(h, BOTTOM_LEFT), _step(h, LEFT)],
 }
+# The neighbour table as shifts: (offset, [N_HEXES] which hexes have their neighbour that far away), for walk_distances
+_offsets = torch.where(NEIGHBOURS >= 0, NEIGHBOURS - torch.arange(N_HEXES)[:, None], 0)
+_NEIGHBOUR_SHIFTS = [(o, ((_offsets == o) & (NEIGHBOURS >= 0)).any(dim=-1)) for o in sorted({int(v) for v in _offsets[NEIGHBOURS >= 0]})]
+_SHIFT_PAD = max(abs(o) for o, _ in _NEIGHBOUR_SHIFTS)
 WIDE_NEIGHBOURS = torch.stack([torch.tensor([[n for n in _wide[side](h)] for h in range(N_HEXES)]) for side in (ATTACKER, DEFENDER)])
 
 
@@ -517,14 +521,22 @@ def smallest(x, dim=-1):
 def walk_distances(open_, sources, steps):
 	"""Breadth-first distances [..., N_HEXES] from the source hexes (bool [..., N_HEXES]) over the open hexes (the
 	sources count as open), INFINITE_DISTANCE beyond `steps` steps; any leading dimensions (e.g. one per unit)."""
-	neighbour = NEIGHBOURS.to(open_.device)
-	on_field = neighbour >= 0
+	# A frontier of booleans, one ring of hexes a step: the same distances as relaxing all of them each step. A hex's
+	# neighbours are the hexes a few fixed offsets away (by row parity), so a step is a few shifted slices, no gather and
+	# no integers (this was half of the model's compute).
+	pad = torch.zeros(open_.shape[:-1] + (_SHIFT_PAD,), dtype=torch.bool, device=open_.device)
+	masks = [(offset, mask.to(open_.device)) for offset, mask in _NEIGHBOUR_SHIFTS]
+	frontier, reached = sources, sources
 	distance = torch.where(sources, 0, INFINITE_DISTANCE)
-	for _ in range(steps):
-		around = distance[..., neighbour.clamp(min=0)]  # [..., H, 6]
-		around = torch.where(on_field, around, INFINITE_DISTANCE)
-		closer = smallest(around) + 1
-		distance = torch.where((open_ | sources) & (closer < distance), closer, distance)
+	for step in range(1, steps + 1):
+		padded = torch.cat([pad, frontier, pad], dim=-1)
+		around = None
+		for offset, mask in masks:
+			shifted = padded[..., _SHIFT_PAD + offset : _SHIFT_PAD + offset + N_HEXES] & mask
+			around = shifted if around is None else around | shifted
+		frontier = around & open_ & ~reached
+		reached = reached | frontier
+		distance = torch.where(frontier, step, distance)
 	return distance
 
 
