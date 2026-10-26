@@ -277,7 +277,15 @@ class Block(nn.Module):
 		b, n, d = x.shape
 		q, k, v = self.qkv(self.norm1(x)).chunk(3, dim=-1)
 		q, k, v = (t.reshape(b, n, self.heads, d // self.heads).transpose(1, 2) for t in (q, k, v))
-		att = (q @ k.transpose(-1, -2)) / math.sqrt(d // self.heads) + self.relation[:, relation].transpose(0, 1)
+		# Not self.relation[:, relation]: on the CPU indexing a parameter with an index this big ([B, T, T]) has a
+		# backward that was 80% of a training step; a choice among the three there (and in the export), an embedding
+		# lookup on a GPU (each the fastest there, fwd+bwd at batch 256: CPU 23 ms vs 2 s, Apple GPU 17 ms vs 28 ms)
+		if x.device.type == "cpu":
+			r, rel = self.relation[:, :, None, None], relation[:, None]
+			bias = torch.where(rel == 0, r[:, 0], torch.where(rel == 1, r[:, 1], r[:, 2]))  # [B, heads, T, T]
+		else:
+			bias = nn.functional.embedding(relation, self.relation.T).permute(0, 3, 1, 2)
+		att = (q @ k.transpose(-1, -2)) / math.sqrt(d // self.heads) + bias
 		att = att.masked_fill(~valid[:, None, None, :], MASKED_LOGIT).softmax(dim=-1)
 		x = x + self.proj((att @ v).transpose(1, 2).reshape(b, n, d))
 		return x + self.mlp(self.norm2(x))
