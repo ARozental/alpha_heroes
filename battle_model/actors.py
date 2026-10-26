@@ -45,6 +45,8 @@ class ActorPool:
 		self.buffer = []  # dicts: record, source, game, version, decisions
 		self.lock = threading.Condition()
 		self.stop = threading.Event()
+		self.running = threading.Event()  # cleared while the learner evaluates: generated actors start no new battle
+		self.running.set()
 		self.stats = {"failures": 0, "dropped_stale": 0, "battles": {"generated": 0, "real": 0}, "last_failure": ""}
 		self.server = play.RecordServer()
 		self.threads = []
@@ -122,12 +124,18 @@ class ActorPool:
 			return "AlphaBattleAI", rng.choice(past_versions)
 		return rng.choice(self.config.league_ais), None
 
+	def pause(self):
+		"""No new generated battles (an eval gets the machine; real games run on at low priority)."""
+		self.running.clear()
+
+	def resume(self):
+		self.running.set()
+
 	def _generated_actor(self, index):
 		rng = random.Random(1_000_003 * (self.config.seed + 1) + 7919 * index)
 		n = 0
 		while not self.stop.is_set():
-			if self.version < 0:
-				time.sleep(1)
+			if self.version < 0 or not self.running.wait(timeout=1):
 				continue
 			n += 1
 			scenario = generator.sample(rng)

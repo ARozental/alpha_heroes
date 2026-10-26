@@ -163,7 +163,7 @@ class RecordServer:
 		self.path.unlink(missing_ok=True)
 
 
-def start(game, model_path, records, max_seconds=120, max_mb=200):
+def start(game, model_path, records, max_seconds=300, max_mb=200):
 	"""Start one battle in the background; returns the process.
 
 	records: per side in game.recorded_sides, where its record goes: "socket" and "key" (a RecordServer: sent
@@ -199,7 +199,8 @@ def start(game, model_path, records, max_seconds=120, max_mb=200):
 		prefix = PREFIX_DIR / f"{os.getpid()}-{next(_server_numbers)}.jsonl"  # a few KB, deleted by finish()
 		prefix.write_text("".join(json.dumps(action) + "\n" for action in game.prefix))
 		env[f"ALPHA_BATTLE_PREFIX_{game.colors[game.our_side]}"] = str(prefix)
-	command = [str(ROOT / "scripts" / "headless.sh"), game.map or map_name(game.scenario), str(max_seconds), str(max_mb), "20"]
+	# A big late-game battle on a busy machine can go a while without a log line: a stall is 60s of silence
+	command = [str(ROOT / "scripts" / "headless.sh"), game.map or map_name(game.scenario), str(max_seconds), str(max_mb), "60"]
 	process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 	process.prefix_file = prefix
 	return process

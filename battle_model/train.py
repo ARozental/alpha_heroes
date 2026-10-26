@@ -42,6 +42,7 @@ on the seeds being fixed: the same training has to work on real, ever-different 
 """
 import argparse
 import copy
+import itertools
 import csv
 import json
 import random
@@ -90,6 +91,11 @@ class TrainConfig:
 	max_record_age: int = 3  # model versions: older records are dropped
 	buffer_decisions: int = 8000  # at most this many decisions wait in the buffer (the oldest go first)
 	decisions_per_update: int = 400
+	# Time instead of epochs: stop after run_hours (0: after `epochs`), the linear learning rate following the time;
+	# an eval every eval_minutes (0: every eval_every epochs); the rate ends at lr_final_fraction of learning_rate
+	run_hours: float = 0.0
+	eval_minutes: float = 0.0
+	lr_final_fraction: float = 0.0
 	# Generated battles: our current model against itself, against a past version of itself (a self-play blind spot that
 	# only the current version shares cannot last), and against a fixed AI (league_ais; none: we train against ourselves)
 	league: tuple = (0.85, 0.15, 0.0)
@@ -182,12 +188,17 @@ COLUMNS = [
 	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds",
 ] + [f"{side}_share_{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS] + [
 	f"{side}_{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")
-] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures"]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
+] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "learning_rate"] + [
+	f"train_{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "mana_left_on_loss")
+]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
 # error. decisions: all decisions of the epoch; rounds: attack + defence battle rounds, averaged over the games.
 
 # progress.csv column -> TensorBoard tag
 TENSORBOARD_TAGS = {
+	**{f"train_{name}": f"train_failures/{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "mana_left_on_loss")},
+	**{name: f"actors/{name}" for name in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures")},
+	"learning_rate": "stability/learning_rate",
 	**{f"{side}_share_{kind.lower()}": f"actions_{side}/{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS},
 	**{f"{side}_{name}": f"credit_{side}/{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")},
 	"mean_reward": "reward/mean", "attack_reward": "reward/attack", "defence_reward": "reward/defence",
@@ -251,7 +262,9 @@ def log_tensorboard(writer, row, self_play=False):
 		if self_play and column == "mean_reward":
 			continue
 		if row.get(column) not in (None, ""):
-			writer.add_scalar(tag, float(row[column]), epoch)
+			value = float(row[column])
+			if value == value:  # not nan: a case that never came up in this update
+				writer.add_scalar(tag, value, epoch)
 	for name in ("attack", "defence"):
 		if row.get(f"{name}_win_rate") in (None, ""):  # runs from before win rates were logged
 			writer.add_scalar(f"won/{name}", float(row[f"{name}_outcome"] == "WIN"), epoch)
@@ -574,8 +587,9 @@ def model_kwargs(config):
 	return {"architecture": "v1", "dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features, "chain_final_value": config.model_chain_final_value, "kill_rule": config.model_kill_rule}
 
 
-def save_checkpoint(path, model, optimizer, epoch, config):
-	torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "model_kwargs": model_kwargs(config)}, path)
+def save_checkpoint(path, model, optimizer, epoch, config, elapsed=0.0):
+	"""elapsed: the training's seconds so far (run_hours counts them across resumes)."""
+	torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "model_kwargs": model_kwargs(config), "elapsed": elapsed}, path)
 
 
 def train(config, resume=False):
@@ -587,6 +601,7 @@ def train(config, resume=False):
 	model = build_model(model_kwargs(config)).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 	first_epoch = 1
+	elapsed_before = 0.0
 	latest = out / "checkpoint_latest.pt"
 	if resume and latest.exists():
 		state = torch.load(latest, map_location=device)
@@ -595,7 +610,8 @@ def train(config, resume=False):
 		model.load_state_dict(state["model"])
 		optimizer.load_state_dict(state["optimizer"])
 		first_epoch = state["epoch"] + 1
-		print(f"resuming after epoch {state['epoch']}")
+		elapsed_before = state.get("elapsed", 0.0)
+		print(f"resuming after epoch {state['epoch']} ({elapsed_before / 3600:.2f} h)")
 
 	battle_map = None if config.generator else play.build_map(config.scenario, variant=config.run)
 	reward_config, advantage_config, ppo_config = config.reward, config.advantage, config.ppo
@@ -693,12 +709,17 @@ def train(config, resume=False):
 		export(cpu_copy(model), model_files[current])
 		producer = Producer(play_epoch)
 		producer.start(first_epoch, model_files[current])
+	run_started, last_eval = time.time(), time.time()
+	elapsed = lambda: elapsed_before + time.time() - run_started
 	try:
-		for epoch in range(first_epoch, config.epochs + 1):
+		for epoch in itertools.count(first_epoch):
+			if (config.run_hours and elapsed() >= config.run_hours * 3600) or (not config.run_hours and epoch > config.epochs):
+				break
 			started = time.time()
 			if config.lr_schedule == "linear":
+				done = min(1.0, elapsed() / (config.run_hours * 3600)) if config.run_hours else (epoch - 1) / config.epochs
 				for group in optimizer.param_groups:
-					group["lr"] = config.learning_rate * (1 - (epoch - 1) / config.epochs)
+					group["lr"] = config.learning_rate * (1 - (1 - config.lr_final_fraction) * done)
 			actor_stats = {}
 			if pool:
 				records, actor_stats = pool.take(config.decisions_per_update)
@@ -768,6 +789,8 @@ def train(config, resume=False):
 				"wait_seconds": round(waited, 1),
 				"train_seconds": round(train_seconds, 1),
 				**{k: actor_stats.get(k, "") for k in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures")},
+				"learning_rate": round(optimizer.param_groups[0]["lr"], 8),
+				**{f"train_{k}": v for k, v in failure_modes(records).items()},  # the same signs of dumb play, in training
 			}
 			for side, name in ((0, "attack"), (1, "defence")):
 				kinds = Counter(ActionType(a["type"]).name for r in records if r.events[0]["our_side"] == side for a in r.actions)
@@ -796,11 +819,18 @@ def train(config, resume=False):
 				flush=True,
 			)
 
-			if config.eval_every and epoch % config.eval_every == 0:
+			due = time.time() - last_eval >= config.eval_minutes * 60 if config.eval_minutes else config.eval_every and epoch % config.eval_every == 0
+			if due:
+				if pool:
+					pool.pause()
 				evaluate_now(epoch)
-			save_checkpoint(latest, model, optimizer, epoch, config)
+				if pool:
+					pool.resume()
+				last_eval = time.time()
+				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed())  # every evaluated model
+			save_checkpoint(latest, model, optimizer, epoch, config, elapsed())
 			if config.checkpoint_every and epoch % config.checkpoint_every == 0:
-				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config)
+				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed())
 	finally:
 		if pool:
 			pool.close()
