@@ -124,8 +124,10 @@ class TrainConfig:
 	batch_size: int = 256  # minibatch of decisions: on the GPU 1.15 ms a decision at 512, 1.8 at 64 (2026-10-26)
 	grad_clip: float = 0.5  # max gradient norm, the usual PPO value
 	# KL control, so the step size does not hang on a hand-picked learning rate: an update stops its steps once its KL
-	# (old against new policy) passes 1.5x target_kl, and after each update the learning rate's scale is cut by 1.5 when
-	# its KL was over 2x target_kl and raised by 1.5 when under half of it (within 0.1..10x). 0 = off. With a fixed
+	# (old against new policy) passes 1.5x target_kl; then the learning rate's scale is cut by 1.5, and raised by 1.5
+	# after an update that took all its steps and ended under half of target_kl (within 0.1..4x). The KL is the last
+	# minibatch's, nearest the update's end: a mean over its steps counts the first ones, where the policy has hardly
+	# moved, and kept raising the rate (to 7.5x within 11 updates, ending in 1-2-step updates). 0 = off. With a fixed
 	# rate, v15-base-lr2 (2e-4, 3200-decision updates) went from KL 0.008 to 0.03-0.09 as its policy sharpened, its
 	# entropy rose and its evals fell.
 	target_kl: float = 0.015
@@ -799,8 +801,10 @@ def train(config, resume=False):
 						break
 			model.eval()
 			if config.target_kl and batches:
-				kl = float(parts_sum["approx_kl"]) / batches
-				lr_scale = min(10.0, lr_scale * 1.5) if kl < config.target_kl / 2 else max(0.1, lr_scale / 1.5) if kl > 2 * config.target_kl else lr_scale
+				if stopped:
+					lr_scale = max(0.1, lr_scale / 1.5)
+				elif float(parts["approx_kl"]) < config.target_kl / 2:
+					lr_scale = min(4.0, lr_scale * 1.5)
 			if pool:
 				pool.publish(model, lambda path: export(cpu_copy(model), path))
 			else:
