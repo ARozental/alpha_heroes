@@ -125,12 +125,15 @@ class TrainConfig:
 	grad_clip: float = 0.5  # max gradient norm, the usual PPO value
 	# KL control, so the step size does not hang on a hand-picked learning rate: an update stops its steps once its KL
 	# (old against new policy) passes 1.5x target_kl; then the learning rate's scale is cut by 1.5, and raised by 1.5
-	# after an update that took all its steps and ended under half of target_kl (within 0.1..4x). The KL is the last
+	# after an update that took all its steps and ended under half of target_kl (within 0.1..lr_scale_max). The KL is the last
 	# minibatch's, nearest the update's end: a mean over its steps counts the first ones, where the policy has hardly
 	# moved, and kept raising the rate (to 7.5x within 11 updates, ending in 1-2-step updates). 0 = off. With a fixed
 	# rate, v15-base-lr2 (2e-4, 3200-decision updates) went from KL 0.008 to 0.03-0.09 as its policy sharpened, its
 	# entropy rose and its evals fell.
 	target_kl: float = 0.015
+	# The user's rule (2026-10-26): stability over speed, never above learning_rate (1e-4: 2e-4 went unstable), so the
+	# KL control only lowers the rate and raises it back up to where it started
+	lr_scale_max: float = 1.0
 	checkpoint_every: int = 0  # also keep checkpoint_<epoch>.pt every this many epochs; 0 = only checkpoint_latest.pt
 	attempts: int = 3  # tries per epoch when a battle fails or stalls before the run stops
 	keep_records: bool = False  # also write every battle record to <run dir>/records (debugging; ~0.3 MB a decision on disk)
@@ -804,7 +807,7 @@ def train(config, resume=False):
 				if stopped:
 					lr_scale = max(0.1, lr_scale / 1.5)
 				elif float(parts["approx_kl"]) < config.target_kl / 2:
-					lr_scale = min(4.0, lr_scale * 1.5)
+					lr_scale = min(config.lr_scale_max, lr_scale * 1.5)
 			if pool:
 				pool.publish(model, lambda path: export(cpu_copy(model), path))
 			else:
