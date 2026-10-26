@@ -289,9 +289,9 @@ class BattleProcess:
 
 	def _line(self, timeout):
 		"""The client's next line ("ready" for the next game), or None if it did not come in time or the client ended."""
-		deadline = time.time() + timeout
+		deadline = time.monotonic() + timeout  # monotonic: it stands still while the machine sleeps
 		while b"\n" not in self.pending:
-			left = deadline - time.time()
+			left = deadline - time.monotonic()
 			if left <= 0 or self.process.poll() is not None:
 				return None
 			ready, _, _ = select.select([self.conn], [], [], min(left, 1.0))
@@ -320,13 +320,13 @@ class BattleProcess:
 		try:
 			job = {"map": name, "env": env, "settings": settings, "clear_env": list(QUEUE_ENV_PREFIXES)}
 			self.conn.sendall((json.dumps(job) + "\n").encode())
-			deadline = time.time() + self.battle_seconds
+			deadline = time.monotonic() + self.battle_seconds
 			while True:
 				with self.records._lock:
 					done = all(key.split("#")[0] in self.records.records for key in keys)
 				if done:
 					break
-				if time.time() > deadline or self.process.poll() is not None:
+				if time.monotonic() > deadline or self.process.poll() is not None:
 					status = "stalled" if self.process.poll() is None else f"exited ({self.process.poll()})"
 					self.close_process()
 					raise RuntimeError(f"battle did not finish cleanly ({status} in a battle process, map {name})")

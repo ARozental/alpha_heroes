@@ -69,8 +69,15 @@ LAST_LOG_SIZE=-1
 LAST_LOG_CHANGE=$SECONDS
 cpu_seconds() { ps -o time= -p "$PID" 2>/dev/null | awk -F: '{ s = 0; for (i = 1; i <= NF; i++) s = s * 60 + $i; printf "%d", s }'; }
 CPU_AT_CHANGE=$(cpu_seconds)
+LAST_TICK=$SECONDS
 while kill -0 "$PID" 2>/dev/null; do
 	sleep 1
+	# The machine was asleep (a closed lid): the gap is no silence and no game time, so every timer moves past it
+	if (( SECONDS - LAST_TICK > 10 )); then
+		GAP=$(( SECONDS - LAST_TICK - 1 ))
+		START=$(( START + GAP )); LAST_LOG_CHANGE=$(( LAST_LOG_CHANGE + GAP ))
+	fi
+	LAST_TICK=$SECONDS
 	LOG_SIZE=$(stat -f %z "$RUN_DIR/logs/VCMI_Client_log.txt" 2>/dev/null || echo 0)
 	if [ "$LOG_SIZE" != "$LAST_LOG_SIZE" ]; then
 		LAST_LOG_SIZE=$LOG_SIZE
