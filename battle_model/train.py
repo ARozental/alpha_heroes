@@ -225,7 +225,7 @@ EVAL_COLUMNS = [
 	"attack_army_kept", "attack_army_killed", "defence_army_kept", "defence_army_killed",
 	"attack_baseline_army_kept", "attack_baseline_army_killed", "defence_baseline_army_kept", "defence_baseline_army_killed",
 	"escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss",
-	"score_generated", "score_neutrals", "score_real", "score_castle",
+	"score_generated", "score_neutrals", "score_real", "score_castle", "score_hard",  # one a set of EVAL_SETS
 ]  # eval.csv, greedy battles per side: win rate, mean reward -1..1, outcomes; and minus the eval opponent's own reward on
 # the same seeds. army_kept / army_killed: shares of our army kept and of the enemy's lost (data.BattleSummary), ours
 # and the eval opponent's on the same seeds: the same whatever the reward's definition. total_score: THE measure of a
