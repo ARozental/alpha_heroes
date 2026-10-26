@@ -3,6 +3,7 @@
 #
 # Usage: scripts/headless.sh <map> [max_seconds=300] [max_mb=200] [stall_seconds=30]
 #   map          e.g. "Maps/Elbow Room"
+#   VCMI_LLDB    optional env var: run the client under lldb, which prints every thread's backtrace on a crash
 #   SETTINGS     optional env var: JSON merged into the run's settings.json,
 #                e.g. SETTINGS='{"ai":{"combatEnemyAI":"UpLeftAI"}}'
 #
@@ -41,7 +42,11 @@ json.dump(merge(settings, json.loads(sys.argv[2])), open(sys.argv[1], "w"), inde
 EOF
 
 cd "$ROOT/build/bin"
-VCMI_USER_DIR="$RUN_DIR" ./vcmiclient --headless --testmap "$MAP" > "$RUN_DIR/stdout.txt" 2>&1 &
+if [ -n "${VCMI_LLDB:-}" ]; then  # debugging a crash: every thread's backtrace lands in stdout.txt
+	VCMI_USER_DIR="$RUN_DIR" lldb --batch -o "process handle SIGPIPE -n true -p true -s false" -o run -k "thread backtrace all" -k quit -- ./vcmiclient --headless --testmap "$MAP" > "$RUN_DIR/stdout.txt" 2>&1 &
+else
+	VCMI_USER_DIR="$RUN_DIR" ./vcmiclient --headless --testmap "$MAP" > "$RUN_DIR/stdout.txt" 2>&1 &
+fi
 PID=$!
 
 cleanup()
