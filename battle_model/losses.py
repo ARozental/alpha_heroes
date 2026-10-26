@@ -76,7 +76,10 @@ from .distributions import entropy, log_prob, log_prob_at
 @dataclass(frozen=True)
 class AdvantageConfig:
 	gamma: float = 1.0  # discount per decision (step 3); 1 = the battle's end counts fully for every decision
-	lam: float = 0.95  # GAE lambda (step 5); 1 = judge each decision by the final outcome only
+	# GAE lambda (step 5); 1 = judge each decision by the final outcome only. 0.8 (2026-10-26, the user's call: bootstrap
+	# for now; the comparison with 0.95, every earlier run's, is to come): a decision 12 steps from the end gets 7% of its
+	# credit from the outcome (0.95: 54%), the rest from the value head's estimates, so far less of later luck
+	lam: float = 0.8
 	normalize_min_decisions: int = 8  # step 5: rescale a group's advantages only if it has at least this many decisions
 	# Which value heads (V0, V1, V2, V) the policy maximizes (policy_advantages). Default: V and V2. In 400-epoch
 	# self-play runs (2026-10-23, one seed each) adding V2 beat V alone against BattleAI on both sides: greedy reward
