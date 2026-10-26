@@ -70,6 +70,19 @@ def test_full_action_probabilities_sum_to_one_and_entropy_is_exact(model):
 		assert np.isclose(float(entropy(out)[0]), exact, atol=1e-4), seed
 
 
+def test_entropy_bonus_does_not_favour_types_with_many_options(model):
+	"""The bonus's gradient on the type logits is the type entropy's alone: without that, each type was paid the entropy of
+	what follows it (MOVE's ~100 hexes against WAIT's nothing), a constant push toward moving."""
+	from battle_model.distributions import _entropy
+	for seed in range(3):
+		out = run(model, small_masks(seed))
+		logp_type = out["logp_type"].clone().requires_grad_()
+		(full,) = torch.autograd.grad(entropy({**out, "logp_type": logp_type}).sum(), logp_type, allow_unused=True)
+		(alone,) = torch.autograd.grad(_entropy(logp_type).sum(), logp_type)
+		legal = torch.isfinite(out["logp_type"])
+		assert torch.allclose(full[legal], alone[legal], atol=1e-6), seed
+
+
 def _batched(out, actions):
 	"""log_prob of many actions against one state: repeat the outputs along the batch axis."""
 	n = len(actions)

@@ -41,7 +41,8 @@ class ActorPool:
 		self.models.mkdir(parents=True, exist_ok=True)
 		self.link = self.models / "current.onnx"
 		self.generated_games = generated_games  # train.generated_games
-		self.version = -1
+		# A resumed run goes on numbering from its newest model (else it would overwrite its league snapshots)
+		self.version = max((int(p.stem.split("_")[1]) for p in self.models.glob("model_*.onnx")), default=-1)
 		self.buffer = []  # dicts: record, source, game, version, decisions
 		self.lock = threading.Condition()
 		self.stop = threading.Event()

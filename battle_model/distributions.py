@@ -70,13 +70,19 @@ def _entropy(logp):
 
 
 def _expect(logp, values):
-	"""E[values] under the distribution exp(logp) over the last axis."""
-	return (logp.exp() * values).sum(dim=-1)
+	"""E[values] under the distribution exp(logp) over the last axis; no gradient through the weights (entropy says why)."""
+	return (logp.exp().detach() * values).sum(dim=-1)
 
 
 def entropy(out):
-	"""Exact entropy of the full action distribution, shape [B]."""
-	p_type = out["logp_type"].exp()
+	"""Exact entropy of the full action distribution, shape [B].
+
+	Its gradient is that of every choice's own entropy: a sub-choice's entropy is weighted by its parent's probability
+	without a gradient through that probability. With one, the bonus paid each action type entropy_weight times the
+	entropy of what follows it (MOVE ~ln 100 hexes, SHOOT a few targets, WAIT nothing), a constant push toward the types
+	with the most options: in v14-11h shooters drifted from shooting to moving (90% to 55% of the decisions where they
+	could shoot) while the outcomes stayed the same."""
+	p_type = out["logp_type"].exp().detach()
 	h = _entropy(out["logp_type"])
 	h = h + p_type[:, list(HEX_TYPES)].sum(dim=-1) * _entropy(out["logp_move_hex"])
 	h = h + p_type[:, ActionType.MELEE] * (_entropy(out["logp_melee_target"]) + _expect(out["logp_melee_target"], _entropy(out["logp_melee_from"])))
