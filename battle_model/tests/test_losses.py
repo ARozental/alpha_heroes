@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from battle_model.data import collate
@@ -13,26 +14,26 @@ REWARDS = [0.0, 0.0, 0.0, R]
 
 
 def test_lambda_one_judges_every_decision_by_the_final_outcome():
-	returns, adv = battle_returns_and_advantages(VALUES, REWARDS, AdvantageConfig(gamma=1.0, lam=1.0))
+	returns, adv = battle_returns_and_advantages(VALUES, REWARDS, AdvantageConfig(credit="gae", gamma=1.0, lam=1.0))
 	assert torch.allclose(returns, torch.full((4,), R))
 	assert torch.allclose(adv, R - torch.tensor(VALUES))
 
 
 def test_lambda_zero_is_the_one_step_change_of_the_prediction():
-	_, adv = battle_returns_and_advantages(VALUES, REWARDS, AdvantageConfig(gamma=1.0, lam=0.0))
+	_, adv = battle_returns_and_advantages(VALUES, REWARDS, AdvantageConfig(credit="gae", gamma=1.0, lam=0.0))
 	expected = [1.5 - 1.0, 0.5 - 1.5, 2.0 - 0.5, R - 2.0]  # V(next) - V(now), last step: R - V
 	assert torch.allclose(adv, torch.tensor(expected))
 
 
 def test_decision_that_raised_the_prediction_gets_credit():
 	# With a decent value head, the decision after which V jumped (t=2: 0.5 -> 2.0) is the most credited
-	_, adv = battle_returns_and_advantages(VALUES, REWARDS, AdvantageConfig(gamma=1.0, lam=0.5))
+	_, adv = battle_returns_and_advantages(VALUES, REWARDS, AdvantageConfig(credit="gae", gamma=1.0, lam=0.5))
 	assert int(adv.argmax()) == 2
 	assert float(adv[1]) < 0  # after t=1 the prediction dropped
 
 
 def test_discount():
-	returns, _ = battle_returns_and_advantages([0.0, 0.0], [0.0, 1.0], AdvantageConfig(gamma=0.9, lam=1.0))
+	returns, _ = battle_returns_and_advantages([0.0, 0.0], [0.0, 1.0], AdvantageConfig(credit="gae", gamma=0.9, lam=1.0))
 	assert torch.allclose(returns, torch.tensor([0.9, 1.0]))
 
 
@@ -152,3 +153,16 @@ def test_search_loss_is_the_cross_entropy_to_the_search_policy():
 		loss.backward()
 		optimizer.step()
 	assert float(parts["approx_kl"]) < 0.5 * kl_before
+
+
+def test_window_credit():
+	"""credit "window": 85% the value at our first decision two rounds on (the result once there is none), 15% the
+	result, each minus the value now."""
+	values, rewards, rounds = [0.1, 0.3, 0.2, 0.5], [0.0, 0.0, 0.0, 1.0], [1, 1, 3, 4]
+	config = AdvantageConfig(credit="window", window_rounds=2, outcome_share=0.15)
+	_, adv = battle_returns_and_advantages(values, rewards, config, rounds)
+	later = [0.2, 0.2, 1.0, 1.0]  # rounds 1 -> the decision in round 3; round 3 and 4: none two rounds on
+	expected = [0.85 * (l - v) + 0.15 * (1.0 - v) for l, v in zip(later, values)]
+	assert torch.allclose(adv, torch.tensor(expected), atol=1e-6)
+	with pytest.raises(ValueError):
+		battle_returns_and_advantages(values, rewards, config)  # it needs the rounds

@@ -264,8 +264,8 @@ def battle_examples(record, reward_config=RewardConfig(), advantage_config=Advan
 	values = outputs["value"][:, -1]  # V, the final-reward head (-1..1)
 	rewards = torch.zeros(len(decisions))
 	rewards[-1] = to_scale(summary.reward, reward_config)
-	_, final_advantages = battle_returns_and_advantages(values, rewards, advantage_config)
 	rounds = [int(d[0]["g_round"]) for d in decisions]
+	_, final_advantages = battle_returns_and_advantages(values, rewards, advantage_config, rounds)
 	labels = value_targets(rounds, summary.round_scores, summary.reward)
 	advantages = policy_advantages(final_advantages, labels, outputs["value"], advantage_config)
 	summary.advantage_std = float(advantages.std()) if len(advantages) > 1 else 0.0

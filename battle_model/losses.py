@@ -76,6 +76,17 @@ from .distributions import entropy, log_prob, log_prob_at
 @dataclass(frozen=True)
 class AdvantageConfig:
 	gamma: float = 1.0  # discount per decision (step 3); 1 = the battle's end counts fully for every decision
+	# How the final-reward credit of a decision is made (step 5):
+	#   "window"  the user's linear mix (2026-10-26):
+	#             (1 - outcome_share) * [V(our first decision window_rounds rounds later) - V(now)]
+	#             + outcome_share * [final reward - V(now)]
+	#             the value head's view of the position a while later (the battle's result if it ends before), plus a
+	#             share of the real outcome so the value head's blind spots still get corrected; the window is game
+	#             time (rounds), the same for any army size, where lam counts decisions
+	#   "gae"     GAE(lam): exponentially decaying shares of every later step (lam below)
+	credit: str = "window"
+	window_rounds: int = 2
+	outcome_share: float = 0.15
 	# GAE lambda (step 5); 1 = judge each decision by the final outcome only. 0.8 (2026-10-26, the user's call: bootstrap
 	# for now; the comparison with 0.95, every earlier run's, is to come): a decision 12 steps from the end gets 7% of its
 	# credit from the outcome (0.95: 54%), the rest from the value head's estimates, so far less of later luck
@@ -114,17 +125,28 @@ def value_targets(decision_rounds, round_scores, final_reward, horizons=N_VALUE_
 	return labels
 
 
-def battle_returns_and_advantages(values, rewards, config=AdvantageConfig()):
+def battle_returns_and_advantages(values, rewards, config=AdvantageConfig(), rounds=None):
 	"""Steps 3-5 for one battle seen by one side.
 
 	values:  [T] V(s_t), the final-reward head (-1..1), from the model that played the battle (recorded while playing)
 	rewards: [T] reward right after each decision: 0, except the last, which is the terminal reward
-	Returns (returns [T], advantages [T]). returns is the GAE(lambda) return (G_t for lambda = 1); the
+	rounds:  [T] the battle round of each decision (config.credit "window" needs them)
+	Returns (returns [T], advantages [T]). returns is the advantage plus V (G_t for GAE with lambda = 1); the
 	value heads are trained on value_targets instead, where V's label is the final reward itself.
 	The battle is over after the last decision, so its next value is 0.
 	"""
 	values = torch.as_tensor(values, dtype=torch.float32)
 	rewards = torch.as_tensor(rewards, dtype=torch.float32)
+	if config.credit == "window":
+		if rounds is None:
+			raise ValueError("credit 'window' needs each decision's round")
+		rounds = torch.as_tensor(rounds, dtype=torch.long)
+		final = rewards.sum()  # the terminal reward (rewards are 0 before it)
+		# Our first decision window_rounds rounds on (rounds never decrease): its V, or the result if there is none
+		later_index = torch.searchsorted(rounds, rounds + config.window_rounds)
+		later = torch.cat([values, final[None]])[later_index]
+		advantages = (1 - config.outcome_share) * (later - values) + config.outcome_share * (final - values)
+		return advantages + values, advantages
 	advantages = torch.zeros_like(values)
 	running, next_value = 0.0, 0.0
 	for t in reversed(range(len(values))):
