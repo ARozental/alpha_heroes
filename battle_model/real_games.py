@@ -17,7 +17,8 @@ from pathlib import Path
 from . import play
 
 PLAYER_COLORS = ("RED", "BLUE", "TAN", "GREEN", "ORANGE", "PURPLE", "TEAL", "PINK", play.NEUTRAL)
-MAX_GAME_SECONDS = 900  # a game is cut (headless.sh kills it) after this; its finished battles are already sent
+MAX_GAME_SECONDS = 900
+REAL_GAME_NICENESS = 15  # a game is cut (headless.sh kills it) after this; its finished battles are already sent
 
 
 def maps():
@@ -41,7 +42,9 @@ def start_game(map_name, model_path, socket_path, game_key, seed, temperature=1.
 		env[f"ALPHA_BATTLE_RECORD_KEY_{color}"] = f"{game_key}:{color}"
 		env[f"ALPHA_BATTLE_SEED_{color}"] = str(seed * 101 + i)
 	command = [str(play.ROOT / "scripts" / "headless.sh"), map_name, str(max_seconds), "300", "120"]
-	return subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+	# Low priority: Nullkiller2 plans its turns on every core (TBB), and later in a game that starved the battles
+	# (generated and eval ones stalled and were killed); battles come first, the real games take what is left
+	return subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, preexec_fn=lambda: os.nice(REAL_GAME_NICENESS))
 
 
 def scenario_of(record):
