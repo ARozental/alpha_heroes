@@ -214,37 +214,56 @@ def _watch_parent(server):
 
 
 class InferenceServer:
-	"""Starts the server process; set_model gives it weights (state_dict) under a name."""
+	"""Starts the server processes, each on its own socket (socket_paths; socket_path is the first); set_model gives
+	them all weights (state_dict) under a name. On the CPU one process does not scale past a core or two (its Python
+	and the model's many small operations), so several share the games; on a GPU one process batches them all."""
 
-	def __init__(self, socket_path, device="cpu", family="battle", model_kwargs=None, threads=2):
+	def __init__(self, socket_path, device="cpu", family="battle", model_kwargs=None, threads=2, processes=1):
 		import multiprocessing
 
-		self.socket_path = str(socket_path)
-		if os.path.exists(self.socket_path):
-			os.unlink(self.socket_path)
+		base = str(socket_path)
+		self.socket_paths = [base] if processes == 1 else [base.replace(".sock", f"-{i}.sock") for i in range(processes)]
+		self.socket_path = self.socket_paths[0]
 		context = multiprocessing.get_context("spawn")  # no fork of a process with threads and a GPU context
-		self.control, child = context.Pipe()
 		self.lock = threading.Lock()
-		self.process = context.Process(target=_serve, args=(self.socket_path, device, family, dict(model_kwargs or {}), child, threads), daemon=True)
-		self.process.start()
-		if not self.control.poll(120) or self.control.recv() != ("ready",):
-			raise RuntimeError("the inference server did not start")
+		self.controls, self.processes = [], []
+		for path in self.socket_paths:
+			if os.path.exists(path):
+				os.unlink(path)
+			control, child = context.Pipe()
+			process = context.Process(target=_serve, args=(path, device, family, dict(model_kwargs or {}), child, threads), daemon=True)
+			process.start()
+			self.controls.append(control)
+			self.processes.append(process)
+		for control in self.controls:
+			if not control.poll(120) or control.recv() != ("ready",):
+				raise RuntimeError("the inference server did not start")
 
 	def set_model(self, name, version, model):
 		"""Serve model's current weights (a module or a state_dict) under name, as version."""
 		state = model.state_dict() if hasattr(model, "state_dict") else model
+		state = {key: value.detach().cpu() for key, value in state.items()}
 		with self.lock:
-			self.control.send(("set", name, int(version), {key: value.detach().cpu() for key, value in state.items()}))
+			for control in self.controls:
+				control.send(("set", name, int(version), state))
 
 	def drop(self, name):
 		with self.lock:
-			self.control.send(("drop", name))
+			for control in self.controls:
+				control.send(("drop", name))
+
+	def socket_for(self, index):
+		"""The socket of the index-th client (actor): the clients spread evenly over the processes."""
+		return self.socket_paths[index % len(self.socket_paths)]
 
 	def close(self):
-		self.process.terminate()
-		self.process.join(timeout=10)
-		if os.path.exists(self.socket_path):
-			os.unlink(self.socket_path)
+		for process in self.processes:
+			process.terminate()
+		for process in self.processes:
+			process.join(timeout=10)
+		for path in self.socket_paths:
+			if os.path.exists(path):
+				os.unlink(path)
 
 
 class InferenceClient:

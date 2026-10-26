@@ -53,7 +53,9 @@ class ActorPool:
 		if config.inference == "server":
 			play.SOCKET_DIR.mkdir(parents=True, exist_ok=True)
 			self.socket = play.SOCKET_DIR / f"infer-{os.getpid()}.sock"
-			self.server = InferenceServer(self.socket, device=inference_device(config.inference_device), model_kwargs=model_kwargs, threads=config.inference_threads)
+			device = inference_device(config.inference_device)
+			processes = config.inference_processes or (1 if device != "cpu" else max(1, (os.cpu_count() or 4) // 5))
+			self.server = InferenceServer(self.socket, device=device, model_kwargs=model_kwargs, threads=config.inference_threads, processes=processes)
 			import torch
 
 			for path in sorted(self.models.glob("snapshot_*.pt")):  # the league of a resumed run
@@ -110,9 +112,9 @@ class ActorPool:
 		match = re.search(r"model_(\d+)\.onnx|@(\d+)$", start.get("model", ""))
 		return int(match.group(1) or match.group(2)) if match else -1
 
-	def inference_settings(self):
-		"""The settings (env) that send a game's battles to the inference server, if there is one."""
-		return (("ALPHA_BATTLE_INFERENCE_SOCKET", str(self.socket)),) if self.server else ()
+	def inference_settings(self, actor):
+		"""The settings (env) that send an actor's battles to the inference server (one of its processes), if any."""
+		return (("ALPHA_BATTLE_INFERENCE_SOCKET", self.server.socket_for(actor)),) if self.server else ()
 
 	# ---- actors ----
 
@@ -182,7 +184,7 @@ class ActorPool:
 			files = []
 			try:
 				games, files = self.generated_games([scenario], f"actor{index}_{n}", self.config, our_sides=(our_side,), opponent=opponent, temperature=1.0)
-				game = play.replace(games[0], settings=games[0].settings + self.inference_settings())
+				game = play.replace(games[0], settings=games[0].settings + self.inference_settings(index))
 				if past_model is not None:  # the other side is our AI with an older model, not recorded
 					key = "ALPHA_BATTLE_INFERENCE_MODEL" if self.server else "ALPHA_BATTLE_MODEL"
 					game = play.replace(game, settings=game.settings + ((f"{key}_{game.colors[1 - our_side]}", str(past_model)),))
@@ -204,7 +206,7 @@ class ActorPool:
 				time.sleep(1)
 				continue
 			n += 1
-			process = real_games.start_game(rng.choice(maps), self.link, self.records.path, f"r{index}_{n}", rng.randrange(2**31), max_seconds=self.config.real_game_seconds, settings=self.inference_settings())
+			process = real_games.start_game(rng.choice(maps), self.link, self.records.path, f"r{index}_{n}", rng.randrange(2**31), max_seconds=self.config.real_game_seconds, settings=self.inference_settings(self.config.generated_actors + index))
 			while process.poll() is None and not self.stop.is_set():
 				time.sleep(1)
 			if process.poll() is None:  # training is over

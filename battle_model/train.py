@@ -90,8 +90,8 @@ class TrainConfig:
 	real_game_seconds: int = 900
 	game_share: float = 0.125  # at most this share of an update from any one game
 	max_record_age: int = 3  # model versions: older records are dropped
-	buffer_decisions: int = 8000  # at most this many decisions wait in the buffer (the oldest go first)
-	decisions_per_update: int = 400
+	buffer_decisions: int = 16000  # at most this many decisions wait in the buffer (the oldest go first)
+	decisions_per_update: int = 3200  # ~60 battles: each gradient over many outcomes (800, ~15 battles, was the noisy v14-11h)
 	# Time instead of epochs: stop after run_hours (0: after `epochs`), the linear learning rate following the time;
 	# an eval every eval_minutes (0: every eval_every epochs); the rate ends at lr_final_fraction of learning_rate
 	run_hours: float = 0.0
@@ -103,7 +103,8 @@ class TrainConfig:
 	league_ais: tuple = ("BattleAI",)
 	inference: str = "server"  # actors: "server" (one process runs the model for every game, live weights) or "onnx" (actors.py)
 	inference_device: str = "auto"  # the server's: "auto" = CUDA if there is one, else the CPU; or e.g. "cpu", "cuda"
-	inference_threads: int = 4  # the server's torch threads on the CPU
+	inference_threads: int = 1  # each server process's torch threads on the CPU (more threads barely help at small batches)
+	inference_processes: int = 0  # server processes; 0: one on a GPU, a fifth of the cores on the CPU
 	run: str = "castle_vs_inferno"
 	epochs: int = 1000
 	opponent: str = "BattleAI"  # who we train against; "self" (play.SELF_PLAY): our model on both sides, learning from both
@@ -118,8 +119,8 @@ class TrainConfig:
 	random_seeds: bool = False
 	learning_rate: float = 1e-4  # Adam; 3e-4 (the usual PPO default) learned and then forgot this scenario
 	lr_schedule: str = "constant"  # "linear": decay to 0 at the last epoch, as standard PPO does; Adam's steps stay ~lr even when the gradients are only noise
-	ppo_passes: int = 4  # optimisation passes over each epoch's decisions; PPO reuses its data a few times
-	batch_size: int = 64  # minibatch of decisions; an epoch of 16 battles is ~300 decisions
+	ppo_passes: int = 2  # optimisation passes over each epoch's decisions; PPO reuses its data a few times
+	batch_size: int = 256  # minibatch of decisions: on the GPU 1.15 ms a decision at 512, 1.8 at 64 (2026-10-26)
 	grad_clip: float = 0.5  # max gradient norm, the usual PPO value
 	checkpoint_every: int = 0  # also keep checkpoint_<epoch>.pt every this many epochs; 0 = only checkpoint_latest.pt
 	attempts: int = 3  # tries per epoch when a battle fails or stalls before the run stops
