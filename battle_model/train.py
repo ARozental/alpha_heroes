@@ -398,7 +398,8 @@ def failure_modes(records):
 	"""Signs of dumb play in a set of battle records (eval), each a share 0..1 (nan when it never came up):
 	escape_while_ahead    retreats and surrenders while our value head thought we were winning (V > 0)
 	shooter_not_shooting  decisions of a unit that could shoot where it moved, waited or defended instead
-	worthless_cast        hero casts with a predicted value <= 0 when another legal cast had a positive one
+	worthless_cast        hero casts at a unit or hex that lose us value (predicted value < 0: e.g. a Frost Ring on our own
+	                      stacks); 0 is no sign: buffs, debuffs and summons change no health when cast (Slow, Shield)
 	mana_left_on_loss     the share of our mana left unspent in battles we lost"""
 	from .data import summarize
 	counts = {name: [0, 0] for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "mana_left_on_loss")}
@@ -414,11 +415,9 @@ def failure_modes(records):
 				counts["shooter_not_shooting"][1] += 1
 			if kind == ActionType.HERO_SPELL and a["spell"] >= 0:
 				sign = 1.0 if int(t["g_our_side"][i]) == 0 else -1.0  # the values are the attacker's gain minus the defender's
-				values = [sign * t["s_unit_value"][i][t["m_spell_unit"][i] != 0], sign * t["s_hex_value"][i][t["m_spell_hex"][i] != 0]]
-				best = max((float(v.max()) for v in values if v.size), default=0.0)
 				chosen = sign * float(t["s_unit_value"][i, a["spell"], a["target_unit"]]) if a["target_unit"] >= 0 else sign * float(t["s_hex_value"][i, a["spell"], a["target_hex"]]) if a["target_hex"] >= 0 else None
-				if chosen is not None and best > 0:
-					counts["worthless_cast"][0] += chosen <= 0
+				if chosen is not None:
+					counts["worthless_cast"][0] += chosen < 0
 					counts["worthless_cast"][1] += 1
 		s = summarize(r.events)
 		start = next((e for e in r.events if e.get("event") == "start"), {})
