@@ -37,6 +37,7 @@ def start_game(map_name, model_path, socket_path, game_key, seed, temperature=1.
 		ALPHA_BATTLE_MODEL=str(Path(model_path).absolute()),  # not resolved: a link (actors.py) is followed at each battle
 		ALPHA_BATTLE_TEMPERATURE=str(temperature),
 		ALPHA_BATTLE_RECORD_SOCKET=str(socket_path),
+		ALPHA_BATTLE_REQUIRE_MODEL="1",  # a battle without its model fails the game, never plays defending
 		SETTINGS=json.dumps({"server": {"seed": seed}, "ai": {"combatEnemyAI": ai, "combatAlliedAI": ai, "combatNeutralAI": ai}}),
 	)
 	for i, color in enumerate(PLAYER_COLORS):

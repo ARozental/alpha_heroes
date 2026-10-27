@@ -215,7 +215,7 @@ def game_setup(game, model_path, records):
 	side our model plays gets its own settings (AlphaBattleAI reads ALPHA_BATTLE_<NAME>_<COLOR> before
 	ALPHA_BATTLE_<NAME>): its record and its sampling seed.
 	"""
-	env = {"ALPHA_BATTLE_MODEL": str(Path(model_path).resolve()), "ALPHA_BATTLE_TEMPERATURE": str(game.temperature)}
+	env = {"ALPHA_BATTLE_MODEL": str(Path(model_path).resolve()), "ALPHA_BATTLE_TEMPERATURE": str(game.temperature), "ALPHA_BATTLE_REQUIRE_MODEL": "1"}
 	settings = {"server": {"seed": game.game_seed}, **({"ai": {"combatNeutralAI": game.ai if 1 in game.recorded_sides else game.opponent}} if game.neutrals else {})}
 	env.update(dict(game.settings))
 	for side, color in enumerate(game.colors):

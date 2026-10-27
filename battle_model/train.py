@@ -60,7 +60,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 from . import generator, play, rules
 from .data import collate, credit_check, make_dataloader, summarize
-from .export import export
+from .distributions import log_prob
+from .export import export, verify
 from .losses import AdvantageConfig, PPOConfig, ppo_loss, search_loss
 from .constants import N_ACTION_TYPES, ActionType
 from .model import build_model
@@ -83,6 +84,7 @@ class TrainConfig:
 	eval_real_scenarios: int = 0  # generator evals: also the first this many battles of real games (REAL_EVAL), both sides
 	eval_castle_seeds: int = 0  # generator evals: also castle_vs_inferno (`scenario`) on this many EVAL_SEEDS: regressions
 	eval_extra_opponents: tuple = ("MMAI",)  # also evaluated against these (eval_<name>.csv, TensorBoard eval_<name>/)
+	eval_workers: int = 12  # battle processes of an eval (play_eval; the learner and the generated actors wait meanwhile)
 	# Training in updates from many battles at once (actors.py) instead of epochs of games_per_side battles: an
 	# "epoch" is then one update of decisions_per_update decisions, taken from the actors' buffer
 	actors: bool = False
@@ -207,7 +209,7 @@ COLUMNS = [
 	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds",
 ] + [f"{side}_share_{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS] + [
 	f"{side}_{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")
-] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "learning_rate", "ppo_steps", "outcome_share"] + [
+] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow", "learning_rate", "ppo_steps", "update_kl", "outcome_share"] + [
 	f"train_{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")
 ]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
@@ -216,9 +218,10 @@ COLUMNS = [
 # progress.csv column -> TensorBoard tag
 TENSORBOARD_TAGS = {
 	**{f"train_{name}": f"train_failures/{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")},
-	**{name: f"actors/{name}" for name in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures")},
+	**{name: f"actors/{name}" for name in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow")},
 	"learning_rate": "stability/learning_rate",
 	"ppo_steps": "stability/ppo_steps",  # fewer than the passes' when the KL control stopped the update
+	"update_kl": "stability/update_kl",
 	"outcome_share": "stability/outcome_share",  # the window credit's share of the real outcome (by V's quality)
 	**{f"{side}_share_{kind.lower()}": f"actions_{side}/{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS},
 	**{f"{side}_{name}": f"credit_{side}/{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")},
@@ -242,6 +245,7 @@ EVAL_COLUMNS = [
 	"escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss",
 	"score_generated", "score_neutrals", "score_real", "score_castle", "score_hard",  # one a set of EVAL_SETS
 	"score_balanced", "score_worst",  # the sets' mean (each alike) and the worst set
+	"score_generated_se", "score_neutrals_se", "score_real_se", "score_castle_se", "score_hard_se",  # their standard errors
 ]  # eval.csv, greedy battles per side: win rate, mean reward -1..1, outcomes; and minus the eval opponent's own reward on
 # the same seeds. army_kept / army_killed: shares of our army kept and of the enemy's lost (data.BattleSummary), ours
 # and the eval opponent's on the same seeds: the same whatever the reward's definition. total_score: THE measure of a
@@ -261,7 +265,7 @@ def log_eval_tensorboard(writer, row, opponent=""):
 		writer.add_scalar(f"{prefix}/total_score", float(row["total_score"]), epoch)
 	else:  # (old runs: one opponent, its score is the total)
 		writer.add_scalar("eval/total_score", float(row["total_score"]), epoch)
-	for column in (*(f"score_{k}" for k in EVAL_SETS), "score_balanced", "score_worst", "escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss"):
+	for column in (*(f"score_{k}" for k in EVAL_SETS), *(f"score_{k}_se" for k in EVAL_SETS), "score_balanced", "score_worst", "escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss"):
 		if row.get(column) not in (None, "") and row[column] == row[column]:  # skip nan: a set or a case that never came up
 			writer.add_scalar(f"{prefix}/{column}", float(row[column]), epoch)
 	for name in ("attack", "defence", "mean"):
@@ -357,6 +361,42 @@ def play_in_groups(games, model_path, config, label):
 	return [r for i in range(0, len(games), n) for r in play_with_retries(games[i : i + n], model_path, None, config, label)]
 
 
+def play_eval(games, model_path, config, label):
+	"""The records of the eval battles, played on config.eval_workers persistent battle processes (play.BattleProcess:
+	a VCMI start-up per 50 battles, not one per battle as play_in_groups), new ones each eval. Game i goes to worker
+	i % eval_workers, so every eval plays the same battles in the same processes in the same order. A battle that
+	fails or stalls is retried in a new process, config.attempts tries."""
+	model_path = Path(model_path).resolve()  # VCMI runs in build/bin: paths must be absolute
+	n = min(config.eval_workers, len(games))
+	results, errors = [None] * len(games), []
+
+	def work(worker):
+		process = play.BattleProcess()
+		try:
+			for i in range(worker, len(games), n):
+				for attempt in range(1, config.attempts + 1):
+					try:
+						results[i] = process.play(games[i], model_path)
+						break
+					except RuntimeError as error:
+						print(f"{label}: battle {i}, attempt {attempt} failed: {str(error)[:300]}", flush=True)
+						if attempt == config.attempts:
+							raise
+		except BaseException as error:  # re-raised below, in the calling thread
+			errors.append(error)
+		finally:
+			process.close()
+
+	threads = [threading.Thread(target=work, args=(w,), daemon=True) for w in range(n)]
+	for thread in threads:
+		thread.start()
+	for thread in threads:
+		thread.join()
+	if errors:
+		raise errors[0]
+	return [r for records in results for r in records]
+
+
 GENERATED_ROOT = ROOT / "runtime" / "generated"  # generated scenarios of running training epochs, deleted after each
 EVAL_GENERATOR_SEED = 20261025  # the generated eval battles: the same for every run
 
@@ -444,9 +484,11 @@ def full_shot(t, i):
 def failure_modes(records):
 	"""Signs of dumb play in a set of battle records (eval), each a share 0..1 (nan when it never came up):
 	escape_while_ahead    retreats and surrenders while our value head thought we were winning (V > 0)
-	shooter_not_shooting  decisions of a unit that could shoot at full damage (a legal target within 10 hexes, or a
-	                      shooter without a distance penalty) where it moved, waited or defended instead: waiting for an
-	                      enemy to come within full range is no failure, nor is defending while blocked (it cannot shoot)
+	shooter_not_shooting  of a unit's rounds where it could shoot at full damage at one of its decisions (a legal
+	                      target within 10 hexes, or no distance penalty), those it ended moving, waiting or defending
+	                      without having shot: waiting and then shooting is no failure (shooting after the enemy commits),
+	                      nor is waiting for an enemy to come within full range, nor defending while blocked (it cannot
+	                      shoot then)
 	worthless_cast        hero casts at a unit or hex that lose us value (predicted value < 0: e.g. a Frost Ring on our own
 	                      stacks); 0 is no sign: buffs, debuffs and summons change no health when cast (Slow, Shield)
 	cast_skipped_on_loss  in battles we lost, the share of the rounds our hero could cast in (one of our decisions had a
@@ -456,14 +498,22 @@ def failure_modes(records):
 	counts = {name: [0, 0] for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")}
 	for r in records:
 		t = r.tensors
+		shooters = {}  # (round, slot) -> [could shoot at full damage, shot, its last action]
+		for i, a in enumerate(r.actions):
+			if t["m_type"][i, ActionType.SHOOT] or a["type"] == ActionType.SHOOT:
+				turn = shooters.setdefault((int(t["g_round"][i]), int(t["g_active_unit"][i])), [False, False, None])
+				turn[0] |= bool(t["m_type"][i, ActionType.SHOOT]) and full_shot(t, i)
+				turn[1] |= a["type"] == ActionType.SHOOT
+				turn[2] = a["type"]
+		for could, shot, last in shooters.values():
+			if could:
+				counts["shooter_not_shooting"][0] += (not shot) and last in (ActionType.MOVE, ActionType.WAIT, ActionType.DEFEND)
+				counts["shooter_not_shooting"][1] += 1
 		for i, a in enumerate(r.actions):
 			kind = a["type"]
 			if kind in (ActionType.RETREAT, ActionType.SURRENDER):
 				counts["escape_while_ahead"][0] += float(t["value"][i, -1]) > 0
 				counts["escape_while_ahead"][1] += 1
-			if t["m_type"][i, ActionType.SHOOT] and full_shot(t, i):
-				counts["shooter_not_shooting"][0] += kind in (ActionType.MOVE, ActionType.WAIT, ActionType.DEFEND)
-				counts["shooter_not_shooting"][1] += 1
 			if kind == ActionType.HERO_SPELL and a["spell"] >= 0:
 				sign = 1.0 if int(t["g_our_side"][i]) == 0 else -1.0  # the values are the attacker's gain minus the defender's
 				chosen = sign * float(t["s_unit_value"][i, a["spell"], a["target_unit"]]) if a["target_unit"] >= 0 else sign * float(t["s_hex_value"][i, a["spell"], a["target_hex"]]) if a["target_hex"] >= 0 else None
@@ -505,7 +555,7 @@ def eval_baseline(model, out, battle_map, config, suffix=""):
 			return rows
 	model_path = out / "eval.onnx"
 	export(cpu_copy(model), model_path)  # loaded but not used: the delegate plays
-	records = play_in_groups([replace(g, settings=(("ALPHA_BATTLE_DELEGATE", config.eval_opponent),)) for g in games], model_path, config, "eval baseline")
+	records = play_eval([replace(g, settings=(("ALPHA_BATTLE_DELEGATE", config.eval_opponent),)) for g in games], model_path, config, "eval baseline")
 	summaries = {(g.our_side, g.game_seed): summarize(r.events) for g, r in zip(games, records)}
 	rows = {key: (s.reward, s.army_kept, s.army_killed) for key, s in summaries.items()}
 	with path.open("w", newline="") as f:
@@ -519,9 +569,11 @@ def eval_round(model, epoch, out, battle_map, config, baseline):
 	"""Play the eval battles against config.eval_opponent with the current model; the eval.csv row."""
 	started = time.time()
 	model_path = out / "eval.onnx"
-	export(cpu_copy(model), model_path)
+	cpu = cpu_copy(model)
+	export(cpu, model_path)
+	verify(cpu, model_path, seeds=(epoch,), batch_sizes=(2,))  # the eval plays this file, training the torch model: the same?
 	games = eval_games(config, battle_map)
-	records = play_in_groups(games, model_path, config, f"eval {epoch}")
+	records = play_eval(games, model_path, config, f"eval {epoch}")
 	summaries = [summarize(r.events) for r in records]
 	write_traces(out, epoch, f"vs_{config.eval_opponent}_greedy", [next(r for g, r in zip(games, records) if g.our_side == side) for side in (0, 1)])  # the first seed's
 	row = {"epoch": epoch}
@@ -551,6 +603,7 @@ def eval_round(model, epoch, out, battle_map, config, baseline):
 		by_set.setdefault(key, []).append(s.reward - baseline[(g.our_side, g.game_seed)][0])
 	for key in EVAL_SETS:
 		row[f"score_{key}"] = round(sum(by_set[key]) / len(by_set[key]), 4) if key in by_set else float("nan")
+		row[f"score_{key}_se"] = round(float(np.std(by_set[key], ddof=1) / np.sqrt(len(by_set[key]))), 4) if len(by_set.get(key, ())) > 1 else float("nan")  # its noise
 	# The goal is to win every set, not a good average (the user, 2026-10-27): each set counted alike, and the worst
 	sets = [row[f"score_{key}"] for key in EVAL_SETS if row[f"score_{key}"] == row[f"score_{key}"]]
 	row["score_balanced"] = round(sum(sets) / len(sets), 4) if sets else float("nan")
@@ -704,6 +757,8 @@ def train(config, resume=False):
 		if not path.exists() or not resume:
 			with path.open("w", newline="") as f:
 				csv.writer(f).writerow(EVAL_COLUMNS)
+		else:  # (it was not: the rows after a resume that added columns did not fit its header)
+			upgrade_csv(path, EVAL_COLUMNS)
 
 	def evaluate_now(epoch):
 		"""Every eval opponent's eval round; the score of the model is their mean, each opponent counting the same
@@ -777,7 +832,7 @@ def train(config, resume=False):
 	pool = None
 	if config.actors:  # actors play all the time; each update takes its battles from their buffer
 		from .actors import ActorPool
-		pool = ActorPool(config, out, generated_games, architecture)
+		pool = ActorPool(config, out, generated_games, architecture, trained_epochs=first_epoch - 1)
 		pool.publish(model, lambda path: export(cpu_copy(model), path))
 		pool.start()
 	else:
@@ -827,7 +882,20 @@ def train(config, resume=False):
 				chunks = [model.facts(select(epoch_data["inputs"], torch.arange(i, i + 256, device=device).clamp(max=len(examples) - 1))) for i in range(0, len(examples), 256)]
 				epoch_data["facts"] = {key: torch.cat([c[key] for c in chunks])[: len(examples)] for key in chunks[0]}
 				del chunks  # its blocks would double the features' memory until the next update
-			stopped = False
+			if epoch_data is not None and config.target_kl:
+				# The KL control's anchor: this update's actions under the model as the update starts. Measured against the
+				# policy that played (old_log_prob, about one version back), the previous update's own move counted as
+				# this one's: 44 of v15-window's updates stopped after one step, most right after a full update
+				with torch.no_grad():
+					anchors = []
+					for i in range(0, len(examples), 256):
+						index = torch.arange(i, i + 256, device=device).clamp(max=len(examples) - 1)
+						rows = select(epoch_data, index)
+						anchors.append(log_prob(model(rows["inputs"], rows["facts"]) if "facts" in rows else model(rows["inputs"]), rows["action"]))
+					epoch_data["anchor_log_prob"] = torch.cat(anchors)[: len(examples)]
+					del anchors
+			stopped, update_kl, kl_sum = False, 0.0, 0.0
+			kl_of = lambda out, rows: (lambda d: (d.exp() - 1 - d).mean())(log_prob(out, rows["action"]).detach() - rows["anchor_log_prob"])  # k3: KL(anchor || now)
 			for _ in range(config.ppo_passes if examples else 0):
 				if stopped:
 					break
@@ -855,14 +923,17 @@ def train(config, resume=False):
 					for key in parts_sum:
 						parts_sum[key] += parts[key]  # summed on the device: no sync each step
 					batches += 1
-					if config.target_kl and float(parts["approx_kl"]) > 1.5 * config.target_kl:
-						stopped = True  # this update has moved the policy far enough
-						break
+					if config.target_kl:
+						update_kl = float(kl_of(out_batch, batch))  # before this step: how far the update has moved so far
+						kl_sum += update_kl
+						if update_kl > 1.5 * config.target_kl:
+							stopped = True  # this update has moved the policy far enough
+							break
 			model.eval()
 			if config.target_kl and batches:
 				if stopped:
 					lr_scale = max(0.1, lr_scale / 1.5)
-				elif float(parts["approx_kl"]) < config.target_kl / 2:
+				elif update_kl < config.target_kl / 2:  # the update's last minibatch: nearest where it ended
 					lr_scale = min(config.lr_scale_max, lr_scale * 1.5)
 			epoch_data = batch = out_batch = loss = None  # (none of them may exist: an update with no minibatch)
 			if device.type == "mps":
@@ -897,9 +968,10 @@ def train(config, resume=False):
 				"seconds": round(time.time() - started, 1),
 				"wait_seconds": round(waited, 1),
 				"train_seconds": round(train_seconds, 1),
-				**{k: actor_stats.get(k, "") for k in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures")},
+				**{k: actor_stats.get(k, "") for k in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow")},
 				"learning_rate": round(optimizer.param_groups[0]["lr"], 8),
 				"ppo_steps": batches,
+				"update_kl": round(kl_sum / max(batches, 1), 5),  # KL(start of the update || during it), what the KL control uses
 				"outcome_share": round(advantage_config.outcome_share, 3),
 				**{f"train_{k}": v for k, v in failure_modes(records).items()},  # the same signs of dumb play, in training
 			}

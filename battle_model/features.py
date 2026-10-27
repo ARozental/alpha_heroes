@@ -23,6 +23,8 @@ The feature names (the *_FEATURES tuples) are the model's: a rule weight per nam
 """
 from dataclasses import dataclass
 
+import math
+
 import torch
 
 from . import rules
@@ -450,6 +452,20 @@ def versus_best(values, legal):
 	return values * legal / best.clamp(min=EPS)
 
 
+def wipe_chance(low, high, hp, count):
+	"""P(the attack's damage >= hp). The engine deals the integer mean of n = min(10, count) rolls, each uniform on
+	low..high (BattleInfo::getActualDamage): for n = 1 the uniform's own chance, else the normal approximation of the
+	rolls' sum (continuity-corrected); damage without a spread reaches hp or not. A uniform for every n (as before)
+	said 0.30 where the engine's chance is ~1.4% (hp at 70% of the range, 10 rolls)."""
+	n = count.clamp(1, 10)
+	single = fraction(high - hp + 1, high - low + 1)
+	spread = ((high - low + 1) ** 2 - 1) / 12  # the variance of one roll
+	z = (hp - 0.5 / n - (low + high) / 2) / torch.sqrt(spread / n).clamp(min=EPS)
+	normal = 0.5 * (1 - torch.erf(z / math.sqrt(2)))
+	chance = torch.where(n > 1, normal, single)
+	return torch.where(high > low, chance, (low >= hp).float())
+
+
 def attack_features(b, shooting):
 	"""What the acting unit's attack, a shot or a melee attack, would do to each unit, [B, U, len(ATTACK_FEATURES)];
 	0 for units that are not enemies:
@@ -474,7 +490,7 @@ def attack_features(b, shooting):
 	hp = b.health.float()
 	damage = fraction(average, hp)
 	killed = fraction(rules.kills(average.long(), units).float(), units["count"].float())
-	wipe = fraction(high - hp + 1, high - low + 1)
+	wipe = wipe_chance(low, high, hp, me["count"].float())
 	value_destroyed = fraction(b.value * damage, b.enemy_value[:, None])
 	threat_removed = threat_share(b) * (0.5 * killed + 0.5 * damage)
 

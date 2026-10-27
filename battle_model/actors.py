@@ -41,14 +41,17 @@ LEAGUE_EVERY = 50  # every this many versions one is kept for good, as a past op
 
 
 class ActorPool:
-	def __init__(self, config, out, generated_games, model_kwargs=None):
+	def __init__(self, config, out, generated_games, model_kwargs=None, trained_epochs=0):
 		self.config = config
 		self.models = out / "models"
 		self.models.mkdir(parents=True, exist_ok=True)
 		self.link = self.models / "current.onnx"
 		self.generated_games = generated_games  # train.generated_games
-		# A resumed run goes on numbering from its newest model (else it would overwrite its league snapshots)
-		self.version = max((int(p.stem.split("_")[1]) for p in [*self.models.glob("model_*.onnx"), *self.models.glob("snapshot_*.pt")]), default=-1)
+		# A version is the epoch that trained it (publish adds 1: the first is the model as it starts). A resumed run
+		# goes on from its epoch, and past its newest model (else it would overwrite its league snapshots): from the
+		# newest model alone it fell behind the epochs by up to LEAGUE_EVERY each resume
+		newest = max((int(p.stem.split("_")[1]) for p in [*self.models.glob("model_*.onnx"), *self.models.glob("snapshot_*.pt")]), default=-1)
+		self.version = max(newest, trained_epochs - 1)
 		self.server = None
 		if config.inference == "server":
 			play.SOCKET_DIR.mkdir(parents=True, exist_ok=True)
@@ -58,14 +61,15 @@ class ActorPool:
 			self.server = InferenceServer(self.socket, device=device, model_kwargs=model_kwargs, threads=config.inference_threads, processes=processes)
 			import torch
 
-			for path in sorted(self.models.glob("snapshot_*.pt")):  # the league of a resumed run
-				self.server.set_model(path.stem.replace("snapshot_", "v"), int(path.stem.split("_")[1]), torch.load(path, map_location="cpu"))
+			for path in sorted(self.models.glob("snapshot_*.pt")):  # the league of a resumed run, by the names past_versions gives
+				version = int(path.stem.split("_")[1])
+				self.server.set_model(f"v{version}", version, torch.load(path, map_location="cpu"))
 		self.buffer = []  # dicts: record, source, game, version, decisions
 		self.lock = threading.Condition()
 		self.stop = threading.Event()
 		self.running = threading.Event()  # cleared while the learner evaluates: generated actors start no new battle
 		self.running.set()
-		self.stats = {"failures": 0, "dropped_stale": 0, "battles": {"generated": 0, "real": 0}, "last_failure": ""}
+		self.stats = {"failures": 0, "dropped_stale": 0, "dropped_overflow": 0, "battles": {"generated": 0, "real": 0}, "last_failure": ""}
 		self.records = play.RecordServer()
 		self.threads = []
 
@@ -101,9 +105,10 @@ class ActorPool:
 
 	def past_versions(self):
 		"""The league's past versions: server model names ("v350") or ONNX files."""
+		# Not version 0: the untrained model, a free win that teaches nothing
 		if self.server:
-			return [f"v{int(p.stem.split('_')[1])}" for p in sorted(self.models.glob("snapshot_*.pt")) if int(p.stem.split("_")[1]) < self.version]
-		return sorted(p for p in self.models.glob("model_*.onnx") if int(p.stem.split("_")[1]) % LEAGUE_EVERY == 0 and int(p.stem.split("_")[1]) < self.version)
+			return [f"v{int(p.stem.split('_')[1])}" for p in sorted(self.models.glob("snapshot_*.pt")) if 0 < int(p.stem.split("_")[1]) < self.version]
+		return sorted(p for p in self.models.glob("model_*.onnx") if int(p.stem.split("_")[1]) % LEAGUE_EVERY == 0 and 0 < int(p.stem.split("_")[1]) < self.version)
 
 	@staticmethod
 	def version_of(record):
@@ -183,6 +188,10 @@ class ActorPool:
 		while not self.stop.is_set():
 			if self.version < 0 or not self.running.wait(timeout=1):
 				continue
+			with self.lock:  # backpressure: no battle while the buffer holds this source's share of an update
+				if self.generated_waiting() >= (1 - self.config.real_share) * self.config.decisions_per_update:
+					self.lock.wait(timeout=1)
+					continue
 			n += 1
 			scenario = generator.sample(rng)
 			opponent, past_model = self._opponent(rng)
@@ -204,6 +213,10 @@ class ActorPool:
 					path.unlink(missing_ok=True)
 		if process:
 			process.close()
+
+	def generated_waiting(self):
+		"""Decisions of generated battles in the buffer, young enough to be used (call with self.lock held)."""
+		return sum(b["decisions"] for b in self.buffer if b["source"] == "generated" and b["version"] >= self.version - self.config.max_record_age)
 
 	def _real_actor(self, index):
 		rng = random.Random(7 * (self.config.seed + 1) + 104729 * index)
@@ -262,7 +275,10 @@ class ActorPool:
 			self.buffer = [b for b in self.buffer if id(b) not in ids]
 			overflow = sum(b["decisions"] for b in self.buffer) - config.buffer_decisions
 			while overflow > 0 and self.buffer:  # the oldest go first
-				overflow -= self.buffer.pop(0)["decisions"]
+				dropped = self.buffer.pop(0)["decisions"]
+				overflow -= dropped
+				self.stats["dropped_overflow"] += dropped
+			self.lock.notify_all()  # generated actors waiting for room (backpressure) go on
 			total = max(1, sum(taken.values()))
 			stats = {
 				"real_share": round(taken["real"] / total, 3),
@@ -270,11 +286,14 @@ class ActorPool:
 				"buffer_decisions": sum(b["decisions"] for b in self.buffer),
 				"record_age": round(sum(self.version - b["version"] for b in chosen) / max(1, len(chosen)), 2),
 				"actor_failures": self.stats["failures"],
+				"dropped_stale": self.stats["dropped_stale"],
+				"dropped_overflow": self.stats["dropped_overflow"],
 			}
 		return [b["record"] for b in chosen], stats
 
 	def _select(self, decisions):
-		"""(battles, decisions per game, decisions per source) for an update, newest first: real_share from real games,
+		"""(battles, decisions per game, decisions per source) for an update, oldest first (within max_record_age: newest
+		first left the long battles, which start under an older version, to age out): real_share from real games,
 		the rest generated, the other source filling when one is short; no real game over game_share of the update
 		(a generated battle is a game of its own, both of its sides taken together)."""
 		config = self.config
@@ -283,7 +302,7 @@ class ActorPool:
 		chosen_ids = set()
 
 		def pick(source, goal):
-			for b in sorted((b for b in self.buffer if b["source"] == source and id(b) not in chosen_ids), key=lambda b: -b["version"]):
+			for b in sorted((b for b in self.buffer if b["source"] == source and id(b) not in chosen_ids), key=lambda b: b["version"]):
 				if taken[source] >= goal or sum(taken.values()) >= decisions:
 					return
 				if source == "real" and per_game.get(b["game"], 0) > 0 and per_game[b["game"]] + b["decisions"] > cap:

@@ -173,6 +173,13 @@ void AlphaBattleAI::loadModel()
 	{
 		model.reset();
 		logAi->error("AlphaBattleAI: cannot use model '%s': %s. Every unit defends.", modelPath, e.what());
+		// Training and evals: a side without its model must fail the battle, not play it defending (unrecorded league
+		// opponents did, after a resume misnamed their models, and their battles were trained on as normal)
+		if(!playerSetting(*cb, "ALPHA_BATTLE_REQUIRE_MODEL").empty())
+		{
+			logAi->error("AlphaBattleAI: ALPHA_BATTLE_REQUIRE_MODEL is set: the game ends here");
+			std::abort();
+		}
 		if(record) // a training record must never silently contain a battle the model did not play
 		{
 			std::string message = e.what();
