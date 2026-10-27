@@ -42,6 +42,7 @@ on the seeds being fixed: the same training has to work on real, ever-different 
 """
 import argparse
 import copy
+import functools
 import itertools
 import csv
 import json
@@ -53,10 +54,11 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from . import generator, play
+from . import generator, play, rules
 from .data import collate, credit_check, make_dataloader, summarize
 from .export import export
 from .losses import AdvantageConfig, PPOConfig, ppo_loss, search_loss
@@ -416,10 +418,33 @@ def eval_set(game):
 	return "real" if about.startswith("real") else "castle" if about.startswith("castle") else "hard" if about.startswith("hard") else "neutrals" if about.startswith("hero_vs_neutrals") else "generated"
 
 
+@functools.lru_cache(maxsize=1)
+def _no_distance_penalty():
+	return rules.creature_tables()["no_distance_penalty"].numpy()
+
+
+def full_shot(t, i):
+	"""Whether the acting unit of decision i (record tensors t) can shoot something at full damage: a legal target
+	within rules.SHOOTING_PENALTY_DISTANCE hexes (either of its hexes), or it has no distance penalty."""
+	shooter = int(t["g_active_unit"][i])
+	creature = int(t["u_creature"][i, shooter])
+	if 0 <= creature < len(_no_distance_penalty()) - 1 and _no_distance_penalty()[creature]:
+		return True
+	legal = np.asarray(t["m_shoot_target"][i], dtype=bool)
+	if not legal.any():
+		return False
+	here = torch.as_tensor(int(t["u_hex"][i, shooter]))
+	hexes, rears = torch.as_tensor(np.asarray(t["u_hex"][i], dtype=np.int64)), torch.as_tensor(np.asarray(t["u_rear_hex"][i], dtype=np.int64))
+	near = (rules.hex_distance(here, hexes) <= rules.SHOOTING_PENALTY_DISTANCE) | ((rears >= 0) & (rules.hex_distance(here, rears) <= rules.SHOOTING_PENALTY_DISTANCE))
+	return bool((near.numpy() & legal).any())
+
+
 def failure_modes(records):
 	"""Signs of dumb play in a set of battle records (eval), each a share 0..1 (nan when it never came up):
 	escape_while_ahead    retreats and surrenders while our value head thought we were winning (V > 0)
-	shooter_not_shooting  decisions of a unit that could shoot where it moved, waited or defended instead
+	shooter_not_shooting  decisions of a unit that could shoot at full damage (a legal target within 10 hexes, or a
+	                      shooter without a distance penalty) where it moved, waited or defended instead: waiting for an
+	                      enemy to come within full range is no failure, nor is defending while blocked (it cannot shoot)
 	worthless_cast        hero casts at a unit or hex that lose us value (predicted value < 0: e.g. a Frost Ring on our own
 	                      stacks); 0 is no sign: buffs, debuffs and summons change no health when cast (Slow, Shield)
 	cast_skipped_on_loss  in battles we lost, the share of the rounds our hero could cast in (one of our decisions had a
@@ -434,7 +459,7 @@ def failure_modes(records):
 			if kind in (ActionType.RETREAT, ActionType.SURRENDER):
 				counts["escape_while_ahead"][0] += float(t["value"][i, -1]) > 0
 				counts["escape_while_ahead"][1] += 1
-			if t["m_type"][i, ActionType.SHOOT]:
+			if t["m_type"][i, ActionType.SHOOT] and full_shot(t, i):
 				counts["shooter_not_shooting"][0] += kind in (ActionType.MOVE, ActionType.WAIT, ActionType.DEFEND)
 				counts["shooter_not_shooting"][1] += 1
 			if kind == ActionType.HERO_SPELL and a["spell"] >= 0:

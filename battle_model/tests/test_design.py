@@ -249,3 +249,20 @@ def test_unsound_records_are_caught():
 	assert "out of range" in check_record(Record([], [wait, dict(wait, type=30570)], tensors))
 	assert "not legal" in check_record(Record([], [wait, dict(wait, type=1)], tensors))
 	assert "decisions" in check_record(Record([], [wait], tensors))
+
+
+def test_full_shot_needs_a_target_in_full_range():
+	"""train.full_shot: a shooter counts as able to shoot at full damage only with a legal target within 10 hexes
+	(waiting for one to come closer is no failure)."""
+	import numpy as np
+	from battle_model.schema import empty_inputs
+	from battle_model.train import full_shot
+
+	x = empty_inputs(1)
+	x["g_active_unit"][0] = 0
+	x["u_creature"][0, 0] = 1  # a creature with the distance penalty (no NO_DISTANCE_PENALTY in the vocabulary row)
+	x["u_hex"][0, 0], x["u_hex"][0, 1] = 1, 15  # 14 hexes apart, the same row
+	x["m_shoot_target"][0, 1] = True
+	assert not full_shot(x, 0)
+	x["u_hex"][0, 1] = 8  # 7 hexes
+	assert full_shot(x, 0)
