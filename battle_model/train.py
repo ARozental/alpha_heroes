@@ -241,6 +241,7 @@ EVAL_COLUMNS = [
 	"attack_baseline_army_kept", "attack_baseline_army_killed", "defence_baseline_army_kept", "defence_baseline_army_killed",
 	"escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss",
 	"score_generated", "score_neutrals", "score_real", "score_castle", "score_hard",  # one a set of EVAL_SETS
+	"score_balanced", "score_worst",  # the sets' mean (each alike) and the worst set
 ]  # eval.csv, greedy battles per side: win rate, mean reward -1..1, outcomes; and minus the eval opponent's own reward on
 # the same seeds. army_kept / army_killed: shares of our army kept and of the enemy's lost (data.BattleSummary), ours
 # and the eval opponent's on the same seeds: the same whatever the reward's definition. total_score: THE measure of a
@@ -260,7 +261,7 @@ def log_eval_tensorboard(writer, row, opponent=""):
 		writer.add_scalar(f"{prefix}/total_score", float(row["total_score"]), epoch)
 	else:  # (old runs: one opponent, its score is the total)
 		writer.add_scalar("eval/total_score", float(row["total_score"]), epoch)
-	for column in (*(f"score_{k}" for k in EVAL_SETS), "escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss"):
+	for column in (*(f"score_{k}" for k in EVAL_SETS), "score_balanced", "score_worst", "escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss"):
 		if row.get(column) not in (None, "") and row[column] == row[column]:  # skip nan: a set or a case that never came up
 			writer.add_scalar(f"{prefix}/{column}", float(row[column]), epoch)
 	for name in ("attack", "defence", "mean"):
@@ -550,6 +551,10 @@ def eval_round(model, epoch, out, battle_map, config, baseline):
 		by_set.setdefault(key, []).append(s.reward - baseline[(g.our_side, g.game_seed)][0])
 	for key in EVAL_SETS:
 		row[f"score_{key}"] = round(sum(by_set[key]) / len(by_set[key]), 4) if key in by_set else float("nan")
+	# The goal is to win every set, not a good average (the user, 2026-10-27): each set counted alike, and the worst
+	sets = [row[f"score_{key}"] for key in EVAL_SETS if row[f"score_{key}"] == row[f"score_{key}"]]
+	row["score_balanced"] = round(sum(sets) / len(sets), 4) if sets else float("nan")
+	row["score_worst"] = round(min(sets), 4) if sets else float("nan")
 	row["mean_vs_baseline"] = round((sum(rewards) - sum(baselines)) / len(rewards), 4)
 	row.update(failure_modes(records))
 	row["seconds"] = round(time.time() - started, 1)
@@ -705,8 +710,13 @@ def train(config, resume=False):
 		(eval/total_score in TensorBoard, eval_total.csv; each opponent's own rows under eval_<opponent>/)."""
 		if any(c.eval_opponent == "MMAI" for c in opponents) and "mmai" not in play.active_mods():  # it would play as BattleAI
 			raise RuntimeError(f"the MMAI mod is not active ({play.USER_DIR / 'config' / 'modSettings.json'}): MMAI would fall back to BattleAI")
-		scores = {c.eval_opponent: evaluate_against(epoch, c, baseline)["total_score"] for c, baseline in zip(opponents, baselines)}
+		rows = {c.eval_opponent: evaluate_against(epoch, c, baseline) for c, baseline in zip(opponents, baselines)}
+		scores = {name: row["total_score"] for name, row in rows.items()}
 		total = round(sum(scores.values()) / len(scores), 4)
+		balanced = round(sum(row["score_balanced"] for row in rows.values()) / len(rows), 4)
+		worst = round(min(row["score_worst"] for row in rows.values()), 4)  # the worst set against any opponent
+		writer.add_scalar("eval/balanced_score", balanced, epoch)
+		writer.add_scalar("eval/worst_set", worst, epoch)
 		path = out / "eval_total.csv"
 		new = not path.exists()
 		with path.open("a", newline="") as f:
@@ -715,7 +725,7 @@ def train(config, resume=False):
 			csv.writer(f).writerow([epoch, total, *scores.values()])
 		writer.add_scalar("eval/total_score", total, epoch)
 		writer.flush()
-		print(f"eval  {epoch:4d}  TOTAL SCORE {total:+.3f}  (" + ", ".join(f"vs {name} {score:+.3f}" for name, score in scores.items()) + ")", flush=True)
+		print(f"eval  {epoch:4d}  TOTAL SCORE {total:+.3f}  (" + ", ".join(f"vs {name} {score:+.3f}" for name, score in scores.items()) + f")  balanced {balanced:+.3f}  worst set {worst:+.3f}", flush=True)
 
 	def evaluate_against(epoch, config_for, baseline):
 		row = eval_round(model, epoch, out, battle_map, config_for, baseline)
