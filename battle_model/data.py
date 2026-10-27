@@ -31,7 +31,7 @@ import numpy as np
 import torch
 
 from . import vocab
-from .distributions import ACTION_FIELDS, log_prob, stack_actions
+from .distributions import ACTION_FIELDS, is_legal, log_prob, stack_actions
 from .losses import AdvantageConfig, battle_returns_and_advantages, normalize_advantages, policy_advantages, value_targets
 from .reward import Outcome, RewardConfig, assets_after, hero_asset, mana_value, round_score, terminal_reward, to_scale
 from .schema import INPUTS, OUTPUTS
@@ -223,6 +223,30 @@ def load_decision(path):
 def decision_paths(record_dir):
 	"""A record's decisions in the order they were made (decision_00000.npz, ...; or older decision_* directories)."""
 	return sorted(Path(record_dir).glob("decision_*"))
+
+
+def check_record(record):
+	"""None if every recorded decision is sound, else what is wrong: a decision count that differs between its parts,
+	or an action that is out of range or illegal under that decision's own masks. A record that fails is never
+	trained on: a corrupt one (an action type of 30570) once stopped a run inside a training step."""
+	n = len(record.actions)
+	for name, tensor in record.tensors.items():
+		if len(tensor) != n:
+			return f"{name} has {len(tensor)} decisions, the actions {n}"
+	m_type = record.tensors.get("m_type")
+	for i, action in enumerate(record.actions):
+		kind = action.get("type", -1)
+		if not isinstance(kind, int) or not 0 <= kind < m_type.shape[1]:
+			return f"decision {i}: action type {kind!r} out of range"
+		if not m_type[i, kind]:
+			return f"decision {i}: action type {kind} not legal under its masks"
+		try:
+			legal = is_legal(action, {k: np.asarray(v)[i : i + 1] for k, v in record.tensors.items() if k.startswith("m_")})
+		except (IndexError, KeyError, TypeError):  # a field out of its table
+			legal = False
+		if not legal:
+			return f"decision {i}: action {action} not legal under its masks"
+	return None
 
 
 def read_decisions(record):

@@ -171,13 +171,20 @@ class RecordServer:
 		while True:
 			ready, _, _ = select.select([self._socket], [], [], 0.1)
 			if ready:
-				connection, _ = self._socket.accept()
-				with connection:
-					data = bytearray()
-					while chunk := connection.recv(1 << 20):
-						data += chunk
-				(key_length,) = struct.unpack_from("<I", data, 0)
-				key = bytes(data[4 : 4 + key_length]).decode().split("#", 1)[0]  # AlphaBattleAI numbers each battle: key#n
+				# One bad connection (empty: a game killed as it connected; cut short) is dropped, never the server:
+				# an empty one ended this thread, and every record after it was lost
+				try:
+					connection, _ = self._socket.accept()
+					with connection:
+						data = bytearray()
+						while chunk := connection.recv(1 << 20):
+							data += chunk
+					(key_length,) = struct.unpack_from("<I", data, 0)
+					if len(data) < 4 + key_length:
+						continue
+					key = bytes(data[4 : 4 + key_length]).decode().split("#", 1)[0]  # AlphaBattleAI numbers each battle: key#n
+				except (OSError, struct.error, UnicodeDecodeError):
+					continue
 				with self._lock:
 					self.records.setdefault(key, []).append(bytes(data[4 + key_length :]))
 			elif self._stop.is_set():

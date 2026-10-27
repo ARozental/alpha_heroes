@@ -233,3 +233,19 @@ def test_exposure_features_are_shares():
 	b = F.read_battle(x, BattleModel().tables())
 	e = F.exposure_features(b)
 	assert e.shape == (8, len(F.EXPOSURE_FEATURES)) and (e >= 0).all() and (e <= 1).all()
+
+
+def test_unsound_records_are_caught():
+	"""data.check_record: an action out of range or illegal under its own masks is caught (never trained on)."""
+	import numpy as np
+	from battle_model.data import Record, check_record
+	from battle_model.schema import empty_inputs, OUTPUTS
+
+	x = empty_inputs(2)
+	x["m_type"][:, 0] = True  # WAIT legal
+	tensors = {**x, **{s.name: np.zeros((2,) + s.shape, np.float32) for s in OUTPUTS}}
+	wait = {"type": 0, "hex": -1, "unit": -1, "spell": -1, "target_unit": -1, "target_hex": -1, "target2_hex": -1, "target2_unit": -1}
+	assert check_record(Record([], [wait, wait], tensors)) is None
+	assert "out of range" in check_record(Record([], [wait, dict(wait, type=30570)], tensors))
+	assert "not legal" in check_record(Record([], [wait, dict(wait, type=1)], tensors))
+	assert "decisions" in check_record(Record([], [wait], tensors))

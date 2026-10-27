@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 
 from . import generator, play, real_games
-from .data import parse_record
+from .data import check_record, parse_record
 from .inference import InferenceServer
 
 KEEP_VERSIONS = 6  # the newest model versions kept for the actors (older ones are deleted unless a league snapshot)
@@ -143,6 +143,11 @@ class ActorPool:
 					self.stats["failures"] += 1
 					self.stats["last_failure"] = message = next(e for e in r.events if e.get("event") == "error").get("message", "")[:300]
 					print(f"actors: a {source} battle had an error ({game}): {message}", flush=True)
+					continue
+				if problem := check_record(r):  # a corrupt record: never trained on
+					self.stats["failures"] += 1
+					self.stats["last_failure"] = problem[:300]
+					print(f"actors: a {source} battle's record is unsound ({game}): {problem[:300]}", flush=True)
 					continue
 				self.buffer.append({"record": r, "source": source, "game": game, "version": self.version_of(r), "decisions": r.decisions})
 				self.stats["battles"][source] += 1
