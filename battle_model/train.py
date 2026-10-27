@@ -207,7 +207,7 @@ COLUMNS = [
 	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds",
 ] + [f"{side}_share_{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS] + [
 	f"{side}_{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")
-] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "learning_rate", "ppo_steps"] + [
+] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "learning_rate", "ppo_steps", "outcome_share"] + [
 	f"train_{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")
 ]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
@@ -219,6 +219,7 @@ TENSORBOARD_TAGS = {
 	**{name: f"actors/{name}" for name in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures")},
 	"learning_rate": "stability/learning_rate",
 	"ppo_steps": "stability/ppo_steps",  # fewer than the passes' when the KL control stopped the update
+	"outcome_share": "stability/outcome_share",  # the window credit's share of the real outcome (by V's quality)
 	**{f"{side}_share_{kind.lower()}": f"actions_{side}/{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS},
 	**{f"{side}_{name}": f"credit_{side}/{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")},
 	"mean_reward": "reward/mean", "attack_reward": "reward/attack", "defence_reward": "reward/defence",
@@ -639,9 +640,10 @@ def model_kwargs(config):
 	return {"architecture": "v1", "dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features, "chain_final_value": config.model_chain_final_value, "kill_rule": config.model_kill_rule}
 
 
-def save_checkpoint(path, model, optimizer, epoch, config, elapsed=0.0, lr_scale=1.0):
-	"""elapsed: the training's seconds so far (run_hours counts them across resumes); lr_scale: the KL control's."""
-	torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "model_kwargs": model_kwargs(config), "elapsed": elapsed, "lr_scale": lr_scale}, path)
+def save_checkpoint(path, model, optimizer, epoch, config, elapsed=0.0, lr_scale=1.0, value_ev=None):
+	"""elapsed: the training's seconds so far (run_hours counts them across resumes); lr_scale: the KL control's;
+	value_ev: the smoothed explained variance the window credit's outcome share follows."""
+	torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "model_kwargs": model_kwargs(config), "elapsed": elapsed, "lr_scale": lr_scale, "value_ev": value_ev}, path)
 
 
 def train(config, resume=False):
@@ -656,6 +658,7 @@ def train(config, resume=False):
 	first_epoch = 1
 	elapsed_before = 0.0
 	lr_scale = 1.0  # the KL control's (target_kl)
+	value_ev = None  # the value head's explained variance (credit_check), smoothed: sets the window credit's outcome share
 	latest = out / "checkpoint_latest.pt"
 	if resume and latest.exists():
 		state = torch.load(latest, map_location=device)
@@ -667,6 +670,7 @@ def train(config, resume=False):
 		first_epoch = state["epoch"] + 1
 		elapsed_before = state.get("elapsed", 0.0)
 		lr_scale = state.get("lr_scale", 1.0)
+		value_ev = state.get("value_ev")
 		print(f"resuming after epoch {state['epoch']} ({elapsed_before / 3600:.2f} h)")
 
 	battle_map = None if config.generator else play.build_map(config.scenario, variant=config.run)
@@ -677,6 +681,9 @@ def train(config, resume=False):
 			csv.writer(f).writerow(COLUMNS)
 	else:
 		upgrade_csv(progress, COLUMNS)
+		if value_ev is None:  # a checkpoint from before value_ev was kept: the last updates' explained variance
+			evs = [(float(r["attack_value_ev"]) + float(r["defence_value_ev"])) / 2 for r in list(csv.DictReader(progress.open()))[-10:] if r.get("attack_value_ev") not in (None, "", "nan") and r.get("defence_value_ev") not in (None, "", "nan")]
+			value_ev = sum(evs) / len(evs) if evs else None
 	writer = SummaryWriter(out / "tensorboard" / "run")  # one folder for the whole run: a resume goes on with the same line
 	eval_csv = out / "eval.csv"
 	if not eval_csv.exists() or not resume:
@@ -791,6 +798,10 @@ def train(config, resume=False):
 			waited = time.time() - started
 			if not pool and config.prefetch and epoch < config.epochs:
 				producer.start(epoch + 1, model_files[current])  # with the model before this epoch's update
+			if advantage_config.credit == "window" and advantage_config.outcome_share_max > advantage_config.outcome_share:
+				a = config.advantage
+				trust = min(1.0, max(0.0, (value_ev if value_ev is not None else 0.0) / a.outcome_share_full_ev))
+				advantage_config = replace(advantage_config, outcome_share=a.outcome_share_max - (a.outcome_share_max - a.outcome_share) * trust)
 			loader, summaries, _ = make_dataloader(records, config.batch_size, True, reward_config, advantage_config)
 
 			weights_before = flat_weights(model)
@@ -879,6 +890,7 @@ def train(config, resume=False):
 				**{k: actor_stats.get(k, "") for k in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures")},
 				"learning_rate": round(optimizer.param_groups[0]["lr"], 8),
 				"ppo_steps": batches,
+				"outcome_share": round(advantage_config.outcome_share, 3),
 				**{f"train_{k}": v for k, v in failure_modes(records).items()},  # the same signs of dumb play, in training
 			}
 			for side, name in ((0, "attack"), (1, "defence")):
@@ -898,6 +910,10 @@ def train(config, resume=False):
 				row[f"{name}_value_error"] = round(average([s.value_error for s in side_summaries]), 4)
 				ev, own_lost, killed = credit_check(side_summaries)
 				row[f"{name}_value_ev"], row[f"{name}_credit_own_lost"], row[f"{name}_credit_killed"] = round(ev, 3), round(own_lost, 3), round(killed, 3)
+			evs = [row[f"{name}_value_ev"] for name in ("attack", "defence") if row[f"{name}_value_ev"] == row[f"{name}_value_ev"]]
+			if evs:  # the window credit's outcome share follows it (smoothed over ~10 updates)
+				now = max(-1.0, min(1.0, sum(evs) / len(evs)))
+				value_ev = now if value_ev is None else 0.9 * value_ev + 0.1 * now
 			with progress.open("a", newline="") as f:
 				csv.writer(f).writerow([row[c] for c in COLUMNS])
 			log_tensorboard(writer, row, self_play=config.opponent == play.SELF_PLAY)
@@ -916,10 +932,10 @@ def train(config, resume=False):
 				if pool:
 					pool.resume()
 				last_eval = time.monotonic()
-				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale)  # every evaluated model
-			save_checkpoint(latest, model, optimizer, epoch, config, elapsed(), lr_scale)
+				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev)  # every evaluated model
+			save_checkpoint(latest, model, optimizer, epoch, config, elapsed(), lr_scale, value_ev)
 			if config.checkpoint_every and epoch % config.checkpoint_every == 0:
-				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale)
+				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev)
 	finally:
 		if pool:
 			pool.close()

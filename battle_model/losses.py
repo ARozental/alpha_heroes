@@ -87,6 +87,12 @@ class AdvantageConfig:
 	credit: str = "window"
 	window_rounds: int = 2
 	outcome_share: float = 0.15
+	# "window": the outcome's share follows how good the value head is (train.py, by its explained variance EV):
+	# outcome_share_max at EV <= 0, falling linearly to outcome_share at EV >= outcome_share_full_ev. A weak value head is
+	# not trusted with most of the credit: v15-window's first two hours (EV < 0) went flat and half unlearned casting,
+	# and it was well again once EV was ~0.2-0.4. outcome_share_max = outcome_share: off.
+	outcome_share_max: float = 0.5
+	outcome_share_full_ev: float = 0.4
 	# GAE lambda (step 5); 1 = judge each decision by the final outcome only. 0.8 (2026-10-26, the user's call: bootstrap
 	# for now; the comparison with 0.95, every earlier run's, is to come): a decision 12 steps from the end gets 7% of its
 	# credit from the outcome (0.95: 54%), the rest from the value head's estimates, so far less of later luck
