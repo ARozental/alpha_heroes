@@ -652,7 +652,7 @@ def train(config, resume=False):
 			csv.writer(f).writerow(COLUMNS)
 	else:
 		upgrade_csv(progress, COLUMNS)
-	writer = SummaryWriter(out / "tensorboard" / time.strftime("%Y%m%d-%H%M%S"))
+	writer = SummaryWriter(out / "tensorboard" / "run")  # one folder for the whole run: a resume goes on with the same line
 	eval_csv = out / "eval.csv"
 	if not eval_csv.exists() or not resume:
 		with eval_csv.open("w", newline="") as f:
