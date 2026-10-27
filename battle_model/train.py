@@ -60,7 +60,7 @@ from . import generator, play
 from .data import collate, credit_check, make_dataloader, summarize
 from .export import export
 from .losses import AdvantageConfig, PPOConfig, ppo_loss, search_loss
-from .constants import ActionType
+from .constants import N_ACTION_TYPES, ActionType
 from .model import build_model
 from .trace import trace
 from .reward import Outcome, RewardConfig, to_scale
@@ -789,6 +789,13 @@ def train(config, resume=False):
 					order = order[: len(examples) - len(examples) % config.batch_size]
 				for first in range(0, len(order), config.batch_size):
 					batch = select(epoch_data, order[first : first + config.batch_size])
+					# The minibatch's actions as the GPU holds them, before any use: on Apple's GPU they were twice garbage
+					# (action types of 30570, 10640) in a heavily swapping run, though valid on the CPU (data.check_record),
+					# and indexing with them stopped the run; such an update is now dropped with a note instead
+					if bool(((batch["action"]["type"] < 0) | (batch["action"]["type"] >= N_ACTION_TYPES)).any()):
+						print(f"update {epoch}: a minibatch's actions are corrupt on the {device} (step {batches}): the rest of this update is dropped", flush=True)
+						stopped = True
+						break
 					out_batch = model(batch["inputs"], batch["facts"]) if "facts" in batch else model(batch["inputs"])
 					if config.search_simulations > 0 and "search" in batch:
 						loss, parts = search_loss(out_batch, batch["search"], batch["value_labels"], ppo_config)

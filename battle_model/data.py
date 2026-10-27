@@ -188,8 +188,16 @@ def parse_record(data):
 		entries[name] = view[offset + 8 : offset + 8 + size]
 		offset += 8 + size
 	lines = lambda name: [json.loads(line) for line in bytes(entries[name]).decode().splitlines() if line.strip()]
-	tensors = {s.name: np.load(io.BytesIO(entries[s.name + ".npy"])) for s in INPUTS + OUTPUTS}
+	tensors = {s.name: compact(np.load(io.BytesIO(entries[s.name + ".npy"]))) for s in INPUTS + OUTPUTS}
 	return Record(lines("events.jsonl"), lines("actions.jsonl"), tensors)
+
+
+def compact(array):
+	"""An int64 array as int32 when its values fit (all inputs do: ~630k at most): records wait in the actors' buffer
+	by the thousand, at ~675 KB a decision in int64, and the machine swapped (collate widens them back)."""
+	if array.dtype == np.int64 and array.size and np.abs(array).max() < 2**31:
+		return array.astype(np.int32)
+	return array
 
 
 def load_record(path):
@@ -314,7 +322,7 @@ def collate(examples):
 	policy: "search" = {"action": {field: [B, K]}, "probs": [B, K]}, padded to the longest with probability 0 (and
 	all fields -1); an example without one has all probabilities 0."""
 	batch = {
-		"inputs": {s.name: torch.from_numpy(np.stack([e["inputs"][s.name] for e in examples])) for s in INPUTS},
+		"inputs": {s.name: torch.from_numpy(np.stack([e["inputs"][s.name] for e in examples]).astype(np.int64) if s.dtype == "int64" else np.stack([e["inputs"][s.name] for e in examples])) for s in INPUTS},
 		"action": {f: torch.tensor([e["action"][f] for e in examples], dtype=torch.long) for f in ACTION_FIELDS},
 		"old_log_prob": torch.stack([e["old_log_prob"] for e in examples]),
 		"advantage": torch.stack([e["advantage"] for e in examples]),
