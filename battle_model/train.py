@@ -780,6 +780,7 @@ def train(config, resume=False):
 			if epoch_data is not None and hasattr(model, "facts"):  # the features: once per decision, not once per pass
 				chunks = [model.facts(select(epoch_data["inputs"], torch.arange(i, i + 256, device=device).clamp(max=len(examples) - 1))) for i in range(0, len(examples), 256)]
 				epoch_data["facts"] = {key: torch.cat([c[key] for c in chunks])[: len(examples)] for key in chunks[0]}
+				del chunks  # its blocks would double the features' memory until the next update
 			stopped = False
 			for _ in range(config.ppo_passes if examples else 0):
 				if stopped:
@@ -817,6 +818,12 @@ def train(config, resume=False):
 					lr_scale = max(0.1, lr_scale / 1.5)
 				elif float(parts["approx_kl"]) < config.target_kl / 2:
 					lr_scale = min(config.lr_scale_max, lr_scale * 1.5)
+			epoch_data = batch = out_batch = loss = None  # (none of them may exist: an update with no minibatch)
+			if device.type == "mps":
+				# The update's tensors differ in size every update (its battles' decisions): MPS's caching allocator kept
+				# blocks of every size, a 22 GB footprint on a 26 GB machine, which then swapped heavily (and twice
+				# handed a training step garbage); give them back after each update
+				torch.mps.empty_cache()
 			if pool:
 				pool.publish(model, lambda path: export(cpu_copy(model), path))
 			else:

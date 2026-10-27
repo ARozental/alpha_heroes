@@ -262,7 +262,7 @@ class BattleProcess:
 	(~0.6 s of CPU, more than the rest of a short battle) once every max_battles, not once a battle. play() is play()
 	for one game; a battle that fails or stalls kills the process (the next play starts a new one) and raises."""
 
-	def __init__(self, battle_seconds=300, max_battles=300, max_mb=300):
+	def __init__(self, battle_seconds=300, max_battles=50, max_mb=300):  # VCMI grows by game (1.3-2.7 GB after ~100): a new one every 50
 		self.battle_seconds, self.max_battles, self.max_mb = battle_seconds, max_battles, max_mb
 		self.records = RecordServer()
 		self.process = self.conn = None
