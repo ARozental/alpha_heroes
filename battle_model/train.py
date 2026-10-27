@@ -742,8 +742,10 @@ def train(config, resume=False):
 		export(cpu_copy(model), model_files[current])
 		producer = Producer(play_epoch)
 		producer.start(first_epoch, model_files[current])
-	run_started, last_eval = time.time(), time.time()
-	elapsed = lambda: elapsed_before + time.time() - run_started
+	# The run's time (run_hours, the learning rate's schedule, eval_minutes) on the monotonic clock: it stands still
+	# while the machine sleeps (a closed lid stole 2.3 of v15-window's 11 hours and decayed its rate as if they ran)
+	run_started, last_eval = time.monotonic(), time.monotonic()
+	elapsed = lambda: elapsed_before + time.monotonic() - run_started
 	try:
 		for epoch in itertools.count(first_epoch):
 			if (config.run_hours and elapsed() >= config.run_hours * 3600) or (not config.run_hours and epoch > config.epochs):
@@ -867,14 +869,14 @@ def train(config, resume=False):
 				flush=True,
 			)
 
-			due = time.time() - last_eval >= config.eval_minutes * 60 if config.eval_minutes else config.eval_every and epoch % config.eval_every == 0
+			due = time.monotonic() - last_eval >= config.eval_minutes * 60 if config.eval_minutes else config.eval_every and epoch % config.eval_every == 0
 			if due:
 				if pool:
 					pool.pause()
 				evaluate_now(epoch)
 				if pool:
 					pool.resume()
-				last_eval = time.time()
+				last_eval = time.monotonic()
 				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale)  # every evaluated model
 			save_checkpoint(latest, model, optimizer, epoch, config, elapsed(), lr_scale)
 			if config.checkpoint_every and epoch % config.checkpoint_every == 0:
