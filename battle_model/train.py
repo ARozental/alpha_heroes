@@ -246,6 +246,7 @@ EVAL_COLUMNS = [
 	"score_generated", "score_neutrals", "score_real", "score_castle", "score_hard",  # one a set of EVAL_SETS
 	"score_balanced", "score_worst",  # the sets' mean (each alike) and the worst set
 	"score_generated_se", "score_neutrals_se", "score_real_se", "score_castle_se", "score_hard_se",  # their standard errors
+	"failed_battles",  # left out: they failed every attempt (play_eval)
 ]  # eval.csv, greedy battles per side: win rate, mean reward -1..1, outcomes; and minus the eval opponent's own reward on
 # the same seeds. army_kept / army_killed: shares of our army kept and of the enemy's lost (data.BattleSummary), ours
 # and the eval opponent's on the same seeds: the same whatever the reward's definition. total_score: THE measure of a
@@ -365,7 +366,8 @@ def play_eval(games, model_path, config, label):
 	"""The records of the eval battles, played on config.eval_workers persistent battle processes (play.BattleProcess:
 	a VCMI start-up per 50 battles, not one per battle as play_in_groups), new ones each eval. Game i goes to worker
 	i % eval_workers, so every eval plays the same battles in the same processes in the same order. A battle that
-	fails or stalls is retried in a new process, config.attempts tries."""
+	fails or stalls is retried once in a new process, then left out (an eval stopped the run when
+	one battle stalled every time). Returns (the games played, their records)."""
 	model_path = Path(model_path).resolve()  # VCMI runs in build/bin: paths must be absolute
 	n = min(config.eval_workers, len(games))
 	results, errors = [None] * len(games), []
@@ -374,14 +376,12 @@ def play_eval(games, model_path, config, label):
 		process = play.BattleProcess()
 		try:
 			for i in range(worker, len(games), n):
-				for attempt in range(1, config.attempts + 1):
+				for attempt in range(1, min(config.attempts, 2) + 1):  # greedy: a battle that stalls once mostly stalls again
 					try:
 						results[i] = process.play(games[i], model_path)
 						break
 					except RuntimeError as error:
 						print(f"{label}: battle {i}, attempt {attempt} failed: {str(error)[:300]}", flush=True)
-						if attempt == config.attempts:
-							raise
 		except BaseException as error:  # re-raised below, in the calling thread
 			errors.append(error)
 		finally:
@@ -394,7 +394,10 @@ def play_eval(games, model_path, config, label):
 		thread.join()
 	if errors:
 		raise errors[0]
-	return [r for records in results for r in records]
+	played = [i for i, records in enumerate(results) if records is not None]
+	if len(played) < len(games):
+		print(f"{label}: left out {len(games) - len(played)} battles that failed every attempt: {[games[i].map for i in range(len(games)) if results[i] is None]}", flush=True)
+	return [games[i] for i in played], [r for i in played for r in results[i]]
 
 
 GENERATED_ROOT = ROOT / "runtime" / "generated"  # generated scenarios of running training epochs, deleted after each
@@ -555,7 +558,7 @@ def eval_baseline(model, out, battle_map, config, suffix=""):
 			return rows
 	model_path = out / "eval.onnx"
 	export(cpu_copy(model), model_path)  # loaded but not used: the delegate plays
-	records = play_eval([replace(g, settings=(("ALPHA_BATTLE_DELEGATE", config.eval_opponent),)) for g in games], model_path, config, "eval baseline")
+	games, records = play_eval([replace(g, settings=(("ALPHA_BATTLE_DELEGATE", config.eval_opponent),)) for g in games], model_path, config, "eval baseline")
 	summaries = {(g.our_side, g.game_seed): summarize(r.events) for g, r in zip(games, records)}
 	rows = {key: (s.reward, s.army_kept, s.army_killed) for key, s in summaries.items()}
 	with path.open("w", newline="") as f:
@@ -572,8 +575,9 @@ def eval_round(model, epoch, out, battle_map, config, baseline):
 	cpu = cpu_copy(model)
 	export(cpu, model_path)
 	verify(cpu, model_path, seeds=(epoch,), batch_sizes=(2,))  # the eval plays this file, training the torch model: the same?
-	games = eval_games(config, battle_map)
-	records = play_eval(games, model_path, config, f"eval {epoch}")
+	games = [g for g in eval_games(config, battle_map) if (g.our_side, g.game_seed) in baseline]  # (one the baseline failed has none)
+	played, records = play_eval(games, model_path, config, f"eval {epoch}")
+	failed, games = len(games) - len(played), played
 	summaries = [summarize(r.events) for r in records]
 	write_traces(out, epoch, f"vs_{config.eval_opponent}_greedy", [next(r for g, r in zip(games, records) if g.our_side == side) for side in (0, 1)])  # the first seed's
 	row = {"epoch": epoch}
@@ -610,6 +614,7 @@ def eval_round(model, epoch, out, battle_map, config, baseline):
 	row["score_worst"] = round(min(sets), 4) if sets else float("nan")
 	row["mean_vs_baseline"] = round((sum(rewards) - sum(baselines)) / len(rewards), 4)
 	row.update(failure_modes(records))
+	row["failed_battles"] = failed
 	row["seconds"] = round(time.time() - started, 1)
 	return row
 
