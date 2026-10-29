@@ -128,7 +128,11 @@ class PPOConfig:
 	value_weight: float = 0.5  # step 7: the value loss shares the network with the policy, standard PPO weight
 	entropy_weight: float = 0.0  # step 7: the constant bonus on every decision's entropy (0.01 until 2026-10-28; see step 7)
 	entropy_floor: float = 0.3  # step 7: nats; ~the 10th percentile of decisions' entropy at v15/joint1 checkpoints
-	entropy_floor_weight: float = 0.1  # step 7: how hard a decision below the floor is pushed back up
+	# step 7: how hard a decision below the floor is pushed back up. 0 since 2026-10-29: in joint2 the floor was the one
+	# steady push against shooting (gradient_study on 3078: t -5.8 generated, -8.8 campaign battles), as the sharpest
+	# decisions it lifts are confident shots (23-29% of shooter states sat below it, 4-7% of the rest); PPO's clip and the
+	# KL control already limit how fast a choice sharpens
+	entropy_floor_weight: float = 0.0
 	value_head_weights: tuple = (1.0,) * (N_VALUE_HORIZONS + 1)  # step 4: share of each value head (V0, V1, V2, V) in the value loss
 
 

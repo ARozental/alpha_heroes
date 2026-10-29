@@ -31,6 +31,12 @@ What the model must learn first is made easy to learn:
     all creatures with it, so an ability learned on one holds for the others.
   - Retreat and surrender. Their exact reward now, and the score if the battle ended now, go into the type logits
     (features.outcome_features).
+  - Take what gains (2026-10-29, after joint2's shooters drifted into idling: the policy gradient for those shots was
+    noise, so nothing held them up). VCMI's BattleAI takes the action whose value, as the engine plays it, is best,
+    and only idles when nothing gains. Here every shot, melee attack (from each hex), hero spell and creature spell
+    target gets a value prior, VALUE_PRIOR_LOGITS x gain x tanh(its engine value / VALUE_PRIOR_SCALE), which reaches its
+    action type through the best follow-up; waiting, defending and moving get none. A gain per kind is learned within
+    x1/5..x5 from 1: the priors help, they do not decide (a shooter may still learn to run).
 
 Each token is a gated MLP (SwiGLU) over [its embeddings summed, its numbers], then RMSNorm; the trunk is pre-norm
 attention blocks with RMSNorm and SwiGLU. A choice's logit is as in v2 (ActionHeads): a pointer score (the context's
@@ -431,6 +437,17 @@ class Strength(nn.Module):
 		return (ratios * self.exponents).sum(dim=-1)  # [B, variants]
 
 
+# The value priors (the module's docstring, "Take what gains"): a shot worth the median of joint2's (0.018 of both
+# armies' value) gets ~1.4 logits, one worth 0.05 ~2; a melee trade that loses 0.04 ~-1.9. Over waiting, defending and
+# moving that is what the type gets too: in joint2 the 5% of shooter states where an idle type beat SHOOT were behind by
+# up to ~1 logit (the median shooter state is 7 ahead)
+VALUE_PRIOR_KINDS = ("shot", "melee", "spell", "creature_spell")
+VALUE_PRIOR_LOGITS = 2.0
+VALUE_PRIOR_SCALE = 0.02  # of both armies' value: the median best shot
+VALUE_PRIOR_GAIN = 5.0  # each kind's gain within x1/5..x5
+VALUE_PRIOR_STEP = 10.0  # its parameter moves this much faster than a plain weight (x5 in ~1,000 consistent steps)
+
+
 class ActionHeads(nn.Module):
 	"""Every choice's logit: pointer score + its features' score + priors + the value of its best follow-up."""
 
@@ -477,6 +494,7 @@ class ActionHeads(nn.Module):
 			second[spell] = int(kind)
 		self.register_buffer("second_target", second, persistent=False)
 		self.register_buffer("type_one_hot", torch.eye(N_ACTION_TYPES), persistent=False)
+		self.value_gains = nn.Parameter(torch.zeros(len(VALUE_PRIOR_KINDS)))  # each kind's value prior: log-gain, 0 = x1
 		with torch.no_grad():  # untrained: the biases (priors.py), no type rules, zero pointer scores
 			self.type_head.weight.zero_()
 			self.type_head.bias.copy_(priors.action_types())
@@ -489,6 +507,19 @@ class ActionHeads(nn.Module):
 			self.spell_head.bias.copy_(priors.spells())
 			self.spell_query.weight.zero_()
 			self.creature_spell_query.weight.zero_()
+
+	def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+		"""A checkpoint (or a league snapshot) from before the value priors: they start at their prior."""
+		if prefix + "value_gains" not in state_dict:
+			state_dict[prefix + "value_gains"] = torch.zeros_like(self.value_gains)
+		super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+	def value_prior(self, value, kind):
+		"""The logit an option's engine value (of both armies' value, -1..1) adds: VALUE_PRIOR_LOGITS x gain x tanh(value /
+		VALUE_PRIOR_SCALE), the gain of its kind (VALUE_PRIOR_KINDS) learned within x1/VALUE_PRIOR_GAIN..xVALUE_PRIOR_GAIN."""
+		raw = self.value_gains[VALUE_PRIOR_KINDS.index(kind)]
+		gain = VALUE_PRIOR_GAIN ** torch.tanh(VALUE_PRIOR_STEP * raw)
+		return VALUE_PRIOR_LOGITS * gain * torch.tanh(value / VALUE_PRIOR_SCALE)
 
 	def mastery_bias(self, x):
 		"""[B, N_SPELLS]: each spell's bias for our hero's mastery of it (none, basic, advanced, expert: the engine's,
@@ -518,10 +549,13 @@ class ActionHeads(nn.Module):
 		actions = self.spell_actions(actions, x)
 		rule = lambda head, legal: self.rules[head](actions[head], legal, context)
 
-		# Leaves first: a choice's logit includes the value of the best choice it leads to
-		melee_from = torch.einsum("bud,bhd->buh", k["melee_from_unit"](units) + q["melee_from"][:, None, :], k["melee_from_hex"](hexes)) * scale + rule("melee_from", x["m_melee_from"])
+		# Leaves first: a choice's logit includes the value of the best choice it leads to. The engine's value of a melee
+		# attack from each hex: the target's (from its best hex) plus that hex's against the best (hex_value, <= 0)
+		melee_value = actions["melee_target"][..., F.ATTACK_FEATURES.index("net_value"), None] + actions["melee_from"][..., F.FROM_FEATURES.index("hex_value")]
+		melee_from = torch.einsum("bud,bhd->buh", k["melee_from_unit"](units) + q["melee_from"][:, None, :], k["melee_from_hex"](hexes)) * scale + rule("melee_from", x["m_melee_from"]) + self.value_prior(melee_value, "melee")
 		melee_target = point(q["melee"], units, "melee_unit") + rule("melee_target", x["m_melee_target"]) + best_of(melee_from, x["m_melee_from"])
-		shoot_target = point(q["shoot"], units, "shoot_unit") + rule("shoot_target", x["m_shoot_target"])
+		shot_value = actions["shoot_target"][..., F.SHOT_FEATURES.index("net_value")]  # (0 at our own units: a tent's HEAL targets)
+		shoot_target = point(q["shoot"], units, "shoot_unit") + rule("shoot_target", x["m_shoot_target"]) + self.value_prior(shot_value, "shot")
 		move = point(q["move"], hexes, "move_hex") + rule("move", x["m_move_hex"])
 
 		spell2_from = k["spell2_from_unit"](units) + q["spell2"][:, None, :]
@@ -529,14 +563,15 @@ class ActionHeads(nn.Module):
 		spell2_unit = torch.einsum("bud,bvd->buv", spell2_from, k["spell2_unit"](units)) * scale
 		spell_q = self.spell_query.weight[None, :, :] + q["spell"][:, None, :]
 		second_value = torch.stack([torch.zeros_like(spell2_hex[..., 0]), best_of(spell2_unit, x["m_spell2_unit"]), best_of(spell2_hex, x["m_spell2_hex"])], dim=1)  # [B, kind, U]
-		spell_unit = torch.einsum("bsd,bud->bsu", spell_q, k["spell_unit"](units)) * scale + rule("spell_unit", x["m_spell_unit"]) + second_value[:, self.second_target, :]
-		spell_hex = torch.einsum("bsd,bhd->bsh", spell_q, k["spell_hex"](hexes)) * scale + rule("spell_hex", x["m_spell_hex"])
+		net = F.SPELL_FEATURES.index("net_value")  # (0 for a spell that changes no health: its learned value is in versus_best)
+		spell_unit = torch.einsum("bsd,bud->bsu", spell_q, k["spell_unit"](units)) * scale + rule("spell_unit", x["m_spell_unit"]) + second_value[:, self.second_target, :] + self.value_prior(actions["spell_unit"][..., net], "spell")
+		spell_hex = torch.einsum("bsd,bhd->bsh", spell_q, k["spell_hex"](hexes)) * scale + rule("spell_hex", x["m_spell_hex"]) + self.value_prior(actions["spell_hex"][..., net], "spell")
 		first_targets = torch.cat([spell_unit, spell_hex], dim=-1)
 		spell = self.spell_head(context) + self.mastery_bias(x) + best_of(first_targets, torch.cat([x["m_spell_unit"], x["m_spell_hex"]], dim=-1))
 
 		creature_q = q["creature_spell"] + self.creature_spell_query(vocab_index(x["g_creature_spell"], EFFECT_VOCAB))
-		creature_unit = point(creature_q, units, "creature_spell_unit") + rule("creature_spell_unit", x["m_creature_spell_unit"])
-		creature_hex = point(creature_q, hexes, "creature_spell_hex") + rule("creature_spell_hex", x["m_creature_spell_hex"])
+		creature_unit = point(creature_q, units, "creature_spell_unit") + rule("creature_spell_unit", x["m_creature_spell_unit"]) + self.value_prior(actions["creature_spell_unit"][..., net], "creature_spell")
+		creature_hex = point(creature_q, hexes, "creature_spell_hex") + rule("creature_spell_hex", x["m_creature_spell_hex"]) + self.value_prior(actions["creature_spell_hex"][..., net], "creature_spell")
 		creature = (torch.cat([creature_unit, creature_hex], dim=-1), torch.cat([x["m_creature_spell_unit"], x["m_creature_spell_hex"]], dim=-1))
 
 		follow = torch.zeros_like(self.type_head(context))

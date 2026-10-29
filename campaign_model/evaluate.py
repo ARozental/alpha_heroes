@@ -174,6 +174,9 @@ def log(row, path, writer=None):
 		for key in COLUMNS[2:]:
 			if isinstance(row[key], (int, float)) and row[key] == row[key]:
 				writer.add_scalar(f"campaign_eval/{key}", row[key], row["version"])
+		# The overall scores' tab (the user, 2026-10-29): each model against the other AIs, battle_eval beside it
+		# (battle_model/train.py); self-play training never shows there
+		writer.add_scalar("overall_score/campaign_eval", row["score"], row["version"])
 		writer.flush()
 	print(
 		f"campaign eval {row['version']:4d}  SCORE {row['score']:.3f} ± {row['score_se']:.3f} (1 = an average player; Nullkiller2 elsewhere; day 28: {row['score_d28']:.3f})"

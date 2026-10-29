@@ -84,7 +84,8 @@ def test_large_battles_look_the_same_at_any_size():
 
 def test_each_action_scores_its_own_logit():
 	"""Untrained, the pointer scores and the second-order rule terms are 0, so each choice's logit is its own features'
-	first-order score, plus (for a choice with follow-ups) its best follow-up's logit."""
+	first-order score, plus its value prior (a melee attack's: the engine's value from that hex), plus (for a choice with
+	follow-ups) its best follow-up's logit."""
 	torch.manual_seed(0)
 	x = melee_position()
 	allow_melee(x, 1, 64)
@@ -100,7 +101,8 @@ def test_each_action_scores_its_own_logit():
 		outcomes = F.outcome_features(b)
 		actions = F.action_features(b, F.attack_features(b, False), F.attack_features(b, True), maps, can, F.battle_features(b, maps))
 		rules = model.actions.rules
-		from_logits = (actions["melee_from"] * rules["melee_from"].linear).sum(-1)
+		melee_value = actions["melee_target"][..., F.ATTACK_FEATURES.index("net_value"), None] + actions["melee_from"][..., F.FROM_FEATURES.index("hex_value")]
+		from_logits = (actions["melee_from"] * rules["melee_from"].linear).sum(-1) + model.actions.value_prior(melee_value, "melee")
 		target_logits = (actions["melee_target"] * rules["melee_target"].linear).sum(-1) + best_of(from_logits, t["m_melee_from"])
 		move_logits = (actions["move"] * rules["move"].linear).sum(-1)
 	# The hexes of each target: the first-order scores, normalised over that target's legal hexes

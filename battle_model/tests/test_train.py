@@ -42,3 +42,30 @@ def test_generated_actors_fill_what_the_real_games_leave_short():
 	assert room() == 2600
 	pool.buffer.append({"source": "real", "decisions": 2000, "version": 9})
 	assert room() == 0.6 * 3200  # real battles enough: generated only their share
+
+
+def test_an_old_checkpoints_optimizer_keeps_its_moments_for_the_parameters_it_had():
+	"""load_optimizer: Adam's state saved before the value priors existed maps onto the same parameters (by name) of the
+	new model, and the new parameters start fresh; the progress row logs the priors' gains (1 at the start)."""
+	import torch
+
+	from battle_model.model import BattleModel
+	from battle_model.train import load_optimizer, value_gains
+
+	torch.manual_seed(0)
+	model = BattleModel()
+	names = [n for n, _ in model.named_parameters()]
+	old_params = [p for n, p in model.named_parameters() if not n.endswith("value_gains")]
+	old = torch.optim.Adam(old_params, lr=1e-4)
+	for p in old_params:
+		p.grad = torch.ones_like(p)
+	old.step()
+	state = {"model": {k: v for k, v in model.state_dict().items() if not k.endswith("value_gains")}, "optimizer": old.state_dict()}
+	new = torch.optim.Adam(model.parameters(), lr=1e-4)
+	load_optimizer(new, model, state)
+	kept = new.state_dict()["state"]
+	gains_index = names.index("actions.value_gains")
+	assert gains_index not in kept and len(kept) == len(names) - 1
+	first = next(i for i, n in enumerate(names) if not n.endswith("value_gains"))
+	assert torch.equal(kept[first]["exp_avg"], old.state_dict()["state"][0]["exp_avg"])
+	assert value_gains(model) == {"value_gain_shot": 1.0, "value_gain_melee": 1.0, "value_gain_spell": 1.0, "value_gain_creature_spell": 1.0}

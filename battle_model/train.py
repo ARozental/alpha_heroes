@@ -67,7 +67,7 @@ from .distributions import log_prob
 from .export import export, verify
 from .losses import AdvantageConfig, PPOConfig, ppo_loss, search_loss
 from .constants import N_ACTION_TYPES, ActionType
-from .model import build_model
+from .model import VALUE_PRIOR_GAIN, VALUE_PRIOR_KINDS, VALUE_PRIOR_STEP, build_model
 from .trace import trace
 from .reward import Outcome, RewardConfig, to_scale
 
@@ -150,7 +150,10 @@ class TrainConfig:
 	# each update's step is mostly noise and the weights walk; their average cancels the walk and keeps what the signal
 	# moves. eval_live: also evaluate the trained weights against eval_opponent (eval_live.csv) and log the paired
 	# difference average - live on the same battles (eval/average_minus_live): the test of the average
-	weight_average: float = 0.99
+	# Off since 2026-10-29: in joint2 the average scored below the trained weights in all 5 paired evals (pooled -0.0075
+	# +- 0.0025) and idled shooters 2-3x as often (3315: 0.25/0.49 against 0.15): averaging the weights of a walk is not
+	# the walk's average policy
+	weight_average: float = 0.0
 	eval_live: bool = True
 	attempts: int = 3  # tries per epoch when a battle fails or stalls before the run stops
 	keep_records: bool = False  # also write every battle record to <run dir>/records (debugging; ~0.3 MB a decision on disk)
@@ -231,7 +234,7 @@ COLUMNS = [
 	f"{side}_{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")
 ] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow", "learning_rate", "ppo_steps", "update_kl", "outcome_share", "round_head_weight"] + [
 	f"train_{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")
-]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
+] + [f"value_gain_{kind}" for kind in VALUE_PRIOR_KINDS]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
 # error. decisions: all decisions of the epoch; rounds: attack + defence battle rounds, averaged over the games.
 
@@ -244,6 +247,7 @@ TENSORBOARD_TAGS = {
 	"update_kl": "stability/update_kl",
 	"outcome_share": "stability/outcome_share",  # the window credit's share of the real outcome (by V's quality)
 	"round_head_weight": "stability/round_head_weight",  # V2's share of what the policy maximizes (by V's quality)
+	**{f"value_gain_{kind}": f"priors/value_gain_{kind}" for kind in VALUE_PRIOR_KINDS},  # each value prior's learned gain (model.ActionHeads.value_prior)
 	**{f"{side}_share_{kind.lower()}": f"actions_{side}/{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS},
 	**{f"{side}_{name}": f"credit_{side}/{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")},
 	"mean_reward": "reward/mean", "attack_reward": "reward/attack", "defence_reward": "reward/defence",
@@ -761,6 +765,33 @@ class WeightAverage:
 		self.updates += 1
 
 
+def value_gains(model):
+	"""{value_gain_<kind>: its gain} of the model's value priors (model.VALUE_PRIOR_KINDS; none for older architectures)."""
+	heads = getattr(model, "actions", None)
+	if not hasattr(heads, "value_gains"):
+		return {}
+	with torch.no_grad():
+		gains = VALUE_PRIOR_GAIN ** torch.tanh(VALUE_PRIOR_STEP * heads.value_gains.detach().float().cpu())
+	return {f"value_gain_{kind}": round(float(g), 4) for kind, g in zip(VALUE_PRIOR_KINDS, gains)}
+
+
+def load_optimizer(optimizer, model, state):
+	"""The checkpoint's optimizer state. A checkpoint from before parameters were added (2026-10-29: the value priors,
+	model.VALUE_PRIOR_KINDS) keeps Adam's moments for the parameters it had, matched by name in the model's order; the
+	new ones start fresh."""
+	saved = state["optimizer"]
+	names = [name for name, _ in model.named_parameters()]
+	if len(saved["param_groups"][0]["params"]) == len(names):
+		optimizer.load_state_dict(saved)
+		return
+	had = [i for i, name in enumerate(names) if name in state["model"]]  # the checkpoint's parameters, in its order
+	if len(had) != len(saved["param_groups"][0]["params"]):
+		raise ValueError(f"the checkpoint's optimizer has {len(saved['param_groups'][0]['params'])} parameters, its model {len(had)}")
+	moments = {new: saved["state"][old] for old, new in enumerate(had) if old in saved["state"]}
+	optimizer.load_state_dict({"state": moments, "param_groups": [{**saved["param_groups"][0], "params": list(range(len(names)))}]})
+	print(f"optimizer: Adam's moments kept for {len(had)} parameters, fresh for {len(names) - len(had)} new: " + ", ".join(n for i, n in enumerate(names) if i not in set(had)), flush=True)
+
+
 def save_checkpoint(path, model, optimizer, epoch, config, elapsed=0.0, lr_scale=1.0, value_ev=None, average=None):
 	"""elapsed: the training's seconds so far (run_hours counts them across resumes); lr_scale: the KL control's;
 	value_ev: the smoothed explained variance the window credit's outcome share follows; average: the WeightAverage
@@ -790,7 +821,7 @@ def train(config, resume=False):
 		model = build_model(architecture).to(device)  # the architecture the run was started with
 		optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 		model.load_state_dict(state["model"])
-		optimizer.load_state_dict(state["optimizer"])
+		load_optimizer(optimizer, model, state)
 		first_epoch = state["epoch"] + 1
 		elapsed_before = state.get("elapsed", 0.0)
 		lr_scale = state.get("lr_scale", 1.0)
@@ -803,7 +834,7 @@ def train(config, resume=False):
 		model = build_model(architecture).to(device)
 		optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 		model.load_state_dict(state["model"])
-		optimizer.load_state_dict(state["optimizer"])
+		load_optimizer(optimizer, model, state)
 		first_epoch = state["epoch"] + 1  # its numbering goes on, so its league snapshots keep their versions
 		lr_scale = state.get("lr_scale", 1.0)
 		value_ev = state.get("value_ev")
@@ -880,6 +911,7 @@ def train(config, resume=False):
 				csv.writer(f).writerow(["epoch", "total_score", *(f"vs_{name}" for name in scores)])
 			csv.writer(f).writerow([epoch, total, *scores.values()])
 		writer.add_scalar("eval/total_score", total, epoch)
+		writer.add_scalar("overall_score/battle_eval", total, epoch)  # (the overall scores' tab: campaign_eval is the campaign's, campaign_model/evaluate.py)
 		writer.flush()
 		print(f"eval  {epoch:4d}  TOTAL SCORE {total:+.3f}  (" + ", ".join(f"vs {name} {score:+.3f}" for name, score in scores.items()) + f")  balanced {balanced:+.3f}  worst set {worst:+.3f}", flush=True)
 
@@ -1113,6 +1145,7 @@ def train(config, resume=False):
 				"update_kl": round(kl_sum / max(batches, 1), 5),  # KL(start of the update || during it), what the KL control uses
 				"outcome_share": round(advantage_config.outcome_share, 3),
 				"round_head_weight": round(float(advantage_config.policy_heads[2]), 3),
+				**value_gains(model),
 				**{f"train_{k}": v for k, v in failure_modes(records).items()},  # the same signs of dumb play, in training
 			}
 			for side, name in ((0, "attack"), (1, "defence")):

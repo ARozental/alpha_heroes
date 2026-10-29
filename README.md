@@ -27,7 +27,7 @@ brew install cmake ninja ccache innoextract boost minizip sdl2 sdl2_image sdl2_m
 
 cmake -S vcmi -B build -G Ninja -D CMAKE_BUILD_TYPE=RelWithDebInfo \
   -D CMAKE_C_COMPILER_LAUNCHER=ccache -D CMAKE_CXX_COMPILER_LAUNCHER=ccache -D ENABLE_TEST=OFF \
-  -D EXTRA_AI_DIRS="$(pwd)/agents/UpLeftAI;$(pwd)/agents/AlphaBattleAI"
+  -D EXTRA_AI_DIRS="$(pwd)/agents/UpLeftAI;$(pwd)/agents/AlphaBattleAI;$(pwd)/agents/AlphaMapAI"
 cmake --build build
 
 python3 -m venv .venv && .venv/bin/pip install -r battle_model/requirements.txt
@@ -41,6 +41,46 @@ mkdir -p runtime/vcmi-user
 innoextract -s -g -d runtime/gog-extract <path>/setup_heroes_of_might_and_magic_3_complete_*.exe
 mv runtime/gog-extract/{Data,Maps,Mp3} runtime/vcmi-user/ && rm -rf runtime/gog-extract
 ```
+
+## Training (battle and campaign together)
+
+```sh
+.venv/bin/python -m campaign_model.joint --run NAME --hours 12        # a new run (battle model from runtime/saved/)
+.venv/bin/python -m campaign_model.joint --run NAME --hours 12 --resume   # go on after a stop (kill -TERM <pid>)
+.venv/bin/tensorboard --logdir runtime/train                          # tab overall_score: battle_eval, campaign_eval
+```
+
+`overall_score/battle_eval` is the battle model against BattleAI and MMAI (mean reward, -1..1; greedy, on fixed
+battles that play the same every time), `overall_score/campaign_eval` the campaign model against Nullkiller2 (our
+share of all empires' value at day 56 x players: 1 = an average player). Training itself is self-play only.
+
+### On a second machine (an independent run beside this one)
+
+Two machines do not share one run: the second runs its own (its own seed, or other settings) and the evals, which
+are the same battles and maps everywhere, compare them.
+
+1. Setup as above (macOS; on Linux the same packages from the distribution, and torch picks CUDA by itself). The
+   repos are private: the machine needs an SSH key of the ARozental account for the clone and its submodule.
+2. The game data (GOG, as above) into `runtime/vcmi-user/`, then `scripts/export_vocab.sh` (the engine's tables:
+   `battle_model/artifacts/vocab.json`).
+3. The MMAI mod (an eval opponent): copy `runtime/vcmi-user/Mods/mmai/` from the first machine (or the VCMI mod
+   from its repository, its models from `Mods/mmai/models/sources.json`), list it in
+   `runtime/vcmi-user/config/modSettings.json` (`"mods": ["vcmi", "core", "mmai"]`), and keep `"seed": 1` in
+   `Mods/mmai/config/mmai-settings.json` (evals that play the same every time).
+4. The starting models, not in git (`runtime/` is ignored): copy `runtime/saved/` (the battle checkpoints and the
+   league's `models/`), and to start the campaign from where the first machine is, its run's
+   `campaign/checkpoint_latest.pt`:
+   ```sh
+   rsync -a FIRST:alpha_heroes/runtime/saved/ runtime/saved/
+   rsync -a FIRST:alpha_heroes/runtime/train/<run>/campaign/checkpoint_latest.pt runtime/saved/campaign_start.pt
+   ```
+5. Run with its own name and seeds; size the games and actors to the machine (24 GB: 6 games and 8 actors, the
+   recipe's; 8 and 10 swapped):
+   ```sh
+   .venv/bin/python -m campaign_model.joint --run NAME2 --hours 12 --battle-from runtime/saved/<battle checkpoint> \
+     --set seed=2 campaign.seed=2 campaign.init_from=runtime/saved/campaign_start.pt
+   ```
+   (campaign.init_from takes the campaign model's weights; its trust in the value heads is measured again.)
 
 ## Running
 

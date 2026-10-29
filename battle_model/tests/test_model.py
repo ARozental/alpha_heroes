@@ -167,10 +167,13 @@ def test_ppo_loss_gradients_are_finite():
 	assert abs(float(parts["ratio"]) - 1.0) < 1e-4  # same parameters: ratio is 1
 
 
-def test_untrained_model_picks_types_with_the_prior_odds():
-	"""With its rule weights at 0, the untrained model's types follow ACTION_TYPE_PRIOR exactly (zero pointer scores:
-	every follow-up is worth 0, so the best one adds nothing)."""
+def test_untrained_model_picks_types_with_the_prior_odds(monkeypatch):
+	"""With its rule weights at 0 and the value priors off, the untrained model's types follow ACTION_TYPE_PRIOR exactly
+	(zero pointer scores: every follow-up is worth 0, so the best one adds nothing)."""
+	import battle_model.model as model_module
 	from battle_model.layers import ACTION_TYPE_PRIOR
+
+	monkeypatch.setattr(model_module, "VALUE_PRIOR_LOGITS", 0.0)
 	torch.manual_seed(3)
 	m = BattleModel().eval()
 	with torch.no_grad():  # the spells' biases lift HERO_SPELL by the best castable spell's: zero them here
@@ -261,3 +264,37 @@ def test_history_reaches_the_outputs():
 		out = run(model, changed)
 		assert not torch.allclose(finite(out["logp_move_hex"]), finite(base["logp_move_hex"])), "history did not reach the policy"
 		assert not torch.allclose(out["value"], base["value"]), "history did not reach the value"
+
+
+
+def test_the_value_priors_lift_what_gains_and_load_into_old_checkpoints(monkeypatch):
+	"""Each option's engine value adds VALUE_PRIOR_LOGITS x gain x tanh(value / VALUE_PRIOR_SCALE) to its logit, and its
+	type gets its best option's through the follow-up: a valuable shot puts SHOOT above defending and waiting by about
+	that (the rest of the untrained model is 0). A state dict from before the priors loads (strictly), at gain 1."""
+	import battle_model.model as model_module
+	from battle_model import features as F
+	from battle_model.model import VALUE_PRIOR_LOGITS, VALUE_PRIOR_SCALE
+
+	torch.manual_seed(5)
+	m = BattleModel().eval()
+	x = random_inputs(batch=1, seed=7)
+	x["m_type"][0] = False
+	x["m_type"][0, [ActionType.WAIT, ActionType.DEFEND, ActionType.SHOOT]] = True
+	target = int(np.flatnonzero(x["m_shoot_target"][0])[0])
+	x["a_shoot_value"][0, target] = 10**6 * (1 - 2 * int(x["g_our_side"][0]))  # the engine: a shot that gains a lot
+	t = {k: torch.from_numpy(v) for k, v in x.items()}
+	with torch.no_grad():
+		facts = m.facts(t)
+		shot = facts["shot"][0, :, F.ATTACK_FEATURES.index("net_value")]
+		legal = t["m_shoot_target"][0]
+		assert float(shot[legal].max()) > 0.04  # (2x VALUE_PRIOR_SCALE: the prior near its full VALUE_PRIOR_LOGITS)
+		out = m(t, facts)
+		with_prior = out["logp_type"][0, ActionType.SHOOT] - out["logp_type"][0, ActionType.DEFEND]
+		monkeypatch.setattr(model_module, "VALUE_PRIOR_LOGITS", 0.0)
+		without = m(t, facts)["logp_type"][0]
+	lift = float(with_prior - (without[ActionType.SHOOT] - without[ActionType.DEFEND]))
+	assert abs(lift - VALUE_PRIOR_LOGITS * float(torch.tanh(shot[legal].max() / VALUE_PRIOR_SCALE))) < 1e-4
+	old = {k: v for k, v in m.state_dict().items() if not k.endswith("value_gains")}
+	fresh = BattleModel()
+	fresh.load_state_dict(old)  # strict: the hook adds the priors' gains
+	assert torch.equal(fresh.actions.value_gains.detach(), torch.zeros(4))

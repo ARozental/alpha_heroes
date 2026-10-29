@@ -169,18 +169,20 @@ def test_window_credit():
 
 
 def test_the_entropy_floor_pushes_only_decisions_below_it(monkeypatch):
-	"""entropy_term: no gradient for decisions whose entropy is above the floor, a push up for those below; the constant
-	bonus (entropy_weight) is off by default (it pushed every decision the same way: battle_model/gradient_study.py)."""
+	"""entropy_term: no gradient for decisions whose entropy is above the floor, a push up for those below. Both the
+	constant bonus (entropy_weight: it pushed every decision the same way, battle_model/gradient_study.py) and the floor
+	(entropy_floor_weight: it pushed confident shots, joint2) are off by default; below_floor is still measured."""
 	import battle_model.losses as losses
 
 	h = torch.tensor([0.05, 0.2, 0.8, 2.0], requires_grad=True)
 	monkeypatch.setattr(losses, "entropy", lambda out: h)
 	config = losses.PPOConfig()
-	assert config.entropy_weight == 0.0 and config.entropy_floor == 0.3
+	assert config.entropy_weight == 0.0 and config.entropy_floor_weight == 0.0 and config.entropy_floor == 0.3
 	term, bonus, below = losses.entropy_term({}, config)
+	assert float(below) == 0.5 and float(bonus) == float(h.mean()) and float(term) == 0.0
+	term, _, _ = losses.entropy_term({}, losses.PPOConfig(entropy_floor_weight=0.1))
 	(grad,) = torch.autograd.grad(term, h)
 	assert (grad[:2] < 0).all() and (grad[2:] == 0).all()  # descent raises the entropy of the two below the floor only
-	assert float(below) == 0.5 and float(bonus) == float(h.mean())
 
 
 
