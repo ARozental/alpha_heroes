@@ -5,8 +5,9 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class CampaignConfig:
-	# Self-play games: a new random map each (play.make_map), every player our campaign model, every battle (the
-	# wandering monsters' too) our battle model, whose records go to the battle learner as real games' do
+	# Self-play games: a new random map each (play.make_map), every player our campaign model, every player's battle
+	# our battle model (the wandering monsters are BattleAI, as in a real game: play.play's neutral_ai), whose records go
+	# to the battle learner as real games' do
 	games: int = 0  # played at once; 0: no campaign training (a battle-only run)
 	# Each game's last day, drawn per game (learner.draw_days): days_min plus a geometric number of days with mean
 	# days_tail, at most days_max. Past days_min every day is as likely to be the last as the one before (the user,

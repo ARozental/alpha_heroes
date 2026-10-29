@@ -3,7 +3,7 @@ the battle model (that has its own optimizer etc...)"): battle_model/train.py ru
 
 	games        config.games self-play games at once, each on a new random map (2-4 players, water and the
 	             underground on, a day cap drawn per game: draw_days): every player our campaign model (this learner's inference server, family
-	             "campaign"), every battle our battle model (the battle learner's server), the wandering monsters' too.
+	             "campaign"), every player's battle our battle model (the battle learner's server; the wandering monsters BattleAI's).
 	             The battles' records go to the battle learner as real games' do (actors.py: its real_share, with the
 	             generated battles, hard cases among them, as the rest, so it does not forget them); the campaign
 	             decisions and the daily ledgers come here

@@ -22,9 +22,13 @@ from battle_model.train import ROOT, TrainConfig, train, with_overrides
 
 BATTLE_FROM = ROOT / "runtime" / "saved" / "battle_joint1_02840.pt"  # joint1's 2840 (+0.076, every set positive), a read-only copy; runtime/saved/models: joint1's league snapshots up to it (no eval baselines: the reward changed with the war machines)
 RECIPE = (
-	"generator=true", "actors=true", "generated_actors=8", "real_games=0", "real_share=0.4",
+	# The focus on the campaign (the user, 2026-10-29): its battles (mostly against wandering monsters) are 70% of each
+	# battle update, our generated scenarios the rest (their variety is low: too few hard cases, too simple), the
+	# battle model learning at 3e-5 (the campaign's 1e-4); more campaign games, fewer generated actors (8 games and 10
+	# actors swapped in 24 GB, 2026-10-28)
+	"generator=true", "actors=true", "generated_actors=4", "real_games=0", "real_share=0.7", "learning_rate=3e-5",
 	"eval_scenarios=24", "eval_neutral_scenarios=12", "eval_hard_scenarios=24", "eval_real_scenarios=24", "eval_castle_seeds=16",
-	"eval_minutes=60", "seed=1", "campaign.games=6", "campaign.inference_processes=2", "campaign.eval_minutes=60",  # (joint2, 2026-10-28: 8 games and 10 actors swapped; 6 and 8 fit in 24 GB)
+	"eval_minutes=60", "seed=1", "campaign.games=8", "campaign.inference_processes=2", "campaign.eval_minutes=60",
 	"advantage.credit=window",  # (the default: the battle model's linear round window since 2026-10-26, no GAE lambda)
 )
 

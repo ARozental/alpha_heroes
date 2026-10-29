@@ -48,7 +48,8 @@ class IBattleModel;
 ///
 /// The model plays every decision: units, our war machines when the hero controls them (CATAPULT, HEAL, the ballista's
 /// SHOOT), and the tactics phase (TACTICS_MOVE one unit after another, TACTICS_END). An attacker retreats when it can
-/// after STALEMATE_ROUNDS rounds in a row with no damage done (VCMI has no round limit). An error is counted and the
+/// after STALEMATE_ROUNDS rounds in a row with no damage done (VCMI has no round limit), and any side at ROUND_LIMIT
+/// (the side ahead a few rounds later). An error is counted and the
 /// unit defends (playDefault); errors must stay at 0.
 class AlphaBattleAI : public CBattleGameInterface
 {

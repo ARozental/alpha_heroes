@@ -152,8 +152,13 @@ class RecordServer:
 	reads what is still queued, then closes the socket.
 	"""
 
-	def __init__(self):
+	def __init__(self, concurrent=False):
+		"""concurrent: read each connection in a thread of its own (records of independent battles from many games: one
+		that ends while another's long record is being read does not wait, and its game does not stall in send; joint2,
+		2026-10-29: campaign games killed by the 60 s stall watchdog in AlphaBattleAI's BattleRecord::send). Otherwise
+		one connection after another, in order (a game's successive messages keep their order)."""
 		SOCKET_DIR.mkdir(parents=True, exist_ok=True)
+		self.concurrent = concurrent
 		self.path = SOCKET_DIR / f"{os.getpid()}-{next(_server_numbers)}.sock"
 		if len(str(self.path)) >= 100:  # sockaddr_un.sun_path is 104 bytes on macOS
 			raise RuntimeError(f"socket path too long: {self.path}")
@@ -171,24 +176,33 @@ class RecordServer:
 		while True:
 			ready, _, _ = select.select([self._socket], [], [], 0.1)
 			if ready:
-				# One bad connection (empty: a game killed as it connected; cut short) is dropped, never the server:
-				# an empty one ended this thread, and every record after it was lost
 				try:
 					connection, _ = self._socket.accept()
-					with connection:
-						data = bytearray()
-						while chunk := connection.recv(1 << 20):
-							data += chunk
-					(key_length,) = struct.unpack_from("<I", data, 0)
-					if len(data) < 4 + key_length:
-						continue
-					key = bytes(data[4 : 4 + key_length]).decode().split("#", 1)[0]  # AlphaBattleAI numbers each battle: key#n
-				except (OSError, struct.error, UnicodeDecodeError):
+				except OSError:
 					continue
-				with self._lock:
-					self.records.setdefault(key, []).append(bytes(data[4 + key_length :]))
+				if self.concurrent:
+					threading.Thread(target=self._read, args=(connection,), daemon=True).start()
+				else:
+					self._read(connection)
 			elif self._stop.is_set():
 				return
+
+	def _read(self, connection):
+		# One bad connection (empty: a game killed as it connected; cut short) is dropped, never the server: an empty
+		# one ended this thread, and every record after it was lost
+		try:
+			with connection:
+				data = bytearray()
+				while chunk := connection.recv(1 << 23):
+					data += chunk
+			(key_length,) = struct.unpack_from("<I", data, 0)
+			if len(data) < 4 + key_length:
+				return
+			key = bytes(data[4 : 4 + key_length]).decode().split("#", 1)[0]  # AlphaBattleAI numbers each battle: key#n
+		except (OSError, struct.error, UnicodeDecodeError):
+			return
+		with self._lock:
+			self.records.setdefault(key, []).append(bytes(data[4 + key_length :]))
 
 	def drain(self):
 		"""The records received since the last drain ({key: [bytes, ...]}), removed from records."""

@@ -109,16 +109,19 @@ def directory_mb(path):
 	return sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file()) / 2**20 if path else 0.0
 
 
-def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_ai="BattleAI", game_key="g0", settings=(), niceness=0, temperature=1.0, ours=None, our_battle_ai="AlphaBattleAI", stop=None):
+def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_ai="BattleAI", game_key="g0", settings=(), niceness=0, temperature=1.0, ours=None, our_battle_ai="AlphaBattleAI", stop=None, neutral_ai="BattleAI"):
 	"""Play one game against the inference server at socket_path; returns (records.Game, GameInfo).
 
-	battle_ai plays every battle (the wandering monsters' too); settings: more environment (e.g. the battle AI's
+	battle_ai plays the players' battles, neutral_ai the wandering monsters' (the game's AI, as in a real game; the
+	monsters cannot flee, so AlphaBattleAI's stalemate retreat never ends a battle where ours keep away: joint2,
+	2026-10-29, battles of 1000+ decisions, mostly DEFEND and MOVE, ~0.4 MB of record each, killed 30-50% of the
+	campaign games through the stall watchdog); settings: more environment (e.g. the battle AI's
 	inference server and record keys). ours: None (every player is our AI), or the colors that are, the others
 	Nullkiller2 with battle_ai while ours fight with our_battle_ai (an evaluation). stop: an Event that ends the game
 	early (training is over)."""
 	with battle_play.RecordServer() as server:
 		env = dict(os.environ)
-		ai = {"adventureEnemyAI": "AlphaMapAI", "adventureAlliedAI": "AlphaMapAI", "combatEnemyAI": battle_ai, "combatAlliedAI": battle_ai, "combatNeutralAI": battle_ai}
+		ai = {"adventureEnemyAI": "AlphaMapAI", "adventureAlliedAI": "AlphaMapAI", "combatEnemyAI": battle_ai, "combatAlliedAI": battle_ai, "combatNeutralAI": neutral_ai}
 		if ours is not None:
 			ai.update(adventureEnemyAI="Nullkiller2", adventureAlliedAI="Nullkiller2")
 		env.update(

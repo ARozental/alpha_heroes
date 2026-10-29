@@ -5,8 +5,9 @@ actors=true), so the examples of an update come from many games instead of one g
 	                   version of the model or a fixed AI (the league: config.league)
 	real-game actors   each plays whole real games (real_games.py), every battle of them by the current model; their
 	                   records stream in while the game goes on
-	campaign games     a joint run's (campaign_model/learner.py): our campaign model's self-play games, every battle by
-	                   the current model; their battles are real games' battles here (campaign_settings)
+	campaign games     a joint run's (campaign_model/learner.py): our campaign model's self-play games, every player's
+	                   battle by the current model (the wandering monsters BattleAI); their battles are real games'
+	                   battles here (campaign_settings)
 	the buffer         every record waits there until an update takes it, at most max_record_age model versions old
 	take()             an update's battles: real_share of its decisions from real games, the rest generated (filled
 	                   from the other source when one is short), at most game_share of them from any one game, newest
@@ -73,7 +74,7 @@ class ActorPool:
 		self.running = threading.Event()  # cleared while the learner evaluates: generated actors start no new battle
 		self.running.set()
 		self.stats = {"failures": 0, "dropped_stale": 0, "dropped_overflow": 0, "battles": {"generated": 0, "real": 0}, "last_failure": ""}
-		self.records = play.RecordServer()
+		self.records = play.RecordServer(concurrent=True)  # the real games' and campaign games' battles: many games at once
 		self.threads = []
 
 	# ---- models ----
@@ -125,8 +126,8 @@ class ActorPool:
 		return (("ALPHA_BATTLE_INFERENCE_SOCKET", self.server.socket_for(actor)),) if self.server else ()
 
 	def campaign_settings(self, game, key, seed):
-		"""The env of campaign game number `game`'s battles (campaign_model/learner.py): every battle, the wandering
-		monsters' too, played by the current model and recorded here as a real game's (under "<key>:<COLOR>")."""
+		"""The env of campaign game number `game`'s battles (campaign_model/learner.py): every player's battle played
+		by the current model and recorded here as a real game's (under "<key>:<COLOR>"; the wandering monsters are BattleAI)."""
 		settings = dict(self.inference_settings(self.config.generated_actors + self.config.real_games + game))
 		settings.update(
 			ALPHA_BATTLE_MODEL=str(self.link.absolute()),
@@ -227,6 +228,8 @@ class ActorPool:
 			scenario = generator.sample(rng)
 			opponent, past_model = self._opponent(rng)
 			our_side = 0 if opponent == play.SELF_PLAY else rng.randrange(2)
+			if "neutrals" in scenario:  # wandering monsters are the game's AI, never ours (campaign_model/play.py: neutral_ai)
+				opponent, past_model, our_side = NEUTRAL_AI, None, 0
 			files = []
 			try:
 				games, files = self.generated_games([scenario], f"actor{index}_{n}", self.config, our_sides=(our_side,), opponent=opponent, temperature=1.0)
@@ -358,6 +361,9 @@ class ActorPool:
 		pick("real", decisions)  # one source short: the other fills the update
 		pick("generated", decisions)
 		return chosen, per_game, taken
+
+
+NEUTRAL_AI = "BattleAI"  # the wandering monsters' battle AI in generated battles, as in a campaign game
 
 
 def inference_device(name):

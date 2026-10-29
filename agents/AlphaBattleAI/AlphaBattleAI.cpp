@@ -51,6 +51,12 @@ constexpr int SEARCH_ROUND_CAP = 30; // the search's horizon (BattleSearchEnv)
 // siege whose catapult is gone, no towers, walls standing and no side able to reach the other: VCMI has no round limit)
 constexpr int STALEMATE_ROUNDS = 30;
 constexpr int DEFENDER_STALEMATE_DELAY = 5; // the defender retreats this many rounds after the attacker would
+// Whatever the damage, a battle that reaches this round ends: the side not ahead retreats when it can, the side ahead
+// AHEAD_LIMIT_DELAY rounds later (joint2, 2026-10-29: both sides ours, battles of 1700 decisions per side, mostly
+// DEFEND and MOVE, that the quiet rule above never ended; each held its campaign game until the stall watchdog killed
+// it, ~0.4 MB of record per decision). Ordinary battles end within 15 rounds.
+constexpr int ROUND_LIMIT = 50;
+constexpr int AHEAD_LIMIT_DELAY = 5;
 constexpr int MAX_ATTEMPTS = 8; // choices per unit turn before the unit defends (playDefault)
 std::atomic<int> recordsSent{0}; // per process: each battle's record gets its own key (a game has many battles)
 
@@ -519,7 +525,8 @@ void AlphaBattleAI::activeStack(const BattleID & battleID, const CStack * stack)
 	// which never retreats, a defending hero whose last unit kept flying out of reach held a campaign game until its
 	// time limit (joint1, 2026-10-28). A defender without a hero (a garrison, wandering monsters) cannot flee: open
 	// Only a side not ahead retreats: one far ahead whose enemy's last unit stays out of reach would throw away a won
-	// army (2026-10-28 review); its battle runs on, and the game's time limit ends it (the campaign's labels stop there)
+	// army (2026-10-28 review); its battle runs on until ROUND_LIMIT (the game's time limit came too late: the stall
+	// watchdog killed the game first)
 	const int quiet = battle->battleGetRound() - lastDamageRound;
 	const bool attacker = battle->battleGetMySide() == BattleSide::ATTACKER;
 	const auto mySide = battle->battleGetMySide();
@@ -531,6 +538,16 @@ void AlphaBattleAI::activeStack(const BattleID & battleID, const CStack * stack)
 		cb->battleMakeUnitAction(battleID, BattleAction::makeRetreat(battle->battleGetMySide()));
 		return;
 	}
+	const int round = battle->battleGetRound();
+	if(round >= ROUND_LIMIT + (ahead ? AHEAD_LIMIT_DELAY : 0) && battle->battleCanFlee())
+	{
+		++stats.fallbacks;
+		logAi->info("AlphaBattleAI: round %d (no damage for %d rounds): the %s, %s, retreats", round, quiet, attacker ? "attacker" : "defender", ahead ? "ahead" : "not ahead");
+		cb->battleMakeUnitAction(battleID, BattleAction::makeRetreat(battle->battleGetMySide()));
+		return;
+	}
+	if(round == ROUND_LIMIT + AHEAD_LIMIT_DELAY && !battle->battleCanFlee())
+		logAi->info("AlphaBattleAI: round %d (no damage for %d rounds): the %s, %s, cannot retreat", round, quiet, attacker ? "attacker" : "defender", ahead ? "ahead" : "not ahead");
 	if(!model)
 	{
 		playDefault(battleID, stack);

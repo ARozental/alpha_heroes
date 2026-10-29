@@ -47,12 +47,13 @@ mv runtime/gog-extract/{Data,Maps,Mp3} runtime/vcmi-user/ && rm -rf runtime/gog-
 ```sh
 .venv/bin/python -m campaign_model.joint --run NAME --hours 12        # a new run (battle model from runtime/saved/)
 .venv/bin/python -m campaign_model.joint --run NAME --hours 12 --resume   # go on after a stop (kill -TERM <pid>)
-.venv/bin/tensorboard --logdir runtime/train                          # tab overall_score: battle_eval, campaign_eval
+.venv/bin/tensorboard --logdir runtime/train                          # tab eval: battle, campaign
 ```
 
-`overall_score/battle_eval` is the battle model against BattleAI and MMAI (mean reward, -1..1; greedy, on fixed
-battles that play the same every time), `overall_score/campaign_eval` the campaign model against Nullkiller2 (our
-share of all empires' value at day 56 x players: 1 = an average player). Training itself is self-play only.
+`eval/battle` is the battle model against BattleAI and MMAI (mean reward, -1..1; greedy, on fixed battles that play
+the same every time), `eval/campaign` the campaign model against Nullkiller2 (our share of all empires' value at day
+56 x players: 1 = an average player); the eval tab holds nothing else (the per-set and per-opponent details are under
+eval_details). Training itself is self-play, the wandering monsters BattleAI as in a real game.
 
 ### On a second machine (an independent run beside this one)
 

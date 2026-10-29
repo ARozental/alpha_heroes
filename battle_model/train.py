@@ -282,15 +282,21 @@ _eval_rng = random.Random(20261023)
 EVAL_SEEDS = tuple(_eval_rng.randrange(1, 2**31) for _ in range(256))
 
 
+# TensorBoard's eval tab holds the top-level scores only (the user, 2026-10-29): eval/battle (here, evaluate_now: the
+# battle model against the eval opponents) and eval/campaign (campaign_model/evaluate.py: against Nullkiller2); the
+# rest of an eval goes under eval_<opponent>/ and eval_details/
+EVAL_TAB = "eval/battle"
+
+
 def log_eval_tensorboard(writer, row, opponent=""):
-	"""An eval row as TensorBoard scalars under eval_<opponent>/ (eval/total_score is the mean over the opponents,
-	evaluate_now), or under eval/ for a run with a single, unnamed opponent."""
+	"""An eval row as TensorBoard scalars under eval_<opponent>/ (EVAL_TAB is the mean over the opponents, evaluate_now),
+	or eval_details/ for a run with a single, unnamed opponent (whose total is EVAL_TAB)."""
 	epoch = int(row["epoch"])
-	prefix = f"eval_{opponent}" if opponent else "eval"
+	prefix = f"eval_{opponent}" if opponent else "eval_details"
 	if opponent:
 		writer.add_scalar(f"{prefix}/total_score", float(row["total_score"]), epoch)
-	else:  # (old runs: one opponent, its score is the total)
-		writer.add_scalar("eval/total_score", float(row["total_score"]), epoch)
+	else:  # (one opponent: its score is the total)
+		writer.add_scalar(EVAL_TAB, float(row["total_score"]), epoch)
 	for kind, score in row.get("hard_kinds", {}).items():
 		writer.add_scalar(f"{prefix}/hard/{kind}", float(score), epoch)
 	for column in (*(f"score_{k}" for k in EVAL_SETS), *(f"score_{k}_se" for k in EVAL_SETS), "score_balanced", "score_worst", "escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss"):
@@ -494,8 +500,12 @@ def eval_set(game):
 
 
 @functools.lru_cache(maxsize=1)
+def _creature_tables():
+	return rules.creature_tables()
+
+
 def _no_distance_penalty():
-	return rules.creature_tables()["no_distance_penalty"].numpy()
+	return _creature_tables()["no_distance_penalty"].numpy()
 
 
 def full_shot(t, i):
@@ -514,14 +524,34 @@ def full_shot(t, i):
 	return bool((near.numpy() & legal).any())
 
 
+def melee_escapes(t, rows, actions):
+	"""[len(rows)] for MOVE decisions rows of a record (tensors t): the move takes the acting unit to a hex where less
+	of the enemy army could attack it in melee in its coming turn than where it stood (features.threat_maps'
+	melee_threat_value), the hex it left being within some enemy's melee reach: a shooter kiting."""
+	from . import features as F
+	from .schema import INPUTS
+
+	index = np.asarray(rows)
+	x = {s.name: torch.from_numpy(np.asarray(t[s.name])[index].astype(np.int64) if s.dtype == "int64" else np.asarray(t[s.name])[index]) for s in INPUTS}
+	with torch.no_grad():
+		b = F.read_battle(x, _creature_tables())
+		maps, _ = F.threat_maps(b, *F.distance_maps(b))
+	threat = maps[..., F.HEX_FEATURES.index("melee_threat_value")].numpy()  # [n, H]
+	here = threat[np.arange(len(index)), np.asarray(t["u_hex"])[index, np.asarray(t["g_active_unit"])[index]].clip(min=0)]
+	there = np.array([threat[k, a["hex"]] if a.get("hex", -1) >= 0 else here[k] for k, a in enumerate(actions)])
+	return (here > 0) & (there < here)
+
+
 def failure_modes(records):
 	"""Signs of dumb play in a set of battle records (eval), each a share 0..1 (nan when it never came up):
 	escape_while_ahead    retreats and surrenders while our value head thought we were winning (V > 0)
-	shooter_not_shooting  of a unit's rounds where it could shoot at full damage at one of its decisions (a legal
-	                      target within 10 hexes, or no distance penalty), those it ended moving, waiting or defending
-	                      without having shot: waiting and then shooting is no failure (shooting after the enemy commits),
-	                      nor is waiting for an enemy to come within full range, nor defending while blocked (it cannot
-	                      shoot then)
+	shooter_not_shooting  of a shooter's decisions where it can shoot at full damage (a legal target within 10 hexes, or
+	                      no distance penalty), those that waste it (2026-10-29, the user): it defends; it moves without
+	                      escaping melee (a move off a hex enemies could reach in melee next turn to one fewer of them can
+	                      is kiting: 38% of the idle moves at 3792); it waits and its next decision that round can no
+	                      longer shoot at full damage (waiting, then shooting at full damage, is common and fine; a wait
+	                      when only a half-damage shot was there is no failure). Defending while blocked is none (it
+	                      cannot shoot then). Before, a unit's whole round counted, kiting included
 	worthless_cast        hero casts at a unit or hex that lose us value (predicted value < 0: e.g. a Frost Ring on our own
 	                      stacks); 0 is no sign: buffs, debuffs and summons change no health when cast (Slow, Shield)
 	cast_skipped_on_loss  in battles we lost, the share of the rounds our hero could cast in (one of our decisions had a
@@ -531,17 +561,19 @@ def failure_modes(records):
 	counts = {name: [0, 0] for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")}
 	for r in records:
 		t = r.tensors
-		shooters = {}  # (round, slot) -> [could shoot at full damage, shot, its last action]
-		for i, a in enumerate(r.actions):
-			if t["m_type"][i, ActionType.SHOOT] or a["type"] == ActionType.SHOOT:
-				turn = shooters.setdefault((int(t["g_round"][i]), int(t["g_active_unit"][i])), [False, False, None])
-				turn[0] |= bool(t["m_type"][i, ActionType.SHOOT]) and full_shot(t, i)
-				turn[1] |= a["type"] == ActionType.SHOOT
-				turn[2] = a["type"]
-		for could, shot, last in shooters.values():
-			if could:
-				counts["shooter_not_shooting"][0] += (not shot) and last in (ActionType.MOVE, ActionType.WAIT, ActionType.DEFEND)
-				counts["shooter_not_shooting"][1] += 1
+		full = [bool(t["m_type"][i, ActionType.SHOOT]) and full_shot(t, i) for i in range(len(r.actions))]
+		chances = [i for i in range(len(r.actions)) if full[i]]
+		moves = [i for i in chances if r.actions[i]["type"] == ActionType.MOVE]
+		escaped = dict(zip(moves, melee_escapes(t, moves, [r.actions[i] for i in moves]))) if moves else {}
+		for i in chances:
+			kind = r.actions[i]["type"]
+			if kind == ActionType.WAIT:  # judged by what it left: the unit's next decision this round
+				later = next((j for j in range(i + 1, len(r.actions)) if int(t["g_round"][j]) == int(t["g_round"][i]) and int(t["g_active_unit"][j]) == int(t["g_active_unit"][i])), None)
+				wasted = later is not None and not full[later]
+			else:
+				wasted = kind == ActionType.DEFEND or (kind == ActionType.MOVE and not escaped[i])
+			counts["shooter_not_shooting"][0] += wasted
+			counts["shooter_not_shooting"][1] += 1
 		for i, a in enumerate(r.actions):
 			kind = a["type"]
 			if kind in (ActionType.RETREAT, ActionType.SURRENDER):
@@ -896,22 +928,21 @@ def train(config, resume=False):
 			ours, theirs = rows[opponents[0].eval_opponent]["rewards"], live["rewards"]
 			diff = np.array([ours[k] - theirs[k] for k in ours if k in theirs])
 			if len(diff) > 1:
-				writer.add_scalar("eval/average_minus_live", float(diff.mean()), epoch)
+				writer.add_scalar("eval_details/average_minus_live", float(diff.mean()), epoch)
 				print(f"eval  {epoch:4d}  average - live weights vs {opponents[0].eval_opponent}: {diff.mean():+.4f} +- {diff.std(ddof=1) / np.sqrt(len(diff)):.4f} over {len(diff)} battles (live: total score {live['total_score']:+.3f})", flush=True)
 		scores = {name: row["total_score"] for name, row in rows.items()}
 		total = round(sum(scores.values()) / len(scores), 4)
 		balanced = round(sum(row["score_balanced"] for row in rows.values()) / len(rows), 4)
 		worst = round(min(row["score_worst"] for row in rows.values()), 4)  # the worst set against any opponent
-		writer.add_scalar("eval/balanced_score", balanced, epoch)
-		writer.add_scalar("eval/worst_set", worst, epoch)
+		writer.add_scalar("eval_details/balanced_score", balanced, epoch)
+		writer.add_scalar("eval_details/worst_set", worst, epoch)
 		path = out / "eval_total.csv"
 		new = not path.exists()
 		with path.open("a", newline="") as f:
 			if new:
 				csv.writer(f).writerow(["epoch", "total_score", *(f"vs_{name}" for name in scores)])
 			csv.writer(f).writerow([epoch, total, *scores.values()])
-		writer.add_scalar("eval/total_score", total, epoch)
-		writer.add_scalar("overall_score/battle_eval", total, epoch)  # (the overall scores' tab: campaign_eval is the campaign's, campaign_model/evaluate.py)
+		writer.add_scalar(EVAL_TAB, total, epoch)
 		writer.flush()
 		print(f"eval  {epoch:4d}  TOTAL SCORE {total:+.3f}  (" + ", ".join(f"vs {name} {score:+.3f}" for name, score in scores.items()) + f")  balanced {balanced:+.3f}  worst set {worst:+.3f}", flush=True)
 
