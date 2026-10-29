@@ -67,11 +67,23 @@ def make_map(seed, players=2, size=36, levels=2, water="random", attempts=5):
 	raise RuntimeError(f"{attempts} maps from seed {seed} ({players} players, {size}x{size}) each left a player without a town")
 
 
+def ledgers(messages):
+	"""The ledger snapshots received so far; one that cannot be read (cut off as its game was killed) is left out."""
+	snapshots = []
+	for key, payloads in list(messages.items()):
+		if key.endswith(":ledger"):
+			for payload in list(payloads):
+				try:
+					snapshots.append(json.loads(payload))
+				except (json.JSONDecodeError, UnicodeDecodeError):
+					pass
+	return snapshots
+
+
 def finished(messages, days, ours=None):
 	"""Each of our players (ours: their colors; None: every player) has sent its last records: all of them (the game
 	ended for them), or, once a day past the cap has begun, every one still in the game."""
-	snapshots = [json.loads(p) for key, payloads in list(messages.items()) if key.endswith(":ledger") for p in list(payloads)]
-	daily = [s for s in snapshots if not s.get("final")]
+	daily = [s for s in ledgers(messages) if not s.get("final")]
 	if not daily:
 		return False
 	done = {key.split(":")[-2] for key in list(messages) if key.endswith(":done")}
@@ -85,7 +97,7 @@ def finished(messages, days, ours=None):
 
 def latest_day(messages):
 	"""The day of the newest daily ledger."""
-	return max((json.loads(p)["day"] for key, payloads in list(messages.items()) if key.endswith(":ledger") for p in list(payloads) if not json.loads(p).get("final")), default=0)
+	return max((s["day"] for s in ledgers(messages) if not s.get("final")), default=0)
 
 
 def run_dir_of(pid):

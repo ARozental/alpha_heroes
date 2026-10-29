@@ -36,3 +36,10 @@ def test_a_damaged_records_message_is_left_out_not_the_game():
 
 	game = collect({"g:RED": [b"AMZ1\x10\x00\x00\x00" + b"\x78\x9c\x01"], "g:ledger": [b'{"day": 1, "players": []}']})
 	assert game.damaged == 1 and game.decisions == [] and 1 in game.ledgers
+
+
+def test_a_damaged_ledger_snapshot_is_left_out_not_the_game():
+	from campaign_model.records import collect
+
+	game = collect({"g:ledger": [b'{"day": 1, "players": []}', b'{"day": 2, "players": [{"color": 0,']})
+	assert game.damaged == 1 and list(game.ledgers) == [1]

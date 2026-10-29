@@ -49,7 +49,7 @@ class Game:
 	final: list = field(default_factory=list)  # snapshots taken at the end of the game
 	done: dict = field(default_factory=dict)  # color -> the AI's summary ({"errors", "failed_actions"})
 	record_bytes: int = 0
-	damaged: int = 0  # records messages that could not be read (left out)
+	damaged: int = 0  # records messages and ledger snapshots that could not be read (left out)
 	days: int = 0  # the day cap it was played to (0: none known): reaching it is the game's end (labels.end_labels)
 
 
@@ -80,7 +80,11 @@ def collect(messages):
 		parts = key.split(":")
 		for payload in payloads:
 			if parts[-1] == "ledger":
-				snapshot = json.loads(payload)
+				try:
+					snapshot = json.loads(payload)
+				except (json.JSONDecodeError, UnicodeDecodeError):  # cut off (the game killed as it sent it): this snapshot only
+					game.damaged += 1
+					continue
 				if snapshot.get("final"):
 					game.final.append(snapshot)
 				else:
