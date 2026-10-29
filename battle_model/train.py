@@ -46,17 +46,20 @@ import functools
 import itertools
 import csv
 import json
+import os
 import random
 import shutil
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
+
+from campaign_model.config import CampaignConfig
 
 from . import generator, play, rules
 from .data import collate, credit_check, make_dataloader, summarize
@@ -129,9 +132,11 @@ class TrainConfig:
 	grad_clip: float = 0.5  # max gradient norm, the usual PPO value
 	# KL control, so the step size does not hang on a hand-picked learning rate: an update stops its steps once its KL
 	# (old against new policy) passes 1.5x target_kl; then the learning rate's scale is cut by 1.5, and raised by 1.5
-	# after an update that took all its steps and ended under half of target_kl (within 0.1..lr_scale_max). The KL is the last
-	# minibatch's, nearest the update's end: a mean over its steps counts the first ones, where the policy has hardly
-	# moved, and kept raising the rate (to 7.5x within 11 updates, ending in 1-2-step updates). 0 = off. With a fixed
+	# after an update that took all its steps and ended under half of target_kl (within 0.1..lr_scale_max). The KL is the mean
+	# of the last KL_WINDOW minibatches' (k3), nearest the update's end: a mean over all its steps counts the first ones,
+	# where the policy has hardly moved, and kept raising the rate (to 7.5x within 11 updates, ending in 1-2-step updates);
+	# one minibatch's is noise (2026-10-28 review: 15% of v15-window's updates stopped early, 99% of them with a mean KL
+	# under half the stop line, and each stop cut the rate). 0 = off. With a fixed
 	# rate, v15-base-lr2 (2e-4, 3200-decision updates) went from KL 0.008 to 0.03-0.09 as its policy sharpened, its
 	# entropy rose and its evals fell.
 	target_kl: float = 0.015
@@ -139,6 +144,14 @@ class TrainConfig:
 	# KL control only lowers the rate and raises it back up to where it started
 	lr_scale_max: float = 1.0
 	checkpoint_every: int = 0  # also keep checkpoint_<epoch>.pt every this many epochs; 0 = only checkpoint_latest.pt
+	# The evals (and the checkpoints' "average") use a running average of the weights over updates (WeightAverage),
+	# decaying by this per update (0.99: ~100 updates, ~1 h); 0: the evals use the trained weights. The battle policy's
+	# gradient is noise-level (gradient_study.py, 2026-10-28: an update's direction no more alike than pure noise's), so
+	# each update's step is mostly noise and the weights walk; their average cancels the walk and keeps what the signal
+	# moves. eval_live: also evaluate the trained weights against eval_opponent (eval_live.csv) and log the paired
+	# difference average - live on the same battles (eval/average_minus_live): the test of the average
+	weight_average: float = 0.99
+	eval_live: bool = True
 	attempts: int = 3  # tries per epoch when a battle fails or stalls before the run stops
 	keep_records: bool = False  # also write every battle record to <run dir>/records (debugging; ~0.3 MB a decision on disk)
 	device: str = "auto"  # where torch trains: "auto" = the GPU (cuda, Apple mps) if there is one, else "cpu"; the CPU plays the battles
@@ -155,9 +168,15 @@ class TrainConfig:
 	model_chain_final_value: bool = False  # v1 only: BattleModelV1(chain_final_value=...)
 	model_kill_rule: bool = True  # v1 only: BattleModelV1(kill_rule=...)
 	seed: int = 0  # the model's initial weights
+	# A new run that goes on from another run's checkpoint (its weights, optimizer, epoch numbering, KL control and
+	# league snapshots; its eval baselines when the eval sets are the same), evaluated first
+	init_from: str = ""
 	reward: RewardConfig = field(default_factory=RewardConfig)
 	advantage: AdvantageConfig = field(default_factory=AdvantageConfig)
 	ppo: PPOConfig = field(default_factory=PPOConfig)
+	# The campaign model trained alongside (campaign_model/learner.py; campaign.games > 0, with actors): its games'
+	# battles are this run's real battles (real_share), its updates take turns with ours, its own optimizer
+	campaign: CampaignConfig = field(default_factory=CampaignConfig)
 
 
 def _parse_item(text):
@@ -171,7 +190,8 @@ def _parse_item(text):
 
 
 def with_overrides(config, assignments):
-	"""config with "name=value" assignments applied; "ppo.name", "advantage.name", "reward.name" set the sub-configs."""
+	"""config with "name=value" assignments applied; "ppo.name", "advantage.name", "reward.name", "campaign.name" set
+	the sub-configs."""
 	for assignment in assignments:
 		key, value = assignment.split("=", 1)
 		target, name = key.split(".", 1) if "." in key else (None, key)
@@ -205,11 +225,11 @@ ACTION_KINDS = ("WAIT", "DEFEND", "MOVE", "MELEE", "SHOOT", "HERO_SPELL", "CREAT
 
 COLUMNS = [
 	"epoch", "attack_reward", "attack_outcome", "defence_reward", "defence_outcome", "mean_reward", "attack_raw_reward", "defence_raw_reward", "attack_win_rate", "defence_win_rate",
-	"decisions", "rounds", "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "signal_ratio", "weight_change",
+	"decisions", "rounds", "policy_loss", "value_loss", "entropy", "below_floor", "approx_kl", "clip_fraction", "signal_ratio", "weight_change",
 	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds",
 ] + [f"{side}_share_{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS] + [
 	f"{side}_{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")
-] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow", "learning_rate", "ppo_steps", "update_kl", "outcome_share"] + [
+] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow", "learning_rate", "ppo_steps", "update_kl", "outcome_share", "round_head_weight"] + [
 	f"train_{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")
 ]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
@@ -223,12 +243,13 @@ TENSORBOARD_TAGS = {
 	"ppo_steps": "stability/ppo_steps",  # fewer than the passes' when the KL control stopped the update
 	"update_kl": "stability/update_kl",
 	"outcome_share": "stability/outcome_share",  # the window credit's share of the real outcome (by V's quality)
+	"round_head_weight": "stability/round_head_weight",  # V2's share of what the policy maximizes (by V's quality)
 	**{f"{side}_share_{kind.lower()}": f"actions_{side}/{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS},
 	**{f"{side}_{name}": f"credit_{side}/{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")},
 	"mean_reward": "reward/mean", "attack_reward": "reward/attack", "defence_reward": "reward/defence",
 	"attack_raw_reward": "raw_reward/attack", "defence_raw_reward": "raw_reward/defence",
 	"attack_win_rate": "won/attack", "defence_win_rate": "won/defence",
-	"policy_loss": "loss/policy", "value_loss": "loss/value", "entropy": "loss/entropy",
+	"policy_loss": "loss/policy", "value_loss": "loss/value", "entropy": "loss/entropy", "below_floor": "loss/entropy_below_floor",
 	"signal_ratio": "stability/signal_ratio", "weight_change": "stability/weight_change", "approx_kl": "stability/approx_kl", "clip_fraction": "stability/clip_fraction",
 	"attack_advantage_std": "advantage_std/attack", "defence_advantage_std": "advantage_std/defence",
 	"attack_value_error": "value_error/attack", "defence_value_error": "value_error/defence",
@@ -266,6 +287,8 @@ def log_eval_tensorboard(writer, row, opponent=""):
 		writer.add_scalar(f"{prefix}/total_score", float(row["total_score"]), epoch)
 	else:  # (old runs: one opponent, its score is the total)
 		writer.add_scalar("eval/total_score", float(row["total_score"]), epoch)
+	for kind, score in row.get("hard_kinds", {}).items():
+		writer.add_scalar(f"{prefix}/hard/{kind}", float(score), epoch)
 	for column in (*(f"score_{k}" for k in EVAL_SETS), *(f"score_{k}_se" for k in EVAL_SETS), "score_balanced", "score_worst", "escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss"):
 		if row.get(column) not in (None, "") and row[column] == row[column]:  # skip nan: a set or a case that never came up
 			writer.add_scalar(f"{prefix}/{column}", float(row[column]), epoch)
@@ -455,6 +478,9 @@ def eval_name(config, main_opponent):
 
 
 EVAL_SETS = ("generated", "neutrals", "real", "castle", "hard")
+# Greedy evals: a shooter that could shoot at full damage and did not is a failure of the model or of the metric
+# above this share (the user, 2026-10-28: 0.99+ shooting is the aim with no sampling noise; 0.95 is fine in training)
+SHOOTER_IDLE_LIMIT = 0.01
 
 
 def eval_set(game):
@@ -568,7 +594,10 @@ def eval_baseline(model, out, battle_map, config, suffix=""):
 	return rows
 
 
-def eval_round(model, epoch, out, battle_map, config, baseline):
+KL_WINDOW = 4  # minibatches whose mean KL the KL control judges an update by (TrainConfig.target_kl)
+
+
+def eval_round(model, epoch, out, battle_map, config, baseline, name=""):
 	"""Play the eval battles against config.eval_opponent with the current model; the eval.csv row."""
 	started = time.time()
 	model_path = out / "eval.onnx"
@@ -579,7 +608,7 @@ def eval_round(model, epoch, out, battle_map, config, baseline):
 	played, records = play_eval(games, model_path, config, f"eval {epoch}")
 	failed, games = len(games) - len(played), played
 	summaries = [summarize(r.events) for r in records]
-	write_traces(out, epoch, f"vs_{config.eval_opponent}_greedy", [next(r for g, r in zip(games, records) if g.our_side == side) for side in (0, 1)])  # the first seed's
+	write_traces(out, epoch, f"vs_{config.eval_opponent}_greedy{name}", [next(r for g, r in zip(games, records) if g.our_side == side) for side in (0, 1)])  # the first seed's
 	row = {"epoch": epoch}
 	rewards, baselines = [], []
 	for side, name in ((0, "attack"), (1, "defence")):
@@ -611,11 +640,19 @@ def eval_round(model, epoch, out, battle_map, config, baseline):
 	# The goal is to win every set, not a good average (the user, 2026-10-27): each set counted alike, and the worst
 	sets = [row[f"score_{key}"] for key in EVAL_SETS if row[f"score_{key}"] == row[f"score_{key}"]]
 	row["score_balanced"] = round(sum(sets) / len(sets), 4) if sets else float("nan")
+	# Each trick of the hard set on its own (generator.HARD_KINDS; TensorBoard eval_<opponent>/hard/<kind>, not a column)
+	kinds = {}
+	for g, s in zip(games, summaries):
+		about = play.scenario_of(g.scenario).get("_about", "")
+		if about.startswith("hard"):
+			kinds.setdefault(about.split()[1].rstrip(",:"), []).append(s.reward - baseline[(g.our_side, g.game_seed)][0])
+	row["hard_kinds"] = {k: round(sum(v) / len(v), 4) for k, v in sorted(kinds.items())}
 	row["score_worst"] = round(min(sets), 4) if sets else float("nan")
 	row["mean_vs_baseline"] = round((sum(rewards) - sum(baselines)) / len(rewards), 4)
 	row.update(failure_modes(records))
 	row["failed_battles"] = failed
 	row["seconds"] = round(time.time() - started, 1)
+	row["rewards"] = {(g.our_side, g.game_seed, eval_set(g)): s.reward for g, s in zip(games, summaries)}  # (not a column: for paired comparisons)
 	return row
 
 
@@ -703,10 +740,33 @@ def model_kwargs(config):
 	return {"architecture": "v1", "dim": config.model_dim, "layers": config.model_layers, "mask_features": config.model_mask_features, "chain_final_value": config.model_chain_final_value, "kill_rule": config.model_kill_rule}
 
 
-def save_checkpoint(path, model, optimizer, epoch, config, elapsed=0.0, lr_scale=1.0, value_ev=None):
+class WeightAverage:
+	"""One running average of a model's weights, updated after each update: average = d * average + (1 - d) * weights,
+	d = min(decay, (1 + n) / (10 + n)) after n updates (a short average while there are few, as in TensorFlow's
+	ExponentialMovingAverage). A single copy of the parameters on the model's device, one fused op per update; the
+	buffers are constants, copied with the model."""
+
+	def __init__(self, model, decay, state=None, updates=0):
+		self.decay, self.updates = decay, updates
+		self.model = copy.deepcopy(model).eval()
+		for p in self.model.parameters():
+			p.requires_grad_(False)
+		if state is not None:
+			self.model.load_state_dict(state)
+
+	@torch.no_grad()
+	def update(self, model):
+		d = min(self.decay, (1 + self.updates) / (10 + self.updates))
+		torch._foreach_lerp_(list(self.model.parameters()), [p.detach() for p in model.parameters()], 1 - d)
+		self.updates += 1
+
+
+def save_checkpoint(path, model, optimizer, epoch, config, elapsed=0.0, lr_scale=1.0, value_ev=None, average=None):
 	"""elapsed: the training's seconds so far (run_hours counts them across resumes); lr_scale: the KL control's;
-	value_ev: the smoothed explained variance the window credit's outcome share follows."""
-	torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "model_kwargs": model_kwargs(config), "elapsed": elapsed, "lr_scale": lr_scale, "value_ev": value_ev}, path)
+	value_ev: the smoothed explained variance the window credit's outcome share follows; average: the WeightAverage
+	(saved as "average", the weights the evals played; "model" is the trained weights the optimizer goes on from)."""
+	extra = {"average": average.model.state_dict(), "average_updates": average.updates} if average else {}
+	torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "model_kwargs": model_kwargs(config), "elapsed": elapsed, "lr_scale": lr_scale, "value_ev": value_ev, **extra}, path)
 
 
 def train(config, resume=False):
@@ -723,6 +783,7 @@ def train(config, resume=False):
 	lr_scale = 1.0  # the KL control's (target_kl)
 	value_ev = None  # the value head's explained variance (credit_check), smoothed: sets the window credit's outcome share
 	latest = out / "checkpoint_latest.pt"
+	state = {}
 	if resume and latest.exists():
 		state = torch.load(latest, map_location=device)
 		architecture = state.get("model_kwargs", {})
@@ -735,6 +796,27 @@ def train(config, resume=False):
 		lr_scale = state.get("lr_scale", 1.0)
 		value_ev = state.get("value_ev")
 		print(f"resuming after epoch {state['epoch']} ({elapsed_before / 3600:.2f} h)")
+	elif config.init_from:  # a new run going on from another's checkpoint
+		source = Path(config.init_from)
+		state = torch.load(source, map_location=device)
+		architecture = state.get("model_kwargs", {})
+		model = build_model(architecture).to(device)
+		optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+		model.load_state_dict(state["model"])
+		optimizer.load_state_dict(state["optimizer"])
+		first_epoch = state["epoch"] + 1  # its numbering goes on, so its league snapshots keep their versions
+		lr_scale = state.get("lr_scale", 1.0)
+		value_ev = state.get("value_ev")
+		(out / "models").mkdir(parents=True, exist_ok=True)
+		for snapshot in (source.parent / "models").glob("snapshot_*.pt"):  # the league's past versions
+			if int(snapshot.stem.split("_")[1]) <= state["epoch"] and not (out / "models" / snapshot.name).exists():
+				shutil.copy2(snapshot, out / "models" / snapshot.name)
+		for baseline in source.parent.glob("eval_baseline*.csv"):  # (eval_baseline recomputes them if the sets differ)
+			if not (out / baseline.name).exists():
+				shutil.copy2(baseline, out / baseline.name)
+		print(f"starting from {source} (epoch {state['epoch']})")
+	# (a run from another's checkpoint keeps its average only on a resume: a new run averages from its start)
+	average = WeightAverage(model, config.weight_average, *((state["average"], state["average_updates"]) if resume and "average" in state else ())) if config.weight_average else None
 
 	battle_map = None if config.generator else play.build_map(config.scenario, variant=config.run)
 	reward_config, advantage_config, ppo_config = config.reward, config.advantage, config.ppo
@@ -764,6 +846,8 @@ def train(config, resume=False):
 				csv.writer(f).writerow(EVAL_COLUMNS)
 		else:  # (it was not: the rows after a resume that added columns did not fit its header)
 			upgrade_csv(path, EVAL_COLUMNS)
+	if resume and (out / "eval_live.csv").exists():  # (the same for the live weights' evals: 2026-10-28 review)
+		upgrade_csv(out / "eval_live.csv", EVAL_COLUMNS)
 
 	def evaluate_now(epoch):
 		"""Every eval opponent's eval round; the score of the model is their mean, each opponent counting the same
@@ -771,6 +855,18 @@ def train(config, resume=False):
 		if any(c.eval_opponent == "MMAI" for c in opponents) and "mmai" not in play.active_mods():  # it would play as BattleAI
 			raise RuntimeError(f"the MMAI mod is not active ({play.USER_DIR / 'config' / 'modSettings.json'}): MMAI would fall back to BattleAI")
 		rows = {c.eval_opponent: evaluate_against(epoch, c, baseline) for c, baseline in zip(opponents, baselines)}
+		if average and average.updates and config.eval_live:  # the trained weights on the same battles: the average's test
+			live = eval_round(model, epoch, out, battle_map, opponents[0], baselines[0], "_live")  # (its own traces)
+			with (out / "eval_live.csv").open("a", newline="") as f:
+				if f.tell() == 0:
+					csv.writer(f).writerow(EVAL_COLUMNS)
+				csv.writer(f).writerow([live[c] for c in EVAL_COLUMNS])
+			log_eval_tensorboard(writer, live, "live")
+			ours, theirs = rows[opponents[0].eval_opponent]["rewards"], live["rewards"]
+			diff = np.array([ours[k] - theirs[k] for k in ours if k in theirs])
+			if len(diff) > 1:
+				writer.add_scalar("eval/average_minus_live", float(diff.mean()), epoch)
+				print(f"eval  {epoch:4d}  average - live weights vs {opponents[0].eval_opponent}: {diff.mean():+.4f} +- {diff.std(ddof=1) / np.sqrt(len(diff)):.4f} over {len(diff)} battles (live: total score {live['total_score']:+.3f})", flush=True)
 		scores = {name: row["total_score"] for name, row in rows.items()}
 		total = round(sum(scores.values()) / len(scores), 4)
 		balanced = round(sum(row["score_balanced"] for row in rows.values()) / len(rows), 4)
@@ -788,17 +884,26 @@ def train(config, resume=False):
 		print(f"eval  {epoch:4d}  TOTAL SCORE {total:+.3f}  (" + ", ".join(f"vs {name} {score:+.3f}" for name, score in scores.items()) + f")  balanced {balanced:+.3f}  worst set {worst:+.3f}", flush=True)
 
 	def evaluate_against(epoch, config_for, baseline):
-		row = eval_round(model, epoch, out, battle_map, config_for, baseline)
+		row = eval_round(average.model if average else model, epoch, out, battle_map, config_for, baseline)
+		if average and pool:  # the weights it just scored (eval.onnx) play the campaign evals' battles too
+			staged = pool.models / "average.onnx.tmp"
+			shutil.copyfile(out / "eval.onnx", staged)
+			os.replace(staged, pool.models / "average.onnx")
+			pool.eval_model = pool.models / "average.onnx"
 		with (out / f"eval{eval_name(config_for, config.eval_opponent)}.csv").open("a", newline="") as f:
 			csv.writer(f).writerow([row[c] for c in EVAL_COLUMNS])
 		log_eval_tensorboard(writer, row, config_for.eval_opponent)
+		if row["shooter_not_shooting"] > SHOOTER_IDLE_LIMIT:  # (nan compares false)
+			print(f"eval  {epoch:4d}  FAILURE vs {config_for.eval_opponent}: shooters idle in {row['shooter_not_shooting']:.3f} of their full-damage chances, over {SHOOTER_IDLE_LIMIT} (greedy: the model or the metric is wrong)", flush=True)
 		print(f"eval  {epoch:4d}  total score {row['total_score']:+.3f}  vs {config_for.eval_opponent}, greedy: attack won {row['attack_win_rate']:.2f} {row['attack_reward']:+.3f} ({row['attack_vs_baseline']:+.3f} vs its own)  defence won {row['defence_win_rate']:.2f} {row['defence_reward']:+.3f} ({row['defence_vs_baseline']:+.3f} vs its own)  {row['seconds']}s"
 			f"  | sets: " + ", ".join(f"{k} {row[f'score_{k}']:+.3f}" for k in EVAL_SETS if row[f"score_{k}"] == row[f"score_{k}"]) +
-			f"  | failures: escape ahead {row['escape_while_ahead']}, shooter idle {row['shooter_not_shooting']}, worthless cast {row['worthless_cast']}, cast skipped on loss {row['cast_skipped_on_loss']}", flush=True)
+			f"  | failures: escape ahead {row['escape_while_ahead']}, shooter idle {row['shooter_not_shooting']}, worthless cast {row['worthless_cast']}, cast skipped on loss {row['cast_skipped_on_loss']}"
+			+ ("  | tricks: " + ", ".join(f"{k} {v:+.3f}" for k, v in row["hard_kinds"].items()) if row.get("hard_kinds") else ""), flush=True)
 		return row
 
-	if config.eval_every and first_epoch == 1:
-		evaluate_now(0)  # the untrained model
+	pool = None  # (the actors start after the first eval: evaluate_against reads it)
+	if config.eval_every and (first_epoch == 1 or (config.init_from and not resume)):
+		evaluate_now(first_epoch - 1)  # the model as the run starts
 	settings = (("ALPHA_BATTLE_SEARCH_SIMULATIONS", str(config.search_simulations)),) if config.search_simulations > 0 else ()
 
 	def epoch_games(epoch):
@@ -840,13 +945,33 @@ def train(config, resume=False):
 		pool = ActorPool(config, out, generated_games, architecture, trained_epochs=first_epoch - 1)
 		pool.publish(model, lambda path: export(cpu_copy(model), path))
 		pool.start()
-	else:
+	campaign = None
+	if config.campaign.games:  # the campaign model, trained alongside: its games' battles are our real battles
+		if not pool or not pool.server:
+			raise ValueError("campaign training needs actors=true and inference=server")
+		from campaign_model.learner import CampaignLearner
+
+		try:
+			campaign = CampaignLearner(config.campaign, out, device if config.campaign.device == "auto" else torch.device(config.campaign.device), pool, resume=resume)
+			if campaign.eval_due():  # the campaign model as the run starts, against Nullkiller2
+				pool.pause()
+				campaign.evaluate(first_epoch - 1)
+				pool.resume()
+			campaign.start()
+		except BaseException:
+			if campaign:
+				campaign.close()
+			pool.close()
+			raise
+	if not pool:
 		export(cpu_copy(model), model_files[current])
 		producer = Producer(play_epoch)
 		producer.start(first_epoch, model_files[current])
 	# The run's time (run_hours, the learning rate's schedule, eval_minutes) on the monotonic clock: it stands still
 	# while the machine sleeps (a closed lid stole 2.3 of v15-window's 11 hours and decayed its rate as if they ran)
 	run_started, last_eval = time.monotonic(), time.monotonic()
+	if resume and (out / "eval_total.csv").exists():  # the next eval eval_minutes after the last one, not after the resume
+		last_eval -= time.time() - (out / "eval_total.csv").stat().st_mtime
 	elapsed = lambda: elapsed_before + time.monotonic() - run_started
 	try:
 		for epoch in itertools.count(first_epoch):
@@ -868,14 +993,18 @@ def train(config, resume=False):
 			waited = time.time() - started
 			if not pool and config.prefetch and epoch < config.epochs:
 				producer.start(epoch + 1, model_files[current])  # with the model before this epoch's update
-			if advantage_config.credit == "window" and advantage_config.outcome_share_max > advantage_config.outcome_share:
-				a = config.advantage
-				trust = min(1.0, max(0.0, (value_ev if value_ev is not None else 0.0) / a.outcome_share_full_ev))
+			# How far the credit trusts the value head (its smoothed explained variance): the outcome's share falls with it,
+			# and so does the round heads' share of what the policy maximizes (AdvantageConfig.policy_heads)
+			a = config.advantage
+			trust = min(1.0, max(0.0, (value_ev if value_ev is not None else 0.0) / a.outcome_share_full_ev))
+			if advantage_config.credit == "window" and a.outcome_share_max > a.outcome_share:
 				advantage_config = replace(advantage_config, outcome_share=a.outcome_share_max - (a.outcome_share_max - a.outcome_share) * trust)
+			if a.fade_round_heads:
+				advantage_config = replace(advantage_config, policy_heads=tuple(w * (1 - trust) for w in a.policy_heads[:-1]) + (a.policy_heads[-1],))
 			loader, summaries, _ = make_dataloader(records, config.batch_size, True, reward_config, advantage_config)
 
 			weights_before = flat_weights(model)
-			parts_sum, batches = {key: torch.zeros((), device=device) for key in ("policy", "value", "entropy", "approx_kl", "clip_fraction")}, 0
+			parts_sum, batches = {key: torch.zeros((), device=device) for key in ("policy", "value", "entropy", "below_floor", "approx_kl", "clip_fraction")}, 0
 			trained = time.time()
 			model.train()
 			examples = loader.dataset
@@ -899,7 +1028,7 @@ def train(config, resume=False):
 						anchors.append(log_prob(model(rows["inputs"], rows["facts"]) if "facts" in rows else model(rows["inputs"]), rows["action"]))
 					epoch_data["anchor_log_prob"] = torch.cat(anchors)[: len(examples)]
 					del anchors
-			stopped, update_kl, kl_sum = False, 0.0, 0.0
+			stopped, update_kl, kl_sum, recent = False, 0.0, 0.0, deque(maxlen=KL_WINDOW)
 			kl_of = lambda out, rows: (lambda d: (d.exp() - 1 - d).mean())(log_prob(out, rows["action"]).detach() - rows["anchor_log_prob"])  # k3: KL(anchor || now)
 			for _ in range(config.ppo_passes if examples else 0):
 				if stopped:
@@ -929,16 +1058,20 @@ def train(config, resume=False):
 						parts_sum[key] += parts[key]  # summed on the device: no sync each step
 					batches += 1
 					if config.target_kl:
-						update_kl = float(kl_of(out_batch, batch))  # before this step: how far the update has moved so far
-						kl_sum += update_kl
+						kl = float(kl_of(out_batch, batch))  # before this step: how far the update has moved so far
+						kl_sum += kl
+						recent.append(kl)
+						update_kl = sum(recent) / len(recent)  # the last KL_WINDOW minibatches': one's is noise
 						if update_kl > 1.5 * config.target_kl:
 							stopped = True  # this update has moved the policy far enough
 							break
 			model.eval()
+			if average and batches:
+				average.update(model)
 			if config.target_kl and batches:
 				if stopped:
 					lr_scale = max(0.1, lr_scale / 1.5)
-				elif update_kl < config.target_kl / 2:  # the update's last minibatch: nearest where it ended
+				elif update_kl < config.target_kl / 2:  # the update's last minibatches: nearest where it ended
 					lr_scale = min(config.lr_scale_max, lr_scale * 1.5)
 			epoch_data = batch = out_batch = loss = None  # (none of them may exist: an update with no minibatch)
 			if device.type == "mps":
@@ -956,16 +1089,17 @@ def train(config, resume=False):
 			train_seconds = time.time() - trained
 
 			by_side = [[s for s in summaries if s.our_side == side] for side in (0, 1)]
-			average = lambda values: sum(values) / len(values) if values else float("nan")  # a side can be absent (generator: all battles against neutrals)
+			mean_of = lambda values: sum(values) / len(values) if values else float("nan")  # a side can be absent (generator: all battles against neutrals)
 			mean = {key: float(value) / max(batches, 1) for key, value in parts_sum.items()}
 			row = {
 				"epoch": epoch,
-				"mean_reward": round(to_scale(average([s.reward for s in by_side[0] + by_side[1]]), reward_config), 4),
+				"mean_reward": round(to_scale(mean_of([s.reward for s in by_side[0] + by_side[1]]), reward_config), 4),
 				"decisions": sum(s.decisions for s in summaries),
-				"rounds": round(sum(average([s.rounds for s in side]) for side in by_side), 2),
+				"rounds": round(sum(mean_of([s.rounds for s in side]) for side in by_side), 2),
 				"policy_loss": round(mean["policy"], 5),
 				"value_loss": round(mean["value"], 5),
 				"entropy": round(mean["entropy"], 4),
+				"below_floor": round(mean["below_floor"], 4),
 				"approx_kl": round(mean["approx_kl"], 5),
 				"clip_fraction": round(mean["clip_fraction"], 4),
 				"signal_ratio": round(signal_ratio(optimizer), 4),
@@ -978,6 +1112,7 @@ def train(config, resume=False):
 				"ppo_steps": batches,
 				"update_kl": round(kl_sum / max(batches, 1), 5),  # KL(start of the update || during it), what the KL control uses
 				"outcome_share": round(advantage_config.outcome_share, 3),
+				"round_head_weight": round(float(advantage_config.policy_heads[2]), 3),
 				**{f"train_{k}": v for k, v in failure_modes(records).items()},  # the same signs of dumb play, in training
 			}
 			for side, name in ((0, "attack"), (1, "defence")):
@@ -988,13 +1123,13 @@ def train(config, resume=False):
 			if config.eval_every and epoch % config.eval_every == 0 and config.opponent == play.SELF_PLAY:
 				write_traces(out, epoch, "selfplay", records[:2])  # one self-play battle, seen from both sides
 			for name, side_summaries in (("attack", by_side[0]), ("defence", by_side[1])):
-				raw = average([s.reward for s in side_summaries])
+				raw = mean_of([s.reward for s in side_summaries])
 				row[f"{name}_reward"] = round(to_scale(raw, reward_config), 4)
 				row[f"{name}_raw_reward"] = round(raw, 4)
-				row[f"{name}_win_rate"] = round(average([float(s.outcome == Outcome.WIN) for s in side_summaries]), 4)
+				row[f"{name}_win_rate"] = round(mean_of([float(s.outcome == Outcome.WIN) for s in side_summaries]), 4)
 				row[f"{name}_outcome"] = outcome_text(side_summaries)
-				row[f"{name}_advantage_std"] = round(average([s.advantage_std for s in side_summaries]), 4)
-				row[f"{name}_value_error"] = round(average([s.value_error for s in side_summaries]), 4)
+				row[f"{name}_advantage_std"] = round(mean_of([s.advantage_std for s in side_summaries]), 4)
+				row[f"{name}_value_error"] = round(mean_of([s.value_error for s in side_summaries]), 4)
 				ev, own_lost, killed = credit_check(side_summaries)
 				row[f"{name}_value_ev"], row[f"{name}_credit_own_lost"], row[f"{name}_credit_killed"] = round(ev, 3), round(own_lost, 3), round(killed, 3)
 			evs = [row[f"{name}_value_ev"] for name in ("attack", "defence") if row[f"{name}_value_ev"] == row[f"{name}_value_ev"]]
@@ -1011,6 +1146,10 @@ def train(config, resume=False):
 				flush=True,
 			)
 
+			if campaign and config.campaign.learner == "turns":
+				campaign.step(epoch)  # an update of the campaign model when its games are in (its own optimizer)
+			elif campaign:
+				campaign.note_epoch(epoch)  # (its updates run in its own thread)
 			due = time.monotonic() - last_eval >= config.eval_minutes * 60 if config.eval_minutes else config.eval_every and epoch % config.eval_every == 0
 			if due:
 				if pool:
@@ -1019,11 +1158,17 @@ def train(config, resume=False):
 				if pool:
 					pool.resume()
 				last_eval = time.monotonic()
-				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev)  # every evaluated model
-			save_checkpoint(latest, model, optimizer, epoch, config, elapsed(), lr_scale, value_ev)
+				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average)  # every evaluated model
+			if campaign and campaign.eval_due():  # against Nullkiller2, with the battle actors paused
+				pool.pause()
+				campaign.evaluate(epoch)
+				pool.resume()
+			save_checkpoint(latest, model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average)
 			if config.checkpoint_every and epoch % config.checkpoint_every == 0:
-				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev)
+				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average)
 	finally:
+		if campaign:
+			campaign.close()
 		if pool:
 			pool.close()
 
@@ -1034,7 +1179,7 @@ def main():
 	parser.add_argument("--run", default=TrainConfig.run)
 	parser.add_argument("--resume", action="store_true")
 	parser.add_argument("--follow", metavar="RUN", help="mirror a running run's progress.csv into TensorBoard instead of training")
-	parser.add_argument("--set", nargs="*", default=[], metavar="NAME=VALUE", help="override TrainConfig fields; ppo.NAME, advantage.NAME, reward.NAME for the sub-configs")
+	parser.add_argument("--set", nargs="*", default=[], metavar="NAME=VALUE", help="override TrainConfig fields; ppo.NAME, advantage.NAME, reward.NAME, campaign.NAME for the sub-configs")
 	args = parser.parse_args()
 	if args.follow:
 		follow(args.follow)

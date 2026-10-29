@@ -1,7 +1,8 @@
 """The battle reward: zero-sum, from what each side owns. No trainable parameters.
 
 	assets(side) = army      the value of the creatures it keeps after the battle (gold + resources at base prices)
-	             + hero      what its hero is worth (hero_asset: its levels and its artifacts), while the side has it
+	             + hero      what its hero is worth (hero_asset: its levels and its artifacts; its war machines still
+	                         standing, at game_values.WAR_MACHINE_CREATURES), while the side has it
 	             + mana      mana_value x the hero's spell power x its mana left, while the side still has its hero
 	reward(side) = (assets the enemy lost - assets we lost) / (both sides' assets at the start)      in -1..1
 
@@ -30,20 +31,20 @@ correction, learned by a small separate head, once they matter:
 	- experience: left out on purpose (2026-10-25): the reward stays battle-local and zero-sum, as the campaign-map gains
 	  a battle opens (towns, mines, time) are not counted either
 	- Necromancy and similar: raising creatures after the battle from the enemy's dead
-	- war machines: destroyed ones are lost (their artifact is removed), but neither side's assets count them yet
+	- (war machines are counted: half their price as part of their hero, data.summarize; the catapult and arrow towers 0)
 	- Eagle Eye: learning the enemy's spells; Learning, Scholar-like effects
 	- time: a long battle costs both sides nothing here (the round penalty of before is gone), but movement and days
 	  matter in a campaign
-	- sieges (CATAPULT, not played by the model yet): damaged walls and towers are a cost to the town's owner
+	- sieges (the model plays the catapult: ActionType.CATAPULT): damaged walls and towers are a cost to the town's owner
 	- campaigns with more than two players: a loss to our enemy is not all our gain
 """
 from dataclasses import dataclass
 from enum import IntEnum
 
-# config/resources.json "price"
-RESOURCE_PRICES = {"wood": 250, "mercury": 500, "ore": 250, "sulfur": 500, "crystal": 500, "gems": 500, "gold": 1}
-# GameConstants::HERO_GOLD_COST: rehiring a retreated or surrendered hero from the tavern
-HERO_HIRE_COST = 2500
+import game_values
+# The prices are the shared list's (game_values), which the campaign model prices with too.
+# HERO_HIRE_COST: rehiring a retreated or surrendered hero from the tavern
+from game_values import HERO_HIRE_COST, RESOURCE_PRICES, WAR_MACHINE_CREATURES, resources_value  # noqa: F401 (re-exported)
 
 
 class Outcome(IntEnum):
@@ -58,20 +59,15 @@ class Outcome(IntEnum):
 class RewardConfig:
 	# Gold per mana point per point of spell power. Fixed for now; later from outside (the campaign: a Magic Well
 	# nearby makes mana worth ~0). At 2, a power-5 hero's 50 mana is worth 500 gold: ~3% of a week-1 army.
-	mana_value: float = 2.0
+	mana_value: float = game_values.MANA_VALUE
 	# A hero's levels (hero_level_value): level_value x (levels above free_levels) ^ level_exponent. A fresh hero (its
 	# hire price buys it with a few creatures) and one of the first levels is worth nothing beyond that; a level is
 	# worth about a hire price; and more than linear, as a high level also stands for the shrines, skills and
 	# specialty growth a hero collects, though far from the experience the levels take (which grows 20% a level).
 	# 2500 x (L - 3) ^ 1.3: level 4 2500, 10 ~31 600, 20 ~100 000, 30 ~181 000.
-	level_value: float = 2500.0
-	free_levels: float = 3.0
-	level_exponent: float = 1.3
-
-
-def resources_value(resources):
-	"""Gold value of a cost dict, e.g. {"gold": 3000, "gems": 1}."""
-	return sum(RESOURCE_PRICES[name] * amount for name, amount in resources.items())
+	level_value: float = game_values.LEVEL_VALUE
+	free_levels: float = game_values.FREE_LEVELS
+	level_exponent: float = game_values.LEVEL_EXPONENT
 
 
 def stack_value(unit_cost, count):
@@ -84,7 +80,7 @@ def mana_value(mana, power, config=RewardConfig()):
 
 def hero_level_value(level, config=RewardConfig()):
 	"""What a hero's levels are worth (RewardConfig): level counts its way to the next level (12.5: halfway to 13)."""
-	return config.level_value * max(0.0, level - config.free_levels) ** config.level_exponent
+	return game_values.hero_level_value(level, config.level_value, config.free_levels, config.level_exponent)
 
 
 def hero_asset(level, artifacts, config=RewardConfig()):

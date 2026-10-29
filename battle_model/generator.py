@@ -325,7 +325,134 @@ def hard_one_big_stack(rng, cfg, w):
 	return scenario
 
 
-HARD_KINDS = {"one_big_stack": hard_one_big_stack}
+def _learn(side, spells, w, knowledge=4):
+	"""Give a hero a spellbook, full mana, these spells, the Wisdom to learn them and enough Knowledge to cast a few."""
+	level_of = {short(s["key"]): s["level"] for s in w["spells"]}
+	need = next(i for i, top in enumerate(LEARNABLE) if top >= max(level_of[k] for k in spells))
+	skills = dict(side.get("secondary_skills", []))
+	if skills.get("wisdom", 0) < need:
+		if "wisdom" not in skills and len(skills) >= MAX_SECONDARY:
+			skills.pop(next(k for k in reversed(list(skills)) if k != "wisdom"))
+		skills["wisdom"] = need
+	side["secondary_skills"] = [[k, v] for k, v in skills.items()]
+	primary = list(side.get("primary_skills", [1, 1, 1, 1]))
+	primary[3] = max(primary[3], knowledge)
+	side.update(spellbook=True, spells=sorted(set(side.get("spells", [])) | set(spells)), mana_fraction=1.0, primary_skills=primary)
+
+
+def _creatures(w, levels, test=lambda c: True):
+	"""Creature keys of the given levels (bases and upgrades alike) that pass test(row)."""
+	return [k for k, c in w["creature"].items() if levels["min"] <= c["level"] <= levels["max"] and test(c)]
+
+
+def _shooter(c):
+	return c.get("shots", 0) > 0
+
+
+def _cheap_singles(rng, count, w, taken=()):
+	"""`count` stacks of a single level-1 creature each, all different (an army's stacks are of different creatures):
+	what sacrificed blockers are made of."""
+	pool = [k for k in _creatures(w, {"min": 1, "max": 1}, lambda c: not _shooter(c)) if k not in taken]
+	return [[k, 1] for k in rng.sample(pool, min(count, len(pool)))]
+
+
+def hard_shooter_guard(rng, cfg, w):
+	"""A strong shooter and a few single cheap creatures against neutrals that walk or fly (no shooters), about as
+	strong: won by keeping them off the shooter (the cheap stacks in the way, Force Field, the Tactics phase), lost
+	if they reach it (cfg hard.shooter_guard)."""
+	h = cfg["hard"]["shooter_guard"]
+	scenario = sample_type(rng, cfg, w, "hero_vs_neutrals")
+	side = scenario["sides"][0]
+	value = army_value(side["army"], w)
+	shooter = rng.choice(_creatures(w, h["shooter_level"], _shooter))
+	side["army"] = [[shooter, max(1, round(value / creature_value(shooter, w)))]] + _cheap_singles(rng, between(rng, h["blockers"]), w, (shooter,))
+	melee = rng.choice(_creatures(w, h["enemy_level"], lambda c: not _shooter(c) and c.get("speed", 0) >= h["enemy_speed"]))
+	enemy = army_value(side["army"], w) * rng.uniform(h["value_ratio"]["min"], h["value_ratio"]["max"])
+	scenario["neutrals"] = {"creature": melee, "count": max(1, round(enemy / creature_value(melee, w))), "upgraded_stack": False}
+	_learn(side, ["forceField"], w)
+	if rng.random() < h["tactics"]:
+		skills = dict(side["secondary_skills"])
+		skills["tactics"] = 3
+		side["secondary_skills"] = [[k, v] for k, v in list(skills.items())[-MAX_SECONDARY:]]
+	scenario["_about"] = f"hard shooter_guard: {side['army'][0][1]} {shooter} and {len(side['army']) - 1} single blockers vs {scenario['neutrals']['count']} {melee}"
+	return scenario
+
+
+def hard_blind_the_big_stack(rng, cfg, w):
+	"""Two heroes; the enemy's army one big stack and a few small ones, stronger than ours: won by blinding (or
+	slowing) the big stack and beating the rest, lost in a straight fight (cfg hard.blind_the_big_stack)."""
+	h = cfg["hard"]["blind_the_big_stack"]
+	scenario = sample_type(rng, cfg, w, "hero_vs_hero")
+	ours, theirs = scenario["sides"]
+	value = army_value(ours["army"], w) * rng.uniform(h["value_ratio"]["min"], h["value_ratio"]["max"])
+	big = rng.choice(_creatures(w, h["big_level"], lambda c: not _shooter(c)))
+	small = [[k, 1] for k in rng.sample([k for k in _creatures(w, {"min": 1, "max": 3}) if k != big], between(rng, h["small_stacks"]))]
+	theirs["army"] = [[big, max(1, round(value * h["big_share"] / creature_value(big, w)))]] + [[k, max(1, round(value * (1 - h["big_share"]) / len(small) / creature_value(k, w)))] for k, _ in small]
+	_learn(ours, ["blind", "slow"], w)
+	scenario["_about"] = f"hard blind_the_big_stack: {theirs['army'][0][1]} {big} in an army of {army_value(theirs['army'], w):.0f} vs ours {army_value(ours['army'], w):.0f}"
+	return scenario
+
+
+def hard_berserk(rng, cfg, w):
+	"""Neutrals in several stacks of one creature, stronger than us: won by berserking a stack into its neighbours
+	(cfg hard.berserk)."""
+	h = cfg["hard"]["berserk"]
+	scenario = sample_type(rng, cfg, w, "hero_vs_neutrals")
+	side = scenario["sides"][0]
+	key = rng.choice(_creatures(w, h["level"]))
+	value = army_value(side["army"], w) * rng.uniform(h["value_ratio"]["min"], h["value_ratio"]["max"])
+	scenario["neutrals"] = {"creature": key, "count": max(1, round(value / creature_value(key, w))), "upgraded_stack": False}
+	_learn(side, ["berserk"], w)
+	scenario["_about"] = f"hard berserk: army {army_value(side['army'], w):.0f} vs {scenario['neutrals']['count']} {key} ({value:.0f} gold)"
+	return scenario
+
+
+def hard_enemy_shooters(rng, cfg, w):
+	"""Two heroes; most of the enemy's army shooters, ours with a fast flyer: won by blocking or blinding their
+	shooters early (a flyer next to a shooter stops its shots), lost trading shots (cfg hard.enemy_shooters)."""
+	h = cfg["hard"]["enemy_shooters"]
+	scenario = sample_type(rng, cfg, w, "hero_vs_hero")
+	ours, theirs = scenario["sides"]
+	flyer = rng.choice([k for k in _creatures(w, h["flyer_level"], lambda c: "FLYING" in c.get("abilities", []) and c.get("speed", 0) >= h["flyer_speed"]) if k not in {a for a, _ in ours["army"]}])
+	ours["army"] = ([[flyer, max(1, round(army_value(ours["army"], w) * h["flyer_share"] / creature_value(flyer, w)))]] + ours["army"])[:7]
+	# The enemy against our army with its flyer (drawn against the army before it, the ratio was 0.69-1.0, not the
+	# configured 0.9-1.3: often won without the trick, 2026-10-28 review)
+	value = army_value(ours["army"], w) * rng.uniform(h["value_ratio"]["min"], h["value_ratio"]["max"])
+	shooters = rng.sample(_creatures(w, h["shooter_level"], _shooter), between(rng, h["shooter_stacks"]))
+	share = value * h["shooter_share"] / len(shooters)
+	melee = rng.choice([k for k in _creatures(w, {"min": 1, "max": 4}, lambda c: not _shooter(c)) if k not in shooters])
+	theirs["army"] = [[k, max(1, round(share / creature_value(k, w)))] for k in shooters] + [[melee, max(1, round(value * (1 - h["shooter_share"]) / creature_value(melee, w)))]]
+	if rng.random() < h["spells"]:
+		_learn(ours, [rng.choice(["blind", "forgetfulness"])], w)
+	scenario["_about"] = f"hard enemy_shooters: {len(shooters)} shooter stacks vs our {flyer} flyers, armies {army_value(ours['army'], w):.0f} vs {army_value(theirs['army'], w):.0f}"
+	return scenario
+
+
+def hard_hopeless(rng, cfg, w):
+	"""Two heroes, the enemy several times stronger, ours worth saving (hero_level: from level 6 its levels alone are
+	worth over 4 rehires): won (the least lost) by retreating early, which keeps the hero; fighting on loses it with
+	the army (cfg hard.hopeless). A hero worth less than its rehire keeps nothing by retreating (reward.py: max(0, hero
+	+ mana - rehire)), and fighting on still kills, so with the phases' own heroes (levels 1-4 in week 1) the kind
+	taught both ways (2026-10-28 review): ours is drawn again, as the phases' heroes are, at hero_level."""
+	h = cfg["hard"]["hopeless"]
+	scenario = sample_type(rng, cfg, w, "hero_vs_hero")
+	ours, theirs = scenario["sides"]
+	phase = dict(rng.choice(list(cfg["phase"].values())), hero_level=h["hero_level"])
+	ours.update(draw_hero(rng, ours["faction"], phase, cfg, w))
+	factor = rng.uniform(h["enemy_factor"]["min"], h["enemy_factor"]["max"])
+	theirs["army"] = [[k, max(1, round(n * factor))] for k, n in theirs["army"]]
+	scenario["_about"] = f"hard hopeless: the enemy x{factor:.1f}, armies {army_value(ours['army'], w):.0f} vs {army_value(theirs['army'], w):.0f}"
+	return scenario
+
+
+HARD_KINDS = {
+	"one_big_stack": hard_one_big_stack,
+	"shooter_guard": hard_shooter_guard,
+	"blind_the_big_stack": hard_blind_the_big_stack,
+	"berserk": hard_berserk,
+	"enemy_shooters": hard_enemy_shooters,
+	"hopeless": hard_hopeless,
+}
 
 
 def main():

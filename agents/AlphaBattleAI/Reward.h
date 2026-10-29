@@ -9,6 +9,7 @@
 /// The terminal reward of a battle for each side, as training computes it (battle_model/reward.py: zero-sum, from each
 /// side's assets; battle_model/data.py summarize() for which numbers go in), for the search's terminal states.
 /// Plain numbers only, so tools/SearchSelfTest.cpp can check it against Python (tests/test_search.py).
+/// War machines are not counted here (summarize counts them as part of their hero since 2026-10-28; the search is off).
 namespace AlphaReward
 {
 using namespace AlphaSchema;

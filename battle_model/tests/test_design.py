@@ -266,3 +266,17 @@ def test_full_shot_needs_a_target_in_full_range():
 	assert not full_shot(x, 0)
 	x["u_hex"][0, 1] = 8  # 7 hexes
 	assert full_shot(x, 0)
+
+
+def test_a_heros_cast_at_an_enemy_counts_as_often_as_it_is_not_reflected():
+	"""The engine's prediction counts resistance already (castValue, per affected unit); torch counts a hero's cast at
+	an enemy unit as often as its Magic Mirror lets it through: the attacker's bolt at the Devils (+2000) with a 20%
+	mirror counts (0.8 - 0.2) x 2000 (a reflected bolt costs about what it would gain). At our own unit: unchanged."""
+	x = lightning_battle(0)
+	net = lambda x: F.spell_features(F.read_battle(x, BattleModel().tables()))["spell_unit"][0, LIGHTNING_BOLT, :, F.SPELL_FEATURES.index("net_value")]  # noqa: E731
+	full = net(x)
+	x["u_magic_resistance"][0, 1] = 50  # (in the engine's price, not here)
+	assert torch.equal(net(x), full)
+	x["u_magic_mirror"][0, 1] = 20
+	mirrored = net(x)
+	assert torch.isclose(mirrored[1], full[1] * 0.6) and torch.isclose(mirrored[0], full[0])

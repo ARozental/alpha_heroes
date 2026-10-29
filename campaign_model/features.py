@@ -1,0 +1,569 @@
+"""The campaign model's hand-made features: functions of the raw inputs, the game's tables (prices, creature stats,
+experience per level) and, where a function says so, a few learnable prior parameters passed in. model.CustomFeatures
+calls them in order in make_custom_features; each is small and named for what it computes, and returns plain units
+(gold, tiles, days, log strength) that the model maps to bounded inputs.
+
+Values are in gold, Φ's (empire.py) and the labels' unit, so they add up: what a tile offers is the object we may
+take there, plus the expected return of the fight that stepping there starts, plus the worth of the land it reveals.
+value_logit maps gold to a logit for the fixed priors. The game's rules used here are VCMI's: a battle's experience
+is the hit points of the creatures killed, +500 for beating a hero or taking a town (BattleResultProcessor.cpp).
+"""
+import math
+
+import torch
+from torch.nn import functional as F
+
+from battle_model.features import scales, signed_scales
+from battle_model.layers import vocab_index
+
+from . import constants as c
+from .schema import HEADS, SPECS
+
+HO, W, G, L, TG = c.OWN_HEROES, c.WINDOW, c.MAP_GRID, c.MAP_LEVELS, c.TRAVEL_GRID
+# A typical count for each of VCMI's quantity ids (CCreature::CreatureQuantityId: 0 unknown, few 1-4, several 5-9,
+# pack 10-19, lots 20-49, horde 50-99, throng 100-249, swarm 250-499, zounds 500-999, legion 1000+)
+QUANTITY_COUNTS = (15, 3, 7, 15, 35, 75, 175, 375, 750, 1500)
+OBJ_HERO, OBJ_TOWN, OBJ_MONSTER = 34, 98, 54  # Obj ids
+DANGER_RANGE = 15.0  # tiles: an enemy hero this far reaches a tile with even odds (about a day's walk)
+SIGHT_RADIUS = 5  # tiles a hero reveals around it (VCMI's scouting radius without the Scouting skill)
+HERO_XP = TOWN_XP = 500.0  # experience for beating a hero, for taking a town (VCMI)
+# value_logit: OBJECT_BASE x tanh(gold / BASE_GOLD) + sign x log(1 + |gold| / OBJECT_SCALE): about +2 for anything worth
+# taking (a +-0.5 logit nudge does nothing among ~300 legal tiles), Nullkiller2's spread on a log scale, 4.0 at 10,000
+OBJECT_BASE, BASE_GOLD, OBJECT_SCALE = 2.0, 300.0, 1565.0
+MOVEMENT_PER_TILE = 100.0  # movement points a step on normal terrain costs (diagonals more, roads less)
+
+
+# ---- small helpers ----
+
+def bit(flags, value):
+	return torch.remainder(torch.div(flags, value, rounding_mode="floor"), 2) == 1
+
+
+def log_add(a, b):
+	"""log(e^a + e^b) (torch.logaddexp, which ONNX opset 17 lacks)."""
+	return torch.maximum(a, b) + torch.log1p(torch.exp(-(a - b).abs()))
+
+
+def one_hot(index, n):
+	return (index.unsqueeze(-1) == torch.arange(n, device=index.device)).float()
+
+
+def bucket(kind, value, subtype):
+	"""A hashed embedding row for (kind, value, subtype) id triples."""
+	return torch.remainder((kind + 1) * 7919 + (value + 1) * 131 + subtype.clamp(min=0) * 7, c.SUBTYPE_BUCKETS)
+
+
+def bounded(raw, low, high, start, step):
+	"""A learnable prior parameter kept within [low, high]: start when raw is 0 (where weight decay pulls it back),
+	moving `step` times faster than a plain weight (model.CORRECTION_STEP), smooth everywhere."""
+	offset = math.log((start - low) / (high - start))
+	return low + (high - low) * torch.sigmoid(step * raw + offset)
+
+
+def value_logit(gold):
+	"""A value in gold as a prior logit: ~+2 for anything worth having, +2.2 for 550 gold, +3.3 for 4,000, +4.0 for
+	10,000, the same below 0 for losses, and smooth through 0 (no jump between a small gain and a small loss)."""
+	return OBJECT_BASE * torch.tanh(gold / BASE_GOLD) + torch.sign(gold) * torch.log1p(gold.abs() / OBJECT_SCALE)
+
+
+def offer(logits, legal):
+	"""What a table offers: its best legal entry's prior logit, 0 when nothing is worth anything. logits, legal
+	[B, ...] -> [B]. The best, not a sum: early in a game hundreds of fogged areas are each mildly worth exploring, and
+	a soft sum over them (log 1 + sum e^p - 1) came to ~6 logits from their number alone (it held END back for good)."""
+	return torch.relu(logits).masked_fill(~legal, 0.0).flatten(1).amax(dim=1)
+
+
+def relative_position(delta):
+	"""[..., 8] features of offsets [..., 3] in tiles (x, y, level): direction at 8 and 32 tiles, Chebyshev distance at
+	8, 32 and 128 tiles, the same level. Every distance in tiles: the same on any map size."""
+	distance = torch.maximum(delta[..., 0].abs(), delta[..., 1].abs())
+	return torch.cat(
+		[signed_scales(delta[..., 0], (8, 32)), signed_scales(delta[..., 1], (8, 32)), scales(distance, (8, 32, 128)), (delta[..., 2] == 0).float().unsqueeze(-1)],
+		dim=-1,
+	)
+
+
+# ---- armies and heroes ----
+
+def typical_counts(counts, detailed, t):
+	"""Exact counts, or the typical count of a quantity id where not detailed (what a human sees)."""
+	typical = t.quantity_counts[counts.clamp(0, len(QUANTITY_COUNTS) - 1)]
+	return torch.where(detailed, counts.clamp(min=0).float(), typical)
+
+
+def army(creatures, counts, detailed, t):
+	"""An army's creatures as seen [..., A]: (counts, its strength (count x fight value, NK2's getArmyStrength), its
+	worth in gold (count x (cost + u), empire.py's), the experience for killing it (count x hit points))."""
+	present = creatures >= 0
+	index = vocab_index(creatures, c.CREATURE_VOCAB)
+	count = typical_counts(counts, detailed.unsqueeze(-1).expand_as(counts), t) * present
+	power = (count * t.fight_value[index]).sum(dim=-1)
+	gold = (count * (t.creature_cost[index] + t.creature_unit[index])).sum(dim=-1)
+	health = (count * t.creature_health[index]).sum(dim=-1)
+	return count, power, gold, health
+
+
+def hero_strength(primary, power):
+	"""log of a hero's army strength x fighting strength sqrt((1 + 0.05 attack)(1 + 0.05 defense)) (NK2's
+	getTotalStrength); for a town's garrison, power alone (primary 0)."""
+	p = primary.clamp(min=0).float()
+	return torch.log1p(power) + 0.5 * torch.log((1 + 0.05 * p[..., 0]) * (1 + 0.05 * p[..., 1]))
+
+
+def fractional_level(experience, table):
+	"""A hero's level with the way to the next (game_values.fractional_level): 1500 experience -> 2.5."""
+	top = table.shape[0]
+	level = (experience.unsqueeze(-1) >= table).sum(dim=-1).clamp(min=1)  # table[0] = 0: level 1 at least
+	low = table[(level - 1).clamp(max=top - 1)]
+	high = table[level.clamp(max=top - 1)]
+	way = torch.where(level < top, (experience - low) / (high - low).clamp(min=1), torch.zeros_like(experience))
+	return level.float() + way.clamp(0, 1)
+
+
+def level_value(level):
+	"""What a hero's levels are worth (game_values.hero_level_value): levels 1-3 free, then 2500 x (L - 3)^1.3."""
+	return 2500.0 * torch.relu(level - 3.0) ** 1.3
+
+
+def experience_value(experience, gained, t):
+	"""What gaining experience is worth to a hero in Φ: the value of the levels it reaches."""
+	return level_value(fractional_level(experience + gained, t.level_experience)) - level_value(fractional_level(experience, t.level_experience))
+
+
+def hero_worth(x, t):
+	"""Each hero's own worth in Φ [B, H]: its levels and its artifacts (ours; others: none seen)."""
+	artifacts = torch.cat([x["h_artifacts"], x["h_backpack"]], dim=-1)
+	carried = (t.artifact_price[vocab_index(artifacts, c.ARTIFACT_VOCAB)] * (artifacts >= 0)).sum(dim=-1)
+	return level_value(fractional_level(x["h_exp"].clamp(min=0).float(), t.level_experience)) + carried
+
+
+# ---- our empire: Φ ----
+
+PHI_PARTS = ("resources", "buildings", "income", "army", "for_hire", "heroes", "artifacts", "mana", "hero_penalty", "explored")
+# Φ as the value head reads it: x / (x + c) at these rival values (gold), the 2-player share's own form, so its gradient
+# is the share's against a rival worth c. joint1's empires: ~40k on day 1, 88k-272k at a game's end, NK2's ~400k
+PHI_SCALES = (3e4, 1e5, 3e5, 1e6)
+
+
+def empire_value(x, t):
+	"""Our empire's value Φ in gold by empire.py's rules from the inputs: its parts [B, PHI_PARTS] and total [B], the
+	ledger's to the gold (with the armies in our mines' garrisons and the creatures for hire in our dwellings outside
+	towns: without them the value audit saw Φ fall when a hero left troops in a mine, which the ledger does not)."""
+	own_heroes = (x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)).float()
+	own_towns = (x["t_present"][:, : c.OWN_TOWNS] & (x["t_owner"][:, : c.OWN_TOWNS] == c.OWNER_SELF)).float()
+	exact = lambda creatures: torch.ones_like(creatures[..., 0], dtype=torch.bool)  # noqa: E731 (ours: exact counts)
+	_, _, hero_army, _ = army(x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO], exact(x["h_army_creature"][:, :HO]), t)
+	_, _, garrison, _ = army(x["t_garrison_creature"][:, : c.OWN_TOWNS], x["t_garrison_count"][:, : c.OWN_TOWNS], exact(x["t_garrison_creature"][:, : c.OWN_TOWNS]), t)
+	_, _, owned, _ = army(x["g_owned_creature"], x["g_owned_count"], exact(x["g_owned_creature"]), t)
+	dwelling = x["g_dwelling_creature"]
+	dwelling_hire = (x["g_dwelling_count"].clamp(min=0).float() * t.creature_unit[vocab_index(dwelling, c.CREATURE_VOCAB)] * (dwelling >= 0)).sum(dim=-1)
+	faction = vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)
+	available = x["t_available_creature"][:, : c.OWN_TOWNS]
+	experience = x["h_exp"][:, :HO].clamp(min=0).float()
+	artifacts = torch.cat([x["h_artifacts"][:, :HO], x["h_backpack"][:, :HO]], dim=-1)
+	usable_mana = torch.minimum(x["h_mana"][:, :HO].clamp(min=0), 3 * x["h_spell_cost"][:, :HO].clamp(min=0)).float()
+	parts = torch.stack(
+		[
+			(x["g_resources"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
+			((x["t_built"][:, : c.OWN_TOWNS].float() * t.building_value[faction]).sum(dim=-1) * own_towns).sum(dim=-1),
+			t.income_days * (x["g_object_income"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
+			(hero_army * own_heroes).sum(dim=-1) + (garrison * own_towns).sum(dim=-1) + owned,
+			((x["t_available"][:, : c.OWN_TOWNS].clamp(min=0).float() * t.creature_unit[vocab_index(available, c.CREATURE_VOCAB)] * (available >= 0)).sum(dim=-1) * own_towns).sum(dim=-1) + dwelling_hire,
+			(level_value(fractional_level(experience, t.level_experience)) * own_heroes).sum(dim=-1),
+			((t.artifact_price[vocab_index(artifacts, c.ARTIFACT_VOCAB)] * (artifacts >= 0)).sum(dim=-1) * own_heroes).sum(dim=-1),
+			(2.0 * x["h_primary"][:, :HO, 2].clamp(min=0).float() * usable_mana * own_heroes).sum(dim=-1),  # game_values.capped_mana_value
+			-t.hero_penalty * own_heroes.sum(dim=-1) ** 2,
+			t.explored_tile * x["g_explored"].clamp(min=0).float(),
+		],
+		dim=-1,
+	)
+	return parts, parts.sum(dim=-1)
+
+
+def phi_features(parts, total):
+	"""Φ as the learned layers see it, every feature bounded: x / (x + c) at PHI_SCALES (0..1) and each part's share of
+	the parts' absolute sum (-1..1). Φ comes from the inputs alone: no gradient flows through it, and no weight ever
+	sees its size."""
+	return torch.cat([scales(total, PHI_SCALES), parts / (parts.abs().sum(dim=-1, keepdim=True) + 1000)], dim=-1)
+
+
+# ---- enemies: danger and fights ----
+
+def enemies(x, hero_strength):
+	"""The other players' heroes we see: positions [B, E, 3], log strength [B, E], present [B, E]."""
+	return x["h_pos"][:, HO:], hero_strength[:, HO:], x["h_present"][:, HO:] & (x["h_owner"][:, HO:] != c.OWNER_SELF)
+
+
+def reach(foes, x_pos, y_pos, z_pos):
+	"""How near each enemy hero is to positions [N, ...] (x, y, level), foes (enemies()) per N: [N, ..., E] reach (1 at
+	its tile, 1/2 at DANGER_RANGE tiles, ~0 beyond twice that or on another level) and its log strength [N, 1.., E]."""
+	pos, strength, present = foes
+	shape = (x_pos.shape[0],) + (1,) * (x_pos.dim() - 1) + (present.shape[1],)
+	ex, ey, ez = (pos[..., i].reshape(shape) for i in range(3))
+	distance = torch.maximum((x_pos.unsqueeze(-1) - ex).abs(), (y_pos.unsqueeze(-1) - ey).abs()).float()
+	near = torch.sigmoid(4 * (1 - distance / DANGER_RANGE)) * (z_pos.unsqueeze(-1) == ez) * present.reshape(shape)
+	return near, strength.reshape(shape)
+
+
+def town_danger(x, hero_strength, town_strength):
+	"""Our towns' danger [B, OWN_TOWNS]: the most an enemy hero we see threatens one (its reach x P(it beats the
+	garrison and the heroes there))."""
+	def defender(index):  # [B, TO]: the log strength of a hero there, very low if none
+		found = torch.gather(hero_strength, 1, index.clamp(min=0))
+		return torch.where(index >= 0, found, torch.full_like(found, -30.0))
+
+	to = c.OWN_TOWNS
+	defence = log_add(log_add(town_strength[:, :to], defender(x["t_visiting"][:, :to])), defender(x["t_garrison_hero"][:, :to]))
+	pos = x["t_pos"][:, :to]
+	near, theirs = reach(enemies(x, hero_strength), pos[..., 0], pos[..., 1], pos[..., 2])  # [B, TO, E]
+	return (near * torch.sigmoid(2 * (theirs - defence.unsqueeze(-1)))).amax(dim=-1) * (x["t_present"][:, :to] & (x["t_owner"][:, :to] == c.OWNER_SELF))
+
+
+def expected_loss(ratio, has_enemy):
+	"""The share of the army a won fight costs: NK2's (their strength / ours)^2, at most all of it."""
+	return has_enemy * torch.exp(-2 * torch.relu(ratio))
+
+
+def win_chance(ratio, sharpness):
+	"""P(we win) from the log-ratio of the strengths (ours / theirs): 1/2 when even."""
+	return torch.sigmoid(sharpness * ratio)
+
+
+def fight_return(win, loss, our_army, our_hero, gain):
+	"""A fight's expected return in gold: P(win) x (what winning gains - the army it costs) - P(lose) x (the whole
+	army and the hero's own worth: a lost battle takes both)."""
+	return win * (gain - loss * our_army) - (1 - win) * (our_army + our_hero)
+
+
+def worst_guard(values, monster, guarded):
+	"""For each tile in a wandering monster's zone of control (guarded), the worst value among the monsters next to it
+	(stepping there starts their fight); 0 elsewhere. values, monster, guarded [K, W, W]."""
+	big = 1e9
+	worst = -F.max_pool2d(-torch.where(monster, values, torch.full_like(values, big)).unsqueeze(1), 3, stride=1, padding=1).squeeze(1)
+	return torch.where(guarded & (worst < big / 2), worst, torch.zeros_like(worst))
+
+
+# ---- exploration and the map's blocks ----
+
+def unexplored_around(flags, radius=SIGHT_RADIUS):
+	"""The share of the map's tiles within `radius` of each window tile that we have not revealed: what stepping
+	there would show. flags [K, W, W] -> [K, W, W]."""
+	unrevealed = (bit(flags, c.TILE_ON_MAP) & ~bit(flags, c.TILE_REVEALED)).float().unsqueeze(1)
+	return F.avg_pool2d(unrevealed, 2 * radius + 1, stride=1, padding=radius, count_include_pad=False).squeeze(1)
+
+
+def block_side(x):
+	"""Tiles a side of the map encoder's blocks [B]: ceil(max(width, height) / MAP_GRID)."""
+	size = x["g_map"].clamp(min=1)
+	return torch.div(torch.maximum(size[:, 0], size[:, 1]) + G - 1, G, rounding_mode="floor").clamp(min=1)
+
+
+def centres(x, per_side):
+	"""The centres in tiles [B, L * per_side^2, 3] of the map cut into per_side x per_side blocks a level."""
+	b = x["g_day"].shape[0]
+	span = (block_side(x) * (G // per_side)).float()
+	middle = torch.arange(per_side, device=span.device).float() + 0.5
+	cy, cx = torch.meshgrid(middle, middle, indexing="ij")
+	levels = torch.arange(L, device=span.device).float()
+	return torch.stack(
+		[
+			cx.reshape(1, 1, -1).expand(b, L, -1) * span[:, None, None],
+			cy.reshape(1, 1, -1).expand(b, L, -1) * span[:, None, None],
+			levels.reshape(1, L, 1).expand(b, L, per_side * per_side),
+		],
+		dim=-1,
+	).reshape(b, L * per_side * per_side, 3)
+
+
+# Each Obj id's class (the last row: an id past the vocab), and which classes have an OUR_ form (the next class)
+CLASS_OF = torch.tensor([int(c.object_class(i)) for i in range(c.OBJECT_VOCAB)] + [int(c.ObjectClass.OTHER)])
+OWNED = torch.tensor([kind in c.OWNED_CLASSES for kind in c.ObjectClass])
+
+
+def object_classes(x):
+	"""Each listed object's ObjectClass [B, MO] (-1 none): its type's, the OUR_ form of an owned class when it is ours,
+	VISITED once we visited it."""
+	obj = x["m_object"]
+	kind = CLASS_OF.to(obj.device)[vocab_index(obj, c.OBJECT_VOCAB)]
+	kind = torch.where(OWNED.to(obj.device)[kind] & (x["m_owner"] == c.OWNER_SELF), kind + 1, kind)
+	kind = torch.where(bit(x["m_flags"], c.OBJECT_VISITED_BY_PLAYER), torch.full_like(kind, int(c.ObjectClass.VISITED)), kind)
+	return torch.where(obj >= 0, kind, torch.full_like(kind, -1))
+
+
+def object_counts(x):
+	"""Each map block's count of the objects we see, by class [B, L, G, G, N_OBJECT_CLASSES], from the list of all of
+	them (the engine counted them until 2026-10-28; what matters is the model's to find)."""
+	b = x["m_object"].shape[0]
+	kind = object_classes(x)
+	side = block_side(x)
+	pos = x["m_pos"].clamp(min=0)
+	row = torch.div(pos[..., 1], side[:, None], rounding_mode="floor").clamp(max=G - 1)
+	column = torch.div(pos[..., 0], side[:, None], rounding_mode="floor").clamp(max=G - 1)
+	batch = torch.arange(b, device=pos.device)[:, None]
+	cells = b * L * G * G * c.N_OBJECT_CLASSES
+	index = ((((batch * L + pos[..., 2].clamp(max=L - 1)) * G + row) * G + column) * c.N_OBJECT_CLASSES + kind.clamp(min=0))
+	index = torch.where((kind >= 0) & (pos[..., 2] < L), index, torch.full_like(index, cells)).reshape(-1)
+	counts = torch.zeros(cells + 1, device=pos.device).index_add(0, index, torch.ones(index.shape, device=pos.device))
+	return counts[:cells].reshape(b, L, G, G, c.N_OBJECT_CLASSES)
+
+
+def area_contents(x, counts):
+	"""Each TRAVEL area's object counts by class [B, L * TG^2, N_OBJECT_CLASSES] (counts: object_counts) and the share
+	of its tiles we have not revealed [B, L * TG^2]: the 2 x 2 map blocks it is made of."""
+	b = x["g_day"].shape[0]
+	merge = G // TG
+	objects = counts.reshape(b * L, G, G, c.N_OBJECT_CLASSES).permute(0, 3, 1, 2)
+	objects = F.avg_pool2d(objects, merge) * merge * merge
+	tiles = x["g_tiles"].float().reshape(b * L, G, G, c.N_GRID_COUNTS).permute(0, 3, 1, 2)
+	tiles = F.avg_pool2d(tiles, merge) * merge * merge
+	on_map, revealed = tiles[:, c.GridCount.ON_MAP], tiles[:, c.GridCount.REVEALED]
+	hidden = (on_map - revealed) / on_map.clamp(min=1)
+	return objects.permute(0, 2, 3, 1).reshape(b, L * TG * TG, c.N_OBJECT_CLASSES), hidden.reshape(b, L * TG * TG)
+
+
+def movement_discount(days, exponent):
+	"""NK2's discount of a target's value by the days to reach it (PriorityEvaluator::evaluateMovement): 1 / (0.75 +
+	days^exponent), its exponent 1.3."""
+	return 1.0 / (0.75 + days.clamp(min=0) ** exponent)
+
+
+# ---- our previous decision ----
+
+# What each action type's table's first axis is (our heroes and towns are 8 each: the shapes cannot tell), and the shapes
+A = c.ActionType
+FIRST_AXIS = {A.MOVE: "hero", A.CAST: "hero", A.BUY: "hero", A.DISMISS: "hero", A.TRAVEL: "hero", A.BUILD: "town", A.RECRUIT: "town", A.HIRE: "town", A.ARMY: "holder", A.UPGRADE: "holder"}
+TABLES = {int(t): SPECS[out].shape for t, (out, _) in HEADS.items() if t in FIRST_AXIS}
+
+
+def last_actors(x):
+	"""What our previous turn decision today was about (g_last_*, the model's own choice, echoed by the engine): which
+	of our heroes [B, HO] and towns [B, TO] (its table's first axis; ARMY's destination holder too), 0/1."""
+	kind, index = x["g_last_type"], x["g_last_index"]
+	heroes = torch.zeros(kind.shape[0], c.OWN_HEROES, device=kind.device)
+	towns = torch.zeros(kind.shape[0], c.OWN_TOWNS, device=kind.device)
+	for t, shape in TABLES.items():
+		chosen = ((kind == t) & (index >= 0)).float().unsqueeze(-1)
+		axes = [torch.div(index.clamp(min=0), math.prod(shape[1:]), rounding_mode="floor")]
+		if t == int(A.ARMY):  # (holder, slot, holder, amount): where the troops went too
+			axes.append(torch.remainder(torch.div(index.clamp(min=0), shape[3], rounding_mode="floor"), shape[2]))
+		for axis in axes:
+			one = F.one_hot(axis.clamp(max=shape[0] - 1), shape[0]).float() * chosen
+			if FIRST_AXIS[A(t)] == "hero":
+				heroes = heroes + one
+			elif FIRST_AXIS[A(t)] == "town":
+				towns = towns + one
+			else:  # holders: our heroes, then our towns, then the other army
+				heroes, towns = heroes + one[:, : c.OWN_HEROES], towns + one[:, c.OWN_HEROES : c.OWN_HEROES + c.OWN_TOWNS]
+	return heroes.clamp(max=1), towns.clamp(max=1)
+
+
+# ---- Nullkiller2's brain, as features ----
+# (2026-10-28, the user: "consume all the NK2 brain as ops that create features that can be easily used in the graph and
+# give sane gradients".) Each is Nullkiller2's own computation (VCMI's AI/Nullkiller2) from the inputs alone, scaled to
+# a few units; the model reads them through weights that start at 0, and where Nullkiller2's habit is a plain rule, as a
+# prior with a learnable bounded weight (CustomFeatures)
+
+MAX_GOLD_PRESSURE = 0.3  # nk2ai-settings.json maxGoldPressure: over it Nullkiller2 is short of gold
+CITADEL, CASTLE, TOWN_HALL, CITY_HALL, CAPITOL = 8, 9, 11, 12, 13  # building ids
+MAGE_GUILD_LEVELS = 5  # building ids 0..4: the mage guild's levels 1..5
+SPELLBOOK = 0  # artifact id
+SKILLS = (  # VCMI's secondary skill ids, in order (vocab secondary_skills)
+	"pathfinding", "archery", "logistics", "scouting", "diplomacy", "navigation", "leadership", "wisdom", "mysticism", "luck", "ballistics", "eagleEye",
+	"necromancy", "estates", "fireMagic", "airMagic", "waterMagic", "earthMagic", "scholar", "tactics", "artillery", "learning", "offence", "armorer",
+	"intelligence", "sorcery", "resistance", "firstAid",
+)
+# Nullkiller2's score of each skill for a main hero and for a scout (HeroManager's SecondarySkillScoreMap); the rest 0
+MAIN_SKILLS = {
+	"diplomacy": 2, "logistics": 2, "earthMagic": 2, "armorer": 2, "offence": 2, "airMagic": 1, "wisdom": 1, "leadership": 1, "intelligence": 1,
+	"resistance": 1, "mysticism": -1, "sorcery": -1, "estates": -1, "firstAid": -1, "learning": -1, "scholar": -1, "eagleEye": -1, "navigation": -1,
+}
+SCOUT_SKILLS = {"logistics": 2, "estates": 2, "pathfinding": 1, "scholar": 1}
+SCHOOLS = ("fireMagic", "airMagic", "waterMagic", "earthMagic")
+
+
+def skill_table(scores):
+	return torch.tensor([float(scores.get(name, 0)) for name in SKILLS])
+
+
+MAIN_SKILL_SCORE, SCOUT_SKILL_SCORE = skill_table(MAIN_SKILLS), skill_table(SCOUT_SKILLS)
+
+
+def own_towns(x):
+	return x["t_present"][:, : c.OWN_TOWNS] & (x["t_owner"][:, : c.OWN_TOWNS] == c.OWNER_SELF)
+
+
+def hero_roles(x, hero_strength):
+	"""Nullkiller2's main heroes [B, HO] (HeroManager::update): ours by fighting strength, the first max(towns, 1) of
+	them (a bigger map adds some after day 21), at most twice the towns; the rest are scouts."""
+	ours = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
+	towns = own_towns(x).sum(dim=1)
+	bigger = (x["g_day"] > 21).long() * torch.div(x["g_map"][:, 0], 108, rounding_mode="floor")
+	mains = torch.minimum((towns + bigger).clamp(min=1), 2 * towns)
+	strength = torch.where(ours, hero_strength[:, :HO], torch.full_like(hero_strength[:, :HO], -1e9))
+	index = torch.arange(HO, device=strength.device)
+	stronger = (strength[:, None, :] > strength[:, :, None]) | ((strength[:, None, :] == strength[:, :, None]) & (index[None, None, :] < index[None, :, None]))
+	rank = (stronger & ours[:, None, :]).sum(dim=-1)
+	return ours & (rank < mains[:, None])
+
+
+def skill_scores(x, main, t):
+	"""Nullkiller2's score of each option of a level-up [B, O] (SecondarySkillEvaluator): its table's (a main hero's or a
+	scout's), +1.5 for a new skill worth 2 (or 1, when the hero has at most one upgrade left), and for a main hero +1.5
+	for Wisdom past level 10 without it, +1 for a first school of magic; 0 for options that are no skill."""
+	b = x["g_day"].shape[0]
+	rows = torch.arange(b, device=main.device)
+	hero = x["d_hero"].clamp(0, HO - 1)
+	known = x["h_skills"][rows, hero]  # [B, N_SECONDARY_SKILLS], 0..3
+	is_main = (main[rows, hero] & (x["d_hero"] >= 0)).unsqueeze(-1)
+	skill = x["o_type"].clamp(0, c.N_SECONDARY_SKILLS - 1)
+	is_skill = (x["o_kind"] == c.OptionKind.SKILL) & (x["o_type"] >= 0)
+	score = torch.where(is_main, MAIN_SKILL_SCORE.to(main.device)[skill], SCOUT_SKILL_SCORE.to(main.device)[skill])
+	new = torch.gather(known, 1, skill) == 0
+	upgrades_left = ((3 - known) * (known > 0)).sum(dim=-1, keepdim=True)
+	score = score + 1.5 * (new & ((score >= 2) | ((score >= 1) & (upgrades_left <= 1)))).float()
+	level = torch.floor(fractional_level(x["h_exp"][rows, hero].clamp(min=0).float(), t.level_experience)).unsqueeze(-1)
+	wisdom = SKILLS.index("wisdom")
+	score = score + 1.5 * (is_main & (skill == wisdom) & (level > 10) & (known[:, wisdom : wisdom + 1] == 0)).float()
+	schools = torch.tensor([SKILLS.index(name) for name in SCHOOLS], device=main.device)
+	no_magic = ~(known[:, schools] > 0).any(dim=-1, keepdim=True)
+	score = score + (is_main & (skill[..., None] == schools).any(dim=-1) & no_magic).float()
+	return score * is_skill
+
+
+def gold_pressure(x, t):
+	"""Nullkiller2's gold pressure [B] (BuildAnalyzer::calculateGoldPressure): what its plans cost, the army its towns
+	offer and each town's next hall, over 1 + 2 x the gold it has + a week's gold income."""
+	own = own_towns(x)
+	creature = x["t_available_creature"][:, : c.OWN_TOWNS]
+	army = ((x["t_available"][:, : c.OWN_TOWNS].clamp(min=0).float() * t.creature_cost[vocab_index(creature, c.CREATURE_VOCAB)] * (creature >= 0)).sum(dim=-1) * own).sum(dim=-1)
+	built, cost = x["t_built"][:, : c.OWN_TOWNS], t.building_cost[vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)]
+	hall = torch.zeros_like(army.unsqueeze(-1).expand(-1, c.OWN_TOWNS))
+	for building in (CAPITOL, CITY_HALL, TOWN_HALL):  # the first hall not built (the cheapest last: it overrides)
+		hall = torch.where(built[..., building], hall, cost[..., building])
+	development = (hall * own).sum(dim=-1)
+	gold, income = x["g_resources"][:, 6].clamp(min=0).float(), x["g_income"][:, 6].clamp(min=0).float()
+	return (army + development) / (1 + 2 * gold + 7 * income)
+
+
+def recruit_pause(x, pressure, town_danger):
+	"""Nullkiller2 buys no army while short of gold if a town of ours has no City Hall yet and nothing threatens it
+	(BuyArmyBehavior) [B], 0..1."""
+	waiting = own_towns(x) & ~x["t_built"][:, : c.OWN_TOWNS, CITY_HALL] & (town_danger < 0.5)
+	return torch.sigmoid(10 * (pressure - MAX_GOLD_PRESSURE)) * waiting.any(dim=1).float()
+
+
+def build_rewards(x, t):
+	"""Nullkiller2's view of each building of our towns [B, TO, N_BUILDINGS, 4] (BuildThis), scaled: half a week of the
+	daily income it adds (gold); 1.5 x a week's growth of its dwelling's creature in strength (an upgraded dwelling:
+	what the upgrade adds; a citadel or castle: half the town's weekly army); its cost (gold); a mage guild's level."""
+	faction = vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)
+	strength = lambda creature: t.fight_value[vocab_index(creature, c.CREATURE_VOCAB)] * (creature >= 0)  # noqa: E731
+	creature, base = t.dwelling_creature[faction], t.dwelling_base[faction]
+	growth = t.creature_growth[vocab_index(creature, c.CREATURE_VOCAB)]
+	army = torch.where(base >= 0, growth * (strength(creature) - strength(base)), 1.5 * growth * strength(creature))
+	town_army = (x["t_growth"][:, : c.OWN_TOWNS].clamp(min=0).float() * strength(x["t_available_creature"][:, : c.OWN_TOWNS])).sum(dim=-1)
+	buildings = torch.arange(c.N_BUILDINGS, device=army.device)
+	army = army + ((buildings == CITADEL) | (buildings == CASTLE)).float() * town_army.unsqueeze(-1) / 2
+	mage = torch.where(buildings < MAGE_GUILD_LEVELS, (buildings + 1).float() / MAGE_GUILD_LEVELS, torch.zeros_like(buildings, dtype=army.dtype))
+	return torch.stack(
+		[torch.log1p(3.5 * t.building_income[faction].clamp(min=0) / 1000), torch.log1p(army.clamp(min=0) / 1000), torch.log1p(t.building_cost[faction] / 1000), mage.expand_as(army)], dim=-1
+	)
+
+
+def upgrade_gains(x, t):
+	"""What upgrading each stack of ours adds [B, HD, A, 2] (Nullkiller2's makePossibleUpgrades upgrades every stack it
+	can afford, to the upgrade worth the most), scaled: its count x the strength the upgrade adds; what it costs."""
+	creature = torch.cat([x["h_army_creature"][:, :HO], x["t_garrison_creature"][:, : c.OWN_TOWNS], x["x_creature"].unsqueeze(1)], dim=1)
+	count = torch.cat([x["h_army_count"][:, :HO], x["t_garrison_count"][:, : c.OWN_TOWNS], x["x_count"].unsqueeze(1)], dim=1).clamp(min=0).float()
+	now = vocab_index(creature, c.CREATURE_VOCAB)
+	up = t.creature_upgrade[now]
+	better = (creature >= 0) & (up >= 0)
+	after = vocab_index(up, c.CREATURE_VOCAB)
+	gain = count * (t.fight_value[after] - t.fight_value[now]) * better
+	cost = count * (t.creature_cost[after] - t.creature_cost[now]).clamp(min=0) * better
+	return torch.stack([torch.log1p(gain.clamp(min=0) / 1000), torch.log1p(cost / 1000)], dim=-1)
+
+
+def spellbook_wanted(x, main):
+	"""[B, HO] Nullkiller2 buys a spellbook for a main hero who has none (in a town with a mage guild, gold permitting:
+	the BUY mask's)."""
+	return main & ~(x["h_artifacts"][:, :HO] == SPELLBOOK).any(dim=-1)
+
+
+# ---- Nullkiller2's plans across days, as weak pulls ----
+# (2026-10-28, the user: "weak features, also make it easy to ignore them".) Each is a value in gold; the model takes it
+# as a feature through weights that start at 0, and as a prior of a bounded weight that starts at half a logit and can
+# fall to 0 (CustomFeatures.pull_weights)
+
+PULL_SCALE = 5000.0  # gold: a pull's prior is its weight x tanh(gold / PULL_SCALE)
+
+
+def reinforcements(x, t, town_gold):
+	"""What each town of ours can give a hero that comes [B, TO] (gold): its garrison, and as much of its army for hire
+	as our gold buys (Nullkiller2's BuyArmy for a main hero: howManyReinforcementsCanGet)."""
+	creature = x["t_available_creature"][:, : c.OWN_TOWNS]
+	for_hire = (x["t_available"][:, : c.OWN_TOWNS].clamp(min=0).float() * t.creature_cost[vocab_index(creature, c.CREATURE_VOCAB)] * (creature >= 0)).sum(dim=-1)
+	gold = x["g_resources"][:, 6].clamp(min=0).float()
+	return (town_gold[:, : c.OWN_TOWNS] + torch.minimum(for_hire, gold.unsqueeze(-1))) * own_towns(x)
+
+
+def town_stakes(x, t, town_gold):
+	"""What each town of ours is worth to us [B, TO] (gold): its buildings at cost and its garrison (DefenceBehavior)."""
+	faction = vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)
+	buildings = (x["t_built"][:, : c.OWN_TOWNS].float() * t.building_value[faction]).sum(dim=-1)
+	return (buildings + town_gold[:, : c.OWN_TOWNS]) * own_towns(x)
+
+
+def hire_want(x, pressure, town_danger, kinds):
+	"""Nullkiller2 hires its tavern's best hero (RecruitHeroBehavior) when we have no hero, see over 5 treasures a hero of
+	ours, have a threat near or gold to spare (its hero brings an army worth over half a hire, as most do), or gold piles
+	up (10,000 with a Capitol, 30,000); its priority falls with our heroes, 3 / (heroes + 1). [B] 0..1 (kinds: the listed
+	objects' classes, object_classes)."""
+	heroes = (x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)).sum(dim=1).float()
+	treasures = ((kinds == c.ObjectClass.PICKUP) | (kinds == c.ObjectClass.TREASURE)).sum(dim=1).float()
+	spare = 1 - torch.sigmoid(10 * (pressure - MAX_GOLD_PRESSURE))
+	gold = x["g_resources"][:, 6].clamp(min=0).float()
+	capitol = (own_towns(x) & x["t_built"][:, : c.OWN_TOWNS, CAPITOL]).any(dim=1).float()
+	want = torch.stack(
+		[
+			(heroes == 0).float(), torch.sigmoid(treasures - 5 * heroes), torch.maximum(town_danger.amax(dim=1), spare),
+			torch.sigmoid((gold - 10000) / 1000) * spare * capitol, torch.sigmoid((gold - 30000) / 1000) * spare,
+		],
+		dim=-1,
+	).amax(dim=-1)
+	return want * (3 / (heroes + 1)).clamp(max=1)
+
+
+def trade_needs(x, t):
+	"""What trading could make buildable (Nullkiller2's ResourceTrader trades toward its planned building) [B, R, 2]: the
+	gold value of each resource the buildings short of resources lack (build_short: the most any lacks), and of what we
+	have of it beyond what they need; scaled."""
+	short = x["build_short"][:, : c.OWN_TOWNS].float()  # [B, TO, NB]
+	faction = vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)
+	cost = t.building_resources[faction] * short.unsqueeze(-1)  # [B, TO, NB, R]
+	have = x["g_resources"].clamp(min=0).float()[:, None, None, :]
+	lack = torch.relu(cost - have).amax(dim=(1, 2))  # [B, R]
+	spare = torch.relu(have[:, 0, 0] - cost.amax(dim=(1, 2)))
+	price = t.resource_price
+	return torch.stack([torch.log1p(lack * price / 1000), torch.log1p(spare * price / 1000)], dim=-1)
+
+
+def area_index(x, pos):
+	"""The TRAVEL area [..] (level, row, column of TRAVEL_GRID) of map positions pos [B, .., 3], -1 off the levels."""
+	side = (2 * block_side(x)).reshape((-1,) + (1,) * (pos.dim() - 2))
+	row = torch.div(pos[..., 1].clamp(min=0), side, rounding_mode="floor").clamp(max=TG - 1)
+	column = torch.div(pos[..., 0].clamp(min=0), side, rounding_mode="floor").clamp(max=TG - 1)
+	return torch.where(pos[..., 2] < L, (pos[..., 2].clamp(min=0) * TG + row) * TG + column, torch.full_like(row, -1))
+
+
+def blocked_by_guards(value, region, zone, monster, steps=c.WINDOW_RADIUS):
+	"""Kill a guard, take what it blocks (Nullkiller2's ClusterBehavior) [K, W, W]: on each wandering monster's tile, the
+	best object value in a region we reach only through its zone. value: each tile's object value (gold); region:
+	passable tiles we cannot reach, outside every zone; zone: the monsters' zones; monster: their tiles. The best value
+	spreads through the region (steps hops), then onto the zone tiles next to it and the monsters they surround."""
+	pool = lambda v: F.max_pool2d(v.unsqueeze(1), 3, stride=1, padding=1).squeeze(1)  # noqa: E731
+	best = torch.where(region, value.clamp(min=0), torch.zeros_like(value))
+	for _ in range(steps):
+		best = torch.where(region, torch.maximum(best, pool(best)), best)
+	return pool(pool(best) * zone) * monster
+

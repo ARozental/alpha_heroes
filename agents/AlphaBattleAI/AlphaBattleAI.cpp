@@ -50,6 +50,7 @@ constexpr int SEARCH_ROUND_CAP = 30; // the search's horizon (BattleSearchEnv)
 // A battle where nothing is damaged for this many rounds in a row ends with the attacker retreating, when it can (a
 // siege whose catapult is gone, no towers, walls standing and no side able to reach the other: VCMI has no round limit)
 constexpr int STALEMATE_ROUNDS = 30;
+constexpr int DEFENDER_STALEMATE_DELAY = 5; // the defender retreats this many rounds after the attacker would
 constexpr int MAX_ATTEMPTS = 8; // choices per unit turn before the unit defends (playDefault)
 std::atomic<int> recordsSent{0}; // per process: each battle's record gets its own key (a game has many battles)
 
@@ -237,10 +238,17 @@ void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * 
 				json += std::string(json.size() > 1 ? ", " : "") + "[" + std::to_string(stack->getCreatureID().getNum()) + ", " + std::to_string(stack->getCount()) + "]";
 			return json + "]";
 		};
+		auto machines = [&](BattleSide s) // each side's war machines (creature ids): the reward counts them (data.py summarize)
+		{
+			std::string json = "[";
+			for(const auto * stack : cb->getBattle(battleID)->battleGetStacksIf([s](const CStack * st) { return st->unitSide() == s && st->unitSlot() == SlotID::WAR_MACHINES_SLOT; }))
+				json += std::string(json.size() > 1 ? ", " : "") + std::to_string(stack->creatureId().getNum());
+			return json + "]";
+		};
 		const auto * hero = cb->getBattle(battleID)->battleGetMyHero();
 		const auto * enemyHero = heroes[1 - static_cast<int>(side)];
 		const auto & played = modelFile; // which model version plays (the link may point at a newer one by now)
-		recordEvent("{\"event\": \"start\", \"model\": \"" + played + "\", \"our_side\": " + std::to_string(static_cast<int>(side)) + ", \"armies\": [" + army(army1) + ", " + army(army2) + "], \"our_mana\": " + std::to_string(hero ? hero->mana : 0) + ", \"our_mana_max\": " + std::to_string(hero ? hero->manaLimit() : 0) + ", \"enemy_mana\": " + std::to_string(enemyHero ? enemyHero->mana : 0) + ", \"enemy_mana_max\": " + std::to_string(enemyHero ? enemyHero->manaLimit() : 0) + ", \"powers\": [" + std::to_string(battleStartValues.power[0]) + ", " + std::to_string(battleStartValues.power[1]) + "], \"heroes\": [[" + std::to_string(battleStartValues.heroLevel[0]) + ", " + std::to_string(battleStartValues.artifacts[0]) + "], [" + std::to_string(battleStartValues.heroLevel[1]) + ", " + std::to_string(battleStartValues.artifacts[1]) + "]]}");
+		recordEvent("{\"event\": \"start\", \"model\": \"" + played + "\", \"our_side\": " + std::to_string(static_cast<int>(side)) + ", \"armies\": [" + army(army1) + ", " + army(army2) + "], \"machines\": [" + machines(BattleSide::ATTACKER) + ", " + machines(BattleSide::DEFENDER) + "], \"our_mana\": " + std::to_string(hero ? hero->mana : 0) + ", \"our_mana_max\": " + std::to_string(hero ? hero->manaLimit() : 0) + ", \"enemy_mana\": " + std::to_string(enemyHero ? enemyHero->mana : 0) + ", \"enemy_mana_max\": " + std::to_string(enemyHero ? enemyHero->manaLimit() : 0) + ", \"powers\": [" + std::to_string(battleStartValues.power[0]) + ", " + std::to_string(battleStartValues.power[1]) + "], \"heroes\": [[" + std::to_string(battleStartValues.heroLevel[0]) + ", " + std::to_string(battleStartValues.artifacts[0]) + "], [" + std::to_string(battleStartValues.heroLevel[1]) + ", " + std::to_string(battleStartValues.artifacts[1]) + "]]}");
 		try
 		{
 			recordEvent("{\"event\": \"scenario\", \"scenario\": " + scenarioJson(battleID, army1, army2) + "}");
@@ -507,10 +515,19 @@ void AlphaBattleAI::activeStack(const BattleID & battleID, const CStack * stack)
 		fallback->activeStack(battleID, stack);
 		return;
 	}
-	if(battle->battleGetMySide() == BattleSide::ATTACKER && battle->battleGetRound() - lastDamageRound >= STALEMATE_ROUNDS && battle->battleCanFlee())
+	// The defender too, a few rounds later (the attacker's rule goes first when both sides are ours): against BattleAI,
+	// which never retreats, a defending hero whose last unit kept flying out of reach held a campaign game until its
+	// time limit (joint1, 2026-10-28). A defender without a hero (a garrison, wandering monsters) cannot flee: open
+	// Only a side not ahead retreats: one far ahead whose enemy's last unit stays out of reach would throw away a won
+	// army (2026-10-28 review); its battle runs on, and the game's time limit ends it (the campaign's labels stop there)
+	const int quiet = battle->battleGetRound() - lastDamageRound;
+	const bool attacker = battle->battleGetMySide() == BattleSide::ATTACKER;
+	const auto mySide = battle->battleGetMySide();
+	const bool ahead = aliveArmyValue(*battle, mySide) > aliveArmyValue(*battle, mySide == BattleSide::ATTACKER ? BattleSide::DEFENDER : BattleSide::ATTACKER);
+	if(quiet >= STALEMATE_ROUNDS + (attacker ? 0 : DEFENDER_STALEMATE_DELAY) && battle->battleCanFlee() && !ahead)
 	{
 		++stats.fallbacks;
-		logAi->info("AlphaBattleAI: no damage for %d rounds: the attacker retreats", battle->battleGetRound() - lastDamageRound);
+		logAi->info("AlphaBattleAI: no damage for %d rounds: the %s retreats", quiet, attacker ? "attacker" : "defender");
 		cb->battleMakeUnitAction(battleID, BattleAction::makeRetreat(battle->battleGetMySide()));
 		return;
 	}

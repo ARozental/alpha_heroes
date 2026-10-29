@@ -9,7 +9,7 @@ Bump SCHEMA_VERSION on any change to sizes, enums, input or output definitions.
 """
 from enum import IntEnum
 
-SCHEMA_VERSION = 15  # 8: 20 unit slots (10 per side) instead of 40; 9: CREATURE_SPELL (g_creature_spell, its masks and outputs); 10: spells' predicted value change (s_*_value, c_*_value); 11: engine-played attack values (a_*), engine damage estimates (p_*), surrender cost, start assets, kept counts; 12: hero level and artifacts, units hit by each cast and attack; 13: spell mastery from the engine (h_spell_mastery), h_spells with tomes and scrolls; 14: 14 unit slots per side, tactics, catapult and heal actions, our hero's worn artifacts (h_worn_artifacts); 15: what the battle showed so far (h_seen_spells .., u_start_count .., the e_* event log)
+SCHEMA_VERSION = 16  # 16: each unit's magic resistance and Magic Mirror (u_magic_*), raw; 8: 20 unit slots (10 per side) instead of 40; 9: CREATURE_SPELL (g_creature_spell, its masks and outputs); 10: spells' predicted value change (s_*_value, c_*_value); 11: engine-played attack values (a_*), engine damage estimates (p_*), surrender cost, start assets, kept counts; 12: hero level and artifacts, units hit by each cast and attack; 13: spell mastery from the engine (h_spell_mastery), h_spells with tomes and scrolls; 14: 14 unit slots per side, tactics, catapult and heal actions, our hero's worn artifacts (h_worn_artifacts); 15: what the battle showed so far (h_seen_spells .., u_start_count .., the e_* event log)
 
 # Battlefield: VCMI BattleHex indices 0..186 are used as-is (17 columns x 11 rows,
 # columns 0 and 16 are the unplayable side columns). No remapping on the C++ side.

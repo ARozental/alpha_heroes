@@ -685,8 +685,9 @@ def outcome_features(b, config=None):
 	surrender_reward  our surrendering now: we keep the army and pay the surrender cost and the hero's rehire (0 when we
 	                  cannot surrender: the mask forbids it anyway)
 	Assets as summarize() counts them: the kept creatures (u_kept) at their value, mana at mana_value x spell power,
-	heroes as reward.hero_asset; the enemy hero's level and artifacts are hidden (0 in the inputs), so its hero counts 0
-	here (the true reward counts it)."""
+	heroes as reward.hero_asset with their war machines still standing (every one listed at the start: destroyed units
+	stay in the inputs); the enemy hero's level and artifacts are hidden (0 in the inputs), so its hero counts 0 here
+	(the true reward counts it)."""
 	from .reward import HERO_HIRE_COST, RewardConfig
 
 	config = config or RewardConfig()
@@ -695,10 +696,13 @@ def outcome_features(b, config=None):
 	sides = torch.arange(2, device=price.device)
 	on_side = (x["u_side"][:, None, :] == sides[None, :, None]).float()  # [B, side, U]
 	army = (on_side * (x["u_kept"].float() * price)[:, None, :]).sum(dim=-1)  # [B, side]
+	machine = price * (b.units["war_machine"] & (x["u_present"] != 0))  # [B, U] (u_kept leaves them out)
+	machines_start = (on_side * machine[:, None, :]).sum(dim=-1)
+	machines = (on_side * (machine * (x["u_alive"] != 0))[:, None, :]).sum(dim=-1)  # still standing
 	power = x["h_power"].float().clamp(min=0) * (x["h_present"] != 0)
 	mana = config.mana_value * power * x["h_mana"].float().clamp(min=0)
-	hero = hero_assets(x, config)  # [B, side]
-	start = x["g_start_army"].float() + hero + config.mana_value * power * x["g_start_mana"].float().clamp(min=0)
+	hero = hero_assets(x, config) + machines  # [B, side]
+	start = x["g_start_army"].float() + hero_assets(x, config) + machines_start + config.mana_value * power * x["g_start_mana"].float().clamp(min=0)
 	our = x["g_our_side"].clamp(0, 1)
 	batch = torch.arange(our.shape[0], device=our.device)
 	pick = lambda t, side: t[batch, side]
@@ -798,6 +802,9 @@ def spell_features(b):
 	                for the others (Slow, Bless, ...) versus_best is 0 here and the model puts a learned value instead
 	target_value    the value of the unit it targets (on the hex, for a hex), of both armies' value: what a buff or a
 	                curse is cast on (which unit is worth it, and why, is for the model to learn)
+	The engine's prediction counts each affected unit's part as often as it lands past its magic resistance (castValue);
+	a hero's cast at an enemy unit is also reflected onto one of ours as often as its Magic Mirror (u_magic_mirror) says,
+	which costs about what it would have gained (2026-10-28: 3 of ~45 damaging casts at units missed so).
 	*_hit_*         how many enemy units and how many of ours the cast affects (hits: area spells, chains)
 
 	spell_unit [B, S, U, n], spell_hex [B, S, H, n], creature_spell_unit [B, U, n], creature_spell_hex [B, H, n].
@@ -810,9 +817,14 @@ def spell_features(b):
 	on = (b.units["hex"][..., None] == hexes) | (b.units["rear"][..., None] == hexes)  # [B, U, H]
 	hex_value = (unit_value[..., None] * on).sum(dim=1).clamp(0, 1)  # [B, H]
 
-	def per_spell(name, legal, target):  # inputs <name>_value, _enemies, _allies and legal [B, ..., targets]; target [B, targets]
+	mirror = x["u_magic_mirror"].clamp(0, 100).float() / 100  # [B, U]
+	hero_lands = 1 - b.enemy.float() * 2 * mirror  # (1 - mirror) x the gain - mirror x about the same, on us
+
+	def per_spell(name, legal, target, lands=None):  # inputs <name>_value, _enemies, _allies and legal [B, ..., targets]; target [B, targets]
 		value = x[f"{name}_value"]
 		ours = value.float() * sign.view(-1, *[1] * (value.dim() - 1)) * legal
+		if lands is not None:  # (a hero's cast at a unit: how often it is not reflected, as a factor of its gain)
+			ours = ours * lands
 		best = ours.abs().amax(dim=-1, keepdim=True)
 		net = (ours / both.view(-1, *[1] * (value.dim() - 1))).clamp(-1, 1)
 		changes = (best > 0).float().expand_as(ours)
@@ -821,7 +833,7 @@ def spell_features(b):
 		return torch.cat([torch.stack([net, ours / best.clamp(min=EPS), changes, target], dim=-1), hit], dim=-1)
 
 	return {
-		"spell_unit": per_spell("s_unit", x["m_spell_unit"], unit_value),
+		"spell_unit": per_spell("s_unit", x["m_spell_unit"], unit_value, hero_lands[:, None, :]),
 		"spell_hex": per_spell("s_hex", x["m_spell_hex"], hex_value),
 		"creature_spell_unit": per_spell("c_unit", x["m_creature_spell_unit"], unit_value),
 		"creature_spell_hex": per_spell("c_hex", x["m_creature_spell_hex"], hex_value),

@@ -86,6 +86,8 @@ INPUTS = (
 	_i("u_casts", (U,), "creature spell casts left"),
 	_i("u_morale", (U,), "morale"),
 	_i("u_luck", (U,), "luck"),
+	_i("u_magic_resistance", (U,), "chance in % it resists a negative spell (the engine's magicResistance(): its own, its hero's Resistance, auras: a player sees it in the stack's window); castValue counts it already, the unit features will read it"),
+	_i("u_magic_mirror", (U,), "chance in % it reflects a hostile hero spell cast at it onto one of the caster's units (MAGIC_MIRROR)"),
 	_i("u_moved", (U,), "1 if it already acted this round"),
 	_i("u_waited", (U,), "1 if it waited this round"),
 	_i("u_defending", (U,), "1 if in defensive stance"),

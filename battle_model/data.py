@@ -21,6 +21,7 @@ and per battle a BattleSummary with the reward (reward.py) and the outcome.
 A sent record is ~190 KB a decision, in memory only. Keeping data across epochs will want a compact format
 (sparse masks, ~115 bytes a decision).
 """
+import copy
 import io
 import json
 import struct
@@ -33,7 +34,7 @@ import torch
 from . import vocab
 from .distributions import ACTION_FIELDS, is_legal, log_prob, stack_actions
 from .losses import AdvantageConfig, battle_returns_and_advantages, normalize_advantages, policy_advantages, value_targets
-from .reward import Outcome, RewardConfig, assets_after, hero_asset, mana_value, round_score, terminal_reward, to_scale
+from .reward import WAR_MACHINE_CREATURES, Outcome, RewardConfig, assets_after, hero_asset, mana_value, round_score, terminal_reward, to_scale
 from .schema import INPUTS, OUTPUTS
 
 # EBattleResult
@@ -136,17 +137,25 @@ def summarize(events, config=RewardConfig(), side=None):
 	# as lost) + units summoned for good (Pit Lords' demons join the army; the casualties count those killed again)
 	summoned = end.get("summoned", [[], []])
 	army_start = {s: army_value(start["armies"][s]) for s in (our, enemy)}
-	army_end = {s: army_start[s] - army_value(end["casualties"][s]) + army_value(summoned[s]) for s in (our, enemy)}
-	assets_start = {s: army_start[s] + heroes[s] + mana(start, s) for s in (our, enemy)}
+	# War machines: part of their hero (half price; the catapult and arrow towers 0: game_values), kept unless the side
+	# loses; the engine's casualties count those destroyed, which no army's start counts (records before 2026-10-28 have
+	# no "machines": none counted, and their casualties no longer taken off the army: a destroyed ballista was -2500)
+	machine = lambda stacks: [[c, n] for c, n in stacks if c in WAR_MACHINE_CREATURES]  # noqa: E731
+	troops = lambda stacks: [[c, n] for c, n in stacks if c not in WAR_MACHINE_CREATURES]  # noqa: E731
+	machines = start.get("machines", [[], []])
+	machines_start = {s: army_value([[c, 1] for c in machines[s]]) for s in (our, enemy)}
+	machines_end = {s: max(0.0, machines_start[s] - army_value(machine(end["casualties"][s]))) for s in (our, enemy)}
+	army_end = {s: army_start[s] - army_value(troops(end["casualties"][s])) + army_value(summoned[s]) for s in (our, enemy)}
+	assets_start = {s: army_start[s] + heroes[s] + machines_start[s] + mana(start, s) for s in (our, enemy)}
 	cost = {s: surrender["cost"] if surrender and s == recorder else 0.0 for s in (our, enemy)}  # only the recorder's is known
 	captured = {s: hero_facts[1 - s][1] if outcome_of(s) == Outcome.WIN and outcome_of(1 - s) == Outcome.LOSS else 0.0 for s in (our, enemy)}
-	assets_end = {s: assets_after(outcome_of(s), army_end[s], heroes[s], mana(end, s), cost[s], captured[s]) for s in (our, enemy)}
+	assets_end = {s: assets_after(outcome_of(s), army_end[s], heroes[s] + machines_end[s], mana(end, s), cost[s], captured[s]) for s in (our, enemy)}
 	reward = terminal_reward(assets_start[our], assets_end[our], assets_start[enemy], assets_end[enemy])
 
 	scores = {}
 	for e in events:
 		if e["event"] == "round_end" and e["round"] >= 1:  # round 0 is the start of the battle
-			now = {s: army_value(e["alive"][s]) + heroes[s] + mana(e, s) for s in (our, enemy)}
+			now = {s: army_value(e["alive"][s]) + heroes[s] + machines_start[s] + mana(e, s) for s in (our, enemy)}  # (machines lost on the way: not known)
 			scores[e["round"]] = round_score(assets_start[our], now[our], assets_start[enemy], now[enemy])
 
 	mana_key = "our_mana" if our == recorder else "enemy_mana"
@@ -198,6 +207,63 @@ def compact(array):
 	if array.dtype == np.int64 and array.size and np.abs(array).max() < 2**31:
 		return array.astype(np.int32)
 	return array
+
+
+class Sparse:
+	"""A large, mostly zero array kept as its nonzero entries (compact_record): their flat positions, and their values
+	unless it is a mask."""
+
+	__slots__ = ("shape", "dtype", "index", "values")
+
+	def __init__(self, array):
+		self.shape, self.dtype = array.shape, array.dtype
+		flat = array.reshape(-1)
+		self.index = np.flatnonzero(flat).astype(np.int32 if flat.size < 2**31 else np.int64)
+		self.values = None if array.dtype == np.bool_ else flat[self.index]
+
+	def dense(self):
+		out = np.zeros(self.shape, self.dtype)
+		out.reshape(-1)[self.index] = True if self.values is None else self.values
+		return out
+
+	@property
+	def nbytes(self):
+		return self.index.nbytes + (self.values.nbytes if self.values is not None else 0)
+
+
+# The inputs kept sparse in the actors' buffer: the per-spell and per-unit tables over the hexes and units (rows of
+# spells the hero lacks, of absent units, of hexes nothing can be done from: mostly zero)
+SPARSE_INPUTS = tuple(s.name for s in INPUTS if int(np.prod(s.shape)) >= 1000)
+
+
+def compact_record(record):
+	"""The record as the actors' buffer keeps it: of the policy's outputs only the chosen actions' log-probabilities
+	(tensors["old_log_prob"], [n]: all PPO needs of them) and the value heads, and the large input tables as Sparse
+	(expand_record makes them dense again for an update). A record is ~0.4 MB a decision in full, over half of it in
+	tables that are mostly zero, and the buffer held 16k decisions (~6.5 GB) on a 26 GB machine that swapped.
+	Changes the record in place and returns it; check_record it before (it needs every output)."""
+	tensors = dict(record.tensors)
+	logp = {s.name: torch.from_numpy(np.ascontiguousarray(tensors.pop(s.name))) for s in OUTPUTS if s.name.startswith("logp_")}
+	if logp:
+		tensors["old_log_prob"] = log_prob(logp, stack_actions(record.actions)).numpy() if record.actions else np.zeros(0, np.float32)
+	for name in SPARSE_INPUTS:
+		if isinstance(tensors.get(name), np.ndarray):
+			tensors[name] = Sparse(tensors[name])
+	record.tensors = tensors
+	return record
+
+
+def expand_record(record):
+	"""A copy of a compacted record with its inputs dense again (its outputs stay compact); a full one as it is."""
+	if not any(isinstance(v, Sparse) for v in record.tensors.values()):
+		return record
+	out = copy.copy(record)  # (with what else it carries: its source)
+	out.tensors = {k: v.dense() if isinstance(v, Sparse) else v for k, v in record.tensors.items()}
+	return out
+
+
+def record_bytes(record):
+	return sum(v.nbytes for v in record.tensors.values())
 
 
 def load_record(path):
@@ -261,7 +327,7 @@ def read_decisions(record):
 	"""[(inputs, outputs, action)] of a Record (or a record folder) in the order they were made, without the batch axis."""
 	record = as_record(record)
 	return [
-		({s.name: record.tensors[s.name][i] for s in INPUTS}, {s.name: record.tensors[s.name][i] for s in OUTPUTS}, action)
+		({s.name: record.tensors[s.name][i] for s in INPUTS}, {s.name: record.tensors[s.name][i] for s in OUTPUTS if s.name in record.tensors}, action)
 		for i, action in enumerate(record.actions)
 	]
 
@@ -290,9 +356,9 @@ def battle_examples(record, reward_config=RewardConfig(), advantage_config=Advan
 	if not decisions:
 		return [], summary
 
-	outputs = {s.name: torch.from_numpy(record.tensors[s.name]) for s in OUTPUTS}
+	outputs = {s.name: torch.from_numpy(record.tensors[s.name]) for s in OUTPUTS if s.name in record.tensors}
 	actions = stack_actions([d[2] for d in decisions])
-	old_log_prob = log_prob(outputs, actions)
+	old_log_prob = torch.from_numpy(record.tensors["old_log_prob"]) if "old_log_prob" in record.tensors else log_prob(outputs, actions)  # (compact_record's)
 	values = outputs["value"][:, -1]  # V, the final-reward head (-1..1)
 	rewards = torch.zeros(len(decisions))
 	rewards[-1] = to_scale(summary.reward, reward_config)
@@ -345,8 +411,11 @@ def make_dataloader(records, batch_size=64, shuffle=True, reward_config=RewardCo
 	"""(DataLoader over the model's own decisions in the given battle records (Records or record folders), the
 	battles' summaries, every battle's examples in order including replayed (forced) ones).
 
-	Advantages are computed over whole battles, then normalised per side we played over the decisions
-	trained on, not per batch (losses.normalize_advantages).
+	Advantages are computed over whole battles, then normalised per side we played and per source over the decisions
+	trained on, not per batch (losses.normalize_advantages). The source is a record's `source` attribute (actors.py:
+	"generated" or "real"; none counts as generated): normalised together, the campaign games' battles (a joint run's
+	real battles) got 50% larger advantages than the generated ones (mean |A| 0.94 against 0.62) while their gradient
+	was unrelated to the generated battles' (cosine -0.06): they took a larger share of every step than of the data.
 	"""
 	examples, summaries, lines, sides, battles = [], [], [], [], []
 	for i, record in enumerate(records):
@@ -355,7 +424,8 @@ def make_dataloader(records, batch_size=64, shuffle=True, reward_config=RewardCo
 		summaries.append(summary)
 		chosen = [e for e in battle if not e["forced"]]
 		examples += chosen
-		sides += [summary.our_side] * len(chosen)
+		source = 1 if getattr(record, "source", "generated") == "real" else 0
+		sides += [summary.our_side + 2 * source] * len(chosen)  # a normalisation group: side x source
 		battles += [i] * len(chosen)
 	if examples:
 		advantages = normalize_advantages(torch.stack([e["advantage"] for e in examples]), torch.tensor(sides), torch.tensor(battles), advantage_config)

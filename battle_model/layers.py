@@ -47,11 +47,14 @@ class Block(nn.Module):
 		self.norm2 = nn.LayerNorm(dim)
 		self.mlp = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
 
-	def forward(self, x, key_valid):
+	def forward(self, x, key_valid, bias=None):
+		"""bias: [B, heads, N, N] added to the attention logits (the campaign model's relative positions), or None."""
 		b, n, d = x.shape
 		q, k, v = self.qkv(self.norm1(x)).chunk(3, dim=-1)
 		q, k, v = (t.reshape(b, n, self.heads, d // self.heads).transpose(1, 2) for t in (q, k, v))
 		att = (q @ k.transpose(-1, -2)) / math.sqrt(d // self.heads)
+		if bias is not None:
+			att = att + bias
 		att = att.masked_fill(~key_valid[:, None, None, :], MASKED_LOGIT).softmax(dim=-1)
 		x = x + self.proj((att @ v).transpose(1, 2).reshape(b, n, d))
 		return x + self.mlp(self.norm2(x))

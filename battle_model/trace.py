@@ -51,11 +51,12 @@ def trace(record):
 	for i, action in enumerate(record.actions):
 		x = {k: v[i] for k, v in record.tensors.items()}
 		active = int(x["g_active_unit"])
-		p_type = float(np.exp(x["logp_type"][action["type"]]))
+		# (a compacted record, data.compact_record, has only the chosen action's whole probability)
+		p = f"p(type)={float(np.exp(x['logp_type'][action['type']])):.2f}" if "logp_type" in x else f"p(action)={float(np.exp(x['old_log_prob'])):.2f}"
 		value = float(x["value"][-1])
 		lines.append(
 			f"r{int(x['g_round']):<2} {vocab.name('creatures', int(x['u_creature'][active])):>14} x{int(x['u_count'][active]):<3} "
-			f"p(type)={p_type:.2f} V={value:+.2f}  {describe_action(x, action):48s} | enemy: {army(x, 1 - ours)}"
+			f"{p} V={value:+.2f}  {describe_action(x, action):48s} | enemy: {army(x, 1 - ours)}"
 		)
 	lines.append(f"outcome {summary.outcome.name} after {summary.rounds} rounds, reward {summary.reward:+.3f} (scaled {to_scale(summary.reward):+.3f}), kept {summary.own_kept:.0f} of {summary.own_start_value:.0f}, killed {summary.enemy_lost:.0f} of {summary.enemy_start_value:.0f}")
 	return "\n".join(lines)

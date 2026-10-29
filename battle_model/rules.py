@@ -38,7 +38,7 @@ import torch
 
 from . import vocab
 from .constants import CREATURE_VOCAB, FIELD_WIDTH, N_HEXES
-from .reward import resources_value
+from .reward import WAR_MACHINE_CREATURES, resources_value
 
 # config/gameConfig.json "combat", in exact steps: attack over defence adds 1/20 a point (0.05), at most 80 points
 # (+400%); defence over attack removes 1/40 a point (0.025), at most 28 points (-70%)
@@ -70,7 +70,7 @@ def _ability_value(row, name, subtype=None):
 
 
 CREATURE_TABLES = {
-	"value": (torch.float32, lambda row: resources_value(row.get("cost", {}))),
+	"value": (torch.float32, lambda row: WAR_MACHINE_CREATURES.get(row["id"], resources_value(row.get("cost", {})))),  # (vocab.creature_value)
 	"shooter": (torch.bool, lambda row: "SHOOTER" in row.get("abilities", ())),
 	"flying": (torch.bool, lambda row: "FLYING" in row.get("abilities", ())),
 	"no_melee_penalty": (torch.bool, lambda row: "NO_MELEE_PENALTY" in row.get("abilities", ())),

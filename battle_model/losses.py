@@ -14,8 +14,9 @@ From reward to loss, for one battle seen by one side:
 
 1. Trajectory. The side's model makes decisions d_0 .. d_{T-1}: one per unit turn it plays, plus one
    per hero cast. Between them the opponent acts and dice are rolled; to the model that is simply the
-   environment. Turns played by the scripted fallback (war machines, tactics, round 30+) are not
-   decisions of the model, but they do affect the outcome.
+   environment. War machines under our control (a catapult's wall part, a First Aid Tent's patient, a ballista's
+   shot) and tactics placements are the model's decisions too; the engine plays a war machine itself when the hero
+   lacks its skill, and a stalemate (STALEMATE_ROUNDS without damage) ends in a retreat, as chess's 50-move rule.
 
 2. Reward. reward.py gives one number R when the battle ends: the assets (army, hero, mana) the enemy lost
    minus those we lost, of both sides' assets at the start. Every earlier decision gets reward 0. Per-decision rewards, if we
@@ -40,15 +41,17 @@ From reward to loss, for one battle seen by one side:
    mapped to 0..1): same minimum as the squared error, but the gradient does not vanish when the
    output saturates on a wrong answer.
    V, the final-reward head, makes the advantages below, and V stands alone (not chained to V0..V2,
-   model.py). AdvantageConfig.policy_heads switches round heads on as extra advantage terms (step 5b): by
-   default V2 (the score two rounds ahead); V0 and V1 are only auxiliary predictions that shape the network.
+   model.py: chained, it inherited their material swings and taught the defence passivity, 2026-10-23). The
+   policy maximizes V alone (AdvantageConfig.policy_heads, step 5b); V0..V2 are auxiliary predictions that shape
+   the network.
 
-5. Advantage. A_t is how much better than expected the outcome of decision t was. GAE(lambda) mixes
-	   one step:    delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)   how much the prediction rose after the action
-	   full battle: G_t - V(s_t)                                   final outcome against the prediction
-   lambda = 1 uses only the full-battle estimate: unbiased but noisy, since every decision of a won
-   battle looks good, even the bad ones. lambda = 0 uses only the one-step estimate: little noise,
-   but it trusts V completely. 0.95 is the usual compromise.
+5. Advantage. A_t is how much better than expected the outcome of decision t was (AdvantageConfig.credit):
+	   "window" (the default): V at our first decision window_rounds (2) rounds on (the result once the battle has
+	                ended) - V(s_t), mixed with the real outcome R - V(s_t): its share outcome_share (15%) once V is
+	                good, more (up to outcome_share_max, 50%) while V's explained variance is low (train.py)
+	   "gae":       GAE(lambda), between one step, delta_t = r_t + gamma * V(s_{t+1}) - V(s_t) (how much the
+	                prediction rose after the action), and the full battle, G_t - V(s_t) (lambda = 1: unbiased but
+	                noisy, every decision of a won battle looks good, even the bad ones)
    This is how a single number at the end becomes credit for individual decisions: once the value
    head is any good, a decision after which the predicted outcome jumps gets a positive advantage
    and one after which it drops gets a negative one.
@@ -60,9 +63,17 @@ From reward to loss, for one battle seen by one side:
    PPO therefore clips the ratio to [1 - clip_range, 1 + clip_range] and takes the more pessimistic
    of the clipped and unclipped terms.
 
-7. Total loss = policy + value_weight * (weighted value losses) - entropy_weight * entropy.
-   The entropy bonus keeps the action distribution from collapsing onto early habits. The ACTION_TYPE_PRIOR
-   in model.py already starts the model at sensible odds, so this bonus can stay small.
+7. Total loss = policy + value_weight * (weighted value losses) + entropy_floor_weight * mean(max(0, floor - H)).
+   The entropy floor keeps a decision from collapsing onto one choice: only decisions sharper than entropy_floor nats
+   are pushed back up. It replaced a constant bonus (- entropy_weight * mean H, now 0 by default) on 2026-10-28, after
+   joint1's median p(SHOOT) where shooting was legal fell from 0.99 to 0.32 in ~300 updates while entropy rose.
+   What battle_model/gradient_study.py showed (runtime/studies/drift2): the bonus pushed every minibatch the same way,
+   lowering p(SHOOT) by 4-15 a minibatch (Adam's units, t = -9 to -28); the policy gradient's mean along the same
+   direction was not resolved (-59 to +48, t within +-0.7: ~+-650 a minibatch). So which push was the bigger is not
+   shown, and v15-window trained 2,290 updates with the same bonus without that drift (the 2026-10-28 review). The
+   floor stays for what it is: bounded (it lets a decision go at entropy_floor, a bonus pushes forever) and silent
+   above it; whether it beats the bonus is an ablation from checkpoint 2840 not yet run. The ACTION_TYPE_PRIOR in
+   model.py starts the model at sensible odds.
 """
 from dataclasses import dataclass
 
@@ -93,23 +104,31 @@ class AdvantageConfig:
 	# and it was well again once EV was ~0.2-0.4. outcome_share_max = outcome_share: off.
 	outcome_share_max: float = 0.5
 	outcome_share_full_ev: float = 0.4
-	# GAE lambda (step 5); 1 = judge each decision by the final outcome only. 0.8 (2026-10-26, the user's call: bootstrap
-	# for now; the comparison with 0.95, every earlier run's, is to come): a decision 12 steps from the end gets 7% of its
-	# credit from the outcome (0.95: 54%), the rest from the value head's estimates, so far less of later luck
+	# GAE lambda (step 5), read by credit "gae" only: the "window" default has no decay of any kind. 1 = judge each
+	# decision by the final outcome only. 0.8 was the default for 40 minutes on 2026-10-26 (da86ba9 to ca3ee7b: the
+	# v15-history run; earlier runs 0.95); v15-window, joint1 and every run since used the window, so no lambda
+	# comparison is pending. At 0.8 a decision 12 steps from the end gets 7% of its credit from the outcome (0.95: 54%)
 	lam: float = 0.8
 	normalize_min_decisions: int = 8  # step 5: rescale a group's advantages only if it has at least this many decisions
-	# Which value heads (V0, V1, V2, V) the policy maximizes (policy_advantages). Default: V and V2. In 400-epoch
-	# self-play runs (2026-10-23, one seed each) adding V2 beat V alone against BattleAI on both sides: greedy reward
-	# minus BattleAI's own on the same seeds, attack -0.09 vs -0.24, defence +0.10 vs +0.01. V0 and V1 stay
-	# auxiliary: maximizing the score at the end of this round rewards e.g. keeping units alive even when that is pointless.
-	policy_heads: tuple = (0, 0, 1, 1)
+	# How much of each value head (V0, V1, V2, V) the policy maximizes (policy_advantages): weights. The policy
+	# maximizes the final outcome V alone (the user, 2026-10-28: the longest horizon, as the campaign's day 7); the
+	# window credit reaches it through V two rounds on, and the outcome's share covers V's blind spots while V is weak.
+	# The round heads are chained to each other (each learns the difference to the previous, detached) and only shape
+	# the network: a round head's term pays for material kept k rounds on, so it punishes a sacrifice that wins later (a
+	# weak stack dying to shield a shooter). (V2's term once helped early runs: 2026-10-23, one seed each, V + V2 beat V
+	# alone against BattleAI, attack -0.09 vs -0.24, defence +0.10 vs +0.01; V's explained variance was ~0 then and is
+	# ~0.4 now.) fade_round_heads: a round head given a weight here counts less as V's trust rises (train.py)
+	policy_heads: tuple = (0, 0, 0, 1)
+	fade_round_heads: bool = True
 
 
 @dataclass(frozen=True)
 class PPOConfig:
 	clip_range: float = 0.2  # step 6: one update may change p(action) by at most +-20%; PPO's standard value
 	value_weight: float = 0.5  # step 7: the value loss shares the network with the policy, standard PPO weight
-	entropy_weight: float = 0.01  # step 7: small exploration bonus
+	entropy_weight: float = 0.0  # step 7: the constant bonus on every decision's entropy (0.01 until 2026-10-28; see step 7)
+	entropy_floor: float = 0.3  # step 7: nats; ~the 10th percentile of decisions' entropy at v15/joint1 checkpoints
+	entropy_floor_weight: float = 0.1  # step 7: how hard a decision below the floor is pushed back up
 	value_head_weights: tuple = (1.0,) * (N_VALUE_HORIZONS + 1)  # step 4: share of each value head (V0, V1, V2, V) in the value loss
 
 
@@ -187,18 +206,18 @@ def value_loss(out, targets, config=PPOConfig(), weight=None):
 def policy_advantages(final_advantages, value_labels, values, config=AdvantageConfig()):
 	"""Step 5b: the advantage the policy follows, from the value heads that config.policy_heads switches on.
 
-	final_advantages: [T] GAE advantages with V and the final reward (battle_returns_and_advantages)
+	final_advantages: [T] each decision's final-reward credit (battle_returns_and_advantages: the window by default)
 	value_labels:     [T, heads] value_targets; values: [T, heads] the heads' outputs, both -1..1
-	V counts with its GAE advantage; a round head k with its label (the reward formula at the end of round
+	V counts with that credit; a round head k with its label (the reward formula at the end of round
 	r_t + k) minus its own prediction: how much better than it expected that round went.
 	"""
 	heads = config.policy_heads
 	if len(heads) != values.shape[1]:
-		raise ValueError(f"policy_heads needs one flag per value head ({values.shape[1]}), got {heads}")
+		raise ValueError(f"policy_heads needs one weight per value head ({values.shape[1]}), got {heads}")
 	total = final_advantages * float(heads[-1])
-	for k, on in enumerate(heads[:-1]):
-		if on:
-			total = total + (value_labels[:, k] - values[:, k])
+	for k, weight in enumerate(heads[:-1]):
+		if weight:
+			total = total + float(weight) * (value_labels[:, k] - values[:, k])
 	return total
 
 
@@ -249,17 +268,29 @@ def ppo_loss(out, action, old_log_prob, advantage, value_labels, config=PPOConfi
 	clipped = ratio.clamp(1 - config.clip_range, 1 + config.clip_range)
 	policy = -weighted_mean(torch.min(ratio * advantage, clipped * advantage), weight)
 	value, per_head = value_loss(out, value_labels, config, weight)
-	bonus = weighted_mean(entropy(out), weight)
-	total = policy + config.value_weight * value - config.entropy_weight * bonus
+	entropy_loss, bonus, below = entropy_term(out, config, weight)
+	total = policy + config.value_weight * value + entropy_loss
 	return total, {
 		"policy": policy.detach(),
 		"value": value.detach(),
 		"value_per_head": per_head,
 		"entropy": bonus.detach(),
+		"below_floor": below,
 		"ratio": ratio.mean().detach(),
 		"approx_kl": (old_log_prob - new_log_prob).mean().detach(),
 		"clip_fraction": ((ratio - 1).abs() > config.clip_range).float().mean().detach(),
 	}
+
+
+def entropy_term(out, config=PPOConfig(), weight=None):
+	"""Step 7: (the loss term, the mean entropy, the share of decisions below the floor). The floor pushes up only
+	decisions sharper than config.entropy_floor; the constant bonus (entropy_weight) pushes every decision."""
+	h = entropy(out)
+	bonus = weighted_mean(h, weight)
+	term = -config.entropy_weight * bonus
+	if config.entropy_floor_weight:
+		term = term + config.entropy_floor_weight * weighted_mean(torch.relu(config.entropy_floor - h), weight)
+	return term, bonus, (h < config.entropy_floor).float().mean().detach()
 
 
 def search_loss(out, search, value_labels, config=PPOConfig()):
@@ -283,13 +314,14 @@ def search_loss(out, search, value_labels, config=PPOConfig()):
 	count = searched.sum().clamp(min=1.0)
 	policy = (cross * searched).sum() / count
 	value, per_head = value_loss(out, value_labels, config)
-	bonus = entropy(out).mean()
-	total = policy + config.value_weight * value - config.entropy_weight * bonus
+	entropy_loss, bonus, below = entropy_term(out, config)
+	total = policy + config.value_weight * value + entropy_loss
 	return total, {
 		"policy": policy.detach(),
 		"value": value.detach(),
 		"value_per_head": per_head,
 		"entropy": bonus.detach(),
+		"below_floor": below,
 		"ratio": torch.ones((), device=probs.device),
 		"approx_kl": (((cross - own) * searched).sum() / count).detach(),
 		"clip_fraction": torch.zeros((), device=probs.device),

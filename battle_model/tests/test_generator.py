@@ -114,3 +114,21 @@ def test_hard_cases(drawn):
 		ratio = generator.creature_value(s["neutrals"]["creature"], w) * s["neutrals"]["count"] / generator.army_value(side["army"], w)
 		assert h["value_ratio"]["min"] * 0.8 < ratio < h["value_ratio"]["max"] * 1.2  # counts are whole creatures
 		assert set(side["spells"]) & set(h["spells"])
+
+
+def test_enemy_shooters_ratio_counts_our_flyer_and_the_hopeless_hero_is_worth_saving():
+	"""enemy_shooters: the enemy's army against ours with its flyer is within value_ratio (it was drawn against the army
+	before the flyer: 0.69-1.0 of it, 2026-10-28 review); hopeless: our hero at hero_level or above (a hero worth less
+	than its rehire keeps nothing by retreating)."""
+	cfg, w = generator.load_config(), generator.world()
+	rng = random.Random(3)
+	h = cfg["hard"]["enemy_shooters"]
+	for _ in range(20):
+		ours, theirs = generator.hard_enemy_shooters(rng, cfg, w)["sides"]
+		ratio = generator.army_value(theirs["army"], w) / generator.army_value(ours["army"], w)
+		assert h["value_ratio"]["min"] * 0.8 < ratio < h["value_ratio"]["max"] * 1.2  # counts are whole creatures
+	lowest = cfg["hard"]["hopeless"]["hero_level"]["min"]
+	for _ in range(20):
+		experience = generator.hard_hopeless(rng, cfg, w)["sides"][0]["experience"]
+		assert sum(1 for e in w["experience"] if e <= experience) >= lowest
+

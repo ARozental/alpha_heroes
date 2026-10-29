@@ -1,0 +1,175 @@
+"""Games of the campaign model: a random map from VCMI's generator (water and the underground on), every player
+AlphaMapAI asking the inference server (family "campaign"), or (an evaluation) some players Nullkiller2; battles
+played by a battle AI (retreats and surrenders are the battle AI's decisions, not the campaign model's). The AIs stop
+at a day cap and the game is killed as soon as each of our players still in it has sent its last records;
+scripts/headless.sh caps its time and disk.
+
+	.venv/bin/python -m campaign_model.play --days 5 --seed 1
+"""
+import argparse
+import json
+import os
+import random
+import subprocess
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from battle_model import play as battle_play
+
+from .records import collect
+
+ROOT = battle_play.ROOT
+USER_DIR = battle_play.USER_DIR
+MAP_DIR = "Maps/alpha_random"
+COLORS = ("RED", "BLUE", "TAN", "GREEN", "ORANGE", "PURPLE", "TEAL", "PINK")
+STATUS_INGAME = 0
+
+
+@dataclass
+class GameInfo:
+	map_name: str
+	template: str
+	seconds: float
+	status: str  # how the game ended
+	run_dir: str
+	run_mb: float  # the run directory (logs) on disk
+
+
+def players_without_a_town(path):
+	"""The players of a generated map (.vmap) with no starting town: the generator sometimes leaves one out (template
+	8SM0f gave red none), and such a player is out at once (and red's loss ended the whole game)."""
+	import re
+	import zipfile
+
+	text = zipfile.ZipFile(path).read("header.json").decode()
+	header = json.loads(re.sub(r",(\s*[}\]])", r"\1", re.sub(r"//[^\n]*", "", text)))
+	return sorted(color for color, player in header.get("players", {}).items() if not player.get("mainTown"))
+
+
+def make_map(seed, players=2, size=36, levels=2, water="random", attempts=5):
+	"""Write a random map into the VCMI user data folder; returns (map name, template). A map where a player has no
+	starting town is generated again from the next seed (seed + 1000003 x attempt)."""
+	for attempt in range(attempts):
+		this_seed = seed + 1_000_003 * attempt
+		name = f"{MAP_DIR}/s{size}-p{players}-l{levels}-{water}-{this_seed}"
+		out = USER_DIR / (name + ".vmap")
+		out.parent.mkdir(parents=True, exist_ok=True)
+		env = {**os.environ, "VCMI_USER_DIR": str(battle_play._map_builder_dir())}
+		command = [str(ROOT / "build" / "bin" / "alpha_make_random_map"), str(out), str(this_seed), str(size), str(players), str(levels), water]
+		result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
+		if result.returncode != 0 or not out.exists():
+			raise RuntimeError(f"generating the map failed:\n{result.stdout[-1500:]}\n{result.stderr[-1500:]}")
+		template = result.stdout.rsplit("template ", 1)[-1].strip().rstrip(")") if "template " in result.stdout else "?"
+		if not players_without_a_town(out):
+			return name, template
+		out.unlink(missing_ok=True)
+	raise RuntimeError(f"{attempts} maps from seed {seed} ({players} players, {size}x{size}) each left a player without a town")
+
+
+def finished(messages, days, ours=None):
+	"""Each of our players (ours: their colors; None: every player) has sent its last records: all of them (the game
+	ended for them), or, once a day past the cap has begun, every one still in the game."""
+	snapshots = [json.loads(p) for key, payloads in list(messages.items()) if key.endswith(":ledger") for p in list(payloads)]
+	daily = [s for s in snapshots if not s.get("final")]
+	if not daily:
+		return False
+	done = {key.split(":")[-2] for key in list(messages) if key.endswith(":done")}
+	players = {COLORS[p["color"]] for p in daily[0]["players"]} if ours is None else set(ours)
+	if players <= done:
+		return True
+	latest = max(daily, key=lambda s: s["day"])
+	playing = {COLORS[p["color"]] for p in latest["players"] if p["status"] == STATUS_INGAME} & players
+	return latest["day"] > days and playing <= done
+
+
+def latest_day(messages):
+	"""The day of the newest daily ledger."""
+	return max((json.loads(p)["day"] for key, payloads in list(messages.items()) if key.endswith(":ledger") for p in list(payloads) if not json.loads(p).get("final")), default=0)
+
+
+def run_dir_of(pid):
+	runs = sorted((ROOT / "runtime" / "runs").glob(f"*-{pid}-*"))
+	return runs[-1] if runs else None
+
+
+def directory_mb(path):
+	return sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file()) / 2**20 if path else 0.0
+
+
+def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_ai="BattleAI", game_key="g0", settings=(), niceness=0, temperature=1.0, ours=None, our_battle_ai="AlphaBattleAI", stop=None):
+	"""Play one game against the inference server at socket_path; returns (records.Game, GameInfo).
+
+	battle_ai plays every battle (the wandering monsters' too); settings: more environment (e.g. the battle AI's
+	inference server and record keys). ours: None (every player is our AI), or the colors that are, the others
+	Nullkiller2 with battle_ai while ours fight with our_battle_ai (an evaluation). stop: an Event that ends the game
+	early (training is over)."""
+	with battle_play.RecordServer() as server:
+		env = dict(os.environ)
+		ai = {"adventureEnemyAI": "AlphaMapAI", "adventureAlliedAI": "AlphaMapAI", "combatEnemyAI": battle_ai, "combatAlliedAI": battle_ai, "combatNeutralAI": battle_ai}
+		if ours is not None:
+			ai.update(adventureEnemyAI="Nullkiller2", adventureAlliedAI="Nullkiller2")
+		env.update(
+			ALPHA_MAP_INFERENCE_SOCKET=str(socket_path),
+			ALPHA_MAP_RECORD_SOCKET=str(server.path),
+			ALPHA_MAP_GAME_KEY=game_key,
+			ALPHA_MAP_DAYS=str(days),
+			ALPHA_MAP_TEMPERATURE=str(temperature),
+			SETTINGS=json.dumps({"server": {"seed": seed}, "ai": ai}),
+		)
+		for i, color in enumerate(COLORS):
+			env[f"ALPHA_MAP_SEED_{color}"] = str(seed * 101 + i)
+			env.pop(f"VCMI_BATTLE_AI_{color}", None)
+			env.pop(f"VCMI_ADVENTURE_AI_{color}", None)
+			if ours is not None and color in ours:
+				env[f"VCMI_ADVENTURE_AI_{color}"] = "AlphaMapAI"  # (a vcmi patch: one game seats different AIs)
+				env[f"VCMI_BATTLE_AI_{color}"] = our_battle_ai
+		env.update(dict(settings))
+		command = [str(ROOT / "scripts" / "headless.sh"), map_name, str(max_seconds), str(max_mb), "60"]
+		if niceness:
+			command = ["nice", "-n", str(niceness)] + command  # (nice execs the script: the same process id)
+		started = time.time()
+		process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+		status = "the game ended"
+		while process.poll() is None:
+			time.sleep(0.25)
+			if finished(server.records, days, ours):
+				status = f"stopped at day {latest_day(server.records)}"
+				break
+			if stop is not None and stop.is_set():
+				status = "stopped: training is over"
+				break
+		if process.poll() is None:
+			process.terminate()  # headless.sh kills the client on its way out
+		output = process.communicate(timeout=60)[0]
+		seconds = time.time() - started
+		if status == "the game ended":
+			status = next((line.split(":", 1)[1].strip() for line in output.splitlines() if line.startswith("status:")), "the game ended")
+		time.sleep(0.3)  # what the last connections still carry
+		messages = server.drain()
+	run = run_dir_of(process.pid)
+	game = collect(messages)
+	return game, GameInfo(map_name, "", seconds, status, str(run), directory_mb(run))
+
+
+def main():
+	from .train import serve_model
+
+	parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+	parser.add_argument("--days", type=int, default=5)
+	parser.add_argument("--seed", type=int, default=1)
+	parser.add_argument("--players", type=int, default=0, help="0: 2 to 4 at random")
+	parser.add_argument("--size", type=int, default=36)
+	parser.add_argument("--checkpoint", default="")
+	args = parser.parse_args()
+	players = args.players or random.Random(args.seed).randint(2, 4)
+	map_name, template = make_map(args.seed, players, args.size)
+	with serve_model(args.checkpoint) as (model, server):
+		game, info = play(server.socket_path, map_name, args.days, args.seed)
+	info.template = template
+	print(info)
+	print(f"{len(game.decisions)} decisions, ledgers for days {sorted(game.ledgers)}, done {game.done}")
+
+
+if __name__ == "__main__":
+	main()

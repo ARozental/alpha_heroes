@@ -91,6 +91,8 @@ void encodeUnits(EncodedBattle & e, const CPlayerBattleCallback & battle, const 
 		// raw sum of bonuses (bug fix 2026-10-23)
 		t.set(In::u_morale, u, s->moraleVal());
 		t.set(In::u_luck, u, s->luckVal());
+		t.set(In::u_magic_resistance, u, s->magicResistance());
+		t.set(In::u_magic_mirror, u, s->valOfBonuses(BonusType::MAGIC_MIRROR));
 		t.set(In::u_moved, u, s->moved());
 		t.set(In::u_waited, u, s->waitedThisTurn);
 		t.set(In::u_defending, u, s->defending);
@@ -291,10 +293,13 @@ bool healsForOneBattle(const CSpell & spell, int level)
 /// effect of the spell (UnitEffect::getHealthChange, the rules the cast itself uses), priced as the reward prices
 /// armies: hit points at the creature's value per hit point, raised or summoned creatures at their value; nothing for
 /// units the side does not keep after the battle, nor for health that only lasts the battle (healsForOneBattle).
-/// The value for the attacker minus for the defender, in gold.
+/// The value for the attacker minus for the defender, in gold, expected over the engine's resistance roll: each unit a
+/// negative magical spell affects resists it on its own (BattleSpellMechanics::beforeCast), so its part counts as often
+/// as it lands (single targets, chains and areas alike).
 int64_t castValue(const CPlayerBattleCallback & battle, const CSpell & spell, const spells::Mechanics & mechanics, const battle::Target & aim)
 {
 	const bool temporary = healsForOneBattle(spell, mechanics.getEffectLevel()); // the caster's mastery (getSpellLevel is the spell's circle)
+	const bool resistible = spell.isNegative() && spell.isMagical();
 	const auto canonical = mechanics.canonicalizeTarget(aim);
 	double value = 0;
 	mechanics.forEachEffect([&](const spells::effects::Effect & effect)
@@ -314,7 +319,7 @@ int64_t castValue(const CPlayerBattleCallback & battle, const CSpell & spell, co
 			const auto * stack = destination.unitValue ? battle.battleGetStackByID(destination.unitValue->unitId(), false) : nullptr;
 			if(!stack)
 				continue;
-			const double sign = stack->unitSide() == BattleSide::ATTACKER ? 1.0 : -1.0;
+			const double sign = (stack->unitSide() == BattleSide::ATTACKER ? 1.0 : -1.0) * (resistible ? 1.0 - std::min(stack->magicResistance(), 100) / 100.0 : 1.0);
 			if(now.unitType != CreatureID::NONE && now.unitType != stack->creatureId()) // a new creature (Pit Lords' demons)
 				value += sign * units * creatureValue(now.unitType.toCreature());
 			else if(keptAfterBattle(stack) && !(temporary && hp > 0))

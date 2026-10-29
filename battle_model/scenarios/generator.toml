@@ -212,10 +212,17 @@ upgraded_stack = 0.15  # chance of one extra stack of the upgraded creature, as 
 # Hard cases: a share of all generated battles drawn from kinds the model is known to play badly, each kind its own
 # entry (more as they are found, e.g. by the hard-cases pool: actors.py TODO). The user's decision, 2026-10-26.
 [hard]
-p = 0.10  # of all generated battles
+p = 0.25  # of all generated battles (2026-10-28: 0.10 with one kind; each trick needs its own share to be learned)
 
+# Each kind is decided by one trick an expert uses (sources: Heroes Community tactics threads, 2001-2007): the trick
+# must be visible in the outcome, so a policy gradient at noise level elsewhere still gets a clear signal here
 [hard.kinds]
-one_big_stack = { p = 1.0, desc = "a hero against one big stack" }  # v14-11h kited and retreated where BattleAI wins
+one_big_stack       = { p = 0.20, desc = "a hero against one big stack" }  # v14-11h kited and retreated where BattleAI wins
+shooter_guard       = { p = 0.20, desc = "keep the enemy off our strong shooter: single cheap blockers, Force Field, Tactics" }
+blind_the_big_stack = { p = 0.15, desc = "blind or slow the enemy's one big stack" }
+berserk             = { p = 0.15, desc = "berserk a stack into its neighbours" }
+enemy_shooters      = { p = 0.15, desc = "block their shooters with a fast flyer, or blind them" }
+hopeless            = { p = 0.15, desc = "retreat early and keep the hero" }
 
 # A hero against many creatures of one type (no upgraded stack), about as strong as its army: hard, but winnable by
 # letting one stack take the big one's retaliation and the rest hit it freely, or with the right spells. Its hero has a
@@ -225,6 +232,38 @@ value_ratio = { min = 0.6, max = 1.4 }  # the stack's value over the hero's army
 level = { min = 1, max = 4 }  # low and middle levels: the count is what is big
 extra_spells = { min = 2, max = 5 }
 spells = ["blind", "bless", "slow", "haste", "shield", "curse", "weakness", "precision", "fortune", "stoneSkin", "disruptingRay", "forceField", "forgetfulness", "airShield", "misfortune", "mirth", "berserk", "prayer", "frenzy", "sorrow", "counterstrike"]
+
+[hard.shooter_guard]
+shooter_level = { min = 3, max = 7 }
+blockers = { min = 3, max = 5 }  # single level-1 creatures
+enemy_level = { min = 2, max = 6 }
+enemy_speed = 6  # walkers and flyers fast enough to reach the shooter in a round or two
+value_ratio = { min = 0.9, max = 1.4 }  # the neutrals' value over our army's
+tactics = 0.5  # the hero also has expert Tactics (place the blockers before the battle)
+
+[hard.blind_the_big_stack]
+value_ratio = { min = 1.3, max = 2.0 }  # the enemy's army over ours
+big_level = { min = 5, max = 7 }
+big_share = 0.75
+small_stacks = { min = 1, max = 3 }
+
+[hard.berserk]
+level = { min = 2, max = 6 }
+value_ratio = { min = 1.2, max = 1.8 }
+
+[hard.enemy_shooters]
+value_ratio = { min = 0.9, max = 1.3 }
+shooter_level = { min = 2, max = 6 }
+shooter_stacks = { min = 2, max = 3 }
+shooter_share = 0.65
+flyer_level = { min = 2, max = 7 }
+flyer_speed = 9
+flyer_share = 0.3  # of our army's value, added to it
+spells = 0.5  # our hero also has Blind or Forgetfulness
+
+[hard.hopeless]
+enemy_factor = { min = 3.0, max = 6.0 }
+hero_level = { min = 6, max = 12 }  # worth saving: level 6 is 10,400 gold of levels, over 4 rehires
 
 [neutrals.creature_origin]
 any_faction = { p = 0.85, desc = "a town's creature" }

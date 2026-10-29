@@ -3,6 +3,8 @@
 // The ids are the engine's own: exactly the values the C++ side puts into the model inputs.
 // Also what the battle generator (battle_model/generator.py) samples from: upgrades, artifact classes and slots,
 // hero classes and their level-up chances, factions, the mage guild's spell chances, the experience per level.
+// For the campaign model (campaign_model/): town buildings (cost, daily produce, what each upgrades), each faction's
+// creatures by level, horde levels, the map object types, terrains and roads.
 //
 // Usage (scripts/export_vocab.sh sets this up): VCMI_USER_DIR=... build/bin/alpha_export_vocab <out.json>
 #include "StdInc.h"
@@ -20,6 +22,9 @@
 #include "lib/entities/artifact/CArtifact.h"
 #include "lib/entities/faction/CFaction.h"
 #include "lib/entities/faction/CTown.h"
+#include "lib/entities/building/CBuilding.h"
+#include "lib/mapObjectConstructors/CObjectClassesHandler.h"
+#include "lib/RoadHandler.h"
 #include "lib/entities/hero/CHero.h"
 #include "lib/entities/hero/CHeroClassHandler.h"
 #include "lib/entities/faction/CTownHandler.h"
@@ -231,6 +236,78 @@ JsonNode factions()
 	return list;
 }
 
+JsonNode resourcesJson(const TResources & resources)
+{
+	JsonNode node;
+	for(int r = 0; r < static_cast<int>(RESOURCES.size()); ++r)
+		if(resources[GameResID(r)] != 0)
+			node[RESOURCES[r]].Integer() = resources[GameResID(r)];
+	return node;
+}
+
+JsonNode buildings()
+{
+	JsonNode list; // every faction's town buildings: (faction, id) is the key, ids are BuildingID numbers
+	for(const auto & f : LIBRARY->townh->objects)
+	{
+		if(!f || !f->town)
+			continue;
+		for(const auto & [id, b] : f->town->buildings)
+		{
+			JsonNode node;
+			node["faction"].Integer() = f->getIndex();
+			node["id"].Integer() = id.getNum();
+			node["key"].String() = b->getJsonKey();
+			node["name"].String() = b->getNameTranslated();
+			node["cost"] = resourcesJson(b->resources);
+			node["produce"] = resourcesJson(b->produce); // a day; only the top building of an upgrade chain produces
+			node["upgrade"].Integer() = b->upgrade.getNum(); // the building this one upgrades, -1 if none
+			node["auto"].Bool() = b->mode == CBuilding::BUILD_AUTO;
+			list.Vector().push_back(node);
+		}
+	}
+	return list;
+}
+
+JsonNode townCreatures()
+{
+	JsonNode list; // for each faction with a town: creatures[level] = [base, upgrade, ...], horde_levels[0..1]
+	for(const auto & f : LIBRARY->townh->objects)
+	{
+		if(!f || !f->town)
+			continue;
+		JsonNode node;
+		node["faction"].Integer() = f->getIndex();
+		for(const auto & level : f->town->creatures)
+		{
+			JsonNode ids;
+			for(const auto & creature : level)
+				ids.Vector().emplace_back(static_cast<si64>(creature.getNum()));
+			node["creatures"].Vector().push_back(ids);
+		}
+		for(int horde = 0; horde < 2; ++horde)
+			node["horde_levels"].Vector().emplace_back(static_cast<si64>(f->town->hordeLvl.count(horde) ? f->town->hordeLvl.at(horde) : -1));
+		list.Vector().push_back(node);
+	}
+	return list;
+}
+
+JsonNode objectTypes()
+{
+	JsonNode list; // map object types (Obj ids), named by their first subtype, with their handler (e.g. "mine")
+	for(const auto & type : LIBRARY->objtypeh->knownObjects())
+	{
+		JsonNode node;
+		node["id"].Integer() = type.getNum();
+		node["handler"].String() = LIBRARY->objtypeh->getObjectHandlerName(type);
+		const auto subtypes = LIBRARY->objtypeh->knownSubObjects(type);
+		node["name"].String() = subtypes.empty() ? "" : LIBRARY->objtypeh->getObjectName(type, *subtypes.begin());
+		node["subtypes"].Integer() = static_cast<si64>(subtypes.size());
+		list.Vector().push_back(node);
+	}
+	return list;
+}
+
 JsonNode experience()
 {
 	JsonNode list; // the experience a hero needs for level 1, 2, ...
@@ -280,6 +357,11 @@ int main(int argc, const char * argv[])
 	vocab["hero_classes"] = heroClasses();
 	vocab["factions"] = factions();
 	vocab["experience"] = experience();
+	vocab["buildings"] = buildings();
+	vocab["town_creatures"] = townCreatures();
+	vocab["object_types"] = objectTypes();
+	vocab["terrains"] = simple(LIBRARY->terrainTypeHandler->objects);
+	vocab["roads"] = simple(LIBRARY->roadTypeHandler->objects);
 	std::ofstream(out) << vocab.toString();
 	std::cout << "wrote " << out << "\n";
 

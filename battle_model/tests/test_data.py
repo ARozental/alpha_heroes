@@ -130,3 +130,61 @@ def test_the_enemy_side_scores_the_same_battle_mirrored():
 	# We retreat: the enemy wins and counts our whole army as destroyed
 	fled = summarize(events(1, {"round": 2, "winner": 0, "result": RESULT_ESCAPE, "casualties": [[], []], "alive": [[], []]}), side=0)
 	assert fled.outcome == Outcome.WIN and fled.enemy_lost == army_value(OURS)
+
+
+def test_a_compacted_record_trains_the_same(tmp_path):
+	import numpy as np
+	import torch
+
+	from battle_model.data import Sparse, compact_record, expand_record, load_record, make_dataloader
+	from battle_model.distributions import sample
+	from battle_model.model import BattleModel
+	from battle_model.schema import random_inputs
+
+	torch.manual_seed(0)
+	model = BattleModel(dim=32, layers=1).eval()
+	decisions = []
+	for i in range(5):
+		x = random_inputs(batch=1, seed=i)
+		x["s_hex_value"][:, 3:] = 0  # mostly zero, as real ones are
+		with torch.no_grad():
+			out = model({k: torch.from_numpy(v) for k, v in x.items()})
+		outputs = {k: v.numpy() for k, v in out.items() if k != "value_logit"}
+		decisions.append(({**x, **outputs}, sample(outputs, 0, np.random.default_rng(i))))
+	write_record(tmp_path / "game_0", decisions, events(0, {"round": 3, "winner": 0, "result": RESULT_NORMAL, "casualties": [[], THEIRS], "alive": [[], []]}))
+
+	full = load_record(tmp_path / "game_0")
+	compact = compact_record(load_record(tmp_path / "game_0"))
+	assert isinstance(compact.tensors["s_hex_value"], Sparse) and not any(k.startswith("logp_") for k in compact.tensors)
+	assert compact.tensors["s_hex_value"].nbytes < full.tensors["s_hex_value"].nbytes / 10
+	expanded = expand_record(compact)
+	(a, _, _), (b, _, _) = (make_dataloader([r], batch_size=8, shuffle=False) for r in (full, expanded))
+	for x, y in zip(a.dataset, b.dataset):
+		assert all(np.array_equal(x["inputs"][k], y["inputs"][k]) for k in x["inputs"])
+		assert torch.equal(x["old_log_prob"], y["old_log_prob"]) and torch.equal(x["advantage"], y["advantage"])
+		assert torch.equal(x["value_labels"], y["value_labels"])
+
+
+def test_war_machines_are_half_their_price_kept_unless_the_side_loses():
+	"""The start event lists each side's war machines; the engine's casualties count the destroyed ones, which no
+	army's start holds: a winner whose ballista was shot loses its half price (1250), not 2500 off its army; a loser
+	loses the rest with its hero; the catapult is worth nothing."""
+	BALLISTA, TENT, CATAPULT = 146, 147, 145
+	assert vocab.creature_value(BALLISTA) == 1250 and vocab.creature_value(TENT) == 375 and vocab.creature_value(CATAPULT) == 0
+	start = {"event": "start", "our_side": 0, "armies": [OURS, THEIRS], "machines": [[BALLISTA, TENT, CATAPULT], [BALLISTA]], "our_mana": 0, "our_mana_max": 0}
+	end = {"event": "end", "round": 3, "winner": 0, "result": RESULT_NORMAL, "casualties": [[[0, 4], [BALLISTA, 1]], THEIRS], "alive": [[], []], "our_mana": 0}
+	s = summarize([start, end])
+	assert s.own_kept == army_value(OURS) - army_value([[0, 4]]) + 375  # the tent stands, the ballista does not
+	assert s.enemy_lost == army_value(THEIRS) + 1250  # the loser's ballista goes with its hero
+	old = summarize([{k: v for k, v in start.items() if k != "machines"}, end])  # a record from before: none counted
+	assert old.own_kept == army_value(OURS) - army_value([[0, 4]])  # (the destroyed ballista was taken off as -2500)
+
+
+def test_war_machines_in_the_campaign_are_half_their_price():
+	from campaign_model.vocab import artifact_prices
+	from game_values import artifact_price
+
+	prices = artifact_prices()
+	assert (prices[3], prices[4], prices[5], prices[6], prices[0], prices[2]) == (0, 1250, 500, 375, 0, 0)  # catapult, ballista, cart, tent; spellbook, Grail
+	assert all(artifact_price(a) == prices[a] for a in (0, 2, 3, 4, 5, 6, 7))
+	assert prices[4] == vocab.artifact_price(4) / 2 and prices[6] == vocab.artifact_price(6) / 2

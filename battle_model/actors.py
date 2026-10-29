@@ -5,6 +5,8 @@ actors=true), so the examples of an update come from many games instead of one g
 	                   version of the model or a fixed AI (the league: config.league)
 	real-game actors   each plays whole real games (real_games.py), every battle of them by the current model; their
 	                   records stream in while the game goes on
+	campaign games     a joint run's (campaign_model/learner.py): our campaign model's self-play games, every battle by
+	                   the current model; their battles are real games' battles here (campaign_settings)
 	the buffer         every record waits there until an update takes it, at most max_record_age model versions old
 	take()             an update's battles: real_share of its decisions from real games, the rest generated (filled
 	                   from the other source when one is short), at most game_share of them from any one game, newest
@@ -33,7 +35,7 @@ import time
 from pathlib import Path
 
 from . import generator, play, real_games
-from .data import check_record, parse_record
+from .data import check_record, compact_record, expand_record, parse_record
 from .inference import InferenceServer
 
 KEEP_VERSIONS = 6  # the newest model versions kept for the actors (older ones are deleted unless a league snapshot)
@@ -46,6 +48,7 @@ class ActorPool:
 		self.models = out / "models"
 		self.models.mkdir(parents=True, exist_ok=True)
 		self.link = self.models / "current.onnx"
+		self.eval_model = None  # the averaged weights as of the battle model's last eval (train.py), for campaign evals
 		self.generated_games = generated_games  # train.generated_games
 		# A version is the epoch that trained it (publish adds 1: the first is the model as it starts). A resumed run
 		# goes on from its epoch, and past its newest model (else it would overwrite its league snapshots): from the
@@ -121,6 +124,29 @@ class ActorPool:
 		"""The settings (env) that send an actor's battles to the inference server (one of its processes), if any."""
 		return (("ALPHA_BATTLE_INFERENCE_SOCKET", self.server.socket_for(actor)),) if self.server else ()
 
+	def campaign_settings(self, game, key, seed):
+		"""The env of campaign game number `game`'s battles (campaign_model/learner.py): every battle, the wandering
+		monsters' too, played by the current model and recorded here as a real game's (under "<key>:<COLOR>")."""
+		settings = dict(self.inference_settings(self.config.generated_actors + self.config.real_games + game))
+		settings.update(
+			ALPHA_BATTLE_MODEL=str(self.link.absolute()),
+			ALPHA_BATTLE_TEMPERATURE="1",
+			ALPHA_BATTLE_RECORD_SOCKET=str(self.records.path),
+			ALPHA_BATTLE_REQUIRE_MODEL="1",  # a battle without its model fails the game, never plays defending
+		)
+		for i, color in enumerate(real_games.PLAYER_COLORS):
+			settings[f"ALPHA_BATTLE_RECORD_KEY_{color}"] = f"{key}:{color}"
+			settings[f"ALPHA_BATTLE_SEED_{color}"] = str(seed * 101 + i)
+		return tuple(settings.items())
+
+	def eval_settings(self, game):
+		"""The env of our battles in a campaign evaluation game, greedy, not recorded: the averaged weights the battle
+		evals score (eval_model, from the last one), or the current model before it (2026-10-28 review: the two evals
+		measured different battle models)."""
+		settings = dict(self.inference_settings(game))
+		settings.update(ALPHA_BATTLE_MODEL=str((self.eval_model or self.link).absolute()), ALPHA_BATTLE_TEMPERATURE="0", ALPHA_BATTLE_REQUIRE_MODEL="1")
+		return tuple(settings.items())
+
 	# ---- actors ----
 
 	def start(self):
@@ -128,7 +154,7 @@ class ActorPool:
 			self.threads.append(threading.Thread(target=self._generated_actor, args=(i,), daemon=True))
 		for i in range(self.config.real_games):
 			self.threads.append(threading.Thread(target=self._real_actor, args=(i,), daemon=True))
-		if self.config.real_games:
+		if self.config.real_games or self.config.campaign.games:  # (campaign games' battles come in as real games')
 			self.threads.append(threading.Thread(target=self._collector, daemon=True))
 		for t in self.threads:
 			t.start()
@@ -142,18 +168,23 @@ class ActorPool:
 			self.server.close()
 
 	def _add(self, records, source, game):
+		sound, failures = [], []
+		for r in records:  # (outside the lock: the other actors and the learner go on meanwhile)
+			if any(e.get("event") == "error" for e in r.events):  # a battle the model did not play: never trained on
+				failures.append(message := next(e for e in r.events if e.get("event") == "error").get("message", "")[:300])
+				print(f"actors: a {source} battle had an error ({game}): {message}", flush=True)
+			elif problem := check_record(r):  # a corrupt record: never trained on
+				failures.append(problem[:300])
+				print(f"actors: a {source} battle's record is unsound ({game}): {problem[:300]}", flush=True)
+			else:
+				compact_record(r)  # (~10x smaller in the buffer; take() expands it)
+				r.source = source  # (data.make_dataloader normalises each source's advantages on its own)
+				sound.append(r)
 		with self.lock:
-			for r in records:
-				if any(e.get("event") == "error" for e in r.events):  # a battle the model did not play: never trained on
-					self.stats["failures"] += 1
-					self.stats["last_failure"] = message = next(e for e in r.events if e.get("event") == "error").get("message", "")[:300]
-					print(f"actors: a {source} battle had an error ({game}): {message}", flush=True)
-					continue
-				if problem := check_record(r):  # a corrupt record: never trained on
-					self.stats["failures"] += 1
-					self.stats["last_failure"] = problem[:300]
-					print(f"actors: a {source} battle's record is unsound ({game}): {problem[:300]}", flush=True)
-					continue
+			if failures:
+				self.stats["failures"] += len(failures)
+				self.stats["last_failure"] = failures[-1]
+			for r in sound:
 				self.buffer.append({"record": r, "source": source, "game": game, "version": self.version_of(r), "decisions": r.decisions})
 				self.stats["battles"][source] += 1
 			self.lock.notify_all()
@@ -188,8 +219,8 @@ class ActorPool:
 		while not self.stop.is_set():
 			if self.version < 0 or not self.running.wait(timeout=1):
 				continue
-			with self.lock:  # backpressure: no battle while the buffer holds this source's share of an update
-				if self.generated_waiting() >= (1 - self.config.real_share) * self.config.decisions_per_update:
+			with self.lock:  # backpressure: no battle while the buffer holds what the next update takes of this source
+				if self.generated_waiting() >= self.generated_room():
 					self.lock.wait(timeout=1)
 					continue
 			n += 1
@@ -213,6 +244,15 @@ class ActorPool:
 					path.unlink(missing_ok=True)
 		if process:
 			process.close()
+
+	def generated_room(self):
+		"""The generated decisions the next update takes (call with self.lock held): their share of it, or more when the
+		real games' battles waiting fall short of theirs, as _select then fills the update with generated ones
+		(2026-10-28: campaign battles were ~20% of each update, not real_share's 40%, and with the generated actors held
+		at their 60% the learner waited 13-50 s an update for the campaign's battles)."""
+		config = self.config
+		real = sum(b["decisions"] for b in self.buffer if b["source"] == "real" and b["version"] >= self.version - config.max_record_age)
+		return max((1 - config.real_share) * config.decisions_per_update, config.decisions_per_update - real)
 
 	def generated_waiting(self):
 		"""Decisions of generated battles in the buffer, young enough to be used (call with self.lock held)."""
@@ -289,7 +329,7 @@ class ActorPool:
 				"dropped_stale": self.stats["dropped_stale"],
 				"dropped_overflow": self.stats["dropped_overflow"],
 			}
-		return [b["record"] for b in chosen], stats
+		return [expand_record(b["record"]) for b in chosen], stats
 
 	def _select(self, decisions):
 		"""(battles, decisions per game, decisions per source) for an update, oldest first (within max_record_age: newest
@@ -312,7 +352,7 @@ class ActorPool:
 				per_game[b["game"]] = per_game.get(b["game"], 0) + b["decisions"]
 				taken[source] += b["decisions"]
 
-		real_goal = config.real_share * decisions if config.real_games else 0.0
+		real_goal = config.real_share * decisions if config.real_games or config.campaign.games else 0.0
 		pick("real", real_goal)
 		pick("generated", decisions - real_goal)
 		pick("real", decisions)  # one source short: the other fills the update

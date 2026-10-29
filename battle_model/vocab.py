@@ -40,7 +40,12 @@ def creature(id_):
 
 
 def creature_value(id_):
-	"""Gold value of one creature (gold + resources at base prices), for the reward."""
+	"""Gold value of one creature (gold + resources at base prices), for the reward; a war machine's is
+	game_values.WAR_MACHINE_CREATURES'."""
+	from game_values import WAR_MACHINE_CREATURES
+
+	if id_ in WAR_MACHINE_CREATURES:
+		return WAR_MACHINE_CREATURES[id_]
 	return resources_value(creature(id_).get("cost", {}))
 
 

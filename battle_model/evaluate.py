@@ -22,10 +22,12 @@ from .reward import to_scale
 from .train import ROOT, TrainConfig
 
 
-def load(checkpoint):
+def load(checkpoint, weights="average"):
+	"""(model, epoch) of a checkpoint; weights: "average" (the weights the run's evals played, train.WeightAverage;
+	the trained ones in a checkpoint without it) or "model" (the trained weights)."""
 	state = torch.load(checkpoint, map_location="cpu")
 	model = build_model(state.get("model_kwargs", {}))  # without the key: the first model (model_v1)
-	model.load_state_dict(state["model"])
+	model.load_state_dict(state.get(weights, state["model"]))
 	return model.eval(), state["epoch"]
 
 

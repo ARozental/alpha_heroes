@@ -1,0 +1,429 @@
+"""PPO for the campaign model: the update a joint run takes (learner.py) and a one-game smoke test.
+
+	.venv/bin/python -m campaign_model.train --days 5 --seed 1     # one self-play game, then one update
+
+PPO as the battle model's (battle_model/train.py): the clipped surrogate on advantages normalized over the update,
+passes over minibatches of fixed size, the KL control (an update stops once its KL from the policy at its start passes
+1.5 x target_kl, and the rate's scale is cut by 1.5, or raised back by 1.5 after an update that ended under half of it,
+never above lr_scale_max: the user's rule, never above 1e-4). Entropy: a floor, not a bonus (battle_model/losses.py's
+lesson of 2026-10-28: a constant bonus is a consistent push that beats a noise-level policy gradient), with the
+parents' probabilities detached (a type's table entropy weighs by p(type), which gets no gradient from it:
+test_entropy_bonus_does_not_favour_types_with_many_options). The value heads are trained with cross-entropy (the
+user's rule for 0..1 targets: it learns far better than squared error, whose gradient dies near 0 and 1) against
+their grades (labels.ladder_targets: the shares VALUE_OFFSETS days on, the longer heads' graded against the shorter
+ones' later forecasts), and the growth heads, at growth_weight each, against our own value's log growth on their 0..1
+scale (labels.growth_scale), and V_end, at a share head's weight, against its grades (labels.end_targets); a missing
+grade (nan: past the day cap) is left out, and so is a decision without credit from the policy's loss. The optimizer (make_optimizer) is Adam, with weight decay only on the
+corrections of the model's fixed priors (model.prior_corrections): back to the prior unless the games keep pushing.
+"""
+import argparse
+import contextlib
+import json
+import queue
+import random
+import threading
+import time
+from collections import Counter, deque
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from battle_model import play as battle_play
+from battle_model.inference import InferenceServer
+
+from . import constants as c
+from .config import CampaignConfig
+from .empire import EmpireConfig, empire_value
+from .labels import COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, blend_credit, end_advantages, end_labels, end_steps, explained_variance, growth_labels, label, residual_variances
+from .model import CampaignModel
+from .play import make_map, play
+from .records import NO_EFFECT, decode_inputs
+from .schema import HEADS
+
+RUNS = battle_play.ROOT / "runtime" / "campaign"
+TURN_KINDS = (c.DecisionKind.TURN, c.DecisionKind.EXCHANGE)
+
+
+def model_kwargs(config):
+	return {"dim": config.model_dim, "cell_dim": config.model_cell_dim, "heads": config.model_heads, "layers": config.model_layers}
+
+
+@contextlib.contextmanager
+def serve_model(checkpoint="", model_kwargs=None, processes=1, threads=2):
+	"""A model (new, or a checkpoint's) served under "current" by an inference server for the games."""
+	model, version = CampaignModel(**(model_kwargs or {})), 0
+	if checkpoint:
+		state = torch.load(checkpoint, map_location="cpu")
+		model_kwargs = state.get("model_kwargs", {})
+		model = CampaignModel(**model_kwargs)
+		model.load_state_dict(state["model"])
+		version = state.get("version", 0)
+	battle_play.SOCKET_DIR.mkdir(parents=True, exist_ok=True)
+	server = InferenceServer(battle_play.SOCKET_DIR / f"campaign-{random.getrandbits(32):08x}.sock", family="campaign", model_kwargs=model_kwargs, threads=threads, processes=processes)
+	try:
+		server.set_model("current", version + 1, model)
+		yield model, server
+	finally:
+		server.close()
+
+
+def usable(decisions):
+	"""The decisions to train on: the ones the AI made (a turn decision with no legal entry, or no model, has none)."""
+	return [d for d in decisions if (d.action_type == c.ActionType.END or d.index >= 0) and (d.kind not in TURN_KINDS or d.action_type >= 0)]
+
+
+def head_entropy(logp):
+	"""Entropy of each row of log-probability tables [N, ...] (-inf entries are impossible)."""
+	flat = logp.reshape(logp.shape[0], -1)
+	p = flat.exp()
+	return -(p * torch.where(torch.isfinite(flat), flat, torch.zeros_like(flat))).sum(dim=-1)
+
+
+def choices(decisions):
+	"""The decisions' choices and what the model said when they were made, as arrays."""
+	return {
+		"kind": np.array([d.kind for d in decisions], dtype=np.int64),
+		"action": np.array([d.action_type for d in decisions], dtype=np.int64),
+		"index": np.array([d.index for d in decisions], dtype=np.int64),
+		"cell": np.array([d.cell for d in decisions], dtype=np.int64),
+		"old_logp": np.array([d.logp for d in decisions], dtype=np.float32),
+		"old_value": np.array([d.value for d in decisions], dtype=np.float32).reshape(-1, c.N_VALUE_OFFSETS),
+	}
+
+
+def chosen_logp(out, choice):
+	"""The log-probability (now) of each decision's choice [N] and its decision's entropy [N]: a turn's is the type's
+	plus each type's table entropy weighted by p(type) without its gradient; a question's is its options'.
+
+	choice: tensors [N] kind, action (ActionType, -1 for a question), index (in the type's table, or the option), cell
+	(a targeted spell's tile, -1 none)."""
+	kind, action, index, cell = choice["kind"], choice["action"], choice["index"], choice["cell"]
+	n = kind.shape[0]
+	rows = torch.arange(n, device=kind.device)
+	turn = (kind == c.DecisionKind.TURN) | (kind == c.DecisionKind.EXCHANGE)
+	type_logp = out["type_logp"]
+	type_p = type_logp.exp().detach()
+	zero = torch.zeros((), device=kind.device)
+	logp = torch.where(turn, type_logp[rows, action.clamp(min=0)], out["option_logp"][rows, index.clamp(0, c.N_OPTIONS - 1)])
+	entropy = head_entropy(type_logp)
+	for a, (output, _) in HEADS.items():
+		table = out[output].reshape(n, -1)
+		chosen = turn & (action == a)
+		logp = logp + torch.where(chosen, table[rows, index.clamp(0, table.shape[1] - 1)], zero)
+		entropy = entropy + type_p[:, a] * head_entropy(table)
+	# A targeted spell's tile: its hero's own table
+	hero = torch.div(index.clamp(min=0), c.N_ADVENTURE_SPELLS, rounding_mode="floor").clamp(max=c.OWN_HEROES - 1)
+	cells = out["cast_cell_logp"].reshape(n, c.OWN_HEROES, -1)[rows, hero]
+	targeted = turn & (action == c.ActionType.CAST) & (cell >= 0)
+	logp = logp + torch.where(targeted, cells[rows, cell.clamp(min=0)], zero)
+	entropy = torch.where(turn, entropy, head_entropy(out["option_logp"]))
+	return logp, entropy
+
+
+def _prefetched(batches, decode, device):
+	"""(rows, inputs on device) of each batch of rows, decoded one batch ahead in a thread (zlib and numpy let the
+	training step go on meanwhile)."""
+	ready = queue.Queue(maxsize=2)
+
+	def work():
+		try:
+			for rows in batches:
+				ready.put((rows, decode(rows)))
+		except BaseException as error:  # re-raised in the training thread
+			ready.put(error)
+		ready.put(None)
+
+	threading.Thread(target=work, daemon=True).start()
+	while (item := ready.get()) is not None:
+		if isinstance(item, BaseException):
+			raise item
+		rows, inputs = item
+		yield rows, {name: torch.from_numpy(value).to(device) for name, value in inputs.items()}
+
+
+def make_optimizer(model, config=CampaignConfig()):
+	"""AdamW: no weight decay but on the corrections of the model's fixed priors (model.prior_corrections: the object
+	values' gains and deltas), decayed by config.prior_decay toward 0, the prior (the user, 2026-10-28: the
+	regularization penalizes the change from Nullkiller2's values). Adam moves a weight ~lr a step when its gradient is
+	consistent and the decay pulls lr x prior_decay x weight back, so a correction's weight settles near 1 / prior_decay
+	under a steady push (its effect: CORRECTION_STEP times that) and near 0 under noise."""
+	corrections = model.prior_corrections()
+	ids = {id(p) for p in corrections}
+	rest = [p for p in model.parameters() if id(p) not in ids]
+	return torch.optim.AdamW([{"params": rest, "weight_decay": 0.0}, {"params": corrections, "weight_decay": config.prior_decay}], lr=config.learning_rate)
+
+
+def value_fit(predicted, actual):
+	"""The 7-day head's fit, both off the share prior: the correlation of its forecasts with what then happened, and each
+	one's spread (std): a negative explained variance is noise (correlation ~0) or overconfidence (correlation > 0,
+	the forecasts' spread above the correlation x the outcomes')."""
+	ok = np.isfinite(actual) & np.isfinite(predicted)
+	if ok.sum() < 3:
+		return {"value_corr": float("nan"), "value_spread": float("nan"), "label_spread": float("nan")}
+	p, a = predicted[ok], actual[ok]
+	return {"value_corr": float(np.corrcoef(p, a)[0, 1]) if p.std() > 0 and a.std() > 0 else 0.0, "value_spread": float(p.std()), "label_spread": float(a.std())}
+
+
+def gpu_held(device, release=False):
+	"""On Apple's GPU: the memory the process holds there (MB); release: its cached blocks freed after. The batches'
+	shapes vary (windows only for the heroes present) and MPS keeps a block of every size it saw: the update held ~8 GB
+	more than it used (2026-10-28), next to the battle learner's, and the machine swapped. Freeing them every step
+	doubled the update's time; the update process sets MPS's low watermark instead (learner.MPS_LOW_WATERMARK), so the
+	allocator frees them itself when it holds too much."""
+	if device.type != "mps":
+		return 0.0
+	held = torch.mps.driver_allocated_memory() / 2**20
+	if release:
+		torch.mps.empty_cache()
+	return held
+
+
+# The KL control judges the update's KL by the mean of its last minibatches' (k3 estimates): one minibatch's is noise
+# (2026-10-28 review: 15% of v15-window's updates stopped early, 99% of them with a mean KL under half the stop line)
+KL_WINDOW = 4
+
+
+def head_loss(logits, targets, valid, count=None):
+	"""[heads] each head's cross-entropy against its soft targets, over the decisions that have one (valid): its sum over
+	them / their count (count: the whole minibatch's, for one micro-batch of it)."""
+	loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none") * valid
+	return loss.sum(dim=0) / (valid.sum(dim=0) if count is None else count).clamp(min=1)
+
+
+def ppo_update(
+	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
+	growth=None, labels=None, end=None,
+):
+	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
+	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
+	share heads' grades (labels.ladder_targets; nan: none); growth [N, N_VALUE_OFFSETS] or None: the growth heads',
+	the log of our value at the end of each day (labels.growth_labels), learned over our value at the decision (the
+	model's Φ of its inputs, detached); labels: the real shares, for the heads' explained variance (default: targets).
+	advantages [N]: the policy's (labels.horizon_advantages; nan: no credit, left out of the policy's loss), or None
+	for the mix of returns [N] (the label mix minus the decisions' price) minus the heads' mix (weights).
+	end or None: the end head's, {"targets" [N]: its grades (labels.end_targets), "real" [N] (labels.end_labels),
+	"step", "week" [N]: indices into these decisions (labels.end_steps), "price" [N] (labels.label's), "weight": the
+	end credit's share of the policy's advantage, "outcome": the week's share in it (labels.end_advantages)}; the end
+	credit is computed here, from V_end of the model as the update starts (the KL anchor's pass), and blended with
+	advantages (labels.blend_credit) before they are normalized. decode(rows) gives the inputs of those decisions
+	(default: decode_inputs). Returns (metrics, the KL control's new lr_scale)."""
+	n, started = len(decisions), time.time()
+	decode = decode or (lambda rows: decode_inputs([decisions[r] for r in rows]))
+	choice = {name: torch.from_numpy(value).to(device) for name, value in choices(decisions).items()}
+	if advantages is None:
+		baseline = choice["old_value"] @ torch.tensor(weights, dtype=torch.float32, device=device)
+		advantage = torch.from_numpy(np.asarray(returns, dtype=np.float32)).to(device) - baseline
+	else:
+		advantage = torch.from_numpy(np.asarray(advantages, dtype=np.float32)).to(device)
+	targets_t = torch.from_numpy(np.asarray(targets, dtype=np.float32)).to(device)
+	share_valid = torch.isfinite(targets_t).float()
+	targets_t = targets_t.nan_to_num(0.0)
+	if growth is not None:
+		growth_t = torch.from_numpy(np.asarray(growth, dtype=np.float32)).to(device)
+		growth_valid = torch.isfinite(growth_t).float()
+		growth_t = growth_t.nan_to_num(0.0)
+	if end is not None:
+		end_t = torch.from_numpy(np.asarray(end["targets"], dtype=np.float32)).to(device)
+		end_valid = torch.isfinite(end_t).float()
+		end_t = end_t.nan_to_num(0.0)
+	for group in optimizer.param_groups:
+		group["lr"] = config.learning_rate * lr_scale
+	size = config.batch_size
+	# The KL control's anchor: each decision's choice under the model as the update starts; and V_end there (the end
+	# credit's)
+	model.eval()
+	anchor, end_now, prior = torch.empty(n, device=device), torch.empty(n, device=device), torch.empty(n, device=device)
+	gpu_anchor_mb = 0.0
+	with torch.no_grad():
+		chunk = max(1, size // max(1, config.micro_batches))  # (no gradients, but at a whole minibatch it was the update's peak: 5.2 GB)
+		chunks = [np.arange(i, i + chunk).clip(max=n - 1) for i in range(0, n, chunk)]  # the last one padded: fixed shapes
+		for rows, inputs in _prefetched(chunks, decode, device):
+			index = torch.from_numpy(rows).to(device)
+			out = model(inputs)
+			logp, _ = chosen_logp(out, {k: choice[k][index] for k in ("kind", "action", "index", "cell")})
+			anchor[index] = logp
+			end_now[index] = torch.sigmoid(out["end_logit"].float())
+			prior[index] = 1.0 / inputs["g_players"].float().clamp(min=2)  # the share heads' start: 1 / players
+			gpu_anchor_mb = max(gpu_anchor_mb, gpu_held(device))
+	gpu_mb = 0.0
+	if end is not None and end["weight"] > 0:  # the policy's credit moves toward the end's as V_end proves itself
+		turn = choices(decisions)["kind"] == c.DecisionKind.TURN
+		later = end_advantages(end_now.cpu().numpy(), end["step"], end["week"], end["real"], end["price"], turn, config.decision_price, end["outcome"])
+		advantage = torch.from_numpy(blend_credit(advantage.cpu().numpy(), later, end["weight"])).to(device)
+	credited = torch.isfinite(advantage)
+	if int(credited.sum()) > 1:
+		advantage = (advantage - advantage[credited].mean()) / (advantage[credited].std() + 1e-8)
+	advantage = torch.where(credited, advantage, torch.zeros_like(advantage))
+	unsound = ~torch.isfinite(anchor)  # a choice the model calls impossible now (its legality changed): left out
+	totals, steps, stopped, update_kl, recent = Counter(), 0, False, 0.0, deque(maxlen=KL_WINDOW)
+	model.train()
+	for _ in range(config.passes):
+		if stopped:
+			break
+		order = torch.randperm(n).numpy()
+		if n >= size:
+			order = order[: n - n % size]
+		for rows, inputs in _prefetched([order[i : i + size] for i in range(0, len(order), size)], decode, device):
+			index = torch.from_numpy(rows).to(device)
+			whole = (~unsound[index]).float()
+			# The minibatch's counts: each micro-batch's losses are its sums over these, so the micro-batches' gradients add
+			# up to the whole minibatch's, at 1 / micro_batches of its peak memory (2026-10-28: the update's ~8 GB on
+			# Apple's GPU next to the battle learner's sent the machine into swap)
+			counts = {"credit": (whole * credited[index].float()).sum().clamp(min=1), "keep": whole.sum().clamp(min=1), "share": share_valid[index].sum(dim=0)}
+			if growth is not None:
+				counts["growth"] = growth_valid[index].sum(dim=0)
+			if end is not None:
+				counts["end"] = end_valid[index].sum(dim=0)
+			optimizer.zero_grad()
+			step = Counter()
+			for part in np.array_split(np.arange(len(rows)), max(1, min(config.micro_batches, len(rows)))):
+				at = torch.from_numpy(part).to(device)
+				sub, keep = index[at], whole[at]
+				out = model({name: value[at] for name, value in inputs.items()})
+				logp, entropy = chosen_logp(out, {k: choice[k][sub] for k in ("kind", "action", "index", "cell")})
+				logp = torch.where(keep > 0, logp, choice["old_logp"][sub])
+				log_ratio = logp - choice["old_logp"][sub]
+				ratio = log_ratio.exp()
+				a, credit = advantage[sub], keep * credited[sub].float()
+				policy = -(torch.minimum(ratio * a, ratio.clamp(1 - config.clip, 1 + config.clip) * a) * credit).sum() / counts["credit"]
+				value, heads = head_loss(out["value_logit"], targets_t[sub], share_valid[sub], counts["share"]).sum(), float(c.N_VALUE_OFFSETS)
+				if growth is not None:  # our value's log growth from the decision, on the heads' 0..1 scale
+					now = out["phi"].detach().clamp(min=PHI_FLOOR).log().unsqueeze(-1)
+					scaled = ((growth_t[sub] - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
+					value = value + config.growth_weight * head_loss(out["growth_logit"], scaled, growth_valid[sub], counts["growth"]).sum()
+					heads += config.growth_weight * c.N_VALUE_OFFSETS
+				if end is not None:  # V_end, at a share head's weight
+					value = value + head_loss(out["end_logit"].unsqueeze(-1), end_t[sub].unsqueeze(-1), end_valid[sub].unsqueeze(-1), counts["end"].unsqueeze(-1)).sum()
+					heads += 1.0
+				value = value / heads
+				bonus = (entropy * keep).sum() / counts["keep"]
+				floor = (torch.relu(config.entropy_floor - entropy) * keep).sum() / counts["keep"]  # only decisions below it
+				loss = policy + config.value_weight * value - config.entropy_weight * bonus + config.entropy_floor_weight * floor
+				loss.backward()
+				drift = logp.detach() - anchor[sub].nan_to_num(neginf=0.0)
+				step.update(
+					policy=policy.item(),
+					value=value.item(),
+					entropy=bonus.item(),
+					below_floor=float(((entropy < config.entropy_floor).float() * keep).sum() / counts["keep"]),
+					clip_fraction=float((((ratio - 1).abs() > config.clip).float() * keep).sum() / counts["keep"]),
+					kl=float((((drift.exp() - 1) - drift) * keep).sum() / counts["keep"]),  # k3, before this step
+				)
+			grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip))
+			optimizer.step()
+			gpu_mb = max(gpu_mb, gpu_held(device))
+			steps += 1
+			recent.append(step["kl"])
+			update_kl = float(np.mean(recent))  # the update's KL: the last KL_WINDOW minibatches', not one's
+			totals.update(step, grad_norm=grad_norm)
+			if config.target_kl and update_kl > 1.5 * config.target_kl:
+				stopped = True  # this update has moved the policy far enough
+				break
+	model.eval()
+	if config.target_kl and steps:
+		if stopped:
+			lr_scale = max(0.1, lr_scale / 1.5)
+		elif update_kl < config.target_kl / 2:
+			lr_scale = min(config.lr_scale_max, lr_scale * 1.5)
+	# The share heads' explained variance over the share prior's: the player count alone explains much of a share (1/2 in
+	# a 2-player game, 1/4 in a 4-player one), and the heads start there, so plain EV trusted them before they learned
+	predicted, actual = choice["old_value"].cpu().numpy(), np.asarray(targets if labels is None else labels, dtype=np.float32)
+	predicted, actual = predicted - prior.cpu().numpy()[:, None], actual - prior.cpu().numpy()[:, None]
+	metrics = {key: value / max(steps, 1) for key, value in totals.items()}
+	metrics.update(
+		steps=steps,
+		stopped=stopped,
+		last_kl=update_kl,
+		unsound=int(unsound.sum()),
+		decisions=n,
+		learning_rate=config.learning_rate * lr_scale,
+		credited=int(credited.sum()),
+		gpu_mb=gpu_mb,
+		gpu_anchor_mb=gpu_anchor_mb,
+		update_seconds=time.time() - started,
+		**{f"value_ev_d{k}": explained_variance(predicted[:, i], actual[:, i]) for i, k in enumerate(c.VALUE_OFFSETS)},
+		**{f"value_parts_d{k}": residual_variances(predicted[:, i], actual[:, i]) for i, k in enumerate(c.VALUE_OFFSETS)},
+		**value_fit(predicted[:, -1], actual[:, -1]),
+	)
+	return metrics, lr_scale
+
+
+def summarize(game, empire=EmpireConfig()):
+	"""Per day and player: Φ and its parts, the share, heroes; and the decisions by kind and action type."""
+	lines = []
+	heroes = []
+	for day, snapshot in sorted(game.ledgers.items()):
+		values = {COLORS[p["color"]]: empire_value(p, empire) for p in snapshot["players"]}
+		total = sum(max(v["total"], 0) for v in values.values()) or 1
+		for p in snapshot["players"]:
+			if p["status"] == 0:
+				heroes.append(len(p["heroes"]))
+		cells = "  ".join(f"{color} {v['total']:8.0f} ({max(v['total'], 0) / total:.3f})" for color, v in values.items())
+		lines.append(f"start of day {day}: {cells}")
+	last = game.ledgers[max(game.ledgers)] if game.ledgers else None
+	if last:
+		for p in last["players"]:
+			parts = empire_value(p, empire)
+			lines.append(f"  {COLORS[p['color']]:6s} " + " ".join(f"{k} {v:.0f}" for k, v in parts.items() if k != "total"))
+	kinds = Counter(c.DecisionKind(d.kind).name for d in game.decisions)
+	types = Counter(c.ActionType(d.action_type).name for d in game.decisions if d.action_type >= 0)
+	no_effect = Counter(c.ActionType(d.action_type).name for d in game.decisions if d.flags & NO_EFFECT)
+	lines.append(f"decisions by kind {dict(kinds)}; turn actions {dict(types)}; changed nothing {dict(no_effect)}")
+	lines.append(f"heroes (mean over players and days): {np.mean(heroes) if heroes else float('nan'):.2f}")
+	return "\n".join(lines), (float(np.mean(heroes)) if heroes else float("nan"))
+
+
+def main():
+	parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+	parser.add_argument("--days", type=int, default=5)
+	parser.add_argument("--seed", type=int, default=1)
+	parser.add_argument("--players", type=int, default=0, help="0: 2 to 4 at random")
+	parser.add_argument("--size", type=int, default=36)
+	parser.add_argument("--water", default="random")
+	parser.add_argument("--checkpoint", default="", help="start from this checkpoint (default: a new model)")
+	parser.add_argument("--max-seconds", type=int, default=170, help="the game's time limit (headless.sh kills it)")
+	parser.add_argument("--battle-ai", default="BattleAI")
+	parser.add_argument("--name", default="")
+	args = parser.parse_args()
+	torch.manual_seed(args.seed)
+	config, labels = CampaignConfig(passes=1), LabelConfig()
+	name = args.name or time.strftime("%Y%m%d-%H%M%S")
+	out_dir = RUNS / name
+	out_dir.mkdir(parents=True, exist_ok=True)
+
+	players = args.players or random.Random(args.seed).randint(2, 4)
+	map_name, template = make_map(args.seed, players, args.size, water=args.water)
+	print(f"map {map_name} ({template}), {players} players, {args.days} days")
+	with serve_model(args.checkpoint) as (model, server):
+		game, info = play(server.socket_path, map_name, args.days, args.seed, max_seconds=args.max_seconds, battle_ai=args.battle_ai)
+	(battle_play.USER_DIR / (map_name + ".vmap")).unlink(missing_ok=True)
+	info.template = template
+	print(f"game: {info.status}, {info.seconds:.1f}s, logs {info.run_mb:.1f} MB; records {game.record_bytes / 2**20:.2f} MB "
+		  f"({game.record_bytes / max(len(game.decisions), 1) / 1024:.1f} KB a decision, {game.record_bytes / 2**20 / max(info.seconds, 1e-9) * 60:.2f} MB/min)")
+	print(f"AIs: {game.done}")
+	summary, heroes_mean = summarize(game)
+	print(summary)
+	(out_dir / "ledgers.json").write_text(json.dumps({"days": game.ledgers, "final": game.final}))
+	(out_dir / "decisions.json").write_text(json.dumps([{k: v for k, v in vars(d).items() if k != "inputs"} for d in game.decisions]))
+	game.decisions, game.days = usable(game.decisions), args.days
+	if not game.decisions or not game.ledgers:
+		raise SystemExit("no decisions or no ledger: nothing to train on")
+	targets, mixed, price = label(game, labels)
+	real = end_labels(game)
+	step, week = end_steps(game)
+	end = {"targets": real, "real": real, "step": step, "week": week, "price": price, "weight": 0.0, "outcome": 1.0}  # (V_end trained, not yet credited)
+	optimizer = make_optimizer(model, config)
+	started = time.time()
+	metrics, _ = ppo_update(model, optimizer, game.decisions, targets, mixed - price, config, growth=growth_labels(game), end=end)
+	metrics["seconds"] = time.time() - started
+	metrics.update(heroes_mean=heroes_mean, label_mean=float(np.nanmean(mixed)), price_mean=float(price.mean()), game_seconds=info.seconds, game_status=info.status)
+	print("update: " + ", ".join(f"{k} {v:.4g}" if isinstance(v, float) else f"{k} {v}" for k, v in metrics.items()))
+	checkpoint = out_dir / "model_00001.pt"
+	torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "version": 1, "model_kwargs": {}}, checkpoint)
+	(out_dir / "metrics.json").write_text(json.dumps({"map": map_name, "template": template, "players": players, **metrics}, indent=1, default=str))
+	print(f"saved {checkpoint}")
+
+
+if __name__ == "__main__":
+	main()

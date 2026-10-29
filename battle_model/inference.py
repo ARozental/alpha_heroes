@@ -3,9 +3,10 @@ live weights. The games ask it over a Unix socket instead of each loading an ONN
 create the session) and running it on a CPU core; the trainer sends new weights over a pipe instead of exporting them
 (1.3 s an update). The ONNX path stays for evals and the finished product.
 
-Generic over model families (a network and its contract): "battle" now, the adventure map later. A client says which
-family it speaks at the start (the contract hash must match) and names the model of each request: "current" (the
-trainer's newest weights) or any other the trainer set, e.g. a past version for the league ("v350").
+Generic over model families (a network and its contract): "battle", and "campaign" (the adventure map,
+campaign_model/). A client says which family it speaks at the start (the contract hash must match) and names the model
+of each request: "current" (the trainer's newest weights) or any other the trainer set, e.g. a past version for the
+league ("v350").
 
 Wire protocol, little endian, one request at a time per connection; every message is a u32 length and that many bytes:
   hello    client: json {"family": ..., "contract_hash": ...}          server: json {"ok": true} or {"error": ...}
@@ -37,10 +38,16 @@ class Family:
 
 
 def families():
+	from campaign_model import schema as campaign_schema
+	from campaign_model.model import build_model as build_campaign_model
+
 	from . import schema
 	from .model import build_model
 
-	return {"battle": Family(schema.INPUTS, schema.OUTPUTS, schema.contract_hash(), build_model)}
+	return {
+		"battle": Family(schema.INPUTS, schema.OUTPUTS, schema.contract_hash(), build_model),
+		"campaign": Family(campaign_schema.INPUTS, campaign_schema.OUTPUTS, campaign_schema.contract_hash(), build_campaign_model),
+	}
 
 
 def wire_layout(specs, inputs):

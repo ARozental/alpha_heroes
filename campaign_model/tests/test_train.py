@@ -1,0 +1,193 @@
+import numpy as np
+import torch
+
+from campaign_model import constants as c
+from campaign_model.model import CampaignModel
+from campaign_model.records import Decision
+from campaign_model.schema import HEADS, random_inputs
+from campaign_model.config import CampaignConfig
+from campaign_model.train import choices, chosen_logp, head_entropy, ppo_update
+
+
+def sample(out, x, b, rng):
+	"""A choice drawn as AlphaMapAI::sample draws it: the type, then its table (or an option)."""
+	def draw(logp):
+		p = logp.exp().numpy().reshape(-1)
+		return int(rng.choice(len(p), p=p / p.sum()))
+
+	kind = int(x["g_kind"][b])
+	if kind not in (c.DecisionKind.TURN, c.DecisionKind.EXCHANGE):
+		return -1, draw(out["option_logp"][b]), -1
+	action = draw(out["type_logp"][b])
+	if action == c.ActionType.END:
+		return action, -1, -1
+	return action, draw(out[HEADS[c.ActionType(action)][0]][b]), -1
+
+
+def decisions_for(model, x, seed=0):
+	rng = np.random.default_rng(seed)
+	with torch.no_grad():
+		out = model({k: torch.from_numpy(v) for k, v in x.items()})
+	result = []
+	for b in range(len(x["g_kind"])):
+		action, index, cell = sample(out, x, b, rng)
+		logp = float(out["type_logp"][b, action] + (out[HEADS[c.ActionType(action)][0]][b].reshape(-1)[index] if action > 0 else 0)) if action >= 0 else float(out["option_logp"][b, index])
+		result.append(Decision("RED", 1, int(x["g_kind"][b]), b, 1, action, index, cell, logp, tuple(out["value"][b].tolist()), 0, b""))
+	return result
+
+
+def choice_tensors(decisions):
+	return {k: torch.from_numpy(v) for k, v in choices(decisions).items() if k in ("kind", "action", "index", "cell")}
+
+
+def test_chosen_logp_is_the_log_probability_the_ai_sampled_with():
+	torch.manual_seed(0)
+	model = CampaignModel(dim=32, cell_dim=16, layers=1).eval()
+	x = random_inputs(8, seed=3)
+	decisions = decisions_for(model, x)
+	with torch.no_grad():
+		logp, entropy = chosen_logp(model({k: torch.from_numpy(v) for k, v in x.items()}), choice_tensors(decisions))
+	assert np.allclose(logp.numpy(), [d.logp for d in decisions], atol=1e-5)
+	assert (entropy >= 0).all()
+
+
+def test_entropy_bonus_does_not_favour_types_with_many_options():
+	"""The bonus's gradient on the type logits is the type entropy's alone (the parents' probabilities detached)."""
+	torch.manual_seed(1)
+	model = CampaignModel(dim=32, cell_dim=16, layers=1)
+	x = random_inputs(6, seed=5)
+	decisions = [Decision("RED", 1, int(k), 0, 1, 0, -1, -1, 0.0, (0.5,) * 3, 0, b"") for k in x["g_kind"]]
+	out = model({k: torch.from_numpy(v) for k, v in x.items()})
+	type_logp = out["type_logp"].detach().clone().requires_grad_()
+	_, entropy = chosen_logp({**out, "type_logp": type_logp}, choice_tensors(decisions))
+	(full,) = torch.autograd.grad(entropy.sum(), type_logp)
+	alone_logp = type_logp.detach().clone().requires_grad_()
+	turn = torch.tensor([int(k) in (c.DecisionKind.TURN, c.DecisionKind.EXCHANGE) for k in x["g_kind"]])
+	(alone,) = torch.autograd.grad((head_entropy(alone_logp) * turn).sum(), alone_logp)
+	legal = torch.isfinite(out["type_logp"])
+	assert torch.allclose(full[legal], alone[legal], atol=1e-6)
+
+
+def test_an_update_moves_the_weights_a_little():
+	torch.manual_seed(2)
+	model = CampaignModel(dim=32, cell_dim=16, layers=1)
+	x = random_inputs(10, seed=6)
+	decisions = decisions_for(model.eval(), x)
+	before = [p.detach().clone() for p in model.parameters()]
+	targets = np.full((10, c.N_VALUE_OFFSETS), 0.6, dtype=np.float32)
+	returns = np.linspace(0.3, 0.7, 10).astype(np.float32)
+	config = CampaignConfig(batch_size=4, passes=2)
+	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
+	metrics, scale = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, returns, config, decode=decode)
+	assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters()))
+	assert metrics["steps"] == 4 and metrics["unsound"] == 0 and metrics["decisions"] == 10  # 2 passes of 2 full minibatches
+	assert np.isfinite(metrics["kl"]) and metrics["kl"] < 0.02 and 0.1 <= scale <= 1.0
+
+
+def test_the_kl_control_stops_an_update_that_moves_too_far():
+	torch.manual_seed(3)
+	model = CampaignModel(dim=32, cell_dim=16, layers=1)
+	x = random_inputs(16, seed=7)
+	decisions = decisions_for(model.eval(), x)
+	targets = np.full((16, c.N_VALUE_OFFSETS), 0.5, dtype=np.float32)
+	returns = np.linspace(-1, 1, 16).astype(np.float32)
+	config = CampaignConfig(batch_size=4, passes=20, learning_rate=0.05, target_kl=1e-4)
+	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
+	metrics, scale = ppo_update(model, torch.optim.Adam(model.parameters()), decisions, targets, returns, config, decode=decode)
+	assert metrics["stopped"] and metrics["steps"] < 80 and scale == 1 / 1.5
+
+
+def test_head_loss_counts_only_the_decisions_with_a_grade():
+	from campaign_model.train import head_loss
+
+	logits = torch.tensor([[0.0, 1.0], [2.0, -1.0], [0.5, 0.5]])
+	targets = torch.tensor([[0.5, 0.2], [0.9, 0.0], [0.1, 0.7]])
+	valid = torch.tensor([[1.0, 1.0], [1.0, 0.0], [0.0, 1.0]])
+	every = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+	assert torch.allclose(head_loss(logits, targets, valid), torch.stack([every[:2, 0].mean(), every[[0, 2], 1].mean()]))
+
+
+def test_an_update_leaves_out_missing_grades_and_credit_and_trains_the_growth_heads():
+	"""Grades past the day cap (nan) add nothing to their heads' loss, decisions without credit (nan) nothing to the
+	policy's; the growth heads learn our value's growth over the model's Φ at the decision."""
+	torch.manual_seed(4)
+	model = CampaignModel(dim=32, cell_dim=16, layers=1)
+	x = random_inputs(8, seed=9)
+	decisions = decisions_for(model.eval(), x)
+	targets = np.full((8, c.N_VALUE_OFFSETS), 0.6, dtype=np.float32)
+	targets[4:, 1:] = np.nan
+	growth = np.full((8, c.N_VALUE_OFFSETS), np.log(50000.0), dtype=np.float32)
+	growth[6:] = np.nan
+	advantages = np.linspace(-1, 1, 8).astype(np.float32)
+	advantages[[1, 5]] = np.nan
+	before = model.growth_heads.weight.detach().clone()
+	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
+	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, None, CampaignConfig(batch_size=4, passes=1), decode=decode, advantages=advantages, growth=growth)
+	assert metrics["credited"] == 6 and np.isfinite(metrics["value"]) and np.isfinite(metrics["policy"])
+	assert not torch.equal(before, model.growth_heads.weight)
+
+
+def test_an_update_trains_the_end_head_and_credits_through_it_by_its_weight():
+	"""V_end learns its grades; the end credit (from V_end of the model as the update starts) takes its weight's share
+	of the policy's advantage, and credits decisions the 7-day credit has none for (within a week of a day cap)."""
+	torch.manual_seed(6)
+	model = CampaignModel(dim=32, cell_dim=16, layers=1)
+	x = random_inputs(8, seed=11)
+	decisions = decisions_for(model.eval(), x)
+	targets = np.full((8, c.N_VALUE_OFFSETS), np.nan, dtype=np.float32)
+	seven = np.full(8, np.nan, dtype=np.float32)
+	seven[:4] = np.linspace(-1, 1, 4)
+	end = {
+		"targets": np.full(8, 0.8, dtype=np.float32), "real": np.full(8, 0.8, dtype=np.float32), "step": np.array([1, 2, 3, 4, 5, 6, 7, -1]),
+		"week": np.full(8, -1), "price": np.zeros(8, dtype=np.float32), "weight": 0.0, "outcome": 0.25,
+	}
+	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
+	config = CampaignConfig(batch_size=4, passes=1)
+	before = model.end_head.weight.detach().clone()
+	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-3), decisions, targets, None, config, decode=decode, advantages=seven, end=end)
+	assert metrics["credited"] == 4 and not torch.equal(before, model.end_head.weight)  # weight 0: the 7-day credit alone
+	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, None, config, decode=decode, advantages=seven, end={**end, "weight": 0.5})
+	assert metrics["credited"] == 8 and np.isfinite(metrics["policy"])
+
+
+def test_heads_that_know_only_the_player_count_explain_nothing():
+	"""The share heads start at 1 / players; their explained variance (the credit's trust in them) is over that prior's,
+	so a head that knows only the player count earns no trust, however much of the shares the count explains."""
+	torch.manual_seed(7)
+	model = CampaignModel(dim=32, cell_dim=16, layers=1)
+	x = random_inputs(8, seed=13)
+	x["g_players"] = np.array([2, 2, 3, 3, 4, 4, 2, 4], dtype=x["g_players"].dtype)
+	decisions = decisions_for(model.eval(), x)  # (recorded values: the untrained heads', 1 / players)
+	prior = 1.0 / x["g_players"].astype(np.float32)
+	assert np.allclose([d.value for d in decisions], prior[:, None], atol=1e-6)
+	labels = np.repeat((prior + np.random.default_rng(0).normal(0, 0.02, 8)).astype(np.float32)[:, None], c.N_VALUE_OFFSETS, axis=1)
+	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
+	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, labels, np.zeros(8, dtype=np.float32), CampaignConfig(batch_size=4, passes=1), decode=decode)
+	assert all(abs(metrics[f"value_ev_d{k}"]) < 1e-5 for k in c.VALUE_OFFSETS)  # (plain EV here: ~0.97)
+
+
+def test_micro_batches_take_the_same_step():
+	"""A minibatch in micro-batches (their gradients summed, each normalized by the whole minibatch's counts) moves the
+	weights as the whole minibatch at once."""
+	import copy
+
+	torch.manual_seed(8)
+	model = CampaignModel(dim=32, cell_dim=16, layers=1)
+	x = random_inputs(8, seed=15)
+	decisions = decisions_for(model.eval(), x)
+	targets = np.full((8, c.N_VALUE_OFFSETS), 0.6, dtype=np.float32)
+	targets[5:, 1:] = np.nan
+	growth = np.full((8, c.N_VALUE_OFFSETS), np.log(50000.0), dtype=np.float32)
+	advantages = np.linspace(-1, 1, 8).astype(np.float32)
+	advantages[2] = np.nan
+	end = {"targets": np.linspace(0.2, 0.8, 8).astype(np.float32), "real": np.full(8, 0.7, dtype=np.float32), "step": np.array([1, 2, 3, 4, 5, 6, 7, -1]), "week": np.full(8, -1), "price": np.zeros(8, dtype=np.float32), "weight": 0.5, "outcome": 0.25}
+	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
+	results = []
+	for parts in (1, 3):
+		m = copy.deepcopy(model)
+		torch.manual_seed(0)
+		metrics, _ = ppo_update(m, torch.optim.SGD(m.parameters(), lr=0.1), decisions, targets, None, CampaignConfig(batch_size=8, passes=1, micro_batches=parts, target_kl=0.0), decode=decode, advantages=advantages, growth=growth, end=end)
+		results.append((m, metrics))
+	(a, ma), (b, mb) = results
+	assert all(torch.allclose(p, q, atol=1e-6) for p, q in zip(a.parameters(), b.parameters()))
+	assert all(abs(ma[k] - mb[k]) < 1e-5 for k in ("policy", "value", "entropy", "kl", "grad_norm"))

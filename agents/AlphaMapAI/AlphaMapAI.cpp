@@ -1,0 +1,856 @@
+#include "StdInc.h"
+#include "AlphaMapAI.h"
+
+#include "InferenceClient.h"
+#include "Ledger.h"
+
+#include "lib/AsyncRunner.h"
+#include "lib/CConfigHandler.h"
+#include "lib/CCreatureHandler.h"
+#include "lib/UnlockGuard.h"
+#include "lib/battle/BattleStateInfoForRetreat.h"
+#include "lib/callback/CCallback.h"
+#include "lib/gameState/CGameState.h"
+#include "lib/mapObjects/CGDwelling.h"
+#include "lib/mapObjects/CGHeroInstance.h"
+#include "lib/mapObjects/CGTownInstance.h"
+#include "lib/mapObjects/MiscObjects.h"
+#include "lib/networkPacks/Component.h"
+#include "lib/networkPacks/PacksForClient.h"
+#include "lib/networkPacks/PacksForServer.h"
+#include "lib/serializer/CTypeList.h"
+
+#include <zlib.h>
+
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+using namespace MapSchema;
+
+namespace
+{
+std::string env(const std::string & name, const std::string & fallback = "")
+{
+	const char * value = std::getenv(name.c_str());
+	return value ? value : fallback;
+}
+
+/// Sends one message to the trainer's RecordServer (battle_model/play.py): u32 key length, key, payload
+void sendToRecordServer(const std::string & socketPath, const std::string & key, const std::string & payload)
+{
+	sockaddr_un address{};
+	address.sun_family = AF_UNIX;
+	if(socketPath.size() >= sizeof(address.sun_path))
+		throw std::runtime_error("record socket path too long: " + socketPath);
+	std::copy(socketPath.begin(), socketPath.end(), address.sun_path);
+	const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if(fd < 0)
+		throw std::runtime_error("cannot create a socket for the records");
+	if(connect(fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) != 0)
+	{
+		close(fd);
+		throw std::runtime_error("cannot connect to the record socket " + socketPath);
+	}
+	std::string message;
+	const auto length = static_cast<uint32_t>(key.size());
+	message.append(reinterpret_cast<const char *>(&length), 4);
+	message += key;
+	message += payload;
+	for(size_t sent = 0; sent < message.size();)
+	{
+		const auto n = ::send(fd, message.data() + sent, message.size() - sent, 0);
+		if(n <= 0)
+		{
+			close(fd);
+			throw std::runtime_error("sending records failed");
+		}
+		sent += static_cast<size_t>(n);
+	}
+	close(fd);
+}
+
+template<typename T>
+void put(std::string & out, T value)
+{
+	out.append(reinterpret_cast<const char *>(&value), sizeof(T));
+}
+
+/// The first whole number in a question's text (e.g. the gold asked for creatures), 0 if none
+int64_t firstNumber(const std::string & text)
+{
+	int64_t number = 0;
+	bool found = false;
+	for(char ch : text)
+	{
+		if(ch >= '0' && ch <= '9')
+		{
+			number = std::min<int64_t>(number * 10 + (ch - '0'), 1000000000);
+			found = true;
+		}
+		else if(found)
+			break;
+	}
+	return number;
+}
+
+std::mutex ledgerMutex;
+int ledgerDay = 0; // the last day a ledger was sent for, by any AlphaMapAI of this process
+}
+
+AlphaMapAI::AlphaMapAI()
+	: asyncTasks(std::make_unique<AsyncRunner>())
+{
+}
+
+AlphaMapAI::~AlphaMapAI()
+{
+	finish();
+}
+
+std::string AlphaMapAI::getBattleAIName() const
+{
+	if(settings["ai"]["combatEnemyAI"].getType() == JsonNode::JsonType::DATA_STRING)
+		return settings["ai"]["combatEnemyAI"].String();
+	return "BattleAI";
+}
+
+void AlphaMapAI::initGameInterface(std::shared_ptr<Environment> environment, std::shared_ptr<CCallback> callback)
+{
+	cb = callback;
+	cbc = callback;
+	env = environment;
+	playerID = *cb->getPlayerID();
+	cb->waitTillRealize = true;
+	cb->unlockGsWhenWaiting = true;
+
+	const auto color = boost::to_upper_copy(playerID.toString());
+	modelName = ::env("ALPHA_MAP_MODEL", "current");
+	recordSocket = ::env("ALPHA_MAP_RECORD_SOCKET");
+	gameKey = ::env("ALPHA_MAP_GAME_KEY", "game");
+	dayCap = std::stoi(::env("ALPHA_MAP_DAYS", "0"));
+	temperature = std::stod(::env("ALPHA_MAP_TEMPERATURE", "1"));
+	rng.seed(std::stoull(::env("ALPHA_MAP_SEED_" + color, std::to_string(std::random_device()()))));
+	const auto socketPath = ::env("ALPHA_MAP_INFERENCE_SOCKET");
+	try
+	{
+		if(socketPath.empty())
+			throw std::runtime_error("ALPHA_MAP_INFERENCE_SOCKET is not set");
+		inference = std::make_unique<InferenceClient>(socketPath, FAMILY, CONTRACT_HASH);
+	}
+	catch(const std::exception & e)
+	{
+		logAi->error("AlphaMapAI %s: no model: %s", color, e.what());
+		++errors;
+	}
+	logAi->info("AlphaMapAI %s: model %s, day cap %d", color, modelName, dayCap);
+}
+
+// ---- threads and queries ----
+
+void AlphaMapAI::addQuery(QueryID id, const std::string & description)
+{
+	if(id == QueryID(-1))
+		return;
+	std::scoped_lock lock(statusMutex);
+	queries[id] = description;
+	statusChanged.notify_all();
+}
+
+void AlphaMapAI::answer(QueryID id, int selection)
+{
+	if(id == QueryID(-1))
+		return;
+	cb->selectionMade(selection, id); // returns when the server has applied it (waitTillRealize)
+	std::scoped_lock lock(statusMutex);
+	queries.erase(id);
+	statusChanged.notify_all();
+}
+
+void AlphaMapAI::runAsync(const std::string & description, std::function<void()> task)
+{
+	asyncTasks->run([this, description, task]() noexcept
+	{
+		std::shared_lock gsLock(CGameState::mutex);
+		try
+		{
+			task();
+		}
+		catch(const std::exception & e)
+		{
+			logAi->error("AlphaMapAI %s: %s failed: %s", playerID.toString(), description, e.what());
+			++errors;
+		}
+	});
+}
+
+bool AlphaMapAI::isFree()
+{
+	return queries.empty() && battle == 0 && visits == 0 && !moving;
+}
+
+void AlphaMapAI::waitTillFree()
+{
+	auto unlock = vstd::makeUnlockSharedGuard(CGameState::mutex);
+	std::unique_lock lock(statusMutex);
+	while(!stopping && !isFree())
+		statusChanged.wait_for(lock, std::chrono::milliseconds(10));
+}
+
+void AlphaMapAI::yourTurn(QueryID queryID)
+{
+	addQuery(queryID, "your turn");
+	{
+		std::scoped_lock lock(statusMutex);
+		havingTurn = true;
+	}
+	runAsync("answering the turn", [this, queryID]() { answer(queryID, 0); });
+	asyncTasks->run([this]() noexcept
+	{
+		{
+			std::unique_lock lock(statusMutex);
+			while(!stopping && !isFree())
+				statusChanged.wait_for(lock, std::chrono::milliseconds(10));
+		}
+		std::shared_lock gsLock(CGameState::mutex);
+		makeTurn();
+	});
+}
+
+void AlphaMapAI::makeTurn()
+{
+	try
+	{
+		const int today = cb->getDate(Date::DAY);
+		if(today != day)
+		{
+			day = today;
+			decisionsToday = 0;
+			futile.clear();
+		}
+		activeHero = ObjectInstanceID(); // the dialogs' context: no hero yet this turn (a question before our first
+		activeTarget = int3(-1, -1, -1); // move, a start-of-turn event, got yesterday's last hero: 2026-10-28 review)
+		lastChoice = Choice();
+		lastChanged = -1;
+		if(dayCap > 0 && day > dayCap)
+			return; // the records are sent (playerStartsTurn); the turn stays open, so the game waits here until
+					// the trainer stops it (ending turns would race through the days, a ledger each)
+		for(int n = 0; n < MAX_DECISIONS_PER_DAY && !stopping; ++n)
+		{
+			waitTillFree();
+			if(cb->getPlayerStatus(playerID, false) != EPlayerStatus::INGAME)
+				return;
+			auto decision = encode(DecisionKind::TURN);
+			const auto choice = decide(decision);
+			if(choice.type <= static_cast<int>(ActionType::END))
+				break;
+			const bool changed = execute(decision, choice);
+			if(!changed)
+			{
+				noEffect(choice);
+				futile.insert({choice.type, choice.index, choice.cell});
+			}
+			else
+				futile.clear(); // the state changed: what failed before may work now
+			lastChoice = choice;
+			lastChanged = changed ? 1 : 0;
+		}
+		waitTillFree();
+	}
+	catch(const std::exception & e)
+	{
+		logAi->error("AlphaMapAI %s: the turn failed: %s", playerID.toString(), e.what());
+		++errors;
+	}
+	sendRecords(false);
+	endTurn();
+}
+
+void AlphaMapAI::endTurn()
+{
+	if(cb->getPlayerStatus(playerID, false) != EPlayerStatus::INGAME)
+		return;
+	for(int attempt = 0; attempt < 10 && !stopping; ++attempt)
+	{
+		{
+			std::scoped_lock lock(statusMutex);
+			if(!havingTurn)
+				return;
+		}
+		cb->endTurn();
+	}
+	logAi->error("AlphaMapAI %s: could not end the turn", playerID.toString());
+}
+
+void AlphaMapAI::requestRealized(PackageApplied * pa)
+{
+	if(pa->packType == CTypeList::getInstance().getTypeID<EndTurn>(nullptr) && pa->result)
+	{
+		std::scoped_lock lock(statusMutex);
+		havingTurn = false;
+		statusChanged.notify_all();
+	}
+}
+
+void AlphaMapAI::playerBlocked(int reason, bool start)
+{
+	std::scoped_lock lock(statusMutex);
+	if(start && reason == PlayerBlocked::UPCOMING_BATTLE)
+		battle = 1;
+	if(reason == PlayerBlocked::ONGOING_MOVEMENT)
+		moving = start;
+	statusChanged.notify_all();
+}
+
+void AlphaMapAI::heroVisit(const CGHeroInstance * visitor, const CGObjectInstance * visitedObj, bool start)
+{
+	std::scoped_lock lock(statusMutex);
+	visits += start ? 1 : -1;
+	visits = std::max(visits, 0);
+	statusChanged.notify_all();
+}
+
+void AlphaMapAI::battleStart(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2, int3 tile, const CGHeroInstance * hero1, const CGHeroInstance * hero2, BattleSide side, bool replayAllowed)
+{
+	{
+		std::scoped_lock lock(statusMutex);
+		battle = 2;
+	}
+	CAdventureAI::battleStart(battleID, army1, army2, tile, hero1, hero2, side, replayAllowed);
+}
+
+void AlphaMapAI::battleEnd(const BattleID & battleID, const BattleResult * br, QueryID queryID)
+{
+	{
+		std::scoped_lock lock(statusMutex);
+		battle = 3;
+	}
+	CAdventureAI::battleEnd(battleID, br, queryID);
+}
+
+void AlphaMapAI::battleResultsApplied()
+{
+	std::scoped_lock lock(statusMutex);
+	battle = 0;
+	statusChanged.notify_all();
+}
+
+std::optional<BattleAction> AlphaMapAI::makeSurrenderRetreatDecision(const BattleID & battleID, const BattleStateInfoForRetreat & battleState)
+{
+	// Not the campaign model's decision (the user, 2026-10-27): Nullkiller2's rule and thresholds
+	// (config/ai/nk2ai/nk2ai-settings.json): retreat a weak army that is close to death while we still have a town
+	const double ours = static_cast<double>(battleState.getOurStrength());
+	const double ratio = ours / std::max<double>(1.0, static_cast<double>(battleState.getEnemyStrength()));
+	if(!cb->getTownsInfo().empty() && ours < 2000 && ratio < 0.1 && battleState.canFlee)
+		return BattleAction::makeRetreat(battleState.ourSide);
+	return std::nullopt;
+}
+
+void AlphaMapAI::finish()
+{
+	stopping = true;
+	statusChanged.notify_all();
+	if(asyncTasks)
+	{
+		asyncTasks->wait();
+		asyncTasks.reset();
+	}
+}
+
+// ---- the daily ledger: every player's assets, for the empire values (campaign_model/empire.py) ----
+
+void AlphaMapAI::playerStartsTurn(PlayerColor player)
+{
+	if(recordSocket.empty())
+		return;
+	const int today = cb->getDate(Date::DAY);
+	if(dayCap > 0 && today > dayCap)
+		sendRecords(true); // every player's last records (and its summary) as the first day past the cap begins
+	std::scoped_lock lock(ledgerMutex);
+	if(today <= ledgerDay)
+		return;
+	ledgerDay = today;
+	try
+	{
+		sendToRecordServer(recordSocket, gameKey + ":ledger#" + std::to_string(today), ledgerJson(static_cast<const IGameInfoCallback &>(*cb).gameState(), today, false));
+	}
+	catch(const std::exception & e)
+	{
+		logAi->error("AlphaMapAI: the ledger of day %d was not sent: %s", today, e.what());
+	}
+}
+
+void AlphaMapAI::gameOver(PlayerColor player, const EVictoryLossCheckResult & victoryLossCheckResult)
+{
+	if(!recordSocket.empty() && player == playerID)
+	{
+		try
+		{
+			sendRecords(true);
+			// The end as this player saw it; the trainer takes it as the last snapshot of the game
+			std::scoped_lock lock(ledgerMutex);
+			sendToRecordServer(recordSocket, gameKey + ":ledger#end-" + playerID.toString(), ledgerJson(static_cast<const IGameInfoCallback &>(*cb).gameState(), cb->getDate(Date::DAY), true));
+		}
+		catch(const std::exception & e)
+		{
+			logAi->error("AlphaMapAI %s: the end of the game was not sent: %s", playerID.toString(), e.what());
+		}
+	}
+	if(player == playerID)
+	{
+		stopping = true;
+		statusChanged.notify_all();
+	}
+}
+
+// ---- the model ----
+
+Choice AlphaMapAI::decide(Decision & decision)
+{
+	Choice choice;
+	try
+	{
+		if(!inference)
+			throw std::runtime_error("no model");
+		const auto inputs = decision.inputs.wire();
+		std::string reply;
+		uint32_t version = 0;
+		{
+			std::scoped_lock lock(inferenceMutex);
+			version = inference->request(modelName, 1, inputs, reply);
+		}
+		const auto outputs = Outputs::fromWire(reply);
+		choice = sample(decision, outputs);
+		Record entry;
+		entry.day = cb->getDate(Date::DAY);
+		entry.kind = static_cast<int>(decision.kind);
+		entry.decisionsToday = decisionsToday;
+		entry.version = version;
+		entry.choice = choice;
+		for(int k = 0; k < N_VALUE_OFFSETS; ++k)
+			entry.value[k] = outputs[Out::value][k];
+		entry.inputs = inputs;
+		std::scoped_lock lock(recordsMutex);
+		entry.serial = choice.record = ++recordSerial;
+		entry.choice.record = entry.serial;
+		records.push_back(std::move(entry));
+	}
+	catch(const std::exception & e)
+	{
+		logAi->error("AlphaMapAI %s: no decision: %s", playerID.toString(), e.what());
+		++errors;
+		choice = Choice();
+	}
+	if(decision.kind == DecisionKind::TURN)
+		++decisionsToday;
+	return choice;
+}
+
+Choice AlphaMapAI::sample(const Decision & decision, const Outputs & outputs)
+{
+	std::scoped_lock lock(rngMutex);
+	// One draw among the legal (finite) entries of [begin, end), with probabilities p^(1/temperature); returns the
+	// index and the model's own log-probability of it
+	auto draw = [this](const std::vector<float> & logp, size_t begin, size_t end) -> std::pair<int, float>
+	{
+		int best = -1;
+		double total = 0;
+		std::vector<double> weights(end - begin, 0.0);
+		double top = -std::numeric_limits<double>::infinity();
+		for(size_t i = begin; i < end; ++i)
+			if(std::isfinite(logp[i]))
+				top = std::max<double>(top, logp[i]);
+		if(!std::isfinite(top))
+			return {-1, 0.0f};
+		for(size_t i = begin; i < end; ++i)
+		{
+			if(!std::isfinite(logp[i]))
+				continue;
+			if(temperature <= 0)
+			{
+				if(best < 0 || logp[i] > logp[best])
+					best = static_cast<int>(i);
+				continue;
+			}
+			weights[i - begin] = std::exp((logp[i] - top) / temperature);
+			total += weights[i - begin];
+		}
+		if(temperature > 0)
+		{
+			double target = std::uniform_real_distribution<double>(0.0, total)(rng);
+			for(size_t i = begin; i < end; ++i)
+			{
+				if(weights[i - begin] <= 0)
+					continue;
+				best = static_cast<int>(i);
+				target -= weights[i - begin];
+				if(target <= 0)
+					break;
+			}
+		}
+		return {best, logp[best]};
+	};
+
+	Choice choice;
+	if(decision.kind != DecisionKind::TURN && decision.kind != DecisionKind::EXCHANGE)
+	{
+		const auto [index, logp] = draw(outputs[Out::option_logp], 0, N_OPTIONS);
+		choice.index = index;
+		choice.logp = logp;
+		return choice;
+	}
+	const auto [type, typeLogp] = draw(outputs[Out::type_logp], 0, N_ACTION_TYPES);
+	choice.type = type;
+	choice.logp = typeLogp;
+	if(type <= static_cast<int>(ActionType::END))
+		return choice;
+	const auto & table = outputs[head(static_cast<ActionType>(type)).first];
+	const auto [index, indexLogp] = draw(table, 0, table.size());
+	choice.index = index;
+	choice.logp += indexLogp;
+	if(type == static_cast<int>(ActionType::CAST) && index >= 0)
+	{
+		const int hero = index / N_ADVENTURE_SPELLS;
+		const int spell = index % N_ADVENTURE_SPELLS;
+		if(std::find(TARGETED_SPELLS.begin(), TARGETED_SPELLS.end(), spell) != TARGETED_SPELLS.end())
+		{
+			const size_t cells = WINDOW * WINDOW;
+			const auto [cell, cellLogp] = draw(outputs[Out::cast_cell_logp], hero * cells, (hero + 1) * cells);
+			choice.cell = cell < 0 ? -1 : cell - static_cast<int>(hero * cells);
+			choice.logp += cellLogp;
+		}
+	}
+	if(index < 0)
+		choice.type = -1; // a legal type with no legal entry: the model and the masks disagree
+	return choice;
+}
+
+void AlphaMapAI::noEffect(const Choice & choice)
+{
+	++failedActions;
+	logAi->warn("AlphaMapAI %s: action %d entry %d changed nothing", playerID.toString(), choice.type, choice.index);
+	// The decision's own record: a dialog the action raised (a Town Portal's choice, a yes/no) records after it
+	std::scoped_lock lock(recordsMutex);
+	for(auto r = records.rbegin(); r != records.rend(); ++r)
+		if(r->serial == choice.record)
+		{
+			r->flags |= RECORD_NO_EFFECT;
+			break;
+		}
+}
+
+void AlphaMapAI::sendRecords(bool final)
+{
+	if(recordSocket.empty())
+		return;
+	std::vector<Record> pending;
+	{
+		std::scoped_lock lock(recordsMutex);
+		if(final && done)
+			return; // sent already
+		pending.swap(records);
+		done = done || final;
+	}
+	const auto color = boost::to_upper_copy(playerID.toString());
+	try
+	{
+		if(!pending.empty())
+		{
+			// "AMR1", the count, then each decision (campaign_model/records.py); zlib-compressed after "AMZ1" and the size
+			std::string raw = "AMR1";
+			put<uint32_t>(raw, static_cast<uint32_t>(pending.size()));
+			for(const auto & r : pending)
+			{
+				put<uint32_t>(raw, r.day);
+				put<uint32_t>(raw, r.kind);
+				put<uint32_t>(raw, r.decisionsToday);
+				put<uint32_t>(raw, r.version);
+				put<int32_t>(raw, r.choice.type);
+				put<int32_t>(raw, r.choice.index);
+				put<int32_t>(raw, r.choice.cell);
+				put<float>(raw, r.choice.logp);
+				for(float v : r.value)
+					put<float>(raw, v);
+				put<uint32_t>(raw, r.flags);
+				put<uint32_t>(raw, static_cast<uint32_t>(r.inputs.size()));
+				raw += r.inputs;
+			}
+			uLongf size = compressBound(raw.size());
+			std::string packed(size, '\0');
+			if(compress2(reinterpret_cast<Bytef *>(packed.data()), &size, reinterpret_cast<const Bytef *>(raw.data()), raw.size(), 6) != Z_OK)
+				throw std::runtime_error("compressing the records failed");
+			packed.resize(size);
+			std::string payload = "AMZ1";
+			put<uint32_t>(payload, static_cast<uint32_t>(raw.size()));
+			payload += packed;
+			sendToRecordServer(recordSocket, gameKey + ":" + color + "#" + std::to_string(recordsSent++), payload);
+		}
+		if(final)
+		{
+			const auto summary = "{\"errors\": " + std::to_string(errors) + ", \"failed_actions\": " + std::to_string(failedActions) + "}";
+			sendToRecordServer(recordSocket, gameKey + ":" + color + ":done", summary);
+		}
+	}
+	catch(const std::exception & e)
+	{
+		logAi->error("AlphaMapAI %s: records not sent: %s", color, e.what());
+		++errors;
+	}
+}
+
+// ---- questions the engine asks ----
+
+void AlphaMapAI::showBlockingDialog(const std::string & text, const std::vector<Component> & components, QueryID askID, const int soundID, bool selection, bool cancel, bool safeToAutoaccept)
+{
+	addQuery(askID, "blocking dialog");
+	if(!selection && !cancel)
+	{
+		runAsync("closing a dialog", [this, askID]() { answer(askID, 0); });
+		return;
+	}
+	runAsync("a dialog", [this, text, components, askID, soundID, selection, cancel]()
+	{
+		auto decision = encode(selection ? DecisionKind::SELECT : DecisionKind::YES_NO);
+		encodeOptionContext(decision, activeHero, activeTarget);
+		decision.inputs.at(In::d_number) = firstNumber(text);
+		decision.inputs.at(In::d_sound) = soundID;
+		auto & in = decision.inputs;
+		if(selection)
+		{
+			for(int i = 0; i < std::min<int>(components.size(), N_OPTIONS); ++i)
+			{
+				in.at(In::o_kind, i) = static_cast<int>(OptionKind::COMPONENT);
+				in.at(In::o_type, i) = static_cast<int>(components[i].type);
+				in.at(In::o_subtype, i) = components[i].subType.getNum();
+				in.at(In::o_amount, i) = components[i].value.value_or(0);
+				in.at(In::option_mask, i) = 1;
+				decision.answers.push_back(i + 1); // components are numbered from 1
+			}
+			if(cancel && decision.answers.size() < static_cast<size_t>(N_OPTIONS)) // declining is an answer too (0)
+			{
+				const int i = static_cast<int>(decision.answers.size());
+				in.at(In::o_kind, i) = static_cast<int>(OptionKind::NO);
+				in.at(In::option_mask, i) = 1;
+				decision.answers.push_back(0);
+			}
+		}
+		else
+		{
+			in.at(In::o_kind, 0) = static_cast<int>(OptionKind::YES);
+			in.at(In::o_kind, 1) = static_cast<int>(OptionKind::NO);
+			in.at(In::option_mask, 0) = in.at(In::option_mask, 1) = 1;
+			decision.answers = {1, 0};
+		}
+		const auto choice = decide(decision);
+		answer(askID, choice.index >= 0 ? decision.answers[choice.index] : decision.answers.front());
+	});
+}
+
+void AlphaMapAI::heroGotLevel(const CGHeroInstance * hero, PrimarySkill pskill, std::vector<SecondarySkill> & skills, QueryID queryID)
+{
+	addQuery(queryID, "level up");
+	const auto heroID = hero->id;
+	runAsync("a level up", [this, heroID, skills, queryID]()
+	{
+		const auto * h = cb->getHero(heroID);
+		if(skills.empty() || !h)
+		{
+			answer(queryID, 0);
+			return;
+		}
+		auto decision = encode(DecisionKind::LEVEL_UP);
+		encodeOptionContext(decision, heroID, h->visitablePos());
+		for(int i = 0; i < std::min<int>(skills.size(), N_OPTIONS); ++i)
+		{
+			decision.inputs.at(In::o_kind, i) = static_cast<int>(OptionKind::SKILL);
+			decision.inputs.at(In::o_type, i) = skills[i].getNum();
+			decision.inputs.at(In::o_subtype, i) = h->getSecSkillLevel(skills[i]) + 1;
+			decision.inputs.at(In::option_mask, i) = 1;
+			decision.answers.push_back(i);
+		}
+		const auto choice = decide(decision);
+		answer(queryID, choice.index >= 0 ? decision.answers[choice.index] : 0);
+	});
+}
+
+void AlphaMapAI::commanderGotLevel(const CCommanderInstance * commander, std::vector<ui32> skills, QueryID queryID)
+{
+	addQuery(queryID, "commander level up");
+	runAsync("a commander level up", [this, queryID]() { answer(queryID, 0); });
+}
+
+void AlphaMapAI::showMapObjectSelectDialog(QueryID askID, const Component & icon, const MetaString & title, const MetaString & description, const std::vector<ObjectInstanceID> & objects)
+{
+	addQuery(askID, "object selection");
+	runAsync("an object selection", [this, askID, objects]()
+	{
+		auto decision = encode(DecisionKind::OBJECT_SELECT);
+		encodeOptionContext(decision, activeHero, activeTarget);
+		for(const auto & id : objects)
+		{
+			const auto * obj = cb->getObj(id, false);
+			const int i = static_cast<int>(decision.answers.size());
+			if(!obj || i >= N_OPTIONS)
+				continue;
+			decision.inputs.at(In::o_kind, i) = static_cast<int>(OptionKind::OBJECT);
+			decision.inputs.at(In::o_type, i) = obj->ID.getNum();
+			decision.inputs.at(In::o_subtype, i) = obj->subID.getNum();
+			const auto pos = obj->visitablePos();
+			decision.inputs.at(In::o_pos, i, 0) = pos.x;
+			decision.inputs.at(In::o_pos, i, 1) = pos.y;
+			decision.inputs.at(In::o_pos, i, 2) = pos.z;
+			decision.inputs.at(In::option_mask, i) = 1;
+			decision.answers.push_back(id.getNum()); // the reply is the object
+		}
+		if(decision.answers.empty())
+		{
+			answer(askID, objects.empty() ? 0 : objects.front().getNum());
+			return;
+		}
+		const auto choice = decide(decision);
+		answer(askID, decision.answers[std::max(choice.index, 0)]);
+	});
+}
+
+void AlphaMapAI::showRecruitmentDialog(const CGDwelling * dwelling, const CArmedInstance * dst, int level, QueryID queryID)
+{
+	addQuery(queryID, "recruitment");
+	const auto dwellingID = dwelling->id;
+	const auto dstID = dst->id;
+	runAsync("a recruitment", [this, dwellingID, dstID, queryID]()
+	{
+		const auto * d = dynamic_cast<const CGDwelling *>(cb->getObj(dwellingID, false));
+		const auto * army = dynamic_cast<const CArmedInstance *>(cb->getObj(dstID, false));
+		// The dearest creature on offer that fits the army; the model picks how many (options: none and fractions)
+		int bestLevel = -1;
+		CreatureID creature;
+		int most = 0;
+		if(d && army)
+		{
+			int bestCost = -1;
+			for(int i = 0; i < static_cast<int>(d->creatures.size()); ++i)
+			{
+				const auto & [count, ids] = d->creatures[i];
+				if(ids.empty() || count <= 0 || !army->getSlotFor(ids.back()).validSlot())
+					continue;
+				const int cost = ids.back().toCreature()->getRecruitCost(EGameResID::GOLD);
+				const int affordable = std::min<int>(count, cb->getResourceAmount() / ids.back().toCreature()->getFullRecruitCost());
+				if(affordable > 0 && cost > bestCost)
+				{
+					bestCost = cost;
+					bestLevel = i;
+					creature = ids.back();
+					most = affordable;
+				}
+			}
+		}
+		if(bestLevel < 0)
+		{
+			answer(queryID, 0);
+			return;
+		}
+		auto decision = encode(DecisionKind::RECRUIT_DWELLING);
+		encodeOptionContext(decision, dstID, d->visitablePos());
+		std::vector<int> amounts = {0};
+		for(double fraction : RECRUIT_FRACTIONS)
+		{
+			const int amount = std::max(1, static_cast<int>(std::ceil(most * fraction)));
+			if(amount != amounts.back())
+				amounts.push_back(amount);
+		}
+		for(int i = 0; i < std::min<int>(amounts.size(), N_OPTIONS); ++i)
+		{
+			decision.inputs.at(In::o_kind, i) = static_cast<int>(OptionKind::AMOUNT);
+			decision.inputs.at(In::o_type, i) = creature.getNum();
+			decision.inputs.at(In::o_amount, i) = amounts[i];
+			decision.inputs.at(In::option_mask, i) = 1;
+			decision.answers.push_back(amounts[i]);
+		}
+		const auto choice = decide(decision);
+		const int amount = choice.index >= 0 ? decision.answers[choice.index] : 0;
+		if(amount > 0)
+			cb->recruitCreatures(d, army, creature, amount, bestLevel);
+		answer(queryID, 0);
+	});
+}
+
+void AlphaMapAI::showGarrisonDialog(const CArmedInstance * up, const CGHeroInstance * down, bool removableUnits, QueryID queryID, const MetaString & customTitle)
+{
+	addQuery(queryID, "garrison");
+	const auto upID = up->id;
+	const auto downID = down->id;
+	if(!removableUnits || up->tempOwner != down->tempOwner && up->tempOwner.isValidPlayer())
+	{
+		runAsync("closing a garrison", [this, queryID]() { answer(queryID, 0); });
+		return;
+	}
+	runAsync("a garrison", [this, upID, downID, queryID]() { exchange(upID, downID, queryID); });
+}
+
+void AlphaMapAI::heroExchangeStarted(ObjectInstanceID hero1, ObjectInstanceID hero2, QueryID queryID)
+{
+	addQuery(queryID, "hero exchange");
+	runAsync("a hero exchange", [this, hero1, hero2, queryID]()
+	{
+		if(cb->getHero(hero1) && cb->getHero(hero2))
+			exchange(hero1, hero2, queryID);
+		else
+			answer(queryID, 0);
+	});
+}
+
+void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, QueryID queryID)
+{
+	// Troop moves between the two armies while the server holds the exchange open, until the model ends it
+	futile.clear();
+	for(int n = 0; n < 32 && !stopping; ++n)
+	{
+		auto decision = encode(DecisionKind::EXCHANGE, first, second);
+		if(!decision.inputs.any(In::army_mask))
+			break;
+		const auto choice = decide(decision);
+		if(choice.type != static_cast<int>(ActionType::ARMY))
+			break;
+		if(!execute(decision, choice))
+		{
+			noEffect(choice);
+			futile.insert({choice.type, choice.index, choice.cell});
+		}
+		else
+			futile.clear();
+	}
+	futile.clear();
+	answer(queryID, 0);
+}
+
+void AlphaMapAI::showTeleportDialog(const CGHeroInstance * hero, TeleportChannelID channel, TTeleportExitsList exits, bool impassable, QueryID askID)
+{
+	// Not a model decision (rare: monoliths with several exits): the exit the path goes through, else the engine's choice
+	addQuery(askID, "teleport");
+	int chosen = -1;
+	for(size_t i = 0; i < exits.size(); ++i)
+	{
+		const auto * exit = cb->getObj(exits[i].first, false);
+		if(exits[i].second == intendedExit || (exit && exit->visitablePos() == intendedExit))
+			chosen = static_cast<int>(i);
+	}
+	runAsync("a teleport", [this, askID, chosen]() { answer(askID, chosen); });
+}
+
+void AlphaMapAI::showTavernWindow(const CGObjectInstance * object, const CGHeroInstance * visitor, QueryID queryID)
+{
+	addQuery(queryID, "tavern"); // map taverns: not yet a decision (hiring is in our towns)
+	runAsync("closing a tavern", [this, queryID]() { answer(queryID, 0); });
+}
+
+void AlphaMapAI::showMarketWindow(const IMarket * market, const CGHeroInstance * visitor, QueryID queryID)
+{
+	addQuery(queryID, "market"); // trading posts, altars, black markets: not yet decisions
+	runAsync("closing a market", [this, queryID]() { answer(queryID, 0); });
+}
+
+void AlphaMapAI::showUniversityWindow(const IMarket * market, const CGHeroInstance * visitor, QueryID queryID)
+{
+	addQuery(queryID, "university"); // not yet a decision
+	runAsync("closing a university", [this, queryID]() { answer(queryID, 0); });
+}

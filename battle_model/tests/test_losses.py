@@ -94,8 +94,8 @@ def test_policy_follows_only_the_heads_switched_on():
 	final = torch.tensor([0.5, -0.2])
 	labels = torch.tensor([[0.3, 0.1, 0.4, 0.6], [0.2, 0.0, -0.1, 0.6]])
 	values = torch.tensor([[0.1, 0.1, 0.1, 0.2], [0.4, 0.0, 0.3, 0.1]])
-	assert torch.equal(policy_advantages(final, labels, values, AdvantageConfig(policy_heads=(0, 0, 0, 1))), final)
-	both = policy_advantages(final, labels, values)  # default: V and V2
+	assert torch.equal(policy_advantages(final, labels, values), final)  # default: the final outcome V alone
+	both = policy_advantages(final, labels, values, AdvantageConfig(policy_heads=(0, 0, 1, 1)))
 	assert torch.allclose(both, final + (labels[:, 2] - values[:, 2]))
 	only_v2 = policy_advantages(final, labels, values, AdvantageConfig(policy_heads=(0, 0, 1, 0)))
 	assert torch.allclose(only_v2, labels[:, 2] - values[:, 2])
@@ -166,3 +166,33 @@ def test_window_credit():
 	assert torch.allclose(adv, torch.tensor(expected), atol=1e-6)
 	with pytest.raises(ValueError):
 		battle_returns_and_advantages(values, rewards, config)  # it needs the rounds
+
+
+def test_the_entropy_floor_pushes_only_decisions_below_it(monkeypatch):
+	"""entropy_term: no gradient for decisions whose entropy is above the floor, a push up for those below; the constant
+	bonus (entropy_weight) is off by default (it pushed every decision the same way: battle_model/gradient_study.py)."""
+	import battle_model.losses as losses
+
+	h = torch.tensor([0.05, 0.2, 0.8, 2.0], requires_grad=True)
+	monkeypatch.setattr(losses, "entropy", lambda out: h)
+	config = losses.PPOConfig()
+	assert config.entropy_weight == 0.0 and config.entropy_floor == 0.3
+	term, bonus, below = losses.entropy_term({}, config)
+	(grad,) = torch.autograd.grad(term, h)
+	assert (grad[:2] < 0).all() and (grad[2:] == 0).all()  # descent raises the entropy of the two below the floor only
+	assert float(below) == 0.5 and float(bonus) == float(h.mean())
+
+
+
+def test_round_heads_count_by_their_weight_in_what_the_policy_maximizes():
+	from battle_model.losses import AdvantageConfig, policy_advantages
+
+	final = torch.tensor([0.2, -0.1])
+	labels = torch.tensor([[0.0, 0.0, 0.5, 0.3], [0.0, 0.0, -0.4, -0.2]])
+	values = torch.tensor([[0.0, 0.0, 0.1, 0.1], [0.0, 0.0, 0.0, 0.0]])
+	full = policy_advantages(final, labels, values, AdvantageConfig(policy_heads=(0, 0, 1, 1)))
+	faded = policy_advantages(final, labels, values, AdvantageConfig(policy_heads=(0, 0, 0.25, 1)))
+	gone = policy_advantages(final, labels, values, AdvantageConfig(policy_heads=(0, 0, 0.0, 1)))
+	assert torch.allclose(full, final + (labels[:, 2] - values[:, 2]))
+	assert torch.allclose(faded, final + 0.25 * (labels[:, 2] - values[:, 2]))
+	assert torch.allclose(gone, final)

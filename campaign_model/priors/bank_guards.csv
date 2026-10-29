@@ -1,0 +1,12 @@
+id,subtype,name,guard_power,guard_health,reward_gold
+16,0,creatureBank/cyclopsStockpile,33936,2240,16000
+16,1,creatureBank/dwarvenTreasury,16129,1650,6200
+16,2,creatureBank/griffinConservatory,36080,2750,9625
+16,3,creatureBank/impCache,8415,660,3000
+16,4,creatureBank/medusaStore,12269,816,6550
+16,5,creatureBank/nagaBank,34038,1815,13200
+16,6,creatureBank/dragonFlyHive,12375,990,6600
+24,0,derelictShip/derelictShip,10395,990,5085
+25,0,dragonUtopia/dragonUtopia,87178,3999,81209
+84,0,crypt/crypt,7203,621,3014
+85,0,shipwreck/shipwreck,4620,360,4149
