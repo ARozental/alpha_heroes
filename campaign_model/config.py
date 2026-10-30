@@ -22,7 +22,7 @@ class CampaignConfig:
 	game_map_share: float = 1 / 3  # games on one of the game's own maps (maps.GAME_MAPS), the rest on generated ones
 	levels: int = 2  # with the underground (the user: water and underground stay on)
 	water: str = "random"
-	game_seconds: int = 600  # headless.sh's limit for one game (what it recorded until then is used); a 56-day game takes ~20 s, the slowest of 1,935 took 150 s (games now run to days_max = 112), and an endless battle (no round limit in VCMI) never ends
+	game_seconds: int = 1200  # headless.sh's limit for one game (what it recorded until then is used); since the games have taverns and dwellings (2026-10-29) a 56-day game takes ~200 s (~2,200 decisions) and a 113-day one ~560 s
 	niceness: int = 10  # as the generated battles'
 	temperature: float = 1.0
 	# The campaign family's inference server
@@ -86,10 +86,12 @@ class CampaignConfig:
 	decision_price: float = 1e-4  # share points per turn decision
 	# Evaluation against Nullkiller2 (evaluate.py): our models in one seat, Nullkiller2 in the others
 	eval_minutes: float = 60.0  # 0: none
-	# 2, 3 and 4 players in turn (the first 24 are the setups of before, so paired comparisons go on); at 24 sampled games the
-	# score's standard error was ~0.07 and the evals' spread below it (2026-10-29): the user asked for a readable eval
-	eval_games: int = 48
+	# 2, 3 and 4 players in turn (the setups of before, so paired comparisons go on), played greedy: the user asked for a
+	# readable eval (2026-10-29: at temperature 1 the score's standard error, ~0.07, was above the evals' own spread).
+	# 24, not 48: since the games have taverns and dwellings (vcmi 47c9d57eb) and hires pay, a game has ~4.5x the
+	# decisions (2-4 minutes, 24 at once), and 48 of them held the machine for most of 20 minutes an hour
+	eval_games: int = 24
 	eval_parallel: int = 24  # games at once (a VCMI client each, next to the training's)
 	eval_days: int = 56  # (the score at day 28 is logged too: score_d28)
 	eval_temperature: float = 0.0  # greedy, as the battle evals (2026-10-29: at 1.0 an eval's own sampling hid any change under ~0.1); evals compare only with those played the same way
-	eval_seconds: int = 240  # an eval game takes 10-30 s; an endless siege (BattleAI never retreats, VCMI has no round limit) held a whole eval, and with it the training, for 900 s
+	eval_seconds: int = 600  # 240 cut half of the first greedy eval's games short (2026-10-29: 120-240 s a game, 24 at once); an endless siege once held a whole eval for 900 s (no longer: vcmi's stalemate rule)
