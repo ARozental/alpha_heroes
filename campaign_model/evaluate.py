@@ -91,16 +91,21 @@ def evaluate(config, server, battle, version, epoch, stop=None):
 	started = time.time()
 	games = setups(config.eval_games)
 	results = [None] * len(games)
+	slots = threading.Semaphore(max(1, config.eval_parallel))
 
 	def work(i):
 		seed, players, color = games[i]
+		with slots:
+			play_one(i, seed, players, color)
+
+	def play_one(i, seed, players, color):
 		try:
 			name = eval_map(seed, players, config)
 			game, info = play(
 				server.socket_for(i), name, config.eval_days, seed, max_seconds=config.eval_seconds, battle_ai="BattleAI", game_key=f"e{i}",
 				settings=battle.eval_settings(i), temperature=config.eval_temperature, ours=(color,), stop=stop,
 			)
-			results[i] = {**score(game, color, players, config.eval_days), "setup": i, "seed": seed, "map": name, "color": color, "status": info.status, "seconds": round(info.seconds, 1), "failures": failure_counts(game.decisions)}
+			results[i] = {**score(game, color, players, config.eval_days), "setup": i, "seed": seed, "map": name, "color": color, "temperature": config.eval_temperature, "status": info.status, "seconds": round(info.seconds, 1), "failures": failure_counts(game.decisions)}
 			if info.status.startswith("stopped at day") or "exit code 0" in info.status:
 				shutil.rmtree(info.run_dir, ignore_errors=True)  # (a failed game's logs are kept)
 		except Exception as error:  # left out of the score, counted
@@ -159,12 +164,15 @@ def earlier_evals(path):
 def log(row, path, writer=None):
 	"""Append the row to path (eval.csv) and each game's results to eval_games.jsonl next to it; first its paired
 	differences with the previous eval and the first (vs_previous, vs_first)."""
-	evals = list(earlier_evals(path.with_name("eval_games.jsonl")).values())
+	# (only evals played the same way: an eval's own sampling at another temperature is another measure, not a change)
+	same = lambda games: games[0].get("temperature", 1.0) == row.get("per_game", [{}])[0].get("temperature", 1.0) if games and row.get("per_game") else False  # noqa: E731
+	everything = list(earlier_evals(path.with_name("eval_games.jsonl")).values())
+	evals = [games for games in everything if same(games)]
 	row["vs_previous"], row["vs_previous_se"] = paired(row.get("per_game", []), evals[-1]) if evals else (float("nan"), float("nan"))
 	row["vs_first"], row["vs_first_se"] = paired(row.get("per_game", []), evals[0]) if evals else (float("nan"), float("nan"))
 	with path.with_name("eval_games.jsonl").open("a") as f:
 		for game in row.get("per_game", []):
-			f.write(json.dumps({"eval": len(evals) + 1, "version": row["version"], **game}) + "\n")
+			f.write(json.dumps({"eval": len(everything) + 1, "version": row["version"], **game}) + "\n")
 	new = not path.exists()
 	with path.open("a", newline="") as f:
 		if new:

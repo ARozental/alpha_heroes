@@ -63,6 +63,31 @@ def test_eval_games_are_fixed_and_move_our_seat():
 	assert [g[2] for g in games] == ["RED", "RED", "RED", "BLUE", "BLUE", "BLUE"]
 
 
+def test_evals_compare_only_with_evals_played_the_same_way(tmp_path):
+	"""(2026-10-29) The eval went greedy: a greedy eval's paired differences are against earlier greedy ones only (the
+	sampled evals before it measured another thing), and it still gets the next eval number."""
+	import json
+	import math
+
+	from campaign_model.evaluate import COLUMNS, log
+
+	def row(version, scores, temperature=None):
+		games = [{"seed": i, "map": f"m{i}", "color": "RED", "score": x, **({} if temperature is None else {"temperature": temperature})} for i, x in enumerate(scores)]
+		return {**{k: 0.0 for k in COLUMNS}, "version": version, "per_game": games}
+
+	path = tmp_path / "eval.csv"
+	log(row(1, [0.1, 0.2, 0.3]), path)  # sampled, from before the field
+	log(row(2, [0.2, 0.3, 0.4]), path)
+	greedy = row(3, [0.5, 0.5, 0.5], temperature=0.0)
+	log(greedy, path)
+	assert math.isnan(greedy["vs_previous"]) and math.isnan(greedy["vs_first"])
+	later = row(4, [0.6, 0.7, 0.6], temperature=0.0)
+	log(later, path)
+	assert later["vs_previous"] == pytest.approx(0.1333, abs=1e-3) and later["vs_first"] == later["vs_previous"]
+	numbers = [json.loads(line)["eval"] for line in (tmp_path / "eval_games.jsonl").read_text().splitlines()]
+	assert numbers == [1] * 3 + [2] * 3 + [3] * 3 + [4] * 3
+
+
 def game_of(decisions):
 	return Game(decisions=[Decision("RED", 1, int(c.DecisionKind.TURN), 0, 1, 0, -1, -1, 0.0, (0.5,) * 3, 0, b"")] * decisions)
 

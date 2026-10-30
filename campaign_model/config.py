@@ -86,7 +86,10 @@ class CampaignConfig:
 	decision_price: float = 1e-4  # share points per turn decision
 	# Evaluation against Nullkiller2 (evaluate.py): our models in one seat, Nullkiller2 in the others
 	eval_minutes: float = 60.0  # 0: none
-	eval_games: int = 24  # 2, 3 and 4 players in turn; at 12 the score's standard error was ~0.1 (an eval takes ~20 s)
+	# 2, 3 and 4 players in turn (the first 24 are the setups of before, so paired comparisons go on); at 24 sampled games the
+	# score's standard error was ~0.07 and the evals' spread below it (2026-10-29): the user asked for a readable eval
+	eval_games: int = 48
+	eval_parallel: int = 24  # games at once (a VCMI client each, next to the training's)
 	eval_days: int = 56  # (the score at day 28 is logged too: score_d28)
-	eval_temperature: float = 1.0  # the campaign model's sampling (its battles are greedy, as battle evals)
+	eval_temperature: float = 0.0  # greedy, as the battle evals (2026-10-29: at 1.0 an eval's own sampling hid any change under ~0.1); evals compare only with those played the same way
 	eval_seconds: int = 240  # an eval game takes 10-30 s; an endless siege (BattleAI never retreats, VCMI has no round limit) held a whole eval, and with it the training, for 900 s
