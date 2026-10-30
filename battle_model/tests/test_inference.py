@@ -59,3 +59,29 @@ def test_a_different_contract_is_refused(served):
 	conn.connect(server.socket_path)
 	send_message(conn, json.dumps({"family": "battle", "contract_hash": "not-this-one"}).encode())
 	assert "error" in json.loads(read_message(conn))
+
+
+def free_port():
+	import socket
+
+	with socket.socket() as s:
+		s.bind(("127.0.0.1", 0))
+		return s.getsockname()[1]
+
+
+def test_a_client_on_another_machine_speaks_tcp_compressed():
+	"""Over TCP (worker.py's games) the same outputs as over the Unix socket, each message zlib-compressed."""
+	torch.manual_seed(1)
+	model = BattleModel().eval()
+	port = free_port()
+	server = InferenceServer(play.SOCKET_DIR / "test-inference-tcp.sock", device="cpu", model_kwargs={"architecture": "v3"}, threads=1, tcp_host="127.0.0.1", tcp_port=port)
+	try:
+		server.set_model("current", 7, model)
+		x = random_inputs(batch=3, seed=5)
+		local, distant = InferenceClient(server.socket_path), InferenceClient(server.endpoints("127.0.0.1")[0])
+		(v1, a), (v2, b) = local.run("current", x), distant.run("current", x)
+		assert v1 == v2 == 7 and distant.packed and not local.packed
+		for name in a:
+			assert np.array_equal(np.isfinite(a[name]), np.isfinite(b[name])) and np.allclose(np.nan_to_num(a[name], neginf=0), np.nan_to_num(b[name], neginf=0), atol=1e-6), name
+	finally:
+		server.close()

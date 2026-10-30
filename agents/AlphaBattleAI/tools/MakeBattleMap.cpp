@@ -116,27 +116,10 @@ void addHero(CMap & map, EditorCallback & cb, const JsonNode & side, PlayerColor
 
 	map.getEditManager()->insertObject(hero);
 }
-}
 
-int main(int argc, const char * argv[])
+/// Builds the map of one scenario file into out
+void buildMap(const std::string & scenarioPath, const std::string & out)
 {
-	if(argc != 3)
-	{
-		std::cerr << "usage: alpha_make_battle_map <scenario.json> <out.vmap>\n";
-		return 2;
-	}
-	const std::string scenarioPath = boost::filesystem::absolute(argv[1]).string();
-	const std::string out = boost::filesystem::absolute(argv[2]).string();
-	boost::filesystem::current_path(boost::filesystem::system_complete(argv[0]).parent_path());
-
-	CConsoleHandler console;
-	CBasicLogConfigurator logConfigurator(VCMIDirs::get().userLogsPath() / "VCMI_MakeBattleMap_log.txt", &console);
-	logConfigurator.configureDefault();
-	LIBRARY = new GameLibrary;
-	LIBRARY->initializeFilesystem(false);
-	logConfigurator.configure();
-	LIBRARY->initializeLibrary();
-
 	std::stringstream text;
 	text << std::ifstream(scenarioPath).rdbuf();
 	const std::string data = text.str();
@@ -230,9 +213,62 @@ int main(int argc, const char * argv[])
 
 	CMapService mapService;
 	mapService.saveMap(map, out);
-	std::cout << "wrote " << out << "\n";
+}
+}
 
-	map.reset(); // the map refers to the library's texts: free it first
+int main(int argc, const char * argv[])
+{
+	// --serve: one map after another, the game's library loaded once (its start is most of a map's cost: ~0.2 s of
+	// CPU a generated battle): each line on stdin is "<scenario.json>\t<out.vmap>", answered on stdout by "@@ok" or
+	// "@@error <message>" (stdout also has the console's log lines; battle_model/play.py MapBuilder)
+	const bool serve = argc == 2 && std::string(argv[1]) == "--serve";
+	if(argc != 3 && !serve)
+	{
+		std::cerr << "usage: alpha_make_battle_map <scenario.json> <out.vmap>\n       alpha_make_battle_map --serve\n";
+		return 2;
+	}
+	const std::string scenarioPath = serve ? "" : boost::filesystem::absolute(argv[1]).string();
+	const std::string out = serve ? "" : boost::filesystem::absolute(argv[2]).string();
+	boost::filesystem::current_path(boost::filesystem::system_complete(argv[0]).parent_path());
+
+	CConsoleHandler console;
+	CBasicLogConfigurator logConfigurator(VCMIDirs::get().userLogsPath() / "VCMI_MakeBattleMap_log.txt", &console);
+	logConfigurator.configureDefault();
+	LIBRARY = new GameLibrary;
+	LIBRARY->initializeFilesystem(false);
+	logConfigurator.configure();
+	LIBRARY->initializeLibrary();
+
+	if(serve)
+	{
+		std::cout << "@@ready" << std::endl;
+		for(std::string line; std::getline(std::cin, line);)
+		{
+			const auto tab = line.find('\t');
+			if(tab == std::string::npos)
+			{
+				std::cout << "@@error expected <scenario>\\t<out>" << std::endl;
+				continue;
+			}
+			try
+			{
+				buildMap(line.substr(0, tab), line.substr(tab + 1));
+				std::cout << "@@ok" << std::endl;
+			}
+			catch(const std::exception & e)
+			{
+				std::string message = e.what();
+				std::replace(message.begin(), message.end(), '\n', ' ');
+				std::cout << "@@error " << message << std::endl;
+			}
+		}
+	}
+	else
+	{
+		buildMap(scenarioPath, out);
+		std::cout << "wrote " << out << "\n";
+	}
+
 	logConfigurator.deconfigure();
 	delete LIBRARY;
 	return 0;

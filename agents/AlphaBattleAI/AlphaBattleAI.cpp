@@ -114,6 +114,8 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 			faults.push_back(fault);
 
 	simCheckEnabled = playerSetting(*CB, "ALPHA_BATTLE_SIM_CHECK") == "1";
+	attackCache.check = !playerSetting(*CB, "ALPHA_BATTLE_ATTACK_CHECK").empty();
+	attackCache.freshCheck = playerSetting(*CB, "ALPHA_BATTLE_ATTACK_CHECK") == "2";
 	const auto simulations = playerSetting(*CB, "ALPHA_BATTLE_SEARCH_SIMULATIONS");
 	searchSimulations = simulations.empty() ? 0 : std::stoi(simulations);
 	const auto considered = playerSetting(*CB, "ALPHA_BATTLE_SEARCH_CONSIDERED");
@@ -205,6 +207,7 @@ void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * 
 {
 	stats = Stats(); // the neutral player's battle AI is reused for every battle
 	history.reset();
+	attackCache.clear();
 	history.seeUnits(*cb->getBattle(battleID));
 	if(!delegated && !inferenceSocket.empty())
 		loadModel(); // the version this battle starts with, for its record
@@ -380,6 +383,9 @@ void AlphaBattleAI::battleEnd(const BattleID & battleID, const BattleResult * br
 		const double n = std::max(1, stats.searched);
 		logAi->info("AlphaBattleAI: search: simulations=%d searched=%d errors=%d changed=%d avg_ms=%.1f (copy %.1f, encode %.1f, model %.1f, apply %.1f) avg_network_calls=%.1f", searchSimulations, stats.searched, stats.searchErrors, stats.searchChanged, stats.searchMs / n, stats.searchCopyMs / n, stats.searchEncodeMs / n, stats.searchModelMs / n, stats.searchApplyMs / n, stats.searchEvaluations / n);
 	}
+	if(attackCache.check)
+		logAi->info("AlphaBattleAI: attack check: decisions=%d mismatches=%d", attackCache.checked, attackCache.mismatches);
+	attackCache.clear(); // (its copy of the game state: freed between battles)
 	if(simCheckEnabled)
 		logAi->info("AlphaBattleAI: simulation check: checks=%d rejected=%d exact_mismatches=%d dice_mismatches=%d avg_copy_ms=%.3f avg_apply_ms=%.3f", stats.simChecks, stats.simRejected, stats.simExactMismatches, stats.simDiceMismatches, stats.simChecks ? stats.simCopyMs / stats.simChecks : 0.0, stats.simChecks ? stats.simApplyMs / stats.simChecks : 0.0);
 	if(fallback)
@@ -515,7 +521,7 @@ void AlphaBattleAI::activeStack(const BattleID & battleID, const CStack * stack)
 		{
 			const auto player = cb->getPlayerID().value_or(PlayerColor::NEUTRAL);
 			delegatePending = std::make_unique<EncodedBattle>(encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(battle->battleGetMySide())], battleStartValues, &history));
-			encodeAttackValues(*delegatePending, env->game()->gameState(), battleID, player, stats.attackValues);
+			encodeAttackValues(*delegatePending, env->game()->gameState(), battleID, player, stats.attackValues, &attackCache);
 			delegateStack = stack->unitId();
 		}
 		fallback->activeStack(battleID, stack);
@@ -593,7 +599,7 @@ void AlphaBattleAI::playWithModel(const BattleID & battleID, const CStack * stac
 	{
 		const auto start = std::chrono::steady_clock::now();
 		auto encoded = encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(battle->battleGetMySide())], battleStartValues, &history);
-		encodeAttackValues(encoded, env->game()->gameState(), battleID, player, stats.attackValues);
+		encodeAttackValues(encoded, env->game()->gameState(), battleID, player, stats.attackValues, &attackCache);
 		for(const auto & action : rejected)
 			excludeAction(encoded, action);
 		if(!encoded.tensors.any(In::m_type))

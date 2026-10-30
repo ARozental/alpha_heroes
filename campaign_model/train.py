@@ -129,17 +129,19 @@ def _prefetched(batches, decode, device):
 	def work():
 		try:
 			for rows in batches:
-				ready.put((rows, decode(rows)))
+				inputs = {name: torch.from_numpy(value) for name, value in decode(rows).items()}
+				ready.put((rows, {name: value.pin_memory() for name, value in inputs.items()} if device.type == "cuda" else inputs))
 		except BaseException as error:  # re-raised in the training thread
 			ready.put(error)
 		ready.put(None)
 
 	threading.Thread(target=work, daemon=True).start()
+	pinned = device.type == "cuda"  # (a copy from pageable memory waits for the GPU: ~100 of them a minibatch)
 	while (item := ready.get()) is not None:
 		if isinstance(item, BaseException):
 			raise item
 		rows, inputs = item
-		yield rows, {name: torch.from_numpy(value).to(device) for name, value in inputs.items()}
+		yield rows, {name: value.to(device, non_blocking=pinned) for name, value in inputs.items()}
 
 
 def make_optimizer(model, config=CampaignConfig()):
@@ -224,6 +226,9 @@ def excess_loss(logits, targets):
 	predicts its target exactly."""
 	floor = -(torch.special.xlogy(targets, targets) + torch.special.xlogy(1 - targets, 1 - targets))
 	return F.binary_cross_entropy_with_logits(logits, targets, reduction="none") - floor
+
+
+STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl")  # a step's metrics, in ppo_update's order
 
 
 def ppo_update(
@@ -328,7 +333,7 @@ def ppo_update(
 			if end is not None:
 				counts["end"] = end_valid[index].sum(dim=0)
 			optimizer.zero_grad()
-			step = Counter()
+			parts = []
 			for part in np.array_split(np.arange(len(rows)), max(1, min(config.micro_batches, len(rows)))):
 				at = torch.from_numpy(part).to(device)
 				sub, keep = index[at], whole[at]
@@ -354,16 +359,18 @@ def ppo_update(
 				loss = policy + config.value_weight * value - config.entropy_weight * bonus + config.entropy_floor_weight * floor
 				loss.backward()
 				drift = logp.detach() - anchor[sub].nan_to_num(neginf=0.0)
-				step.update(
-					policy=policy.item(),
-					value=value.item(),
-					entropy=bonus.item(),
-					below_floor=float(((entropy < config.entropy_floor).float() * keep).sum() / counts["keep"]),
-					clip_fraction=float((((ratio - 1).abs() > config.clip).float() * keep).sum() / counts["keep"]),
-					kl=float((((drift.exp() - 1) - drift) * keep).sum() / counts["keep"]),  # k3, before this step
-				)
-			grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip))
+				parts.append(torch.stack([  # (summed on the device: one sync a step, not six a micro-batch)
+					policy.detach(),
+					value.detach(),
+					bonus.detach(),
+					((entropy < config.entropy_floor).float() * keep).sum() / counts["keep"],  # below_floor
+					(((ratio - 1).abs() > config.clip).float() * keep).sum() / counts["keep"],  # clip_fraction
+					(((drift.exp() - 1) - drift) * keep).sum() / counts["keep"],  # kl: k3, before this step
+				]).float())
+			grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 			optimizer.step()
+			*sums, grad_norm = torch.cat([torch.stack(parts).sum(dim=0), grad_norm.detach().float().reshape(1)]).tolist()
+			step = Counter(dict(zip(STEP_PARTS, sums)))
 			gpu_mb = max(gpu_mb, gpu_held(device))
 			steps += 1
 			recent.append(step["kl"])

@@ -128,6 +128,98 @@ def _remove_dead_map_builder_dirs():
 			pass
 
 
+class MapBuilder:
+	"""One alpha_make_battle_map --serve process: the game's library loaded once, then one map after another (a process
+	a map was ~0.2 s of CPU, ~20% of a generated battle's; then ~2-4 ms). One a process, its threads taking turns (41 MB
+	in all, not a builder a thread); one that fails or stalls is replaced."""
+
+	TIMEOUT = 60  # seconds for one map (a few ms each; the library's load at the start ~0.4 s)
+
+	def __init__(self):
+		self.process, self.pending = None, b""
+
+	def _start(self):
+		self.close()
+		env = {**os.environ, "VCMI_USER_DIR": str(_map_builder_dir())}
+		self.process = subprocess.Popen([str(ROOT / "build" / "bin" / "alpha_make_battle_map"), "--serve"], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+		self.pending = b""
+		if self._reply() != "@@ready":
+			self.close()
+			raise RuntimeError("the map builder did not start")
+
+	def _reply(self):
+		"""The process's next protocol line ("@@..."; the console's log lines go by), or "" if none came in time."""
+		deadline = time.monotonic() + self.TIMEOUT
+		while True:
+			while b"\n" in self.pending:
+				line, self.pending = self.pending.split(b"\n", 1)
+				text = line.decode(errors="replace").strip()
+				if "@@" in text:  # (after the console's colour codes)
+					return text[text.index("@@") :]
+			left = deadline - time.monotonic()
+			if left <= 0 or self.process.poll() is not None:
+				return ""
+			ready, _, _ = select.select([self.process.stdout], [], [], min(left, 1.0))
+			if ready:
+				chunk = os.read(self.process.stdout.fileno(), 1 << 16)
+				if not chunk:
+					return ""
+				self.pending += chunk
+
+	serves = None  # whether the built tool has --serve (an older build: one process a map, as before)
+
+	def build(self, scenario_path, out):
+		if MapBuilder.serves is False:
+			return _build_map_once(scenario_path, out)
+		for attempt in (1, 2):
+			if self.process is None or self.process.poll() is not None:
+				try:
+					self._start()
+				except RuntimeError:
+					if MapBuilder.serves is None:  # never started here: a build from before --serve
+						MapBuilder.serves = False
+						return _build_map_once(scenario_path, out)
+					raise
+				MapBuilder.serves = True
+			try:
+				self.process.stdin.write(f"{scenario_path}\t{out}\n".encode())
+				self.process.stdin.flush()
+			except OSError:
+				self.close()
+				continue
+			reply = self._reply()
+			if reply == "@@ok" and Path(out).exists():
+				return
+			if reply.startswith("@@error"):
+				raise RuntimeError(f"building the map failed: {reply[8:][:2000]}")
+			self.close()  # (died or stalled: a new one for the next try)
+		raise RuntimeError(f"building the map failed: the map builder died or stalled on {scenario_path}")
+
+	def close(self):
+		if self.process is not None:
+			try:
+				self.process.stdin.close()
+				self.process.wait(timeout=5)
+			except (OSError, subprocess.TimeoutExpired):
+				self.process.kill()
+				self.process.wait()
+			self.process = None
+
+	def __del__(self):
+		self.close()
+
+
+def _build_map_once(scenario_path, out):
+	"""One map in a process of its own (~0.2 s of CPU: the game's library loaded for it)."""
+	env = {**os.environ, "VCMI_USER_DIR": str(_map_builder_dir())}
+	result = subprocess.run([str(ROOT / "build" / "bin" / "alpha_make_battle_map"), str(scenario_path), str(out)], env=env, capture_output=True, text=True)
+	if result.returncode != 0 or not Path(out).exists():
+		raise RuntimeError(f"building the map failed:\n{result.stdout[-2000:]}\n{result.stderr[-2000:]}")
+
+
+_map_builder, _map_builder_lock = MapBuilder(), threading.Lock()
+
+
 def build_map(scenario_path, variant=""):
 	"""Write the scenario's battle-only map into the VCMI user data folder (overwrites); returns its map name.
 
@@ -136,10 +228,11 @@ def build_map(scenario_path, variant=""):
 	name = map_name(scenario_path, variant)
 	out = USER_DIR / (name + ".vmap")
 	out.parent.mkdir(parents=True, exist_ok=True)
-	env = {**os.environ, "VCMI_USER_DIR": str(_map_builder_dir())}
-	result = subprocess.run([str(ROOT / "build" / "bin" / "alpha_make_battle_map"), str(scenario_path), str(out)], env=env, capture_output=True, text=True)
-	if result.returncode != 0 or not out.exists():
-		raise RuntimeError(f"building the map failed:\n{result.stdout[-2000:]}\n{result.stderr[-2000:]}")
+	if MapBuilder.serves is False:  # (an older build: a process a map, in parallel as before)
+		_build_map_once(Path(scenario_path).resolve(), out.resolve())
+		return name
+	with _map_builder_lock:
+		_map_builder.build(Path(scenario_path).resolve(), out.resolve())
 	return name
 
 
@@ -191,18 +284,25 @@ class RecordServer:
 		# One bad connection (empty: a game killed as it connected; cut short) is dropped, never the server: an empty
 		# one ended this thread, and every record after it was lost
 		try:
-			with connection:
-				data = bytearray()
-				while chunk := connection.recv(1 << 23):
-					data += chunk
-			(key_length,) = struct.unpack_from("<I", data, 0)
-			if len(data) < 4 + key_length:
+			with connection:  # into one buffer that grows as it fills (a battle's record is tens of MB): two copies in all
+				data, size = bytearray(1 << 20), 0
+				while True:
+					if size == len(data):
+						data.extend(bytes(len(data)))
+					n = connection.recv_into(memoryview(data)[size:])
+					if not n:
+						break
+					size += n
+			view = memoryview(data)[:size]
+			(key_length,) = struct.unpack_from("<I", view, 0)
+			if size < 4 + key_length:
 				return
-			key = bytes(data[4 : 4 + key_length]).decode().split("#", 1)[0]  # AlphaBattleAI numbers each battle: key#n
+			key = bytes(view[4 : 4 + key_length]).decode().split("#", 1)[0]  # AlphaBattleAI numbers each battle: key#n
+			record = bytes(view[4 + key_length :])
 		except (OSError, struct.error, UnicodeDecodeError):
 			return
 		with self._lock:
-			self.records.setdefault(key, []).append(bytes(data[4 + key_length :]))
+			self.records.setdefault(key, []).append(record)
 
 	def drain(self):
 		"""The records received since the last drain ({key: [bytes, ...]}), removed from records."""

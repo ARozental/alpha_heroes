@@ -127,6 +127,7 @@ void AlphaMapAI::initGameInterface(std::shared_ptr<Environment> environment, std
 	const auto color = boost::to_upper_copy(playerID.toString());
 	modelName = ::env("ALPHA_MAP_MODEL", "current");
 	recordSocket = ::env("ALPHA_MAP_RECORD_SOCKET");
+	recordsPerDecision = ::env("ALPHA_MAP_RECORD_FORMAT", "1") == "2";
 	gameKey = ::env("ALPHA_MAP_GAME_KEY", "game");
 	dayCap = std::stoi(::env("ALPHA_MAP_DAYS", "0"));
 	temperature = std::stod(::env("ALPHA_MAP_TEMPERATURE", "1"));
@@ -562,33 +563,60 @@ void AlphaMapAI::sendRecords(bool final)
 	{
 		if(!pending.empty())
 		{
-			// "AMR1", the count, then each decision (campaign_model/records.py); zlib-compressed after "AMZ1" and the size
-			std::string raw = "AMR1";
-			put<uint32_t>(raw, static_cast<uint32_t>(pending.size()));
-			for(const auto & r : pending)
+			// "AMZ2" (ALPHA_MAP_RECORD_FORMAT=2, asked by a trainer that reads it): the count, then each decision
+			// (campaign_model/records.py) with its inputs zlib-compressed on their own at level 1, which the trainer keeps as
+			// they come. Else "AMZ1": the whole message compressed, at level 1 (it was 6: ~40% of this AI's CPU; the trainer
+			// decompresses it and compresses each decision again)
+			auto header = [&](std::string & out, const Record & r)
 			{
-				put<uint32_t>(raw, r.day);
-				put<uint32_t>(raw, r.kind);
-				put<uint32_t>(raw, r.decisionsToday);
-				put<uint32_t>(raw, r.version);
-				put<int32_t>(raw, r.choice.type);
-				put<int32_t>(raw, r.choice.index);
-				put<int32_t>(raw, r.choice.cell);
-				put<float>(raw, r.choice.logp);
+				put<uint32_t>(out, r.day);
+				put<uint32_t>(out, r.kind);
+				put<uint32_t>(out, r.decisionsToday);
+				put<uint32_t>(out, r.version);
+				put<int32_t>(out, r.choice.type);
+				put<int32_t>(out, r.choice.index);
+				put<int32_t>(out, r.choice.cell);
+				put<float>(out, r.choice.logp);
 				for(float v : r.value)
-					put<float>(raw, v);
-				put<uint32_t>(raw, r.flags);
-				put<uint32_t>(raw, static_cast<uint32_t>(r.inputs.size()));
-				raw += r.inputs;
+					put<float>(out, v);
+				put<uint32_t>(out, r.flags);
+				put<uint32_t>(out, static_cast<uint32_t>(r.inputs.size()));
+			};
+			auto deflate = [](const std::string & raw)
+			{
+				uLongf size = compressBound(raw.size());
+				std::string packed(size, '\0');
+				if(compress2(reinterpret_cast<Bytef *>(packed.data()), &size, reinterpret_cast<const Bytef *>(raw.data()), raw.size(), 1) != Z_OK)
+					throw std::runtime_error("compressing the records failed");
+				packed.resize(size);
+				return packed;
+			};
+			std::string payload;
+			if(recordsPerDecision)
+			{
+				payload = "AMZ2";
+				put<uint32_t>(payload, static_cast<uint32_t>(pending.size()));
+				for(const auto & r : pending)
+				{
+					header(payload, r);
+					const auto packed = deflate(r.inputs);
+					put<uint32_t>(payload, static_cast<uint32_t>(packed.size()));
+					payload += packed;
+				}
 			}
-			uLongf size = compressBound(raw.size());
-			std::string packed(size, '\0');
-			if(compress2(reinterpret_cast<Bytef *>(packed.data()), &size, reinterpret_cast<const Bytef *>(raw.data()), raw.size(), 6) != Z_OK)
-				throw std::runtime_error("compressing the records failed");
-			packed.resize(size);
-			std::string payload = "AMZ1";
-			put<uint32_t>(payload, static_cast<uint32_t>(raw.size()));
-			payload += packed;
+			else
+			{
+				std::string raw = "AMR1";
+				put<uint32_t>(raw, static_cast<uint32_t>(pending.size()));
+				for(const auto & r : pending)
+				{
+					header(raw, r);
+					raw += r.inputs;
+				}
+				payload = "AMZ1";
+				put<uint32_t>(payload, static_cast<uint32_t>(raw.size()));
+				payload += deflate(raw);
+			}
 			sendToRecordServer(recordSocket, gameKey + ":" + color + "#" + std::to_string(recordsSent++), payload);
 		}
 		if(final)

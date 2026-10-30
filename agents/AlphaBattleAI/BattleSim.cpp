@@ -23,6 +23,10 @@ class MeanRandom final : public vstd::RNG
 {
 	bool up = false;
 
+public:
+	void reset() { up = false; }
+
+private:
 	int64_t middle(int64_t lower, int64_t upper)
 	{
 		up = !up;
@@ -234,6 +238,12 @@ void BattleSimulation::scriptDice(std::optional<std::vector<bool>> script)
 	server->scripted.script = script.value_or(std::vector<bool>());
 	server->scripted.chances.clear();
 	server->scripted.outcomes.clear();
+}
+
+void BattleSimulation::resetScriptedDice()
+{
+	scriptDice(std::nullopt);
+	server->mean.reset();
 }
 
 const std::vector<double> & BattleSimulation::rollChances() const

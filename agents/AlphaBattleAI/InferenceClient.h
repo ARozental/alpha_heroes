@@ -10,10 +10,12 @@
 class InferenceClient
 {
 	int fd = -1;
+	bool compressed = false; // over TCP (socketPath "tcp:<host>:<port>"): every message zlib-compressed
 	std::mutex mutex;
 
 public:
-	/// Connects and says which family and contract it speaks; the server refuses a different contract
+	/// Connects and says which family and contract it speaks; the server refuses a different contract. socketPath: a
+	/// Unix socket, or "tcp:<host>:<port>" for a server on another machine
 	InferenceClient(const std::string & socketPath, const std::string & family, const std::string & contractHash);
 	~InferenceClient();
 	InferenceClient(const InferenceClient &) = delete;

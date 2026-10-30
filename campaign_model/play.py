@@ -127,6 +127,7 @@ def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_
 		env.update(
 			ALPHA_MAP_INFERENCE_SOCKET=str(socket_path),
 			ALPHA_MAP_RECORD_SOCKET=str(server.path),
+			ALPHA_MAP_RECORD_FORMAT="2",  # each decision compressed apart, kept as it comes (records.py)
 			ALPHA_MAP_GAME_KEY=game_key,
 			ALPHA_MAP_DAYS=str(days),
 			ALPHA_MAP_TEMPERATURE=str(temperature),

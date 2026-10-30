@@ -105,21 +105,31 @@ std::vector<uint32_t> attacked(const CBattleInfoCallback & battle, const CStack 
 }
 }
 
-void encodeAttackValues(EncodedBattle & e, const CGameState & game, const BattleID & battleID, PlayerColor player, AttackValueStats & stats)
+AttackValueCache::AttackValueCache() = default;
+AttackValueCache::~AttackValueCache() = default;
+
+void AttackValueCache::clear()
+{
+	sim.reset();
+	game = nullptr;
+	battle = -1;
+}
+
+namespace
+{
+/// encodeAttackValues' work, the attacks played on sim (a copy of battle battleID of game, any earlier state of it)
+void valueAttacks(EncodedBattle & e, BattleSimulation & sim, const CGameState & game, const BattleID & battleID, PlayerColor player, AttackValueStats & stats)
 {
 	auto & t = e.tensors;
-	if(e.mode != EncodedBattle::Mode::NORMAL || (!t.any(In::m_melee_target) && !t.any(In::m_shoot_target)))
-		return; // the special decisions (tactics, catapult, heal) have no attacks
-	const auto started = std::chrono::steady_clock::now();
-	++stats.calls;
 	const CBattleInfoCallback & battle = *game.getBattle(battleID);
 	const CStack * active = e.units[e.activeSlot];
 	auto unit = [&](int slot) -> const battle::Unit * { return slot >= 0 && slot < MAX_UNITS ? e.units[slot] : nullptr; };
-	auto sim = BattleSimulation::copyOf(game, battleID, 0);
-	const double before = keptValue(sim->battle());
+	sim.resetScriptedDice();
+	sim.restoreBattle(game, battleID);
+	const double before = keptValue(sim.battle());
 	auto value = [&](const ChosenAction & a)
 	{
-		return std::llround(expectedChange(*sim, game, battleID, player, engineAction(active->unitSide(), active, a, unit), before, stats.runs));
+		return std::llround(expectedChange(sim, game, battleID, player, engineAction(active->unitSide(), active, a, unit), before, stats.runs));
 	};
 
 	for(int u = 0; u < MAX_UNITS; ++u)
@@ -169,6 +179,59 @@ void encodeAttackValues(EncodedBattle & e, const CGameState & game, const Battle
 				found = outcomes.emplace(key, value(ChosenAction{.type = static_cast<int>(ActionType::MELEE), .hex = h, .unit = u})).first;
 			}
 			t.set(In::a_melee_value, u, h, found->second);
+		}
+	}
+}
+}
+
+void encodeAttackValues(EncodedBattle & e, const CGameState & game, const BattleID & battleID, PlayerColor player, AttackValueStats & stats, AttackValueCache * cache)
+{
+	auto & t = e.tensors;
+	if(e.mode != EncodedBattle::Mode::NORMAL || (!t.any(In::m_melee_target) && !t.any(In::m_shoot_target)))
+		return; // the special decisions (tactics, catapult, heal) have no attacks
+	const auto started = std::chrono::steady_clock::now();
+	++stats.calls;
+	if(!cache)
+	{
+		auto sim = BattleSimulation::copyOf(game, battleID, 0);
+		valueAttacks(e, *sim, game, battleID, player, stats);
+	}
+	else
+	{
+		if(!cache->sim || cache->game != &game || cache->battle != battleID.getNum())
+		{
+			cache->sim = BattleSimulation::copyOf(game, battleID, 0);
+			cache->game = &game;
+			cache->battle = battleID.getNum();
+		}
+		std::optional<EncodedBattle> fresh;
+		if(cache->check)
+			fresh = e;
+		if(cache->freshCheck) // (ALPHA_BATTLE_ATTACK_CHECK=2: two new copies compared, the kept one unused)
+			valueAttacks(e, *BattleSimulation::copyOf(game, battleID, 0), game, battleID, player, stats);
+		else
+			valueAttacks(e, *cache->sim, game, battleID, player, stats);
+		if(fresh)
+		{
+			AttackValueStats unused;
+			auto sim = BattleSimulation::copyOf(game, battleID, 0);
+			valueAttacks(*fresh, *sim, game, battleID, player, unused);
+			std::string differences;
+			for(int u = 0; u < MAX_UNITS; ++u)
+			{
+				if(t.get(In::a_shoot_value, u) != fresh->tensors.get(In::a_shoot_value, u))
+					differences += " shoot " + std::to_string(u) + ": " + std::to_string(t.get(In::a_shoot_value, u)) + " vs " + std::to_string(fresh->tensors.get(In::a_shoot_value, u)) + ";";
+				for(int h = 0; h < N_HEXES; ++h)
+					if(t.get(In::a_melee_value, u, h) != fresh->tensors.get(In::a_melee_value, u, h))
+						differences += " melee " + std::to_string(u) + " from " + std::to_string(h) + ": " + std::to_string(t.get(In::a_melee_value, u, h)) + " vs " + std::to_string(fresh->tensors.get(In::a_melee_value, u, h)) + ";";
+			}
+			++cache->checked;
+			if(!differences.empty())
+			{
+				++cache->mismatches;
+				const CStack * active = e.units[e.activeSlot];
+				logAi->error("AlphaBattleAI: ATTACK CHECK: %s valued attacks unlike a new copy (round %d, %s of side %d):%s", cache->freshCheck ? "a new copy" : "the kept copy", game.getBattle(battleID)->battleGetRound(), active->unitType()->getJsonKey(), static_cast<int>(active->unitSide()), differences);
+			}
 		}
 	}
 	stats.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();

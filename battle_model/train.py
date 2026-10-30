@@ -62,7 +62,7 @@ from torch.utils.tensorboard import SummaryWriter
 from campaign_model.config import CampaignConfig
 
 from . import generator, play, rules
-from .data import collate, credit_check, make_dataloader, summarize
+from .data import collate, credit_check, make_dataloader, summarize, widened
 from .distributions import log_prob
 from .export import export, verify
 from .device import sync, use_fused
@@ -114,6 +114,11 @@ class TrainConfig:
 	inference_threads: int = 1  # each server process's torch threads on the CPU (more threads barely help at small batches)
 	inference_processes: int = 0  # server processes; 0: one on a GPU, a fifth of the cores on the CPU
 	persistent_battles: bool = True  # each generated actor plays its battles in one VCMI process (play.BattleProcess)
+	# Workers on other machines (remote.py, worker.py): they connect to this port (0: none), play with this machine's
+	# inference servers over the network and send their records here; remote_token: their shared secret (empty: the
+	# file runtime/remote-token, made here on the first run)
+	remote_port: int = 0
+	remote_token: str = ""
 	run: str = "castle_vs_inferno"
 	epochs: int = 1000
 	opponent: str = "BattleAI"  # who we train against; "self" (play.SELF_PLAY): our model on both sides, learning from both
@@ -1058,6 +1063,11 @@ def train(config, resume=False):
 				campaign.close()
 			pool.close()
 			raise
+	hub = None
+	if config.remote_port and pool:  # workers on other machines
+		from .remote import Hub
+
+		hub = Hub(config, pool, campaign)
 	if not pool:
 		export(cpu_copy(model), model_files[current])
 		producer = Producer(play_epoch)
@@ -1103,13 +1113,15 @@ def train(config, resume=False):
 			trained = time.time()
 			model.train()
 			examples = loader.dataset
-			epoch_data = to_device(collate(examples), device) if examples else None  # every decision of the epoch, moved to the GPU once
+			# Every decision of the epoch, moved to the GPU once, its int64 inputs as int32 (half the bytes to stack and to move:
+			# 1.9 GB of a 3,200-decision update in int64), widened a minibatch at a time
+			epoch_data = to_device(collate(examples, widen=False), device) if examples else None
 			marks = [time.time()]
 			# Every tensor shape on the GPU is fixed: MPS keeps a compiled graph per shape (~100 MB each, never freed), so
 			# a last batch of a new size every epoch filled memory and swap. The last chunk repeats its last decision;
 			# each pass leaves out its last partial batch (a different one each pass).
 			if epoch_data is not None and hasattr(model, "facts"):  # the features: once per decision, not once per pass
-				chunks = [model.facts(select(epoch_data["inputs"], torch.arange(i, i + 256, device=device).clamp(max=len(examples) - 1))) for i in range(0, len(examples), 256)]
+				chunks = [model.facts(widened(select(epoch_data["inputs"], torch.arange(i, i + 256, device=device).clamp(max=len(examples) - 1)))) for i in range(0, len(examples), 256)]
 				epoch_data["facts"] = {key: torch.cat([c[key] for c in chunks])[: len(examples)] for key in chunks[0]}
 				del chunks  # its blocks would double the features' memory until the next update
 			fresh_value = float("nan")
@@ -1123,7 +1135,7 @@ def train(config, resume=False):
 					for i in range(0, len(examples), 256):
 						index = torch.arange(i, i + 256, device=device).clamp(max=len(examples) - 1)
 						rows = select(epoch_data, index)
-						out_rows = model(rows["inputs"], rows["facts"]) if "facts" in rows else model(rows["inputs"])
+						out_rows = model(widened(rows["inputs"]), rows["facts"]) if "facts" in rows else model(widened(rows["inputs"]))
 						anchors.append(log_prob(out_rows, rows["action"]))
 						excess.append(value_excess(out_rows, rows["value_labels"], ppo_config))
 					epoch_data["anchor_log_prob"] = torch.cat(anchors)[: len(examples)]
@@ -1148,7 +1160,7 @@ def train(config, resume=False):
 						print(f"update {epoch}: a minibatch's actions are corrupt on the {device} (step {batches}): the rest of this update is dropped", flush=True)
 						stopped = True
 						break
-					out_batch = model(batch["inputs"], batch["facts"]) if "facts" in batch else model(batch["inputs"])
+					out_batch = model(widened(batch["inputs"]), batch["facts"]) if "facts" in batch else model(widened(batch["inputs"]))
 					if config.search_simulations > 0 and "search" in batch:
 						loss, parts = search_loss(out_batch, batch["search"], batch["value_labels"], ppo_config)
 					else:
@@ -1276,6 +1288,8 @@ def train(config, resume=False):
 			if config.checkpoint_every and epoch % config.checkpoint_every == 0:
 				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average)
 	finally:
+		if hub:
+			hub.close()
 		if campaign:
 			campaign.close()
 		if pool:

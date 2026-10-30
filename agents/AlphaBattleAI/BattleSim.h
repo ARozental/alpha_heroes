@@ -55,6 +55,9 @@ public:
 	/// come (past its end: no success). Each roll's chance of success is kept (rollChances), so that a caller can
 	/// weight the outcome and try the other branches. An empty optional: random dice again.
 	void scriptDice(std::optional<std::vector<bool>> script);
+	/// The scripted dice as a new copy has them (their alternate rounding starts again), so that a copy kept for many
+	/// decisions values each one as a new copy would (AttackValueCache)
+	void resetScriptedDice();
 	/// The chances of success of the scripted rolls made since scriptDice, and what each one rolled
 	const std::vector<double> & rollChances() const;
 	const std::vector<bool> & rollOutcomes() const;

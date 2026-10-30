@@ -529,6 +529,9 @@ def walk_distances(open_, sources, steps):
 	masks = [(offset, mask.to(open_.device)) for offset, mask in _NEIGHBOUR_SHIFTS]
 	frontier, reached = sources, sources
 	distance = torch.where(sources, 0, INFINITE_DISTANCE)
+	# On the CPU, done once no frontier is left (every few steps: a check costs about a step): an empty frontier stays
+	# empty, so the distances are the same. Not on a GPU (each check a sync) nor in the export (a traced loop is fixed)
+	early = open_.device.type == "cpu" and not torch.jit.is_tracing() and not torch.onnx.is_in_onnx_export()
 	for step in range(1, steps + 1):
 		padded = torch.cat([pad, frontier, pad], dim=-1)
 		around = None
@@ -538,6 +541,8 @@ def walk_distances(open_, sources, steps):
 		frontier = around & open_ & ~reached
 		reached = reached | frontier
 		distance = torch.where(frontier, step, distance)
+		if early and step % 4 == 0 and not frontier.any():
+			break
 	return distance
 
 

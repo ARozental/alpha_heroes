@@ -298,3 +298,30 @@ def test_the_value_priors_lift_what_gains_and_load_into_old_checkpoints(monkeypa
 	fresh = BattleModel()
 	fresh.load_state_dict(old)  # strict: the hook adds the priors' gains
 	assert torch.equal(fresh.actions.value_gains.detach(), torch.zeros(4))
+
+
+def test_the_trunks_folded_relation_bias_is_the_bias():
+	"""Block folds its relation bias r[h, relation(i, j)] into q and k (scaled_dot_product_attention): the same attention
+	as adding the bias to the logits (relation 0 opposite sides, 1 either has none, 2 same side)."""
+	import math
+
+	from battle_model.constants import MASKED_LOGIT
+	from battle_model.model import Block
+
+	torch.manual_seed(3)
+	block = Block(64, 4)
+	with torch.no_grad():
+		block.relation.copy_(torch.randn(4, 3))
+	b, n = 3, 40
+	x = torch.randn(b, n, 64)
+	team = torch.randint(-1, 2, (b, n))
+	valid = torch.rand(b, n) > 0.3
+	valid[:, 0] = True
+	q, k, v = block.qkv(block.norm1(x)).chunk(3, dim=-1)
+	q, k, v = (t.reshape(b, n, 4, 16).transpose(1, 2) for t in (q, k, v))
+	relation = (team[:, :, None] * team[:, None, :]).sign() + 1
+	bias = block.relation[torch.arange(4)[None, :, None, None], relation[:, None]]
+	att = ((q @ k.transpose(-1, -2)) / math.sqrt(16) + bias).masked_fill(~valid[:, None, None, :], MASKED_LOGIT).softmax(dim=-1)
+	h = x + block.proj((att @ v).transpose(1, 2).reshape(b, n, 64))
+	expected = h + block.mlp(block.norm2(h))
+	assert torch.allclose(block(x, valid, team), expected, atol=1e-5)

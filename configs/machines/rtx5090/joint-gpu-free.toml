@@ -10,8 +10,8 @@
 #   - RAM is the limit: the Mac's 6 games and 8 actors peaked at 16.7 GB here (beside Zonkey's ~3 GB: killed); alone
 #     that is about all of WSL's 20 GB with nothing left for the hourly evals. 4 games and 8 actors should leave ~3 GB.
 #   - campaign updates need 8,192 decisions of >= 4 games: fewer than 4 games at once starves the campaign learner.
-#   - inference on the GPU (a few ms alone, to check) leaves the cores to the games; the campaign's own inference
-#     server is always on the CPU (campaign_model/learner.py).
+#   - inference on the GPU (a few ms alone, to check) leaves the cores to the games; the campaign's inference server
+#     too since 2026-10-29 ([campaign] below; it was always on the CPU).
 #   - More games: give WSL more memory (.wslconfig: memory=26GB, then `wsl --shutdown`; that stops every WSL process,
 #     Zonkey's too), then try the Mac's 6 games and 8 actors.
 # To measure: runtime/measure.sh joint-free campaign_model.joint --run measure-joint-free --battle-from <checkpoint>
@@ -24,4 +24,8 @@ buffer_decisions = 6000
 
 [campaign]
 games = 4
-inference_processes = 2
+# The campaign's inference on the GPU (inference_device "auto" is CUDA here, since 2026-10-29: on the CPU a decision cost
+# 5-10 ms of a core, the games' biggest share): one process batches every game's requests. NOT MEASURED YET
+inference_processes = 1
+# The same gradient as the recipe's 4 parts (they are summed), in one: the 32 GB GPU has the memory. NOT MEASURED YET
+micro_batches = 1

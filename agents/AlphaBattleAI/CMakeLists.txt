@@ -4,13 +4,14 @@ set(ALPHA_BATTLE_AI_SOURCES
 	AlphaBattleAI.h AttackValues.h BattleSearch.h BattleSim.h Dump.h Encoder.h GumbelSearch.h Model.h Policy.h Reward.h Schema.generated.h StdInc.h Tensors.h
 )
 find_package(onnxruntime CONFIG REQUIRED)
+find_package(ZLIB REQUIRED) # InferenceClient: compressed requests to a server on another machine
 # AlphaBattleAIDev: the same AI under another name, to try C++ changes while training runs keep using
 # AlphaBattleAI: `cmake --build build --target AlphaBattleAIDev`, then play with ai="AlphaBattleAIDev"
 foreach(target AlphaBattleAI AlphaBattleAIDev)
 	add_library(${target} SHARED ${ALPHA_BATTLE_AI_SOURCES})
 	target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR})
 	# vcmiservercommon: the server's battle rules, run on copies of a battle by BattleSim
-	target_link_libraries(${target} PRIVATE vcmi vcmiservercommon onnxruntime::onnxruntime)
+	target_link_libraries(${target} PRIVATE vcmi vcmiservercommon onnxruntime::onnxruntime ZLIB::ZLIB)
 	vcmi_set_output_dir(${target} "AI")
 endforeach()
 

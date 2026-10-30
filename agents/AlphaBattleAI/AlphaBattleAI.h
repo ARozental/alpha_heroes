@@ -157,6 +157,7 @@ class AlphaBattleAI : public CBattleGameInterface
 	// when the real game has applied it (actionFinished) the two battles are compared
 	bool simCheckEnabled = false;
 	std::unique_ptr<BattleSimulation> simCheck;
+	AttackValueCache attackCache; // encodeAttackValues' copy of the game state, one per battle
 	std::optional<BattleAction> simCheckAction;
 	void compareWithSimulation(const BattleID & battleID);
 

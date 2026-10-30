@@ -55,6 +55,35 @@ the same every time), `eval/campaign` the campaign model against Nullkiller2 (ou
 56 x players: 1 = an average player); the eval tab holds nothing else (the per-set and per-opponent details are under
 eval_details). Training itself is self-play, the wandering monsters BattleAI as in a real game.
 
+### On several machines (one run)
+
+The machine with the GPU (the master) trains; others (workers) play games for it. A worker runs only VCMI: every
+decision is asked of the master's inference servers over the network (~4 KB a battle decision, compressed), and its
+battle records and finished campaign games go to the master (`battle_model/remote.py`, `battle_model/worker.py`).
+
+1. Every machine: the same code (`git pull`, the same `vcmi` submodule commit, rebuilt: `cmake --build build`) and the
+   game data (`runtime/vcmi-user`, as above; the master refuses a worker whose model contracts differ from its own).
+2. The master: the run with `remote_port` set (it listens there, its battle inference on `remote_port + 1 + i`, the
+   campaign's on `remote_port + 51 + i`):
+   ```sh
+   .venv/bin/python -m campaign_model.joint --run NAME --hours 12 --machine configs/machines/rtx5090/joint-gpu-free.toml --set remote_port=7700
+   ```
+   The first such run writes the shared secret to `runtime/remote-token`; copy it to each worker's `runtime/`.
+3. Each worker, its own sizes (`configs/machines/<machine>/worker.toml` or `--set generated_actors=N campaign.games=M`):
+   ```sh
+   .venv/bin/python -m battle_model.worker --master <master's address> --machine configs/machines/mac-m4/worker.toml
+   ```
+   It waits for the master and reconnects after a stop and resume of the run. The master logs `remote: worker ... joined`
+   and, when one leaves, what it played.
+4. The master in WSL2 (the RTX 5090 PC): other machines reach WSL only with mirrored networking (`networkingMode=mirrored`
+   under `[wsl2]` in `C:\Users\<you>\.wslconfig`, then `wsl --shutdown`: it stops every WSL process) or a
+   `netsh interface portproxy` per port. Inbound TCP 7700-7760 must pass Windows' firewall and, in mirrored mode, WSL's
+   Hyper-V firewall (an administrator PowerShell: `New-NetFirewallRule -DisplayName alpha_heroes -Direction Inbound
+   -Protocol TCP -LocalPort 7700-7760 -Action Allow` and `New-NetFirewallHyperVRule -Name alpha_heroes -DisplayName
+   alpha_heroes -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts
+   7700-7760`). Check from a worker with the run started: `nc -vz <master's address> 7700`. Home network only: the token
+   is the only lock.
+
 ### On a second machine (an independent run beside this one)
 
 Two machines do not share one run: the second runs its own (its own seed, or other settings) and the evals, which

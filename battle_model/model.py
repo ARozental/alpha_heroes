@@ -58,7 +58,6 @@ from .constants import (
 	EFFECT_VOCAB,
 	GATE_STATE_VOCAB,
 	HEX_TYPES,
-	MASKED_LOGIT,
 	N_ACTION_TYPES,
 	N_EVENTS,
 	N_HEXES,
@@ -354,21 +353,29 @@ class Block(nn.Module):
 		self.mlp = SwiGLU(dim, 4 * dim // 3, dim)
 		self.relation = nn.Parameter(torch.zeros(heads, 3))
 
-	def forward(self, x, valid, relation):
+	def forward(self, x, valid, team):
+		"""team [B, T]: each token's side as the relation sees it, +1 / -1 (the two sides) or 0 (none)."""
 		b, n, d = x.shape
+		h, dh = self.heads, d // self.heads
 		q, k, v = self.qkv(self.norm1(x)).chunk(3, dim=-1)
-		q, k, v = (t.reshape(b, n, self.heads, d // self.heads).transpose(1, 2) for t in (q, k, v))
-		# Not self.relation[:, relation]: on the CPU indexing a parameter with an index this big ([B, T, T]) has a
-		# backward that was 80% of a training step; a choice among the three there (and in the export), an embedding
-		# lookup on a GPU (each the fastest there, fwd+bwd at batch 256: CPU 23 ms vs 2 s, Apple GPU 17 ms vs 28 ms)
-		if x.device.type == "cpu":
-			r, rel = self.relation[:, :, None, None], relation[:, None]
-			bias = torch.where(rel == 0, r[:, 0], torch.where(rel == 1, r[:, 1], r[:, 2]))  # [B, heads, T, T]
-		else:
-			bias = nn.functional.embedding(relation, self.relation.T).permute(0, 3, 1, 2)
-		att = (q @ k.transpose(-1, -2)) / math.sqrt(d // self.heads) + bias
-		att = att.masked_fill(~valid[:, None, None, :], MASKED_LOGIT).softmax(dim=-1)
-		x = x + self.proj((att @ v).transpose(1, 2).reshape(b, n, d))
+		q, k, v = (t.reshape(b, n, h, dh).transpose(1, 2) for t in (q, k, v))
+		# The relation bias r[h, relation(i, j)] (relation 0 opposite sides, 1 either has none, 2 same side) is
+		# r1 + alpha a_i a_j + beta s_i s_j with s = team, a = |team|, alpha = (r0 + r2) / 2 - r1, beta = (r2 - r0) / 2: the
+		# constant r1 drops out of the softmax, the rest is two more dims of q and k. So no [B, heads, T, T] bias or mask
+		# is ever made, and the fused attention kernel runs it (2026-10-29: the trunk's attention 2x faster on the CPU,
+		# forward and backward; the same function as the bias, to float rounding). Padded with zeros to a multiple of 8,
+		# v alike: the fast kernels' shapes (on the CPU 18 / 16 dims took the slow path)
+		r = self.relation
+		alpha, beta = (r[:, 0] + r[:, 2]) / 2 - r[:, 1], (r[:, 2] - r[:, 0]) / 2
+		s = team.to(q.dtype)[:, None, :, None].expand(b, h, n, 1)
+		a = s.abs()
+		width = dh + 2 + (-(dh + 2)) % 8
+		zeros = q.new_zeros(b, h, n, width - dh - 2)
+		q = torch.cat([q / math.sqrt(dh), alpha[None, :, None, None] * a, beta[None, :, None, None] * s, zeros], dim=-1)
+		k = torch.cat([k, a, s, zeros], dim=-1)
+		v = torch.cat([v, q.new_zeros(b, h, n, width - dh)], dim=-1)
+		att = nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=valid[:, None, None, :], scale=1.0)[..., :dh]
+		x = x + self.proj(att.transpose(1, 2).reshape(b, n, d))
 		return x + self.mlp(self.norm2(x))
 
 
@@ -385,12 +392,11 @@ class Trunk(nn.Module):
 		k = self.kind.weight
 		tokens = torch.cat([(glob + k[0])[:, None, :], heroes + k[1], units + k[2], events + k[4], hexes + k[3]], dim=1)
 		none = torch.zeros_like(unit_team[:, :1])
-		team = torch.cat([none, hero_team, unit_team, event_team, none.expand(-1, N_HEXES)], dim=1)
-		relation = (team[:, :, None] * team[:, None, :]).sign() + 1  # 0 opposite sides, 1 either has none, 2 same side
+		team = torch.cat([none, hero_team, unit_team, event_team, none.expand(-1, N_HEXES)], dim=1).sign()  # (Block: the relation)
 		always = torch.ones_like(unit_valid[:, :1])
 		valid = torch.cat([always, hero_valid, unit_valid, event_valid, always.expand(-1, N_HEXES)], dim=1)
 		for block in self.blocks:
-			tokens = block(tokens, valid, relation)
+			tokens = block(tokens, valid, team)
 		tokens = self.norm(tokens)
 		units_end = 1 + N_SIDES + units.shape[1]
 		return tokens[:, 0], tokens[:, 1 : 1 + N_SIDES], tokens[:, 1 + N_SIDES : units_end], tokens[:, -N_HEXES:]

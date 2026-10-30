@@ -8,6 +8,9 @@ is learned (the recipe: learning rate, rewards, eval sets) - that stays on the c
 configs/machines/<machine>/<training>-<case>.toml
   training: battle (battle_model.train, actors=true) | campaign | joint (campaign_model.joint)
   case:     gpu-free (nothing else on the GPU) | gpu-shared (another training run on the GPU, e.g. Zonkey)
+configs/machines/<machine>/worker.toml
+  the games the machine plays as a worker for a run on another machine (battle_model.worker --machine; README.md
+  "On several machines"): generated_actors, [campaign] games
 ```
 
 Use one with `--machine`; it is applied after the recipe and before `--set`, so `--set` still overrides it:

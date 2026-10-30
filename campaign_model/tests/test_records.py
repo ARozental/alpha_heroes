@@ -13,7 +13,17 @@ def wire(x, b):
 
 
 def message(x, n):
-	"""A records message as AlphaMapAI::sendRecords writes it."""
+	"""A records message as AlphaMapAI::sendRecords writes it: each decision's inputs compressed on their own."""
+	out = b"AMZ2" + struct.pack("<I", n)
+	for b in range(n):
+		inputs = wire(x, b)
+		packed = zlib.compress(inputs, 1)
+		out += HEADER.pack(b + 1, int(x["g_kind"][b]), b, 7, 1, 5, -1, -0.5, *([0.25] * c.N_VALUE_OFFSETS), 1, len(inputs)) + struct.pack("<I", len(packed)) + packed
+	return out
+
+
+def old_message(x, n):
+	"""A records message as AlphaMapAI::sendRecords wrote it before 2026-10-29: the whole message compressed."""
 	raw = b"AMR1" + struct.pack("<I", n)
 	for b in range(n):
 		inputs = wire(x, b)
@@ -23,12 +33,20 @@ def message(x, n):
 
 def test_records_round_trip():
 	x = random_inputs(3, seed=4)
-	game = collect({"g0:RED": [message(x, 3)], "g0:RED:done": [b'{"errors": 0}'], "g0:ledger": [b'{"day": 1, "players": []}']})
-	assert [d.day for d in game.decisions] == [1, 2, 3] and game.decisions[0].flags == 1 and game.done == {"RED": {"errors": 0}}
-	assert 1 in game.ledgers
-	decoded = decode_inputs(game.decisions)
-	for name, value in x.items():
-		assert np.array_equal(decoded[name], value), name
+	for make in (message, old_message):
+		game = collect({"g0:RED": [make(x, 3)], "g0:RED:done": [b'{"errors": 0}'], "g0:ledger": [b'{"day": 1, "players": []}']})
+		assert [d.day for d in game.decisions] == [1, 2, 3] and game.decisions[0].flags == 1 and game.done == {"RED": {"errors": 0}}
+		assert 1 in game.ledgers
+		decoded = decode_inputs(game.decisions)
+		for name, value in x.items():
+			assert np.array_equal(decoded[name], value), name
+
+
+def test_a_records_message_cut_short_is_left_out():
+	x = random_inputs(2, seed=5)
+	whole = message(x, 2)
+	game = collect({"g:RED": [whole[: len(whole) - 100]], "g:ledger": [b'{"day": 1, "players": []}']})
+	assert game.damaged == 1 and game.decisions == []
 
 
 def test_a_damaged_records_message_is_left_out_not_the_game():

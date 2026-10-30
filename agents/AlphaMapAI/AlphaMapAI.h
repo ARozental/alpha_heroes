@@ -91,6 +91,7 @@ class AlphaMapAI : public CAdventureAI
 	std::mutex inferenceMutex;
 	std::string modelName = "current";
 	std::string recordSocket;
+	bool recordsPerDecision = false; // ALPHA_MAP_RECORD_FORMAT=2: "AMZ2", each decision compressed apart (records.py)
 	std::string gameKey = "game";
 	int dayCap = 0;
 	double temperature = 1.0;

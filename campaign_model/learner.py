@@ -118,7 +118,12 @@ class CampaignLearner:
 		if config.learner == "process":
 			self.worker = UpdateProcess(config, self.kwargs, self.model, self.optimizer, self.lr_scale, latest)
 		battle_play.SOCKET_DIR.mkdir(parents=True, exist_ok=True)
-		self.server = InferenceServer(battle_play.SOCKET_DIR / f"campaign-{os.getpid()}.sock", device="cpu", family="campaign", model_kwargs=self.kwargs, threads=config.inference_threads, processes=config.inference_processes)
+		from battle_model.actors import inference_device
+
+		from battle_model import remote
+
+		port = battle.config.remote_port  # (workers on other machines: remote.py)
+		self.server = InferenceServer(battle_play.SOCKET_DIR / f"campaign-{os.getpid()}.sock", device=inference_device(config.inference_device), family="campaign", model_kwargs=self.kwargs, threads=config.inference_threads, processes=config.inference_processes, tcp_port=port + remote.CAMPAIGN_PORT if port else 0)
 		self.server.set_model("current", self.version, self.model)
 		self.finished = []  # finished games: (records.Game, play.GameInfo)
 		self.lock = threading.Condition()
@@ -128,6 +133,7 @@ class CampaignLearner:
 		self.stats = Counter()
 		self.model_lock = threading.Lock()  # the learner thread's update against a checkpoint taken by an evaluation
 		self.battle_epoch = 0
+		self.key_prefix = ""  # (a worker's games: its name first, remote.Hub)
 		self.failed_runs = []
 		self.threads = []
 		self.writer = SummaryWriter(self.run / "tensorboard" / "campaign")
@@ -198,7 +204,7 @@ class CampaignLearner:
 			if not self.running.wait(timeout=1):
 				continue
 			n += 1
-			key = f"c{index}_{n}"
+			key = f"{self.key_prefix}c{index}_{n}"
 			players, size, seed = rng.choice(config.players), rng.choice(config.sizes), rng.randrange(1, 2**31)
 			game_map, days = rng.random() < config.game_map_share, draw_days(rng, config)
 			map_name = None
@@ -227,12 +233,16 @@ class CampaignLearner:
 				shutil.rmtree(info.run_dir, ignore_errors=True)
 			else:  # its records up to then are still used: the labels take the last day it reached as its end
 				self._failed(f"game {key} ({map_name}, {players} players): {info.status} (run {info.run_dir})", info.run_dir)
-			self._log_game(key, map_name, players, game, info)
-			with self.lock:
-				self.finished.append((game, info))
-				self.stats["games"] += 1
-				self.stats["game_maps"] += game_map
-				self.lock.notify_all()
+			self._game_done(key, map_name, players, game, info, game_map)
+
+	def _game_done(self, key, map_name, players, game, info, game_map):
+		"""A finished game (one of this machine's, or a worker's: remote.Hub) for the next updates."""
+		self._log_game(key, map_name, players, game, info)
+		with self.lock:
+			self.finished.append((game, info))
+			self.stats["games"] += 1
+			self.stats["game_maps"] += game_map
+			self.lock.notify_all()
 
 	def _log_game(self, key, map_name, players, game, info):
 		"""One line per finished game in <run>/campaign/games.jsonl: how and when it ended, each player's end."""

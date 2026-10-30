@@ -2,11 +2,13 @@
 Ledger.cpp) to a RecordServer (battle_model/play.py) under the keys "<game>:<COLOR>" (records), "<game>:ledger"
 (snapshots) and "<game>:<COLOR>:done" (a player stopped at the day cap or the end of its game).
 
-A records message: "AMZ1", u32 size, zlib("AMR1", u32 count, count x decision); a decision: u32 day, u32 kind,
-u32 decisions earlier that day, u32 model version, i32 action type (-1 for a question), i32 index, i32 cell,
-f32 log-probability, f32 value[N_VALUE_OFFSETS], u32 flags (NO_EFFECT), u32 n, n bytes of inputs (the inference
-server's wire encoding). A decision's inputs are ~340 KB (eight hero windows of 33 x 33 tiles), so each is kept
-zlib-compressed (1-4 KB) until a minibatch decodes it.
+A records message: "AMZ2", u32 count, count x decision; a decision: u32 day, u32 kind, u32 decisions earlier that day,
+u32 model version, i32 action type (-1 for a question), i32 index, i32 cell, f32 log-probability,
+f32 value[N_VALUE_OFFSETS], u32 flags (NO_EFFECT), u32 n, u32 m, m bytes: the n bytes of its inputs (the inference
+server's wire encoding) zlib-compressed. A decision's inputs are ~340 KB (eight hero windows of 33 x 33 tiles), so each
+is kept compressed (1-4 KB) as it came until a minibatch decodes it (play.py asks for this format: ALPHA_MAP_RECORD_FORMAT=2).
+Without it (and before 2026-10-29): "AMZ1", u32 size, zlib("AMR1", u32 count, count x decision with u32 n, n bytes of
+inputs), the whole message compressed at once, each decision compressed again here.
 """
 import json
 import struct
@@ -54,6 +56,21 @@ class Game:
 
 
 def parse_records(color, payload):
+	if payload[:4] == b"AMZ2":
+		(count,) = struct.unpack_from("<I", payload, 4)
+		offset, out = 8, []
+		for _ in range(count):
+			day, kind, today, version, action_type, index, cell, logp, *rest = HEADER.unpack_from(payload, offset)
+			value, flags, n = tuple(rest[: c.N_VALUE_OFFSETS]), rest[-2], rest[-1]
+			(m,) = struct.unpack_from("<I", payload, offset + HEADER.size)
+			offset += HEADER.size + 4
+			if n != IN_BYTES:
+				raise ValueError(f"a decision has {n} input bytes, the contract {IN_BYTES}")
+			if offset + m > len(payload):
+				raise ValueError("a damaged records message")
+			out.append(Decision(color, day, kind, today, version, action_type, index, cell, logp, value, flags, bytes(payload[offset : offset + m])))
+			offset += m
+		return out
 	if payload[:4] != b"AMZ1":
 		raise ValueError("not a records message")
 	(size,) = struct.unpack_from("<I", payload, 4)

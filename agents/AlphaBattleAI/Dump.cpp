@@ -6,6 +6,7 @@
 #include "lib/filesystem/CZipSaver.h"
 #include "lib/filesystem/MinizipExtensions.h"
 
+#include <climits>
 #include <filesystem>
 #include <stdexcept>
 
@@ -75,11 +76,27 @@ void BattleRecord::addDecision(const InputTensors & in, const OutputTensors & ou
 	for(int i = 0; i < static_cast<int>(In::COUNT); ++i)
 	{
 		const auto & data = in.data(static_cast<In>(i));
+		auto & column = inputs[i];
+		const size_t at = column.size();
 		if(INPUTS[i].dtype == DType::BOOL)
-			for(const auto v : data)
-				inputs[i] += static_cast<char>(v != 0);
+		{
+			column.resize(at + data.size());
+			for(size_t k = 0; k < data.size(); ++k)
+				column[at + k] = static_cast<char>(data[k] != 0);
+		}
 		else
-			inputs[i].append(reinterpret_cast<const char *>(data.data()), data.size() * sizeof(int64_t));
+		{
+			// As int32, as the inference wire sends them (Model.cpp): half the bytes of int64, and the trainer keeps them so
+			// (data.py compact read every int64 array to narrow it, ~1 ms of its CPU a decision)
+			column.resize(at + data.size() * sizeof(int32_t));
+			auto * out = reinterpret_cast<int32_t *>(column.data() + at);
+			for(size_t k = 0; k < data.size(); ++k)
+			{
+				if(data[k] < INT32_MIN || data[k] > INT32_MAX)
+					throw std::runtime_error(std::string("input '") + INPUTS[i].name + "' is out of the int32 range of the record");
+				out[k] = static_cast<int32_t>(data[k]);
+			}
+		}
 	}
 	for(int o = 0; o < static_cast<int>(Out::COUNT); ++o)
 	{
@@ -96,7 +113,7 @@ std::string BattleRecord::serialize() const
 	appendEntry(out, "events.jsonl", events);
 	appendEntry(out, "actions.jsonl", actions);
 	for(int i = 0; i < static_cast<int>(In::COUNT); ++i)
-		appendEntry(out, std::string(INPUTS[i].name) + ".npy", npy(INPUTS[i].dtype == DType::BOOL ? "|b1" : "<i8", INPUTS[i], inputs[i].data(), inputs[i].size(), decisions));
+		appendEntry(out, std::string(INPUTS[i].name) + ".npy", npy(INPUTS[i].dtype == DType::BOOL ? "|b1" : "<i4", INPUTS[i], inputs[i].data(), inputs[i].size(), decisions));
 	for(int o = 0; o < static_cast<int>(Out::COUNT); ++o)
 		appendEntry(out, std::string(OUTPUTS[o].name) + ".npy", npy("<f4", OUTPUTS[o], outputs[o].data(), outputs[o].size(), decisions));
 	return out;

@@ -35,7 +35,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import generator, play, real_games
+from . import generator, play, real_games, remote
 from .data import check_record, compact_record, expand_record, parse_record
 from .inference import InferenceServer
 
@@ -62,7 +62,9 @@ class ActorPool:
 			self.socket = play.SOCKET_DIR / f"infer-{os.getpid()}.sock"
 			device = inference_device(config.inference_device)
 			processes = config.inference_processes or (1 if device != "cpu" else max(1, (os.cpu_count() or 4) // 5))
-			self.server = InferenceServer(self.socket, device=device, model_kwargs=model_kwargs, threads=config.inference_threads, processes=processes)
+			# (and over TCP for workers on other machines: remote.py)
+			tcp_port = config.remote_port + remote.BATTLE_PORT if config.remote_port else 0
+			self.server = InferenceServer(self.socket, device=device, model_kwargs=model_kwargs, threads=config.inference_threads, processes=processes, tcp_port=tcp_port)
 			import torch
 
 			for path in sorted(self.models.glob("snapshot_*.pt")):  # the league of a resumed run, by the names past_versions gives
@@ -168,9 +170,10 @@ class ActorPool:
 		if self.server:
 			self.server.close()
 
-	def _add(self, records, source, game):
+	def _check(self, records, source, game):
+		"""(the sound records, compacted and marked with their source; what was wrong with the others)."""
 		sound, failures = [], []
-		for r in records:  # (outside the lock: the other actors and the learner go on meanwhile)
+		for r in records:
 			if any(e.get("event") == "error" for e in r.events):  # a battle the model did not play: never trained on
 				failures.append(message := next(e for e in r.events if e.get("event") == "error").get("message", "")[:300])
 				print(f"actors: a {source} battle had an error ({game}): {message}", flush=True)
@@ -181,6 +184,11 @@ class ActorPool:
 				compact_record(r)  # (~10x smaller in the buffer; take() expands it)
 				r.source = source  # (data.make_dataloader normalises each source's advantages on its own)
 				sound.append(r)
+		return sound, failures
+
+	def _add(self, records, source, game, checked=False):
+		"""checked: records already checked and compacted (a worker's, remote.Hub)."""
+		sound, failures = (list(records), []) if checked else self._check(records, source, game)  # (outside the lock)
 		with self.lock:
 			if failures:
 				self.stats["failures"] += len(failures)

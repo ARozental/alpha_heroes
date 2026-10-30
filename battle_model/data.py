@@ -24,7 +24,9 @@ A sent record is ~190 KB a decision, in memory only. Keeping data across epochs 
 import copy
 import io
 import json
+import re
 import struct
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -197,13 +199,29 @@ def parse_record(data):
 		entries[name] = view[offset + 8 : offset + 8 + size]
 		offset += 8 + size
 	lines = lambda name: [json.loads(line) for line in bytes(entries[name]).decode().splitlines() if line.strip()]
-	tensors = {s.name: compact(np.load(io.BytesIO(entries[s.name + ".npy"]))) for s in INPUTS + OUTPUTS}
+	tensors = {s.name: compact(npy_view(entries[s.name + ".npy"])) for s in INPUTS + OUTPUTS}
 	return Record(lines("events.jsonl"), lines("actions.jsonl"), tensors)
+
+
+NPY_HEADER = re.compile(rb"'descr': *'([^']+)', *'fortran_order': *False, *'shape': *\(([^)]*)\)")
+
+
+def npy_view(entry):
+	"""An .npy file's array as a read-only view of its bytes (np.load copied every record's ~0.4 MB a decision twice):
+	format 1.0, C order, as AlphaBattleAI writes them (Dump.cpp); anything else through np.load."""
+	if bytes(entry[:8]) == b"\x93NUMPY\x01\x00":
+		(length,) = struct.unpack_from("<H", entry, 8)
+		match = NPY_HEADER.search(bytes(entry[10 : 10 + length]))
+		if match:
+			shape = tuple(int(d) for d in match.group(2).split(b",") if d.strip())
+			return np.frombuffer(entry, dtype=np.dtype(match.group(1).decode()), count=int(np.prod(shape, dtype=np.int64)), offset=10 + length).reshape(shape)
+	return np.load(io.BytesIO(entry))
 
 
 def compact(array):
 	"""An int64 array as int32 when its values fit (all inputs do: ~630k at most): records wait in the actors' buffer
-	by the thousand, at ~675 KB a decision in int64, and the machine swapped (collate widens them back)."""
+	by the thousand, at ~675 KB a decision in int64, and the machine swapped (collate widens them back). AlphaBattleAI
+	sends them as int32 since 2026-10-29: those pass as they are."""
 	if array.dtype == np.int64 and array.size and np.abs(array).max() < 2**31:
 		return array.astype(np.int32)
 	return array
@@ -243,12 +261,17 @@ def compact_record(record):
 	tables that are mostly zero, and the buffer held 16k decisions (~6.5 GB) on a 26 GB machine that swapped.
 	Changes the record in place and returns it; check_record it before (it needs every output)."""
 	tensors = dict(record.tensors)
-	logp = {s.name: torch.from_numpy(np.ascontiguousarray(tensors.pop(s.name))) for s in OUTPUTS if s.name.startswith("logp_")}
+	with warnings.catch_warnings():  # (parse_record's read-only views: only read here)
+		warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
+		logp = {s.name: torch.from_numpy(np.ascontiguousarray(tensors.pop(s.name))) for s in OUTPUTS if s.name.startswith("logp_")}
 	if logp:
 		tensors["old_log_prob"] = log_prob(logp, stack_actions(record.actions)).numpy() if record.actions else np.zeros(0, np.float32)
 	for name in SPARSE_INPUTS:
 		if isinstance(tensors.get(name), np.ndarray):
 			tensors[name] = Sparse(tensors[name])
+	for name, value in tensors.items():  # (parse_record's arrays are views of the whole message: kept, they would keep it)
+		if isinstance(value, np.ndarray) and value.base is not None:
+			tensors[name] = value.copy()
 	record.tensors = tensors
 	return record
 
@@ -356,7 +379,9 @@ def battle_examples(record, reward_config=RewardConfig(), advantage_config=Advan
 	if not decisions:
 		return [], summary
 
-	outputs = {s.name: torch.from_numpy(record.tensors[s.name]) for s in OUTPUTS if s.name in record.tensors}
+	with warnings.catch_warnings():  # (a full record's outputs: parse_record's read-only views, only read here)
+		warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
+		outputs = {s.name: torch.from_numpy(record.tensors[s.name]) for s in OUTPUTS if s.name in record.tensors}
 	actions = stack_actions([d[2] for d in decisions])
 	old_log_prob = torch.from_numpy(record.tensors["old_log_prob"]) if "old_log_prob" in record.tensors else log_prob(outputs, actions)  # (compact_record's)
 	values = outputs["value"][:, -1]  # V, the final-reward head (-1..1)
@@ -383,12 +408,14 @@ def battle_examples(record, reward_config=RewardConfig(), advantage_config=Advan
 	return examples, summary
 
 
-def collate(examples):
+def collate(examples, widen=True):
 	"""List of examples -> one batch: inputs as model-ready tensors, the rest stacked. When any example has a search
 	policy: "search" = {"action": {field: [B, K]}, "probs": [B, K]}, padded to the longest with probability 0 (and
-	all fields -1); an example without one has all probabilities 0."""
+	all fields -1); an example without one has all probabilities 0. widen=False: the int64 inputs as the records keep
+	them (int32: half the bytes to stack and to move to the GPU), for widened() on the device, a minibatch at a time."""
+	stack = lambda s: np.stack([e["inputs"][s.name] for e in examples])  # noqa: E731
 	batch = {
-		"inputs": {s.name: torch.from_numpy(np.stack([e["inputs"][s.name] for e in examples]).astype(np.int64) if s.dtype == "int64" else np.stack([e["inputs"][s.name] for e in examples])) for s in INPUTS},
+		"inputs": {s.name: torch.from_numpy(stack(s).astype(np.int64) if s.dtype == "int64" and widen else stack(s)) for s in INPUTS},
 		"action": {f: torch.tensor([e["action"][f] for e in examples], dtype=torch.long) for f in ACTION_FIELDS},
 		"old_log_prob": torch.stack([e["old_log_prob"] for e in examples]),
 		"advantage": torch.stack([e["advantage"] for e in examples]),
@@ -405,6 +432,14 @@ def collate(examples):
 				actions[i, : len(s[1])], probs[i, : len(s[1])] = s
 		batch["search"] = {"action": {f: actions[..., j] for j, f in enumerate(ACTION_FIELDS)}, "probs": probs}
 	return batch
+
+
+INT64_INPUTS = frozenset(s.name for s in INPUTS if s.dtype == "int64")
+
+
+def widened(inputs):
+	"""collate(widen=False)'s inputs (or a selection of them) as the model takes them: the int64 ones int64 again."""
+	return {name: value.long() if name in INT64_INPUTS and value.dtype != torch.int64 else value for name, value in inputs.items()}
 
 
 def make_dataloader(records, batch_size=64, shuffle=True, reward_config=RewardConfig(), advantage_config=AdvantageConfig()):

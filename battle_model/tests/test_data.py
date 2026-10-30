@@ -189,3 +189,17 @@ def test_war_machines_in_the_campaign_are_half_their_price():
 	assert all(artifact_price(a) == prices[a] for a in (2, 3, 4, 5, 6, 7))
 	assert artifact_price(0) == 0  # the battle's: a winner never takes a spellbook (the campaign's: its price, 2026-10-29)
 	assert prices[4] == vocab.artifact_price(4) / 2 and prices[6] == vocab.artifact_price(6) / 2
+
+
+def test_npy_view_reads_what_np_load_reads():
+	import io
+
+	import numpy as np
+
+	from battle_model.data import npy_view
+
+	for array in (np.arange(24, dtype=np.int32).reshape(2, 3, 4), np.array([[True, False]]), np.full((3, 0), -np.inf, dtype=np.float32), np.arange(5, dtype=np.int64)):
+		buffer = io.BytesIO()
+		np.save(buffer, array)
+		view = npy_view(memoryview(buffer.getvalue()))
+		assert view.dtype == array.dtype and view.shape == array.shape and np.array_equal(view, array)

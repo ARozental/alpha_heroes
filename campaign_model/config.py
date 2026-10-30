@@ -28,6 +28,10 @@ class CampaignConfig:
 	# The campaign family's inference server
 	inference_processes: int = 1
 	inference_threads: int = 2
+	# The campaign server's device: "auto" = CUDA when there is one (one process batches every game; on the CPU a decision
+	# costs 5-10 ms of a core, the machine's games' biggest share), else the CPU (Apple's GPU is slower for these small
+	# batches and cannot be shared between threads); or e.g. "cpu", "cuda"
+	inference_device: str = "auto"
 	# Updates (train.ppo_update), with their own optimizer
 	decisions_per_update: int = 8192
 	min_games_per_update: int = 4  # one game's decisions are alike: an update takes several games
