@@ -12,7 +12,7 @@ import functools
 import itertools
 import json
 import os
-import select
+import selectors
 import shutil
 import socket
 import struct
@@ -28,6 +28,15 @@ COLORS = ("RED", "BLUE")  # battle side 0 (attacker) and 1 (defender)
 SELF_PLAY = "self"  # Game.opponent for our model against itself
 SOCKET_DIR = ROOT / "runtime" / "sockets"  # RecordServer sockets: only addresses, no data on disk
 PREFIX_DIR = ROOT / "runtime" / "prefixes"  # Game.prefix files, deleted after each battle
+
+
+def readable(handle, timeout):
+	"""Whether handle (a file or socket) has something to read within timeout seconds. select.select fails on a
+	descriptor >= 1024 (2026-10-30, the PC: under LimitNOFILE=65536 beside CUDA the record servers' sockets were above
+	it, and their threads died: "filedescriptor out of range in select()"); a selector (epoll, kqueue) has no limit."""
+	with selectors.DefaultSelector() as selector:
+		selector.register(handle, selectors.EVENT_READ)
+		return bool(selector.select(timeout))
 MAP_BUILDER_DIR = ROOT / "runtime" / "map-builders"  # the map builder's user data folders, one per process and thread
 _server_numbers = itertools.count()
 
@@ -159,8 +168,7 @@ class MapBuilder:
 			left = deadline - time.monotonic()
 			if left <= 0 or self.process.poll() is not None:
 				return ""
-			ready, _, _ = select.select([self.process.stdout], [], [], min(left, 1.0))
-			if ready:
+			if readable(self.process.stdout, min(left, 1.0)):
 				chunk = os.read(self.process.stdout.fileno(), 1 << 16)
 				if not chunk:
 					return ""
@@ -267,8 +275,7 @@ class RecordServer:
 
 	def _serve(self):
 		while True:
-			ready, _, _ = select.select([self._socket], [], [], 0.1)
-			if ready:
+			if readable(self._socket, 0.1):
 				try:
 					connection, _ = self._socket.accept()
 				except OSError:
@@ -415,8 +422,7 @@ class BattleProcess:
 			left = deadline - time.monotonic()
 			if left <= 0 or self.process.poll() is not None:
 				return None
-			ready, _, _ = select.select([self.conn], [], [], min(left, 1.0))
-			if ready:
+			if readable(self.conn, min(left, 1.0)):
 				chunk = self.conn.recv(4096)
 				if not chunk:
 					return None
