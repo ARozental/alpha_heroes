@@ -526,7 +526,7 @@ def walk_distances(open_, sources, steps):
 	# neighbours are the hexes a few fixed offsets away (by row parity), so a step is a few shifted slices, no gather and
 	# no integers (this was half of the model's compute).
 	pad = torch.zeros(open_.shape[:-1] + (_SHIFT_PAD,), dtype=torch.bool, device=open_.device)
-	masks = [(offset, mask.to(open_.device)) for offset, mask in _NEIGHBOUR_SHIFTS]
+	masks = [(offset, moved(mask, open_.device)) for offset, mask in _NEIGHBOUR_SHIFTS]
 	frontier, reached = sources, sources
 	distance = torch.where(sources, 0, INFINITE_DISTANCE)
 	# On the CPU, done once no frontier is left (every few steps: a check costs about a step): an empty frontier stays

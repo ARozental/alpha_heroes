@@ -597,7 +597,7 @@ def unit_summaries(b, can_attack):
 	usable = share * (opposed & in_reach)
 	acting_row = b.mine(share)  # [B, U]: the acting unit against everyone
 	acting_column = share[torch.arange(share.shape[0], device=share.device), :, b.acting]  # everyone against the acting unit
-	return torch.stack([usable.amax(dim=2), usable.amax(dim=1), acting_row * opposed[torch.arange(share.shape[0]), b.acting], acting_column], dim=-1)
+	return torch.stack([usable.amax(dim=2), usable.amax(dim=1), acting_row * opposed[torch.arange(share.shape[0], device=share.device), b.acting], acting_column], dim=-1)
 
 
 def can_attack_at_units(b, can_attack):

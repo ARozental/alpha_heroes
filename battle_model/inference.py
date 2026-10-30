@@ -31,6 +31,10 @@ import numpy as np
 
 ERROR = 0xFFFFFFFF
 MAX_BATCH = 256  # decisions per forward pass
+# CUDA graphs (on CUDA): each model's forward recorded once a batch size, a batch padded up to the next. A forward is
+# ~35 ms of launches at any batch up to 64 under WSL (the campaign model's; 0.6 ms a decision at 64, 34 ms at one,
+# measured 2026-10-30 on the PC), and the games send one decision at a time
+GRAPH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128)
 MODEL_WAIT = 5.0  # seconds a request for a model not served yet waits for its weights (apply_control)
 
 
@@ -170,32 +174,84 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 				_, name, version, state = command
 				if name not in models:
 					models[name] = [family.build(model_kwargs).to(device).eval(), version]
+					if device.type == "cuda" and hasattr(models[name][0], "fixed_windows"):
+						models[name][0].fixed_windows = True  # (the same outputs in fixed shapes: model_v2.windows_of)
 				models[name][0].load_state_dict(state)
 				models[name][1] = version
 			elif command[0] == "drop":
 				models.pop(command[1], None)
+				for key in [key for key in graphs if key[0] == command[1]]:
+					del graphs[key]
+
+	def decode_on_device(on_device):
+		"""The inputs of a batch's bytes [N, in_bytes] on the GPU, its columns cut and converted there."""
+		inputs, n = {}, on_device.shape[0]
+		for (input_name, shape, wire, dtype, nbytes), offset in zip(in_layout, offsets):
+			# (a copy always: one decision's slice counts as contiguous, so .contiguous() kept its odd row stride, the
+			# record's byte count, and the view refused it: "stride(0) must be divisible by 4", 2026-10-30, the PC)
+			column = on_device[:, offset : offset + nbytes].clone(memory_format=torch.contiguous_format).view(torch_dtype[np.dtype(wire)])
+			inputs[input_name] = column.to(torch_dtype[np.dtype(dtype)]).reshape((n,) + shape)
+		return inputs
+
+	def forward_flat(model, inputs, n):
+		out = model(inputs)
+		return torch.cat([out[o_name].float().reshape(n, -1) for o_name, *_ in out_layout], dim=1)
+
+	graphs = {}  # (name, size) -> (pinned host bytes, device bytes, flat outputs, graph), or None: eager (capture failed)
+	graph_pool = [None]  # one memory pool for all: the graphs run one at a time
+
+	def graphed(name, model, data):
+		"""flat [N, out] on the host for the bytes data [N, in_bytes], through name's graph at the next size up (recorded
+		on first use), or None when there is none (too big, or its capture failed)."""
+		total = data.shape[0]
+		size = next((size for size in GRAPH_SIZES if size >= total), None)
+		key = (name, size)
+		if size is None or (key in graphs and graphs[key] is None):
+			return None
+		if key not in graphs:
+			try:
+				host = torch.empty((size, in_bytes), dtype=torch.uint8).pin_memory()
+				host[:total] = torch.from_numpy(data)
+				host[total:] = host[:1]  # (the padding rows a real decision: their outputs are dropped)
+				on_device = host.to(device)
+				side = torch.cuda.Stream()
+				side.wait_stream(torch.cuda.current_stream())
+				with torch.cuda.stream(side), torch.inference_mode():
+					for _ in range(2):
+						forward_flat(model, decode_on_device(on_device), size)
+				torch.cuda.current_stream().wait_stream(side)
+				graph = torch.cuda.CUDAGraph()
+				with torch.inference_mode(), torch.cuda.graph(graph, pool=graph_pool[0]):
+					flat = forward_flat(model, decode_on_device(on_device), size)
+				graph_pool[0] = graph.pool()
+				graphs[key] = (host, on_device, flat, graph)
+			except Exception as error:  # (eager from then on, for this model and size)
+				graphs[key] = None
+				print(f"inference: no CUDA graph for {name} at {size} ({type(error).__name__}: {str(error)[:200]}): eager", flush=True)
+				return None
+		host, on_device, flat, graph = graphs[key]
+		host[:total] = torch.from_numpy(data)  # (the rows past total: an earlier batch's, real decisions)
+		on_device.copy_(host, non_blocking=True)
+		graph.replay()
+		return flat[:total].cpu().numpy()  # (one copy back, one sync)
 
 	def run(name, batch):
 		"""The replies of one model's requests, run as one batch."""
 		model, version = models[name]
 		total = sum(decisions for _, decisions, _, _ in batch)
 		data = np.concatenate([np.frombuffer(payload, dtype=np.uint8).reshape(decisions, in_bytes) for _, decisions, payload, _ in batch])
-		inputs = {}
-		if device.type == "cpu":
-			for (input_name, shape, wire, dtype, nbytes), offset in zip(in_layout, offsets):
-				column = np.ascontiguousarray(data[:, offset : offset + nbytes]).view(wire)
-				inputs[input_name] = torch.from_numpy(column.astype(dtype).reshape((total,) + shape))
-		else:  # the whole batch to the GPU in one copy, its columns cut and converted there (not one copy an input)
-			on_device = torch.from_numpy(data).to(device)
-			for (input_name, shape, wire, dtype, nbytes), offset in zip(in_layout, offsets):
-				# (a copy always: one decision's slice counts as contiguous, so .contiguous() kept its odd row stride, the
-				# record's byte count, and the view refused it: "stride(0) must be divisible by 4", 2026-10-30, the PC)
-				column = on_device[:, offset : offset + nbytes].clone(memory_format=torch.contiguous_format).view(torch_dtype[np.dtype(wire)])
-				inputs[input_name] = column.to(torch_dtype[np.dtype(dtype)]).reshape((total,) + shape)
-		with torch.inference_mode():
-			out = model(inputs)
-			flat = torch.cat([out[o_name].float().reshape(total, -1) for o_name, *_ in out_layout], dim=1)
-		outputs = flat.cpu().numpy()  # (one copy back, one sync)
+		outputs = graphed(name, model, data) if device.type == "cuda" else None
+		if outputs is None:
+			inputs = {}
+			if device.type == "cpu":
+				for (input_name, shape, wire, dtype, nbytes), offset in zip(in_layout, offsets):
+					column = np.ascontiguousarray(data[:, offset : offset + nbytes]).view(wire)
+					inputs[input_name] = torch.from_numpy(column.astype(dtype).reshape((total,) + shape))
+			else:  # the whole batch to the GPU in one copy, its columns cut and converted there (not one copy an input)
+				inputs = decode_on_device(torch.from_numpy(data).to(device))
+			with torch.inference_mode():
+				flat = forward_flat(model, inputs, total)
+			outputs = flat.cpu().numpy()  # (one copy back, one sync)
 		replies, first = [], 0
 		for _, decisions, _, box in batch:
 			replies.append((box, struct.pack("<I", version) + outputs[first : first + decisions].astype(np.float32).tobytes()))

@@ -189,6 +189,9 @@ class CampaignModelV2(nn.Module):
 		super().__init__()
 		d, dc = dim, cell_dim
 		self.dim, self.cell_dim, self.heads = d, dc, heads
+		# Every hero slot's window, absent heroes' masked out (windows_of): fixed shapes and no sync with the host, for a
+		# CUDA graph (inference.py sets it on CUDA); the same outputs, more windows computed
+		self.fixed_windows = False
 		dp = d // 2  # (hero, tile) and (hero, area) pairs
 		self.pair_dim = dp
 		# domain_knowledge
@@ -285,9 +288,9 @@ class CampaignModelV2(nn.Module):
 	def domain_knowledge(self, x):
 		"""model.CustomFeatures' facts (Φ, armies, fights, each window tile's value and prior, TRAVEL's prior, the action
 		priors), for the windows of our heroes there, and the references sizes are relative to."""
-		windows, n = windows_of(x)
+		windows, n, real = windows_of(x, fixed=self.fixed_windows)
 		known = self.features(x, windows)
-		known.windows, known.n = windows, n
+		known.windows, known.n, known.real = windows, n, real
 		known.window_tiles = window_tile_index(x, windows)  # [K, W, W] each window tile's map tile (-1 off the grid)
 		ours = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
 		armies = known.hero_gold[:, :HO] * ours
@@ -351,8 +354,9 @@ class CampaignModelV2(nn.Module):
 		for vectors, positions, present, stamp in ((state.heroes, x["h_pos"], x["h_present"], self.stamp_hero), (state.towns, x["t_pos"], x["t_present"], self.stamp_town)):
 			index, inside = map_index(positions, b)
 			keep = (present & inside).reshape(-1)
-			rows = torch.nonzero(keep).squeeze(-1)
-			cells = cells.index_add(0, index.reshape(-1)[rows], stamp(vectors.reshape(-1, vectors.shape[-1])[rows]))
+			# (every row, the others' adding zeros: no nonzero, whose size the host must learn, for a CUDA graph)
+			stamped = torch.where(keep.unsqueeze(-1), stamp(vectors.reshape(-1, vectors.shape[-1])), 0.0)
+			cells = cells.index_add(0, torch.where(keep, index.reshape(-1), 0), stamped.to(cells.dtype))
 		on_map = ft.bit(x["tile_flags"], c.TILE_ON_MAP).reshape(b * L, 1, S, S).float()
 		grid, half = self.unet(cells.reshape(b, L, S, S, dc).permute(0, 1, 4, 2, 3).reshape(b * L, dc, S, S), on_map)
 		state.tiles = grid.reshape(b, L, dc, S, S).permute(0, 1, 3, 4, 2)  # [B, L, S, S, dc]
@@ -368,9 +372,9 @@ class CampaignModelV2(nn.Module):
 			state.window_reach = self.reach(None, reach_features(x, known.windows))  # [K, W, W, dc]
 			tiles = known.window_tiles.reshape(k, W * W)
 			index = (known.windows[:, None] * (L * S * S) + tiles.clamp(min=0)).reshape(-1)
-			real = (torch.arange(k, device=tiles.device) < known.n)[:, None].expand(k, W * W)
-			inside = torch.nonzero(((tiles >= 0) & real).reshape(-1)).squeeze(-1)
-			reach = reach.index_add(0, index[inside], self.read_tiles.reach(state.window_reach).reshape(-1, heads)[inside])
+			inside = ((tiles >= 0) & known.real[:, None]).reshape(-1)
+			values = torch.where(inside.unsqueeze(-1), self.read_tiles.reach(state.window_reach).reshape(-1, heads), 0.0)
+			reach = reach.index_add(0, torch.where(inside, index, 0), values.to(reach.dtype))
 		reach = torch.cat([reach.reshape(b, HO, L * S * S, heads), torch.zeros(b, H - HO, L * S * S, heads, device=flat.device, dtype=flat.dtype)], dim=1)
 		state.heroes = state.heroes + self.read_tiles(state.heroes, x["h_pos"], x["h_present"], flat, self.tile_positions, valid, reach)
 		state.towns = state.towns + self.read_tiles(state.towns, x["t_pos"], x["t_present"], flat, self.tile_positions, valid)
@@ -453,7 +457,7 @@ class CampaignModelV2(nn.Module):
 		if known.n > 0:
 			state.pairs = self.pairs(state, known)
 			hidden["move"] = f.move(state.pairs)
-			outputs["fs_move"] = dense(f.move_out(hidden["move"]), known.windows, known.n, b)
+			outputs["fs_move"] = dense(real_only(f.move_out(hidden["move"]), known), known.windows, known.n, b)
 		return {"hidden": hidden, "outputs": outputs}
 
 	# ---- think_again ----
@@ -488,9 +492,9 @@ class CampaignModelV2(nn.Module):
 		# MOVE and the targeted spell's tile: each window's pairs, + the hero's act-now score, + the tile's prior
 		move = cast_cell = move_prior = torch.full((b, HO, W, W), 0.0, device=state.glob.device)
 		if known.n > 0:
-			move = dense(self.move_out(state.move_pairs).squeeze(-1), known.windows, known.n, b)
-			move_prior = dense(known.tile_prior, known.windows, known.n, b)
-			cast_cell = dense(self.cast_cell_out(state.move_pairs).squeeze(-1), known.windows, known.n, b)
+			move = dense(real_only(self.move_out(state.move_pairs).squeeze(-1), known), known.windows, known.n, b)
+			move_prior = dense(real_only(known.tile_prior, known), known.windows, known.n, b)
+			cast_cell = dense(real_only(self.cast_cell_out(state.move_pairs).squeeze(-1), known), known.windows, known.n, b)
 		learned[A_.MOVE], prior[A_.MOVE] = move + self.act_move(own_heroes).reshape(b, HO, 1, 1), move_prior
 		offers[A_.MOVE] = ft.offer(move_prior, x["move_mask"])
 		out["cast_cell_logp"] = masked_log_softmax(cast_cell.reshape(b, HO, W * W), x["cast_cell_mask"].reshape(b, HO, W * W)).reshape(b, HO, W, W)
@@ -707,10 +711,21 @@ def window_tile_index(x, windows):
 	return torch.where(inside, (tz * S + ty) * S + tx, torch.full_like(tx, -1))
 
 
-def windows_of(x):
-	"""(flat indices of our heroes' windows there (decision x OWN_HEROES + hero), how many): as model.CampaignModel's."""
-	windows = torch.nonzero(x["h_present"][:, :HO].reshape(-1)).squeeze(-1)
+def windows_of(x, fixed=False):
+	"""(flat indices of the windows computed (decision x OWN_HEROES + hero), how many of them dense() places, [K] which
+	are our heroes'). Our heroes' alone, as model.CampaignModel's, padded on Apple's GPU with copies of the first (the
+	padding not real); fixed: every slot's, absent heroes' not real (CUDA graphs: one shape a batch size, no sync)."""
+	present = x["h_present"][:, :HO].reshape(-1)
+	if fixed:
+		return torch.arange(present.shape[0], device=present.device), present.shape[0], present
+	windows = torch.nonzero(present).squeeze(-1)
 	n = windows.shape[0]
 	if n > 0 and windows.device.type == "mps" and not torch.onnx.is_in_onnx_export():
 		windows = torch.cat([windows, windows[:1].expand((1 << (n - 1).bit_length()) - n)])
-	return windows, n
+	return windows, n, torch.arange(windows.shape[0], device=windows.device) < n
+
+
+def real_only(values, known):
+	"""values [K, ...] with the windows that are not real zeroed (fixed windows: absent heroes'), as dense() would leave
+	them (where, not a product: an absent hero's window may hold inf)."""
+	return torch.where(known.real.reshape((-1,) + (1,) * (values.dim() - 1)), values, torch.zeros((), dtype=values.dtype, device=values.device))

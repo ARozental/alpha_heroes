@@ -1,5 +1,6 @@
 """The inference server (battle_model/inference.py) gives the model's own outputs, by name and version."""
 import json
+import time
 
 import numpy as np
 import pytest
@@ -109,5 +110,43 @@ def test_a_client_on_another_machine_speaks_tcp_compressed():
 		assert v1 == v2 == 7 and distant.packed and not local.packed
 		for name in a:
 			assert np.array_equal(np.isfinite(a[name]), np.isfinite(b[name])) and np.allclose(np.nan_to_num(a[name], neginf=0), np.nan_to_num(b[name], neginf=0), atol=1e-6), name
+	finally:
+		server.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.parametrize("family", ["battle", "campaign"])
+def test_cuda_graphs_follow_new_weights(family):
+	"""On CUDA the server replays recorded graphs: a weight update after the recording must show in the replies (the
+	weights are copied in place), at a padded size too, as the model's own outputs."""
+	from battle_model.inference import families
+	from campaign_model import schema as campaign_schema
+
+	kwargs = {"architecture": "v3"} if family == "battle" else {"architecture": "v2", "dim": 32, "cell_dim": 8, "heads": 2, "layers": 1}
+	inputs_of = random_inputs if family == "battle" else campaign_schema.random_inputs
+	build = families()[family].build
+	torch.manual_seed(0)
+	first, second = build(kwargs).eval(), build(kwargs).eval()
+	with torch.no_grad():
+		for p in second.parameters():
+			p.add_(torch.randn_like(p) * 0.05)
+	server = InferenceServer(play.SOCKET_DIR / f"test-graphs-{family}.sock", device="cuda", family=family, model_kwargs=kwargs, threads=1)
+	try:
+		client = InferenceClient(server.socket_path, family=family)
+		for model, version in ((first, 1), (second, 2)):
+			server.set_model("current", version, model)
+			deadline = time.time() + 20  # (set_model returns before the server applies it: the version shows when it has)
+			while client.run("current")[0] != version and time.time() < deadline:
+				time.sleep(0.05)
+			for batch in (1, 3):
+				x = inputs_of(batch=batch, seed=batch)
+				got_version, out = client.run("current", x)
+				with torch.no_grad():
+					ref = model({k: torch.from_numpy(v) for k, v in x.items()})
+				assert got_version == version
+				for name, value in out.items():
+					expected = ref[name].numpy()
+					assert (np.isfinite(value) == np.isfinite(expected)).all(), (family, version, batch, name)
+					assert np.allclose(np.where(np.isfinite(expected), value, 0), np.where(np.isfinite(expected), expected, 0), atol=2e-3), (family, version, batch, name)
 	finally:
 		server.close()
