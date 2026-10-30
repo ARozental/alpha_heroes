@@ -21,6 +21,33 @@ a quiet machine (2026-10-30: main d4f95bb, then these changes on it, alternately
 With the battle model on a GPU (the PC, and every worker through it) a decision costs a CPU 4.0 ms (was 9.2): the VCMI
 client and the records. (On 2026-10-29, measured while joint2 trained: 27.6 -> 13.4 ms, 101 -> 178 decisions/s.)
 
+## The joint run, before and after
+
+`campaign_model.joint` resumed from the same copy of joint2 (epoch 5518, campaign version 390), evals off, on a quiet
+machine (2026-10-30): 5 minutes to warm up, then 20 measured; main d4f95bb, then d9cb662 (these changes on it).
+
+| | before | after |
+|---|---|---|
+| battle updates an hour | 126 | **156 (+24%)** |
+| battle decisions trained a minute | 6,814 | 8,415 |
+| an update's seconds waiting for battles | 4.36 | 2.28 |
+| its training seconds: data / prepass / steps / publish | 23.28: 2.55 / 6.45 / 13.93 / 0.35 | 19.73: 1.01 / 6.07 / 12.25 / 0.40 |
+| campaign decisions trained (updates) | 48,910 (5) | 47,238 (4) |
+| campaign games played (their decisions) | 48 (138,715) | 47 (138,313) |
+| cores in use | 6.76 | 6.53 |
+
+- On the Mac the GPU is the limit: training is 88% of a battle update, on the M4's GPU beside the campaign learner's
+  updates, which kept their pace (26 ms a decision either way). The battle side gained; the campaign side lost nothing.
+- The campaign learner trains on about a third of what its games play (25 of the 48 games dropped as too old,
+  `CampaignLearner._take`): on this machine its games are not its limit.
+- Campaign battles were 0.093 of each battle update before, 0.060 after (the recipe asks 0.7): the same few campaign
+  battles (4 in a 26-day game on average, 9 decisions each) over 24% more updates. None are lost: in 6 campaign games
+  with ALPHA_BATTLE_ATTACK_CHECK=1 every battle a client logged reached the record server, and the kept copy's attack
+  values equalled a new copy's in every checked decision (137).
+- Exact after the merge: the attack check on 560 generated battles (39,140 decisions) found no difference in either
+  mode (2-3 a run before VCMI's target order fix, e1be37e4a), and 32 greedy battles replayed twice recorded the same
+  107,819,712 values.
+
 ## The costly small things
 
 - `BattleSimulation::copyOf` in `encodeAttackValues`, every decision: a copy of the whole game state through savegame
@@ -30,7 +57,8 @@ client and the records. (On 2026-10-29, measured while joint2 trained: 27.6 -> 1
   difference: 2 of 36,879 decisions differed by 1-15 gold, and 3 of 36,530 between two new copies (=2), the same cases:
   the engine hits an area attack's units in the order of their addresses (`BattleActionProcessor::makeAttack`, a
   `std::set<const CStack *>`), and the simulation's alternate rounding of mean damage depends on that order. Not the
-  kept copy's; probably the ~1% of evals that do not replay exactly.
+  kept copy's; probably the ~1% of evals that did not replay exactly. Fixed in VCMI (e1be37e4a: such targets in unit id
+  order): 0 differences since, in either mode.
 - A new `alpha_make_battle_map` process for every generated battle: ~0.2 s of CPU (the library's load), ~17% of a
   generated actor's CPU. Now ~2-4 ms a map.
 - AlphaMapAI compressed each turn's records at zlib level 6 (~38% of its busy CPU), and the trainer decompressed them
@@ -70,6 +98,10 @@ and 189 battles trained on, 0 failures, both ends stopping cleanly).
 
 ## Not done (recommendations)
 
+- CPU inference is now 68% of a CPU actor's cost (8.6 of 12.65 ms a decision) and did not get cheaper: a request is 1-2
+  decisions, where the fused attention gains little. The legal-entries-only action heads (next) are the way to cut it;
+  on the PC the battle model infers on the GPU and this does not arise.
+
 - The battle model scores all 28 x 187 melee-from and 70 x 187 spell-hex entries, of which ~3 and ~7 are legal on
   average (70% and 92% of decisions none): the action heads are 45% of a training-size forward. Scoring only the legal
   entries gives the same outputs (the rest are masked) for a fraction of the work, but needs shapes that change with the
@@ -77,5 +109,3 @@ and 189 battles trained on, 0 failures, both ends stopping cleanly).
 - The campaign model: 30 ms a decision forward+backward on the CPU, two thirds of the forward in the map encoder and the
   hand-made features, computed three times a decision an update (the KL anchor and two passes). Its parameter-free
   features could be computed once, as the battle model's `facts` are; they are mixed with trainable weights now.
-- The area-attack order nondeterminism above: ordering the extra targets by unit id in VCMI would make the attack
-  values (and replays) exact (an engine bug fix).
