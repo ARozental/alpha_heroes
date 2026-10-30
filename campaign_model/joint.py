@@ -24,8 +24,11 @@ BATTLE_FROM = ROOT / "runtime" / "saved" / "battle_joint1_02840.pt"  # joint1's 
 RECIPE = (
 	# The focus on the campaign (the user, 2026-10-29): its battles (mostly against wandering monsters) are 70% of each
 	# battle update, our generated scenarios the rest (their variety is low: too few hard cases, too simple), the
-	# battle model learning at 3e-5 (the campaign's 1e-4); more campaign games, fewer generated actors (8 games and 10
-	# actors swapped in 24 GB, 2026-10-28)
+	# battle model learning at 3e-5 (the campaign's 1e-4). The share is what the campaign games supply (the pool fills
+	# the rest with generated battles): with 8 games and 4 generated actors it was 0.24 (0.40 before the monsters were
+	# BattleAI's). 10 games and 1 actor (2026-10-29) did not add campaign battles (~28 decisions/s either way) and only
+	# took the generated ones away: the share rose to 0.46 but the learner waited 35 s an update. 8 games and 10 actors
+	# swapped in 24 GB (2026-10-28)
 	"generator=true", "actors=true", "generated_actors=4", "real_games=0", "real_share=0.7", "learning_rate=3e-5",
 	"eval_scenarios=24", "eval_neutral_scenarios=12", "eval_hard_scenarios=24", "eval_real_scenarios=24", "eval_castle_seeds=16",
 	"eval_minutes=60", "seed=1", "campaign.games=8", "campaign.inference_processes=2", "campaign.eval_minutes=60",
