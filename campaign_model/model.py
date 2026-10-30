@@ -1231,7 +1231,14 @@ class CampaignModel(nn.Module):
 
 
 def build_model(model_kwargs=None):
-	return CampaignModel(**dict(model_kwargs or {}))
+	"""The campaign model of a checkpoint's model_kwargs: v1 (CampaignModel here), or model_v2.CampaignModelV2 when its
+	"architecture" says "v2" (docs/campaign_model_v2_draft.md)."""
+	kwargs = dict(model_kwargs or {})
+	if kwargs.pop("architecture", "v1") == "v2":
+		from .model_v2 import CampaignModelV2
+
+		return CampaignModelV2(**kwargs)
+	return CampaignModel(**kwargs)
 
 
 INPUT_NAMES = tuple(s.name for s in INPUTS)

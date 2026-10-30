@@ -36,7 +36,7 @@ from . import constants as c
 from .config import CampaignConfig
 from .empire import EmpireConfig, empire_value
 from .labels import COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, blend_credit, end_advantages, end_labels, end_steps, explained_variance, growth_labels, label, residual_variances
-from .model import CampaignModel
+from .model import CampaignModel, build_model
 from .play import make_map, play
 from .records import NO_EFFECT, decode_inputs
 from .schema import HEADS
@@ -46,17 +46,18 @@ TURN_KINDS = (c.DecisionKind.TURN, c.DecisionKind.EXCHANGE)
 
 
 def model_kwargs(config):
-	return {"dim": config.model_dim, "cell_dim": config.model_cell_dim, "heads": config.model_heads, "layers": config.model_layers}
+	kwargs = {"dim": config.model_dim, "cell_dim": config.model_cell_dim, "heads": config.model_heads, "layers": config.model_layers}
+	return {**kwargs, "architecture": config.model_architecture} if config.model_architecture != "v1" else kwargs
 
 
 @contextlib.contextmanager
 def serve_model(checkpoint="", model_kwargs=None, processes=1, threads=2):
 	"""A model (new, or a checkpoint's) served under "current" by an inference server for the games."""
-	model, version = CampaignModel(**(model_kwargs or {})), 0
+	model, version = build_model(model_kwargs), 0
 	if checkpoint:
 		state = torch.load(checkpoint, map_location="cpu")
 		model_kwargs = state.get("model_kwargs", {})
-		model = CampaignModel(**model_kwargs)
+		model = build_model(model_kwargs)
 		model.load_state_dict(state["model"])
 		version = state.get("version", 0)
 	battle_play.SOCKET_DIR.mkdir(parents=True, exist_ok=True)
@@ -233,7 +234,7 @@ STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl"
 
 def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
-	growth=None, labels=None, end=None,
+	growth=None, labels=None, end=None, foresight=None,
 ):
 	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
 	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
@@ -249,6 +250,13 @@ def ppo_update(
 	advantages (labels.blend_credit) before they are normalized. decode(rows) gives the inputs of those decisions
 	(default: decode_inputs). Returns (metrics, the KL control's new lr_scale)."""
 	n, started = len(decisions), time.time()
+	# The foresight's labels (foresight.game_labels, v2), each decision's row: its loss joins the minibatch's, a share
+	# per micro-batch as the others'; the shared layers' gradient from it against the PPO losses', on the first one
+	from .foresight import ForesightConfig, foresight_loss, gradient_check
+
+	foresight_t = {name: torch.from_numpy(value).to(device) for name, value in foresight.items()} if foresight is not None else None
+	foresight_config = ForesightConfig(weight=getattr(config, "foresight_weight", ForesightConfig.weight))
+	foresight_sums, checked = Counter(), {}
 	decode = decode or (lambda rows: decode_inputs([decisions[r] for r in rows]))
 	choice = {name: torch.from_numpy(value).to(device) for name, value in choices(decisions).items()}
 	if advantages is None:
@@ -357,6 +365,15 @@ def ppo_update(
 				bonus = (entropy * keep).sum() / counts["keep"]
 				floor = (torch.relu(config.entropy_floor - entropy) * keep).sum() / counts["keep"]  # only decisions below it
 				loss = policy + config.value_weight * value - config.entropy_weight * bonus + config.entropy_floor_weight * floor
+				if foresight_t is not None and "fs_turn" in out:
+					fs_loss, fs_parts = foresight_loss(out, {name: value[sub] for name, value in foresight_t.items()}, foresight_config)
+					share = len(part) / len(rows)
+					if not checked:
+						checked = gradient_check(model, loss, share * fs_loss)
+					loss = loss + share * fs_loss
+					for name, value in fs_parts.items():
+						foresight_sums[name] += float(value) * share
+					foresight_sums["steps_seen"] += share
 				loss.backward()
 				drift = logp.detach() - anchor[sub].nan_to_num(neginf=0.0)
 				parts.append(torch.stack([  # (summed on the device: one sync a step, not six a micro-batch)
@@ -402,6 +419,8 @@ def ppo_update(
 		gpu_mb=gpu_mb,
 		gpu_anchor_mb=gpu_anchor_mb,
 		update_seconds=time.time() - started,
+		**{f"foresight_{name}": value / max(foresight_sums["steps_seen"], 1e-9) for name, value in foresight_sums.items() if name != "steps_seen"},
+		**checked,
 		**{f"value_ev_d{k}": explained_variance(predicted[:, i], actual[:, i]) for i, k in enumerate(c.VALUE_OFFSETS)},
 		**{f"value_parts_d{k}": residual_variances(predicted[:, i], actual[:, i]) for i, k in enumerate(c.VALUE_OFFSETS)},
 		**value_fit(predicted[:, -1], actual[:, -1]),

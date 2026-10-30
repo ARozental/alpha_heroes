@@ -80,6 +80,10 @@ class CampaignConfig:
 	learner: str = "process"
 	device: str = "auto"  # "auto": CUDA or Apple's GPU when there is one (process), the battle learner's (turns)
 	torch_threads: int = 8  # the campaign learner's CPU threads (torch's pool is shared by the process: 0 leaves it)
+	# "v1": model.CampaignModel; "v2": model_v2.CampaignModelV2 (docs/campaign_model_v2_draft.md: typed encoders, owners,
+	# the whole map's tiles, foresight heads, every logit a match; cell_dim 16 for it)
+	model_architecture: str = "v1"
+	foresight_weight: float = 0.2  # v2: each foresight head's loss weight (foresight.py; its gradient share is logged)
 	model_dim: int = 64
 	model_cell_dim: int = 32
 	model_heads: int = 4

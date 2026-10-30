@@ -15,7 +15,7 @@ import torch
 from torch import nn
 
 from .constants import SCHEMA_VERSION
-from .model import INPUT_NAMES, OUTPUT_NAMES, CampaignModel
+from .model import INPUT_NAMES, OUTPUT_NAMES, build_model
 from .schema import contract_hash, random_inputs
 
 DEFAULT_PATH = Path(__file__).resolve().parent / "artifacts" / "campaign_model.onnx"
@@ -81,10 +81,10 @@ def main():
 	parser.add_argument("--checkpoint", default="")
 	parser.add_argument("--out", default=str(DEFAULT_PATH))
 	args = parser.parse_args()
-	model = CampaignModel()
+	model = build_model()
 	if args.checkpoint:
 		state = torch.load(args.checkpoint, map_location="cpu")
-		model = CampaignModel(**state.get("model_kwargs", {}))
+		model = build_model(state.get("model_kwargs", {}))
 		model.load_state_dict(state["model"])
 	path = export(model, args.out)
 	print(f"wrote {path}; largest difference from torch {verify(model, path):.2e}")

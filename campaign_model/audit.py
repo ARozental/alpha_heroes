@@ -25,7 +25,7 @@ import torch
 from . import constants as c
 from . import features as ft
 from . import priors
-from .model import CampaignModel, HO
+from .model import HO, build_model
 from .records import NO_EFFECT, decode_inputs
 
 W = c.WINDOW
@@ -196,10 +196,10 @@ def main():
 	from .train import serve_model
 
 	torch.manual_seed(0)
-	model = CampaignModel().eval()
+	model = build_model().eval()
 	if args.checkpoint:
 		state = torch.load(args.checkpoint, map_location="cpu")
-		model = CampaignModel(**state.get("model_kwargs", {})).eval()
+		model = build_model(state.get("model_kwargs", {})).eval()
 		model.load_state_dict(state["model"])
 	games = []
 	with serve_model() as (served, server):

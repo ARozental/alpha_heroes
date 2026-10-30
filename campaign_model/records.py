@@ -126,6 +126,20 @@ def collect(messages):
 	return game
 
 
+def decode_fields(decisions, names):
+	"""{name: array [N, ...]} of only these inputs of the decisions (each decision decompressed once; the map's big
+	inputs, left out, are most of its bytes)."""
+	wanted = set(names)
+	rows = [zlib.decompress(d.inputs) for d in decisions]
+	inputs, offset = {}, 0
+	for name, shape, wire, dtype, nbytes in IN_LAYOUT:
+		if name in wanted:
+			column = np.frombuffer(b"".join(row[offset : offset + nbytes] for row in rows), dtype=wire)
+			inputs[name] = column.astype(dtype).reshape((len(decisions),) + shape)
+		offset += nbytes
+	return inputs
+
+
 def decode_inputs(decisions):
 	"""{input name: array [N, ...]} of the decisions' inputs, in the model's dtypes."""
 	data = np.frombuffer(b"".join(zlib.decompress(d.inputs) for d in decisions), dtype=np.uint8).reshape(len(decisions), IN_BYTES)

@@ -52,17 +52,22 @@ from .labels import (
 	label, ladder_targets, pooled_ev, residual_variances,
 )
 from .maps import GAME_MAPS
-from .model import CampaignModel
+from .foresight import labels_of
+from .model import build_model
 from .play import make_map, play
 from .records import NO_EFFECT, decode_inputs
 from .train import load_optimizer, make_optimizer, model_kwargs, ppo_update, usable
 
 TYPES = [a.name.lower() for a in c.ActionType]
+FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answer") for part in ("battle", "score", "parts")) + ("foresight_hero_alive", "foresight_hero_army", "foresight_turn")
 COLUMNS = [
 	"version", "epoch", "games", "decisions", "dropped_old", "unsound", "credited", "days", "players", "phi_end", "heroes", "label_mean", "price_mean",
 	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "clip_fraction", "grad_norm", "steps", "learning_rate",
 	*(f"value_ev_d{k}" for k in c.VALUE_OFFSETS), *(f"head_ev_{kind}{k}" for kind in "vg" for k in c.VALUE_OFFSETS), "head_ev_vend", "no_effect", "ai_errors", "failed_actions", "game_failures", "game_maps", "dropped_games",
 	"game_seconds", "record_mb", "seconds", "gpu_mb", *(f"share_{t}" for t in TYPES), *(f"failure_{k}" for k in FAILURES), "no_effect_types", "kinds",
+	# v2's foresight losses (foresight.py) and the gradient check: the shared layers' gradient from the PPO losses and the
+	# foresight's, their cosine, the share of parameters no loss reaches
+	*FORESIGHT_COLUMNS, "grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share",
 ]
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
 
@@ -84,7 +89,7 @@ class CampaignLearner:
 		if config.learner == "process":  # the updates' device is the process's; here the model only serves and evaluates
 			device = torch.device("cpu")
 			self.device = device
-		self.model = CampaignModel(**self.kwargs).to(device).eval()
+		self.model = build_model(self.kwargs).to(device).eval()
 		self.optimizer = make_optimizer(self.model, config)
 		self.version, self.lr_scale, self.games_used = 1, 1.0, 0  # version: the served model's (1: as the run starts)
 		self.value_ev = None  # the value heads' explained variance, smoothed over ~10 updates: how far the credit trusts them
@@ -96,7 +101,7 @@ class CampaignLearner:
 		if resume and latest.exists():
 			state = torch.load(latest, map_location=device)
 			self.kwargs = state["model_kwargs"]
-			self.model = CampaignModel(**self.kwargs).to(device).eval()
+			self.model = build_model(self.kwargs).to(device).eval()
 			self.optimizer = make_optimizer(self.model, config)
 			self.model.load_state_dict(state["model"])
 			if "optimizer" in state:
@@ -111,7 +116,7 @@ class CampaignLearner:
 		elif config.init_from:
 			state = torch.load(config.init_from, map_location=device)
 			self.kwargs = state.get("model_kwargs") or self.kwargs
-			self.model = CampaignModel(**self.kwargs).to(device).eval()
+			self.model = build_model(self.kwargs).to(device).eval()
 			self.optimizer = make_optimizer(self.model, config)
 			self.model.load_state_dict(state["model"])
 			print(f"campaign: starting from {config.init_from}", flush=True)
@@ -302,6 +307,7 @@ class CampaignLearner:
 		if not played:
 			return False
 		starts, trust, (weight, outcome) = day_starts(self.model, played, self.model_lock), self.grade_trust(), self.end_credit()
+		foresight = [] if self.kwargs.get("architecture") == "v2" else None  # (v2's foresight labels, each game's)
 		decisions, targets, labels, growth, returns, advantages, errors, players, forecasts, row = [], [], [], [], [], [], [], [], [], Counter()
 		end = {"targets": [], "real": [], "step": [], "week": [], "price": []}
 		for g, game in enumerate(played):
@@ -320,6 +326,10 @@ class CampaignLearner:
 			end["real"].append(real[fresh])
 			end["price"].append(price[fresh])
 			decisions += [d for d, keep in zip(game.decisions, fresh) if keep]
+			if foresight is not None:
+				with self.model_lock:
+					rows = labels_of(game, self.model.features)
+				foresight.append({name: value[fresh] for name, value in rows.items()})
 			targets.append(graded[fresh])
 			labels.append(t[fresh])
 			growth.append(grown[fresh])
@@ -339,6 +349,8 @@ class CampaignLearner:
 		targets, labels, growth = np.concatenate(targets), np.concatenate(labels), np.concatenate(growth)
 		returns, advantages = np.concatenate(returns), np.concatenate(advantages)
 		end = {name: np.concatenate(parts) for name, parts in end.items()}
+		if foresight is not None:
+			foresight = {name: np.concatenate([rows[name] for rows in foresight]) for name in foresight[0]}
 		row["trust"] = self.trust()
 		end["outcome"], end["weight"] = outcome, weight if self.config.credit == "horizon" else 0.0
 		row["end_credit"] = end["weight"]
@@ -349,7 +361,7 @@ class CampaignLearner:
 			row["credit_trust"] = self.credit_check
 			row["credit_gaps"] = gaps
 		if self.worker:  # (the process saves checkpoint_latest.pt, with its optimizer)
-			state, metrics, lr_scale = self.worker.update(decisions, targets, returns, self.labels.weights, {"version": self.version + 1, "games_used": self.games_used + len(games), "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool}, advantages, growth, labels, end)
+			state, metrics, lr_scale = self.worker.update(decisions, targets, returns, self.labels.weights, {"version": self.version + 1, "games_used": self.games_used + len(games), "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool}, advantages, growth, labels, end, foresight)
 			with self.model_lock:
 				self.model.load_state_dict(state)
 				self.lr_scale = lr_scale
@@ -358,7 +370,7 @@ class CampaignLearner:
 				self.games_used += len(games)
 		else:
 			with self.model_lock:
-				metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end)
+				metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight)
 				if self.device.type == "mps":
 					torch.mps.empty_cache()  # (the battle learner's lesson: MPS keeps blocks of every size it saw)
 				self.version += 1
@@ -473,6 +485,7 @@ class CampaignLearner:
 			**{f"failure_{k}": v for k, v in failure_modes(decisions).items()},  # dumb decisions (failures.py)
 			"kinds": " ".join(f"{k}:{n}" for k, n in sorted(Counter(c.DecisionKind(d.kind).name for d in decisions).items())),
 			"no_effect_types": " ".join(f"{t}:{n}" for t, n in sorted(Counter(c.ActionType(d.action_type).name for d in decisions if d.flags & NO_EFFECT).items())),
+			**{name: metrics.get(name, float("nan")) for name in (*FORESIGHT_COLUMNS, "grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share")},
 		}
 		with self.progress.open("a", newline="") as f:
 			csv.writer(f).writerow([round(row[k], 6) if isinstance(row[k], float) else row[k] for k in COLUMNS])
@@ -615,7 +628,7 @@ def _update_worker(config, kwargs, device_name, state, requests, results, latest
 	if config.torch_threads > 0:
 		torch.set_num_threads(config.torch_threads)
 	device = torch.device(device_name)
-	model = CampaignModel(**kwargs).to(device).eval()
+	model = build_model(kwargs).to(device).eval()
 	optimizer = make_optimizer(model, config)
 	model.load_state_dict(state["model"])
 	if state.get("optimizer"):
@@ -623,9 +636,9 @@ def _update_worker(config, kwargs, device_name, state, requests, results, latest
 	use_fused(optimizer)
 	lr_scale = state["lr_scale"]
 	while (request := requests.get()) is not None:
-		decisions, targets, returns, weights, about, advantages, growth, labels, end = request
+		decisions, targets, returns, weights, about, advantages, growth, labels, end, foresight = request
 		try:
-			metrics, lr_scale = ppo_update(model, optimizer, decisions, targets, returns, config, device=device, lr_scale=lr_scale, weights=weights, advantages=advantages, growth=growth, labels=labels, end=end)
+			metrics, lr_scale = ppo_update(model, optimizer, decisions, targets, returns, config, device=device, lr_scale=lr_scale, weights=weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight)
 			if device.type == "mps":
 				torch.mps.empty_cache()  # (the battle learner's lesson: MPS keeps blocks of every size it saw)
 			cpu = {key: value.detach().cpu() for key, value in model.state_dict().items()}
@@ -650,9 +663,9 @@ class UpdateProcess:
 		self.process.start()
 		print(f"campaign: updates in process {self.process.pid} on {device}", flush=True)
 
-	def update(self, decisions, targets, returns, weights, about, advantages=None, growth=None, labels=None, end=None):
+	def update(self, decisions, targets, returns, weights, about, advantages=None, growth=None, labels=None, end=None, foresight=None):
 		"""(the new weights on the CPU, the update's metrics, the KL control's lr_scale); raises if the update failed."""
-		self.requests.put((decisions, targets, returns, weights, about, advantages, growth, labels, end))
+		self.requests.put((decisions, targets, returns, weights, about, advantages, growth, labels, end, foresight))
 		while True:
 			try:
 				status, state, metrics, lr_scale = self.results.get(timeout=60)

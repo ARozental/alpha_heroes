@@ -1,0 +1,690 @@
+"""The campaign model v2 (docs/campaign_model_v2_draft.md): the same contract as model.py (schema.INPUTS, OUTPUTS),
+built as the user's blocks, in order (CampaignModelV2.forward):
+
+	known      = domain_knowledge(x)   features.py and model.CustomFeatures as v1: Φ, armies, fights, tile values and
+	                                   danger, the priors; plus the references a size is relative to (our Φ, our main
+	                                   army, the strongest rival army we see)
+	state      = encode(x)             raw inputs only (encoders.py): the global token, every hero (one function for
+	                                   ours, the rivals', the tavern's), town, option, the other army, the map's tiles
+	state      = take_sides(state)     ownership transforms every vector: ours, nobody's, a rival's (which rival: its
+	                                   own embedding; the rivals' signed half flipped at the start); a token per player
+	state      = join(state, known)    the known facts concatenated onto what they describe, sizes also relative
+	state      = see(state)            heroes and towns stamped on their tiles, a U-Net over the map, every hero and
+	                                   town reading the tiles (its own reach to them, for ours), TRAVEL's areas
+	state      = think(state)          attention over the tokens, biased by their tile offsets and owners' relation
+	foresight  = foresee(state)        what the next action brings (Foresight): predictions for their losses only,
+	                                   their small hidden states for the layers after
+	state      = think_again(...)      the foresight and the known facts joined again, one more attention block
+	outputs    = decide(state, known)  every logit a match of an actor and a target, plus its domain prior; one
+	                                   softmax over all actions: a type's score is its entries' log-mean-exp (their
+	                                   number alone decides nothing) and a learned bias from the priors
+
+What the AI reads is unchanged (OUTPUTS); the foresight's predictions (fs_*) are training's only.
+"""
+import math
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from battle_model.features import scales
+from battle_model.layers import Block, masked_log_softmax, small_embedding, vocab_index, zero_output
+from battle_model.model import RMSNorm, SwiGLU
+
+from . import constants as c
+from . import encoders as E
+from . import features as ft
+from . import priors
+from .model import MOVE_FEATURES, CustomFeatures, PairBias, dense, flat_log_softmax
+from .schema import HEADS
+
+HO, TO, A, W, HD = c.OWN_HEROES, c.OWN_TOWNS, c.ARMY_SLOTS, c.WINDOW, c.N_HOLDERS
+H, T, L, S, TG, R = c.N_HEROES, c.N_TOWNS, c.MAP_LEVELS, c.MAP_TILES, c.TRAVEL_GRID, c.N_RESOURCES
+P = c.MAX_PLAYERS  # player tokens: 0 ours, k the rival whose owner code is OWNER_SELF + k
+AREAS = L * TG * TG
+FORESIGHT_HIDDEN = 16
+# The foresight of an action (move, answer): a battle in its consequences (logit), its score (the battle reward's
+# formula, -1..1), and the change of each of Φ's parts until our next turn decision (symlog of thousands of gold)
+ACTION_TARGETS = 2 + len(ft.PHI_PARTS)
+HERO_TARGETS = 2  # alive and ours tomorrow (logit), its army's log ratio tomorrow
+TURN_TARGETS = 1 + R  # Φ's log ratio at the end of our turn, each resource's log ratio tomorrow
+DISTANCE_BUCKETS = 12  # the tile readers' distance bias: Chebyshev tiles 0, 1, 2, 3-4, 5-7, 8-11, ..., 96+, another level
+
+
+class State:
+	"""The model's state between the blocks: the inputs (x), the tokens and grids (attributes)."""
+
+	def __init__(self, x):
+		self.x = x
+
+
+class Sides(nn.Module):
+	"""take_sides' transform of vectors [..., dim] by their owner codes [...]: per relation (nobody's, ours, a rival's) a
+	scale and a shift per channel, plus each rival's own embedding. A rival's first half starts flipped (the battle
+	model's signed half: a strong stack is bad when it is theirs), the other half as is."""
+
+	def __init__(self, dim):
+		super().__init__()
+		half = dim // 2
+		gamma = torch.ones(3, dim)
+		gamma[2, :half] = -1.0
+		self.gamma = nn.Parameter(gamma)
+		self.beta = nn.Parameter(torch.zeros(3, dim))
+		self.rival = nn.Parameter(torch.zeros(P, dim))
+
+	@staticmethod
+	def relation(owner):
+		"""(0 nobody's, 1 ours, 2 a rival's; the rival's index 0..P-1)."""
+		relation = torch.where(owner == c.OWNER_SELF, torch.ones_like(owner), torch.where(owner > c.OWNER_SELF, torch.full_like(owner, 2), torch.zeros_like(owner)))
+		return relation, (owner - c.OWNER_SELF).clamp(0, P - 1)
+
+	def forward(self, vectors, owner):
+		relation, rival = self.relation(owner)
+		return self.gamma[relation] * vectors + self.beta[relation] + self.rival[rival] * (relation == 2).unsqueeze(-1).float()
+
+
+class MapUNet(nn.Module):
+	"""The map's tiles [B * L, C, S, S] through a U-Net: each tile sees the route to it and a day or two around it.
+	Returns the tiles [B * L, C, S, S] and the half-resolution level [B * L, 2C, S/2, S/2] (TRAVEL's areas). Off-map
+	tiles are zeroed after every block."""
+
+	class Res(nn.Module):
+		def __init__(self, channels):
+			super().__init__()
+			self.norm1, self.norm2 = nn.GroupNorm(1, channels), nn.GroupNorm(1, channels)
+			self.conv1, self.conv2 = nn.Conv2d(channels, channels, 3, padding=1), nn.Conv2d(channels, channels, 3, padding=1)
+			nn.init.zeros_(self.conv2.weight)
+			nn.init.zeros_(self.conv2.bias)
+
+		def forward(self, x, mask):
+			return (x + self.conv2(F.gelu(self.norm2(self.conv1(F.gelu(self.norm1(x))))))) * mask
+
+	def __init__(self, channels):
+		super().__init__()
+		c1, c2, c3 = channels, 2 * channels, 4 * channels
+		self.enc1 = self.Res(c1)
+		self.down1 = nn.Conv2d(c1, c2, 3, stride=2, padding=1)
+		self.enc2 = self.Res(c2)
+		self.down2 = nn.Conv2d(c2, c3, 3, stride=2, padding=1)
+		self.mid1, self.mid2 = self.Res(c3), self.Res(c3)
+		self.up2 = nn.Conv2d(c3 + c2, c2, 3, padding=1)
+		self.dec2 = self.Res(c2)
+		self.up1 = nn.Conv2d(c2 + c1, c1, 3, padding=1)
+		self.dec1 = self.Res(c1)
+
+	def forward(self, x, mask):
+		m2 = F.max_pool2d(mask, 2, ceil_mode=True)
+		m3 = F.max_pool2d(m2, 2, ceil_mode=True)
+		e1 = self.enc1(x, mask)
+		e2 = self.enc2(F.gelu(self.down1(e1)) * m2, m2)
+		m = self.mid2(self.mid1(F.gelu(self.down2(e2)) * m3, m3), m3)
+		d2 = self.dec2(F.gelu(self.up2(torch.cat([F.interpolate(m, size=e2.shape[-2:], mode="nearest"), e2], dim=1))) * m2, m2)
+		d1 = self.dec1(F.gelu(self.up1(torch.cat([F.interpolate(d2, size=e1.shape[-2:], mode="nearest"), e1], dim=1))) * mask, mask)
+		return d1, d2
+
+
+def distance_buckets(delta):
+	"""Chebyshev distance buckets [..] of tile offsets [.., 3]: 0..10 by distance, DISTANCE_BUCKETS - 1 another level."""
+	distance = torch.maximum(delta[..., 0].abs(), delta[..., 1].abs()).float()
+	bucket = torch.where(distance < 3, distance, 2 + torch.floor(torch.log2(distance.clamp(min=1)) * 1.5)).clamp(max=DISTANCE_BUCKETS - 2).long()
+	return torch.where(delta[..., 2] == 0, bucket, torch.full_like(bucket, DISTANCE_BUCKETS - 1))
+
+
+class TileReader(nn.Module):
+	"""Tokens with a place on the map read the map's tiles: attention [B, N, heads, tiles] with a bias by distance and,
+	for our heroes, by their own reach to each tile; its output starts at 0."""
+
+	def __init__(self, dim, cell_dim, heads):
+		super().__init__()
+		self.heads = heads
+		self.q = nn.Linear(dim, dim)
+		self.k = nn.Linear(cell_dim, dim)
+		self.v = nn.Linear(cell_dim, dim)
+		self.distance = nn.Parameter(torch.zeros(heads, DISTANCE_BUCKETS))
+		self.reach = nn.Linear(cell_dim, heads)
+		self.out = zero_output(nn.Linear(dim, dim))
+
+	def forward(self, tokens, positions, placed, tiles, tile_positions, valid, reach=None):
+		"""tokens [B, N, d] at positions [B, N, 3] (placed [B, N]); tiles [B, M, dc] at tile_positions [M, 3] (valid
+		[B, M]); reach: its bias [B, N, M, heads] (self.reach of each hero's reach to each tile) or None. Returns what each
+		token reads [B, N, d]."""
+		b, n, d = tokens.shape
+		h, dh = self.heads, d // self.heads
+		q = self.q(tokens).reshape(b, n, h, dh)
+		k = self.k(tiles).reshape(b, -1, h, dh)
+		v = self.v(tiles).reshape(b, -1, h, dh)
+		logits = torch.einsum("bnhd,bmhd->bhnm", q, k) / math.sqrt(dh)
+		bucket = distance_buckets(tile_positions[None, None, :, :] - positions[:, :, None, :])  # [B, N, M]
+		logits = logits + self.distance[:, bucket].permute(1, 0, 2, 3)
+		if reach is not None:
+			logits = logits + reach.permute(0, 3, 1, 2)
+		att = logits.masked_fill(~valid[:, None, None, :], -1e4).softmax(dim=-1)
+		read = torch.einsum("bhnm,bmhd->bnhd", att, v).reshape(b, n, d)
+		return self.out(read) * placed.unsqueeze(-1).float()
+
+
+class Foresight(nn.Module):
+	"""What the next action brings (model docstring): per (hero, window tile) for MOVE, per question option, per hero, and
+	for the turn, a small hidden state and its predictions. The predictions are for their losses (foresight.py) and
+	nothing else; the hidden states feed think_again."""
+
+	def __init__(self, dim, pair_dim):
+		super().__init__()
+		self.move = SwiGLU(pair_dim, pair_dim, FORESIGHT_HIDDEN)
+		self.answer = SwiGLU(2 * dim, dim, FORESIGHT_HIDDEN)
+		self.hero = SwiGLU(dim, dim // 2, FORESIGHT_HIDDEN)
+		self.turn = SwiGLU(dim, dim // 2, FORESIGHT_HIDDEN)
+		self.move_out = nn.Linear(FORESIGHT_HIDDEN, ACTION_TARGETS)
+		self.answer_out = nn.Linear(FORESIGHT_HIDDEN, ACTION_TARGETS)
+		self.hero_out = nn.Linear(FORESIGHT_HIDDEN, HERO_TARGETS)
+		self.turn_out = nn.Linear(FORESIGHT_HIDDEN, TURN_TARGETS)
+
+
+class CampaignModelV2(nn.Module):
+	ARCHITECTURE = "v2"
+
+	def __init__(self, dim=64, cell_dim=16, heads=4, layers=2):
+		"""cell_dim: the map tiles' width (the U-Net's at full resolution; twice and four times it at half and a quarter):
+		16, as 32 cost 3x v1's inference on the CPU (2026-10-30: 27 ms a decision against 9 ms, the U-Net most of it)."""
+		super().__init__()
+		d, dc = dim, cell_dim
+		self.dim, self.cell_dim, self.heads = d, dc, heads
+		dp = d // 2  # (hero, tile) and (hero, area) pairs
+		self.pair_dim = dp
+		# domain_knowledge
+		self.features = CustomFeatures()
+		# encode
+		self.encode_global = E.GlobalEncoder(d)
+		self.encode_hero = E.HeroEncoder(d)
+		self.encode_town = E.TownEncoder(d)
+		self.encode_tiles = E.TileEncoder(dc)
+		self.encode_options = E.OptionEncoder(d)
+		self.encode_other = E.ArmyEncoder(d)
+		self.reach = E.Tokenizer(5 + E.AMOUNT_FEATURES + 1, dc, embedded=False)  # a hero's reach to its window's tiles
+		self.travel_days = E.Tokenizer(E.AMOUNT_FEATURES + 1, dp, embedded=False)  # its days to each TRAVEL area
+		# take_sides
+		self.sides, self.tile_sides = Sides(d), Sides(dc)
+		self.player = small_embedding(P, d)
+		self.players = E.Tokenizer(2 * d, d)
+		# join
+		self.join_global = E.Tokenizer(d + ft_phi_features() + 3, d, embedded=False)
+		self.join_hero = E.Tokenizer(d + HERO_KNOWN, d, embedded=False)
+		self.join_town = E.Tokenizer(d + TOWN_KNOWN, d, embedded=False)
+		self.join_tiles = nn.Linear(TILE_KNOWN, dc)
+		# see
+		self.stamp_hero, self.stamp_town = nn.Linear(d, dc), nn.Linear(d, dc)
+		self.unet = MapUNet(dc)
+		self.read_tiles = TileReader(d, dc, heads)
+		self.area = nn.Linear(2 * dc, d)
+		# think
+		self.pair_bias = PairBias(heads)
+		self.relation_bias = nn.Parameter(torch.zeros(heads, 6))
+		self.blocks = nn.ModuleList(Block(d, heads) for _ in range(layers))
+		self.norm = RMSNorm(d)
+		# foresee: a (hero, tile) pair is its hero's, its tile's and its reach's projections summed
+		self.pair_hero, self.pair_tile, self.pair_reach = nn.Linear(d, dp), nn.Linear(dc, dp), nn.Linear(dc, dp)
+		self.foresight = Foresight(d, dp)
+		# think_again
+		self.again_global = E.Tokenizer(d + FORESIGHT_HIDDEN + ft_phi_features() + 3, d, embedded=False)
+		self.again_hero = E.Tokenizer(d + FORESIGHT_HIDDEN + HERO_KNOWN, d, embedded=False)
+		self.again_option = E.Tokenizer(d + FORESIGHT_HIDDEN, d, embedded=False)
+		self.again_block = Block(d, heads)
+		self.again_norm = RMSNorm(d)
+		self.move_pair = SwiGLU(dp + FORESIGHT_HIDDEN + MOVE_KNOWN, dp, dp)
+		self.travel_hero, self.travel_area = nn.Linear(d, dp), nn.Linear(d, dp)
+		self.travel_pair = SwiGLU(dp + 1, dp, dp)
+		# decide: each table's learned part; every type's bias from the priors
+		self.move_out, self.cast_cell_out, self.travel_out = nn.Linear(dp, 1), nn.Linear(dp, 1), nn.Linear(dp, 1)
+		self.act_move, self.act_travel = nn.Linear(d, 1), nn.Linear(d, 1)
+		self.building = small_embedding(c.N_BUILDINGS, d)
+		self.build_q = nn.Linear(d, d)
+		self.build_bias = nn.Parameter(torch.zeros(c.N_BUILDINGS))
+		self.nk2_build, self.nk2_upgrade, self.nk2_trade = zero_output(nn.Linear(4, 1)), zero_output(nn.Linear(2, 1)), zero_output(nn.Linear(2, 1))
+		self.recruit_head = nn.Sequential(nn.Linear(2 * d + 9, d), nn.GELU(), nn.Linear(d, c.N_RECRUIT_AMOUNTS * c.N_RECRUIT_TARGETS))
+		self.hire_q, self.hire_k = nn.Linear(d, d), nn.Linear(d, d)
+		self.hire_worth = zero_output(nn.Linear(4, 1))
+		self.army_src, self.army_dst = nn.Linear(2 * d, d), nn.Linear(d, d)
+		self.army_out = nn.Sequential(nn.GELU(), nn.Linear(d, c.N_ARMY_AMOUNTS))
+		self.upgrade_out = nn.Sequential(nn.GELU(), nn.Linear(d, 1))
+		self.trade_head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, R * R * c.N_TRADE_AMOUNTS))
+		self.spell = small_embedding(c.N_ADVENTURE_SPELLS, d)
+		self.cast_q = nn.Linear(d, d)
+		self.buy_item = small_embedding(c.N_BUY_ITEMS, d)
+		self.buy_q = nn.Linear(d, d)
+		self.dismiss_out = nn.Linear(d, 1)
+		self.option_q = nn.Linear(2 * d, d)
+		self.end_out = zero_output(nn.Linear(d, 1))
+		self.type_bias = nn.Parameter(priors.action_types().clone())
+		self.value_hidden = nn.Sequential(nn.Linear(3 * d + ft_phi_features(), d), nn.GELU())
+		self.value_heads = zero_output(nn.Linear(d, c.N_VALUE_OFFSETS))
+		self.growth_heads = zero_output(nn.Linear(d, c.N_VALUE_OFFSETS))
+		self.end_head = zero_output(nn.Linear(d, 1))
+		self.register_buffer("tile_positions", tile_positions(), persistent=False)
+
+	def prior_corrections(self):
+		"""The parameters that correct a fixed prior (model.CustomFeatures): weight decay pulls them back to it."""
+		return self.features.corrections()
+
+	# ---- the whole model ----
+
+	def forward(self, x):
+		known = self.domain_knowledge(x)
+		state = self.encode(x)
+		state = self.take_sides(state)
+		state = self.join(state, known)
+		state = self.see(state, known)
+		state = self.think(state)
+		foresight = self.foresee(state, known)
+		state = self.think_again(state, foresight, known)
+		return {**self.decide(state, known), **foresight["outputs"]}
+
+	# ---- domain_knowledge ----
+
+	def domain_knowledge(self, x):
+		"""model.CustomFeatures' facts (Φ, armies, fights, each window tile's value and prior, TRAVEL's prior, the action
+		priors), for the windows of our heroes there, and the references sizes are relative to."""
+		windows, n = windows_of(x)
+		known = self.features(x, windows)
+		known.windows, known.n = windows, n
+		known.window_tiles = window_tile_index(x, windows)  # [K, W, W] each window tile's map tile (-1 off the grid)
+		ours = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
+		armies = known.hero_gold[:, :HO] * ours
+		rivals = known.hero_gold[:, HO:] * (x["h_present"][:, HO:] & (x["h_owner"][:, HO:] > c.OWNER_SELF))
+		known.reference = {  # [B] each, floored so that early ratios stay bounded
+			"phi": known.phi_total.clamp(min=1000.0),
+			"main_army": armies.amax(dim=1).clamp(min=500.0),
+			"our_army": armies.sum(dim=1).clamp(min=500.0),
+			"rival_army": rivals.amax(dim=1).clamp(min=500.0),
+		}
+		return known
+
+	# ---- encode: raw inputs only ----
+
+	def encode(self, x):
+		state = State(x)
+		state.glob = self.encode_global(x)
+		state.heroes, state.hero_stacks = self.encode_hero(E.hero_fields(x))
+		state.towns, state.town_stacks, state.town_levels = self.encode_town(x)
+		state.tavern, _ = self.encode_hero(E.tavern_fields(x))
+		state.other_stacks, state.other = self.encode_other(x["x_creature"], x["x_count"], torch.ones_like(x["x_creature"][:, 0], dtype=torch.bool))
+		state.options = self.encode_options(x)
+		state.tiles = self.encode_tiles(x)  # [B, L, S, S, dc]
+		return state
+
+	# ---- take_sides: ownership transforms every vector ----
+
+	def take_sides(self, state):
+		x = state.x
+		state.heroes = self.sides(state.heroes, x["h_owner"]) * x["h_present"].unsqueeze(-1)
+		state.towns = self.sides(state.towns, x["t_owner"]) * x["t_present"].unsqueeze(-1)
+		on_map = ft.bit(x["tile_flags"], c.TILE_ON_MAP).unsqueeze(-1)
+		state.tiles = self.tile_sides(state.tiles, x["tile_owner"].clamp(min=0)) * on_map
+		# A token per player: its heroes' and towns' we see, summed and at their max, and its own embedding
+		owners = torch.cat([torch.where(x["h_present"], x["h_owner"], torch.zeros_like(x["h_owner"])), torch.where(x["t_present"], x["t_owner"], torch.zeros_like(x["t_owner"]))], dim=1)
+		of = (owners.unsqueeze(-1) == (c.OWNER_SELF + torch.arange(P, device=owners.device))).float()  # [B, H + T, P]
+		entities = torch.cat([state.heroes, state.towns], dim=1)
+		total = torch.einsum("bnp,bnd->bpd", of, entities)
+		top = (entities.unsqueeze(2) + (of.unsqueeze(-1) - 1) * 1e4).amax(dim=1) * (of.sum(dim=1, keepdim=True) > 0).transpose(1, 2).float()
+		state.player_valid = (of.sum(dim=1) > 0) | (torch.arange(P, device=owners.device) == 0)
+		state.players = self.players(self.player.weight.expand(owners.shape[0], P, -1), torch.cat([total, top], dim=-1)) * state.player_valid.unsqueeze(-1)
+		return state
+
+	# ---- join: the known facts onto what they describe ----
+
+	def join(self, state, known):
+		x = state.x
+		state.glob = self.join_global(None, torch.cat([state.glob, global_known(known)], dim=-1))
+		state.heroes = self.join_hero(None, torch.cat([state.heroes, hero_known(x, known)], dim=-1)) * x["h_present"].unsqueeze(-1)
+		state.towns = self.join_town(None, torch.cat([state.towns, town_known(x, known)], dim=-1)) * x["t_present"].unsqueeze(-1)
+		state.tiles = state.tiles + self.join_tiles(tile_known(x, self.features, known))
+		return state
+
+	# ---- see: the map ----
+
+	def see(self, state, known):
+		x = state.x
+		b = x["g_day"].shape[0]
+		dc = self.cell_dim
+		cells = state.tiles.reshape(b * L * S * S, dc)
+		for vectors, positions, present, stamp in ((state.heroes, x["h_pos"], x["h_present"], self.stamp_hero), (state.towns, x["t_pos"], x["t_present"], self.stamp_town)):
+			index, inside = map_index(positions, b)
+			keep = (present & inside).reshape(-1)
+			rows = torch.nonzero(keep).squeeze(-1)
+			cells = cells.index_add(0, index.reshape(-1)[rows], stamp(vectors.reshape(-1, vectors.shape[-1])[rows]))
+		on_map = ft.bit(x["tile_flags"], c.TILE_ON_MAP).reshape(b * L, 1, S, S).float()
+		grid, half = self.unet(cells.reshape(b, L, S, S, dc).permute(0, 1, 4, 2, 3).reshape(b * L, dc, S, S), on_map)
+		state.tiles = grid.reshape(b, L, dc, S, S).permute(0, 1, 3, 4, 2)  # [B, L, S, S, dc]
+		flat = state.tiles.reshape(b, L * S * S, dc)
+		valid = on_map.reshape(b, L * S * S) > 0
+		# Our heroes' reach on the map, as the tile reader's bias per head: each window's tiles scattered to theirs
+		heads = self.heads
+		reach = torch.zeros(b * HO * L * S * S, heads, device=flat.device, dtype=flat.dtype)
+		if known.n > 0:
+			n = known.n
+			state.window_reach = self.reach(None, reach_features(x, known.windows[:n]))  # [K, W, W, dc]
+			tiles = known.window_tiles[:n].reshape(n, W * W)
+			index = (known.windows[:n, None] * (L * S * S) + tiles.clamp(min=0)).reshape(-1)
+			inside = torch.nonzero((tiles >= 0).reshape(-1)).squeeze(-1)
+			reach = reach.index_add(0, index[inside], self.read_tiles.reach(state.window_reach).reshape(-1, heads)[inside])
+		reach = torch.cat([reach.reshape(b, HO, L * S * S, heads), torch.zeros(b, H - HO, L * S * S, heads, device=flat.device, dtype=flat.dtype)], dim=1)
+		state.heroes = state.heroes + self.read_tiles(state.heroes, x["h_pos"], x["h_present"], flat, self.tile_positions, valid, reach)
+		state.towns = state.towns + self.read_tiles(state.towns, x["t_pos"], x["t_present"], flat, self.tile_positions, valid)
+		state.areas = self.area(half.reshape(b, L, 2 * dc, TG * TG).permute(0, 1, 3, 2).reshape(b, AREAS, 2 * dc))
+		return state
+
+	# ---- think ----
+
+	def tokens(self, state):
+		"""(the tokens [B, N, d], which are there [B, N], their tile positions [B, N, 3] and whether placed, their owner
+		codes [B, N]) in the trunk's order: global, players, heroes, towns, the other army, options, the tavern."""
+		x = state.x
+		b = x["g_day"].shape[0]
+		one = torch.ones(b, 1, dtype=torch.bool, device=state.glob.device)
+		other_present = (x["x_creature"] >= 0).any(dim=-1, keepdim=True)
+		tokens = torch.cat([state.glob.unsqueeze(1), state.players, state.heroes, state.towns, state.other.unsqueeze(1), state.options, state.tavern], dim=1)
+		valid = torch.cat([one, state.player_valid, x["h_present"], x["t_present"], other_present, x["option_mask"], x["g_tavern"] >= 0], dim=1)
+		none_pos = torch.zeros(b, 1, 3, dtype=x["h_pos"].dtype, device=x["h_pos"].device)
+		positions = torch.cat([none_pos, none_pos.expand(b, P, 3), x["h_pos"], x["t_pos"], none_pos, x["o_pos"], none_pos.expand(b, c.N_TAVERN, 3)], dim=1).float()
+		placed = torch.cat([~one, torch.zeros_like(state.player_valid), x["h_present"], x["t_present"], ~one, x["option_mask"] & (x["o_kind"] == c.OptionKind.OBJECT), torch.zeros_like(x["g_tavern"] >= 0)], dim=1)
+		player_codes = (c.OWNER_SELF + torch.arange(P, device=one.device)).expand(b, P)
+		zeros = lambda n: torch.zeros(b, n, dtype=torch.long, device=one.device)  # noqa: E731
+		owners = torch.cat([zeros(1), player_codes, torch.where(x["h_present"], x["h_owner"], zeros(H)), torch.where(x["t_present"], x["t_owner"], zeros(T)), zeros(1), zeros(c.N_OPTIONS), zeros(c.N_TAVERN)], dim=1)
+		kinds = torch.cat([zeros(1), torch.ones(b, P, dtype=torch.long, device=one.device), torch.ones(b, H + T, dtype=torch.long, device=one.device), zeros(1 + c.N_OPTIONS + c.N_TAVERN)], dim=1)
+		return tokens, valid, positions, placed, owners, kinds
+
+	def attention_bias(self, positions, placed, owners, kinds):
+		"""[B, heads, N, N]: by tile offset (PairBias) and by the owners' relation (relation_bias): 0 one of them owns
+		nothing (global, options, ...), 1 both ours, 2 one rival with itself, 3 ours and a rival's, 4 two rivals, 5 one of
+		them nobody's (a neutral town)."""
+		owned = kinds > 0
+		a, b_ = owners[:, :, None], owners[:, None, :]
+		ours_a, ours_b = a == c.OWNER_SELF, b_ == c.OWNER_SELF
+		rival_a, rival_b = a > c.OWNER_SELF, b_ > c.OWNER_SELF
+		relation = torch.where(ours_a & ours_b, 1, torch.where(rival_a & rival_b & (a == b_), 2, torch.where((ours_a & rival_b) | (rival_a & ours_b), 3, torch.where(rival_a & rival_b, 4, 5))))
+		relation = torch.where(owned[:, :, None] & owned[:, None, :], relation, torch.zeros_like(relation))
+		return self.pair_bias(positions, placed) + self.relation_bias[:, relation].permute(1, 0, 2, 3)
+
+	def think(self, state):
+		tokens, valid, positions, placed, owners, kinds = self.tokens(state)
+		state.valid, state.bias = valid, self.attention_bias(positions, placed, owners, kinds)
+		for block in self.blocks:
+			tokens = block(tokens, valid, state.bias)
+		self.split(state, self.norm(tokens))
+		return state
+
+	@staticmethod
+	def split(state, tokens):
+		i = 0
+		for name, n in (("glob", 1), ("players", P), ("heroes", H), ("towns", T), ("other", 1), ("options", c.N_OPTIONS), ("tavern", c.N_TAVERN)):
+			part = tokens[:, i : i + n]
+			setattr(state, name, part.squeeze(1) if name in ("glob", "other") else part)
+			i += n
+
+	# ---- foresee ----
+
+	def pairs(self, state, known):
+		"""Each window's (hero, tile) pairs [K, W, W, dp]: the hero's, its tile's and its reach's projections summed."""
+		b = state.x["g_day"].shape[0]
+		k = known.n
+		heroes = state.heroes[:, :HO].reshape(b * HO, -1).index_select(0, known.windows[:k])
+		flat = state.tiles.reshape(b * L * S * S, self.cell_dim)
+		decision = torch.div(known.windows[:k], HO, rounding_mode="floor")
+		index = known.window_tiles[:k]
+		cells = torch.where((index >= 0).unsqueeze(-1), flat[(decision[:, None, None] * (L * S * S) + index.clamp(min=0)).reshape(-1)].reshape(k, W, W, -1), torch.zeros(k, W, W, self.cell_dim, device=flat.device, dtype=flat.dtype))
+		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach)
+
+	def foresee(self, state, known):
+		x = state.x
+		b = x["g_day"].shape[0]
+		f = self.foresight
+		hidden = {"turn": f.turn(state.glob), "hero": f.hero(state.heroes)}
+		about = torch.gather(state.heroes, 1, x["d_hero"].clamp(min=0).reshape(b, 1, 1).expand(b, 1, self.dim)) * (x["d_hero"] >= 0).reshape(b, 1, 1).float()
+		hidden["answer"] = f.answer(torch.cat([state.options, about.expand(-1, c.N_OPTIONS, -1)], dim=-1))
+		outputs = {
+			"fs_turn": f.turn_out(hidden["turn"]), "fs_hero": f.hero_out(hidden["hero"]), "fs_answer": f.answer_out(hidden["answer"]),
+			"fs_move": torch.zeros(b, HO, W, W, ACTION_TARGETS, device=state.glob.device),
+		}
+		if known.n > 0:
+			state.pairs = self.pairs(state, known)
+			hidden["move"] = f.move(state.pairs)
+			outputs["fs_move"] = dense(f.move_out(hidden["move"]), known.windows, known.n, b)
+		return {"hidden": hidden, "outputs": outputs}
+
+	# ---- think_again ----
+
+	def think_again(self, state, foresight, known):
+		x = state.x
+		hidden = foresight["hidden"]
+		state.glob = state.glob + self.again_global(None, torch.cat([state.glob, hidden["turn"], global_known(known)], dim=-1))
+		state.heroes = state.heroes + self.again_hero(None, torch.cat([state.heroes, hidden["hero"], hero_known(x, known)], dim=-1)) * x["h_present"].unsqueeze(-1)
+		state.options = state.options + self.again_option(None, torch.cat([state.options, hidden["answer"]], dim=-1)) * x["option_mask"].unsqueeze(-1)
+		tokens, valid, *_ = self.tokens(state)
+		self.split(state, self.again_norm(self.again_block(tokens, valid, state.bias)))
+		if known.n > 0:
+			pairs = self.pairs(state, known)  # (with the heroes as they are now)
+			n = known.n
+			move_known = torch.cat([known.move_features[:n], torch.tanh(known.tile_prior[:n] / 4).unsqueeze(-1)], dim=-1)
+			state.move_pairs = self.move_pair(torch.cat([pairs, hidden["move"], move_known], dim=-1))
+		b = x["g_day"].shape[0]
+		days = x["travel_days"][:, :HO].reshape(b, HO, AREAS)
+		travel_in = torch.cat([E.amount(days.clamp(min=0).float() / 100, "days"), (days >= 0).float().unsqueeze(-1)], dim=-1)
+		travel = self.travel_hero(state.heroes[:, :HO]).unsqueeze(2) + self.travel_area(state.areas).unsqueeze(1) + self.travel_days(None, travel_in)
+		state.travel_pairs = self.travel_pair(torch.cat([travel, torch.tanh(known.travel_prior.reshape(b, HO, AREAS) / 4).unsqueeze(-1)], dim=-1))
+		return state
+
+	# ---- decide: every logit a match, one softmax ----
+
+	def decide(self, state, known):
+		x = state.x
+		b, d = x["g_day"].shape[0], self.dim
+		own_heroes, own_towns = state.heroes[:, :HO], state.towns[:, :TO]
+		out, tables = {}, {}
+		# MOVE and the targeted spell's tile: each window's pairs, + the hero's act-now score, + the tile's prior
+		move = cast_cell = torch.full((b, HO, W, W), 0.0, device=state.glob.device)
+		if known.n > 0:
+			move = dense(self.move_out(state.move_pairs).squeeze(-1) + known.tile_prior[: known.n], known.windows, known.n, b)
+			cast_cell = dense(self.cast_cell_out(state.move_pairs).squeeze(-1), known.windows, known.n, b)
+		tables[c.ActionType.MOVE] = move + self.act_move(own_heroes).reshape(b, HO, 1, 1)
+		out["cast_cell_logp"] = masked_log_softmax(cast_cell.reshape(b, HO, W * W), x["cast_cell_mask"].reshape(b, HO, W * W)).reshape(b, HO, W, W)
+		# TRAVEL: (hero, area) pairs, + the area's prior (its value discounted by the days to it)
+		travel = self.travel_out(state.travel_pairs).squeeze(-1) + known.travel_prior.reshape(b, HO, AREAS) + self.act_travel(own_heroes)
+		tables[c.ActionType.TRAVEL] = travel.reshape(b, HO, L, TG, TG)
+		# BUILD: the town's query against each building
+		tables[c.ActionType.BUILD] = self.build_q(own_towns) @ self.building.weight.t() / math.sqrt(d) + self.build_bias + self.nk2_build(known.build_rewards).squeeze(-1)
+		# RECRUIT: the town and each creature level's token, the amounts; Nullkiller2's prior
+		available = x["t_available"][:, :TO].clamp(min=0).float()
+		gold = x["g_resources"][:, 6].clamp(min=0).float()
+		recruit_in = torch.cat(
+			[
+				own_towns.unsqueeze(2).expand(b, TO, c.N_LEVELS, d), state.town_levels[:, :TO], scales(available, (5, 20, 80)),
+				scales(gold, (1000, 5000, 20000)).reshape(b, 1, 1, 3).expand(b, TO, c.N_LEVELS, 3),
+				scales(self.features.creature_cost[vocab_index(x["t_available_creature"][:, :TO], c.CREATURE_VOCAB)] * available, (1000, 5000, 20000)),
+			],
+			dim=-1,
+		)
+		recruit = self.recruit_head(recruit_in).reshape(b, TO, c.N_LEVELS, c.N_RECRUIT_AMOUNTS, c.N_RECRUIT_TARGETS)
+		tables[c.ActionType.RECRUIT] = recruit + self.features.recruit_prior(known.town_danger)
+		# HIRE: the town's query against each hero for hire (the same hero space as ours) + what the hire does to Φ
+		worth = torch.cat([scales(known.tavern_worth.clamp(min=0), (1000, 3000, 10000)), torch.tanh(known.hire_gain / 2000).unsqueeze(-1)], dim=-1)
+		hire = torch.einsum("btd,bsd->bts", self.hire_q(own_towns), self.hire_k(state.tavern)) / math.sqrt(d)
+		tables[c.ActionType.HIRE] = hire + ft.value_logit(known.hire_gain).unsqueeze(1) + self.hire_worth(worth).squeeze(-1).unsqueeze(1)
+		# ARMY and UPGRADE: each stack (its holder's token with it) against each holder
+		holders = torch.cat([own_heroes, own_towns, state.other.unsqueeze(1)], dim=1)
+		holder_stacks = torch.cat([state.hero_stacks[:, :HO], state.town_stacks[:, :TO], state.other_stacks.unsqueeze(1)], dim=1)
+		src = self.army_src(torch.cat([holders.unsqueeze(2).expand(b, HD, A, d), holder_stacks], dim=-1))
+		dst = self.army_dst(holders)
+		tables[c.ActionType.ARMY] = self.army_out(src[:, :, :, None, :] + dst[:, None, None, :, :]) + self.features.army_prior(known.hero_strength[:, :HO])
+		_, upgrade_weight, book_weight, _ = self.features.nk2_weights()
+		tables[c.ActionType.UPGRADE] = self.upgrade_out(src).squeeze(-1) + self.nk2_upgrade(known.upgrade_gains).squeeze(-1) + upgrade_weight * (known.upgrade_gains[..., 0] > 0).float()
+		# TRADE (from the global token), CAST, BUY, DISMISS (each hero's)
+		needs = torch.stack([known.trade_needs[:, None, :, 0].expand(b, R, R), known.trade_needs[:, :, None, 1].expand(b, R, R)], dim=-1)
+		_, _, _, _, trade_weight = self.features.pull_weights()
+		trade_prior = (trade_weight * ((needs[..., 0] > 0) & (needs[..., 1] > 0)).float()).unsqueeze(-1)
+		tables[c.ActionType.TRADE] = self.trade_head(state.glob).reshape(b, R, R, c.N_TRADE_AMOUNTS) + self.nk2_trade(needs) + trade_prior
+		tables[c.ActionType.CAST] = self.cast_q(own_heroes) @ self.spell.weight.t() / math.sqrt(d)
+		book = (torch.arange(c.N_BUY_ITEMS, device=gold.device) == c.BUY_ARTIFACTS.index(ft.SPELLBOOK)).float()
+		tables[c.ActionType.BUY] = self.buy_q(own_heroes) @ self.buy_item.weight.t() / math.sqrt(d) + book_weight * known.spellbook_wanted.float().unsqueeze(-1) * book
+		tables[c.ActionType.DISMISS] = self.dismiss_out(own_heroes).squeeze(-1)
+		# A question's options: each against the global token and the hero it is about; Nullkiller2's skill scores
+		about = torch.gather(state.heroes, 1, x["d_hero"].clamp(min=0).reshape(b, 1, 1).expand(b, 1, d)).squeeze(1) * (x["d_hero"] >= 0).float().unsqueeze(-1)
+		skill_weight, _, _, _ = self.features.nk2_weights()
+		query = self.option_q(torch.cat([state.glob, about], dim=-1))
+		out["option_logp"] = masked_log_softmax((state.options * query.unsqueeze(1)).sum(dim=-1) / math.sqrt(d) + skill_weight * known.skill_scores, x["option_mask"])
+		# One softmax over every action: each table normalised within itself (the contract's), each type scored by its
+		# entries' log-mean-exp + its bias, END by the global token
+		scores, legal_types = [], []
+		for action in c.ActionType:
+			if action == c.ActionType.END:
+				scores.append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action])
+				legal_types.append((x["g_kind"] == c.DecisionKind.TURN) | (x["g_kind"] == c.DecisionKind.EXCHANGE))
+				continue
+			name, mask_name = HEADS[action]
+			logits, mask = tables[action], x[mask_name]
+			out[name] = flat_log_softmax(logits, mask)
+			flat_logits, flat_mask = logits.reshape(b, -1), mask.reshape(b, -1)
+			legal = flat_mask.any(dim=-1)
+			count = flat_mask.float().sum(dim=-1).clamp(min=1)
+			mean = torch.logsumexp(flat_logits.masked_fill(~flat_mask, -1e4), dim=-1) - torch.log(count)
+			scores.append(torch.where(legal, mean, torch.zeros_like(mean)) + self.type_bias[action])
+			legal_types.append(legal)
+		out["type_logp"] = masked_log_softmax(torch.stack(scores, dim=-1), torch.stack(legal_types, dim=-1))
+		self.value(state, known, out)
+		return out
+
+	def value(self, state, known, out):
+		"""The value heads as v1's (model.CampaignModel.value): V2, V5, V7 (our share at the end of those days), the
+		growth heads and V_end, from the global token, our heroes' and towns' mean, our player's token and Φ."""
+		x = state.x
+		mine = torch.cat([x["h_present"][:, :HO], x["t_present"][:, :TO]], dim=1).float().unsqueeze(-1)
+		own = torch.cat([state.heroes[:, :HO], state.towns[:, :TO]], dim=1)
+		own_mean = (own * mine).sum(dim=1) / mine.sum(dim=1).clamp(min=1)
+		hidden = self.value_hidden(torch.cat([state.glob, own_mean, state.players[:, 0], known.phi], dim=-1))
+		share_prior = -torch.log(x["g_players"].clamp(min=2).float() - 1)
+		value_logit = self.value_heads(hidden) + share_prior.unsqueeze(-1)
+		out["value_logit"] = value_logit
+		out["value"] = torch.sigmoid(value_logit)
+		out["growth_logit"] = self.growth_heads(hidden)
+		out["end_logit"] = self.end_head(hidden).squeeze(-1) + share_prior
+		out["phi"] = known.phi_total
+
+
+# ---- helpers: the known facts per entity ----
+
+def ft_phi_features():
+	return len(ft.PHI_SCALES) + len(ft.PHI_PARTS)
+
+
+def log_ratio(value, reference):
+	"""A size relative to a reference [..]: log(value / reference), clipped to -6..6 (0 for nothing)."""
+	return torch.where(value > 0, torch.log(value.clamp(min=1e-3) / reference).clamp(-6, 6), torch.zeros_like(value))
+
+
+def global_known(known):
+	"""[B, PHI_FEATURES + 3]: Φ as the value heads see it, Nullkiller2's gold pressure, its pause, its want of a hero."""
+	return torch.cat([known.phi, torch.stack([known.gold_pressure / (1 + known.gold_pressure), known.recruit_pause, known.hire_want], dim=-1)], dim=-1)
+
+
+HERO_KNOWN = 1 + 3 + 4 + 2 * E.AMOUNT_FEATURES + 1
+
+
+def hero_known(x, known):
+	"""[B, H, HERO_KNOWN]: a hero's strength and army worth (absolute, and relative to our main army, our whole army and
+	the strongest rival's), its worth and its next level's gain (ours), whether it is our main hero."""
+	pad = lambda t: F.pad(t.float(), (0, H - HO))  # noqa: E731
+	r = known.reference
+	gold = known.hero_gold
+	return torch.cat(
+		[
+			(known.hero_strength / 10).unsqueeze(-1), scales(known.hero_power, (1e3, 1e4, 1e5)),
+			torch.stack([log_ratio(gold, r["main_army"][:, None]), log_ratio(gold, r["our_army"][:, None]), log_ratio(gold, r["rival_army"][:, None]), log_ratio(gold, r["phi"][:, None])], dim=-1) / 3,
+			E.amount(pad(known.hero_worth), "gold"), E.amount(pad(known.level_gain), "gold"), pad(known.main).unsqueeze(-1),
+		],
+		dim=-1,
+	)
+
+
+TOWN_KNOWN = 1 + 3 * E.AMOUNT_FEATURES + 2 + 1
+
+
+def town_known(x, known):
+	"""[B, T, TOWN_KNOWN]: a town's strength, value and garrison's worth (absolute; the garrison relative to our main army
+	and to the strongest rival army), its danger (ours)."""
+	r = known.reference
+	return torch.cat(
+		[
+			(known.town_strength / 10).unsqueeze(-1), E.amount(known.town_value, "gold"), E.amount(known.town_gold, "gold"), E.amount(known.town_power, "gold"),
+			torch.stack([log_ratio(known.town_gold, r["main_army"][:, None]), log_ratio(known.town_gold, r["rival_army"][:, None])], dim=-1) / 3,
+			F.pad(known.town_danger, (0, T - TO)).unsqueeze(-1),
+		],
+		dim=-1,
+	)
+
+
+TILE_KNOWN = 2 + E.AMOUNT_FEATURES + 2
+
+
+def tile_known(x, features, known):
+	"""[B, L, S, S, TILE_KNOWN]: what taking the tile's object is worth (Nullkiller2's or Φ's gold, where we may take it:
+	not ours, not visited), its guards' strength (a wandering monster's, as seen), both also relative to our Φ and main
+	army."""
+	obj, flags = x["tile_object"], x["tile_flags"]
+	gate = (obj >= 0) & (obj != ft.OBJ_HERO) & (obj != ft.OBJ_MONSTER) & (x["tile_owner"] != c.OWNER_SELF) & ~ft.bit(flags, c.TILE_VISITED_BY_PLAYER)
+	gold = features.object_gold(obj, x["tile_subtype"]) * gate
+	creature = x["tile_creature"]
+	count = ft.typical_counts(x["tile_count"], ft.bit(flags, c.TILE_EXACT_COUNT), features) * (creature >= 0)
+	power = count * features.fight_value[vocab_index(creature, c.CREATURE_VOCAB)]
+	r = known.reference
+	return torch.cat(
+		[
+			E.signed(gold, "gold"), E.amount(power, "gold"),
+			torch.stack([log_ratio(gold, r["phi"][:, None, None, None]), log_ratio(power, r["main_army"][:, None, None, None])], dim=-1) / 3,
+		],
+		dim=-1,
+	)
+
+
+MOVE_KNOWN = len(MOVE_FEATURES) + 1  # model.MOVE_FEATURES and the tile's prior (tanh / 4)
+
+
+def reach_features(x, windows):
+	"""[K, W, W, 11] a hero's reach to each tile of its window: the days (-1 never .. 3+, one-hot), the movement left on
+	reaching it today, whether this hero visited its object."""
+	pick = lambda name: x[name].reshape((-1, W, W)).index_select(0, windows)  # noqa: E731
+	turns = pick("w_turns")
+	return torch.cat([E.level(turns, -1, 3), E.amount(pick("w_move_left").clamp(min=0), "movement"), ft.bit(pick("w_flags"), c.TILE_VISITED_BY_HERO).float().unsqueeze(-1)], dim=-1)
+
+
+def tile_positions():
+	"""[L * S * S, 3] each map tile's (x, y, level), in the flattened grid's order."""
+	z, y, xx = torch.meshgrid(torch.arange(L), torch.arange(S), torch.arange(S), indexing="ij")
+	return torch.stack([xx, y, z], dim=-1).reshape(-1, 3)
+
+
+def map_index(positions, b):
+	"""(flat grid indices [B, N] of positions [B, N, 3] in the batch's flattened tiles, whether each is inside)."""
+	px, py, pz = positions[..., 0], positions[..., 1], positions[..., 2]
+	inside = (px >= 0) & (px < S) & (py >= 0) & (py < S) & (pz >= 0) & (pz < L)
+	batch = torch.arange(b, device=positions.device)[:, None]
+	index = ((batch * L + pz.clamp(0, L - 1)) * S + py.clamp(0, S - 1)) * S + px.clamp(0, S - 1)
+	return index, inside
+
+
+def window_tile_index(x, windows):
+	"""[K, W, W] each window tile's index in its decision's flattened grid (level, row, column), -1 off the grid."""
+	k = windows.shape[0]
+	pos = x["h_pos"][:, :HO].reshape(-1, 3).index_select(0, windows)  # [K, 3]
+	offsets = torch.arange(W, device=pos.device) - c.WINDOW_RADIUS
+	dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
+	tx, ty = pos[:, 0, None, None] + dx, pos[:, 1, None, None] + dy
+	tz = pos[:, 2, None, None].expand(k, W, W)
+	inside = (tx >= 0) & (tx < S) & (ty >= 0) & (ty < S) & (tz >= 0) & (tz < L)
+	return torch.where(inside, (tz * S + ty) * S + tx, torch.full_like(tx, -1))
+
+
+def windows_of(x):
+	"""(flat indices of our heroes' windows there (decision x OWN_HEROES + hero), how many): as model.CampaignModel's."""
+	windows = torch.nonzero(x["h_present"][:, :HO].reshape(-1)).squeeze(-1)
+	n = windows.shape[0]
+	if n > 0 and windows.device.type == "mps" and not torch.onnx.is_in_onnx_export():
+		windows = torch.cat([windows, windows[:1].expand((1 << (n - 1).bit_length()) - n)])
+	return windows, n
