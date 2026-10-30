@@ -442,7 +442,13 @@ Choice AlphaMapAI::decide(Decision & decision)
 		choice = Choice();
 	}
 	if(decision.kind == DecisionKind::TURN)
+	{
 		++decisionsToday;
+		// A sign of life for the games' stall watchdog (headless.sh: no log output for 60 s kills a game): with a few
+		// heroes a turn is dozens of decisions, each waiting for the inference server, and logged nothing (2026-10-30)
+		if(decisionsToday % 20 == 0)
+			logAi->info("AlphaMapAI %s: day %d, %d turn decisions so far today", playerID.toString(), cb->getDate(Date::DAY), decisionsToday);
+	}
 	return choice;
 }
 
