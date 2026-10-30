@@ -50,6 +50,10 @@ class Game:
 	ledgers: dict = field(default_factory=dict)  # day -> snapshot taken at the start of that day
 	final: list = field(default_factory=list)  # snapshots taken at the end of the game
 	done: dict = field(default_factory=dict)  # color -> the AI's summary ({"errors", "failed_actions"})
+	# color -> its heroes' battles in order (AlphaMapAI::battleStart/battleEnd, "<game>:<COLOR>:battle"): "serial" (the
+	# player's record count before it: the decision that led there is its serial-th), "side" (0 attacker), "armies" and
+	# "heroes" at the start per side, "result" (EBattleResult), "winner" (0, 1, 2 a draw), "casualties" per side, "exp"
+	battles: dict = field(default_factory=dict)
 	record_bytes: int = 0
 	damaged: int = 0  # records messages and ledger snapshots that could not be read (left out)
 	days: int = 0  # the day cap it was played to (0: none known): reaching it is the game's end (labels.end_labels)
@@ -108,6 +112,11 @@ def collect(messages):
 					game.ledgers[snapshot["day"]] = snapshot
 			elif parts[-1] == "done":
 				game.done[parts[-2]] = json.loads(payload) if payload else {}
+			elif parts[-1] == "battle":
+				try:
+					game.battles.setdefault(parts[-2], []).append(json.loads(payload))
+				except (json.JSONDecodeError, UnicodeDecodeError):
+					game.damaged += 1
 			else:
 				game.record_bytes += len(payload)
 				try:

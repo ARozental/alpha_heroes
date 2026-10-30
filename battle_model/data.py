@@ -16,6 +16,8 @@ From it we compute, for every decision:
 	search        for a decision the search played (ALPHA_BATTLE_SEARCH_SIMULATIONS): its improved policy over the
 	              root actions, (actions [K, len(ACTION_FIELDS)], probabilities [K]), from the record's "search"
 	              event; None otherwise (no search, or it failed and the network's action was played)
+	foresight     what happened between it and our next decision, model.Foresight's targets (foresight_labels);
+	              None for the battle's last decision
 and per battle a BattleSummary with the reward (reward.py) and the outcome.
 
 A sent record is ~190 KB a decision, in memory only. Keeping data across epochs will want a compact format
@@ -37,6 +39,7 @@ from . import vocab
 from .distributions import ACTION_FIELDS, is_legal, log_prob, stack_actions
 from .losses import AdvantageConfig, battle_returns_and_advantages, normalize_advantages, policy_advantages, value_targets
 from .reward import WAR_MACHINE_CREATURES, Outcome, RewardConfig, assets_after, hero_asset, mana_value, round_score, terminal_reward, to_scale
+from .constants import MAX_UNITS, N_HEXES
 from .schema import INPUTS, OUTPUTS
 
 # EBattleResult
@@ -358,6 +361,46 @@ def read_decisions(record):
 MIN_WEIGHT, FULL_WEIGHT_SHARE = 0.05, 0.1
 
 
+def unit_health(inputs):
+	"""Each unit slot's hit points [U]: (count - 1) x max HP + the top creature's HP; 0 for an empty or dead slot."""
+	count = inputs["u_count"].astype(np.float64)
+	alive = (inputs["u_present"] != 0) & (inputs["u_alive"] != 0) & (count > 0)
+	return np.where(alive, (count - 1) * inputs["u_max_hp"] + inputs["u_first_hp"], 0.0)
+
+
+def foresight_labels(decisions):
+	"""model.Foresight's targets for each decision of one side's battle: what happened between it and the side's next
+	decision (our action, then the enemy's reply). Per unit slot alive then (and the same creature next: the slots are
+	VCMI's unit ids in order, kept for the dead, so a slot is one unit throughout): "dies", "lost" (the share of its hit
+	points it lost), "dealt" (the hit points it dealt over the other side's then), each 0..1; "unit_mask"; per hex,
+	"hex_enemy": an enemy unit, alive, stands on it at the next decision. None for the last decision (no next one)."""
+	labels = []
+	for i, (now, _, _) in enumerate(decisions):
+		if i + 1 >= len(decisions):
+			labels.append(None)
+			break
+		after = decisions[i + 1][0]
+		before, later = unit_health(now), unit_health(after)
+		alive = before > 0
+		mask = alive & (after["u_present"] != 0) & (after["u_creature"] == now["u_creature"])
+		side = now["u_owner_side"]
+		others = np.array([before[(side != s) & alive].sum() for s in side])  # the other side's hit points, per unit
+		dealt = (after["u_dealt"].astype(np.float64) - now["u_dealt"]) / np.maximum(others, 1.0)
+		enemy = (after["u_present"] != 0) & (after["u_alive"] != 0) & (after["u_owner_side"] != now["g_our_side"])
+		hexes = np.zeros(N_HEXES, dtype=np.float32)
+		for hex_input in ("u_hex", "u_rear_hex"):
+			cells = after[hex_input][enemy]
+			hexes[cells[(cells >= 0) & (cells < N_HEXES)]] = 1.0
+		labels.append({
+			"dies": (mask & (later <= 0)).astype(np.float32),
+			"lost": np.where(mask, np.clip(1.0 - later / np.maximum(before, 1.0), 0.0, 1.0), 0.0).astype(np.float32),
+			"dealt": np.where(mask, np.clip(dealt, 0.0, 1.0), 0.0).astype(np.float32),
+			"unit_mask": mask.astype(np.float32),
+			"hex_enemy": hexes,
+		})
+	return labels
+
+
 def example_weight(summary):
 	"""How much a battle's decisions count in training: its smaller side's share of both sides' assets over
 	FULL_WEIGHT_SHARE, in MIN_WEIGHT..1 (an even fight 1; a 100k hero crushing 2k of monsters 0.2: its outcome was never
@@ -401,8 +444,9 @@ def battle_examples(record, reward_config=RewardConfig(), advantage_config=Advan
 	searches = {e["decision"]: (torch.tensor(e["actions"], dtype=torch.long).view(-1, len(ACTION_FIELDS)), torch.tensor(e["policy"], dtype=torch.float32)) for e in record.events if e["event"] == "search"}
 	weight = example_weight(summary)
 	summary.weight = weight
+	foresight = foresight_labels(decisions)
 	examples = [
-		{"inputs": d[0], "action": d[2], "old_log_prob": old_log_prob[i], "advantage": advantages[i], "value_labels": labels[i], "weight": torch.tensor(weight, dtype=torch.float32), "forced": bool(d[2].get("forced", False)), "search": searches.get(i)}
+		{"inputs": d[0], "action": d[2], "old_log_prob": old_log_prob[i], "advantage": advantages[i], "value_labels": labels[i], "weight": torch.tensor(weight, dtype=torch.float32), "forced": bool(d[2].get("forced", False)), "search": searches.get(i), "foresight": foresight[i]}
 		for i, d in enumerate(decisions)
 	]
 	return examples, summary
@@ -422,6 +466,11 @@ def collate(examples, widen=True):
 		"value_labels": torch.stack([e["value_labels"] for e in examples]),
 		"weight": torch.stack([e.get("weight", torch.tensor(1.0)) for e in examples]),
 	}
+	if any(e.get("foresight") is not None for e in examples):  # (the battle's last decision has none: valid 0)
+		empty = {"dies": np.zeros(MAX_UNITS, np.float32), "lost": np.zeros(MAX_UNITS, np.float32), "dealt": np.zeros(MAX_UNITS, np.float32), "unit_mask": np.zeros(MAX_UNITS, np.float32), "hex_enemy": np.zeros(N_HEXES, np.float32)}
+		rows = [e.get("foresight") or empty for e in examples]
+		batch["foresight"] = {key: torch.from_numpy(np.stack([r[key] for r in rows])) for key in empty}
+		batch["foresight"]["valid"] = torch.tensor([e.get("foresight") is not None for e in examples], dtype=torch.float32)
 	searches = [e.get("search") for e in examples]
 	if any(s is not None for s in searches):
 		k = max(len(s[1]) for s in searches if s is not None)

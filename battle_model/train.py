@@ -66,7 +66,7 @@ from .data import collate, credit_check, make_dataloader, summarize, widened
 from .distributions import log_prob
 from .export import export, verify
 from .device import sync, use_fused
-from .losses import AdvantageConfig, PPOConfig, ppo_loss, search_loss, value_excess, weighted_mean
+from .losses import FORESIGHT_PARTS, AdvantageConfig, PPOConfig, foresight_loss, ppo_loss, search_loss, value_excess, weighted_mean
 from .constants import N_ACTION_TYPES, ActionType
 from .model import VALUE_PRIOR_GAIN, VALUE_PRIOR_KINDS, VALUE_PRIOR_STEP, build_model
 from .trace import trace
@@ -262,7 +262,9 @@ COLUMNS = [
 	f"{side}_{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")
 ] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow", "learning_rate", "ppo_steps", "update_kl", "outcome_share", "round_head_weight"] + [
 	f"train_{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")
-] + [f"value_gain_{kind}" for kind in VALUE_PRIOR_KINDS]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
+] + [f"value_gain_{kind}" for kind in VALUE_PRIOR_KINDS] + [f"foresight_{k}" for k in FORESIGHT_PARTS] + [
+	"grad_trunk_main", "grad_trunk_foresight", "grad_trunk_cosine", "grad_dead_share",
+]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
 # error. decisions: all decisions of the epoch; rounds: attack + defence battle rounds, averaged over the games.
 
@@ -280,6 +282,10 @@ TENSORBOARD_TAGS = {
 	"outcome_share": "stability/outcome_share",  # the window credit's share of the real outcome (by V's quality)
 	"round_head_weight": "stability/round_head_weight",  # V2's share of what the policy maximizes (by V's quality)
 	**{f"value_gain_{kind}": f"priors/value_gain_{kind}" for kind in VALUE_PRIOR_KINDS},  # each value prior's learned gain (model.ActionHeads.value_prior)
+	**{f"foresight_{k}": f"foresight/{k}" for k in FORESIGHT_PARTS},  # model.Foresight's losses (BCE): falling = it learns
+	# Gradient health (trunk_gradients): the trunk's gradient norm from the PPO losses and from the foresight's, how much
+	# they agree (cosine; strongly negative = they fight), and the share of parameters no loss reaches
+	**{name: f"gradients/{name[5:]}" for name in ("grad_trunk_main", "grad_trunk_foresight", "grad_trunk_cosine", "grad_dead_share")},
 	**{f"{side}_share_{kind.lower()}": f"actions_{side}/{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS},
 	**{f"{side}_{name}": f"credit_{side}/{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")},
 	"mean_reward": "reward/mean", "attack_reward": "reward/attack", "defence_reward": "reward/defence",
@@ -843,6 +849,33 @@ def value_gains(model):
 	return {f"value_gain_{kind}": round(float(g), 4) for kind, g in zip(VALUE_PRIOR_KINDS, gains)}
 
 
+GRADIENT_CHECK_EVERY = 5  # updates between gradient health checks (trunk_gradients), on an update's first minibatch
+
+
+def trunk_gradients(model, main, foresight):
+	"""Gradient health on one minibatch, without touching .grad: the trunk's gradient norm from the PPO losses (main) and
+	from the foresight's, their cosine, and the share of the model's parameters neither loss reaches (an exactly zero
+	gradient: a path cut off). The foresight's gradient should be a fraction of the main one's, not dominate it."""
+	trunk = [p for p in model.trunk.parameters() if p.requires_grad]
+	params = [p for p in model.parameters() if p.requires_grad]
+	g_main = torch.autograd.grad(main, params, retain_graph=True, allow_unused=True)
+	g_fore = torch.autograd.grad(foresight, params, retain_graph=True, allow_unused=True)
+	index = {id(p): i for i, p in enumerate(params)}
+	flat = lambda grads: torch.cat([(grads[index[id(p)]] if grads[index[id(p)]] is not None else torch.zeros_like(p)).flatten() for p in trunk])  # noqa: E731
+	a, b = flat(g_main), flat(g_fore)
+	names = {id(p): name for name, p in model.named_parameters()}
+	dead = [names[id(p)] for p, x, y in zip(params, g_main, g_fore) if (x is None or not bool(x.any())) and (y is None or not bool(y.any()))]
+	if dead:  # (heads the minibatch never used, embeddings of ids it never saw; a part always here is a path cut off)
+		print("gradients: none reach " + ", ".join(sorted({".".join(n.split(".")[:3]) for n in dead})), flush=True)
+	dead = len(dead)
+	return {
+		"grad_trunk_main": round(float(a.norm()), 6),
+		"grad_trunk_foresight": round(float(b.norm()), 6),
+		"grad_trunk_cosine": round(float(torch.nn.functional.cosine_similarity(a, b, dim=0)), 4),
+		"grad_dead_share": round(dead / max(len(params), 1), 4),
+	}
+
+
 def load_optimizer(optimizer, model, state):
 	"""The checkpoint's optimizer state. A checkpoint from before parameters were added (2026-10-29: the value priors,
 	model.VALUE_PRIOR_KINDS) keeps Adam's moments for the parameters it had, matched by name in the model's order; the
@@ -855,7 +888,11 @@ def load_optimizer(optimizer, model, state):
 	had = [i for i, name in enumerate(names) if name in state["model"]]  # the checkpoint's parameters, in its order
 	if len(had) != len(saved["param_groups"][0]["params"]):
 		raise ValueError(f"the checkpoint's optimizer has {len(saved['param_groups'][0]['params'])} parameters, its model {len(had)}")
-	moments = {new: saved["state"][old] for old, new in enumerate(had) if old in saved["state"]}
+	shapes = [p.shape for _, p in model.named_parameters()]
+	moments = {new: saved["state"][old] for old, new in enumerate(had) if old in saved["state"] and saved["state"][old]["exp_avg"].shape == shapes[new]}
+	reshaped = [names[new] for old, new in enumerate(had) if old in saved["state"] and new not in moments]
+	if reshaped:
+		print("optimizer: fresh moments for the parameters whose shape changed: " + ", ".join(reshaped), flush=True)
 	optimizer.load_state_dict({"state": moments, "param_groups": [{**saved["param_groups"][0], "params": list(range(len(names)))}]})
 	print(f"optimizer: Adam's moments kept for {len(had)} parameters, fresh for {len(names) - len(had)} new: " + ", ".join(n for i, n in enumerate(names) if i not in set(had)), flush=True)
 
@@ -1109,7 +1146,8 @@ def train(config, resume=False):
 			loader, summaries, _ = make_dataloader(records, config.batch_size, True, reward_config, advantage_config)
 
 			weights_before = flat_weights(model)
-			parts_sum, batches = {key: torch.zeros((), device=device) for key in ("policy", "value", "entropy", "below_floor", "approx_kl", "clip_fraction")}, 0
+			parts_sum, batches = {key: torch.zeros((), device=device) for key in ("policy", "value", "entropy", "below_floor", "approx_kl", "clip_fraction", *(f"foresight_{k}" for k in FORESIGHT_PARTS))}, 0
+			gradient_check = {}
 			trained = time.time()
 			model.train()
 			examples = loader.dataset
@@ -1165,12 +1203,19 @@ def train(config, resume=False):
 						loss, parts = search_loss(out_batch, batch["search"], batch["value_labels"], ppo_config)
 					else:
 						loss, parts = ppo_loss(out_batch, batch["action"], batch["old_log_prob"], batch["advantage"], batch["value_labels"], ppo_config, batch.get("weight"))
+					if "foresight" in batch and "foresight_unit" in out_batch:
+						foresight, foresight_parts = foresight_loss(out_batch, batch["foresight"], ppo_config, batch.get("weight"))
+						loss = loss + foresight
+						parts.update({f"foresight_{k}": v for k, v in foresight_parts.items()})
+						if batches == 0 and epoch % GRADIENT_CHECK_EVERY == 0:
+							gradient_check = trunk_gradients(model, loss - foresight, foresight)
 					optimizer.zero_grad()
 					loss.backward()
 					torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 					optimizer.step()
 					for key in parts_sum:
-						parts_sum[key] += parts[key]  # summed on the device: no sync each step
+						if key in parts:
+							parts_sum[key] += parts[key]  # summed on the device: no sync each step
 					batches += 1
 					if config.target_kl:
 						kl = float(kl_of(out_batch, batch))  # before this step: how far the update has moved so far
@@ -1235,6 +1280,8 @@ def train(config, resume=False):
 				"round_head_weight": round(float(advantage_config.policy_heads[2]), 3),
 				**value_gains(model),
 				**{f"train_{k}": v for k, v in failure_modes(records).items()},  # the same signs of dumb play, in training
+				**{f"foresight_{k}": round(mean[f"foresight_{k}"], 5) for k in FORESIGHT_PARTS},
+				**gradient_check,
 			}
 			for side, name in ((0, "attack"), (1, "defence")):
 				kinds = Counter(ActionType(a["type"]).name for r in records if r.events[0]["our_side"] == side for a in r.actions)
@@ -1258,7 +1305,7 @@ def train(config, resume=False):
 				now = max(-1.0, min(1.0, sum(evs) / len(evs)))
 				value_ev = now if value_ev is None else 0.9 * value_ev + 0.1 * now
 			with progress.open("a", newline="") as f:
-				csv.writer(f).writerow([row[c] for c in COLUMNS])
+				csv.writer(f).writerow([row.get(c, "") for c in COLUMNS])  # (the gradient check's columns: every GRADIENT_CHECK_EVERY updates)
 			log_tensorboard(writer, row, self_play=config.opponent == play.SELF_PLAY)
 			print(
 				f"epoch {epoch:4d}  attack {row['attack_outcome']:9s} {row['attack_reward']:+.3f}  defence {row['defence_outcome']:9s} {row['defence_reward']:+.3f}  won {row['attack_win_rate']:.2f} / {row['defence_win_rate']:.2f}"

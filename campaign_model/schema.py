@@ -129,6 +129,16 @@ INPUTS = (
 	_i("o_amount", (O,), "see OptionKind"),
 	_i("o_pos", (O, 3), "x, y, level (OBJECT)"),
 	# The map around each of our heroes (WINDOW x WINDOW tiles, the hero in the middle)
+	# The whole map, tile by tile (schema 9: the map CNN's input, every hero reading the same tiles): as a window's, but
+	# for no hero in particular (the top object other than a hero: heroes and towns come in as their tokens)
+	_i("tile_terrain", (L, c.MAP_TILES, c.MAP_TILES), "terrain id, -1 off the map or not revealed", fill=-1),
+	_i("tile_road", (L, c.MAP_TILES, c.MAP_TILES), "road id, 0 none"),
+	_i("tile_flags", (L, c.MAP_TILES, c.MAP_TILES), "TILE_* bits (not TILE_VISITED_BY_HERO)"),
+	_i("tile_object", (L, c.MAP_TILES, c.MAP_TILES), "type of the top object other than a hero (visitable first), -1 none", fill=-1),
+	_i("tile_subtype", (L, c.MAP_TILES, c.MAP_TILES), "its subtype"),
+	_i("tile_owner", (L, c.MAP_TILES, c.MAP_TILES), "its owner, relative to us"),
+	_i("tile_creature", (L, c.MAP_TILES, c.MAP_TILES), "a wandering monster's creature, -1 none", fill=-1),
+	_i("tile_count", (L, c.MAP_TILES, c.MAP_TILES), "its count as a human sees it (TILE_EXACT_COUNT: exact, a hero's Visions)"),
 	_i("w_terrain", (HO, W, W), "terrain id, -1 off the map or not revealed", fill=-1),
 	_i("w_road", (HO, W, W), "road id, 0 none"),
 	_i("w_flags", (HO, W, W), "TILE_* bits"),
@@ -309,11 +319,18 @@ def random_inputs(batch=1, seed=0):
 		x["g_tiles"][b, :, :, :, c.GridCount.REVEALED] = revealed
 		x["g_tiles"][b, :, :, :, c.GridCount.BLOCKED] = revealed & (rng.random(revealed.shape) < 0.3)
 		objects = [(98, 0, c.OWNER_SELF), (98, 1, c.OWNER_SELF + 1), (53, 6, c.OWNER_NONE), (101, 0, c.OWNER_NONE), (54, 10, c.OWNER_NONE), (54, 20, c.OWNER_NONE), (112, 0, c.OWNER_NONE)]
+		seen = rng.random((L, c.MAP_TILES, c.MAP_TILES)) < 0.5
+		x["tile_flags"][b] = c.TILE_ON_MAP | np.where(seen, c.TILE_REVEALED, 0) | np.where(seen & (rng.random(seen.shape) < 0.2), c.TILE_BLOCKED, 0)
+		x["tile_terrain"][b] = np.where(seen, rng.integers(0, 10, seen.shape), -1)
 		for i, (obj, subtype, owner) in enumerate(objects[: int(rng.integers(2, len(objects) + 1))]):
 			x["m_object"][b, i], x["m_subtype"][b, i], x["m_owner"][b, i] = obj, subtype, owner
 			x["m_pos"][b, i] = [rng.integers(0, 36), rng.integers(0, 36), rng.integers(0, 2)]
+			tx, ty, tz = x["m_pos"][b, i]
+			x["tile_object"][b, tz, ty, tx], x["tile_subtype"][b, tz, ty, tx], x["tile_owner"][b, tz, ty, tx] = obj, subtype, owner
+			x["tile_flags"][b, tz, ty, tx] |= c.TILE_REVEALED | c.TILE_VISITABLE
 			if obj == 54:
 				x["m_creature"][b, i], x["m_count"][b, i] = subtype, rng.integers(1, 10)
+				x["tile_creature"][b, tz, ty, tx], x["tile_count"][b, tz, ty, tx] = x["m_creature"][b, i], x["m_count"][b, i]
 		for h in range(heroes):
 			x["h_spell_cost"][b, h] = rng.choice([0, 5, 16, 24])
 			if kind == c.DecisionKind.TURN:  # areas a day or more away

@@ -78,6 +78,7 @@ From reward to loss, for one battle seen by one side:
 from dataclasses import dataclass
 
 import torch
+from torch import nn
 import torch.nn.functional as F
 
 from .constants import N_VALUE_HORIZONS
@@ -135,6 +136,11 @@ class PPOConfig:
 	# KL control already limit how fast a choice sharpens
 	entropy_floor_weight: float = 0.0
 	value_head_weights: tuple = (1.0,) * (N_VALUE_HORIZONS + 1)  # step 4: share of each value head (V0, V1, V2, V) in the value loss
+	# The foresight heads (model.Foresight: what happens before our next decision), each target's loss weight: auxiliary,
+	# so they shape the trunk the policy reads without outweighing the policy's own gradient (train.py logs the ratio of
+	# their gradients on the trunk: at 0.05 the foresight's was 2.6% of the PPO losses' on joint2's 5520, too little to
+	# teach the trunk anything; 0.4 for ~20%)
+	foresight_weight: float = 0.4
 
 
 def value_targets(decision_rounds, round_scores, final_reward, horizons=N_VALUE_HORIZONS):
@@ -296,6 +302,26 @@ def ppo_loss(out, action, old_log_prob, advantage, value_labels, config=PPOConfi
 		"approx_kl": (old_log_prob - new_log_prob).mean().detach(),
 		"clip_fraction": ((ratio - 1).abs() > config.clip_range).float().mean().detach(),
 	}
+
+
+FORESIGHT_PARTS = ("dies", "lost", "dealt", "hex_enemy")
+
+
+def foresight_loss(out, labels, config=PPOConfig(), weight=None):
+	"""model.Foresight's loss: binary cross-entropy (soft for the shares lost and dealt, 0..1) of each target against what
+	happened before our next decision (data.foresight_labels), over the unit slots alive then and every hex, each
+	decision weighted as its battle (weight); a battle's last decision has none (labels["valid"] 0). Returns (loss,
+	{part: its mean loss}): FORESIGHT_PARTS, each part's weight config.foresight_weight."""
+	valid = labels["valid"] * (weight if weight is not None else 1.0)
+	denominator = valid.sum().clamp(min=1e-6)
+	mask = labels["unit_mask"]
+	targets = torch.stack([labels["dies"], labels["lost"], labels["dealt"]], dim=-1)
+	unit = nn.functional.binary_cross_entropy_with_logits(out["foresight_unit"], targets, reduction="none")  # [B, U, 3]
+	unit = (unit * mask[..., None]).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 3]
+	hexes = nn.functional.binary_cross_entropy_with_logits(out["foresight_hex"], labels["hex_enemy"], reduction="none").mean(dim=-1)  # [B]
+	per_part = torch.cat([unit, hexes[:, None]], dim=-1)  # [B, 4]
+	parts = (per_part * valid[:, None]).sum(dim=0) / denominator
+	return config.foresight_weight * parts.sum(), {name: parts[i].detach() for i, name in enumerate(FORESIGHT_PARTS)}
 
 
 def entropy_term(out, config=PPOConfig(), weight=None):

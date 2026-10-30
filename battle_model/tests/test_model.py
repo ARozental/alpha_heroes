@@ -35,7 +35,7 @@ def small_masks(seed):
 def test_output_shapes(model):
 	for batch in (1, 3):
 		out = run(model, random_inputs(batch=batch, seed=batch))
-		assert set(out) == {s.name for s in OUTPUTS} | {"value_logit"}  # value_logit: training only
+		assert set(out) == {s.name for s in OUTPUTS} | {"value_logit", "foresight_unit", "foresight_hex"}  # training only
 		for spec in OUTPUTS:
 			assert out[spec.name].shape == (batch,) + spec.shape, spec.name
 

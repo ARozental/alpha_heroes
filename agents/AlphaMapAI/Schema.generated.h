@@ -7,8 +7,8 @@
 
 namespace MapSchema
 {
-constexpr int SCHEMA_VERSION = 8;
-constexpr const char * CONTRACT_HASH = "208e06ff029e6a2f";
+constexpr int SCHEMA_VERSION = 9;
+constexpr const char * CONTRACT_HASH = "63c0862c95d36a97";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;
@@ -57,6 +57,7 @@ constexpr int TILE_EXACT_COUNT = 256;
 constexpr int MAP_OBJECTS = 8192;
 constexpr int MAP_GRID = 36;
 constexpr int MAP_LEVELS = 2;
+constexpr int MAP_TILES = 36;
 constexpr int N_GRID_COUNTS = 5;
 constexpr int OBJECT_VISITED_BY_PLAYER = 1;
 constexpr int OBJECT_EXACT_COUNT = 2;
@@ -230,6 +231,14 @@ enum class In : int
 	o_subtype,
 	o_amount,
 	o_pos,
+	tile_terrain,
+	tile_road,
+	tile_flags,
+	tile_object,
+	tile_subtype,
+	tile_owner,
+	tile_creature,
+	tile_count,
 	w_terrain,
 	w_road,
 	w_flags,
@@ -352,6 +361,14 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"o_subtype", DType::INT64, 1, {8, 1, 1, 1}, 0},
 	TensorSpec{"o_amount", DType::INT64, 1, {8, 1, 1, 1}, 0},
 	TensorSpec{"o_pos", DType::INT64, 2, {8, 3, 1, 1}, 0},
+	TensorSpec{"tile_terrain", DType::INT64, 3, {2, 36, 36, 1}, -1},
+	TensorSpec{"tile_road", DType::INT64, 3, {2, 36, 36, 1}, 0},
+	TensorSpec{"tile_flags", DType::INT64, 3, {2, 36, 36, 1}, 0},
+	TensorSpec{"tile_object", DType::INT64, 3, {2, 36, 36, 1}, -1},
+	TensorSpec{"tile_subtype", DType::INT64, 3, {2, 36, 36, 1}, 0},
+	TensorSpec{"tile_owner", DType::INT64, 3, {2, 36, 36, 1}, 0},
+	TensorSpec{"tile_creature", DType::INT64, 3, {2, 36, 36, 1}, -1},
+	TensorSpec{"tile_count", DType::INT64, 3, {2, 36, 36, 1}, 0},
 	TensorSpec{"w_terrain", DType::INT64, 3, {8, 33, 33, 1}, -1},
 	TensorSpec{"w_road", DType::INT64, 3, {8, 33, 33, 1}, 0},
 	TensorSpec{"w_flags", DType::INT64, 3, {8, 33, 33, 1}, 0},

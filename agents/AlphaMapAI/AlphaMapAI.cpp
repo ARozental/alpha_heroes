@@ -10,7 +10,10 @@
 #include "lib/UnlockGuard.h"
 #include "lib/battle/BattleStateInfoForRetreat.h"
 #include "lib/callback/CCallback.h"
+#include "lib/entities/artifact/CArtifactInstance.h"
 #include "lib/gameState/CGameState.h"
+#include "lib/json/JsonNode.h"
+#include "lib/networkPacks/PacksForClientBattle.h"
 #include "lib/mapObjects/CGDwelling.h"
 #include "lib/mapObjects/CGHeroInstance.h"
 #include "lib/mapObjects/CGTownInstance.h"
@@ -311,11 +314,71 @@ void AlphaMapAI::heroVisit(const CGHeroInstance * visitor, const CGObjectInstanc
 	statusChanged.notify_all();
 }
 
+namespace
+{
+JsonNode battleNumber(int64_t value)
+{
+	JsonNode node;
+	node.Integer() = value;
+	return node;
+}
+
+JsonNode battlePair(int64_t first, int64_t second)
+{
+	JsonNode pair;
+	pair.Vector() = {battleNumber(first), battleNumber(second)};
+	return pair;
+}
+
+JsonNode battleStacks(const CCreatureSet * army)
+{
+	JsonNode list;
+	list.Vector();
+	if(army)
+		for(const auto & [slot, stack] : army->Slots())
+			list.Vector().push_back(battlePair(stack->getId().getNum(), stack->getCount()));
+	return list;
+}
+
+/// A battle's hero as the battle reward prices it (battle_model/reward.py): its experience, mana, spell power and the
+/// artifacts it carries (the war machines among them); null without one
+JsonNode battleHero(const CGHeroInstance * hero)
+{
+	JsonNode node;
+	if(!hero)
+		return node;
+	node["exp"].Integer() = hero->exp;
+	node["level"].Integer() = hero->level;
+	node["mana"].Integer() = hero->mana;
+	node["power"].Integer() = hero->getPrimSkillLevel(PrimarySkill::SPELL_POWER);
+	node["artifacts"].Vector();
+	for(const auto & [position, slot] : hero->artifactsWorn)
+		if(slot.getArt())
+			node["artifacts"].Vector().push_back(battleNumber(slot.getArt()->getTypeId().getNum()));
+	for(const auto & slot : hero->artifactsInBackpack)
+		if(slot.getArt())
+			node["artifacts"].Vector().push_back(battleNumber(slot.getArt()->getTypeId().getNum()));
+	return node;
+}
+}
+
 void AlphaMapAI::battleStart(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2, int3 tile, const CGHeroInstance * hero1, const CGHeroInstance * hero2, BattleSide side, bool replayAllowed)
 {
 	{
 		std::scoped_lock lock(statusMutex);
 		battle = 2;
+	}
+	{
+		// The battle as it starts, for the trainer's foresight labels (records.py): the decision that led here (the
+		// last record before it: a MOVE, or the answer that agreed to fight), both sides' armies and heroes
+		std::scoped_lock lock(recordsMutex);
+		battleNode = JsonNode();
+		battleNode["serial"].Integer() = recordSerial;
+		battleNode["day"].Integer() = cb->getDate(Date::DAY);
+		battleNode["side"].Integer() = side == BattleSide::ATTACKER ? 0 : 1;
+		battleNode["armies"].Vector() = {battleStacks(army1), battleStacks(army2)};
+		battleNode["heroes"].Vector() = {battleHero(hero1), battleHero(hero2)};
+		battleOpen = true;
 	}
 	CAdventureAI::battleStart(battleID, army1, army2, tile, hero1, hero2, side, replayAllowed);
 }
@@ -325,6 +388,27 @@ void AlphaMapAI::battleEnd(const BattleID & battleID, const BattleResult * br, Q
 	{
 		std::scoped_lock lock(statusMutex);
 		battle = 3;
+	}
+	{
+		std::scoped_lock lock(recordsMutex);
+		if(battleOpen && br)
+		{
+			battleNode["result"].Integer() = static_cast<int>(br->result); // EBattleResult: normal, escape, surrender
+			battleNode["winner"].Integer() = static_cast<int>(br->winner); // 0 attacker, 1 defender, 2 a draw
+			battleNode["casualties"].Vector();
+			battleNode["exp"].Vector();
+			for(const auto battleSide : {BattleSide::ATTACKER, BattleSide::DEFENDER})
+			{
+				JsonNode lost;
+				lost.Vector();
+				for(const auto & [creature, count] : br->casualties[battleSide])
+					lost.Vector().push_back(battlePair(creature.getNum(), count));
+				battleNode["casualties"].Vector().push_back(lost);
+				battleNode["exp"].Vector().push_back(battleNumber(br->exp[battleSide]));
+			}
+			battles.push_back(battleNode.toString());
+		}
+		battleOpen = false;
 	}
 	CAdventureAI::battleEnd(battleID, br, queryID);
 }
@@ -551,11 +635,13 @@ void AlphaMapAI::sendRecords(bool final)
 	if(recordSocket.empty())
 		return;
 	std::vector<Record> pending;
+	std::vector<std::string> fought;
 	{
 		std::scoped_lock lock(recordsMutex);
 		if(final && done)
 			return; // sent already
 		pending.swap(records);
+		fought.swap(battles);
 		done = done || final;
 	}
 	const auto color = boost::to_upper_copy(playerID.toString());
@@ -619,6 +705,8 @@ void AlphaMapAI::sendRecords(bool final)
 			}
 			sendToRecordServer(recordSocket, gameKey + ":" + color + "#" + std::to_string(recordsSent++), payload);
 		}
+		for(const auto & battleJson : fought) // (after the records: the decisions they point to are in)
+			sendToRecordServer(recordSocket, gameKey + ":" + color + ":battle#" + std::to_string(battlesSent++), battleJson);
 		if(final)
 		{
 			const auto summary = "{\"errors\": " + std::to_string(errors) + ", \"failed_actions\": " + std::to_string(failedActions) + "}";

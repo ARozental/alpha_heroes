@@ -5,6 +5,7 @@
 
 #include "lib/callback/CAdventureAI.h"
 #include "lib/int3.h"
+#include "lib/json/JsonNode.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -112,6 +113,13 @@ class AlphaMapAI : public CAdventureAI
 	std::mutex recordsMutex;
 	std::vector<Record> records;
 	uint64_t recordSerial = 0;
+	// The battles our heroes fight, for the trainer's foresight labels (campaign_model/records.py): at battleStart both
+	// sides' armies and heroes, keyed to the decision that led there (the record serial before it); at battleEnd the
+	// outcome and casualties; sent with the records
+	JsonNode battleNode;
+	bool battleOpen = false;
+	std::vector<std::string> battles;
+	uint64_t battlesSent = 0;
 	int recordsSent = 0;
 	int day = 0;
 	int decisionsToday = 0;
@@ -186,6 +194,7 @@ private:
 	void encodeTowns(Decision & decision);
 	void encodeWindows(Decision & decision, PathfinderCache & paths);
 	void encodeMap(Decision & decision, const std::vector<int3> & ours);
+	void encodeTiles(Decision & decision);
 	void dropFutile(Decision & decision);
 	void encodeTurnActions(Decision & decision, PathfinderCache & paths);
 	void encodeArmyMoves(Decision & decision, const std::vector<std::pair<int, int>> & pairs);

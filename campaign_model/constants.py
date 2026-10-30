@@ -8,7 +8,7 @@ Every decision is one of two families:
 """
 from enum import IntEnum
 
-SCHEMA_VERSION = 8  # 8: heroes' luck and morale with their parts until the next battle (h_luck, h_morale, h_battle_*), the spells of heroes for hire (g_tavern_spells); 7: what a hero for hire brings (g_tavern_exp, g_tavern_army_*, g_tavern_artifacts); 6: build_short (buildable but for resources); 5: every object we see (MAP_OBJECTS 8192), no g_objects (torch counts them); 4: RECRUIT's destination, TRAVEL's days, our previous decision (g_last_*); 3: the whole map (m_* objects, g_tiles, g_objects), TRAVEL, g_object_income, h_spell_cost; 2: counts as a human sees them
+SCHEMA_VERSION = 9  # 9: the whole map tile by tile (tile_*, MAP_TILES a side), for the model's map CNN (docs/campaign_model_v2_draft.md); 8: heroes' luck and morale with their parts until the next battle (h_luck, h_morale, h_battle_*), the spells of heroes for hire (g_tavern_spells); 7: what a hero for hire brings (g_tavern_exp, g_tavern_army_*, g_tavern_artifacts); 6: build_short (buildable but for resources); 5: every object we see (MAP_OBJECTS 8192), no g_objects (torch counts them); 4: RECRUIT's destination, TRAVEL's days, our previous decision (g_last_*); 3: the whole map (m_* objects, g_tiles, g_objects), TRAVEL, g_object_income, h_spell_cost; 2: counts as a human sees them
 
 N_RESOURCES = 7  # wood, mercury, ore, sulfur, crystal, gems, gold (VCMI's order)
 
@@ -45,6 +45,7 @@ N_OPTIONS = 8  # answers to an engine question
 MAP_OBJECTS = 8192  # every object on revealed tiles (VCMI's getAllVisitableObjs), nearest first: a 144 x 144 two-level map has 3,000-6,000
 MAP_GRID = 36  # blocks per side of each level; a block is ceil(max(width, height) / MAP_GRID) tiles on a side
 MAP_LEVELS = 2  # surface and underground
+MAP_TILES = 36  # the whole map's tiles (tile_*), this many a side: every map played so far (config.sizes); a bigger map needs this raised (the model's map encoder takes any size), its tiles past it are left out (an error, never silent)
 OWNED_STACKS = 16  # stacks listed of our other owned armies (mine garrisons, ...) and of our dwellings outside towns
 TRAVEL_GRID = MAP_GRID // 2  # TRAVEL's areas: blocks of the map encoder's middle level, 18 x 18 a level (2 tiles a side on 36 x 36 maps, 8 on 144 x 144)
 

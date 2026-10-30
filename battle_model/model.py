@@ -5,6 +5,8 @@ heads), built on features.py: the game's own rules, computed exactly, as bounded
 	  facts    = facts(x)             features.py, no parameters (training computes them once per decision and epoch)
 	  tokens   = tokenizers(...)      one token for the battle, each hero, each unit, each hex
 	  tokens   = trunk(tokens)        attention over all of them, knowing ally from enemy
+	  foresight = Foresight(tokens)   what happens before our next decision (training only), its hidden states joined
+	                                  into the unit and hex tokens, then a nonlinear layer
 	  context  = Context(tokens)      the battle, the acting unit, our hero, both sides summed, each side's strength
 	  logits   = ActionHeads(...)     every choice scored (below); values = ValueHeads(context)
 
@@ -37,6 +39,16 @@ What the model must learn first is made easy to learn:
     target gets a value prior, VALUE_PRIOR_LOGITS x gain x tanh(its engine value / VALUE_PRIOR_SCALE), which reaches its
     action type through the best follow-up; waiting, defending and moving get none. A gain per kind is learned within
     x1/5..x5 from 1: the priors help, they do not decide (a shooter may still learn to run).
+
+  - What the enemy will do (2026-10-30). Our own action's effect is the engine's to compute (the attack values); the
+    reply before our next decision is not. Foresight predicts it from each unit's and hex's token: whether the unit
+    dies, the share of its health it loses and of the other side's it deals, and whether an enemy unit will stand on the
+    hex. Its predictions are trained by their own losses (losses.foresight_loss) and never used; their small hidden
+    states join the tokens the heads read (from 0), so the losses shape what the policy sees.
+  - Who acts. Each pointer's query also gets the acting unit's own token straight (from 0), not only through the
+    context, which is wider than before (2026-10-30: CONTEXT_HIDDEN; dim // 2 squeezed 276 numbers through 32).
+  Every part added since a checkpoint was saved starts where it leaves the model's function unchanged
+  (BattleModel.load_state_dict): an older checkpoint loads and plays exactly as before.
 
 Each token is a gated MLP (SwiGLU) over [its embeddings summed, its numbers], then RMSNorm; the trunk is pre-norm
 attention blocks with RMSNorm and SwiGLU. A choice's logit is as in v2 (ActionHeads): a pointer score (the context's
@@ -71,7 +83,7 @@ from .constants import (
 	ActionType,
 )
 from .reward import RewardConfig
-from .layers import EMBEDDING_STD, ActionScore, ValueHeads, best_of, masked_log_softmax, small_embedding, vocab_index
+from .layers import EMBEDDING_STD, ActionScore, ValueHeads, best_of, masked_log_softmax, small_embedding, vocab_index, zero_output
 
 __all__ = ["BattleModel", "best_of", "build_model"]
 
@@ -402,6 +414,63 @@ class Trunk(nn.Module):
 		return tokens[:, 0], tokens[:, 1 : 1 + N_SIDES], tokens[:, 1 + N_SIDES : units_end], tokens[:, -N_HEXES:]
 
 
+# The context's hidden width, in units of dim (2026-10-30: dim // 2, 32, held the battle, the acting unit, our hero, both
+# sides and the strengths, 276 numbers, for every query and value head)
+CONTEXT_HIDDEN = 2
+
+
+def widen_swiglu(state_dict, prefix, module):
+	"""A narrower SwiGLU's weights (an older checkpoint's) into module, the same function: its hidden units keep their
+	places (up's half, gate's half), the new ones start with their outputs at 0 (down's new columns) and learn from
+	there."""
+	key = prefix + "up.weight"
+	if key not in state_dict:
+		return
+	old, new = state_dict[key].shape[0] // 2, module.up.weight.shape[0] // 2
+	if old >= new:
+		return
+	for name in ("weight", "bias"):
+		saved = state_dict[prefix + "up." + name]
+		fresh = getattr(module.up, name).detach().clone().to(saved.device, saved.dtype)
+		fresh[:old], fresh[new : new + old] = saved[:old], saved[old:]
+		state_dict[prefix + "up." + name] = fresh
+	saved = state_dict[prefix + "down.weight"]
+	fresh = torch.zeros(module.down.weight.shape, device=saved.device, dtype=saved.dtype)
+	fresh[:, :old] = saved
+	state_dict[prefix + "down.weight"] = fresh
+
+
+class Foresight(nn.Module):
+	"""What happens before our next decision, from the trunk's tokens (model docstring, "What the enemy will do"): per
+	unit, the logits of UNIT_TARGETS; per hex, of an enemy unit standing on it then. The predictions are for their loss
+	only. Each unit's and hex's hidden state (UNIT_HIDDEN, HEX_HIDDEN wide) joins its token (join_*, from 0), and a gated
+	MLP over the joined token adds to it (after_*, from 0): a nonlinearity between the foresight and every head."""
+
+	UNIT_TARGETS = ("dies", "lost", "dealt")  # it dies; the share of its health it loses; of the other side's it deals
+	UNIT_HIDDEN, HEX_HIDDEN = 16, 8
+
+	def __init__(self, dim):
+		super().__init__()
+		self.unit = SwiGLU(dim, dim // 2, self.UNIT_HIDDEN)
+		self.unit_out = nn.Linear(self.UNIT_HIDDEN, len(self.UNIT_TARGETS))
+		self.hex = SwiGLU(dim, dim // 4, self.HEX_HIDDEN)
+		self.hex_out = nn.Linear(self.HEX_HIDDEN, 1)
+		self.join_unit, self.join_hex = zero_output(nn.Linear(self.UNIT_HIDDEN, dim)), zero_output(nn.Linear(self.HEX_HIDDEN, dim))
+		self.after_unit, self.after_hex = SwiGLU(dim, dim // 2, dim), SwiGLU(dim, dim // 4, dim)
+		self.unit_norm, self.hex_norm = RMSNorm(dim), RMSNorm(dim)
+		for layer in (self.after_unit.down, self.after_hex.down):
+			zero_output(layer)
+
+	def forward(self, units, hexes):
+		"""(units, hexes) with the foresight joined, and its logits {"foresight_unit": [B, U, 3], "foresight_hex": [B, H]}."""
+		unit_hidden, hex_hidden = self.unit(units), self.hex(hexes)
+		units = units + self.join_unit(unit_hidden)
+		units = units + self.after_unit(self.unit_norm(units))
+		hexes = hexes + self.join_hex(hex_hidden)
+		hexes = hexes + self.after_hex(self.hex_norm(hexes))
+		return units, hexes, {"foresight_unit": self.unit_out(unit_hidden), "foresight_hex": self.hex_out(hex_hidden).squeeze(-1)}
+
+
 class Context(nn.Module):
 	"""The decision's context, through a gated MLP: the battle's token, the acting unit's and our hero's, the mean of
 	the living units' (its signed half: ours minus theirs), and our share of each side's strength.
@@ -416,8 +485,12 @@ class Context(nn.Module):
 		self.factor = nn.Linear(dim, 2 * strengths)
 		nn.init.zeros_(self.factor.weight)
 		nn.init.zeros_(self.factor.bias)
-		self.mlp = SwiGLU(4 * dim + 2 * strengths + len(F.STRENGTH_VARIANTS), dim // 2, dim)
+		self.mlp = SwiGLU(4 * dim + 2 * strengths + len(F.STRENGTH_VARIANTS), CONTEXT_HIDDEN * dim, dim)
 		self.norm = RMSNorm(dim)
+
+	def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+		widen_swiglu(state_dict, prefix + "mlp.", self.mlp)  # (a checkpoint from before CONTEXT_HIDDEN)
+		super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
 	def forward(self, b, glob, heroes, units, strength):
 		living = b.units["alive"].float()[..., None]
@@ -488,6 +561,7 @@ class ActionHeads(nn.Module):
 		self.spell_query = small_embedding(N_SPELLS, dim)
 		self.creature_spell_query = small_embedding(EFFECT_VOCAB + 1, dim)  # by the acting unit's spell
 		self.queries = nn.ModuleDict({name: nn.Linear(dim, dim) for name in self.POINTERS})
+		self.actor_queries = nn.ModuleDict({name: zero_output(nn.Linear(dim, dim)) for name in self.POINTERS})  # the acting unit's own token, from 0
 		self.keys = nn.ModuleDict({name: nn.Linear(dim, dim) for name in self.KEYS})
 		# Spell targets: three features each, at up to 70 spells x 187 hexes, so one weight per feature (the pointer score
 		# is their learned nonlinear part)
@@ -547,9 +621,10 @@ class ActionHeads(nn.Module):
 			out[head] = torch.cat([f[..., :best], versus[..., None], f[..., best + 1 :]], dim=-1)
 		return out
 
-	def forward(self, context, units, hexes, actions, x, strength, outcomes, ratios):
+	def forward(self, context, units, hexes, actions, x, strength, outcomes, ratios, acting):
+		"""acting [B, d]: the acting unit's token."""
 		scale = 1.0 / math.sqrt(context.shape[-1])
-		q = {name: layer(context) for name, layer in self.queries.items()}
+		q = {name: layer(context) + self.actor_queries[name](acting) for name, layer in self.queries.items()}
 		k = self.keys
 		point = lambda query, items, key: torch.einsum("bd,bnd->bn", query, k[key](items)) * scale
 		actions = self.spell_actions(actions, x)
@@ -623,6 +698,7 @@ class BattleModel(nn.Module):
 		self.events = EventTokens(dim)
 		self.hexes = HexTokens(dim)
 		self.trunk = Trunk(dim, layers, heads)
+		self.foresight = Foresight(dim)
 		self.context = Context(dim)
 		self.strength = Strength()
 		self.actions = ActionHeads(dim)
@@ -633,6 +709,19 @@ class BattleModel(nn.Module):
 		with torch.no_grad():
 			self.value_strength.weight.zero_()
 			self.value_strength.weight[-1, F.STRENGTH_VARIANTS.index("all")] = 0.5
+
+	# Parts added since a checkpoint was saved: loaded from an older one, they keep this model's own initial values, which
+	# leave its function unchanged (zero outputs: Foresight's joins and after-layers, the actor queries)
+	ADDED = ("foresight.", "actions.actor_queries.")
+
+	def load_state_dict(self, state_dict, strict=True, assign=False):
+		own = self.state_dict()
+		missing = [key for key in own if key.startswith(self.ADDED) and key not in state_dict]
+		if missing:
+			state_dict = dict(state_dict)
+			for key in missing:
+				state_dict[key] = own[key]
+		return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
 	def tables(self):
 		return {name[len("table_"):]: buffer for name, buffer in self.named_buffers() if name.startswith("table_")}
@@ -665,11 +754,14 @@ class BattleModel(nn.Module):
 		units, unit_team = self.units(b, facts)
 		events, event_team = self.events(b, units, heroes)
 		glob, heroes, units, hexes = self.trunk(self.battle(b, facts), heroes, units, self.hexes(b, facts), hero_team, unit_team, x["h_present"] != 0, x["u_present"] != 0, events, event_team, x["e_present"] != 0)
+		units, hexes, foresight = self.foresight(units, hexes)
 		strength = self.strength(facts["strength"])
 		context = self.context(b, glob, heroes, units, strength)
 		actions = F.action_features(b, facts["melee"], facts["shot"], facts["maps"], facts["can_attack"], facts["battle"])
 		actions.update({k.split(":", 1)[1]: v for k, v in facts.items() if k.startswith("spell:")})
-		return {**self.actions(context, units, hexes, actions, x, strength, facts["outcomes"], facts["strength"]), **self.values(context, self.value_strength(strength))}
+		acting = units[torch.arange(units.shape[0], device=units.device), b.acting]
+		heads = self.actions(context, units, hexes, actions, x, strength, facts["outcomes"], facts["strength"], acting)
+		return {**heads, **self.values(context, self.value_strength(strength)), **foresight}  # (foresight: training only)
 
 	def set_rule_weights(self, head, **weights):
 		"""Set a head's linear feature weights by name, e.g. set_rule_weights("melee_target", wipe_chance=2.0)."""

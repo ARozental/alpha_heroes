@@ -57,6 +57,20 @@ std::pair<int, bool> seenCount(const CGObjectInstance * monster, const CGHeroIns
 	return {static_cast<int>(stack->getQuantityID()), false};
 }
 
+/// The object a map tile shows for no hero in particular (the tile grid's): its top visitable object other than a hero
+/// (heroes and towns come in as their tokens), else what blocks it
+const CGObjectInstance * topNonHero(const CCallback & cb, const int3 & pos)
+{
+	auto visitable = cb.getVisitableObjs(pos, false);
+	for(auto it = visitable.rbegin(); it != visitable.rend(); ++it)
+		if((*it)->ID != Obj::HERO)
+			return *it;
+	for(const auto * obj : cb.getBlockingObjs(pos))
+		if(obj->ID != Obj::HERO)
+			return obj;
+	return nullptr;
+}
+
 const CGObjectInstance * topObject(const CCallback & cb, const int3 & pos, const CGObjectInstance * except)
 {
 	auto visitable = cb.getVisitableObjs(pos, false);
@@ -151,6 +165,7 @@ Decision AlphaMapAI::encode(DecisionKind kind, ObjectInstanceID exchangeFirst, O
 	encodeHeroes(decision, paths);
 	encodeWindows(decision, paths);
 	encodeMap(decision, ours);
+	encodeTiles(decision);
 	if(kind == DecisionKind::TURN)
 		encodeTurnActions(decision, paths);
 	if(kind == DecisionKind::EXCHANGE)
@@ -617,6 +632,63 @@ void AlphaMapAI::encodeMap(Decision & decision, const std::vector<int3> & ours)
 		in.at(In::m_flags, i) = flags;
 		in.at(In::m_visitors, i) = visitors;
 	}
+}
+
+void AlphaMapAI::encodeTiles(Decision & decision)
+{
+	// The whole map tile by tile (MAP_TILES a side, schema 9): as a window's tiles but for no hero in particular, every
+	// hero reading the same; a monster's count exact when any of our heroes' Visions reach it
+	auto & in = decision.inputs;
+	const auto size = cb->getMapSize();
+	if(size.x > MAP_TILES || size.y > MAP_TILES)
+	{
+		logAi->error("AlphaMapAI %s: a %dx%d map, MAP_TILES is %d: the tiles past it are left out", playerID.toString(), size.x, size.y, MAP_TILES);
+		++errors;
+	}
+	std::vector<const CGHeroInstance *> heroes;
+	for(int h = 0; h < OWN_HEROES; ++h)
+		if(decision.heroes[h] != ObjectInstanceID())
+			if(const auto * hero = cb->getHero(decision.heroes[h]))
+				heroes.push_back(hero);
+	for(int z = 0; z < std::min(size.z, MAP_LEVELS); ++z)
+		for(int y = 0; y < std::min(size.y, MAP_TILES); ++y)
+			for(int x = 0; x < std::min(size.x, MAP_TILES); ++x)
+			{
+				const int3 pos(x, y, z);
+				int64_t flags = TILE_ON_MAP;
+				if(!cb->isVisible(pos))
+				{
+					in.at(In::tile_flags, z, y, x) = flags;
+					continue;
+				}
+				flags |= TILE_REVEALED;
+				const auto * tile = cb->getTile(pos, false);
+				in.at(In::tile_terrain, z, y, x) = tile->getTerrainID().getNum();
+				in.at(In::tile_road, z, y, x) = tile->getRoadID().getNum();
+				flags |= tile->isWater() ? TILE_WATER : 0;
+				flags |= tile->blocked() ? TILE_BLOCKED : 0;
+				flags |= tile->visitable() ? TILE_VISITABLE : 0;
+				flags |= cb->guardingCreaturePosition(pos) != int3(-1, -1, -1) ? TILE_GUARDED : 0;
+				if(const auto * obj = topNonHero(*cb, pos))
+				{
+					in.at(In::tile_object, z, y, x) = obj->ID.getNum();
+					in.at(In::tile_subtype, z, y, x) = obj->subID.getNum();
+					in.at(In::tile_owner, z, y, x) = owner(obj->tempOwner);
+					flags |= obj->wasVisited(playerID) ? TILE_VISITED_BY_PLAYER : 0;
+					if(obj->ID == Obj::MONSTER)
+						if(const auto * stack = dynamic_cast<const CArmedInstance *>(obj)->getStackPtr(SlotID(0)))
+						{
+							auto [count, exact] = seenCount(obj, nullptr);
+							for(const auto * hero : heroes)
+								if(!exact)
+									std::tie(count, exact) = seenCount(obj, hero);
+							in.at(In::tile_creature, z, y, x) = stack->getId().getNum();
+							in.at(In::tile_count, z, y, x) = count;
+							flags |= exact ? TILE_EXACT_COUNT : 0;
+						}
+				}
+				in.at(In::tile_flags, z, y, x) = flags;
+			}
 }
 
 void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)
