@@ -78,7 +78,7 @@ while kill -0 "$PID" 2>/dev/null; do
 		START=$(( START + GAP )); LAST_LOG_CHANGE=$(( LAST_LOG_CHANGE + GAP ))
 	fi
 	LAST_TICK=$SECONDS
-	LOG_SIZE=$(stat -f %z "$RUN_DIR/logs/VCMI_Client_log.txt" 2>/dev/null || echo 0)
+	LOG_SIZE=$(stat -c %s "$RUN_DIR/logs/VCMI_Client_log.txt" 2>/dev/null || stat -f %z "$RUN_DIR/logs/VCMI_Client_log.txt" 2>/dev/null || echo 0)  # GNU, then BSD stat
 	if [ "$LOG_SIZE" != "$LAST_LOG_SIZE" ]; then
 		LAST_LOG_SIZE=$LOG_SIZE
 		LAST_LOG_CHANGE=$SECONDS

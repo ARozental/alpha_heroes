@@ -21,12 +21,14 @@ import queue
 import socket
 import struct
 import threading
+import time
 from dataclasses import dataclass
 
 import numpy as np
 
 ERROR = 0xFFFFFFFF
 MAX_BATCH = 256  # decisions per forward pass
+MODEL_WAIT = 5.0  # seconds a request for a model not served yet waits for its weights (apply_control)
 
 
 @dataclass(frozen=True)
@@ -126,10 +128,17 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 		finally:
 			conn.close()
 
-	def apply_control():
+	def apply_control(wait_for=None):
+		"""Applies the trainer's queued commands. wait_for: a model name not served yet, waited for up to MODEL_WAIT
+		seconds: set_model returns once the pipe has taken the weights, before control_reader has unpickled them, and a
+		request sent right after it found no model (every time on Linux)."""
+		deadline = time.monotonic() + MODEL_WAIT
 		while True:
 			try:
-				command = commands.get_nowait()
+				if wait_for is None or wait_for in models:
+					command = commands.get_nowait()
+				else:
+					command = commands.get(timeout=max(0.0, deadline - time.monotonic()))
 			except queue.Empty:
 				return
 			if command[0] == "set":
@@ -173,6 +182,8 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 				by_name.setdefault(item[1], []).append(item)
 			for name, batch in by_name.items():
 				try:
+					if name not in models:
+						apply_control(wait_for=name)
 					if name not in models:
 						raise KeyError(f"no model named {name!r} (the server has {sorted(models)})")
 					replies = [(conn, struct.pack("<I", models[name][1]), done) for conn, _, decisions, _, done in batch if decisions == 0]
