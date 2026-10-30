@@ -23,6 +23,7 @@
 #include "lib/spells/Problem.h"
 #include "lib/mapObjects/CGHeroInstance.h"
 #include "lib/spells/CSpellHandler.h"
+#include "lib/spells/BattleSpellMechanics.h"
 #include "lib/spells/ISpellMechanics.h"
 #include "lib/spells/effects/UnitEffect.h"
 
@@ -272,9 +273,21 @@ void encodeUnitMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, co
 // would hit the living one), Resurrection and Animate Dead cannot revive a corpse any unit stands on
 // (Heal::isValidTarget), and Sacrifice can still revive one an enemy stands on but not one under our own living unit
 // (that one is picked instead).
-bool castAffects(const spells::Mechanics & mechanics, const battle::Target & target, const CStack * unit)
+/// mechanics.canBeCastAt(target), given its canBeCast (`castable`, asked once for all the targets): canBeCastAt asks
+/// canBeCast again for each target, and it checks the whole battlefield (95% of canBeCastAt's time, ~18% of a battle
+/// client's CPU). A battle spell's mechanics checks the target alone; any other mechanics the whole
+bool canCastAt(const spells::Mechanics & mechanics, bool castable, const battle::Target & target)
 {
-	if(!mechanics.canBeCastAt(target))
+	if(!castable)
+		return false;
+	if(const auto * battleSpell = dynamic_cast<const spells::BattleSpellMechanics *>(&mechanics))
+		return battleSpell->canBeCastAtIfCastable(target);
+	return mechanics.canBeCastAt(target);
+}
+
+bool castAffects(const spells::Mechanics & mechanics, bool castable, const battle::Target & target, const CStack * unit)
+{
+	if(!canCastAt(mechanics, castable, target))
 		return false;
 	const auto affected = mechanics.getAffectedStacks(target);
 	return std::find(affected.begin(), affected.end(), unit) != affected.end();
@@ -360,18 +373,20 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 			continue; // shape the contract does not describe
 
 		e.spellTargetKind[s] = aims[0] == spells::AimType::LOCATION ? TargetKind::HEX : aims[0] == spells::AimType::CREATURE ? TargetKind::UNIT : TargetKind::NONE;
+		// The server's own check for spells without a destination, and the part of canBeCastAt that is the same for
+		// every destination (castAffects)
+		spells::detail::ProblemImpl problem;
+		const bool castable = mechanics->canBeCast(problem);
 		if(aims[0] == spells::AimType::NO_TARGET)
 		{
-			// The server's own check for spells without a destination
-			spells::detail::ProblemImpl problem;
-			if(mechanics->canBeCast(problem))
+			if(castable)
 				t.set(In::m_spell, s, 1);
 			continue;
 		}
 		if(aims[0] == spells::AimType::LOCATION)
 		{
 			for(int h = 0; h < N_HEXES; ++h)
-				if(mechanics->canBeCastAt({battle::Destination(BattleHex(h))}))
+				if(canCastAt(*mechanics, castable, {battle::Destination(BattleHex(h))}))
 				{
 					t.set(In::m_spell_hex, s, h, 1);
 					t.set(In::s_hex_value, s, h, castValue(battle, *spell, *mechanics, {battle::Destination(BattleHex(h))}));
@@ -382,7 +397,7 @@ void encodeSpellMasks(EncodedBattle & e, const CPlayerBattleCallback & battle, c
 		}
 		else if(aims[0] == spells::AimType::CREATURE)
 		{
-			auto affects = [&](const battle::Target & target, const CStack * unit) { return castAffects(*mechanics, target, unit); };
+			auto affects = [&](const battle::Target & target, const CStack * unit) { return castAffects(*mechanics, castable, target, unit); };
 			for(int u = 0; u < MAX_UNITS; ++u)
 			{
 				const CStack * unit = e.units[u];
@@ -453,11 +468,13 @@ bool encodeCreatureSpellTargets(EncodedBattle & e, const CPlayerBattleCallback &
 	const auto aims = mechanics->getTargetTypes();
 	if(aims.size() != 1)
 		return false;
+	spells::detail::ProblemImpl problem;
+	const bool castable = mechanics->canBeCast(problem); // once for every target (castAffects)
 	bool any = false;
 	if(aims[0] == spells::AimType::LOCATION)
 	{
 		for(int h = 0; h < N_HEXES; ++h)
-			if(mechanics->canBeCastAt({battle::Destination(BattleHex(h))}))
+			if(canCastAt(*mechanics, castable, {battle::Destination(BattleHex(h))}))
 			{
 				t.set(In::m_creature_spell_hex, h, 1);
 				t.set(In::c_hex_value, h, castValue(battle, *spell, *mechanics, {battle::Destination(BattleHex(h))}));
@@ -470,7 +487,7 @@ bool encodeCreatureSpellTargets(EncodedBattle & e, const CPlayerBattleCallback &
 	else if(aims[0] == spells::AimType::CREATURE)
 	{
 		for(int u = 0; u < MAX_UNITS; ++u)
-			if(e.units[u] && castAffects(*mechanics, {battle::Destination(e.units[u])}, e.units[u]))
+			if(e.units[u] && castAffects(*mechanics, castable, {battle::Destination(e.units[u])}, e.units[u]))
 			{
 				t.set(In::m_creature_spell_unit, u, 1);
 				t.set(In::c_unit_value, u, castValue(battle, *spell, *mechanics, {battle::Destination(e.units[u])}));

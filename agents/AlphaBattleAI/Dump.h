@@ -23,8 +23,10 @@ class BattleRecord
 {
 	std::string events;
 	std::string actions;
-	std::vector<std::string> inputs; // per input tensor: the raw values of every decision, concatenated
-	std::vector<std::string> outputs;
+	/// Per decision: its tensors as the record sends them, the inputs (int32, or a byte for a bool) and then the outputs
+	/// (float32), back to back; serialize copies each tensor's bytes of every decision once
+	std::vector<std::string> decisionBytes;
+	std::vector<size_t> tensorBytes; // per input and then output tensor: its bytes in a decision (the schema's shape)
 	int decisions = 0;
 
 public:
@@ -33,6 +35,7 @@ public:
 	void addDecision(const AlphaSchema::InputTensors & in, const AlphaSchema::OutputTensors & out, const ChosenAction & action);
 	int size() const { return decisions; } // decisions so far
 	std::string serialize() const;
+	void serializeInto(std::string & out) const; // serialize, appended to out
 	/// Connects to socketPath and sends the key (u32 length + bytes) and then serialize(); throws on failure
 	void send(const std::string & socketPath, const std::string & key) const;
 };
