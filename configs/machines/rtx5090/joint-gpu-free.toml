@@ -1,0 +1,27 @@
+# Battle and campaign models together (campaign_model.joint), the GPU to ourselves (no Zonkey run).
+#   .venv/bin/python -m campaign_model.joint --run NAME --machine configs/machines/rtx5090/joint-gpu-free.toml
+#
+# Machine: RTX 5090 32 GB (Windows WDDM driver 610.88; torch 2.14.1+cu130), AMD Ryzen 9 9900X 12 cores / 24 threads,
+#   31 GB RAM; Windows 11 + WSL2 Ubuntu 26.04 capped at 20 GB RAM + 8 GB swap (C:\Users\Owner\.wslconfig), repo on
+#   WSL's ext4.
+# Case: nothing else on the GPU; WSL's ~19 GB for us.
+#
+# NOT MEASURED YET (2026-10-29: Zonkey was training) - an estimate from joint-gpu-shared.toml's measurements:
+#   - RAM is the limit: the Mac's 6 games and 8 actors peaked at 16.7 GB here (beside Zonkey's ~3 GB: killed); alone
+#     that is about all of WSL's 20 GB with nothing left for the hourly evals. 4 games and 8 actors should leave ~3 GB.
+#   - campaign updates need 8,192 decisions of >= 4 games: fewer than 4 games at once starves the campaign learner.
+#   - inference on the GPU (a few ms alone, to check) leaves the cores to the games; the campaign's own inference
+#     server is always on the CPU (campaign_model/learner.py).
+#   - More games: give WSL more memory (.wslconfig: memory=26GB, then `wsl --shutdown`; that stops every WSL process,
+#     Zonkey's too), then try the Mac's 6 games and 8 actors.
+# To measure: runtime/measure.sh joint-free campaign_model.joint --run measure-joint-free --battle-from <checkpoint>
+#   --machine <this file>, and runtime/memwatch.sh alpha-measure; note update seconds and peak memory here.
+# generated_actors: the recipe's (4 since the campaign focus, 2026-10-29; its 8 campaign games are more than the 4 here).
+eval_workers = 12
+inference_device = "cuda"
+inference_processes = 1
+buffer_decisions = 6000
+
+[campaign]
+games = 4
+inference_processes = 2

@@ -1,0 +1,21 @@
+# Battle model alone (battle_model.train, actors=true), the GPU to ourselves (no Zonkey run).
+#   .venv/bin/python -m battle_model.train --run NAME --machine configs/machines/rtx5090/battle-gpu-free.toml --set <recipe>
+#
+# Machine: RTX 5090 32 GB (Windows WDDM driver 610.88; torch 2.14.1+cu130), AMD Ryzen 9 9900X 12 cores / 24 threads,
+#   31 GB RAM; Windows 11 + WSL2 Ubuntu 26.04 capped at 20 GB RAM + 8 GB swap (C:\Users\Owner\.wslconfig), repo on
+#   WSL's ext4.
+# Case: nothing else on the GPU; WSL's ~19 GB for us.
+#
+# NOT MEASURED YET (2026-10-29: Zonkey was training) - an estimate from battle-gpu-shared.toml's measurements:
+#   - with Zonkey, the learner took 13-16 s an update on the shared GPU (the M4 took 9.4 s alone): alone it should be
+#     several times faster, and then the battles become the bottleneck: as many actors as the cores carry.
+#   - inference on the GPU: alone, one server process batches every game's requests at a few ms (to check: with
+#     Zonkey it was ~400 ms); that leaves the CPU's cores to VCMI. If the update rate disappoints, compare with
+#     inference_device = "cpu" and 6-8 processes (runtime/bench_inference.py cuda 20 / cpu 20 8).
+#   - RAM: VCMI ~0.2 GB an actor, the trainer 6-8 GB: 20 actors and 16 eval workers fit in WSL's 20 GB.
+# To measure: runtime/measure.sh battle-free battle_model.train --run measure-battle-free --machine <this file> --set
+#   <recipe>, and runtime/memwatch.sh alpha-measure; then note the update seconds, wait_seconds and peak memory here.
+generated_actors = 20
+eval_workers = 16
+inference_device = "cuda"
+inference_processes = 1

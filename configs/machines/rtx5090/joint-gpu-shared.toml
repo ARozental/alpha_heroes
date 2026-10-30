@@ -1,0 +1,27 @@
+# Battle and campaign models together (campaign_model.joint: the campaign games' battles are the battle learner's
+# real battles, real_share of each update), while the Zonkey run trains on the same GPU.
+#   .venv/bin/python -m campaign_model.joint --run NAME --machine configs/machines/rtx5090/joint-gpu-shared.toml
+#
+# Machine: RTX 5090 32 GB (Windows WDDM driver 610.88; torch 2.14.1+cu130), AMD Ryzen 9 9900X 12 cores / 24 threads,
+#   31 GB RAM; Windows 11 + WSL2 Ubuntu 26.04 capped at 20 GB RAM + 8 GB swap (C:\Users\Owner\.wslconfig), repo on
+#   WSL's ext4.
+# Case: Zonkey trains beside us: ~17.7 GB VRAM, GPU 85-95% busy, ~1.5 GB RAM resident + ~6 GB of WSL's swap.
+#
+# The limit here is WSL's 20 GB of RAM, not the GPU or the CPU. Measured 2026-10-29 (battle from lr3e-5's update 31,
+# a new campaign model):
+#   - the Mac's recipe sizes (6 games, 8 actors, 6 battle servers): killed by the kernel's OOM killer after 5 minutes
+#     (16.7 GB peak; the kernel took our trainer, oom_score_adj 200, Zonkey was untouched).
+#   - these sizes (3 games, 6 actors, 4 + 1 servers, 6,000-decision buffer): ran, but at 15.5 GB peak with 2.0 GB of
+#     WSL left: no margin for the hourly evals. Battle updates every 18-25 s (CPU inference); the campaign learner did
+#     no update in 11 minutes (6 games finished; an update takes 8,192 decisions of >= 4 games).
+#   Not recommended: run joint when Zonkey is idle (joint-gpu-free.toml), better still with WSL given more memory.
+#   If it must run beside Zonkey, start it under runtime/memwatch.sh (stops the run before the kernel has to).
+# generated_actors: the recipe's (4 since the campaign focus, 2026-10-29), measured above with 6: fewer, less memory.
+eval_workers = 8
+inference_device = "cpu"
+inference_processes = 4
+buffer_decisions = 6000
+
+[campaign]
+games = 3
+inference_processes = 1

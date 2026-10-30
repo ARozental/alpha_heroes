@@ -1,0 +1,23 @@
+# Battle model alone (battle_model.train, actors=true), while the Zonkey run trains on the same GPU.
+#   .venv/bin/python -m battle_model.train --run NAME --machine configs/machines/rtx5090/battle-gpu-shared.toml --set <recipe>
+#
+# Machine: RTX 5090 32 GB (Windows WDDM driver 610.88; torch 2.14.1+cu130), AMD Ryzen 9 9900X 12 cores / 24 threads,
+#   31 GB RAM; Windows 11 + WSL2 Ubuntu 26.04 capped at 20 GB RAM + 8 GB swap (C:\Users\Owner\.wslconfig), repo on
+#   WSL's ext4 (~/projects/alpha_heroes: /mnt/c can't hold the Unix sockets).
+# Case: Zonkey trains beside us: ~17.7 GB VRAM, GPU 85-95% busy, ~1.5 GB RAM resident + ~6 GB of WSL's swap.
+#
+# Measured 2026-10-29 (run lr3e-5, updates 17-31, from scratch, the joint recipe's battle side):
+#   an update every 14-17 s: 13-16 s of training on the GPU, 0.1-0.4 s waiting for battles; ~3,230 decisions and ~57
+#   battles an update (~210 decisions/s, ~230 updates/h less the hourly eval); records 1.5 model versions old, 550-900
+#   decisions waiting in the buffer, none dropped. VRAM ~8.5 GB. RAM: trainer 5.7-8 GB, inference servers 0.55 GB each,
+#   VCMI 0.2 GB each; WSL had 7.6 GB available; CPU ~45% idle.
+#   Bottleneck: the battle learner on the shared GPU. More actors or servers only make the records older (16 actors
+#   and 8 servers: the same 15-17 s updates, records 1.8 versions old, 3.7 GB available, too little for an eval).
+#
+# Why the inference servers run on the CPU here: on the GPU shared with Zonkey a one-decision request waited ~400 ms
+# (26 decisions/s for 12 actors: updates every ~110 s, 100 s of it waiting); 4 CPU processes did 257/s at 43 ms, 8 did
+# 406/s at 32 ms (runtime/bench_inference.py). The learner needs ~220/s; 6 processes leave a margin.
+generated_actors = 12
+eval_workers = 12
+inference_device = "cpu"
+inference_processes = 6

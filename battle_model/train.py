@@ -206,6 +206,28 @@ def with_overrides(config, assignments):
 	return config
 
 
+def machine_overrides(path):
+	"""A machine config's settings (configs/machines/<machine>/<case>.toml: how many games, actors and servers this
+	machine runs, never what is learned) as with_overrides assignments: top-level keys set TrainConfig fields, a table its
+	sub-config ([campaign] -> campaign.NAME)."""
+	import tomllib
+
+	def text(value):
+		if isinstance(value, bool):
+			return str(value).lower()
+		if isinstance(value, list):
+			return ",".join(map(str, value))
+		return str(value)
+
+	assignments = []
+	for key, value in tomllib.loads(Path(path).read_text()).items():
+		if isinstance(value, dict):
+			assignments += [f"{key}.{name}={text(item)}" for name, item in value.items()]
+		else:
+			assignments.append(f"{key}={text(value)}")
+	return assignments
+
+
 TRAIN_ROOT = ROOT / "runtime" / "train"
 
 
@@ -1254,12 +1276,14 @@ def main():
 	parser.add_argument("--run", default=TrainConfig.run)
 	parser.add_argument("--resume", action="store_true")
 	parser.add_argument("--follow", metavar="RUN", help="mirror a running run's progress.csv into TensorBoard instead of training")
+	parser.add_argument("--machine", metavar="TOML", help="this machine's sizes (configs/machines/<machine>/<case>.toml), applied before --set")
 	parser.add_argument("--set", nargs="*", default=[], metavar="NAME=VALUE", help="override TrainConfig fields; ppo.NAME, advantage.NAME, reward.NAME, campaign.NAME for the sub-configs")
 	args = parser.parse_args()
 	if args.follow:
 		follow(args.follow)
 	else:
-		train(with_overrides(TrainConfig(epochs=args.epochs, run=args.run), args.set), resume=args.resume)
+		machine = machine_overrides(args.machine) if args.machine else []
+		train(with_overrides(TrainConfig(epochs=args.epochs, run=args.run), machine + args.set), resume=args.resume)
 
 
 if __name__ == "__main__":

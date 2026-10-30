@@ -18,7 +18,7 @@ least 4 games, an evaluation against Nullkiller2 every hour (evaluate.py).
 import argparse
 import signal
 
-from battle_model.train import ROOT, TrainConfig, train, with_overrides
+from battle_model.train import ROOT, TrainConfig, machine_overrides, train, with_overrides
 
 BATTLE_FROM = ROOT / "runtime" / "saved" / "battle_joint1_02840.pt"  # joint1's 2840 (+0.076, every set positive), a read-only copy; runtime/saved/models: joint1's league snapshots up to it (no eval baselines: the reward changed with the war machines)
 RECIPE = (
@@ -50,11 +50,13 @@ def main():
 	parser.add_argument("--hours", type=float, default=0.0, help="stop after this many hours of training (0: until stopped)")
 	parser.add_argument("--resume", action="store_true")
 	parser.add_argument("--battle-from", default=str(BATTLE_FROM), help="the battle model's starting checkpoint (a new run)")
+	parser.add_argument("--machine", metavar="TOML", help="this machine's sizes (configs/machines/<machine>/joint-*.toml), applied after the recipe, before --set")
 	parser.add_argument("--set", nargs="*", default=[], metavar="NAME=VALUE", help="override TrainConfig fields after the recipe; campaign.NAME for the campaign side")
 	args = parser.parse_args()
 	# (epochs go on from the starting checkpoint's: without hours, no epoch limit)
 	config = TrainConfig(run=args.run, run_hours=args.hours, epochs=10**9, init_from=args.battle_from)
-	train(with_overrides(config, RECIPE + tuple(args.set)), resume=args.resume)
+	machine = tuple(machine_overrides(args.machine)) if args.machine else ()
+	train(with_overrides(config, RECIPE + machine + tuple(args.set)), resume=args.resume)
 
 
 if __name__ == "__main__":
