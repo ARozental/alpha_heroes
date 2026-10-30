@@ -1053,7 +1053,12 @@ class CampaignModel(nn.Module):
 		out = {}
 		offers = self.move_and_travel(x, f, out, own_heroes, cells, areas, windows, n)
 		hire_prior = self.town_actions(x, f, out, own_towns, town_levels)
-		offers["hire"] = ft.offer(hire_prior, x["hire_mask"])  # (HIRE's type gets its best legal hire's gain)
+		# HIRE's type gets its best legal hire's gain, signed: a hire that loses (a hero with a lone creature) holds HIRE
+		# back as much as a good one pushes it (an offer, clipped at 0, let a learned taste for hiring take bad hires:
+		# 10 hires, 25,000 gold, in a lost game against Nullkiller2, 2026-10-30)
+		legal = x["hire_mask"].reshape(hire_prior.shape[0], -1)
+		best = hire_prior.reshape(legal.shape).masked_fill(~legal, -1e4).amax(dim=1)
+		offers["hire"] = torch.where(legal.any(dim=1), best, torch.zeros_like(best))
 		offers["army"], offers["upgrade"] = self.army_actions(x, f, out, own_heroes, own_towns, other, hero_stacks, town_stacks, other_stacks)
 		offers["buy"], offers["trade"] = self.hero_actions(x, f, out, g, own_heroes)
 		self.question(x, f, out, g, heroes, options)
