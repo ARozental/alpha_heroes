@@ -191,3 +191,24 @@ def test_micro_batches_take_the_same_step():
 	(a, ma), (b, mb) = results
 	assert all(torch.allclose(p, q, atol=1e-6) for p, q in zip(a.parameters(), b.parameters()))
 	assert all(abs(ma[k] - mb[k]) < 1e-5 for k in ("policy", "value", "entropy", "kl", "grad_norm"))
+
+
+def test_the_fresh_value_loss_is_zero_only_for_exact_predictions():
+	"""excess_loss: a head's cross-entropy above its target's entropy, 0 exactly at the target; ppo_update reports it
+	before the update (value_fresh), with growth targets that are partly missing."""
+	from campaign_model.train import excess_loss
+
+	targets = torch.tensor([[0.0, 0.3, 1.0]])
+	exact = torch.logit(targets.clamp(1e-6, 1 - 1e-6))
+	assert float(excess_loss(exact, targets).abs().max()) < 1e-4
+	assert (excess_loss(torch.zeros(1, 3), targets) > 0).all()
+	torch.manual_seed(4)
+	model = CampaignModel(dim=32, cell_dim=16, layers=1)
+	x = random_inputs(8, seed=9)
+	decisions = decisions_for(model.eval(), x)
+	targets = np.full((8, c.N_VALUE_OFFSETS), 0.6, dtype=np.float32)
+	growth = np.full((8, c.N_VALUE_OFFSETS), np.log(50000.0), dtype=np.float32)
+	growth[6:] = np.nan
+	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
+	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, np.zeros(8, np.float32), CampaignConfig(batch_size=4, passes=1), decode=decode, growth=growth)
+	assert np.isfinite(metrics["value_fresh"]) and metrics["value_fresh"] > 0

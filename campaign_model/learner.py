@@ -59,7 +59,7 @@ from .train import make_optimizer, model_kwargs, ppo_update, usable
 TYPES = [a.name.lower() for a in c.ActionType]
 COLUMNS = [
 	"version", "epoch", "games", "decisions", "dropped_old", "unsound", "credited", "days", "players", "phi_end", "heroes", "label_mean", "price_mean",
-	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "entropy", "below_floor", "kl", "last_kl", "clip_fraction", "grad_norm", "steps", "learning_rate",
+	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "clip_fraction", "grad_norm", "steps", "learning_rate",
 	*(f"value_ev_d{k}" for k in c.VALUE_OFFSETS), *(f"head_ev_{kind}{k}" for kind in "vg" for k in c.VALUE_OFFSETS), "head_ev_vend", "no_effect", "ai_errors", "failed_actions", "game_failures", "game_maps", "dropped_games",
 	"game_seconds", "record_mb", "seconds", "gpu_mb", *(f"share_{t}" for t in TYPES), *(f"failure_{k}" for k in FAILURES), "no_effect_types", "kinds",
 ]
@@ -436,6 +436,7 @@ class CampaignLearner:
 			"price_mean": sums["price_sum"] / max(n, 1),
 			"policy_loss": metrics.get("policy", float("nan")),
 			"value_loss": metrics.get("value", float("nan")),
+			"value_loss_fresh": metrics.get("value_fresh", float("nan")),  # train.ppo_update: before the update, above the targets' entropy
 			"entropy": metrics.get("entropy", float("nan")),
 			"below_floor": metrics.get("below_floor", float("nan")),
 			"kl": metrics.get("kl", float("nan")),
@@ -464,6 +465,8 @@ class CampaignLearner:
 		}
 		with self.progress.open("a", newline="") as f:
 			csv.writer(f).writerow([round(row[k], 6) if isinstance(row[k], float) else row[k] for k in COLUMNS])
+		if row["value_loss_fresh"] == row["value_loss_fresh"]:  # the eval tab's (battle_model/train.py VALUE_LOSS_TAB)
+			self.writer.add_scalar("eval/campaign_value_loss", row["value_loss_fresh"], self.version)
 		for name in ("value_corr", "value_spread", "label_spread", "gpu_anchor_mb", "update_seconds"):
 			if metrics.get(name, float("nan")) == metrics.get(name, float("nan")):
 				self.writer.add_scalar(f"campaign/{name}", metrics[name], self.version)

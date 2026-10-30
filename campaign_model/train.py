@@ -191,6 +191,13 @@ def head_loss(logits, targets, valid, count=None):
 	return loss.sum(dim=0) / (valid.sum(dim=0) if count is None else count).clamp(min=1)
 
 
+def excess_loss(logits, targets):
+	"""Each head's cross-entropy against its soft targets above the targets' own entropy (its floor): 0 when the head
+	predicts its target exactly."""
+	floor = -(torch.special.xlogy(targets, targets) + torch.special.xlogy(1 - targets, 1 - targets))
+	return F.binary_cross_entropy_with_logits(logits, targets, reduction="none") - floor
+
+
 def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
 	growth=None, labels=None, end=None,
@@ -234,6 +241,9 @@ def ppo_update(
 	# credit's)
 	model.eval()
 	anchor, end_now, prior = torch.empty(n, device=device), torch.empty(n, device=device), torch.empty(n, device=device)
+	# The same pass measures the value loss on these decisions before the update learns from them (the user, 2026-10-29:
+	# it should go down over time): every value head weighted as the loss below weighs it, above its targets' entropy
+	fresh = {"share": torch.zeros(n, c.N_VALUE_OFFSETS, device=device), "growth": torch.zeros(n, c.N_VALUE_OFFSETS, device=device), "end": torch.zeros(n, 1, device=device)}
 	gpu_anchor_mb = 0.0
 	with torch.no_grad():
 		chunk = max(1, size // max(1, config.micro_batches))  # (no gradients, but at a whole minibatch it was the update's peak: 5.2 GB)
@@ -245,7 +255,21 @@ def ppo_update(
 			anchor[index] = logp
 			end_now[index] = torch.sigmoid(out["end_logit"].float())
 			prior[index] = 1.0 / inputs["g_players"].float().clamp(min=2)  # the share heads' start: 1 / players
+			fresh["share"][index] = excess_loss(out["value_logit"].float(), targets_t[index])
+			if growth is not None:
+				now = out["phi"].float().clamp(min=PHI_FLOOR).log().unsqueeze(-1)
+				fresh["growth"][index] = excess_loss(out["growth_logit"].float(), ((growth_t[index] - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP))
+			if end is not None:
+				fresh["end"][index] = excess_loss(out["end_logit"].float().unsqueeze(-1), end_t[index].unsqueeze(-1))
 			gpu_anchor_mb = max(gpu_anchor_mb, gpu_held(device))
+	masked = lambda x, valid: ((x * valid).sum(dim=0) / valid.sum(dim=0).clamp(min=1)).sum()
+	value_fresh, heads = masked(fresh["share"], share_valid), float(c.N_VALUE_OFFSETS)
+	if growth is not None:
+		value_fresh, heads = value_fresh + config.growth_weight * masked(fresh["growth"], growth_valid), heads + config.growth_weight * c.N_VALUE_OFFSETS
+	if end is not None:
+		value_fresh, heads = value_fresh + masked(fresh["end"], end_valid.unsqueeze(-1)), heads + 1.0
+	value_fresh = float(value_fresh) / heads
+	del fresh
 	gpu_mb = 0.0
 	if end is not None and end["weight"] > 0:  # the policy's credit moves toward the end's as V_end proves itself
 		turn = choices(decisions)["kind"] == c.DecisionKind.TURN
@@ -337,6 +361,7 @@ def ppo_update(
 		last_kl=update_kl,
 		unsound=int(unsound.sum()),
 		decisions=n,
+		value_fresh=value_fresh,
 		learning_rate=config.learning_rate * lr_scale,
 		credited=int(credited.sum()),
 		gpu_mb=gpu_mb,

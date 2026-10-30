@@ -198,3 +198,17 @@ def test_round_heads_count_by_their_weight_in_what_the_policy_maximizes():
 	assert torch.allclose(full, final + (labels[:, 2] - values[:, 2]))
 	assert torch.allclose(faded, final + 0.25 * (labels[:, 2] - values[:, 2]))
 	assert torch.allclose(gone, final)
+
+
+def test_value_excess_is_zero_only_when_every_head_predicts_its_label():
+	"""losses.value_excess: value_loss's cross-entropy above the labels' own entropy, the heads weighted as there."""
+	from battle_model.losses import PPOConfig, value_excess, value_loss
+
+	labels = torch.tensor([[-1.0, -0.2, 0.5, 1.0], [0.0, 0.0, 0.3, 0.9]])
+	exact = {"value_logit": torch.atanh(labels.clamp(-1 + 1e-6, 1 - 1e-6))}
+	assert float(value_excess(exact, labels).abs().max()) < 1e-4
+	off = {"value_logit": exact["value_logit"] + 0.5}
+	assert (value_excess(off, labels) > 0).all()
+	only_v = PPOConfig(value_head_weights=(0.0, 0.0, 0.0, 1.0))
+	floor = -(torch.special.xlogy((labels + 1) / 2, (labels + 1) / 2) + torch.special.xlogy((1 - labels) / 2, (1 - labels) / 2))[:, 3].mean()
+	assert torch.isclose(value_excess(off, labels, only_v).mean(), value_loss(off, labels, only_v)[0] - floor, atol=1e-5)

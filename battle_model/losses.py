@@ -207,6 +207,17 @@ def value_loss(out, targets, config=PPOConfig(), weight=None):
 	return (per_head * weights).sum() / weights.sum(), per_head.detach()
 
 
+def value_excess(out, targets, config=PPOConfig()):
+	"""[B] each decision's value loss (value_loss's cross-entropy, its heads weighted as there) above its labels' own
+	entropy, the cross-entropy's floor: 0 when every head predicts its label exactly. The plain cross-entropy moves
+	with how decisive the battles were (a label near 0 has an entropy near ln 2), this only with how wrong V is."""
+	p = ((targets + 1) / 2).clamp(0.0, 1.0)
+	cross = F.binary_cross_entropy_with_logits(2 * out["value_logit"], p, reduction="none")
+	floor = -(torch.special.xlogy(p, p) + torch.special.xlogy(1 - p, 1 - p))
+	weights = torch.tensor(config.value_head_weights, dtype=cross.dtype, device=cross.device)
+	return ((cross - floor) * weights).sum(dim=-1) / weights.sum()
+
+
 def policy_advantages(final_advantages, value_labels, values, config=AdvantageConfig()):
 	"""Step 5b: the advantage the policy follows, from the value heads that config.policy_heads switches on.
 

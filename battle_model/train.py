@@ -65,7 +65,7 @@ from . import generator, play, rules
 from .data import collate, credit_check, make_dataloader, summarize
 from .distributions import log_prob
 from .export import export, verify
-from .losses import AdvantageConfig, PPOConfig, ppo_loss, search_loss
+from .losses import AdvantageConfig, PPOConfig, ppo_loss, search_loss, value_excess, weighted_mean
 from .constants import N_ACTION_TYPES, ActionType
 from .model import VALUE_PRIOR_GAIN, VALUE_PRIOR_KINDS, VALUE_PRIOR_STEP, build_model
 from .trace import trace
@@ -228,7 +228,7 @@ ACTION_KINDS = ("WAIT", "DEFEND", "MOVE", "MELEE", "SHOOT", "HERO_SPELL", "CREAT
 
 COLUMNS = [
 	"epoch", "attack_reward", "attack_outcome", "defence_reward", "defence_outcome", "mean_reward", "attack_raw_reward", "defence_raw_reward", "attack_win_rate", "defence_win_rate",
-	"decisions", "rounds", "policy_loss", "value_loss", "entropy", "below_floor", "approx_kl", "clip_fraction", "signal_ratio", "weight_change",
+	"decisions", "rounds", "policy_loss", "value_loss", "value_loss_fresh", "entropy", "below_floor", "approx_kl", "clip_fraction", "signal_ratio", "weight_change",
 	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds",
 ] + [f"{side}_share_{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS] + [
 	f"{side}_{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")
@@ -239,6 +239,10 @@ COLUMNS = [
 # error. decisions: all decisions of the epoch; rounds: attack + defence battle rounds, averaged over the games.
 
 # progress.csv column -> TensorBoard tag
+# The value loss in the eval tab too (the user, 2026-10-29: it should go down over time), though it is training's: every
+# update's battles under the model as the update starts, before it trains on them, all the heads weighted as the loss
+# weights them, above the labels' own entropy (losses.value_excess: 0 = V predicts every label exactly)
+VALUE_LOSS_TAB = "eval/battle_value_loss"
 TENSORBOARD_TAGS = {
 	**{f"train_{name}": f"train_failures/{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")},
 	**{name: f"actors/{name}" for name in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow")},
@@ -253,7 +257,7 @@ TENSORBOARD_TAGS = {
 	"mean_reward": "reward/mean", "attack_reward": "reward/attack", "defence_reward": "reward/defence",
 	"attack_raw_reward": "raw_reward/attack", "defence_raw_reward": "raw_reward/defence",
 	"attack_win_rate": "won/attack", "defence_win_rate": "won/defence",
-	"policy_loss": "loss/policy", "value_loss": "loss/value", "entropy": "loss/entropy", "below_floor": "loss/entropy_below_floor",
+	"policy_loss": "loss/policy", "value_loss": "loss/value", "value_loss_fresh": VALUE_LOSS_TAB, "entropy": "loss/entropy", "below_floor": "loss/entropy_below_floor",
 	"signal_ratio": "stability/signal_ratio", "weight_change": "stability/weight_change", "approx_kl": "stability/approx_kl", "clip_fraction": "stability/clip_fraction",
 	"attack_advantage_std": "advantage_std/attack", "defence_advantage_std": "advantage_std/defence",
 	"attack_value_error": "value_error/attack", "defence_value_error": "value_error/defence",
@@ -283,8 +287,9 @@ EVAL_SEEDS = tuple(_eval_rng.randrange(1, 2**31) for _ in range(256))
 
 
 # TensorBoard's eval tab holds the top-level scores only (the user, 2026-10-29): eval/battle (here, evaluate_now: the
-# battle model against the eval opponents) and eval/campaign (campaign_model/evaluate.py: against Nullkiller2); the
-# rest of an eval goes under eval_<opponent>/ and eval_details/
+# battle model against the eval opponents) and eval/campaign (campaign_model/evaluate.py: against Nullkiller2), and
+# each model's training value loss (VALUE_LOSS_TAB, campaign_model/learner.py); the rest of an eval goes under
+# eval_<opponent>/ and eval_details/
 EVAL_TAB = "eval/battle"
 
 
@@ -1079,18 +1084,23 @@ def train(config, resume=False):
 				chunks = [model.facts(select(epoch_data["inputs"], torch.arange(i, i + 256, device=device).clamp(max=len(examples) - 1))) for i in range(0, len(examples), 256)]
 				epoch_data["facts"] = {key: torch.cat([c[key] for c in chunks])[: len(examples)] for key in chunks[0]}
 				del chunks  # its blocks would double the features' memory until the next update
-			if epoch_data is not None and config.target_kl:
+			fresh_value = float("nan")
+			if epoch_data is not None:
 				# The KL control's anchor: this update's actions under the model as the update starts. Measured against the
 				# policy that played (old_log_prob, about one version back), the previous update's own move counted as
 				# this one's: 44 of v15-window's updates stopped after one step, most right after a full update
+				# The same pass measures the value loss on these battles before the update learns from them (VALUE_LOSS_TAB)
 				with torch.no_grad():
-					anchors = []
+					anchors, excess = [], []
 					for i in range(0, len(examples), 256):
 						index = torch.arange(i, i + 256, device=device).clamp(max=len(examples) - 1)
 						rows = select(epoch_data, index)
-						anchors.append(log_prob(model(rows["inputs"], rows["facts"]) if "facts" in rows else model(rows["inputs"]), rows["action"]))
+						out_rows = model(rows["inputs"], rows["facts"]) if "facts" in rows else model(rows["inputs"])
+						anchors.append(log_prob(out_rows, rows["action"]))
+						excess.append(value_excess(out_rows, rows["value_labels"], ppo_config))
 					epoch_data["anchor_log_prob"] = torch.cat(anchors)[: len(examples)]
-					del anchors
+					fresh_value = float(weighted_mean(torch.cat(excess)[: len(examples)], epoch_data.get("weight")))
+					del anchors, excess, out_rows
 			stopped, update_kl, kl_sum, recent = False, 0.0, 0.0, deque(maxlen=KL_WINDOW)
 			kl_of = lambda out, rows: (lambda d: (d.exp() - 1 - d).mean())(log_prob(out, rows["action"]).detach() - rows["anchor_log_prob"])  # k3: KL(anchor || now)
 			for _ in range(config.ppo_passes if examples else 0):
@@ -1161,6 +1171,7 @@ def train(config, resume=False):
 				"rounds": round(sum(mean_of([s.rounds for s in side]) for side in by_side), 2),
 				"policy_loss": round(mean["policy"], 5),
 				"value_loss": round(mean["value"], 5),
+				"value_loss_fresh": round(fresh_value, 5),
 				"entropy": round(mean["entropy"], 4),
 				"below_floor": round(mean["below_floor"], 4),
 				"approx_kl": round(mean["approx_kl"], 5),
