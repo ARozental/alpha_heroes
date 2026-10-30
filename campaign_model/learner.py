@@ -509,8 +509,10 @@ class CampaignLearner:
 		self.writer.flush()
 		print(
 			f"campaign {self.version:4d}  games {row['games']}  decisions {n}  days {row['days']:.1f}  Φ at the end {row['phi_end']:.0f}  heroes {row['heroes']:.2f}"
-			"  value ev " + "/".join(f"{row[f'value_ev_d{k}']:+.2f}" for k in c.VALUE_OFFSETS)
-			+ f" (corr {metrics.get('value_corr', float('nan')):+.2f}, spread {metrics.get('value_spread', float('nan')):.3f} vs {metrics.get('label_spread', float('nan')):.3f})"
+			# (pooled over ~10 updates like the growth and end heads': this update's alone swings with its few games' spread,
+			# -0.65 at a correlation of +0.22 and a spread as wide as the outcomes', 2026-10-30, while the pooled rose)
+			"  value ev " + "/".join(f"{row[f'head_ev_v{k}']:+.2f}" for k in c.VALUE_OFFSETS)
+			+ f" (this update {row[f'value_ev_d{c.VALUE_OFFSETS[-1]}']:+.2f}: corr {metrics.get('value_corr', float('nan')):+.2f}, spread {metrics.get('value_spread', float('nan')):.3f} vs {metrics.get('label_spread', float('nan')):.3f})"
 			+ "  growth ev " + "/".join(f"{row[f'head_ev_g{k}']:+.2f}" for k in c.VALUE_OFFSETS) + f"  end ev {row['head_ev_vend']:+.2f} (credit {row['end_credit']:.2f})"
 			+ f"  kl {row['last_kl']:.4f}  steps {row['steps']}  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s)  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})",
 			flush=True,
