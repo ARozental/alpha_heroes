@@ -24,9 +24,8 @@ Choices made while building it:
   among 300 counted for nothing, so MOVE could never beat END on their account. A plain logsumexp would have let
   the number of reachable tiles alone decide. Within each table, the probabilities are a plain softmax.
 - **Every head's last layer starts at zero**, so the first policy is exactly the domain priors', the known-sane start.
-- **A third of the training games are against Nullkiller2** (`campaign.nullkiller_share`), at a drawn difficulty.
-  Self-play alone never faced its aggression, and the eval against it stayed at 0.14 of parity while every self-play
-  measure improved.
+- **Training is self-play only.** Nullkiller2 is the evaluation's opponent, never a training one (the user,
+  2026-10-30: a model that learned to exploit its weaknesses is not one to play against).
 - **The reach is an attention bias.** Each hero's reach to each tile enters the tile reader as a bias per head (4
   numbers). A 16-wide vector per (hero, tile) pair would have cost ~1.3 GB at a batch of 256.
 - **MOVE stays in each hero's window.** It reads that window's tiles from the shared map, so the AI's contract is
