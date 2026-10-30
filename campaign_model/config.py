@@ -20,6 +20,14 @@ class CampaignConfig:
 	players: tuple = (2, 3, 4)  # drawn uniformly (the user: more than 2 players)
 	sizes: tuple = (36,)  # map width and height, drawn uniformly (the user: small maps only, for now)
 	game_map_share: float = 1 / 3  # games on one of the game's own maps (maps.GAME_MAPS), the rest on generated ones
+	# Games against Nullkiller2 (2026-10-30: self-play alone never faced its aggression, and the campaign eval, against
+	# it, stayed at 0.14 of parity at day 56 while every self-play measure improved: what only Nullkiller2 punishes,
+	# heroes left in its reach, towns left bare, self-play cannot teach): this share of the games have it in the other
+	# seats (we hold max(1, players // 2) seats, drawn at random; its battles BattleAI's, ours our battle model's), at a
+	# difficulty drawn from nullkiller_difficulty (VCMI's 0 easy .. 4 impossible, 1 the default and the eval's: its
+	# resource bonus grows with it)
+	nullkiller_share: float = 1 / 3
+	nullkiller_difficulty: tuple = (1, 1, 2)
 	levels: int = 2  # with the underground (the user: water and underground stay on)
 	water: str = "random"
 	game_seconds: int = 1200  # headless.sh's limit for one game (what it recorded until then is used); since the games have taverns and dwellings (2026-10-29) a 56-day game takes ~200 s (~2,200 decisions) and a 113-day one ~560 s

@@ -109,7 +109,7 @@ def directory_mb(path):
 	return sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file()) / 2**20 if path else 0.0
 
 
-def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_ai="BattleAI", game_key="g0", settings=(), niceness=0, temperature=1.0, ours=None, our_battle_ai="AlphaBattleAI", stop=None, neutral_ai="BattleAI"):
+def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_ai="BattleAI", game_key="g0", settings=(), niceness=0, temperature=1.0, ours=None, our_battle_ai="AlphaBattleAI", stop=None, neutral_ai="BattleAI", difficulty=None):
 	"""Play one game against the inference server at socket_path; returns (records.Game, GameInfo).
 
 	battle_ai plays the players' battles, neutral_ai the wandering monsters' (the game's AI, as in a real game; the
@@ -118,7 +118,8 @@ def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_
 	campaign games through the stall watchdog); settings: more environment (e.g. the battle AI's
 	inference server and record keys). ours: None (every player is our AI), or the colors that are, the others
 	Nullkiller2 with battle_ai while ours fight with our_battle_ai (an evaluation). stop: an Event that ends the game
-	early (training is over)."""
+	early (training is over). difficulty: the game's (VCMI's 0 easy .. 4 impossible; None: the settings' default, 1), the
+	AI players' resource bonus grows with it."""
 	with battle_play.RecordServer() as server:
 		env = dict(os.environ)
 		ai = {"adventureEnemyAI": "AlphaMapAI", "adventureAlliedAI": "AlphaMapAI", "combatEnemyAI": battle_ai, "combatAlliedAI": battle_ai, "combatNeutralAI": neutral_ai}
@@ -131,7 +132,7 @@ def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_
 			ALPHA_MAP_GAME_KEY=game_key,
 			ALPHA_MAP_DAYS=str(days),
 			ALPHA_MAP_TEMPERATURE=str(temperature),
-			SETTINGS=json.dumps({"server": {"seed": seed}, "ai": ai}),
+			SETTINGS=json.dumps({"server": {"seed": seed}, "ai": ai, **({"general": {"lastDifficulty": int(difficulty)}} if difficulty is not None else {})}),
 		)
 		for i, color in enumerate(COLORS):
 			env[f"ALPHA_MAP_SEED_{color}"] = str(seed * 101 + i)

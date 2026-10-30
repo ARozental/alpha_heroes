@@ -64,7 +64,7 @@ COLUMNS = [
 	"version", "epoch", "games", "decisions", "dropped_old", "unsound", "credited", "days", "players", "phi_end", "heroes", "label_mean", "price_mean",
 	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "clip_fraction", "grad_norm", "steps", "learning_rate",
 	*(f"value_ev_d{k}" for k in c.VALUE_OFFSETS), *(f"head_ev_{kind}{k}" for kind in "vg" for k in c.VALUE_OFFSETS), "head_ev_vend", "no_effect", "ai_errors", "failed_actions", "game_failures", "game_maps", "dropped_games",
-	"game_seconds", "record_mb", "seconds", "gpu_mb", *(f"share_{t}" for t in TYPES), *(f"failure_{k}" for k in FAILURES), "no_effect_types", "kinds",
+	"game_seconds", "versus_games", "record_mb", "seconds", "gpu_mb", *(f"share_{t}" for t in TYPES), *(f"failure_{k}" for k in FAILURES), "no_effect_types", "kinds",
 	# v2's foresight losses (foresight.py) and the gradient check: the shared layers' gradient from the PPO losses and the
 	# foresight's, their cosine, the share of parameters no loss reaches
 	*FORESIGHT_COLUMNS, "grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share",
@@ -219,10 +219,15 @@ class CampaignLearner:
 					size = 36
 				else:
 					map_name, _ = make_map(seed, players, size, config.levels, config.water)
+				# A game against Nullkiller2 (config.nullkiller_share): we hold some seats, it the others
+				versus = rng.random() < config.nullkiller_share
+				ours = tuple(sorted(rng.sample(COLORS[:players], max(1, players // 2)))) if versus else None
+				difficulty = rng.choice(config.nullkiller_difficulty) if versus else None
 				game, info = play(
-					self.server.socket_for(index), map_name, days, seed, max_seconds=config.game_seconds, battle_ai="AlphaBattleAI", game_key=key,
-					settings=self.battle.campaign_settings(index, key, seed), niceness=config.niceness, temperature=config.temperature, stop=self.stop,
+					self.server.socket_for(index), map_name, days, seed, max_seconds=config.game_seconds, battle_ai="BattleAI" if versus else "AlphaBattleAI", game_key=key,
+					settings=self.battle.campaign_settings(index, key, seed), niceness=config.niceness, temperature=config.temperature, ours=ours, difficulty=difficulty, stop=self.stop,
 				)
+				game.ours = ours
 			except Exception as error:  # one failed game does not stop training
 				self._failed(f"game {key}: {error}")
 				continue
@@ -257,6 +262,7 @@ class CampaignLearner:
 			"key": key, "map": map_name, "players": players, "status": info.status, "seconds": round(info.seconds, 1), "version": self.version,
 			"days": game.days, "last_day": max(game.ledgers) if game.ledgers else 0, "end_day": end["day"], "decisions": len(game.decisions),
 			"end": {COLORS[p["color"]]: {"status": p["status"], "towns": len(p["towns"]), "heroes": len(p["heroes"])} for p in end["players"]},
+			"ours": list(getattr(game, "ours", None) or []),  # (our seats in a game against Nullkiller2; [] in self-play)
 			"ai": game.done,
 		}
 		with (self.out / "games.jsonl").open("a") as f:
@@ -301,6 +307,7 @@ class CampaignLearner:
 		started = time.time()
 		played = []
 		for game, _ in games:
+			game.all_decisions = game.decisions  # (the foresight's labels count record serials: the battles' point at them)
 			game.decisions = usable(game.decisions)
 			if game.decisions and game.ledgers:
 				played.append(game)
@@ -478,6 +485,7 @@ class CampaignLearner:
 			"game_maps": sum(1 for _, info in games if not info.map_name.startswith("Maps/alpha_random/")),
 			"dropped_games": self.stats["dropped_games"],
 			"game_seconds": mean([info.seconds for _, info in games]),
+			"versus_games": sum(1 for game, _ in games if getattr(game, "ours", None)),  # (games against Nullkiller2 in the update)
 			"record_mb": sum(game.record_bytes for game, _ in games) / 2**20,
 			"seconds": seconds,
 			"gpu_mb": metrics.get("gpu_mb", float("nan")),  # the update's peak on Apple's GPU (train.gpu_held)

@@ -163,16 +163,26 @@ LABEL_INPUTS = (
 def labels_of(game, features, chunk=512):
 	"""game_labels of a game (records.Game), its inputs decoded here (only LABEL_INPUTS), Φ's parts and the heroes' army
 	worth computed with the model's tables (features: model.CustomFeatures)."""
+	from types import SimpleNamespace
+
 	from .records import decode_fields
 
-	x = decode_fields(game.decisions, LABEL_INPUTS)
+	# Every record as sent (game.all_decisions, learner.step: before the unusable ones are dropped): a battle's "serial"
+	# counts them; the rows of the decisions kept are returned
+	full = getattr(game, "all_decisions", game.decisions)
+	x = decode_fields(full, LABEL_INPUTS)
 	parts, gold = [], []
 	with torch.no_grad():
-		for start in range(0, len(game.decisions), chunk):
+		for start in range(0, len(full), chunk):
 			t = {name: torch.from_numpy(value[start : start + chunk]) for name, value in x.items()}
 			parts.append(ft.empire_value(t, features)[0].numpy())
 			gold.append(ft.army(t["h_army_creature"], t["h_army_count"], t["h_detailed"], features)[2].numpy())
-	return game_labels(game, x, np.concatenate(parts).astype(np.float64), np.concatenate(gold).astype(np.float64))
+	labels = game_labels(SimpleNamespace(decisions=full, battles=game.battles), x, np.concatenate(parts).astype(np.float64), np.concatenate(gold).astype(np.float64))
+	if full is not game.decisions:
+		kept = {id(d) for d in game.decisions}
+		rows = np.array([id(d) in kept for d in full], dtype=bool)
+		labels = {name: value[rows] for name, value in labels.items()}
+	return labels
 
 
 def gradient_check(model, main, foresight):

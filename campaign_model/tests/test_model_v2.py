@@ -97,9 +97,11 @@ def test_every_part_learns_after_its_zero_starts_move():
 	x = tensors(rich_inputs(8, seed=4))
 	optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
-	def loss():
+	weights = {}
+
+	def loss():  # (each table's log-probabilities weighted at random: the mean of a uniform table's has no gradient)
 		out = model(x)
-		tables = sum(v.clamp(min=-30).mean() for k, v in out.items() if k.endswith("_logp"))
+		tables = sum((v.clamp(min=-30) * weights.setdefault(k, torch.randn(v.shape, generator=torch.Generator().manual_seed(len(k))))).mean() for k, v in out.items() if k.endswith("_logp"))
 		return tables + out["value"].mean() + out["growth_logit"].mean() + out["end_logit"].mean() + sum(v.pow(2).mean() for k, v in out.items() if k.startswith("fs_"))
 
 	for _ in range(3):

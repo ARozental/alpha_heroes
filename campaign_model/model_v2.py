@@ -15,9 +15,9 @@ built as the user's blocks, in order (CampaignModelV2.forward):
 	foresight  = foresee(state)        what the next action brings (Foresight): predictions for their losses only,
 	                                   their small hidden states for the layers after
 	state      = think_again(...)      the foresight and the known facts joined again, one more attention block
-	outputs    = decide(state, known)  every logit a match of an actor and a target, plus its domain prior; one
-	                                   softmax over all actions: a type's score is its entries' log-mean-exp (their
-	                                   number alone decides nothing) and a learned bias from the priors
+	outputs    = decide(state, known)  every logit a match of an actor and a target, plus its domain prior; a type's
+	                                   score is its best entry's learned part + what its domain prior offers (a type
+	                                   is as good as its best option) + a learned bias from priors/action_types.csv
 
 What the AI reads is unchanged (OUTPUTS); the foresight's predictions (fs_*) are training's only.
 """
@@ -234,25 +234,27 @@ class CampaignModelV2(nn.Module):
 		self.travel_hero, self.travel_area = nn.Linear(d, dp), nn.Linear(d, dp)
 		self.travel_pair = SwiGLU(dp + 1, dp, dp)
 		# decide: each table's learned part; every type's bias from the priors
-		self.move_out, self.cast_cell_out, self.travel_out = nn.Linear(dp, 1), nn.Linear(dp, 1), nn.Linear(dp, 1)
-		self.act_move, self.act_travel = nn.Linear(d, 1), nn.Linear(d, 1)
+		# Every head's last layer starts at 0 (zero_output): the first policy is the domain priors' exactly, the known-sane
+		# start, and the learned parts grow from it
+		self.move_out, self.cast_cell_out, self.travel_out = zero_output(nn.Linear(dp, 1)), zero_output(nn.Linear(dp, 1)), zero_output(nn.Linear(dp, 1))
+		self.act_move, self.act_travel = zero_output(nn.Linear(d, 1)), zero_output(nn.Linear(d, 1))
 		self.building = small_embedding(c.N_BUILDINGS, d)
-		self.build_q = nn.Linear(d, d)
+		self.build_q = zero_output(nn.Linear(d, d))
 		self.build_bias = nn.Parameter(torch.zeros(c.N_BUILDINGS))
 		self.nk2_build, self.nk2_upgrade, self.nk2_trade = zero_output(nn.Linear(4, 1)), zero_output(nn.Linear(2, 1)), zero_output(nn.Linear(2, 1))
-		self.recruit_head = nn.Sequential(nn.Linear(2 * d + 9, d), nn.GELU(), nn.Linear(d, c.N_RECRUIT_AMOUNTS * c.N_RECRUIT_TARGETS))
-		self.hire_q, self.hire_k = nn.Linear(d, d), nn.Linear(d, d)
+		self.recruit_head = nn.Sequential(nn.Linear(2 * d + 9, d), nn.GELU(), zero_output(nn.Linear(d, c.N_RECRUIT_AMOUNTS * c.N_RECRUIT_TARGETS)))
+		self.hire_q, self.hire_k = zero_output(nn.Linear(d, d)), nn.Linear(d, d)
 		self.hire_worth = zero_output(nn.Linear(4, 1))
 		self.army_src, self.army_dst = nn.Linear(2 * d, d), nn.Linear(d, d)
-		self.army_out = nn.Sequential(nn.GELU(), nn.Linear(d, c.N_ARMY_AMOUNTS))
-		self.upgrade_out = nn.Sequential(nn.GELU(), nn.Linear(d, 1))
-		self.trade_head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, R * R * c.N_TRADE_AMOUNTS))
+		self.army_out = nn.Sequential(nn.GELU(), zero_output(nn.Linear(d, c.N_ARMY_AMOUNTS)))
+		self.upgrade_out = nn.Sequential(nn.GELU(), zero_output(nn.Linear(d, 1)))
+		self.trade_head = nn.Sequential(nn.Linear(d, d), nn.GELU(), zero_output(nn.Linear(d, R * R * c.N_TRADE_AMOUNTS)))
 		self.spell = small_embedding(c.N_ADVENTURE_SPELLS, d)
-		self.cast_q = nn.Linear(d, d)
+		self.cast_q = zero_output(nn.Linear(d, d))
 		self.buy_item = small_embedding(c.N_BUY_ITEMS, d)
-		self.buy_q = nn.Linear(d, d)
-		self.dismiss_out = nn.Linear(d, 1)
-		self.option_q = nn.Linear(2 * d, d)
+		self.buy_q = zero_output(nn.Linear(d, d))
+		self.dismiss_out = zero_output(nn.Linear(d, 1))
+		self.option_q = zero_output(nn.Linear(2 * d, d))
 		self.end_out = zero_output(nn.Linear(d, 1))
 		self.type_bias = nn.Parameter(priors.action_types().clone())
 		self.value_hidden = nn.Sequential(nn.Linear(3 * d + ft_phi_features(), d), nn.GELU())
@@ -356,15 +358,18 @@ class CampaignModelV2(nn.Module):
 		state.tiles = grid.reshape(b, L, dc, S, S).permute(0, 1, 3, 4, 2)  # [B, L, S, S, dc]
 		flat = state.tiles.reshape(b, L * S * S, dc)
 		valid = on_map.reshape(b, L * S * S) > 0
-		# Our heroes' reach on the map, as the tile reader's bias per head: each window's tiles scattered to theirs
+		# Our heroes' reach on the map, as the tile reader's bias per head: each window's tiles scattered to theirs. The
+		# windows are computed padded (windows_of: fixed shapes on Apple's GPU, which keeps a graph per shape); the padding
+		# rows, copies of the first window, are left out of the scatter (they would count its reach twice)
 		heads = self.heads
 		reach = torch.zeros(b * HO * L * S * S, heads, device=flat.device, dtype=flat.dtype)
 		if known.n > 0:
-			n = known.n
-			state.window_reach = self.reach(None, reach_features(x, known.windows[:n]))  # [K, W, W, dc]
-			tiles = known.window_tiles[:n].reshape(n, W * W)
-			index = (known.windows[:n, None] * (L * S * S) + tiles.clamp(min=0)).reshape(-1)
-			inside = torch.nonzero((tiles >= 0).reshape(-1)).squeeze(-1)
+			k = known.windows.shape[0]
+			state.window_reach = self.reach(None, reach_features(x, known.windows))  # [K, W, W, dc]
+			tiles = known.window_tiles.reshape(k, W * W)
+			index = (known.windows[:, None] * (L * S * S) + tiles.clamp(min=0)).reshape(-1)
+			real = (torch.arange(k, device=tiles.device) < known.n)[:, None].expand(k, W * W)
+			inside = torch.nonzero(((tiles >= 0) & real).reshape(-1)).squeeze(-1)
 			reach = reach.index_add(0, index[inside], self.read_tiles.reach(state.window_reach).reshape(-1, heads)[inside])
 		reach = torch.cat([reach.reshape(b, HO, L * S * S, heads), torch.zeros(b, H - HO, L * S * S, heads, device=flat.device, dtype=flat.dtype)], dim=1)
 		state.heroes = state.heroes + self.read_tiles(state.heroes, x["h_pos"], x["h_present"], flat, self.tile_positions, valid, reach)
@@ -423,13 +428,14 @@ class CampaignModelV2(nn.Module):
 	# ---- foresee ----
 
 	def pairs(self, state, known):
-		"""Each window's (hero, tile) pairs [K, W, W, dp]: the hero's, its tile's and its reach's projections summed."""
+		"""Each window's (hero, tile) pairs [K, W, W, dp] (K: the windows padded, windows_of): the hero's, its tile's and
+		its reach's projections summed."""
 		b = state.x["g_day"].shape[0]
-		k = known.n
-		heroes = state.heroes[:, :HO].reshape(b * HO, -1).index_select(0, known.windows[:k])
+		k = known.windows.shape[0]
+		heroes = state.heroes[:, :HO].reshape(b * HO, -1).index_select(0, known.windows)
 		flat = state.tiles.reshape(b * L * S * S, self.cell_dim)
-		decision = torch.div(known.windows[:k], HO, rounding_mode="floor")
-		index = known.window_tiles[:k]
+		decision = torch.div(known.windows, HO, rounding_mode="floor")
+		index = known.window_tiles
 		cells = torch.where((index >= 0).unsqueeze(-1), flat[(decision[:, None, None] * (L * S * S) + index.clamp(min=0)).reshape(-1)].reshape(k, W, W, -1), torch.zeros(k, W, W, self.cell_dim, device=flat.device, dtype=flat.dtype))
 		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach)
 
@@ -462,8 +468,7 @@ class CampaignModelV2(nn.Module):
 		self.split(state, self.again_norm(self.again_block(tokens, valid, state.bias)))
 		if known.n > 0:
 			pairs = self.pairs(state, known)  # (with the heroes as they are now)
-			n = known.n
-			move_known = torch.cat([known.move_features[:n], torch.tanh(known.tile_prior[:n] / 4).unsqueeze(-1)], dim=-1)
+			move_known = torch.cat([known.move_features, torch.tanh(known.tile_prior / 4).unsqueeze(-1)], dim=-1)
 			state.move_pairs = self.move_pair(torch.cat([pairs, hidden["move"], move_known], dim=-1))
 		b = x["g_day"].shape[0]
 		days = x["travel_days"][:, :HO].reshape(b, HO, AREAS)
@@ -478,19 +483,23 @@ class CampaignModelV2(nn.Module):
 		x = state.x
 		b, d = x["g_day"].shape[0], self.dim
 		own_heroes, own_towns = state.heroes[:, :HO], state.towns[:, :TO]
-		out, tables = {}, {}
+		out, learned, prior, offers = {}, {}, {}, {}  # each table's learned part and its domain prior apart
+		A_ = c.ActionType
 		# MOVE and the targeted spell's tile: each window's pairs, + the hero's act-now score, + the tile's prior
-		move = cast_cell = torch.full((b, HO, W, W), 0.0, device=state.glob.device)
+		move = cast_cell = move_prior = torch.full((b, HO, W, W), 0.0, device=state.glob.device)
 		if known.n > 0:
-			move = dense(self.move_out(state.move_pairs).squeeze(-1) + known.tile_prior[: known.n], known.windows, known.n, b)
+			move = dense(self.move_out(state.move_pairs).squeeze(-1), known.windows, known.n, b)
+			move_prior = dense(known.tile_prior, known.windows, known.n, b)
 			cast_cell = dense(self.cast_cell_out(state.move_pairs).squeeze(-1), known.windows, known.n, b)
-		tables[c.ActionType.MOVE] = move + self.act_move(own_heroes).reshape(b, HO, 1, 1)
+		learned[A_.MOVE], prior[A_.MOVE] = move + self.act_move(own_heroes).reshape(b, HO, 1, 1), move_prior
+		offers[A_.MOVE] = ft.offer(move_prior, x["move_mask"])
 		out["cast_cell_logp"] = masked_log_softmax(cast_cell.reshape(b, HO, W * W), x["cast_cell_mask"].reshape(b, HO, W * W)).reshape(b, HO, W, W)
 		# TRAVEL: (hero, area) pairs, + the area's prior (its value discounted by the days to it)
-		travel = self.travel_out(state.travel_pairs).squeeze(-1) + known.travel_prior.reshape(b, HO, AREAS) + self.act_travel(own_heroes)
-		tables[c.ActionType.TRAVEL] = travel.reshape(b, HO, L, TG, TG)
+		learned[A_.TRAVEL] = (self.travel_out(state.travel_pairs).squeeze(-1) + self.act_travel(own_heroes)).reshape(b, HO, L, TG, TG)
+		prior[A_.TRAVEL] = known.travel_prior.reshape(b, HO, L, TG, TG)
+		offers[A_.TRAVEL] = ft.offer(prior[A_.TRAVEL], x["travel_mask"])
 		# BUILD: the town's query against each building
-		tables[c.ActionType.BUILD] = self.build_q(own_towns) @ self.building.weight.t() / math.sqrt(d) + self.build_bias + self.nk2_build(known.build_rewards).squeeze(-1)
+		learned[A_.BUILD], prior[A_.BUILD] = self.build_q(own_towns) @ self.building.weight.t() / math.sqrt(d) + self.build_bias, self.nk2_build(known.build_rewards).squeeze(-1)
 		# RECRUIT: the town and each creature level's token, the amounts; Nullkiller2's prior
 		available = x["t_available"][:, :TO].clamp(min=0).float()
 		gold = x["g_resources"][:, 6].clamp(min=0).float()
@@ -502,51 +511,61 @@ class CampaignModelV2(nn.Module):
 			],
 			dim=-1,
 		)
-		recruit = self.recruit_head(recruit_in).reshape(b, TO, c.N_LEVELS, c.N_RECRUIT_AMOUNTS, c.N_RECRUIT_TARGETS)
-		tables[c.ActionType.RECRUIT] = recruit + self.features.recruit_prior(known.town_danger)
+		learned[A_.RECRUIT] = self.recruit_head(recruit_in).reshape(b, TO, c.N_LEVELS, c.N_RECRUIT_AMOUNTS, c.N_RECRUIT_TARGETS)
+		prior[A_.RECRUIT] = self.features.recruit_prior(known.town_danger).expand_as(learned[A_.RECRUIT])
+		skill_weight, upgrade_weight, book_weight, pause_weight = self.features.nk2_weights()
+		home_weight, defend_weight, ferry_weight, hire_weight, trade_weight = self.features.pull_weights()
+		offers[A_.RECRUIT] = -pause_weight * known.recruit_pause  # (no army bought while saving for a hall: Nullkiller2's habit)
 		# HIRE: the town's query against each hero for hire (the same hero space as ours) + what the hire does to Φ
 		worth = torch.cat([scales(known.tavern_worth.clamp(min=0), (1000, 3000, 10000)), torch.tanh(known.hire_gain / 2000).unsqueeze(-1)], dim=-1)
-		hire = torch.einsum("btd,bsd->bts", self.hire_q(own_towns), self.hire_k(state.tavern)) / math.sqrt(d)
-		tables[c.ActionType.HIRE] = hire + ft.value_logit(known.hire_gain).unsqueeze(1) + self.hire_worth(worth).squeeze(-1).unsqueeze(1)
+		learned[A_.HIRE] = torch.einsum("btd,bsd->bts", self.hire_q(own_towns), self.hire_k(state.tavern)) / math.sqrt(d) + self.hire_worth(worth).squeeze(-1).unsqueeze(1)
+		prior[A_.HIRE] = ft.value_logit(known.hire_gain).unsqueeze(1).expand(b, TO, c.N_TAVERN)
+		offers[A_.HIRE] = best_legal(prior[A_.HIRE], x["hire_mask"]) + hire_weight * known.hire_want
 		# ARMY and UPGRADE: each stack (its holder's token with it) against each holder
 		holders = torch.cat([own_heroes, own_towns, state.other.unsqueeze(1)], dim=1)
 		holder_stacks = torch.cat([state.hero_stacks[:, :HO], state.town_stacks[:, :TO], state.other_stacks.unsqueeze(1)], dim=1)
 		src = self.army_src(torch.cat([holders.unsqueeze(2).expand(b, HD, A, d), holder_stacks], dim=-1))
 		dst = self.army_dst(holders)
-		tables[c.ActionType.ARMY] = self.army_out(src[:, :, :, None, :] + dst[:, None, None, :, :]) + self.features.army_prior(known.hero_strength[:, :HO])
-		_, upgrade_weight, book_weight, _ = self.features.nk2_weights()
-		tables[c.ActionType.UPGRADE] = self.upgrade_out(src).squeeze(-1) + self.nk2_upgrade(known.upgrade_gains).squeeze(-1) + upgrade_weight * (known.upgrade_gains[..., 0] > 0).float()
+		learned[A_.ARMY] = self.army_out(src[:, :, :, None, :] + dst[:, None, None, :, :])
+		prior[A_.ARMY] = self.features.army_prior(known.hero_strength[:, :HO]).expand_as(learned[A_.ARMY])
+		offers[A_.ARMY] = best_legal(prior[A_.ARMY], x["army_mask"])  # (below 0 when every legal move leaves troops in a mine)
+		learned[A_.UPGRADE] = self.upgrade_out(src).squeeze(-1) + self.nk2_upgrade(known.upgrade_gains).squeeze(-1)
+		prior[A_.UPGRADE] = upgrade_weight * (known.upgrade_gains[..., 0] > 0).float()
+		offers[A_.UPGRADE] = best_legal(prior[A_.UPGRADE], x["upgrade_mask"])
 		# TRADE (from the global token), CAST, BUY, DISMISS (each hero's)
 		needs = torch.stack([known.trade_needs[:, None, :, 0].expand(b, R, R), known.trade_needs[:, :, None, 1].expand(b, R, R)], dim=-1)
-		_, _, _, _, trade_weight = self.features.pull_weights()
-		trade_prior = (trade_weight * ((needs[..., 0] > 0) & (needs[..., 1] > 0)).float()).unsqueeze(-1)
-		tables[c.ActionType.TRADE] = self.trade_head(state.glob).reshape(b, R, R, c.N_TRADE_AMOUNTS) + self.nk2_trade(needs) + trade_prior
-		tables[c.ActionType.CAST] = self.cast_q(own_heroes) @ self.spell.weight.t() / math.sqrt(d)
+		learned[A_.TRADE] = self.trade_head(state.glob).reshape(b, R, R, c.N_TRADE_AMOUNTS) + self.nk2_trade(needs)
+		prior[A_.TRADE] = (trade_weight * ((needs[..., 0] > 0) & (needs[..., 1] > 0)).float()).unsqueeze(-1).expand_as(learned[A_.TRADE])
+		offers[A_.TRADE] = best_legal(prior[A_.TRADE], x["trade_mask"])
+		learned[A_.CAST] = self.cast_q(own_heroes) @ self.spell.weight.t() / math.sqrt(d)
+		prior[A_.CAST] = torch.zeros_like(learned[A_.CAST])
 		book = (torch.arange(c.N_BUY_ITEMS, device=gold.device) == c.BUY_ARTIFACTS.index(ft.SPELLBOOK)).float()
-		tables[c.ActionType.BUY] = self.buy_q(own_heroes) @ self.buy_item.weight.t() / math.sqrt(d) + book_weight * known.spellbook_wanted.float().unsqueeze(-1) * book
-		tables[c.ActionType.DISMISS] = self.dismiss_out(own_heroes).squeeze(-1)
+		learned[A_.BUY] = self.buy_q(own_heroes) @ self.buy_item.weight.t() / math.sqrt(d)
+		prior[A_.BUY] = (book_weight * known.spellbook_wanted.float().unsqueeze(-1) * book).expand_as(learned[A_.BUY])
+		offers[A_.BUY] = best_legal(prior[A_.BUY], x["buy_mask"])
+		learned[A_.DISMISS] = self.dismiss_out(own_heroes).squeeze(-1)
+		prior[A_.DISMISS] = torch.zeros_like(learned[A_.DISMISS])
 		# A question's options: each against the global token and the hero it is about; Nullkiller2's skill scores
 		about = torch.gather(state.heroes, 1, x["d_hero"].clamp(min=0).reshape(b, 1, 1).expand(b, 1, d)).squeeze(1) * (x["d_hero"] >= 0).float().unsqueeze(-1)
-		skill_weight, _, _, _ = self.features.nk2_weights()
 		query = self.option_q(torch.cat([state.glob, about], dim=-1))
 		out["option_logp"] = masked_log_softmax((state.options * query.unsqueeze(1)).sum(dim=-1) / math.sqrt(d) + skill_weight * known.skill_scores, x["option_mask"])
-		# One softmax over every action: each table normalised within itself (the contract's), each type scored by its
-		# entries' log-mean-exp + its bias, END by the global token
+		# The action type: each table normalised within itself (the contract's: the AI samples a type, then an entry).
+		# A type is as good as its best option: its score is its bias (priors/action_types.csv), what its domain prior
+		# offers (offers: the best legal prior entry, as v1's; MOVE's and TRAVEL's the best tile's and area's value as a
+		# logit, so value in reach holds END back) and its best legal entry's learned part (a max: the log-mean-exp of
+		# before let a few good tiles among 300 count for nothing, and a sum let their number alone decide); END by the
+		# global token
 		scores, legal_types = [], []
 		for action in c.ActionType:
-			if action == c.ActionType.END:
+			if action == A_.END:
 				scores.append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action])
 				legal_types.append((x["g_kind"] == c.DecisionKind.TURN) | (x["g_kind"] == c.DecisionKind.EXCHANGE))
 				continue
 			name, mask_name = HEADS[action]
-			logits, mask = tables[action], x[mask_name]
-			out[name] = flat_log_softmax(logits, mask)
-			flat_logits, flat_mask = logits.reshape(b, -1), mask.reshape(b, -1)
-			legal = flat_mask.any(dim=-1)
-			count = flat_mask.float().sum(dim=-1).clamp(min=1)
-			mean = torch.logsumexp(flat_logits.masked_fill(~flat_mask, -1e4), dim=-1) - torch.log(count)
-			scores.append(torch.where(legal, mean, torch.zeros_like(mean)) + self.type_bias[action])
-			legal_types.append(legal)
+			mask = x[mask_name]
+			out[name] = flat_log_softmax(learned[action] + prior[action], mask)
+			scores.append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action], mask))
+			legal_types.append(mask.reshape(b, -1).any(dim=-1))
 		out["type_logp"] = masked_log_softmax(torch.stack(scores, dim=-1), torch.stack(legal_types, dim=-1))
 		self.value(state, known, out)
 		return out
@@ -569,6 +588,13 @@ class CampaignModelV2(nn.Module):
 
 
 # ---- helpers: the known facts per entity ----
+
+def best_legal(logits, mask):
+	"""The best legal entry [B] of a table [B, ...] (logits broadcastable to mask's shape), 0 where none is legal."""
+	flat, legal = logits.expand(mask.shape).reshape(mask.shape[0], -1), mask.reshape(mask.shape[0], -1)
+	best = flat.masked_fill(~legal, -1e4).amax(dim=1)
+	return torch.where(legal.any(dim=1), best, torch.zeros_like(best))
+
 
 def ft_phi_features():
 	return len(ft.PHI_SCALES) + len(ft.PHI_PARTS)
