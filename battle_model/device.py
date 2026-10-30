@@ -5,8 +5,17 @@ GPU such a copy waits for every kernel queued before it: 21 of them were three q
 time (2026-10-29: a step of 256 decisions 508 -> 376 ms with them made once).
 """
 import functools
+import os
 
 import torch
+
+# PyTorch's allocator on Apple's GPU frees the buffers it caches only above its low watermark, by default 1.4 x the
+# recommended working set (24.9 GB on the 24 GB M4): a joint run's two learners kept 10 and 4.3 GB and the machine
+# compressed memory at 2 GB/s. At 0.2 (3.6 GB, a soft limit: a process may use more) the same run's swap-in fell 12.4 ->
+# 0.6 MB/s and its campaign updates took 16% less a decision, the battle updates as fast (2026-10-30,
+# docs/performance_2026-10-29.md). Read when a process first uses the GPU: the processes it spawns inherit it; a value
+# already in the environment is kept.
+os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.2")
 
 
 @functools.lru_cache(maxsize=None)

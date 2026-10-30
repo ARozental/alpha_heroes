@@ -96,6 +96,45 @@ waits for a request's round trip. Tested on one machine (a master and a worker o
 learner's wait 10 s -> 0.1-4 s an update with the worker's two actors) and a joint run (the worker's 8 campaign games
 and 189 battles trained on, 0 failures, both ends stopping cleanly).
 
+## Second round (2026-10-30)
+
+Profiled in a joint run (a copy of joint2, evals off): per process its memory (`footprint`) and a 20 s `sample`.
+
+- **The Mac's memory** (2026-10-30, 24 GB): the battle trainer's footprint was 15 GB, 10 GB of it Metal (MPS), the
+  campaign update process's 8.5 GB (4.3 GB); swap 9.4 of 10 GB, and the kernel compressed 2.0-2.6 GB/s and decompressed
+  1.7-2.3 GB/s while the run ran (0 once it stopped). PyTorch's MPS allocator frees its cached buffers only above its low
+  watermark, 1.4 x the recommended 17.8 GB = 24.9 GB per process. `PYTORCH_MPS_LOW_WATERMARK_RATIO=0.2` (3.6 GB, a soft
+  limit), now the default (`device.py`): the same resumed run, 10 minutes after 5 of warm-up, default vs 0.2:
+  battle updates 26 vs 26 (an update 23.0 vs 22.5 s), campaign updates 28.4 vs 23.8 ms a decision (2 updates each),
+  campaign games' decisions 7,111 vs 7,542 a minute; the last 3 minutes' swap-in 12.4 vs 0.6 MB/s, swap-out 16.9 vs 5.0,
+  compression 2.0 vs 1.75 GB/s. A modest gain: the learners still peak at 7.5 and 4.3 GB of MPS, their live use (the
+  battle update keeps every decision's `facts` on the GPU, and `torch.cat` of its 256-decision chunks doubles them for a
+  moment: filling one preallocated tensor would not). On CUDA the GPU's memory is its own: none of this.
+- **A battle decision's encoding** (VCMI client, generated battles): 57% of it was `BattleSpellMechanics::canBeCastAt`,
+  95% of that its `canBeCast` (the caster, the mana, the battlefield's every unit for any target), the same for each of
+  the 187 hexes and each unit it asks about. VCMI (performance, no behaviour change): `canBeCastAtIfCastable`, the
+  target's checks alone; the encoder asks `canBeCast` once a spell (`canCastAt` in Encoder.cpp).
+- **A battle's record**: copied ~5 times on its way to the socket (each tensor's string growing, a .npy string per
+  tensor, the archive growing, the message): now one string a decision, and the message sized first and written once
+  (`BattleRecord::serializeInto`). The same bytes.
+- Both, on the actors' battles (2 persistent battle processes on a CPU inference server, the same 60 generated
+  self-play battles with main's build and with these; another run used the machine, so instructions retired count):
+  41.9 -> 34.4 M instructions a decision (-18%; CPU 3.88 -> 3.54 ms), the clients' peak footprint 794 -> 501 MB. Exact:
+  32 greedy castle battles (884 decisions, 107,819,712 recorded values) and 32 greedy generated self-play ones (1,259
+  decisions, 153,557,712 values) recorded the same with both builds.
+- **A campaign game's client**: 11% of its CPU wrote "Tile is not visible!" errors: the encoder asked
+  `guardingCreaturePosition` about map objects on fogged tiles (a town's or mine's visitable tile while another of its
+  tiles is seen), ~2,300 lines in a game's first minute. Fixed in AlphaMapAI's encoder (the same flags: VCMI answers
+  "none" for such a tile).
+
+Not done from this round:
+- A campaign client's deflate (records at zlib level 1) is 13% of its CPU, the paths of its heroes 22%.
+- Evals stop the run: the battle evals ~2 minutes an hour (vs BattleAI 30 s, vs MMAI 85 s), the campaign's 1.5-2.5
+  minutes: ~7% of a joint run's hours.
+- A battle decision's attack values copy the battle back for each dice branch (`restoreBattle`, ~10% of a battle
+  client): half of it the new units' bonus caches filling again (`CUnitState::localInit`).
+- The CPU inference that the actors use on the Mac: the legal-entries-only action heads (below).
+
 ## Not done (recommendations)
 
 - CPU inference is now 68% of a CPU actor's cost (8.6 of 12.65 ms a decision) and did not get cheaper: a request is 1-2
