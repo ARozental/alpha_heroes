@@ -7,6 +7,12 @@ decision asked of the master's inference servers, the records sent there. The ma
 	.venv/bin/python -m battle_model.worker --master pc.local --machine configs/machines/mac-m4/worker.toml
 	.venv/bin/python -m battle_model.worker --master pc.local --set generated_actors=8 campaign.games=4
 
+	.venv/bin/python -m battle_model.worker --master pc.local --local             # its own inference servers
+
+--local: the games ask inference servers on this machine's CPU (inference_processes, campaign.inference_processes:
+its sizes; the master sends the weights as they change, remote.py) instead of the master's over the network: its
+cores play, not only VCMI (2026-10-30: the master's CPU servers were the limit while the Mac's cores idled).
+
 It reconnects when the master goes away (a resumed run), until stopped (Ctrl-C, kill -TERM).
 """
 import argparse
@@ -17,6 +23,7 @@ import socket
 import sys
 import threading
 import time
+import os
 from collections import Counter
 
 from . import play, remote
@@ -80,12 +87,12 @@ class RemoteActors(ActorPool):
 	"""ActorPool's generated actors (and its collector of the campaign games' battles) on a worker: the master's model
 	versions and league, its backpressure (state "room"), the records checked and compacted here, sent there."""
 
-	def __init__(self, config, endpoints, channel, name):
+	def __init__(self, config, endpoints, channel, name, server=None):
 		self.config, self.channel = config, channel
 		# (its scenario and map files named apart from the master's and the other workers': one disk may hold them all)
 		self.generated_games = lambda scenarios, label, config, **game: generated_games(scenarios, f"{name}_{label}", config, **game)
 		self.link = play.ROOT / "runtime" / "remote-model.onnx"  # (named in the env, never read: the master's servers play)
-		self.server = Endpoints(endpoints)
+		self.server = server or Endpoints(endpoints)
 		self.version, self.league, self.room = -1, [], False
 		self.buffer = []
 		self.lock = threading.Condition()
@@ -119,14 +126,14 @@ class RemoteActors(ActorPool):
 		self.channel.send(("failed", "battle", str(error)[:300]))
 
 
-def remote_campaign(config, actors, endpoints, name, channel):
+def remote_campaign(config, actors, endpoints, name, channel, server=None):
 	"""CampaignLearner's self-play games (its _game_actor) on a worker: on the master's campaign server, every finished
 	game sent to the master (remote.Hub hands it to the learner's _game_done)."""
 	from campaign_model.learner import CampaignLearner
 
 	class RemoteCampaign(CampaignLearner):
 		def __init__(self):
-			self.config, self.battle, self.server = config, actors, Endpoints(endpoints)
+			self.config, self.battle, self.server = config, actors, server or Endpoints(endpoints)
 			self.version, self.key_prefix = 1, f"{name}-"
 			self.lock = threading.Condition()
 			self.stop, self.running = threading.Event(), threading.Event()
@@ -156,11 +163,11 @@ def remote_campaign(config, actors, endpoints, name, channel):
 	return RemoteCampaign()
 
 
-def connect(host, port, token, sizes):
+def connect(host, port, token, sizes, models=False):
 	"""(the connection, the hub's welcome); raises SystemExit when the master refuses this worker for good."""
 	conn = socket.create_connection((host, port), timeout=30)
 	conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-	remote.send_frame(conn, json.dumps({"protocol": remote.PROTOCOL, "token": token, "name": socket.gethostname(), "contracts": remote.contracts(), "sizes": sizes}).encode())
+	remote.send_frame(conn, json.dumps({"protocol": remote.PROTOCOL, "token": token, "name": socket.gethostname(), "contracts": remote.contracts(), "sizes": sizes, "models": models}).encode())
 	welcome = json.loads(remote.read_frame(conn))
 	if "error" in welcome:
 		conn.close()
@@ -169,24 +176,82 @@ def connect(host, port, token, sizes):
 	return conn, welcome
 
 
-def serve(host, port, token, overrides, sizes):
+def local_servers(config, welcome):
+	"""{family: an inference server on this machine's CPU} for --local, its sizes the worker's (inference_processes,
+	campaign.inference_processes; 0: a fifth of the cores), the models the master's (welcome's model_kwargs)."""
+	from .inference import InferenceServer
+
+	play.SOCKET_DIR.mkdir(parents=True, exist_ok=True)
+	sizes = {"battle": (config.inference_processes, config.inference_threads), "campaign": (config.campaign.inference_processes, config.campaign.inference_threads)}
+	servers = {}
+	for family, kwargs in welcome.get("model_kwargs", {}).items():
+		processes, threads = sizes[family]
+		processes = processes or max(1, (os.cpu_count() or 4) // 5)
+		servers[family] = InferenceServer(play.SOCKET_DIR / f"worker-{family}-{os.getpid()}.sock", device="cpu", family=family, model_kwargs=kwargs, threads=threads, processes=processes)
+	return servers
+
+
+def apply_models(servers, family, changes):
+	"""A hub's ("models", family, changes): the weights this machine's servers serve from now on."""
+	server = servers.get(family)
+	for model_name, item in changes.items():
+		if server is None:
+			continue
+		if item is None:
+			server.drop(model_name)
+		else:
+			server.set_model(model_name, item[0], item[1])
+
+
+def serve(host, port, token, overrides, sizes, local=False):
 	"""One connection's work: until the master goes away (or this one is stopped)."""
-	conn, welcome = connect(host, port, token, sizes)
-	name, number = welcome["name"], welcome["number"]
-	config = with_overrides(config_from_dict(welcome["config"]), overrides)
-	# Other battles and games than the master's and the other workers': each worker its own seeds
-	config = dataclasses.replace(config, seed=config.seed + 1000 * number, campaign=dataclasses.replace(config.campaign, seed=config.campaign.seed + 1000 * number))
+	conn, welcome = connect(host, port, token, sizes, models=local)
+	servers = {}
+	try:
+		name, number = welcome["name"], welcome["number"]
+		config = with_overrides(config_from_dict(welcome["config"]), overrides)
+		# Other battles and games than the master's and the other workers': each worker its own seeds
+		config = dataclasses.replace(config, seed=config.seed + 1000 * number, campaign=dataclasses.replace(config.campaign, seed=config.campaign.seed + 1000 * number))
+		servers = local_servers(config, welcome) if local else {}
+		if local and not servers:
+			raise SystemExit("--local: the master sent no models to serve (an older master?)")
+		pending = []
+		while not all("current" in server.serving() for server in servers.values()):  # (--local: no game before its servers have the master's current models)
+			kind, payload, *rest = remote.read_message(conn)
+			if kind == "models":
+				apply_models(servers, payload, rest[0])
+			else:
+				pending.append((kind, payload))
+		_play(conn, welcome, config, name, host, port, servers, pending)
+	except (ConnectionError, OSError, EOFError) as error:
+		print(f"worker: lost the master before playing ({str(error)[:200]})", flush=True)
+	finally:
+		conn.close()
+		for server in servers.values():
+			server.close()
+
+
+def _play(conn, welcome, config, name, host, port, servers, pending):
+	"""serve's games, on servers (this machine's, --local) or the master's, until the master goes away."""
 	channel = Channel(conn)
-	actors = RemoteActors(config, [f"tcp:{host}:{p}" for p in welcome["battle_ports"]], channel, name)
-	campaign = remote_campaign(config.campaign, actors, [f"tcp:{host}:{p}" for p in welcome["campaign_ports"]], name, channel) if config.campaign.games and welcome["campaign_ports"] else None
-	print(f"worker {name}: {config.generated_actors} generated actors, {config.campaign.games if campaign else 0} campaign games, for run {config.run} at {host}:{port}", flush=True)
+	actors = RemoteActors(config, [f"tcp:{host}:{p}" for p in welcome["battle_ports"]], channel, name, server=servers.get("battle"))
+	campaign_ok = config.campaign.games and (welcome["campaign_ports"] or "campaign" in servers)
+	campaign = remote_campaign(config.campaign, actors, [f"tcp:{host}:{p}" for p in welcome["campaign_ports"]], name, channel, server=servers.get("campaign")) if campaign_ok else None
+	where = f"its own servers ({', '.join(f'{f} {len(s.socket_paths)}' for f, s in servers.items())} processes)" if servers else "the master's servers"
+	print(f"worker {name}: {config.generated_actors} generated actors, {config.campaign.games if campaign else 0} campaign games, for run {config.run} at {host}:{port}, on {where}", flush=True)
 	actors.start()
 	if campaign:
 		campaign.start()
 	started, last_report = time.monotonic(), time.monotonic()
 	try:
 		while not channel.lost.is_set():
-			kind, state = remote.read_message(conn)
+			if pending:
+				kind, state = pending.pop(0)
+			else:
+				kind, state, *rest = remote.read_message(conn)
+			if kind == "models":
+				apply_models(servers, state, rest[0])
+				continue
 			if kind != "state":
 				continue
 			with actors.lock:
@@ -207,7 +272,6 @@ def serve(host, port, token, overrides, sizes):
 		if campaign:
 			campaign.close()
 		actors.close()
-		conn.close()
 
 
 def main():
@@ -221,6 +285,7 @@ def main():
 	parser.add_argument("--machine", metavar="TOML", help="this machine's sizes (generated_actors, [campaign] games), applied over the run's")
 	parser.add_argument("--set", nargs="*", default=[], metavar="NAME=VALUE", help="more of this machine's sizes, e.g. generated_actors=8 campaign.games=4")
 	parser.add_argument("--once", action="store_true", help="end when the master goes away instead of waiting for it")
+	parser.add_argument("--local", action="store_true", help="the games ask inference servers on this machine's CPU, the master's weights (sizes: inference_processes, campaign.inference_processes)")
 	args = parser.parse_args()
 	host, _, port = args.master.partition(":")
 	token = args.token or (remote.TOKEN_FILE.read_text().strip() if remote.TOKEN_FILE.exists() else "")
@@ -230,7 +295,7 @@ def main():
 	sizes = dict(o.split("=", 1) for o in overrides)
 	while True:
 		try:
-			serve(host, int(port or DEFAULT_PORT), token, overrides, sizes)
+			serve(host, int(port or DEFAULT_PORT), token, overrides, sizes, local=args.local)
 		except (ConnectionError, OSError) as error:
 			print(f"worker: no master at {args.master} ({str(error)[:200]}); trying again in {RETRY_SECONDS}s", flush=True)
 		except KeyboardInterrupt:

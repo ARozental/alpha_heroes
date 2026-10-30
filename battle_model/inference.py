@@ -285,6 +285,9 @@ class InferenceServer:
 		import multiprocessing
 
 		base = str(socket_path)
+		# What it serves, for workers that run their own servers (remote.Hub sends them the weights): name -> (version,
+		# state), and what builds the model
+		self.family, self.model_kwargs, self.served = family, dict(model_kwargs or {}), {}
 		self.socket_paths = [base] if processes == 1 else [base.replace(".sock", f"-{i}.sock") for i in range(processes)]
 		self.socket_path = self.socket_paths[0]
 		self.tcp_ports = [tcp_port + i for i in range(processes)] if tcp_port else []
@@ -311,11 +314,18 @@ class InferenceServer:
 		with self.lock:
 			for control in self.controls:
 				control.send(("set", name, int(version), state))
+			self.served[name] = (int(version), state)
 
 	def drop(self, name):
 		with self.lock:
 			for control in self.controls:
 				control.send(("drop", name))
+			self.served.pop(name, None)
+
+	def serving(self):
+		"""{name: (version, state)} as now served (a copy)."""
+		with self.lock:
+			return dict(self.served)
 
 	def socket_for(self, index):
 		"""The socket of the index-th client (actor): the clients spread evenly over the processes."""

@@ -9,15 +9,20 @@ VCMI alone, the work the master's own cores are too few for once the GPU trains 
 	a worker     .venv/bin/python -m battle_model.worker --master <host>   (worker.py: its sizes, its token)
 
 The hub's protocol, over TCP, every frame a u64 length and that many bytes:
-	hello     worker: json {"protocol", "token", "name", "contracts": {family: hash}}; hub: json {"ok", "number", "name",
-	          "config" (the run's TrainConfig), "battle_ports", "campaign_ports"} or {"error"}. Only then pickles: a
-	          worker without the run's token never gets one unpickled
+	hello     worker: json {"protocol", "token", "name", "contracts": {family: hash}, "models": whether it serves its
+	          own games}; hub: json {"ok", "number", "name", "config" (the run's TrainConfig), "battle_ports",
+	          "campaign_ports", "model_kwargs": {family: kwargs}} or {"error"}. Only then pickles: a worker without the
+	          run's token never gets one unpickled
 	then      zlib (level 1) of a pickle, a tuple each:
 	          worker: ("battle", records, source, game)   checked and compacted records (ActorPool._check), for the buffer
 	                  ("campaign", key, map, players, game, info, game_map)   a finished campaign game (CampaignLearner)
 	                  ("failed", kind, message)   a battle or a game that failed (the actors' failure count)
 	          hub:    ("state", {...})   every STATE_SECONDS: the model's version, the league, whether to play (evals
 	                  pause generated battles), whether the buffer has room for generated battles (backpressure)
+	                  ("models", family, {name: (version, state) or None})   to a worker with "models": the weights
+	                  the master's servers serve that changed since the last (None: dropped), before the state that
+	                  names them. Its games then ask its own servers on its own cores (2026-10-30: the master's CPU
+	                  servers were the limit, the Mac's cores idle at 16 ms a round trip)
 
 The token: TrainConfig.remote_token, else runtime/remote-token (made on the master's first remote run; copy it to each
 worker's runtime/). The records are the master's model versions, so the buffer's staleness rules hold for them alike.
@@ -115,6 +120,11 @@ class Hub:
 	def campaign_ports(self):
 		return list(self.campaign.server.tcp_ports) if self.campaign else []
 
+	def servers(self):
+		"""{family: the master's inference server} (those a worker can mirror)."""
+		found = {"battle": self.pool.server, "campaign": self.campaign.server if self.campaign else None}
+		return {family: server for family, server in found.items() if server is not None and hasattr(server, "serving")}
+
 	def close(self):
 		self.stop.set()
 		self.listener.close()
@@ -158,12 +168,13 @@ class Hub:
 				print(f"remote: refused {address[0]}: {problem}", flush=True)
 				return
 			name = f"w{next(self.numbers)}-{str(hello.get('name', address[0]))[:24]}"
-			send_frame(conn, json.dumps({"ok": True, "number": int(name[1 : name.index("-")]), "name": name, "config": asdict(self.config), "battle_ports": self.battle_ports(), "campaign_ports": self.campaign_ports()}).encode())
+			model_kwargs = {family: server.model_kwargs for family, server in self.servers().items()}
+			send_frame(conn, json.dumps({"ok": True, "number": int(name[1 : name.index("-")]), "name": name, "config": asdict(self.config), "battle_ports": self.battle_ports(), "campaign_ports": self.campaign_ports(), "model_kwargs": model_kwargs}).encode())
 			conn.settimeout(None)
 			with self.lock:
 				self.workers[name] = {"address": address[0], "since": time.time(), "battles": 0, "decisions": 0, "games": 0}
 			print(f"remote: worker {name} ({address[0]}) joined: {hello.get('sizes', {})}", flush=True)
-			threading.Thread(target=self._send_states, args=(conn, lock), daemon=True).start()
+			threading.Thread(target=self._send_states, args=(conn, lock, bool(hello.get("models"))), daemon=True).start()
 			while not self.stop.is_set():
 				message = read_message(conn)
 				kind = message[0]
@@ -196,9 +207,22 @@ class Hub:
 				with self.lock:
 					self.workers.pop(name, None)
 
-	def _send_states(self, conn, lock):
+	def _send_states(self, conn, lock, models=False):
+		sent = {}  # (family, name) -> the version this worker has
 		while not self.stop.is_set():
 			try:
+				if models:
+					for family, server in self.servers().items():
+						serving = server.serving()
+						changes = {name: (version, state) for name, (version, state) in serving.items() if sent.get((family, name)) != version}
+						changes.update({name: None for f, name in list(sent) if f == family and name not in serving})
+						if changes:
+							send_message(conn, ("models", family, changes), lock)
+							for name, item in changes.items():
+								if item is None:
+									sent.pop((family, name), None)
+								else:
+									sent[(family, name)] = item[0]
 				send_message(conn, ("state", self.state()), lock)
 			except OSError:
 				return
