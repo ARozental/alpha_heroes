@@ -1352,7 +1352,21 @@ def train(config, resume=False):
 			pool.close()
 
 
+def stop_on_signals():
+	"""SIGTERM and SIGINT end the run as Ctrl-C does (its actors, servers and VCMI processes closed): a run started in
+	the background from a script has SIGINT ignored (2026-10-30: battle3 went on through kill -INT; campaign_model.joint
+	had the same fix)."""
+	import signal
+
+	def stop(signum, frame):
+		raise KeyboardInterrupt(f"signal {signum}")
+
+	signal.signal(signal.SIGTERM, stop)
+	signal.signal(signal.SIGINT, stop)
+
+
 def main():
+	stop_on_signals()
 	parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 	parser.add_argument("--epochs", type=int, default=TrainConfig.epochs)
 	parser.add_argument("--run", default=TrainConfig.run)
