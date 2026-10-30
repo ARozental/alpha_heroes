@@ -88,7 +88,7 @@ class TrainConfig:
 	eval_real_scenarios: int = 0  # generator evals: also the first this many battles of real games (REAL_EVAL), both sides
 	eval_castle_seeds: int = 0  # generator evals: also castle_vs_inferno (`scenario`) on this many EVAL_SEEDS: regressions
 	eval_extra_opponents: tuple = ("MMAI",)  # also evaluated against these (eval_<name>.csv, TensorBoard eval_<name>/)
-	eval_workers: int = 12  # battle processes of an eval (play_eval; the learner and the generated actors wait meanwhile)
+	eval_workers: int = 12  # battle processes of an eval (play_eval; with actors the learner and the actors go on meanwhile)
 	# Training in updates from many battles at once (actors.py) instead of epochs of games_per_side battles: an
 	# "epoch" is then one update of decisions_per_update decisions, taken from the actors' buffer
 	actors: bool = False
@@ -437,12 +437,17 @@ def play_in_groups(games, model_path, config, label):
 	return [r for i in range(0, len(games), n) for r in play_with_retries(games[i : i + n], model_path, None, config, label)]
 
 
-def play_eval(games, model_path, config, label):
+class EvalStopped(Exception):
+	"""An eval round left unfinished: the run is stopping (play_eval's stop)."""
+
+
+def play_eval(games, model_path, config, label, stop=None):
 	"""The records of the eval battles, played on config.eval_workers persistent battle processes (play.BattleProcess:
 	a VCMI start-up per 50 battles, not one per battle as play_in_groups), new ones each eval. Game i goes to worker
 	i % eval_workers, so every eval plays the same battles in the same processes in the same order. A battle that
 	fails or stalls is retried once in a new process, then left out (an eval stopped the run when
-	one battle stalled every time). Returns (the games played, their records)."""
+	one battle stalled every time). Returns (the games played, their records). stop (threading.Event): once set, no
+	new battle starts and EvalStopped is raised."""
 	model_path = Path(model_path).resolve()  # VCMI runs in build/bin: paths must be absolute
 	n = min(config.eval_workers, len(games))
 	results, errors = [None] * len(games), []
@@ -451,6 +456,8 @@ def play_eval(games, model_path, config, label):
 		process = play.BattleProcess()
 		try:
 			for i in range(worker, len(games), n):
+				if stop is not None and stop.is_set():
+					break
 				for attempt in range(1, min(config.attempts, 2) + 1):  # greedy: a battle that stalls once mostly stalls again
 					try:
 						results[i] = process.play(games[i], model_path)
@@ -469,6 +476,8 @@ def play_eval(games, model_path, config, label):
 		thread.join()
 	if errors:
 		raise errors[0]
+	if stop is not None and stop.is_set():
+		raise EvalStopped(label)
 	played = [i for i, records in enumerate(results) if records is not None]
 	if len(played) < len(games):
 		print(f"{label}: left out {len(games) - len(played)} battles that failed every attempt: {[games[i].map for i in range(len(games)) if results[i] is None]}", flush=True)
@@ -675,7 +684,7 @@ def eval_baseline(model, out, battle_map, config, suffix=""):
 KL_WINDOW = 4  # minibatches whose mean KL the KL control judges an update by (TrainConfig.target_kl)
 
 
-def eval_round(model, epoch, out, battle_map, config, baseline, name=""):
+def eval_round(model, epoch, out, battle_map, config, baseline, name="", stop=None):
 	"""Play the eval battles against config.eval_opponent with the current model; the eval.csv row."""
 	started = time.time()
 	model_path = out / "eval.onnx"
@@ -683,7 +692,7 @@ def eval_round(model, epoch, out, battle_map, config, baseline, name=""):
 	export(cpu, model_path)
 	verify(cpu, model_path, seeds=(epoch,), batch_sizes=(2,))  # the eval plays this file, training the torch model: the same?
 	games = [g for g in eval_games(config, battle_map) if (g.our_side, g.game_seed) in baseline]  # (one the baseline failed has none)
-	played, records = play_eval(games, model_path, config, f"eval {epoch}")
+	played, records = play_eval(games, model_path, config, f"eval {epoch}", stop)
 	failed, games = len(games) - len(played), played
 	summaries = [summarize(r.events) for r in records]
 	write_traces(out, epoch, f"vs_{config.eval_opponent}_greedy{name}", [next(r for g, r in zip(games, records) if g.our_side == side) for side in (0, 1)])  # the first seed's
@@ -986,14 +995,19 @@ def train(config, resume=False):
 	if resume and (out / "eval_live.csv").exists():  # (the same for the live weights' evals: 2026-10-28 review)
 		upgrade_csv(out / "eval_live.csv", EVAL_COLUMNS)
 
-	def evaluate_now(epoch):
+	def evaluate_now(epoch, scored=None, live_weights=None, stop=None):
 		"""Every eval opponent's eval round; the score of the model is their mean, each opponent counting the same
-		(eval/total_score in TensorBoard, eval_total.csv; each opponent's own rows under eval_<opponent>/)."""
+		(eval/total_score in TensorBoard, eval_total.csv; each opponent's own rows under eval_<opponent>/). scored: the
+		weights scored (the average's, else the trained ones: now, unless given); live_weights: the trained weights for
+		eval_live (now, unless given: None when there is no average to compare); stop: play_eval's."""
 		if any(c.eval_opponent == "MMAI" for c in opponents) and "mmai" not in play.active_mods():  # it would play as BattleAI
 			raise RuntimeError(f"the MMAI mod is not active ({play.USER_DIR / 'config' / 'modSettings.json'}): MMAI would fall back to BattleAI")
-		rows = {c.eval_opponent: evaluate_against(epoch, c, baseline) for c, baseline in zip(opponents, baselines)}
-		if average and average.updates and config.eval_live:  # the trained weights on the same battles: the average's test
-			live = eval_round(model, epoch, out, battle_map, opponents[0], baselines[0], "_live")  # (its own traces)
+		if scored is None:
+			scored = average.model if average else model
+			live_weights = model if average and average.updates and config.eval_live else None
+		rows = {c.eval_opponent: evaluate_against(epoch, c, baseline, scored, stop) for c, baseline in zip(opponents, baselines)}
+		if live_weights is not None:  # the trained weights on the same battles: the average's test
+			live = eval_round(live_weights, epoch, out, battle_map, opponents[0], baselines[0], "_live", stop)  # (its own traces)
 			with (out / "eval_live.csv").open("a", newline="") as f:
 				if f.tell() == 0:
 					csv.writer(f).writerow(EVAL_COLUMNS)
@@ -1020,8 +1034,8 @@ def train(config, resume=False):
 		writer.flush()
 		print(f"eval  {epoch:4d}  TOTAL SCORE {total:+.3f}  (" + ", ".join(f"vs {name} {score:+.3f}" for name, score in scores.items()) + f")  balanced {balanced:+.3f}  worst set {worst:+.3f}", flush=True)
 
-	def evaluate_against(epoch, config_for, baseline):
-		row = eval_round(average.model if average else model, epoch, out, battle_map, config_for, baseline)
+	def evaluate_against(epoch, config_for, baseline, scored, stop=None):
+		row = eval_round(scored, epoch, out, battle_map, config_for, baseline, stop=stop)
 		if average and pool:  # the weights it just scored (eval.onnx) play the campaign evals' battles too
 			staged = pool.models / "average.onnx.tmp"
 			shutil.copyfile(out / "eval.onnx", staged)
@@ -1038,6 +1052,42 @@ def train(config, resume=False):
 			+ ("  | tricks: " + ", ".join(f"{k} {v:+.3f}" for k, v in row["hard_kinds"].items()) if row.get("hard_kinds") else ""), flush=True)
 		return row
 
+	class BackgroundEval:
+		"""An actor run's battle eval rounds, one at a time in a thread beside training (start). Its error is raised in the
+		training thread (error, checked after each update); finished: when the last one ended (eval_minutes counts from
+		then, as from a stopped run's eval); join waits for one playing, close stops it (no new battle starts)."""
+
+		def __init__(self):
+			self.thread, self.error, self.finished, self.stop = None, None, None, threading.Event()
+
+		def running(self):
+			return self.thread is not None and self.thread.is_alive()
+
+		def start(self, epoch, scored, live_weights):
+			def run():
+				try:
+					evaluate_now(epoch, scored, live_weights, self.stop)
+				except EvalStopped:
+					print(f"eval  {epoch:4d}  stopped with the run: its unplayed rounds have no row, and it no total", flush=True)
+				except BaseException as error:  # raised in the training thread after its next update
+					self.error = error
+				finally:
+					self.finished = time.monotonic()
+
+			print(f"eval  {epoch:4d}  playing beside training", flush=True)
+			self.thread = threading.Thread(target=run, daemon=True)
+			self.thread.start()
+
+		def join(self):
+			if self.thread is not None:
+				self.thread.join()
+
+		def close(self):
+			self.stop.set()
+			if self.thread is not None:
+				self.thread.join(timeout=600)
+
+	evals, eval_pending = BackgroundEval(), False
 	pool = None  # (the actors start after the first eval: evaluate_against reads it)
 	if config.eval_every and (first_epoch == 1 or (config.init_from and not resume)):
 		evaluate_now(first_epoch - 1)  # the model as the run starts
@@ -1327,23 +1377,34 @@ def train(config, resume=False):
 				campaign.step(epoch)  # an update of the campaign model when its games are in (its own optimizer)
 			elif campaign:
 				campaign.note_epoch(epoch)  # (its updates run in its own thread)
-			due = time.monotonic() - last_eval >= config.eval_minutes * 60 if config.eval_minutes else config.eval_every and epoch % config.eval_every == 0
-			if due:
-				if pool:
-					pool.pause()
-				evaluate_now(epoch)
-				if pool:
-					pool.resume()
-				last_eval = time.monotonic()
+			if evals.error:
+				raise evals.error
+			idle = not evals.running()
+			if evals.finished is not None:  # (read after running: once idle, the last one's end is in)
+				last_eval, evals.finished = evals.finished, None
+			due = idle and time.monotonic() - last_eval >= config.eval_minutes * 60 if config.eval_minutes else config.eval_every and epoch % config.eval_every == 0
+			eval_pending = eval_pending or bool(due)
+			if eval_pending and idle:
+				eval_pending = False
 				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average)  # every evaluated model
-			if campaign and campaign.eval_due():  # against Nullkiller2, with the battle actors paused
+				if pool:
+					# Beside training (2026-10-30: the run stood still ~2 minutes an hour for it): the actors go on and the
+					# learner trains while the eval plays copies of the weights as they are now. Its battles are greedy, so
+					# the same results as with the run stopped, only slower while the actors share the CPU
+					evals.start(epoch, cpu_copy(average.model if average else model), cpu_copy(model) if average and average.updates and config.eval_live else None)
+				else:
+					evaluate_now(epoch)
+					last_eval = time.monotonic()
+			if campaign and campaign.eval_due() and not evals.running():  # against Nullkiller2, with the battle actors paused (after a battle eval)
 				pool.pause()
 				campaign.evaluate(epoch)
 				pool.resume()
 			save_checkpoint(latest, model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average)
 			if config.checkpoint_every and epoch % config.checkpoint_every == 0:
 				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average)
+		evals.join()  # (the run's end: its last eval's row too)
 	finally:
+		evals.close()  # (stopped: no new eval battle; the ones playing end)
 		if hub:
 			hub.close()
 		if campaign:

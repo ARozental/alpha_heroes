@@ -127,24 +127,38 @@ Profiled in a joint run (a copy of joint2, evals off): per process its memory (`
   tiles is seen), ~2,300 lines in a game's first minute. Fixed in AlphaMapAI's encoder (the same flags: VCMI answers
   "none" for such a tile).
 
-Not done from this round:
-- A campaign client's deflate (records at zlib level 1) is 13% of its CPU, the paths of its heroes 22%.
-- Evals stop the run: the battle evals ~2 minutes an hour (vs BattleAI 30 s, vs MMAI 85 s), the campaign's 1.5-2.5
-  minutes: ~7% of a joint run's hours.
+- **Battle evals beside training** (actor runs): they stopped the run, ~2 minutes an hour of joint2 (vs BattleAI 30 s,
+  vs MMAI 85 s: 3%). Now the eval due at an update plays copies of the weights as they are then in a thread
+  (`BackgroundEval` in train.py, its checkpoint saved when it starts), while the learner trains and the actors play;
+  one at a time (one due meanwhile waits for it). The campaign's evals still stop the battle actors (24 games and a time
+  cap: sharing the CPU could cut them short), once a battle eval has ended. The same results: a round's 41 values were
+  equal played alone and in a thread beside 16 CPU burners (12.6 vs 17.3 s); in a test run 3 updates trained during an
+  eval, and SIGTERM mid-eval ended the run in 6 s with nothing left running (no new eval battle starts; the rounds not
+  played have no row).
+- **CPU inference of the battle model** (an inference server process: 1 thread, batch 1, 7.1 ms): the parameter-free
+  features 3.5 ms (distance maps 1.2, threat maps 0.7: many small ops), the action heads 1.4, the trunk 0.9. Scoring
+  only the legal entries would save ~10%, and nothing is limited by it now: the PC infers on its GPU, and on the Mac
+  6 actors (joint4's) make more battles than the learner takes. Not done.
+
+Not done from this round (each ~1-2% of a run, measured, not worth its risk or a new dependency):
+- A campaign client's deflate (zlib level 1, already the fastest zlib setting: Z_RLE no faster and 37% bigger) is
+  0.84 ms of a decision's 853 KB of inputs (schema 9), ~1% of a campaign game's pace (~65 ms a decision, mostly the
+  model's latency); its heroes' paths ~1.3 ms (~2%), and reusing them across decisions needs every change of the map.
 - A battle decision's attack values copy the battle back for each dice branch (`restoreBattle`, ~10% of a battle
   client): half of it the new units' bonus caches filling again (`CUnitState::localInit`).
-- The CPU inference that the actors use on the Mac: the legal-entries-only action heads (below).
+- Giving a battle process's freed memory back between battles (malloc_zone_pressure_relief / malloc_trim): its mean
+  footprint 231 -> 208 MB on the Mac; not kept (on Linux it may matter more: measure on the PC first).
 
 ## Not done (recommendations)
 
 - CPU inference is now 68% of a CPU actor's cost (8.6 of 12.65 ms a decision) and did not get cheaper: a request is 1-2
-  decisions, where the fused attention gains little. The legal-entries-only action heads (next) are the way to cut it;
-  on the PC the battle model infers on the GPU and this does not arise.
+  decisions, where the fused attention gains little. Half of it is the parameter-free features' small ops, a fifth the
+  action heads (second round, above); on the PC the battle model infers on the GPU and this does not arise.
 
 - The battle model scores all 28 x 187 melee-from and 70 x 187 spell-hex entries, of which ~3 and ~7 are legal on
-  average (70% and 92% of decisions none): the action heads are 45% of a training-size forward. Scoring only the legal
-  entries gives the same outputs (the rest are masked) for a fraction of the work, but needs shapes that change with the
-  batch (bad on Apple's GPU, a sync on CUDA): worth it for CPU inference, less on the 5090.
+  average (70% and 92% of decisions none): the action heads are 45% of a training-size forward (20% at batch 1).
+  Scoring only the legal entries gives the same outputs (the rest are masked) for a fraction of the work, but needs
+  shapes that change with the batch (bad on Apple's GPU, a sync on CUDA).
 - The campaign model: 30 ms a decision forward+backward on the CPU, two thirds of the forward in the map encoder and the
   hand-made features, computed three times a decision an update (the KL anchor and two passes). Its parameter-free
   features could be computed once, as the battle model's `facts` are; they are mixed with trainable weights now.
