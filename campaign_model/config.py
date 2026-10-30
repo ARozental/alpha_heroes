@@ -86,12 +86,15 @@ class CampaignConfig:
 	decision_price: float = 1e-4  # share points per turn decision
 	# Evaluation against Nullkiller2 (evaluate.py): our models in one seat, Nullkiller2 in the others
 	eval_minutes: float = 60.0  # 0: none
-	# 2, 3 and 4 players in turn (the setups of before, so paired comparisons go on), played greedy: the user asked for a
-	# readable eval (2026-10-29: at temperature 1 the score's standard error, ~0.07, was above the evals' own spread).
+	# 2, 3 and 4 players in turn (the setups of before, so paired comparisons go on).
 	# 24, not 48: since the games have taverns and dwellings (vcmi 47c9d57eb) and hires pay, a game has ~4.5x the
 	# decisions (2-4 minutes, 24 at once), and 48 of them held the machine for most of 20 minutes an hour
 	eval_games: int = 24
 	eval_parallel: int = 24  # games at once (a VCMI client each, next to the training's)
 	eval_days: int = 56  # (the score at day 28 is logged too: score_d28)
-	eval_temperature: float = 0.0  # greedy, as the battle evals (2026-10-29: at 1.0 an eval's own sampling hid any change under ~0.1); evals compare only with those played the same way
+	# The campaign model samples, as in training (seeded per game and seat: AlphaMapAI's ALPHA_MAP_SEED_<COLOR>). Greedy
+	# (2026-10-29) was a policy never trained or played: its argmax over the move table is often a neighbouring tile and
+	# from there the tile it came from, so heroes walked back and forth a tile at a time until their movement ran out
+	# (95% one-tile moves, 88% back onto a tile of that day; sampled: 19% and 2%) and the eval measured that
+	eval_temperature: float = 1.0
 	eval_seconds: int = 600  # 240 cut half of the first greedy eval's games short (2026-10-29: 120-240 s a game, 24 at once); an endless siege once held a whole eval for 900 s (no longer: vcmi's stalemate rule)
