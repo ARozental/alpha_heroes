@@ -130,14 +130,19 @@ def decode_fields(decisions, names):
 	"""{name: array [N, ...]} of only these inputs of the decisions (each decision decompressed once; the map's big
 	inputs, left out, are most of its bytes)."""
 	wanted = set(names)
-	rows = [zlib.decompress(d.inputs) for d in decisions]
-	inputs, offset = {}, 0
+	fields, offset = [], 0
 	for name, shape, wire, dtype, nbytes in IN_LAYOUT:
 		if name in wanted:
-			column = np.frombuffer(b"".join(row[offset : offset + nbytes] for row in rows), dtype=wire)
-			inputs[name] = column.astype(dtype).reshape((len(decisions),) + shape)
+			fields.append((name, shape, wire, dtype, offset, nbytes))
 		offset += nbytes
-	return inputs
+	# One decision decompressed at a time, only its wanted bytes kept: a decision is ~874 KB whole, so a game's at once
+	# was ~2.6 GB, and an update's games one after another took the PC's memory guard down (2026-10-30)
+	parts = {name: [] for name, *_ in fields}
+	for d in decisions:
+		row = zlib.decompress(d.inputs)
+		for name, _, _, _, start, nbytes in fields:
+			parts[name].append(row[start : start + nbytes])
+	return {name: np.frombuffer(b"".join(parts[name]), dtype=wire).astype(dtype).reshape((len(decisions),) + shape) for name, shape, wire, dtype, _, _ in fields}
 
 
 def decode_inputs(decisions):
