@@ -27,6 +27,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from battle_model.device import constant
 from battle_model.features import scales
 from battle_model.layers import ActionScore, Block, masked_log_softmax, small_embedding, vocab_index, zero_output
 
@@ -366,7 +367,7 @@ class CustomFeatures(nn.Module):
 
 	def town_strength(self, x, power):
 		"""Each town's log strength [B, T]: its garrison's, plus its fort's while it is defended (FORT_STRENGTH x a gain)."""
-		fort = torch.tensor(FORT_STRENGTH, device=power.device)[x["t_fort"].clamp(0, len(FORT_STRENGTH) - 1)]
+		fort = constant(FORT_STRENGTH, power.device)[x["t_fort"].clamp(0, len(FORT_STRENGTH) - 1)]
 		return torch.log1p(power + fort * self.gain(self.fort_gain) * (power > 0))
 
 	def town_value(self, x):

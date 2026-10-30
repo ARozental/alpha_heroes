@@ -28,6 +28,7 @@ import math
 import torch
 
 from . import rules
+from .device import constant
 from .constants import MAX_RETALIATIONS, N_HEXES
 
 EPS = 1e-6
@@ -47,13 +48,13 @@ def relative(a, b):
 def scales(x, cs):
 	"""[..., len(cs)]: x / (x + c) for each scale c, each 0..1 (x >= 0): the same quantity seen at each scale."""
 	x = x.float().clamp(min=0)[..., None]
-	return x / (x + torch.tensor(cs, dtype=torch.float32, device=x.device))
+	return x / (x + constant(cs, x.device, torch.float32))
 
 
 def signed_scales(x, cs):
 	"""The same for a quantity of either sign: x / (|x| + c), each -1..1."""
 	x = x.float()[..., None]
-	return x / (x.abs() + torch.tensor(cs, dtype=torch.float32, device=x.device))
+	return x / (x.abs() + constant(cs, x.device, torch.float32))
 
 
 def damage_factor(advantage):
@@ -273,8 +274,8 @@ def morale(b):
 	"""log of the expected actions a round from morale: log(1 + chance) of a second action for good morale, log(1 -
 	chance) of losing the turn for bad (gameConfig.json); 0 for units morale does not affect (the engine sends 0)."""
 	m = b.x["u_morale"].clamp(-3, 3)
-	good = torch.tensor(rules.GOOD_MORALE, device=m.device)[m.clamp(min=0)]
-	bad = torch.tensor(rules.BAD_MORALE, device=m.device)[(-m).clamp(min=0)]
+	good = constant(rules.GOOD_MORALE, m.device)[m.clamp(min=0)]
+	bad = constant(rules.BAD_MORALE, m.device)[(-m).clamp(min=0)]
 	return torch.log1p(good) + torch.log1p(-bad)
 
 
@@ -282,8 +283,8 @@ def morale(b):
 def luck(b):
 	"""log of the expected damage multiplier from luck: a lucky strike doubles the base damage, an unlucky one halves it."""
 	l = b.x["u_luck"].clamp(-3, 3)
-	good = torch.tensor(rules.GOOD_LUCK, device=l.device)[l.clamp(min=0)]
-	bad = torch.tensor(rules.BAD_LUCK, device=l.device)[(-l).clamp(min=0)]
+	good = constant(rules.GOOD_LUCK, l.device)[l.clamp(min=0)]
+	bad = constant(rules.BAD_LUCK, l.device)[(-l).clamp(min=0)]
 	return torch.log1p(good) + torch.log1p(-0.5 * bad)
 
 

@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from .constants import HEX_TYPES, N_SPELLS, SECOND_TARGET_KIND, TARGET_TYPES, ActionType, TargetKind
+from .device import constant, moved
 
 ACTION_FIELDS = ("type", "hex", "unit", "spell", "target_unit", "target_hex", "target2_hex", "target2_unit")
 
@@ -84,13 +85,13 @@ def entropy(out):
 	could shoot) while the outcomes stayed the same."""
 	p_type = out["logp_type"].exp().detach()
 	h = _entropy(out["logp_type"])
-	h = h + p_type[:, list(HEX_TYPES)].sum(dim=-1) * _entropy(out["logp_move_hex"])
+	h = h + p_type[:, constant(sorted(HEX_TYPES), p_type.device)].sum(dim=-1) * _entropy(out["logp_move_hex"])
 	h = h + p_type[:, ActionType.MELEE] * (_entropy(out["logp_melee_target"]) + _expect(out["logp_melee_target"], _entropy(out["logp_melee_from"])))
-	h = h + p_type[:, list(TARGET_TYPES)].sum(dim=-1) * _entropy(out["logp_shoot_target"])
+	h = h + p_type[:, constant(sorted(TARGET_TYPES), p_type.device)].sum(dim=-1) * _entropy(out["logp_shoot_target"])
 
 	# Per spell: entropy of its first target (one of the two rows is empty) plus, for
 	# two-target spells, the expected entropy of the second target given the first.
-	second_kind = _SECOND_KIND.to(out["logp_spell"].device)
+	second_kind = moved(_SECOND_KIND, out["logp_spell"].device)
 	h2_hex = _entropy(out["logp_spell2_hex"])  # [B, U]
 	h2_unit = _entropy(out["logp_spell2_unit"])
 	h2 = torch.where(second_kind[None, :, None] == TargetKind.HEX, h2_hex[:, None, :], torch.where(second_kind[None, :, None] == TargetKind.UNIT, h2_unit[:, None, :], 0.0))  # [B, S, U]

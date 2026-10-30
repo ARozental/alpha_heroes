@@ -39,6 +39,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from battle_model import play as battle_play
+from battle_model.device import use_fused
 from battle_model.inference import InferenceServer
 
 from . import constants as c
@@ -609,6 +610,7 @@ def _update_worker(config, kwargs, device_name, state, requests, results, latest
 	model.load_state_dict(state["model"])
 	if state.get("optimizer"):
 		optimizer.load_state_dict(state["optimizer"])
+	use_fused(optimizer)
 	lr_scale = state["lr_scale"]
 	while (request := requests.get()) is not None:
 		decisions, targets, returns, weights, about, advantages, growth, labels, end = request

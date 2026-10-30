@@ -13,6 +13,7 @@ import math
 import torch
 from torch.nn import functional as F
 
+from battle_model.device import constant, moved
 from battle_model.features import scales, signed_scales
 from battle_model.layers import vocab_index
 
@@ -284,8 +285,8 @@ def object_classes(x):
 	"""Each listed object's ObjectClass [B, MO] (-1 none): its type's, the OUR_ form of an owned class when it is ours,
 	VISITED once we visited it."""
 	obj = x["m_object"]
-	kind = CLASS_OF.to(obj.device)[vocab_index(obj, c.OBJECT_VOCAB)]
-	kind = torch.where(OWNED.to(obj.device)[kind] & (x["m_owner"] == c.OWNER_SELF), kind + 1, kind)
+	kind = moved(CLASS_OF, obj.device)[vocab_index(obj, c.OBJECT_VOCAB)]
+	kind = torch.where(moved(OWNED, obj.device)[kind] & (x["m_owner"] == c.OWNER_SELF), kind + 1, kind)
 	kind = torch.where(bit(x["m_flags"], c.OBJECT_VISITED_BY_PLAYER), torch.full_like(kind, int(c.ObjectClass.VISITED)), kind)
 	return torch.where(obj >= 0, kind, torch.full_like(kind, -1))
 
@@ -417,14 +418,14 @@ def skill_scores(x, main, t):
 	is_main = (main[rows, hero] & (x["d_hero"] >= 0)).unsqueeze(-1)
 	skill = x["o_type"].clamp(0, c.N_SECONDARY_SKILLS - 1)
 	is_skill = (x["o_kind"] == c.OptionKind.SKILL) & (x["o_type"] >= 0)
-	score = torch.where(is_main, MAIN_SKILL_SCORE.to(main.device)[skill], SCOUT_SKILL_SCORE.to(main.device)[skill])
+	score = torch.where(is_main, moved(MAIN_SKILL_SCORE, main.device)[skill], moved(SCOUT_SKILL_SCORE, main.device)[skill])
 	new = torch.gather(known, 1, skill) == 0
 	upgrades_left = ((3 - known) * (known > 0)).sum(dim=-1, keepdim=True)
 	score = score + 1.5 * (new & ((score >= 2) | ((score >= 1) & (upgrades_left <= 1)))).float()
 	level = torch.floor(fractional_level(x["h_exp"][rows, hero].clamp(min=0).float(), t.level_experience)).unsqueeze(-1)
 	wisdom = SKILLS.index("wisdom")
 	score = score + 1.5 * (is_main & (skill == wisdom) & (level > 10) & (known[:, wisdom : wisdom + 1] == 0)).float()
-	schools = torch.tensor([SKILLS.index(name) for name in SCHOOLS], device=main.device)
+	schools = constant([SKILLS.index(name) for name in SCHOOLS], main.device)
 	no_magic = ~(known[:, schools] > 0).any(dim=-1, keepdim=True)
 	score = score + (is_main & (skill[..., None] == schools).any(dim=-1) & no_magic).float()
 	return score * is_skill

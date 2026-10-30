@@ -65,6 +65,7 @@ from . import generator, play, rules
 from .data import collate, credit_check, make_dataloader, summarize
 from .distributions import log_prob
 from .export import export, verify
+from .device import sync, use_fused
 from .losses import AdvantageConfig, PPOConfig, ppo_loss, search_loss, value_excess, weighted_mean
 from .constants import N_ACTION_TYPES, ActionType
 from .model import VALUE_PRIOR_GAIN, VALUE_PRIOR_KINDS, VALUE_PRIOR_STEP, build_model
@@ -251,7 +252,7 @@ ACTION_KINDS = ("WAIT", "DEFEND", "MOVE", "MELEE", "SHOOT", "HERO_SPELL", "CREAT
 COLUMNS = [
 	"epoch", "attack_reward", "attack_outcome", "defence_reward", "defence_outcome", "mean_reward", "attack_raw_reward", "defence_raw_reward", "attack_win_rate", "defence_win_rate",
 	"decisions", "rounds", "policy_loss", "value_loss", "value_loss_fresh", "entropy", "below_floor", "approx_kl", "clip_fraction", "signal_ratio", "weight_change",
-	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds",
+	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds", "data_seconds", "prepass_seconds", "steps_seconds", "publish_seconds",
 ] + [f"{side}_share_{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS] + [
 	f"{side}_{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")
 ] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow", "learning_rate", "ppo_steps", "update_kl", "outcome_share", "round_head_weight"] + [
@@ -285,6 +286,9 @@ TENSORBOARD_TAGS = {
 	"attack_value_error": "value_error/attack", "defence_value_error": "value_error/defence",
 	"decisions": "battle/decisions", "rounds": "battle/rounds", "seconds": "time/epoch_seconds",
 	"wait_seconds": "time/waiting_for_battles_seconds", "train_seconds": "time/training_seconds",
+	# training_seconds' parts: the update's decisions collated onto the device, the passes before the steps (facts, the
+	# KL anchor, the fresh value loss), the PPO steps, the new weights published to the actors
+	**{f"{part}_seconds": f"time/{part}_seconds" for part in ("data", "prepass", "steps", "publish")},
 }
 
 
@@ -905,6 +909,7 @@ def train(config, resume=False):
 			if not (out / baseline.name).exists():
 				shutil.copy2(baseline, out / baseline.name)
 		print(f"starting from {source} (epoch {state['epoch']})")
+	use_fused(optimizer)
 	# (a run from another's checkpoint keeps its average only on a resume: a new run averages from its start)
 	average = WeightAverage(model, config.weight_average, *((state["average"], state["average_updates"]) if resume and "average" in state else ())) if config.weight_average else None
 
@@ -1099,6 +1104,7 @@ def train(config, resume=False):
 			model.train()
 			examples = loader.dataset
 			epoch_data = to_device(collate(examples), device) if examples else None  # every decision of the epoch, moved to the GPU once
+			marks = [time.time()]
 			# Every tensor shape on the GPU is fixed: MPS keeps a compiled graph per shape (~100 MB each, never freed), so
 			# a last batch of a new size every epoch filled memory and swap. The last chunk repeats its last decision;
 			# each pass leaves out its last partial batch (a different one each pass).
@@ -1123,6 +1129,8 @@ def train(config, resume=False):
 					epoch_data["anchor_log_prob"] = torch.cat(anchors)[: len(examples)]
 					fresh_value = float(weighted_mean(torch.cat(excess)[: len(examples)], epoch_data.get("weight")))
 					del anchors, excess, out_rows
+			sync(device)
+			marks.append(time.time())
 			stopped, update_kl, kl_sum, recent = False, 0.0, 0.0, deque(maxlen=KL_WINDOW)
 			kl_of = lambda out, rows: (lambda d: (d.exp() - 1 - d).mean())(log_prob(out, rows["action"]).detach() - rows["anchor_log_prob"])  # k3: KL(anchor || now)
 			for _ in range(config.ppo_passes if examples else 0):
@@ -1161,6 +1169,8 @@ def train(config, resume=False):
 							stopped = True  # this update has moved the policy far enough
 							break
 			model.eval()
+			sync(device)
+			marks.append(time.time())
 			if average and batches:
 				average.update(model)
 			if config.target_kl and batches:
@@ -1182,6 +1192,7 @@ def train(config, resume=False):
 				if not config.prefetch and epoch < config.epochs:
 					producer.start(epoch + 1, model_files[current])
 			train_seconds = time.time() - trained
+			marks.append(time.time())
 
 			by_side = [[s for s in summaries if s.our_side == side] for side in (0, 1)]
 			mean_of = lambda values: sum(values) / len(values) if values else float("nan")  # a side can be absent (generator: all battles against neutrals)
@@ -1203,6 +1214,7 @@ def train(config, resume=False):
 				"seconds": round(time.time() - started, 1),
 				"wait_seconds": round(waited, 1),
 				"train_seconds": round(train_seconds, 1),
+				**{f"{part}_seconds": round(b - a, 2) for part, a, b in zip(("data", "prepass", "steps", "publish"), [trained] + marks, marks)},
 				**{k: actor_stats.get(k, "") for k in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow")},
 				"learning_rate": round(optimizer.param_groups[0]["lr"], 8),
 				"ppo_steps": batches,

@@ -38,6 +38,7 @@ import torch
 
 from . import vocab
 from .constants import CREATURE_VOCAB, FIELD_WIDTH, N_HEXES
+from .device import constant, moved
 from .reward import WAR_MACHINE_CREATURES, resources_value
 
 # config/gameConfig.json "combat", in exact steps: attack over defence adds 1/20 a point (0.05), at most 80 points
@@ -286,7 +287,7 @@ WIDE_NEIGHBOURS = torch.stack([torch.tensor([[n for n in _wide[side](h)] for h i
 
 def neighbours(hexes):
 	"""[..., 6] the neighbours of hexes (any shape, -1 = none), -1 off the field."""
-	return torch.where(hexes[..., None] >= 0, NEIGHBOURS.to(hexes.device)[hexes.clamp(min=0)], -1)
+	return torch.where(hexes[..., None] >= 0, moved(NEIGHBOURS, hexes.device)[hexes.clamp(min=0)], -1)
 
 
 def available(hexes):
@@ -458,7 +459,7 @@ def reachability(x, me, flying):
 	queue_rank = torch.zeros_like(hexes)  # order in the search's queue within the current layer
 	around = neighbours(hexes)  # [B, H, 6]: the hexes a hex can be reached from
 	# Direction from neighbour k of h back to h: the opposite direction
-	back = torch.tensor([BOTTOM_RIGHT, BOTTOM_LEFT, LEFT, TOP_LEFT, TOP_RIGHT, RIGHT], device=hexes.device)
+	back = constant([BOTTOM_RIGHT, BOTTOM_LEFT, LEFT, TOP_LEFT, TOP_RIGHT, RIGHT], hexes.device)
 	never = N_HEXES * 6
 	for layer in range(MAX_PATH):
 		expands = (distance == layer) & ~stuck  # a hex in a moat or quicksand is reached but not left

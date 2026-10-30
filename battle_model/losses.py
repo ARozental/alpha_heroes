@@ -81,6 +81,7 @@ import torch
 import torch.nn.functional as F
 
 from .constants import N_VALUE_HORIZONS
+from .device import constant
 from .distributions import entropy, log_prob, log_prob_at
 
 
@@ -203,7 +204,7 @@ def value_loss(out, targets, config=PPOConfig(), weight=None):
 	"""
 	probabilities = ((targets + 1) / 2).clamp(0.0, 1.0)
 	per_head = weighted_mean(F.binary_cross_entropy_with_logits(2 * out["value_logit"], probabilities, reduction="none"), weight)
-	weights = torch.tensor(config.value_head_weights, dtype=per_head.dtype, device=per_head.device)
+	weights = constant(config.value_head_weights, per_head.device, per_head.dtype)
 	return (per_head * weights).sum() / weights.sum(), per_head.detach()
 
 
@@ -214,7 +215,7 @@ def value_excess(out, targets, config=PPOConfig()):
 	p = ((targets + 1) / 2).clamp(0.0, 1.0)
 	cross = F.binary_cross_entropy_with_logits(2 * out["value_logit"], p, reduction="none")
 	floor = -(torch.special.xlogy(p, p) + torch.special.xlogy(1 - p, 1 - p))
-	weights = torch.tensor(config.value_head_weights, dtype=cross.dtype, device=cross.device)
+	weights = constant(config.value_head_weights, cross.device, cross.dtype)
 	return ((cross - floor) * weights).sum(dim=-1) / weights.sum()
 
 
