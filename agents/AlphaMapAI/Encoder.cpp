@@ -613,7 +613,9 @@ void AlphaMapAI::encodeMap(Decision & decision, const std::vector<int3> & ours)
 		in.at(In::m_pos, i, 1) = pos.y;
 		in.at(In::m_pos, i, 2) = pos.z;
 		int64_t flags = obj->wasVisited(playerID) ? OBJECT_VISITED_BY_PLAYER : 0;
-		flags |= cb->guardingCreaturePosition(pos) != int3(-1, -1, -1) ? OBJECT_GUARDED : 0;
+		// (only on a tile we see: VCMI logs an error for each fogged one asked, ~2,300 lines in a game's first minute, 11%
+		// of a campaign client's CPU, 2026-10-30)
+		flags |= cb->isVisible(pos) && cb->guardingCreaturePosition(pos) != int3(-1, -1, -1) ? OBJECT_GUARDED : 0;
 		int64_t visitors = 0;
 		for(int h = 0; h < OWN_HEROES; ++h)
 			if(heroes[h] && obj->wasVisited(heroes[h]))

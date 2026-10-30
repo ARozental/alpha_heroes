@@ -1159,9 +1159,18 @@ def train(config, resume=False):
 			# a last batch of a new size every epoch filled memory and swap. The last chunk repeats its last decision;
 			# each pass leaves out its last partial batch (a different one each pass).
 			if epoch_data is not None and hasattr(model, "facts"):  # the features: once per decision, not once per pass
-				chunks = [model.facts(widened(select(epoch_data["inputs"], torch.arange(i, i + 256, device=device).clamp(max=len(examples) - 1)))) for i in range(0, len(examples), 256)]
-				epoch_data["facts"] = {key: torch.cat([c[key] for c in chunks])[: len(examples)] for key in chunks[0]}
-				del chunks  # its blocks would double the features' memory until the next update
+				# Filled in place, a chunk at a time: a torch.cat of the chunks held the features twice at its peak (several
+				# GB on Apple's GPU at ~3,200 decisions: the perf session's measurement, 2026-10-30)
+				facts = None
+				for i in range(0, len(examples), 256):
+					chunk = model.facts(widened(select(epoch_data["inputs"], torch.arange(i, i + 256, device=device).clamp(max=len(examples) - 1))))
+					if facts is None:
+						facts = {key: value.new_empty((len(examples),) + tuple(value.shape[1:])) for key, value in chunk.items()}
+					rows = min(256, len(examples) - i)
+					for key, value in chunk.items():
+						facts[key][i : i + rows] = value[:rows]
+					del chunk
+				epoch_data["facts"] = facts
 			fresh_value = float("nan")
 			if epoch_data is not None:
 				# The KL control's anchor: this update's actions under the model as the update starts. Measured against the
