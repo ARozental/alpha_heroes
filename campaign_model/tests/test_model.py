@@ -17,7 +17,7 @@ from campaign_model.records import IN_LAYOUT, Decision, Game
 from campaign_model.schema import empty_inputs, random_inputs
 from campaign_model.train import make_optimizer
 
-CASTLE, VILLAGE_HALL, DWELLING_1, PIKEMAN = 0, 10, 30, 0
+CASTLE, VILLAGE_HALL, DWELLING_1, PIKEMAN, HALBERDIER = 0, 10, 30, 0, 1
 WINDMILL, GOLD_MINE, TAVERN, UTOPIA = 112, 53, 95, 25
 
 
@@ -43,15 +43,24 @@ def test_phi_in_the_graph_is_the_ledgers_value(model):
 	x["t_available"][0, 0, 0], x["t_available_creature"][0, 0, 0] = 14, PIKEMAN
 	x["h_present"][0, 0], x["h_owner"][0, 0], x["h_detailed"][0, 0] = True, c.OWNER_SELF, True
 	x["h_exp"][0, 0], x["h_mana"][0, 0], x["h_spell_cost"][0, 0] = 5000, 20, 10
-	x["h_primary"][0, 0] = [1, 1, 2, 1]
+	x["h_primary"][0, 0] = x["h_primary_base"][0, 0] = [3, 2, 2, 1]
+	x["h_skills"][0, 0, [0, 1, 2]] = [2, 1, 1]
 	x["h_army_creature"][0, 0, 0], x["h_army_count"][0, 0, 0] = PIKEMAN, 10
 	x["h_artifacts"][0, 0, 0] = 7
+	# a scout: its skills count at SECONDARY_SHARE
+	x["h_present"][0, 1], x["h_owner"][0, 1], x["h_detailed"][0, 1] = True, c.OWNER_SELF, True
+	x["h_exp"][0, 1] = 1500
+	x["h_primary"][0, 1] = x["h_primary_base"][0, 1] = [1, 1, 2, 2]
+	x["h_skills"][0, 1, [3, 4, 5]] = [1, 1, 1]
 	x["g_owned_creature"][0, 0], x["g_owned_count"][0, 0] = PIKEMAN, 6  # left in a mine's garrison
 	x["g_dwelling_creature"][0, 0], x["g_dwelling_count"][0, 0] = PIKEMAN, 9  # for hire at a dwelling we flagged
 	player = {
 		"color": 0, "status": 0, "resources": [10, 4, 10, 4, 4, 4, 10000], "income": [0, 0, 0, 0, 0, 0, 1000], "explored": 100,
 		"towns": [{"faction": CASTLE, "built": [VILLAGE_HALL, DWELLING_1], "garrison": [[PIKEMAN, 5]], "available": [[PIKEMAN, 14]] + [[-1, 0]] * 6}],
-		"heroes": [{"type": 0, "level": 5, "exp": 5000, "mana": 20, "power": 2, "spell_cost": 10, "army": [[PIKEMAN, 10]], "artifacts": [7]}],
+		"heroes": [
+			{"type": 0, "level": 5, "exp": 5000, "mana": 20, "power": 2, "spell_cost": 10, "primary": [3, 2, 2, 1], "skills": [[0, 2], [1, 1], [2, 1]], "army": [[PIKEMAN, 10]], "artifacts": [7]},
+			{"type": 1, "level": 2, "exp": 1500, "mana": 0, "power": 2, "spell_cost": 0, "primary": [1, 1, 2, 2], "skills": [[3, 1], [4, 1], [5, 1]], "army": [], "artifacts": []},
+		],
 		"dwellings": [{"available": [[PIKEMAN, 9]]}], "armies": [[PIKEMAN, 6]],
 	}
 	expected = empire_value(player)
@@ -62,12 +71,43 @@ def test_phi_in_the_graph_is_the_ledgers_value(model):
 		assert value == pytest.approx(expected[name], rel=1e-4, abs=1e-3), name
 
 
+def test_a_hire_in_the_graph_adds_what_empire_value_adds(model):
+	"""features.tavern_worth (before the price and the crowding) is the change of empire.py's value when the hero for
+	hire joins us, with its army, artifacts and skills (weighed against our strongest hero's)."""
+	from campaign_model.empire import empire_value as ledger_value
+
+	hero = {"type": 0, "level": 3, "exp": 2500, "mana": 0, "power": 1, "spell_cost": 0, "primary": [2, 2, 1, 1], "skills": [[0, 1], [1, 2]], "army": [[PIKEMAN, 10]], "artifacts": []}
+	for tavern_skills, tavern_exp in (([[6, 1], [7, 1]], 0), ([[6, 3], [7, 3], [8, 2]], 9000)):  # weaker, then stronger than ours
+		x = empty_inputs(1)
+		x["h_present"][0, 0], x["h_owner"][0, 0], x["h_detailed"][0, 0] = True, c.OWNER_SELF, True
+		x["h_exp"][0, 0] = 2500
+		x["h_primary"][0, 0] = x["h_primary_base"][0, 0] = [2, 2, 1, 1]
+		x["h_skills"][0, 0, [0, 1]] = [1, 2]
+		x["h_army_creature"][0, 0, 0], x["h_army_count"][0, 0, 0] = PIKEMAN, 10
+		x["g_tavern"][0, 0], x["g_tavern_exp"][0, 0] = 5, tavern_exp
+		x["g_tavern_primary"][0, 0] = [1, 2, 1, 1]
+		for skill, level in tavern_skills:
+			x["g_tavern_skills"][0, 0, skill] = level
+		x["g_tavern_army_creature"][0, 0, :2], x["g_tavern_army_count"][0, 0, :2] = [PIKEMAN, HALBERDIER], [12, 4]
+		x["g_tavern_artifacts"][0, 0, 13] = 4  # a ballista
+		before = {"color": 0, "status": 0, "resources": [0] * 7, "income": [0] * 7, "explored": 0, "towns": [], "heroes": [hero], "dwellings": [], "armies": []}
+		hired = {"type": 5, "level": 1, "exp": tavern_exp, "mana": 0, "power": 1, "spell_cost": 0, "primary": [1, 2, 1, 1], "skills": tavern_skills, "army": [[PIKEMAN, 12], [HALBERDIER, 4]], "artifacts": [4]}
+		after = dict(before, heroes=[hero, hired])
+		with torch.no_grad():
+			worth = ft.tavern_worth(tensors(x), model.features)
+		crowding = ledger_value(after)["hero_penalty"] - ledger_value(before)["hero_penalty"]
+		assert float(worth[0, 0]) == pytest.approx(ledger_value(after)["total"] - ledger_value(before)["total"] - crowding, rel=1e-4)
+		assert float(worth[0, 1]) == 0  # an empty slot
+
+
 def window_with(obj, subtype=0, flags=0, owner=c.OWNER_NONE):
 	"""One hero of ours, a revealed window, one object two tiles east of it."""
 	x = empty_inputs(1)
 	x["g_kind"][0], x["g_day"][0], x["g_map"][0] = c.DecisionKind.TURN, 1, [36, 36, 1]
 	x["h_present"][0, 0], x["h_owner"][0, 0], x["h_detailed"][0, 0] = True, c.OWNER_SELF, True
 	x["h_pos"][0, 0] = [10, 10, 0]
+	x["h_primary"][0, 0] = x["h_primary_base"][0, 0] = [1, 1, 1, 2]  # a fresh hero's (empire.py: its skills worth 0)
+	x["h_skills"][0, 0, [0, 1]] = [1, 1]
 	x["h_move"][0, 0] = x["h_move_max"][0, 0] = 1500
 	x["h_army_creature"][0, 0, 0], x["h_army_count"][0, 0, 0] = PIKEMAN, 10
 	x["w_flags"][0, 0] = c.TILE_ON_MAP | c.TILE_REVEALED

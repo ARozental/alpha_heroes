@@ -7,8 +7,8 @@
 
 namespace MapSchema
 {
-constexpr int SCHEMA_VERSION = 6;
-constexpr const char * CONTRACT_HASH = "c7867e7f15ad2541";
+constexpr int SCHEMA_VERSION = 7;
+constexpr const char * CONTRACT_HASH = "1f414549146f16ad";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;
@@ -165,6 +165,12 @@ enum class In : int
 	g_markets,
 	g_tavern,
 	g_tavern_level,
+	g_tavern_exp,
+	g_tavern_primary,
+	g_tavern_skills,
+	g_tavern_army_creature,
+	g_tavern_army_count,
+	g_tavern_artifacts,
 	d_hero,
 	d_object,
 	d_subtype,
@@ -181,6 +187,7 @@ enum class In : int
 	h_level,
 	h_exp,
 	h_primary,
+	h_primary_base,
 	h_mana,
 	h_mana_max,
 	h_spell_cost,
@@ -275,6 +282,12 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"g_markets", DType::INT64, 0, {1, 1, 1, 1}, 0},
 	TensorSpec{"g_tavern", DType::INT64, 1, {2, 1, 1, 1}, -1},
 	TensorSpec{"g_tavern_level", DType::INT64, 1, {2, 1, 1, 1}, 0},
+	TensorSpec{"g_tavern_exp", DType::INT64, 1, {2, 1, 1, 1}, 0},
+	TensorSpec{"g_tavern_primary", DType::INT64, 2, {2, 4, 1, 1}, 0},
+	TensorSpec{"g_tavern_skills", DType::INT64, 2, {2, 28, 1, 1}, 0},
+	TensorSpec{"g_tavern_army_creature", DType::INT64, 2, {2, 7, 1, 1}, -1},
+	TensorSpec{"g_tavern_army_count", DType::INT64, 2, {2, 7, 1, 1}, 0},
+	TensorSpec{"g_tavern_artifacts", DType::INT64, 2, {2, 19, 1, 1}, -1},
 	TensorSpec{"d_hero", DType::INT64, 0, {1, 1, 1, 1}, -1},
 	TensorSpec{"d_object", DType::INT64, 0, {1, 1, 1, 1}, -1},
 	TensorSpec{"d_subtype", DType::INT64, 0, {1, 1, 1, 1}, 0},
@@ -291,6 +304,7 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"h_level", DType::INT64, 1, {16, 1, 1, 1}, 0},
 	TensorSpec{"h_exp", DType::INT64, 1, {16, 1, 1, 1}, 0},
 	TensorSpec{"h_primary", DType::INT64, 2, {16, 4, 1, 1}, 0},
+	TensorSpec{"h_primary_base", DType::INT64, 2, {8, 4, 1, 1}, 0},
 	TensorSpec{"h_mana", DType::INT64, 1, {16, 1, 1, 1}, 0},
 	TensorSpec{"h_mana_max", DType::INT64, 1, {16, 1, 1, 1}, 0},
 	TensorSpec{"h_spell_cost", DType::INT64, 1, {16, 1, 1, 1}, 0},

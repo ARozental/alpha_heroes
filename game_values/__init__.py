@@ -6,13 +6,14 @@ does, so it is expected to make most of the later changes here; every change mov
 	creatures      their recruit cost at those prices (vocab.json)
 	artifacts      their price in the game's artifact table (ARTRAITS, vocab.json)
 	war machines   half their price (ballista, ammo cart, first aid tent), the catapult and arrow towers 0
-	hero levels    LEVEL_VALUE x (level - FREE_LEVELS) ^ LEVEL_EXPONENT: 2500 x (L - 3) ^ 1.3; levels 1-3 are free
-	               (a fresh hero's hire price buys it with a few creatures), level 4 2500, 10 ~31 600, 20 ~100 000
+	hero levels    a level-up from level L is worth LEVEL_VALUE x min(L, LEVEL_STEPS): 2000, 4000, then 6000 each;
+	               level 2 2000, 3 6000, 4 12 000, 10 48 000, 20 108 000 (hero_level_value)
 	mana           battle: MANA_VALUE x spell power x mana;
 	               campaign: the same, but only of the mana a hero can spend in a short battle (capped_mana_value)
 
 The tables are the engine's (battle_model/artifacts/vocab.json, scripts/export_vocab.sh); nothing here is trained.
 """
+import math
 
 # config/resources.json "price", in VCMI's resource order
 RESOURCE_PRICES = {"wood": 250, "mercury": 500, "ore": 250, "sulfur": 500, "crystal": 500, "gems": 500, "gold": 1}
@@ -22,9 +23,10 @@ HERO_HIRE_COST = 2500
 # GameConstants::SPELLBOOK_GOLD_COST: a spellbook in a town with a mage guild
 SPELLBOOK_GOLD_COST = 500
 
-LEVEL_VALUE = 2500.0
-FREE_LEVELS = 3.0
-LEVEL_EXPONENT = 1.3
+# Hero levels (the user, 2026-10-29: every level counts, so the main hero grows; levels 1-3 had been free, and no hero of
+# the campaign gained one): the first level-up's worth, and how many level-ups each add that much again
+LEVEL_VALUE = 2000.0
+LEVEL_STEPS = 3
 # Gold per mana point per point of spell power. At 2, a power-5 hero's 50 mana is worth 500 gold
 MANA_VALUE = 2.0
 # The battle the campaign prices mana for: a hero casts at most once a round
@@ -38,9 +40,20 @@ def resources_value(resources):
 	return sum(RESOURCE_PRICES[name] * amount for name, amount in zip(RESOURCE_ORDER, resources))
 
 
-def hero_level_value(level, level_value=LEVEL_VALUE, free_levels=FREE_LEVELS, level_exponent=LEVEL_EXPONENT):
-	"""What a hero's levels are worth; level counts its way to the next level (12.5: halfway to 13)."""
-	return level_value * max(0.0, level - free_levels) ** level_exponent
+def hero_level_value(level, level_value=LEVEL_VALUE, level_steps=LEVEL_STEPS):
+	"""What a hero's levels are worth: the level-up from level L to L + 1 is worth level_value x min(L, level_steps),
+	2000, 4000, then 6000 each (level 2 2000, 3 6000, 4 12000, 10 48000, 20 108000); level counts its way to the next
+	(12.5: halfway to 13), each experience point of a level worth the same. Over the experience each level takes, that
+	is 2 gold a point at level 1, 4-5 at levels 2-4, falling under 2 from level 11 (a treasure chest's 1000 gold against
+	500 experience: experience for a young hero, gold for a seasoned one). A lone level-2 hero (2000) is worth less than
+	a hire (2500), so it is not worth a retreat; a level-3 one is."""
+	if level <= 1:
+		return 0.0
+	whole = math.floor(level)
+	done = whole - 1  # the level-ups made
+	steps = min(done, level_steps)
+	made = steps * (steps + 1) / 2 + level_steps * (done - steps)
+	return level_value * (made + (level - whole) * min(whole, level_steps))
 
 
 def fractional_level(experience, levels_experience):

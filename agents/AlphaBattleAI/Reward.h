@@ -30,10 +30,15 @@ struct BattleEnd
 	std::array<double, 2> artifacts{}; // the price of the artifacts a winner would take from each side's hero
 };
 
-/// reward.py hero_level_value
+/// game_values.hero_level_value: the level-up from level L is worth LEVEL_VALUE x min(L, LEVEL_STEPS)
 inline double heroLevelValue(double level)
 {
-	return LEVEL_VALUE * std::pow(std::max(0.0, level - FREE_LEVELS), LEVEL_EXPONENT);
+	if(level <= 1)
+		return 0.0;
+	const double whole = std::floor(level);
+	const double done = whole - 1; // the level-ups made
+	const double steps = std::min(done, LEVEL_STEPS);
+	return LEVEL_VALUE * (steps * (steps + 1) / 2 + LEVEL_STEPS * (done - steps) + (level - whole) * std::min(whole, LEVEL_STEPS));
 }
 
 /// reward.py mana_value

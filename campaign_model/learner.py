@@ -55,7 +55,7 @@ from .maps import GAME_MAPS
 from .model import CampaignModel
 from .play import make_map, play
 from .records import NO_EFFECT, decode_inputs
-from .train import make_optimizer, model_kwargs, ppo_update, usable
+from .train import load_optimizer, make_optimizer, model_kwargs, ppo_update, usable
 
 TYPES = [a.name.lower() for a in c.ActionType]
 COLUMNS = [
@@ -100,7 +100,7 @@ class CampaignLearner:
 			self.optimizer = make_optimizer(self.model, config)
 			self.model.load_state_dict(state["model"])
 			if "optimizer" in state:
-				self.optimizer.load_state_dict(state["optimizer"])
+				load_optimizer(self.optimizer, self.model, state["optimizer"], state["model"].keys())
 			self.version, self.lr_scale, self.games_used = state["version"], state.get("lr_scale", 1.0), state.get("games_used", 0)
 			self.value_ev = state.get("value_ev")
 			self.credit_evidence = state.get("credit_evidence", {})

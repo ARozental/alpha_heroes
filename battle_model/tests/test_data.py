@@ -185,6 +185,7 @@ def test_war_machines_in_the_campaign_are_half_their_price():
 	from game_values import artifact_price
 
 	prices = artifact_prices()
-	assert (prices[3], prices[4], prices[5], prices[6], prices[0], prices[2]) == (0, 1250, 500, 375, 0, 0)  # catapult, ballista, cart, tent; spellbook, Grail
-	assert all(artifact_price(a) == prices[a] for a in (0, 2, 3, 4, 5, 6, 7))
+	assert (prices[3], prices[4], prices[5], prices[6], prices[0], prices[2]) == (0, 1250, 500, 375, 500, 0)  # catapult, ballista, cart, tent; spellbook, Grail
+	assert all(artifact_price(a) == prices[a] for a in (2, 3, 4, 5, 6, 7))
+	assert artifact_price(0) == 0  # the battle's: a winner never takes a spellbook (the campaign's: its price, 2026-10-29)
 	assert prices[4] == vocab.artifact_price(4) / 2 and prices[6] == vocab.artifact_price(6) / 2

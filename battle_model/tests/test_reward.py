@@ -13,13 +13,13 @@ def test_resource_prices():
 	assert resources_value({"wood": 2, "ore": 2}) == 1000
 
 
-def test_a_hero_is_worth_its_levels_above_the_first_few_and_its_artifacts():
-	assert hero_level_value(1) == 0 == hero_level_value(3)  # a fresh hero's hire price covers the first levels
-	assert hero_level_value(4) == 2500
-	assert 31_000 < hero_level_value(10) < 32_000 and 99_000 < hero_level_value(20) < 101_000  # more than linear
-	assert hero_level_value(10) / 7 < hero_level_value(20) / 17  # each level is worth more than the one before
-	assert hero_level_value(12.5) == pytest.approx(2500 * 9.5 ** 1.3)  # halfway to 13
-	assert hero_asset(4, 7000) == 9500
+def test_a_hero_is_worth_its_levels_and_its_artifacts():
+	"""(the user, 2026-10-29) Every level counts: the level-up from level L is worth 2000 x min(L, 3)."""
+	assert hero_level_value(1) == 0
+	assert [hero_level_value(level) for level in (2, 3, 4, 5, 10, 20)] == [2000, 6000, 12000, 18000, 48000, 108000]
+	assert hero_level_value(2) < 2500 < hero_level_value(3)  # a lone level-2 hero is not worth a retreat's rehire; a level-3 one is
+	assert hero_level_value(12.5) == pytest.approx(60000 + 0.5 * 6000)  # halfway to 13
+	assert hero_asset(4, 7000) == 19000
 
 
 def test_the_winner_over_a_hero_takes_its_artifacts():

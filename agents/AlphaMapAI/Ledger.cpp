@@ -115,6 +115,18 @@ std::string ledgerJson(const CGameState & gs, int day, bool final)
 						dearest = std::max(dearest, hero->getSpellCost(spell));
 				}
 			h["spell_cost"].Integer() = dearest;
+			// The hero's own skills (campaign_model/empire.py prices them): its primary skills without items or temporary
+			// bonuses (its artifacts are priced apart), and its secondary skills with their levels
+			h["primary"].Vector();
+			for(int k = 0; k < 4; ++k)
+				h["primary"].Vector().push_back(number(hero->getBasePrimarySkillValue(PrimarySkill(k))));
+			h["skills"].Vector();
+			for(const auto & [skill, level] : hero->secSkills)
+			{
+				JsonNode pair;
+				pair.Vector() = {number(skill.getNum()), number(level)};
+				h["skills"].Vector().push_back(pair);
+			}
 			h["army"] = stacks(*hero);
 			h["artifacts"].Vector();
 			for(const auto & [position, slot] : hero->artifactsWorn)

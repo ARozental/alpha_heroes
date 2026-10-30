@@ -726,10 +726,18 @@ def hero_levels(x):
 	return (x["h_level"].float() + x["h_level_progress"].float() / 1000) * (x["h_present"] != 0)
 
 
+def level_value(levels, value, steps):
+	"""game_values.hero_level_value of fractional levels [...] (0 for none and for level 1): the level-up from level L
+	worth value x min(L, steps)."""
+	whole = levels.floor()
+	done = (whole - 1).clamp(min=0)
+	made = done.clamp(max=steps)
+	return value * (made * (made + 1) / 2 + steps * (done - made) + (levels - whole) * whole.clamp(0, steps)) * (levels > 1)
+
+
 def hero_assets(x, config):
 	"""[B, side]: reward.hero_asset of each hero as the inputs show it (the enemy's level and artifacts hidden: 0)."""
-	levels = hero_levels(x)
-	return config.level_value * (levels - config.free_levels).clamp(min=0) ** config.level_exponent + x["h_artifacts"].float() * (x["h_present"] != 0)
+	return level_value(hero_levels(x), config.level_value, config.level_steps) + x["h_artifacts"].float() * (x["h_present"] != 0)
 
 
 # ---- Per action ----

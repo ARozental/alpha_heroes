@@ -369,10 +369,9 @@ enum class Outcome : int
 };
 
 constexpr double MANA_VALUE = 2.0; // gold per mana point per point of spell power
-/// A hero's levels: LEVEL_VALUE x (level - FREE_LEVELS) ^ LEVEL_EXPONENT (reward.py hero_level_value)
-constexpr double LEVEL_VALUE = 2500.0;
-constexpr double FREE_LEVELS = 3.0;
-constexpr double LEVEL_EXPONENT = 1.3;
+/// A hero's levels: the level-up from level L is worth LEVEL_VALUE x min(L, LEVEL_STEPS) (game_values.hero_level_value)
+constexpr double LEVEL_VALUE = 2000.0;
+constexpr double LEVEL_STEPS = 3.0;
 constexpr int HERO_HIRE_COST = 2500;
 /// Gold value of one unit of each resource, in VCMI's order: wood, mercury, ore, sulfur, crystal, gems, gold
 constexpr std::array<int, 7> RESOURCE_PRICES = {250, 500, 250, 500, 500, 500, 1};

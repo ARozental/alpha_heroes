@@ -54,6 +54,14 @@ INPUTS = (
 	_i("g_markets", (), "our marketplaces (trade rates improve with each)"),
 	_i("g_tavern", (c.N_TAVERN,), "hero types for hire, -1 none", fill=-1),
 	_i("g_tavern_level", (c.N_TAVERN,), "their levels"),
+	# What a hire brings (the user, 2026-10-29: the model saw only the type and level, not the army a hero for hire comes
+	# with, the week's two heroes a full one, the others a lone creature): the experience, army and worn artifacts
+	_i("g_tavern_exp", (c.N_TAVERN,), "their experience"),
+	_i("g_tavern_primary", (c.N_TAVERN, c.N_PRIMARY), "their primary skills (without items)"),
+	_i("g_tavern_skills", (c.N_TAVERN, c.N_SECONDARY_SKILLS), "their secondary skills' levels (0 none, 1-3)"),
+	_i("g_tavern_army_creature", (c.N_TAVERN, A), "the creatures each comes with, -1 none", fill=-1),
+	_i("g_tavern_army_count", (c.N_TAVERN, A), "how many"),
+	_i("g_tavern_artifacts", (c.N_TAVERN, c.N_WORN_SLOTS), "the artifact worn in each slot (a spellbook, war machines among them), -1 none", fill=-1),
 	# The question asked (dialog kinds)
 	_i("d_hero", (), "our hero the question is about (index into the hero tokens), -1 none", fill=-1),
 	_i("d_object", (), "object type at that hero's tile or target, -1 none", fill=-1),
@@ -72,6 +80,7 @@ INPUTS = (
 	_i("h_level", (H,), "level"),
 	_i("h_exp", (H,), "experience"),
 	_i("h_primary", (H, c.N_PRIMARY), "attack, defense, spell power, knowledge"),
+	_i("h_primary_base", (HO, c.N_PRIMARY), "our heroes' primary skills without items or temporary bonuses (empire.py prices them)"),
 	_i("h_mana", (H,), "mana"),
 	_i("h_mana_max", (H,), "mana limit"),
 	_i("h_spell_cost", (H,), "mana cost of the dearest combat spell it can cast (ours), 0 none: what its mana is worth"),

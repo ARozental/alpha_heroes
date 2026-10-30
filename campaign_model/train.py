@@ -154,6 +154,34 @@ def make_optimizer(model, config=CampaignConfig()):
 	return torch.optim.AdamW([{"params": rest, "weight_decay": 0.0}, {"params": corrections, "weight_decay": config.prior_decay}], lr=config.learning_rate)
 
 
+def load_optimizer(optimizer, model, saved, saved_keys):
+	"""The optimizer's state from a checkpoint (saved: its state_dict; saved_keys: its model's state_dict keys). A model
+	that has gained parameters since (schema 7: hire_worth) keeps Adam's moments for the ones it had, matched by name
+	within each group, and starts the new ones fresh."""
+	names = {id(p): name for name, p in model.named_parameters()}
+	groups = [[names[id(p)] for p in group["params"]] for group in optimizer.param_groups]
+	if all(len(g) == len(s["params"]) for g, s in zip(groups, saved["param_groups"])):
+		optimizer.load_state_dict(saved)
+		return
+	saved_keys = set(saved_keys)
+	state, param_groups, index = {}, [], 0
+	for group, saved_group in zip(groups, saved["param_groups"]):
+		had = [name for name in group if name in saved_keys]  # the checkpoint's parameters, in its order
+		if len(had) != len(saved_group["params"]):
+			raise ValueError(f"the checkpoint's optimizer group has {len(saved_group['params'])} parameters, its model {len(had)}")
+		old = dict(zip(had, saved_group["params"]))
+		ids = []
+		for name in group:
+			if name in old and old[name] in saved["state"]:
+				state[index] = saved["state"][old[name]]
+			ids.append(index)
+			index += 1
+		param_groups.append({**saved_group, "params": ids})
+	optimizer.load_state_dict({"state": state, "param_groups": param_groups})
+	fresh = [name for group in groups for name in group if name not in saved_keys]
+	print(f"campaign optimizer: Adam's moments kept, fresh for the new parameters: {', '.join(fresh)}", flush=True)
+
+
 def value_fit(predicted, actual):
 	"""The 7-day head's fit, both off the share prior: the correlation of its forecasts with what then happened, and each
 	one's spread (std): a negative explained variance is noise (correlation ~0) or overconfidence (correlation > 0,

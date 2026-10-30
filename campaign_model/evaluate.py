@@ -26,7 +26,7 @@ import numpy as np
 
 from battle_model import play as battle_play
 
-from .empire import STATUS_INGAME, STATUS_LOST, EmpireConfig, empire_value
+from .empire import EMPIRE_VERSION, STATUS_INGAME, STATUS_LOST, EmpireConfig, empire_value
 from .failures import NAMES as FAILURES, failure_counts, failure_modes
 from .labels import COLORS, share_at, share_table
 from .play import make_map, play
@@ -105,7 +105,7 @@ def evaluate(config, server, battle, version, epoch, stop=None):
 				server.socket_for(i), name, config.eval_days, seed, max_seconds=config.eval_seconds, battle_ai="BattleAI", game_key=f"e{i}",
 				settings=battle.eval_settings(i), temperature=config.eval_temperature, ours=(color,), stop=stop,
 			)
-			results[i] = {**score(game, color, players, config.eval_days), "setup": i, "seed": seed, "map": name, "color": color, "temperature": config.eval_temperature, "status": info.status, "seconds": round(info.seconds, 1), "failures": failure_counts(game.decisions)}
+			results[i] = {**score(game, color, players, config.eval_days), "setup": i, "seed": seed, "map": name, "color": color, "temperature": config.eval_temperature, "empire": EMPIRE_VERSION, "status": info.status, "seconds": round(info.seconds, 1), "failures": failure_counts(game.decisions)}
 			if info.status.startswith("stopped at day") or "exit code 0" in info.status:
 				shutil.rmtree(info.run_dir, ignore_errors=True)  # (a failed game's logs are kept)
 		except Exception as error:  # left out of the score, counted
@@ -164,8 +164,10 @@ def earlier_evals(path):
 def log(row, path, writer=None):
 	"""Append the row to path (eval.csv) and each game's results to eval_games.jsonl next to it; first its paired
 	differences with the previous eval and the first (vs_previous, vs_first)."""
-	# (only evals played the same way: an eval's own sampling at another temperature is another measure, not a change)
-	same = lambda games: games[0].get("temperature", 1.0) == row.get("per_game", [{}])[0].get("temperature", 1.0) if games and row.get("per_game") else False  # noqa: E731
+	# (only evals that measure the same thing: another temperature's own sampling, or another version of Φ, whose shares
+	# are the score, is another measure, not a change)
+	measure = lambda game: (game.get("temperature", 1.0), game.get("empire", 1))  # noqa: E731
+	same = lambda games: measure(games[0]) == measure(row["per_game"][0]) if games and row.get("per_game") else False  # noqa: E731
 	everything = list(earlier_evals(path.with_name("eval_games.jsonl")).values())
 	evals = [games for games in everything if same(games)]
 	row["vs_previous"], row["vs_previous_se"] = paired(row.get("per_game", []), evals[-1]) if evals else (float("nan"), float("nan"))

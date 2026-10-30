@@ -63,7 +63,11 @@ def experience_table():
 
 @lru_cache(maxsize=None)
 def artifact_prices():
-	"""artifact id -> its worth as an asset (game_values.artifact_price: spellbook and Grail 0, war machines half)."""
-	from game_values import UNVALUED_ARTIFACTS, WAR_MACHINE_ARTIFACTS
+	"""artifact id -> its worth as an asset (game_values.artifact_price: war machines half, the Grail 0), the spellbook
+	(artifact 0) at its price."""
+	from game_values import SPELLBOOK_GOLD_COST, UNVALUED_ARTIFACTS, WAR_MACHINE_ARTIFACTS
 
-	return {row["id"]: WAR_MACHINE_ARTIFACTS.get(row["id"], 0 if row["id"] in UNVALUED_ARTIFACTS else row["price"]) for row in raw()["artifacts"]}
+	# A hero's spellbook at its price in Φ (the user, 2026-10-29: a tavern hero's spellbook counts; the battle reward's
+	# artifacts are what a winner takes, which a spellbook never is: game_values.UNVALUED_ARTIFACTS)
+	prices = {0: SPELLBOOK_GOLD_COST}  # (artifact 0: the spellbook)
+	return {row["id"]: prices.get(row["id"], WAR_MACHINE_ARTIFACTS.get(row["id"], 0 if row["id"] in UNVALUED_ARTIFACTS else row["price"])) for row in raw()["artifacts"]}

@@ -60,14 +60,10 @@ class RewardConfig:
 	# Gold per mana point per point of spell power. Fixed for now; later from outside (the campaign: a Magic Well
 	# nearby makes mana worth ~0). At 2, a power-5 hero's 50 mana is worth 500 gold: ~3% of a week-1 army.
 	mana_value: float = game_values.MANA_VALUE
-	# A hero's levels (hero_level_value): level_value x (levels above free_levels) ^ level_exponent. A fresh hero (its
-	# hire price buys it with a few creatures) and one of the first levels is worth nothing beyond that; a level is
-	# worth about a hire price; and more than linear, as a high level also stands for the shrines, skills and
-	# specialty growth a hero collects, though far from the experience the levels take (which grows 20% a level).
-	# 2500 x (L - 3) ^ 1.3: level 4 2500, 10 ~31 600, 20 ~100 000, 30 ~181 000.
+	# A hero's levels (game_values.hero_level_value): the level-up from level L worth level_value x min(L, level_steps),
+	# 2000, 4000, then 6000 each: level 2 2000, 3 6000, 4 12000, 10 48000, 20 108000
 	level_value: float = game_values.LEVEL_VALUE
-	free_levels: float = game_values.FREE_LEVELS
-	level_exponent: float = game_values.LEVEL_EXPONENT
+	level_steps: int = game_values.LEVEL_STEPS
 
 
 def stack_value(unit_cost, count):
@@ -80,7 +76,7 @@ def mana_value(mana, power, config=RewardConfig()):
 
 def hero_level_value(level, config=RewardConfig()):
 	"""What a hero's levels are worth (RewardConfig): level counts its way to the next level (12.5: halfway to 13)."""
-	return game_values.hero_level_value(level, config.level_value, config.free_levels, config.level_exponent)
+	return game_values.hero_level_value(level, config.level_value, config.level_steps)
 
 
 def hero_asset(level, artifacts, config=RewardConfig()):

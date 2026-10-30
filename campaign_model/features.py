@@ -16,6 +16,7 @@ from torch.nn import functional as F
 from battle_model.device import constant, moved
 from battle_model.features import scales, signed_scales
 from battle_model.layers import vocab_index
+from game_values import HERO_HIRE_COST as HERO_GOLD_COST
 
 from . import constants as c
 from .schema import HEADS, SPECS
@@ -121,21 +122,89 @@ def fractional_level(experience, table):
 	return level.float() + way.clamp(0, 1)
 
 
-def level_value(level):
-	"""What a hero's levels are worth (game_values.hero_level_value): levels 1-3 free, then 2500 x (L - 3)^1.3."""
-	return 2500.0 * torch.relu(level - 3.0) ** 1.3
+def next_level_gain(primary, t):
+	"""What a hero's next level-up brings in Φ (empire.py skill_value) [...]: a primary point (the next past those it
+	has), a secondary skill level, the level's bonus. primary [..., 4] without items."""
+	points = primary.clamp(min=0).sum(dim=-1).float()
+	return t.primary_point * (points - t.primary_base + 1).clamp(min=0) + t.skill_level + t.level_bonus
 
 
-def experience_value(experience, gained, t):
-	"""What gaining experience is worth to a hero in Φ: the value of the levels it reaches."""
-	return level_value(fractional_level(experience + gained, t.level_experience)) - level_value(fractional_level(experience, t.level_experience))
+def skill_value(primary, skills, experience, t):
+	"""empire.skill_value of heroes [...]: primary [..., 4] without items, skills [..., N_SECONDARY_SKILLS] levels,
+	experience [...]."""
+	points = primary.clamp(min=0).sum(dim=-1).float()
+	extra = (points - t.primary_base).clamp(min=0)
+	level = fractional_level(experience.clamp(min=0).float(), t.level_experience)
+	whole = level.floor()
+	levels = skills.clamp(min=0).sum(dim=-1).float()
+	return t.skill_level * (levels - t.fresh_skill_levels) + t.primary_point * extra * (extra + 1) / 2 + t.level_bonus * (whole - 1).clamp(min=0) + (level - whole) * next_level_gain(primary, t)
+
+
+def main_hero(values, present):
+	"""[B, H] bool: the strongest present hero (the most skill_value; the first of equals), empire.heroes_value's."""
+	best = values.masked_fill(~present, float("-inf")).argmax(dim=-1, keepdim=True)
+	return (torch.arange(values.shape[-1], device=values.device) == best) & present
+
+
+def heroes_value(values, present, t):
+	"""empire.heroes_value [B]: HERO_BASE each, the strongest hero's skill_value (values [B, H]) in full, the others' at
+	SECONDARY_SHARE."""
+	weight = torch.where(main_hero(values, present), torch.ones_like(values), torch.full_like(values, t.secondary_share))
+	return (t.hero_base + weight * values).mul(present.float()).sum(dim=-1)
+
+
+def own_skill_values(x, t):
+	"""Our heroes' skill_value [B, HO] and which are present [B, HO]."""
+	present = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
+	return skill_value(x["h_primary_base"], x["h_skills"][:, :HO], x["h_exp"][:, :HO], t), present
+
+
+def level_gains(x, t):
+	"""What each hero of ours gains in Φ for a level of experience [B, HO]: its next level-up, at its weight (the
+	strongest hero's in full, the others' at SECONDARY_SHARE)."""
+	values, present = own_skill_values(x, t)
+	weight = torch.where(main_hero(values, present), torch.ones_like(values), torch.full_like(values, t.secondary_share))
+	return weight * next_level_gain(x["h_primary_base"], t) * present
+
+
+def experience_value(experience, gained, level_gain, t):
+	"""What gaining experience is worth to a hero in Φ: the levels it makes at the hero's level_gains (each a level-up's
+	worth: a fight's experience rarely makes more than one or two)."""
+	return (fractional_level(experience + gained, t.level_experience) - fractional_level(experience, t.level_experience)) * level_gain
 
 
 def hero_worth(x, t):
-	"""Each hero's own worth in Φ [B, H]: its levels and its artifacts (ours; others: none seen)."""
-	artifacts = torch.cat([x["h_artifacts"], x["h_backpack"]], dim=-1)
+	"""Each hero of ours' own worth in Φ [B, HO]: HERO_BASE, its skill_value at its weight (the strongest hero's in full,
+	the others' at SECONDARY_SHARE) and its artifacts."""
+	values, present = own_skill_values(x, t)
+	weight = torch.where(main_hero(values, present), torch.ones_like(values), torch.full_like(values, t.secondary_share))
+	artifacts = torch.cat([x["h_artifacts"][:, :HO], x["h_backpack"][:, :HO]], dim=-1)
 	carried = (t.artifact_price[vocab_index(artifacts, c.ARTIFACT_VOCAB)] * (artifacts >= 0)).sum(dim=-1)
-	return level_value(fractional_level(x["h_exp"].clamp(min=0).float(), t.level_experience)) + carried
+	return (t.hero_base + weight * values + carried) * present
+
+
+def tavern_worth(x, t):
+	"""What hiring each hero for hire would add to Φ [B, N_TAVERN] (gold), before its price and the crowding: the
+	heroes part's change (empire.heroes_value: HERO_BASE, its skills in full if they beat our strongest hero's, else at
+	SECONDARY_SHARE, and ours re-weighed), the army it comes with at cost + u and its worn artifacts (a spellbook, war
+	machines), as empire_value counts a hero of ours (its mana left out); 0 for an empty slot."""
+	present = (x["g_tavern"] >= 0).float()
+	_, _, army_gold, _ = army(x["g_tavern_army_creature"], x["g_tavern_army_count"], torch.ones_like(x["g_tavern_army_creature"][..., 0], dtype=torch.bool), t)
+	worn = x["g_tavern_artifacts"]
+	carried = (t.artifact_price[vocab_index(worn, c.ARTIFACT_VOCAB)] * (worn >= 0)).sum(dim=-1)
+	theirs = skill_value(x["g_tavern_primary"], x["g_tavern_skills"], x["g_tavern_exp"], t)  # [B, N_TAVERN]
+	ours, mine = own_skill_values(x, t)
+	before = heroes_value(ours, mine, t).unsqueeze(-1)
+	after = torch.stack([heroes_value(torch.cat([ours, theirs[:, s : s + 1]], dim=1), torch.cat([mine, torch.ones_like(mine[:, :1])], dim=1), t) for s in range(theirs.shape[1])], dim=1)
+	return (after - before + army_gold + carried) * present
+
+
+def hire_gain(x, t, worth):
+	"""What hiring each hero for hire does to our Φ [B, N_TAVERN] (gold): its worth (tavern_worth) less the hire's
+	price and the crowding the extra hero adds (empire.py HERO_PENALTY x heroes^2): + for a week's hero with its army,
+	- for one with a lone creature (the user, 2026-10-29)."""
+	heroes = (x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)).sum(dim=1, keepdim=True).float()
+	return worth - HERO_GOLD_COST - t.hero_penalty * (2 * heroes + 1)
 
 
 # ---- our empire: Φ ----
@@ -160,7 +229,6 @@ def empire_value(x, t):
 	dwelling_hire = (x["g_dwelling_count"].clamp(min=0).float() * t.creature_unit[vocab_index(dwelling, c.CREATURE_VOCAB)] * (dwelling >= 0)).sum(dim=-1)
 	faction = vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)
 	available = x["t_available_creature"][:, : c.OWN_TOWNS]
-	experience = x["h_exp"][:, :HO].clamp(min=0).float()
 	artifacts = torch.cat([x["h_artifacts"][:, :HO], x["h_backpack"][:, :HO]], dim=-1)
 	usable_mana = torch.minimum(x["h_mana"][:, :HO].clamp(min=0), 3 * x["h_spell_cost"][:, :HO].clamp(min=0)).float()
 	parts = torch.stack(
@@ -170,7 +238,7 @@ def empire_value(x, t):
 			t.income_days * (x["g_object_income"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
 			(hero_army * own_heroes).sum(dim=-1) + (garrison * own_towns).sum(dim=-1) + owned,
 			((x["t_available"][:, : c.OWN_TOWNS].clamp(min=0).float() * t.creature_unit[vocab_index(available, c.CREATURE_VOCAB)] * (available >= 0)).sum(dim=-1) * own_towns).sum(dim=-1) + dwelling_hire,
-			(level_value(fractional_level(experience, t.level_experience)) * own_heroes).sum(dim=-1),
+			heroes_value(*own_skill_values(x, t), t),
 			((t.artifact_price[vocab_index(artifacts, c.ARTIFACT_VOCAB)] * (artifacts >= 0)).sum(dim=-1) * own_heroes).sum(dim=-1),
 			(2.0 * x["h_primary"][:, :HO, 2].clamp(min=0).float() * usable_mana * own_heroes).sum(dim=-1),  # game_values.capped_mana_value
 			-t.hero_penalty * own_heroes.sum(dim=-1) ** 2,

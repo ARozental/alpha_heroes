@@ -86,6 +86,11 @@ def test_evals_compare_only_with_evals_played_the_same_way(tmp_path):
 	assert later["vs_previous"] == pytest.approx(0.1333, abs=1e-3) and later["vs_first"] == later["vs_previous"]
 	numbers = [json.loads(line)["eval"] for line in (tmp_path / "eval_games.jsonl").read_text().splitlines()]
 	assert numbers == [1] * 3 + [2] * 3 + [3] * 3 + [4] * 3
+	new_phi = row(5, [0.1, 0.1, 0.1], temperature=0.0)
+	for game in new_phi["per_game"]:
+		game["empire"] = 3  # Φ's rules changed again: another measure
+	log(new_phi, path)
+	assert math.isnan(new_phi["vs_previous"])
 
 
 def game_of(decisions):

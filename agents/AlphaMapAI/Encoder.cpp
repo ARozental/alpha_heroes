@@ -278,8 +278,25 @@ void AlphaMapAI::encodeGlobal(Decision & decision)
 		const auto heroes = cb->getAvailableHeroes(tavern);
 		for(int i = 0; i < std::min<int>(heroes.size(), N_TAVERN); ++i)
 		{
-			in.at(In::g_tavern, i) = heroes[i]->getHeroTypeID().getNum();
-			in.at(In::g_tavern_level, i) = heroes[i]->level;
+			const auto * h = heroes[i];
+			in.at(In::g_tavern, i) = h->getHeroTypeID().getNum();
+			in.at(In::g_tavern_level, i) = h->level;
+			in.at(In::g_tavern_exp, i) = h->exp;
+			for(int k = 0; k < N_PRIMARY; ++k)
+				in.at(In::g_tavern_primary, i, k) = h->getBasePrimarySkillValue(PrimarySkill(k));
+			for(const auto & [skill, level] : h->secSkills)
+				if(skill.getNum() >= 0 && skill.getNum() < N_SECONDARY_SKILLS)
+					in.at(In::g_tavern_skills, i, skill.getNum()) = level;
+			// What the hire brings (as the tavern window shows it): its army and worn artifacts
+			for(int s = 0; s < ARMY_SLOTS; ++s)
+				if(const auto * stack = h->getStackPtr(SlotID(s)))
+				{
+					in.at(In::g_tavern_army_creature, i, s) = stack->getId().getNum();
+					in.at(In::g_tavern_army_count, i, s) = stack->getCount();
+				}
+			for(int slot = 0; slot < N_WORN_SLOTS; ++slot)
+				if(const auto * art = h->getArt(ArtifactPosition(slot)))
+					in.at(In::g_tavern_artifacts, i, slot) = art->getTypeId().getNum();
 		}
 	}
 }
@@ -383,7 +400,10 @@ void AlphaMapAI::encodeHeroes(Decision & decision, PathfinderCache & paths)
 			in.at(In::h_level, i) = h->level;
 			in.at(In::h_exp, i) = clampInt(h->exp);
 			for(int k = 0; k < N_PRIMARY; ++k)
+			{
 				in.at(In::h_primary, i, k) = h->getPrimSkillLevel(PrimarySkill(k));
+				in.at(In::h_primary_base, i, k) = h->getBasePrimarySkillValue(PrimarySkill(k));
+			}
 			in.at(In::h_mana, i) = h->mana;
 			in.at(In::h_mana_max, i) = h->manaLimit();
 			int dearest = 0; // the dearest combat spell it can cast (as the ledger's spell_cost)

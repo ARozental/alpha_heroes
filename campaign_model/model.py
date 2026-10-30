@@ -67,6 +67,7 @@ CELL_FEATURES = c.N_TILE_FLAGS + 3 + 2 + 4 + 3 + 1 + len(MOVE_FEATURES)
 OBJECT_FEATURES = 7 + 3 + 1
 BLOCK_FEATURES = c.N_GRID_COUNTS + 2 * c.N_OBJECT_CLASSES + 2  # the tile counts, the object classes (2 scales), the block's size (2 scales)
 TYPE_SUMMARY = 4  # what MOVE and TRAVEL offer, for the type head's learned part
+HIRE_FEATURES = 4  # what a hire brings (features.tavern_worth at 3 scales, features.hire_gain), for the hire table's learned part
 
 
 def game_tables():
@@ -203,6 +204,8 @@ class CustomFeatures(nn.Module):
 
 		empire = EmpireConfig()
 		self.income_days, self.hero_penalty, self.explored_tile = empire.income_days, empire.hero_penalty, empire.explored_tile
+		for name in ("hero_base", "skill_level", "fresh_skill_levels", "primary_point", "primary_base", "level_bonus", "secondary_share"):  # (empire.py's heroes)
+			setattr(self, name, getattr(empire, name))
 		scores, subtypes = priors.object_values()
 		# Tables of a fixed shape, [object, subtype] (the last column: any other subtype), looked up in one gather: a
 		# checkpoint keeps the priors it was trained from, and an edit of the CSVs still loads it
@@ -342,6 +345,7 @@ class CustomFeatures(nn.Module):
 		f.hero_counts, f.hero_power, f.hero_gold, f.hero_health = ft.army(x["h_army_creature"], x["h_army_count"], x["h_detailed"], self)
 		f.hero_strength = ft.hero_strength(x["h_primary"], f.hero_power)
 		f.hero_worth = ft.hero_worth(x, self)
+		f.level_gain = ft.level_gains(x, self)
 		f.town_counts, f.town_power, f.town_gold, f.town_health = ft.army(x["t_garrison_creature"], x["t_garrison_count"], x["t_detailed"], self)
 		f.town_strength = self.town_strength(x, f.town_power)
 		f.town_value = self.town_value(x)
@@ -358,6 +362,8 @@ class CustomFeatures(nn.Module):
 		f.build_rewards, f.upgrade_gains, f.spellbook_wanted = ft.build_rewards(x, self), ft.upgrade_gains(x, self), ft.spellbook_wanted(x, f.main)
 		f.reinforcements, f.town_stakes = ft.reinforcements(x, self, f.town_gold), ft.town_stakes(x, self, f.town_gold)
 		f.hire_want = ft.hire_want(x, f.gold_pressure, f.town_danger, ft.object_classes(x))
+		f.tavern_worth = ft.tavern_worth(x, self)
+		f.hire_gain = ft.hire_gain(x, self, f.tavern_worth)
 		f.trade_needs = ft.trade_needs(x, self)
 		f.area_centres = ft.centres(x, TG)
 		f.travel_prior = self.travel_prior(x, f)
@@ -490,8 +496,10 @@ class CustomFeatures(nn.Module):
 		)
 		# The fight's expected return (gold): win it and gain its experience and the enemy's loss, minus what it costs
 		loss, win = ft.expected_loss(ratio, has_enemy), ft.win_chance(ratio, ft.bounded(self.fight_sharpness, 0.5, 8.0, 4.0, CORRECTION_STEP))
-		gain = their_gold * self.gain(self.enemy_value) + ft.experience_value(ours(x["h_exp"].clamp(min=0).float())[:, None, None], their_health, self)
-		hero = ours(f.hero_worth) + HERO_HIRE_COST * self.gain(self.hero_value)  # what a lost battle takes besides the army
+		gain = their_gold * self.gain(self.enemy_value) + ft.experience_value(ours(x["h_exp"].clamp(min=0).float())[:, None, None], their_health, ours(f.level_gain)[:, None, None], self)
+		# What a lost battle takes besides the army: the hero's worth (a fresh one's HERO_BASE and what it has gained since)
+		# and the rest of a hire's price (a fresh hero's loss: a hire's 2,500, as before skills were priced)
+		hero = ours(f.hero_worth) + (HERO_HIRE_COST - self.hero_base) * self.gain(self.hero_value)
 		fight = ft.fight_return(win, loss, ours(f.hero_gold)[:, None, None], hero[:, None, None], gain) * has_enemy
 		# Kill a guard, take what it blocks (Nullkiller2's ClusterBehavior): a wandering monster's fight counts part of the
 		# best object in a region we reach only through its zone (features.blocked_by_guards), as often as we win it
@@ -791,6 +799,7 @@ class CampaignModel(nn.Module):
 		self.build_bias = nn.Parameter(torch.zeros(c.N_BUILDINGS))
 		self.recruit_head = nn.Sequential(nn.Linear(2 * d + 9, d), nn.GELU(), nn.Linear(d, c.N_RECRUIT_AMOUNTS * c.N_RECRUIT_TARGETS))
 		self.hire_head = nn.Sequential(nn.Linear(2 * d + 2, d), nn.GELU(), nn.Linear(d, 1))
+		self.hire_worth = zero_output(nn.Linear(HIRE_FEATURES, 1))  # what a hire brings, learned from 0 (schema 7)
 		self.army_src = nn.Linear(2 * d, d)
 		self.army_dst = nn.Linear(d, d)
 		self.army_out = nn.Sequential(nn.GELU(), nn.Linear(d, c.N_ARMY_AMOUNTS))
@@ -806,6 +815,22 @@ class CampaignModel(nn.Module):
 		self.value_heads = zero_output(nn.Linear(d, c.N_VALUE_OFFSETS))  # V2, V5, V7: a readout each, none chained
 		self.growth_heads = zero_output(nn.Linear(d, c.N_VALUE_OFFSETS))  # our own growth to the same days (helpers)
 		self.end_head = zero_output(nn.Linear(d, 1))  # V_end: the share at the game's end (labels.end_labels)
+
+	def load_state_dict(self, state_dict, strict=True, assign=False):
+		"""A checkpoint from before schema 7 (2026-10-29, no hire_worth) is migrated: the hire table's new part starts
+		at 0 (its prior: what a hire does to Φ), and the type head's learned part goes back to its priors. It was learned
+		in games whose towns had neither a tavern nor a dwelling (vcmi 47c9d57eb: random maps lost their towns' default
+		buildings), where building had to come first, and had drifted to BUILD +4.3 and HIRE -2.3 logits over 290 updates:
+		left so, it would hold every hire back however much the hire brought."""
+		own = self.state_dict()
+		missing = [key for key in own if key.startswith("hire_worth.") and key not in state_dict]
+		if missing:
+			state_dict = dict(state_dict)
+			for key in missing:
+				state_dict[key] = own[key]
+			state_dict["type_head.weight"] = torch.zeros_like(own["type_head.weight"])
+			state_dict["type_head.bias"] = priors.action_types().to(own["type_head.bias"])
+		return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
 	def prior_corrections(self):
 		"""The parameters that correct a fixed prior: the optimizer's weight decay pulls them back to 0 (to the prior)."""
@@ -1027,7 +1052,8 @@ class CampaignModel(nn.Module):
 		own_heroes, own_towns = heroes[:, :HO], towns[:, :TO]
 		out = {}
 		offers = self.move_and_travel(x, f, out, own_heroes, cells, areas, windows, n)
-		self.town_actions(x, f, out, own_towns, town_levels)
+		hire_prior = self.town_actions(x, f, out, own_towns, town_levels)
+		offers["hire"] = ft.offer(hire_prior, x["hire_mask"])  # (HIRE's type gets its best legal hire's gain)
 		offers["army"], offers["upgrade"] = self.army_actions(x, f, out, own_heroes, own_towns, other, hero_stacks, town_stacks, other_stacks)
 		offers["buy"], offers["trade"] = self.hero_actions(x, f, out, g, own_heroes)
 		self.question(x, f, out, g, heroes, options)
@@ -1083,7 +1109,13 @@ class CampaignModel(nn.Module):
 			],
 			dim=-1,
 		)
-		out["hire_logp"] = flat_log_softmax(self.hire_head(hire_in).squeeze(-1), x["hire_mask"])
+		# What a hire does to Φ as its prior (features.hire_gain: + for a hero with the army the week's heroes bring, - for
+		# one with a lone creature), the same at every town; and the learned part of what it brings, from 0
+		gain = f.hire_gain.unsqueeze(1).expand(b, TO, c.N_TAVERN)
+		worth = torch.cat([scales(f.tavern_worth.clamp(min=0), (1000, 3000, 10000)), torch.tanh(f.hire_gain / 2000).unsqueeze(-1)], dim=-1)
+		hire_prior = ft.value_logit(gain)
+		out["hire_logp"] = flat_log_softmax(self.hire_head(hire_in).squeeze(-1) + hire_prior + self.hire_worth(worth).squeeze(-1).unsqueeze(1), x["hire_mask"])
+		return hire_prior
 
 	def army_actions(self, x, f, out, own_heroes, own_towns, other, hero_stacks, town_stacks, other_stacks):
 		b, d = own_heroes.shape[0], self.dim
@@ -1158,7 +1190,7 @@ class CampaignModel(nn.Module):
 		couple = couple + offers["upgrade"].unsqueeze(-1) * (types == c.ActionType.UPGRADE) + offers["buy"].unsqueeze(-1) * (types == c.ActionType.BUY)
 		couple = couple - (pause_weight * f.recruit_pause).unsqueeze(-1) * (types == c.ActionType.RECRUIT)
 		_, _, _, hire_weight, _ = self.features.pull_weights()  # (weak pulls: hiring as Nullkiller2 would; a trade toward a building)
-		couple = couple + (hire_weight * f.hire_want).unsqueeze(-1) * (types == c.ActionType.HIRE) + offers["trade"].unsqueeze(-1) * (types == c.ActionType.TRADE)
+		couple = couple + (hire_weight * f.hire_want + offers["hire"]).unsqueeze(-1) * (types == c.ActionType.HIRE) + offers["trade"].unsqueeze(-1) * (types == c.ActionType.TRADE)
 		out["type_logp"] = masked_log_softmax(self.type_head(g) + self.type_summary(summary) + couple, torch.stack(legal, dim=-1))
 
 	def value(self, x, f, out, g, own_heroes, own_towns):
