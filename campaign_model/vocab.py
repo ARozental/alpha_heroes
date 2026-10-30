@@ -71,3 +71,20 @@ def artifact_prices():
 	# artifacts are what a winner takes, which a spellbook never is: game_values.UNVALUED_ARTIFACTS)
 	prices = {0: SPELLBOOK_GOLD_COST}  # (artifact 0: the spellbook)
 	return {row["id"]: prices.get(row["id"], WAR_MACHINE_ARTIFACTS.get(row["id"], 0 if row["id"] in UNVALUED_ARTIFACTS else row["price"])) for row in raw()["artifacts"]}
+
+
+@lru_cache(maxsize=None)
+def spell_levels():
+	"""spell id -> its level (1-5), the game's spells (ids below 70)."""
+	return {row["id"]: row["level"] for row in raw()["spells"] if row["id"] < 70}
+
+
+# Creatures a battle's luck or morale never moves (VCMI lib/BasicTypes.cpp: unaffectedByMorale, luckValAndBonusList)
+NO_MORALE = frozenset({"UNDEAD", "NON_LIVING", "MECHANICAL", "SIEGE_WEAPON", "NO_MORALE"})
+NO_LUCK = frozenset({"NO_LUCK"})
+
+
+def feels(creature_id, immune):
+	"""Whether a creature's luck (immune=NO_LUCK) or morale (NO_MORALE) counts in battle; False for an unknown id."""
+	row = creatures().get(creature_id)
+	return bool(row) and not immune.intersection(row.get("abilities", []))

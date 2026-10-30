@@ -1,7 +1,7 @@
 id,subtype,name,gold,score,how
 79,*,resource pile,2000,450,"NK2 gold 100 (x2 under 500) + strategic ~0.25 x 1000 (resources it needs, capped at 0.3); Φ: 6-10 wood or ore x 250, 3-5 of a rare resource x 500 (moddables.json)"
 79,6,gold pile,750,550,NK2 gold 600 (/2 over 500) + strategic ~0.25 x 1000; Φ: 5-10 x 100 gold
-101,*,treasure chest,1500,750,NK2 gold 1500 (/2 over 500); Φ: 1000/1500/2000 gold (or experience: Φ counts levels past 3 only)
+101,*,treasure chest,1500,750,"NK2 gold 1500 (/2 over 500); Φ: 1000/1500/2000 gold, or 500/1000/1500 experience by the level rule (~2.6 gold a point to a fresh main hero's level 2)"
 82,*,sea chest,1500,750,as a treasure chest; Φ: 1500 gold or an artifact
 12,*,campfire,2650,750,NK2 rewardable: ~500 gold + ~5 resources x 100 = 1000 (/2) + strategic ~0.25 x 1000; Φ: 400-600 gold + 4-6 of a resource
 112,*,windmill,2000,1150,NK2 rewardable: 3-6 rare resources x 100 = ~450 (x2 under 500) + strategic ~0.25 x 1000; Φ: 3-6 of a rare resource
@@ -21,51 +21,51 @@ id,subtype,name,gold,score,how
 93,*,spell scroll,2500,1500,"NK2 army reward 1500; Φ: the scroll artifact at its price (the value audit: +2,500 realized)"
 17,*,creature dwelling,500,1500,NK2 army value (AI value x creatures there) and weekly growth: ~1500 for a low-level dwelling; Φ: its creatures for hire at u
 20,*,multi-level dwelling,800,2000,as dwellings; Φ: its creatures for hire at u
-78,*,refugee camp,,1000,creatures for hire; Φ: none (option value: NK2's score stands)
+78,*,refugee camp,,1000,creatures for hire; Φ: u for each one bought (none for the camp itself)
 16,*,creature bank,,3000,"NK2 rewardable: gold and resources ~4000 (/2), artifacts, creatures; Φ: its expected reward, per bank, from VCMI's config (bank_guards.csv; this row only for an unknown bank)"
 84,*,crypt,,2000,a creature bank: gold ~2500 (/2) and an artifact; Φ: its expected reward, per bank, from VCMI's config (bank_guards.csv; this row only for an unknown bank)
 24,*,derelict ship,,3000,a creature bank; Φ: its expected reward, per bank, from VCMI's config (bank_guards.csv; this row only for an unknown bank)
 85,*,shipwreck,,3000,a creature bank; Φ: its expected reward, per bank, from VCMI's config (bank_guards.csv; this row only for an unknown bank)
 25,*,dragon utopia,,10000,a creature bank: ~20000 gold and relics; Φ: its expected reward, per bank, from VCMI's config (bank_guards.csv; this row only for an unknown bank)
-63,*,pyramid,300,1500,a guarded spell; Φ: a spell: Φ has no price for it
-108,*,warrior's tomb,3000,1000,an artifact (and a morale penalty); Φ: an artifact
-41,*,library of enlightenment,,4000,NK2 skill 8 x 500; Φ: none (option value: NK2's score stands)
-4,*,arena,,1000,NK2 skill 2 x 500; Φ: none (option value: NK2's score stands)
-61,*,star axis,,500,NK2 skill 1 x 500; Φ: none (option value: NK2's score stands)
-81,*,scholar,,500,NK2 skill 1 x 500; Φ: none (option value: NK2's score stands)
-47,*,school of magic,,250,NK2 skill 1 x 500 - its cost 1000 / 4; Φ: none (option value: NK2's score stands)
-107,*,school of war,,250,NK2 skill 1 x 500 - its cost 1000 / 4; Φ: none (option value: NK2's score stands)
-32,*,garden of revelation,,500,NK2 skill 1 x 500; Φ: none (option value: NK2's score stands)
-23,*,marletto tower,,500,NK2 skill 1 x 500; Φ: none (option value: NK2's score stands)
-51,*,mercenary camp,,500,NK2 skill 1 x 500; Φ: none (option value: NK2's score stands)
-102,*,tree of knowledge,,500,NK2 skill 1 x 500; Φ: none (option value: NK2's score stands)
-100,*,learning stone,,350,NK2 skill 1 / sqrt(level) ~0.7 x 500; Φ: none (option value: NK2's score stands)
-88,*,shrine of magic incantation,,125,NK2 skill 0.25 x 500; Φ: none (option value: NK2's score stands)
-89,*,shrine of magic gesture,,500,NK2 skill 1 x 500; Φ: none (option value: NK2's score stands)
-90,*,shrine of magic thought,,1000,NK2 skill 2 x 500; Φ: none (option value: NK2's score stands)
-113,*,witch hut,,500,NK2 skill (2 for scouts if not visited; a new skill's worth); Φ: none (option value: NK2's score stands)
-10,*,keymaster's tent,,600,NK2 strategic 0.6 x 1000; Φ: none (option value: NK2's score stands)
+63,*,pyramid,300,1500,"a guarded level 5 spell; Φ v3: 2,500 (500 a spell level), by hero (a spellbook; Wisdom)"
+108,*,warrior's tomb,3000,1000,"an artifact, and -3 morale until the next battle; Φ: the artifact, less 12% of the living army's worth (v3: 6/24 of its turns lost)"
+41,*,library of enlightenment,,4000,"NK2 skill 8 x 500; Φ: eight primary points (the k-th beyond five: 400 x k), by hero"
+4,*,arena,,1000,"NK2 skill 2 x 500; Φ: two primary points (the k-th beyond five: 400 x k; 1,200 for a fresh hero), by hero"
+61,*,star axis,,500,"NK2 skill 1 x 500; Φ: a primary point (the k-th beyond five: 400 x k), by hero"
+81,*,scholar,,500,"NK2 skill 1 x 500; Φ: a spell (v3: 500 a level), a secondary skill level (2,000) or a primary point, by hero"
+47,*,school of magic,,250,"NK2 skill 1 x 500 - its cost 1000 / 4; Φ: a primary point (400 x k) less 1,000: a loss until the hero's third point beyond five"
+107,*,school of war,,250,"NK2 skill 1 x 500 - its cost 1000 / 4; Φ: a primary point (400 x k) less 1,000: a loss until the hero's third point beyond five"
+32,*,garden of revelation,,500,"NK2 skill 1 x 500; Φ: a primary point (the k-th beyond five: 400 x k), by hero"
+23,*,marletto tower,,500,"NK2 skill 1 x 500; Φ: a primary point (the k-th beyond five: 400 x k), by hero"
+51,*,mercenary camp,,500,"NK2 skill 1 x 500; Φ: a primary point (the k-th beyond five: 400 x k), by hero"
+102,*,tree of knowledge,,500,"NK2 skill 1 x 500; Φ: a level-up (~2,600 at level 1, ~6,200 at 10), free or less 2,000 gold or 10 gems, by hero"
+100,*,learning stone,,350,"NK2 skill 1 / sqrt(level) ~0.7 x 500; Φ: 1,000 experience by the level rule, by hero"
+88,*,shrine of magic incantation,,125,"NK2 skill 0.25 x 500; Φ v3: a level 1 spell, 500 (a spellbook needed)"
+89,*,shrine of magic gesture,,500,"NK2 skill 1 x 500; Φ v3: a level 2 spell, 1,000 (a spellbook needed)"
+90,*,shrine of magic thought,,1000,"NK2 skill 2 x 500; Φ v3: a level 3 spell, 1,500 (a spellbook and Wisdom needed)"
+113,*,witch hut,,500,"NK2 skill (2 for scouts if not visited; a new skill's worth); Φ: a secondary skill level, 2,000 (half for a hero not the strongest)"
+10,*,keymaster's tent,,600,NK2 strategic 0.6 x 1000; Φ: nothing (access: what it opens counts when taken)
 98,*,town,5000,4000,"a town to take (NK2: strategic ~1.0-1.5 x 1000 + gold 5 x its income /2 = 4000); Φ: its buildings at cost and 5 days of its income, at least its village hall (2500) and that income (5 x 500); a town the model sees is priced by its fort level too (+15000 fort, +3750 citadel, +10000 castle: model.town_value)"
-57,*,obelisk,,100,the puzzle map; Φ: none (option value: NK2's score stands)
-58,*,redwood observatory,,300,reveals the map around; Φ: none (option value: NK2's score stands)
-60,*,pillar of fire,,300,reveals the map around; Φ: none (option value: NK2's score stands)
-13,*,cartographer,,300,reveals a map layer (costs 1000); Φ: none (option value: NK2's score stands)
-42,*,lighthouse,,300,owned: movement at sea; Φ: none (option value: NK2's score stands)
-27,*,eye of the magi,,100,reveals a little; Φ: none (option value: NK2's score stands)
-37,*,hut of the magi,,100,reveals what the eyes see; Φ: none (option value: NK2's score stands)
-83,*,seer's hut,,300,a quest; Φ: none (option value: NK2's score stands)
-215,*,quest guard,,300,a quest; Φ: none (option value: NK2's score stands)
-30,*,fountain of fortune,,100,luck: NK2 values it 0; Φ: none (option value: NK2's score stands)
-31,*,fountain of youth,,100,movement and morale: NK2 values it 0; Φ: none (option value: NK2's score stands)
-38,*,idol of fortune,,100,luck and morale; Φ: none (option value: NK2's score stands)
-11,*,buoy,,100,morale; Φ: none (option value: NK2's score stands)
-14,*,swan pond,,100,luck; Φ: none (option value: NK2's score stands)
-28,*,faerie ring,,100,luck; Φ: none (option value: NK2's score stands)
-52,*,mermaid,,100,luck; Φ: none (option value: NK2's score stands)
-56,*,oasis,,100,movement and morale; Φ: none (option value: NK2's score stands)
-64,*,rally flag,,100,luck and morale; Φ: none (option value: NK2's score stands)
-94,*,stables,,100,movement; Φ: none (option value: NK2's score stands)
-96,*,temple,,100,morale; Φ: none (option value: NK2's score stands)
-110,*,watering hole,,100,movement and morale; Φ: none (option value: NK2's score stands)
-48,*,magic spring,,100,mana (NK2: by the mana missing); Φ: none (option value: NK2's score stands)
-49,*,magic well,,100,mana (NK2: by the mana missing); Φ: none (option value: NK2's score stands)
+57,*,obelisk,,100,the puzzle map; Φ: nothing (we have no DIG action: the Grail is out of reach)
+58,*,redwood observatory,,300,reveals the map around; Φ: 1 a tile revealed
+60,*,pillar of fire,,300,reveals the map around; Φ: 1 a tile revealed
+13,*,cartographer,,300,"reveals a map layer (costs 1000); Φ: 1 a tile revealed, less 1,000"
+42,*,lighthouse,,300,owned: movement at sea; Φ: nothing (movement)
+27,*,eye of the magi,,100,reveals a little; Φ: 1 a tile revealed
+37,*,hut of the magi,,100,reveals what the eyes see; Φ: 1 a tile revealed
+83,*,seer's hut,,300,"a quest; Φ: its reward when paid, by its rule"
+215,*,quest guard,,300,"a quest; Φ: its reward when paid, by its rule"
+30,*,fountain of fortune,,100,"luck: NK2 values it 0; Φ v3: -1..+3 luck until the next battle, 2% of the army a 24th of chance (bad luck: nothing)"
+31,*,fountain of youth,,100,"movement and morale: NK2 values it 0; Φ v3: +1 morale until the next battle, 2% of the living army; movement: nothing"
+38,*,idol of fortune,,100,"luck and morale; Φ v3: +1 luck or morale (both on day 7) until the next battle, 2% of the army a point"
+11,*,buoy,,100,"morale; Φ v3: +1 morale until the next battle, 2% of the living army"
+14,*,swan pond,,100,"luck; Φ v3: +2 luck until the next battle, 4% of the army; the day's movement ends (nothing in Φ)"
+28,*,faerie ring,,100,"luck; Φ v3: +1 luck until the next battle, 2% of the army"
+52,*,mermaid,,100,"luck; Φ v3: +1 luck until the next battle, 2% of the army"
+56,*,oasis,,100,"movement and morale; Φ v3: +1 morale until the next battle, 2% of the living army; movement: nothing"
+64,*,rally flag,,100,"luck and morale; Φ v3: +1 luck and +1 morale until the next battle, 2% of the army each; movement: nothing"
+94,*,stables,,100,movement; Φ: cavaliers into champions (their worth over the cavaliers'); the week's movement: nothing
+96,*,temple,,100,"morale; Φ v3: +1 morale (+2 on day 7) until the next battle, 2% of the living army a point"
+110,*,watering hole,,100,"movement and morale; Φ v3: +1 morale until the next battle, 2% of the living army; movement: nothing"
+48,*,magic spring,,100,mana (NK2: by the mana missing); Φ: mana to 200% by the mana rule (3 casts of the dearest combat spell)
+49,*,magic well,,100,mana (NK2: by the mana missing); Φ: mana to 100% by the mana rule (3 casts of the dearest combat spell)

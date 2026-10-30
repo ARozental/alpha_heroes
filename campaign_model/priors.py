@@ -36,8 +36,9 @@ def action_types():
 def object_values():
 	"""(each object type's worth in gold [OBJECT_VOCAB + 1] (the last row: none), [(object, subtype, worth - its
 	type's)] for the rows of one subtype). The worth is Φ's immediate gain (the "gold" column: what taking it adds to
-	empire.py's value) where the table has one, else Nullkiller2's score (option value: skills, luck, information, which
-	Φ does not price); a creature bank's is its expected reward (bank_guards.csv). The model turns gold into prior logits
+	empire.py's value) where the table has one, else Nullkiller2's score (what Φ adds by hero: skills, spells, luck and
+	morale; or nothing Φ holds: information, access; docs/empire_value.md); a creature bank's is its expected reward
+	(bank_guards.csv). The model turns gold into prior logits
 	with features.value_logit; campaign_model/audit.py checks the immediate ones against what taking them did."""
 	types, subtypes = torch.zeros(c.OBJECT_VOCAB + 1), []
 	with (PRIORS_DIR / "object_values.csv").open(newline="") as f:
@@ -57,7 +58,8 @@ def object_values():
 
 def immediate_objects():
 	"""The object types whose worth is Φ's immediate gain (a "gold" value, or a bank's reward): what the value audit
-	checks against what taking them did. The rest are option value (skills, luck, information), which Φ does not price."""
+	checks against what taking them did. The rest add to Φ by hero (skills, spells, luck and morale) or not at all
+	(information, access)."""
 	with (PRIORS_DIR / "object_values.csv").open(newline="") as f:
 		ids = {int(row["id"]) for row in csv.DictReader(f) if row.get("gold", "") != ""}
 	return ids | {obj for obj, _ in bank_table()}

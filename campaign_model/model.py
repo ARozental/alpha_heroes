@@ -74,7 +74,8 @@ def game_tables():
 	"""The game's tables the features need, as tensors (zeros or ones where the vocab is missing): per creature its fight
 	value, gold cost, u (what one for hire is worth, empire.py), hit points, weekly growth and best upgrade; the resource
 	prices; each faction's buildings' worth (empire.py), cost, daily income over the building it replaces, and a
-	dwelling's creature (and, upgraded, the creature it upgrades); the artifacts' prices; the experience each level needs."""
+	dwelling's creature (and, upgraded, the creature it upgrades); the artifacts' prices; the experience each level needs;
+	each spell's worth in a spellbook, and whether each creature's luck and morale count in battle (empire.py)."""
 	from game_values import RESOURCE_PRICES
 
 	tables = {
@@ -93,12 +94,15 @@ def game_tables():
 		"dwelling_creature": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),
 		"dwelling_base": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),
 		"building_resources": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, len(RESOURCE_PRICES)),
+		"spell_value": torch.zeros(c.N_SPELLS),
+		"creature_luck": torch.zeros(c.CREATURE_VOCAB + 1),
+		"creature_morale": torch.zeros(c.CREATURE_VOCAB + 1),
 	}
 	try:
 		from .empire import EmpireConfig, _unit, building_value
 		from game_values import resources_value
 
-		from .vocab import artifact_prices, buildings, creature_cost, creatures, experience_table, town_creatures
+		from .vocab import NO_LUCK, NO_MORALE, artifact_prices, buildings, creature_cost, creatures, experience_table, feels, spell_levels, town_creatures
 
 		for creature_id, row in creatures().items():
 			if 0 <= creature_id < c.CREATURE_VOCAB:
@@ -107,6 +111,11 @@ def game_tables():
 				tables["creature_unit"][creature_id] = float(_unit(creature_id, EmpireConfig()))
 				tables["creature_health"][creature_id] = float(row.get("hit_points", 0))
 				tables["creature_growth"][creature_id] = float(row.get("growth", 0))
+				tables["creature_luck"][creature_id] = float(feels(creature_id, NO_LUCK))
+				tables["creature_morale"][creature_id] = float(feels(creature_id, NO_MORALE))
+		for spell, level in spell_levels().items():
+			if 0 <= spell < c.N_SPELLS:
+				tables["spell_value"][spell] = EmpireConfig().spell_level * level
 		by_key = {row["key"]: creature_id for creature_id, row in creatures().items()}
 		for creature_id, row in creatures().items():  # the upgrade worth the most (Nullkiller2's makePossibleUpgrades)
 			ups = [by_key[k] for k in row.get("upgrades", []) if k in by_key and by_key[k] != creature_id and by_key[k] < c.CREATURE_VOCAB]
@@ -204,7 +213,7 @@ class CustomFeatures(nn.Module):
 
 		empire = EmpireConfig()
 		self.income_days, self.hero_penalty, self.explored_tile = empire.income_days, empire.hero_penalty, empire.explored_tile
-		for name in ("hero_base", "skill_level", "fresh_skill_levels", "primary_point", "primary_base", "level_bonus", "secondary_share"):  # (empire.py's heroes)
+		for name in ("hero_base", "skill_level", "fresh_skill_levels", "primary_point", "primary_base", "level_bonus", "secondary_share", "boost"):  # (empire.py's heroes)
 			setattr(self, name, getattr(empire, name))
 		scores, subtypes = priors.object_values()
 		# Tables of a fixed shape, [object, subtype] (the last column: any other subtype), looked up in one gather: a

@@ -2,6 +2,8 @@
 #include "Ledger.h"
 
 #include "lib/CPlayerState.h"
+#include "lib/bonuses/Bonus.h"
+#include "lib/bonuses/BonusSelector.h"
 #include "lib/entities/artifact/CArtifactInstance.h"
 #include "lib/gameState/CGameState.h"
 #include "lib/json/JsonNode.h"
@@ -71,6 +73,17 @@ int64_t revealed(const CGameState & gs, PlayerColor color)
 }
 }
 
+LuckAndMorale luckAndMorale(const CGHeroInstance & hero)
+{
+	const CSelector nextBattle([](const Bonus * bonus) { return Bonus::OneBattle(bonus); });
+	LuckAndMorale result;
+	result.luck = hero.valOfBonuses(BonusType::LUCK);
+	result.morale = hero.valOfBonuses(BonusType::MORALE);
+	result.battleLuck = hero.valOfBonuses(Selector::type()(BonusType::LUCK).And(nextBattle));
+	result.battleMorale = hero.valOfBonuses(Selector::type()(BonusType::MORALE).And(nextBattle));
+	return result;
+}
+
 std::string ledgerJson(const CGameState & gs, int day, bool final)
 {
 	JsonNode root;
@@ -127,6 +140,17 @@ std::string ledgerJson(const CGameState & gs, int day, bool final)
 				pair.Vector() = {number(skill.getNum()), number(level)};
 				h["skills"].Vector().push_back(pair);
 			}
+			// Its spells (empire.py prices each by its level), and its luck and morale with the parts that last until the
+			// next battle (empire.py prices those by the army they lift)
+			h["spells"].Vector();
+			if(hero->hasSpellbook())
+				for(const auto & spell : hero->getSpellsInSpellbook())
+					h["spells"].Vector().push_back(number(spell.getNum()));
+			const auto boosts = luckAndMorale(*hero);
+			h["luck"].Integer() = boosts.luck;
+			h["morale"].Integer() = boosts.morale;
+			h["battle_luck"].Integer() = boosts.battleLuck;
+			h["battle_morale"].Integer() = boosts.battleMorale;
 			h["army"] = stacks(*hero);
 			h["artifacts"].Vector();
 			for(const auto & [position, slot] : hero->artifactsWorn)

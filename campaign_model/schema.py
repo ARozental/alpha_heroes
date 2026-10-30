@@ -62,6 +62,7 @@ INPUTS = (
 	_i("g_tavern_army_creature", (c.N_TAVERN, A), "the creatures each comes with, -1 none", fill=-1),
 	_i("g_tavern_army_count", (c.N_TAVERN, A), "how many"),
 	_i("g_tavern_artifacts", (c.N_TAVERN, c.N_WORN_SLOTS), "the artifact worn in each slot (a spellbook, war machines among them), -1 none", fill=-1),
+	_m("g_tavern_spells", (c.N_TAVERN, c.N_SPELLS), "the spells in their spellbooks"),
 	# The question asked (dialog kinds)
 	_i("d_hero", (), "our hero the question is about (index into the hero tokens), -1 none", fill=-1),
 	_i("d_object", (), "object type at that hero's tile or target, -1 none", fill=-1),
@@ -92,6 +93,12 @@ INPUTS = (
 	_i("h_backpack", (H, c.N_BACKPACK), "first backpack artifacts, -1 none", fill=-1),
 	_i("h_skills", (H, c.N_SECONDARY_SKILLS), "secondary skill levels, 0 none .. 3 expert"),
 	_m("h_spells", (H, c.N_SPELLS), "spells in its spellbook (ours only)"),
+	# Luck and morale (Φ v3, the user 2026-10-30: a Temple's morale must not be skipped): ours the sum of the hero's
+	# bonuses, uncapped (the battle caps them at +-3), with the part that lasts until the next battle apart
+	_i("h_luck", (H,), "luck: ours the sum of its luck bonuses (uncapped), others' VCMI's detailed value, else 0"),
+	_i("h_morale", (H,), "morale: ours the sum of its morale bonuses (uncapped), others' VCMI's detailed value, else 0"),
+	_i("h_battle_luck", (HO,), "ours: the part of h_luck that lasts until the next battle (a Mermaid's, a Fountain of Fortune's)"),
+	_i("h_battle_morale", (HO,), "ours: the part of h_morale that lasts until the next battle (a Temple's, a Buoy's, a Warrior's Tomb's -3)"),
 	_m("h_boat", (H,), "in a boat"),
 	_i("h_town", (H,), "town token it visits or garrisons, -1 none", fill=-1),
 	_m("h_garrisoned", (H,), "the garrison hero of that town"),

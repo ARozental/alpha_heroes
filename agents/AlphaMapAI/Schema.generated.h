@@ -7,8 +7,8 @@
 
 namespace MapSchema
 {
-constexpr int SCHEMA_VERSION = 7;
-constexpr const char * CONTRACT_HASH = "1f414549146f16ad";
+constexpr int SCHEMA_VERSION = 8;
+constexpr const char * CONTRACT_HASH = "208e06ff029e6a2f";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;
@@ -171,6 +171,7 @@ enum class In : int
 	g_tavern_army_creature,
 	g_tavern_army_count,
 	g_tavern_artifacts,
+	g_tavern_spells,
 	d_hero,
 	d_object,
 	d_subtype,
@@ -199,6 +200,10 @@ enum class In : int
 	h_backpack,
 	h_skills,
 	h_spells,
+	h_luck,
+	h_morale,
+	h_battle_luck,
+	h_battle_morale,
 	h_boat,
 	h_town,
 	h_garrisoned,
@@ -288,6 +293,7 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"g_tavern_army_creature", DType::INT64, 2, {2, 7, 1, 1}, -1},
 	TensorSpec{"g_tavern_army_count", DType::INT64, 2, {2, 7, 1, 1}, 0},
 	TensorSpec{"g_tavern_artifacts", DType::INT64, 2, {2, 19, 1, 1}, -1},
+	TensorSpec{"g_tavern_spells", DType::BOOL, 2, {2, 70, 1, 1}, 0},
 	TensorSpec{"d_hero", DType::INT64, 0, {1, 1, 1, 1}, -1},
 	TensorSpec{"d_object", DType::INT64, 0, {1, 1, 1, 1}, -1},
 	TensorSpec{"d_subtype", DType::INT64, 0, {1, 1, 1, 1}, 0},
@@ -316,6 +322,10 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"h_backpack", DType::INT64, 2, {16, 8, 1, 1}, -1},
 	TensorSpec{"h_skills", DType::INT64, 2, {16, 28, 1, 1}, 0},
 	TensorSpec{"h_spells", DType::BOOL, 2, {16, 70, 1, 1}, 0},
+	TensorSpec{"h_luck", DType::INT64, 1, {16, 1, 1, 1}, 0},
+	TensorSpec{"h_morale", DType::INT64, 1, {16, 1, 1, 1}, 0},
+	TensorSpec{"h_battle_luck", DType::INT64, 1, {8, 1, 1, 1}, 0},
+	TensorSpec{"h_battle_morale", DType::INT64, 1, {8, 1, 1, 1}, 0},
 	TensorSpec{"h_boat", DType::BOOL, 1, {16, 1, 1, 1}, 0},
 	TensorSpec{"h_town", DType::INT64, 1, {16, 1, 1, 1}, -1},
 	TensorSpec{"h_garrisoned", DType::BOOL, 1, {16, 1, 1, 1}, 0},

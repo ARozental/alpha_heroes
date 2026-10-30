@@ -1,5 +1,6 @@
 """What an empire is worth (Φ), in gold, from a ledger snapshot (agents/AlphaMapAI/Ledger.cpp): every player's assets
-as raw engine values. The labels (labels.py) are each player's share of all players' Φ some days later.
+as raw engine values. The labels (labels.py) are each player's share of all players' Φ some days later. Every map
+object and town building, what it gives and what Φ adds for it (or why nothing): docs/empire_value.md.
 
 The user's rules (2026-10-27), and why each component is priced as it is:
 - Buying anything at its list price leaves Φ unchanged; value appears when what was bought produces, through pickups,
@@ -25,6 +26,13 @@ The user's rules (2026-10-27), and why each component is priced as it is:
   less than the main hero's. A level-up is then worth ~2.6k at level 1, ~4.2k at 5, ~6.2k at 10; over the experience a
   level takes, more than a treasure chest's 2 gold an experience point up to level ~11, less after. The battle reward
   values a hero by its level alone (game_values.hero_level_value), good enough for a battle.
+  Its spells are among its skills (the user, 2026-10-30: a Shrine must not be skipped): SPELL_LEVEL x each spell's
+  level for every spell in its spellbook (a Shrine of Magic Incantation's 500, a Pyramid's 2,500, a first mage guild's
+  five ~2,500 to the main hero).
+  Its luck and morale until the next battle (a Temple, a Buoy, a Rally Flag, a Warrior's Tomb's -3 morale): each 1/24
+  of chance a battle stack gains (a lucky double-damage hit, an extra turn) or loses (a turn lost to bad morale, 2/24
+  a point) is worth BOOST of the army it lifts at cost + u (luck: every creature; morale: the living), within the
+  battle's +-3 caps, and goes when the battle uses it: a Temple's +1 morale is ~400 to a 20,000 army.
   Their artifacts at the game's prices (a spellbook at its 500: SPELLBOOK_GOLD_COST), and their mana at the battle
   price but only what they can spend in a 3-round battle (game_values.capped_mana_value). A hire with the starting
   army a tavern's heroes of the week come with is a gain (2500 for 1500 and an army of ~1500-2500 at cost + u); one
@@ -45,8 +53,14 @@ from .vocab import DWELLING_FIRST, DWELLING_LAST
 
 STATUS_INGAME, STATUS_LOST = 0, 1  # EPlayerStatus::INGAME, LOSER (WINNER is 2)
 # Bumped when Φ's rules change (the evals' scores are shares of it: evaluate.py compares only evals of one version).
-# 2 (2026-10-29): heroes by their skills (skill_value), the strongest in full; a fresh hero HERO_BASE; the spellbook
-EMPIRE_VERSION = 2
+# 2 (2026-10-29): heroes by their skills (skill_value), the strongest in full; a fresh hero HERO_BASE; the spellbook.
+# 3 (2026-10-30): heroes' spells (SPELL_LEVEL a level), their luck and morale until the next battle (boost_value)
+EMPIRE_VERSION = 3
+# A battle's luck and morale (VCMI config/gameConfig.json "combat": goodLuckChance [1, 2, 3], badLuckChance [],
+# goodMoraleChance [1, 2, 3], badMoraleChance [2, 4, 6], all out of 24): at each value -3..+3 the chance in 24 that a
+# stack's attack is lucky (double damage), or that its turn brings an extra one (+) or is lost (-)
+LUCK_CHANCE = (0, 0, 0, 0, 1, 2, 3)
+MORALE_CHANCE = (-6, -4, -2, 0, 1, 2, 3)
 
 
 @dataclass(frozen=True)
@@ -60,6 +74,8 @@ class EmpireConfig:
 	primary_base: float = 5.0
 	level_bonus: float = 200.0  # a level's own worth (its specialty)
 	secondary_share: float = 0.5  # how much a hero's skills count unless it is the strongest
+	spell_level: float = 500.0  # each spell in a hero's spellbook: this x its level (1-5)
+	boost: float = 0.02  # each 1/24 of battle chance luck or morale gives until the next battle: this x the army it lifts
 	hero_penalty: float = 100.0  # gold x heroes^2
 	explored_tile: float = 1.0  # gold per tile ever revealed (the user, 2026-10-27: 10 was too much; a 72x72 two-level map is 10k)
 
@@ -90,23 +106,47 @@ def building_value(faction, building, config=EmpireConfig()):
 
 def skill_value(hero, config=EmpireConfig()):
 	"""What a hero's own skills are worth (gold), 0 for a fresh hero's (see the top): its secondary skill levels, its
-	primary points (without items), its levels and its way to the next."""
+	primary points (without items), its levels and its way to the next, its spells."""
 	points = sum(max(p, 0) for p in hero["primary"])
 	extra = max(points - config.primary_base, 0.0)
 	level = fractional_level(max(hero["exp"], 0), vocab.experience_table())
 	whole = math.floor(level)
 	levels = sum(max(level_, 0) for _, level_ in hero["skills"])
 	next_gain = config.primary_point * max(points - config.primary_base + 1, 0.0) + config.skill_level + config.level_bonus
-	return config.skill_level * (levels - config.fresh_skill_levels) + config.primary_point * extra * (extra + 1) / 2 + config.level_bonus * (whole - 1) + (level - whole) * next_gain
+	spells = config.spell_level * sum(vocab.spell_levels().get(spell, 0) for spell in hero.get("spells", []))
+	return config.skill_level * (levels - config.fresh_skill_levels) + config.primary_point * extra * (extra + 1) / 2 + config.level_bonus * (whole - 1) + (level - whole) * next_gain + spells
+
+
+def _chance(table, value):
+	"""The battle chance (in 24ths) at a luck or morale value, capped at -3..+3 (LUCK_CHANCE, MORALE_CHANCE)."""
+	return table[min(max(value, -3), 3) + 3]
+
+
+def boost_value(hero, config=EmpireConfig()):
+	"""What a hero's luck and morale until the next battle are worth (gold; see the top): the battle chance they add
+	over the rest of its luck and morale (within the caps: a hero at +3 morale gains nothing from a Temple; a Warrior's
+	Tomb's -3 costs twice a point as a lost turn), BOOST a 24th, of the army each lifts at cost + u."""
+	luck, morale = hero.get("luck", 0), hero.get("morale", 0)
+	gained_luck = _chance(LUCK_CHANCE, luck) - _chance(LUCK_CHANCE, luck - hero.get("battle_luck", 0))
+	gained_morale = _chance(MORALE_CHANCE, morale) - _chance(MORALE_CHANCE, morale - hero.get("battle_morale", 0))
+	if not gained_luck and not gained_morale:
+		return 0.0
+	lucky = living = 0.0
+	for creature, count in hero["army"]:
+		worth = count * (vocab.creature_cost(creature) + _unit(creature, config))
+		lucky += worth * vocab.feels(creature, vocab.NO_LUCK)
+		living += worth * vocab.feels(creature, vocab.NO_MORALE)
+	return config.boost * (gained_luck * lucky + gained_morale * living)
 
 
 def heroes_value(heroes, config=EmpireConfig()):
-	"""Φ's heroes part (gold): HERO_BASE each, the strongest hero's skill_value in full, the others' at SECONDARY_SHARE."""
+	"""Φ's heroes part (gold): HERO_BASE each, the strongest hero's skill_value in full, the others' at SECONDARY_SHARE,
+	and every hero's luck and morale until the next battle (boost_value)."""
 	if not heroes:
 		return 0.0
 	values = [skill_value(h, config) for h in heroes]
 	main = max(values)
-	return config.hero_base * len(heroes) + main + config.secondary_share * (sum(values) - main)
+	return config.hero_base * len(heroes) + main + config.secondary_share * (sum(values) - main) + sum(boost_value(h, config) for h in heroes)
 
 
 def empire_value(player, config=EmpireConfig()):

@@ -9,7 +9,7 @@ from campaign_model import constants as c
 from campaign_model import features as ft
 from campaign_model import priors
 from campaign_model.config import CampaignConfig
-from campaign_model.empire import empire_value
+from campaign_model.empire import EmpireConfig, empire_value
 from campaign_model.evaluate import paired
 from campaign_model.labels import LabelConfig, horizon_advantages
 from campaign_model.model import CampaignModel
@@ -47,23 +47,38 @@ def test_phi_in_the_graph_is_the_ledgers_value(model):
 	x["h_skills"][0, 0, [0, 1, 2]] = [2, 1, 1]
 	x["h_army_creature"][0, 0, 0], x["h_army_count"][0, 0, 0] = PIKEMAN, 10
 	x["h_artifacts"][0, 0, 0] = 7
+	x["h_spells"][0, 0, [15, 21]] = True  # Magic Arrow, Fireball
+	x["h_luck"][0, 0], x["h_battle_luck"][0, 0], x["h_morale"][0, 0], x["h_battle_morale"][0, 0] = 1, 1, 3, 2  # a Rally Flag's luck, +2 morale over +1
 	# a scout: its skills count at SECONDARY_SHARE
 	x["h_present"][0, 1], x["h_owner"][0, 1], x["h_detailed"][0, 1] = True, c.OWNER_SELF, True
 	x["h_exp"][0, 1] = 1500
 	x["h_primary"][0, 1] = x["h_primary_base"][0, 1] = [1, 1, 2, 2]
 	x["h_skills"][0, 1, [3, 4, 5]] = [1, 1, 1]
+	x["h_spells"][0, 1, 53] = True  # Haste
+	x["h_morale"][0, 1], x["h_battle_morale"][0, 1] = -3, -3  # a Warrior's Tomb's, an army-less scout's: nothing
 	x["g_owned_creature"][0, 0], x["g_owned_count"][0, 0] = PIKEMAN, 6  # left in a mine's garrison
 	x["g_dwelling_creature"][0, 0], x["g_dwelling_count"][0, 0] = PIKEMAN, 9  # for hire at a dwelling we flagged
 	player = {
 		"color": 0, "status": 0, "resources": [10, 4, 10, 4, 4, 4, 10000], "income": [0, 0, 0, 0, 0, 0, 1000], "explored": 100,
 		"towns": [{"faction": CASTLE, "built": [VILLAGE_HALL, DWELLING_1], "garrison": [[PIKEMAN, 5]], "available": [[PIKEMAN, 14]] + [[-1, 0]] * 6}],
 		"heroes": [
-			{"type": 0, "level": 5, "exp": 5000, "mana": 20, "power": 2, "spell_cost": 10, "primary": [3, 2, 2, 1], "skills": [[0, 2], [1, 1], [2, 1]], "army": [[PIKEMAN, 10]], "artifacts": [7]},
-			{"type": 1, "level": 2, "exp": 1500, "mana": 0, "power": 2, "spell_cost": 0, "primary": [1, 1, 2, 2], "skills": [[3, 1], [4, 1], [5, 1]], "army": [], "artifacts": []},
+			{
+				"type": 0, "level": 5, "exp": 5000, "mana": 20, "power": 2, "spell_cost": 10, "primary": [3, 2, 2, 1], "skills": [[0, 2], [1, 1], [2, 1]], "army": [[PIKEMAN, 10]], "artifacts": [7],
+				"spells": [15, 21], "luck": 1, "battle_luck": 1, "morale": 3, "battle_morale": 2,
+			},
+			{
+				"type": 1, "level": 2, "exp": 1500, "mana": 0, "power": 2, "spell_cost": 0, "primary": [1, 1, 2, 2], "skills": [[3, 1], [4, 1], [5, 1]], "army": [], "artifacts": [],
+				"spells": [53], "morale": -3, "battle_morale": -3,
+			},
 		],
 		"dwellings": [{"available": [[PIKEMAN, 9]]}], "armies": [[PIKEMAN, 6]],
 	}
 	expected = empire_value(player)
+	# Φ v3's parts: Magic Arrow and Fireball (levels 1 and 3) to the main hero, Haste to the scout at SECONDARY_SHARE, the
+	# main hero's +1 luck and +2 morale (+1 -> +3) on its 10 pikemen; the scout's -3 morale lifts no army
+	config, pikemen = EmpireConfig(), 10 * 75.0
+	without = empire_value(dict(player, heroes=[dict(h, spells=[], battle_luck=0, battle_morale=0) for h in player["heroes"]]))
+	assert expected["heroes"] - without["heroes"] == pytest.approx(config.spell_level * (4 + config.secondary_share) + config.boost * 3 * pikemen)
 	with torch.no_grad():
 		parts, total = ft.empire_value(tensors(x), model.features)
 	assert float(total[0]) == pytest.approx(expected["total"], rel=1e-4)
@@ -90,8 +105,9 @@ def test_a_hire_in_the_graph_adds_what_empire_value_adds(model):
 			x["g_tavern_skills"][0, 0, skill] = level
 		x["g_tavern_army_creature"][0, 0, :2], x["g_tavern_army_count"][0, 0, :2] = [PIKEMAN, HALBERDIER], [12, 4]
 		x["g_tavern_artifacts"][0, 0, 13] = 4  # a ballista
+		x["g_tavern_spells"][0, 0, 15] = True  # Magic Arrow
 		before = {"color": 0, "status": 0, "resources": [0] * 7, "income": [0] * 7, "explored": 0, "towns": [], "heroes": [hero], "dwellings": [], "armies": []}
-		hired = {"type": 5, "level": 1, "exp": tavern_exp, "mana": 0, "power": 1, "spell_cost": 0, "primary": [1, 2, 1, 1], "skills": tavern_skills, "army": [[PIKEMAN, 12], [HALBERDIER, 4]], "artifacts": [4]}
+		hired = {"type": 5, "level": 1, "exp": tavern_exp, "mana": 0, "power": 1, "spell_cost": 0, "primary": [1, 2, 1, 1], "skills": tavern_skills, "army": [[PIKEMAN, 12], [HALBERDIER, 4]], "artifacts": [4], "spells": [15]}
 		after = dict(before, heroes=[hero, hired])
 		with torch.no_grad():
 			worth = ft.tavern_worth(tensors(x), model.features)

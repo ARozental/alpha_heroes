@@ -3,12 +3,13 @@ import copy
 import pytest
 
 from campaign_model import vocab
-from campaign_model.empire import EmpireConfig, building_value, empire_value, heroes_value, shares, skill_value
+from campaign_model.empire import EmpireConfig, boost_value, building_value, empire_value, heroes_value, shares, skill_value
 from game_values import HERO_HIRE_COST, capped_mana_value, resources_value
 
 CASTLE = 0
 VILLAGE_HALL, TOWN_HALL, CITY_HALL, CAPITOL, DWELLING_1, DWELLING_1_UP = 10, 11, 12, 13, 30, 37
-PIKEMAN, HALBERDIER = 0, 1
+PIKEMAN, HALBERDIER, SKELETON = 0, 1, 56
+MAGIC_ARROW, FIREBALL, HASTE = 15, 21, 53
 
 
 def cost(building):
@@ -119,6 +120,37 @@ def test_only_the_strongest_heros_skills_count_in_full():
 	assert value == pytest.approx(2 * config.hero_base + skill_value(main) + config.secondary_share * skill_value(scout))
 	assert heroes_value([scout, main]) == pytest.approx(value)  # whatever the order
 	assert heroes_value([]) == 0
+
+
+def test_spells_count_by_their_level_among_a_heros_skills():
+	"""Each spell in a hero's spellbook is worth SPELL_LEVEL x its level, among its skills: a scout's at SECONDARY_SHARE."""
+	config = EmpireConfig()
+	caster = fresh_hero(0, spells=[MAGIC_ARROW, HASTE, FIREBALL])  # levels 1, 1 and 3
+	assert skill_value(caster) == pytest.approx(config.spell_level * 5)
+	assert skill_value(fresh_hero(0, spells=[])) == 0 and skill_value(fresh_hero(0)) == 0  # (a ledger before Φ v3: no spells)
+	main = fresh_hero(1, exp=1000, primary=[2, 1, 1, 2], skills=[[0, 2], [1, 1]])
+	assert heroes_value([main, caster]) - heroes_value([main, fresh_hero(0)]) == pytest.approx(config.secondary_share * config.spell_level * 5)
+
+
+def test_luck_and_morale_until_the_next_battle_are_worth_the_battle_chance_they_add_to_the_army_they_lift():
+	"""BOOST of the army's worth (cost + u) for each 24th of battle chance: luck lifts every creature, morale only the
+	living; within the +-3 caps; bad morale costs 2/24 a point, bad luck nothing (VCMI's gameConfig.json)."""
+	config = EmpireConfig()
+	army = 10 * (vocab.creature_cost(PIKEMAN) + config.alpha * vocab.creature_cost(PIKEMAN))
+	temple = fresh_hero(0, morale=1, battle_morale=1)
+	assert boost_value(temple) == pytest.approx(config.boost * army)
+	rally_flag = fresh_hero(0, luck=1, battle_luck=1, morale=2, battle_morale=1)  # +1 morale over a permanent +1
+	assert boost_value(rally_flag) == pytest.approx(config.boost * 2 * army)
+	assert boost_value(fresh_hero(0, morale=4, battle_morale=1)) == 0  # +3 already: a Temple adds nothing
+	assert boost_value(fresh_hero(0, morale=3, battle_morale=2)) == pytest.approx(config.boost * 2 * army)  # +1 -> +3
+	tomb = fresh_hero(0, morale=-3, battle_morale=-3)  # a Warrior's Tomb: 6/24 of the turns lost
+	assert boost_value(tomb) == pytest.approx(-6 * config.boost * army)
+	assert boost_value(fresh_hero(0, luck=-1, battle_luck=-1)) == 0  # bad luck does nothing in this configuration
+	undead = fresh_hero(0, army=((SKELETON, 10),), luck=1, battle_luck=1, morale=1, battle_morale=1)
+	skeletons = 10 * (vocab.creature_cost(SKELETON) + config.alpha * vocab.creature_cost(vocab.base_forms()[SKELETON]))
+	assert boost_value(undead) == pytest.approx(config.boost * skeletons)  # the luck only
+	assert boost_value(fresh_hero(0, morale=2)) == 0  # nothing until the next battle: nothing to price
+	assert heroes_value([temple]) - heroes_value([fresh_hero(0, morale=0)]) == pytest.approx(boost_value(temple))  # in Φ, every hero's own
 
 
 def test_mana_counts_only_what_a_short_battle_can_spend():

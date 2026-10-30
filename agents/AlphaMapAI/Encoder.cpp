@@ -1,5 +1,6 @@
 #include "StdInc.h"
 #include "AlphaMapAI.h"
+#include "Ledger.h"
 
 #include "lib/GameConstants.h"
 #include "lib/IGameSettings.h"
@@ -297,6 +298,10 @@ void AlphaMapAI::encodeGlobal(Decision & decision)
 			for(int slot = 0; slot < N_WORN_SLOTS; ++slot)
 				if(const auto * art = h->getArt(ArtifactPosition(slot)))
 					in.at(In::g_tavern_artifacts, i, slot) = art->getTypeId().getNum();
+			if(h->hasSpellbook())
+				for(const auto & spell : h->getSpellsInSpellbook())
+					if(spell.getNum() >= 0 && spell.getNum() < N_SPELLS)
+						in.at(In::g_tavern_spells, i, spell.getNum()) = 1;
 		}
 	}
 }
@@ -436,6 +441,11 @@ void AlphaMapAI::encodeHeroes(Decision & decision, PathfinderCache & paths)
 				for(const auto & spell : h->getSpellsInSpellbook())
 					if(spell.getNum() >= 0 && spell.getNum() < N_SPELLS)
 						in.at(In::h_spells, i, spell.getNum()) = 1;
+			const auto boosts = luckAndMorale(*h); // (Ledger.cpp: as the ledger has them)
+			in.at(In::h_luck, i) = boosts.luck;
+			in.at(In::h_morale, i) = boosts.morale;
+			in.at(In::h_battle_luck, i) = boosts.battleLuck;
+			in.at(In::h_battle_morale, i) = boosts.battleMorale;
 			in.at(In::h_boat, i) = h->inBoat() ? 1 : 0;
 			in.at(In::h_town, i) = townToken(h->getVisitedTown());
 			in.at(In::h_garrisoned, i) = h->isGarrisoned() ? 1 : 0;
@@ -454,6 +464,8 @@ void AlphaMapAI::encodeHeroes(Decision & decision, PathfinderCache & paths)
 						in.at(In::h_primary, i, k) = info.details->primskills[k];
 					in.at(In::h_mana, i) = info.details->mana;
 					in.at(In::h_mana_max, i) = info.details->manaLimit;
+					in.at(In::h_luck, i) = info.details->luck;
+					in.at(In::h_morale, i) = info.details->morale;
 				}
 				for(const auto & [slot, stack] : info.army)
 					if(slot.getNum() >= 0 && slot.getNum() < ARMY_SLOTS && stack.getId() != CreatureID::NONE)

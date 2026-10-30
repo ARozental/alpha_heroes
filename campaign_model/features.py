@@ -129,15 +129,16 @@ def next_level_gain(primary, t):
 	return t.primary_point * (points - t.primary_base + 1).clamp(min=0) + t.skill_level + t.level_bonus
 
 
-def skill_value(primary, skills, experience, t):
+def skill_value(primary, skills, experience, spells, t):
 	"""empire.skill_value of heroes [...]: primary [..., 4] without items, skills [..., N_SECONDARY_SKILLS] levels,
-	experience [...]."""
+	experience [...], spells [..., N_SPELLS] in the spellbook."""
 	points = primary.clamp(min=0).sum(dim=-1).float()
 	extra = (points - t.primary_base).clamp(min=0)
 	level = fractional_level(experience.clamp(min=0).float(), t.level_experience)
 	whole = level.floor()
 	levels = skills.clamp(min=0).sum(dim=-1).float()
-	return t.skill_level * (levels - t.fresh_skill_levels) + t.primary_point * extra * (extra + 1) / 2 + t.level_bonus * (whole - 1).clamp(min=0) + (level - whole) * next_level_gain(primary, t)
+	known = (spells.float() * t.spell_value).sum(dim=-1)
+	return t.skill_level * (levels - t.fresh_skill_levels) + t.primary_point * extra * (extra + 1) / 2 + t.level_bonus * (whole - 1).clamp(min=0) + (level - whole) * next_level_gain(primary, t) + known
 
 
 def main_hero(values, present):
@@ -156,7 +157,26 @@ def heroes_value(values, present, t):
 def own_skill_values(x, t):
 	"""Our heroes' skill_value [B, HO] and which are present [B, HO]."""
 	present = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
-	return skill_value(x["h_primary_base"], x["h_skills"][:, :HO], x["h_exp"][:, :HO], t), present
+	return skill_value(x["h_primary_base"], x["h_skills"][:, :HO], x["h_exp"][:, :HO], x["h_spells"][:, :HO], t), present
+
+
+def battle_chance(table, value):
+	"""empire._chance: the battle chance (24ths) at luck or morale values [...], capped at -3..+3."""
+	return constant(table, value.device)[(value.clamp(-3, 3) + 3).long()]
+
+
+def boost_values(x, t):
+	"""empire.boost_value of our heroes [B, HO]: what their luck and morale until the next battle add (the battle
+	chance over the rest of their luck and morale, within the caps), BOOST a 24th of the army each lifts at cost + u."""
+	from .empire import LUCK_CHANCE, MORALE_CHANCE
+
+	luck, morale = x["h_luck"][:, :HO], x["h_morale"][:, :HO]
+	gained_luck = battle_chance(LUCK_CHANCE, luck) - battle_chance(LUCK_CHANCE, luck - x["h_battle_luck"])
+	gained_morale = battle_chance(MORALE_CHANCE, morale) - battle_chance(MORALE_CHANCE, morale - x["h_battle_morale"])
+	creatures = x["h_army_creature"][:, :HO]
+	index = vocab_index(creatures, c.CREATURE_VOCAB)
+	worth = x["h_army_count"][:, :HO].clamp(min=0).float() * (t.creature_cost[index] + t.creature_unit[index]) * (creatures >= 0)
+	return t.boost * (gained_luck * (worth * t.creature_luck[index]).sum(dim=-1) + gained_morale * (worth * t.creature_morale[index]).sum(dim=-1))
 
 
 def level_gains(x, t):
@@ -192,7 +212,7 @@ def tavern_worth(x, t):
 	_, _, army_gold, _ = army(x["g_tavern_army_creature"], x["g_tavern_army_count"], torch.ones_like(x["g_tavern_army_creature"][..., 0], dtype=torch.bool), t)
 	worn = x["g_tavern_artifacts"]
 	carried = (t.artifact_price[vocab_index(worn, c.ARTIFACT_VOCAB)] * (worn >= 0)).sum(dim=-1)
-	theirs = skill_value(x["g_tavern_primary"], x["g_tavern_skills"], x["g_tavern_exp"], t)  # [B, N_TAVERN]
+	theirs = skill_value(x["g_tavern_primary"], x["g_tavern_skills"], x["g_tavern_exp"], x["g_tavern_spells"], t)  # [B, N_TAVERN]
 	ours, mine = own_skill_values(x, t)
 	before = heroes_value(ours, mine, t).unsqueeze(-1)
 	after = torch.stack([heroes_value(torch.cat([ours, theirs[:, s : s + 1]], dim=1), torch.cat([mine, torch.ones_like(mine[:, :1])], dim=1), t) for s in range(theirs.shape[1])], dim=1)
@@ -238,7 +258,7 @@ def empire_value(x, t):
 			t.income_days * (x["g_object_income"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
 			(hero_army * own_heroes).sum(dim=-1) + (garrison * own_towns).sum(dim=-1) + owned,
 			((x["t_available"][:, : c.OWN_TOWNS].clamp(min=0).float() * t.creature_unit[vocab_index(available, c.CREATURE_VOCAB)] * (available >= 0)).sum(dim=-1) * own_towns).sum(dim=-1) + dwelling_hire,
-			heroes_value(*own_skill_values(x, t), t),
+			heroes_value(*own_skill_values(x, t), t) + (boost_values(x, t) * own_heroes).sum(dim=-1),
 			((t.artifact_price[vocab_index(artifacts, c.ARTIFACT_VOCAB)] * (artifacts >= 0)).sum(dim=-1) * own_heroes).sum(dim=-1),
 			(2.0 * x["h_primary"][:, :HO, 2].clamp(min=0).float() * usable_mana * own_heroes).sum(dim=-1),  # game_values.capped_mana_value
 			-t.hero_penalty * own_heroes.sum(dim=-1) ** 2,
