@@ -39,6 +39,32 @@ def test_outputs_are_the_models(served):
 		client.run("v1", x)
 
 
+GPU = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else None
+
+
+@pytest.mark.skipif(GPU is None, reason="no GPU")
+def test_a_gpu_server_decodes_one_decision_and_many():
+	"""The GPU path cuts the inputs out of the batch's bytes on the device: a batch of one decision failed there
+	("stride(0) must be divisible by 4", 2026-10-30, the PC's first CUDA run), a batch of several did not."""
+	torch.manual_seed(0)
+	model = BattleModel().eval()
+	server = InferenceServer(play.SOCKET_DIR / "test-inference-gpu.sock", device=GPU, model_kwargs={"architecture": "v3"}, threads=1)
+	try:
+		server.set_model("current", 3, model)
+		client = InferenceClient(server.socket_path)
+		for batch in (1, 3):
+			x = random_inputs(batch=batch, seed=batch)
+			_, out = client.run("current", x)
+			with torch.no_grad():
+				ref = model({k: torch.from_numpy(v) for k, v in x.items()})
+			for name, value in out.items():
+				expected = ref[name].numpy()
+				assert (np.isfinite(value) == np.isfinite(expected)).all(), name
+				assert np.allclose(np.where(np.isfinite(expected), value, 0), np.where(np.isfinite(expected), expected, 0), atol=1e-3), (batch, name)
+	finally:
+		server.close()
+
+
 def test_a_new_version_replaces_the_weights(served):
 	server, model = served
 	other = BattleModel().eval()

@@ -188,7 +188,9 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 		else:  # the whole batch to the GPU in one copy, its columns cut and converted there (not one copy an input)
 			on_device = torch.from_numpy(data).to(device)
 			for (input_name, shape, wire, dtype, nbytes), offset in zip(in_layout, offsets):
-				column = on_device[:, offset : offset + nbytes].contiguous().view(torch_dtype[np.dtype(wire)])
+				# (a copy always: one decision's slice counts as contiguous, so .contiguous() kept its odd row stride, the
+				# record's byte count, and the view refused it: "stride(0) must be divisible by 4", 2026-10-30, the PC)
+				column = on_device[:, offset : offset + nbytes].clone(memory_format=torch.contiguous_format).view(torch_dtype[np.dtype(wire)])
 				inputs[input_name] = column.to(torch_dtype[np.dtype(dtype)]).reshape((total,) + shape)
 		with torch.inference_mode():
 			out = model(inputs)
