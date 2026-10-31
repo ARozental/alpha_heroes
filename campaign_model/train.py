@@ -324,7 +324,7 @@ def ppo_update(
 		chunks = [np.arange(i, i + chunk).clip(max=n - 1) for i in range(0, n, chunk)]  # the last one padded: fixed shapes
 		prepass_started = time.perf_counter()
 		for rows, inputs in _prefetched(chunks, decode, device, convert):
-			index = torch.from_numpy(rows).to(device)
+			index = torch.arange(int(rows[0]), int(rows[0]) + len(rows), device=device).clamp(max=n - 1)  # (made there: a copy from pageable memory waited for the GPU)
 			out = graphs.eval(inputs) if graphs else model(inputs)
 			logp, _ = chosen_logp(out, {k: choice[k][index] for k in ("kind", "action", "index", "cell")})
 			anchor[index] = logp
