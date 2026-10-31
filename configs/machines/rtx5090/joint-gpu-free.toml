@@ -35,8 +35,9 @@ games = 12
 # The campaign's inference on the GPU, graphed (above): one process batches every game's requests
 inference_device = "cuda"
 inference_processes = 1
-# 64 decisions a micro-batch (the batch's parts' gradients summed: the same gradient): at 256 the v2 model filled the
+# 128 decisions a micro-batch (the batch's parts' gradients summed: the same gradient): a step's cost under WSL is its ops' launches
+# (~2.3 s a micro-batch whatever its size, 60 ms of it the GPU's, 2026-10-30), so a bigger part is nearly free; at 256 the v2 model filled the
 # 32 GB GPU and took 10 GB of host memory (2026-10-30)
 batch_size = 512
-micro_batches = 8
+micro_batches = 4
 eval_parallel = 8
