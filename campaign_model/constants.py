@@ -51,11 +51,11 @@ TRAVEL_GRID = MAP_GRID // 2  # TRAVEL's areas: blocks of the map encoder's middl
 
 N_ADVENTURE_SPELLS = 10  # spell ids 0..9 are exactly the adventure spells
 SUMMON_BOAT, SCUTTLE_BOAT, VISIONS, VIEW_EARTH, DISGUISE, VIEW_AIR, FLY, WATER_WALK, DIMENSION_DOOR, TOWN_PORTAL = range(10)
-# Spells that only show the map: never cast by the model (model_v2's castable). The value heads read the map as the
-# player sees it, so V7 rose after each (+0.0004-0.0005, against -0.0005 after a move) and the step credit paid for
-# seeing, not for having: casting climbed from 2% to 10% of joint5's turn decisions, ~1 cast a hero-day, about a
-# hero's daily mana, which its battles then lacked (2026-10-31: View Earth 5.4%, View Air 4.1%, Visions 1.3%)
-INFO_SPELLS = (VISIONS, VIEW_EARTH, VIEW_AIR)
+# Spells the model may not cast (model_v2's castable): none. View Air, View Earth and Visions were masked 2026-10-31 10:05
+# as "only showing the map" (V7 rose after them; casts were 11% of the turn decisions), and the next eval against
+# Nullkiller2 fell from 0.22 to 0.07 (eliminated 20 of 24, from 13): what they show includes the enemy's heroes and armies,
+# worth nothing against self-play's passive players and much against an attacker. Back the next hour
+INFO_SPELLS = ()
 TARGETED_SPELLS = (DIMENSION_DOOR,)  # the spells whose target is a tile (cast_cell); Scuttle Boat: not yet
 
 BUY_ARTIFACTS = (0, 4, 5, 6)  # spellbook (mage guild), ballista, ammo cart, first aid tent (blacksmith)
