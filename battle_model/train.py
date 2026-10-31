@@ -106,6 +106,11 @@ class TrainConfig:
 	max_record_age: int = 3  # model versions: older records are dropped
 	buffer_decisions: int = 16000  # at most this many decisions wait in the buffer (the oldest go first)
 	decisions_per_update: int = 3200  # ~60 battles: each gradient over many outcomes (800, ~15 battles, was the noisy v14-11h)
+	# Each side's decisions trained on, drawn at random once its credit is known (supply.prepare); 0: all of them. A
+	# battle's decisions share its outcome, so it is one sample, not ~50: k a side (both sides of a self-play battle,
+	# the winner's and the loser's) makes an update's decisions as many outcomes (the user, 2026-10-31: "only taking one
+	# example from every battle ... battles are much cheaper than campaigns"), at ~50/k times the battles an update
+	examples_per_battle: int = 0
 	# Time instead of epochs: stop after run_hours (0: after `epochs`), the linear learning rate following the time;
 	# an eval every eval_minutes (0: every eval_every epochs); the rate ends at lr_final_fraction of learning_rate
 	run_hours: float = 0.0

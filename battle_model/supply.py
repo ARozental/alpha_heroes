@@ -127,6 +127,8 @@ def prepare(record, source, key, config, keep_record=False):
 		return None, f"FAILURE: a {source} battle's record is unsound ({key}): {problem[:300]}"
 	examples, summary = battle_examples(record, config.reward, config.advantage)
 	chosen = [e for e in examples if not e["forced"]]
+	if config.examples_per_battle and len(chosen) > config.examples_per_battle:  # (TrainConfig.examples_per_battle)
+		chosen = [chosen[i] for i in sorted(random.sample(range(len(chosen)), config.examples_per_battle))]
 	item = {
 		"kind": "battle", "source": source, "game": key, "version": version_of(record), "decisions": len(chosen), "summary": summary,
 		"failures": failure_counts([record]), "actions": Counter(ActionType(a["type"]).name for a in record.actions), "data": None, "record": None,

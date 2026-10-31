@@ -11,6 +11,8 @@ import argparse
 import json
 import pickle
 import random
+import signal
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -23,25 +25,33 @@ from .play import GameRun, make_map
 from .records import TEACHER
 
 
-def audit(games):
-	"""What the recorder made of the teacher's requests over games ({key: records.Game})."""
-	matched, approximate, unmatched, types, decisions, errors = 0, 0, Counter(), Counter(), 0, 0
-	for game in games.values():
-		for summary in game.done.values():
-			teacher = summary.get("teacher", {})
-			matched += teacher.get("matched", 0)
-			approximate += teacher.get("approximate", 0)
-			unmatched.update(teacher.get("unmatched", {}))
-			errors += summary.get("errors", 0)
-		for d in game.decisions:
-			if d.flags & TEACHER:
-				decisions += 1
-				types[c.ActionType(d.action_type).name] += 1
-	requests = matched + sum(unmatched.values())
+def tally(game, totals=None):
+	"""What the recorder made of a game's teacher requests, added to totals (a Counter of counts; "type:" and
+	"unmatched:" keys by kind); returns totals. The games themselves are not kept (each ~35 MB)."""
+	totals = Counter() if totals is None else totals
+	totals["games"] += 1
+	for summary in game.done.values():
+		teacher = summary.get("teacher", {})
+		totals["matched"] += teacher.get("matched", 0)
+		totals["approximate"] += teacher.get("approximate", 0)
+		totals["errors"] += summary.get("errors", 0)
+		for kind, count in teacher.get("unmatched", {}).items():
+			totals["unmatched:" + kind] += count
+	for d in game.decisions:
+		if d.flags & TEACHER:
+			totals["decisions"] += 1
+			totals["type:" + c.ActionType(d.action_type).name] += 1
+	return totals
+
+
+def audit(totals):
+	"""tally's counts as the report: shares matched (of the requests) and approximate (of the matched), by kind."""
+	unmatched = {k.split(":", 1)[1]: v for k, v in totals.most_common() if k.startswith("unmatched:")}
+	requests = totals["matched"] + sum(unmatched.values())
 	return {
-		"games": len(games), "decisions": decisions, "errors": errors,
-		"matched_share": matched / max(1, requests), "approximate_share_of_matched": approximate / max(1, matched),
-		"matched_by_type": dict(types.most_common()), "unmatched": dict(unmatched.most_common()),
+		"games": totals["games"], "decisions": totals["decisions"], "errors": totals["errors"],
+		"matched_share": totals["matched"] / max(1, requests), "approximate_share_of_matched": totals["approximate"] / max(1, totals["matched"]),
+		"matched_by_type": {k.split(":", 1)[1]: v for k, v in totals.most_common() if k.startswith("type:")}, "unmatched": unmatched,
 	}
 
 
@@ -57,15 +67,19 @@ def main():
 	parser.add_argument("--max-gb", type=float, default=5.0, help="stop once the saved games take this much")
 	parser.add_argument("--game-seconds", type=int, default=config.game_seconds)
 	args = parser.parse_args()
+	signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))  # (so the games playing are ended on the way out, not orphaned)
 	out = Path(args.out)
 	out.mkdir(parents=True, exist_ok=True)
 	rng = random.Random(args.seed)
-	started, saved_bytes, games, running, next_game = time.time(), 0, {}, {}, 0
+	started, saved_bytes, totals, running, next_game = time.time(), 0, Counter(), {}, 0
 	deadline = started + 60 * args.minutes
 	try:
 		while next_game < args.games or running:
 			while next_game < args.games and len(running) < args.parallel and time.time() < deadline and saved_bytes < args.max_gb * 1e9:
 				seed = args.seed + next_game
+				if (out / f"game_{seed}.pkl").exists():  # (a run started again: its games kept, not played twice)
+					next_game += 1
+					continue
 				players, size = rng.choice(config.players), rng.choice(config.sizes)
 				map_name = make_map(seed, players, size, config.levels, config.water)[0]
 				run = GameRun(battle_play.SOCKET_DIR / "teacher-none.sock", map_name, args.days, seed, max_seconds=args.game_seconds, battle_ai="BattleAI", game_key=f"t{seed}", teacher=True)
@@ -82,11 +96,13 @@ def main():
 				del running[seed]
 				(battle_play.USER_DIR / (map_name + ".vmap")).unlink(missing_ok=True)
 				path = out / f"game_{seed}.pkl"
-				with open(path, "wb") as f:
+				with open(path.with_suffix(".part"), "wb") as f:  # (renamed once whole: a stop mid-write leaves no torn game)
 					pickle.dump(game, f, protocol=pickle.HIGHEST_PROTOCOL)
+				path.with_suffix(".part").rename(path)
 				saved_bytes += path.stat().st_size
-				games[seed] = game
-				one = audit({seed: game})
+				tally(game, totals)
+				one = audit(tally(game))
+				del game
 				minutes = (time.time() - started) / 60
 				print(f"teacher: game {seed} ({players} players, {info.status}, {time.time() - begun:.0f} s): {one['decisions']} decisions, matched {one['matched_share']:.1%}, {path.stat().st_size / 1e6:.0f} MB; total {saved_bytes / 1e6:.0f} MB, {saved_bytes / 1e6 / max(minutes, 1e-9):.1f} MB/min", flush=True)
 			time.sleep(0.5)
@@ -94,7 +110,7 @@ def main():
 		for run, map_name, *_ in running.values():
 			run.terminate()
 			(battle_play.USER_DIR / (map_name + ".vmap")).unlink(missing_ok=True)
-	report = audit(games)
+	report = audit(totals)
 	report.update(mb=saved_bytes / 1e6, minutes=(time.time() - started) / 60, mb_per_minute=saved_bytes / 1e6 / max((time.time() - started) / 60, 1e-9))
 	(out / "audit.json").write_text(json.dumps(report, indent=1))
 	print(json.dumps(report, indent=1))
