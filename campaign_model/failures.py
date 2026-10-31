@@ -12,12 +12,16 @@ the evaluations against Nullkiller2. They should be near 0, though not always 0.
 import numpy as np
 
 from . import constants as c
-from .records import decode_inputs
+from .records import decode_fields
 
 HO, W, L, TG, HD, A = c.OWN_HEROES, c.WINDOW, c.MAP_LEVELS, c.TRAVEL_GRID, c.N_HOLDERS, c.ARMY_SLOTS
 SAFE_CLASSES = (c.ObjectClass.PICKUP, c.ObjectClass.TREASURE)
 CLASS_OF = np.array([int(c.object_class(i)) for i in range(c.OBJECT_VOCAB)] + [int(c.ObjectClass.OTHER)])
 NAMES = ("pickup_passed_end", "pickup_passed_travel", "troops_left")
+# The inputs safe_pickups reads, decoded CHUNK decisions at a time: the update's END and TRAVEL decisions (~a third of
+# them) decoded whole at once were ~10 GB (1.7 MB a decision), the spike that stopped the PC's run (2026-10-30)
+FIELDS = ("h_present", "h_owner", "w_object", "w_flags", "move_mask", "w_creature", "w_owner")
+CHUNK = 256
 
 
 def safe_pickups(x, b):
@@ -42,11 +46,13 @@ def failure_counts(decisions):
 	for name, chosen in (("pickup_passed_end", ends), ("pickup_passed_travel", travels)):
 		if not chosen:
 			continue
-		x = decode_inputs(chosen)
-		for b, d in enumerate(chosen):
-			pickups = safe_pickups(x, b)
-			counts[name][0] += bool(pickups.any() if name == "pickup_passed_end" else pickups[min(d.index // (L * TG * TG), HO - 1)])
-			counts[name][1] += 1
+		for start in range(0, len(chosen), CHUNK):
+			part = chosen[start : start + CHUNK]
+			x = decode_fields(part, FIELDS)
+			for b, d in enumerate(part):
+				pickups = safe_pickups(x, b)
+				counts[name][0] += bool(pickups.any() if name == "pickup_passed_end" else pickups[min(d.index // (L * TG * TG), HO - 1)])
+				counts[name][1] += 1
 	for d in decisions:
 		if d.action_type == c.ActionType.ARMY and d.index >= 0:
 			source, _, target, _ = np.unravel_index(d.index, (HD, A, HD, c.N_ARMY_AMOUNTS))
