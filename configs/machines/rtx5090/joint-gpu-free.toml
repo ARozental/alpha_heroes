@@ -27,8 +27,16 @@ inference_processes = 3
 inference_batch_wait_ms = 0
 buffer_decisions = 8000
 # Generated battles at once here, at most (the learner's demand decides how many play: supply.py). With the Mac serving
-# the inference (inference_endpoints), the battle learner waited 10-17 s an update on 6 (2026-10-30), 11 GB of RAM free
-generated_actors = 8
+# the inference (inference_endpoints), the battle learner waited 10-17 s an update on 6 (2026-10-30), 11 GB of RAM free.
+# 4 since 2026-10-31: the campaign model is the one to train most (the user), the battle model's updates fewer and larger
+generated_actors = 4
+# The battle model's steps (the user, 2026-10-31): its eval flat at ~+0.09 for ~1,100 updates of 256-decision steps,
+# signal_ratio ~0.12 (mostly noise); each step now averages ~3,072 decisions (12 minibatches accumulated), at 1e-5, 3 passes
+learning_rate = 1e-5
+accumulate = 12
+ppo_passes = 3
+# 48 battles a side an eval (16 before): a set's standard error was ~0.03 (the total's ~0.013), more than the changes to see
+eval_seeds = 48
 # Loader workers kept for the Mac's game slots (worker.py --slots): 2 slots there, its cores on inference
 remote_slots = 2
 # Three updates' worth of campaign games finished and in flight (supply.py): with two, the permits emptied the pipeline

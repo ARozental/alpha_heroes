@@ -148,6 +148,10 @@ class TrainConfig:
 	lr_schedule: str = "constant"  # "linear": decay to 0 at the last epoch, as standard PPO does; Adam's steps stay ~lr even when the gradients are only noise
 	ppo_passes: int = 2  # optimisation passes over each epoch's decisions; PPO reuses its data a few times
 	batch_size: int = 256  # minibatch of decisions: on the GPU 1.15 ms a decision at 512, 1.8 at 64 (2026-10-26)
+	# Minibatches an optimizer step averages its gradient over (accumulated: the GPU holds one minibatch at a time). The
+	# battle model's steps of 256 decisions were mostly noise once it played well (signal_ratio ~0.12 and falling, its
+	# eval flat at ~+0.09 for ~1,100 updates, 2026-10-31): the user's call, ~10x the batch at a third of the rate (1e-5)
+	accumulate: int = 1
 	grad_clip: float = 0.5  # max gradient norm, the usual PPO value
 	# KL control, so the step size does not hang on a hand-picked learning rate: an update stops its steps once its KL
 	# (old against new policy) passes 1.5x target_kl; then the learning rate's scale is cut by 1.5, and raised by 1.5
@@ -1321,48 +1325,61 @@ def train(config, resume=False):
 			marks.append(time.time())
 			stopped, update_kl, kl_sum, recent = False, 0.0, 0.0, deque(maxlen=KL_WINDOW)
 			kl_of = lambda out, rows: (lambda d: (d.exp() - 1 - d).mean())(log_prob(out, rows["action"]).detach() - rows["anchor_log_prob"])  # k3: KL(anchor || now)
+			group = max(1, config.accumulate)  # minibatches an optimizer step averages its gradient over
+			steps = 0
 			for _ in range(config.ppo_passes if examples else 0):
 				if stopped:
 					break
 				order = torch.randperm(len(examples)).to(device)
-				if len(examples) >= config.batch_size:
-					order = order[: len(examples) - len(examples) % config.batch_size]
-				for first in range(0, len(order), config.batch_size):
-					batch = select(epoch_data, order[first : first + config.batch_size])
-					# The minibatch's actions as the GPU holds them, before any use: on Apple's GPU they were twice garbage
-					# (action types of 30570, 10640) in a heavily swapping run, though valid on the CPU (data.check_record),
-					# and indexing with them stopped the run; such an update is now dropped with a note instead
-					if bool(((batch["action"]["type"] < 0) | (batch["action"]["type"] >= N_ACTION_TYPES)).any()):
-						print(f"update {epoch}: a minibatch's actions are corrupt on the {device} (step {batches}): the rest of this update is dropped", flush=True)
+				whole = config.batch_size * group if len(examples) >= config.batch_size * group else config.batch_size
+				if len(examples) >= whole:
+					order = order[: len(examples) - len(examples) % whole]
+				firsts = list(range(0, len(order), config.batch_size))
+				for g in range(0, len(firsts), group):
+					members, corrupt = firsts[g : g + group], False
+					optimizer.zero_grad()
+					for first in members:
+						batch = select(epoch_data, order[first : first + config.batch_size])
+						# The minibatch's actions as the GPU holds them, before any use: on Apple's GPU they were twice garbage
+						# (action types of 30570, 10640) in a heavily swapping run, though valid on the CPU (data.check_record),
+						# and indexing with them stopped the run; such an update is now dropped with a note instead
+						if bool(((batch["action"]["type"] < 0) | (batch["action"]["type"] >= N_ACTION_TYPES)).any()):
+							print(f"update {epoch}: a minibatch's actions are corrupt on the {device} (step {batches}): the rest of this update is dropped", flush=True)
+							corrupt = True
+							break
+						out_batch = model(widened(batch["inputs"]), batch["facts"]) if "facts" in batch else model(widened(batch["inputs"]))
+						if config.search_simulations > 0 and "search" in batch:
+							loss, parts = search_loss(out_batch, batch["search"], batch["value_labels"], ppo_config)
+						else:
+							loss, parts = ppo_loss(out_batch, batch["action"], batch["old_log_prob"], batch["advantage"], batch["value_labels"], ppo_config, batch.get("weight"))
+						if "foresight" in batch and "foresight_unit" in out_batch:
+							foresight, foresight_parts = foresight_loss(out_batch, batch["foresight"], ppo_config, batch.get("weight"))
+							loss = loss + foresight
+							parts.update({f"foresight_{k}": v for k, v in foresight_parts.items()})
+							if batches == 0 and epoch % GRADIENT_CHECK_EVERY == 0:
+								gradient_check = trunk_gradients(model, loss - foresight, foresight)
+						(loss / len(members)).backward()  # (the step's gradient: the mean of its minibatches')
+						for key in parts_sum:
+							if key in parts:
+								parts_sum[key] += parts[key]  # summed on the device: no sync each step
+						batches += 1
+						if config.target_kl:
+							kl = float(kl_of(out_batch, batch))  # before this step: how far the update has moved so far
+							kl_sum += kl
+							recent.append(kl)
+							update_kl = sum(recent) / len(recent)  # the last KL_WINDOW minibatches': one's is noise
+							if update_kl > 1.5 * config.target_kl:
+								stopped = True  # this update has moved the policy far enough (after this step)
+								break
+					if corrupt:
+						optimizer.zero_grad()
 						stopped = True
 						break
-					out_batch = model(widened(batch["inputs"]), batch["facts"]) if "facts" in batch else model(widened(batch["inputs"]))
-					if config.search_simulations > 0 and "search" in batch:
-						loss, parts = search_loss(out_batch, batch["search"], batch["value_labels"], ppo_config)
-					else:
-						loss, parts = ppo_loss(out_batch, batch["action"], batch["old_log_prob"], batch["advantage"], batch["value_labels"], ppo_config, batch.get("weight"))
-					if "foresight" in batch and "foresight_unit" in out_batch:
-						foresight, foresight_parts = foresight_loss(out_batch, batch["foresight"], ppo_config, batch.get("weight"))
-						loss = loss + foresight
-						parts.update({f"foresight_{k}": v for k, v in foresight_parts.items()})
-						if batches == 0 and epoch % GRADIENT_CHECK_EVERY == 0:
-							gradient_check = trunk_gradients(model, loss - foresight, foresight)
-					optimizer.zero_grad()
-					loss.backward()
 					torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 					optimizer.step()
-					for key in parts_sum:
-						if key in parts:
-							parts_sum[key] += parts[key]  # summed on the device: no sync each step
-					batches += 1
-					if config.target_kl:
-						kl = float(kl_of(out_batch, batch))  # before this step: how far the update has moved so far
-						kl_sum += kl
-						recent.append(kl)
-						update_kl = sum(recent) / len(recent)  # the last KL_WINDOW minibatches': one's is noise
-						if update_kl > 1.5 * config.target_kl:
-							stopped = True  # this update has moved the policy far enough
-							break
+					steps += 1
+					if stopped:
+						break
 			model.eval()
 			sync(device)
 			marks.append(time.time())
@@ -1414,7 +1431,7 @@ def train(config, resume=False):
 				**{k: actor_stats.get(k, "") for k in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow")},
 				**(supply_columns(supply.status()) if supply else {}),
 				"learning_rate": round(optimizer.param_groups[0]["lr"], 8),
-				"ppo_steps": batches,
+				"ppo_steps": steps,
 				"update_kl": round(kl_sum / max(batches, 1), 5),  # KL(start of the update || during it), what the KL control uses
 				"outcome_share": round(advantage_config.outcome_share, 3),
 				"round_head_weight": round(float(advantage_config.policy_heads[2]), 3),
