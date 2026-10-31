@@ -189,3 +189,39 @@ def test_a_moves_window_takes_the_questions_and_battles_it_led_to():
 	assert not labels["move_mask"][2] and not labels["answer_mask"][2]  # a BUILD: no head of its own
 	assert labels["hero_mask"][0, 0] and not labels["hero_alive"][0, 0]  # our hero was gone the next day
 	assert labels["turn_mask"][0].all()
+
+
+def test_the_memory_carries_what_a_later_decision_needs():
+	"""Memory alone, through backpropagation over 4 steps: a bit shown only at the first step is predicted at the last
+	(~100% with the memory, a coin toss with it held at 0); and its read starts at 0 (the model as without memory)."""
+	from campaign_model.model_v2 import Memory
+
+	def run(memory_on, seed=0):
+		torch.manual_seed(seed)
+		dim, steps, batch = 16, 4, 64
+		memory, head = Memory(dim, heads=2, slots=4, width=8), torch.nn.Linear(dim, 1)
+		optimizer = torch.optim.Adam([*memory.parameters(), *head.parameters()], lr=1e-2)
+		valid = torch.ones(batch, 2, dtype=torch.bool)
+		accuracy = 0.0
+		for _ in range(300):
+			bit = torch.randint(0, 2, (batch,)).float()
+			state = torch.zeros(batch, 4, 8)
+			for t in range(steps):
+				tokens = torch.randn(batch, 2, dim) * 0.1
+				if t == 0:
+					tokens[:, 0, 0] += 2 * bit - 1
+				tokens = memory.read(tokens, state)
+				state = memory.write(tokens, valid, state) if memory_on else state
+			logit = head(tokens[:, 1]).squeeze(-1)
+			loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, bit)
+			optimizer.zero_grad()
+			loss.backward()
+			optimizer.step()
+			accuracy = 0.9 * accuracy + 0.1 * float(((logit > 0).float() == bit).float().mean())
+		return accuracy
+
+	assert run(True) > 0.9
+	assert run(False) < 0.7
+	fresh = Memory(16, heads=2, slots=4, width=8)
+	tokens = torch.randn(3, 5, 16)
+	assert torch.equal(fresh.read(tokens, torch.rand(3, 4, 8)), tokens)

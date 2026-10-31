@@ -182,6 +182,50 @@ class Foresight(nn.Module):
 		self.turn_out = nn.Linear(FORESIGHT_HIDDEN, TURN_TARGETS)
 
 
+class Memory(nn.Module):
+	"""The model's memory (constants.MEMORY_SLOTS slots of MEMORY_WIDTH, -1..1): what one player's decisions carry
+	forward, the model's own output passed back by AlphaMapAI (x["mem"]; x["mem_float"] when a trainer unrolls it).
+	  read   the trunk's tokens attend to the slots before think's blocks: a residual whose output starts at 0, so the
+	         model is at first what it was without memory
+	  write  after think_again each slot attends to the trunk's tokens and moves toward what it read by a gated update
+	         (a GRU's: gate x tanh candidate), so a slot stays in -1..1 and keeps what is not overwritten
+	The slots' own embeddings and the write start small but not at 0: with a zero read and a zero memory both, neither
+	would ever get a gradient."""
+
+	def __init__(self, dim, heads, slots=c.MEMORY_SLOTS, width=c.MEMORY_WIDTH):
+		super().__init__()
+		self.heads = heads
+		self.slot = nn.Parameter(torch.randn(slots, width) * 0.1)
+		self.query, self.key, self.value = nn.Linear(dim, dim), nn.Linear(width, dim), nn.Linear(width, dim)
+		self.read_out = zero_output(nn.Linear(dim, dim))
+		self.write_query, self.write_key, self.write_value = nn.Linear(width, dim), nn.Linear(dim, dim), nn.Linear(dim, dim)
+		self.gate = nn.Linear(dim + width, width)
+		nn.init.constant_(self.gate.bias, -2.0)  # (a slot moves ~12% of the way a decision at first)
+		self.candidate = nn.Linear(dim + width, width)
+
+	def attend(self, q, k, v, mask=None):
+		"""[B, n, d] queries over [B, m, d] keys and values; mask [B, m] (True: may be attended to)."""
+		b, n, d = q.shape
+		heads = lambda t: t.reshape(b, t.shape[1], self.heads, d // self.heads).transpose(1, 2)  # noqa: E731
+		out = F.scaled_dot_product_attention(heads(q), heads(k), heads(v), attn_mask=None if mask is None else mask[:, None, None, :])
+		return out.transpose(1, 2).reshape(b, n, d)
+
+	@staticmethod
+	def of(x):
+		"""The memory a decision starts from [B, slots, width]: the trainer's unrolled one, else the one passed in."""
+		return x["mem_float"] if "mem_float" in x else x["mem"].float() / c.MEMORY_SCALE
+
+	def read(self, tokens, memory):
+		slots = memory + self.slot
+		return tokens + self.read_out(self.attend(self.query(tokens), self.key(slots), self.value(slots)))
+
+	def write(self, tokens, valid, memory):
+		seen = self.attend(self.write_query(memory + self.slot), self.write_key(tokens), self.write_value(tokens), valid)
+		both = torch.cat([seen, memory], dim=-1)
+		gate = torch.sigmoid(self.gate(both))
+		return (1 - gate) * memory + gate * torch.tanh(self.candidate(both))
+
+
 class CampaignModelV2(nn.Module):
 	ARCHITECTURE = "v2"
 
@@ -224,6 +268,7 @@ class CampaignModelV2(nn.Module):
 		# think
 		self.pair_bias = PairBias(heads)
 		self.relation_bias = nn.Parameter(torch.zeros(heads, 6))
+		self.memory = Memory(d, heads)  # (read before the blocks, written after think_again)
 		self.blocks = nn.ModuleList(Block(d, heads) for _ in range(layers))
 		self.norm = RMSNorm(d)
 		# foresee: a (hero, tile) pair is its hero's, its tile's and its reach's projections summed
@@ -285,7 +330,7 @@ class CampaignModelV2(nn.Module):
 		state = self.think(state)
 		foresight = self.foresee(state, known)
 		state = self.think_again(state, foresight, known)
-		return {**self.decide(state, known), **foresight["outputs"]}
+		return {**self.decide(state, known), **foresight["outputs"], "memory": state.memory_out}
 
 	# ---- domain_knowledge ----
 
@@ -420,6 +465,8 @@ class CampaignModelV2(nn.Module):
 	def think(self, state):
 		tokens, valid, positions, placed, owners, kinds = self.tokens(state)
 		state.valid, state.bias = valid, self.attention_bias(positions, placed, owners, kinds)
+		state.mem = Memory.of(state.x)
+		tokens = self.memory.read(tokens, state.mem)
 		for block in self.blocks:
 			tokens = block(tokens, valid, state.bias)
 		self.split(state, self.norm(tokens))
@@ -473,7 +520,9 @@ class CampaignModelV2(nn.Module):
 		state.heroes = state.heroes + self.again_hero(None, torch.cat([state.heroes, hidden["hero"], hero_known(x, known)], dim=-1)) * x["h_present"].unsqueeze(-1)
 		state.options = state.options + self.again_option(None, torch.cat([state.options, hidden["answer"]], dim=-1)) * x["option_mask"].unsqueeze(-1)
 		tokens, valid, *_ = self.tokens(state)
-		self.split(state, self.again_norm(self.again_block(tokens, valid, state.bias)))
+		tokens = self.again_norm(self.again_block(tokens, valid, state.bias))
+		self.split(state, tokens)
+		state.memory_out = self.memory.write(tokens, valid, state.mem)
 		if known.n > 0:
 			pairs = self.pairs(state, known)  # (with the heroes as they are now)
 			move_known = torch.cat([known.move_features, torch.tanh(known.tile_prior / 4).unsqueeze(-1)], dim=-1)

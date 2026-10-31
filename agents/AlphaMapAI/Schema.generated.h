@@ -7,8 +7,8 @@
 
 namespace MapSchema
 {
-constexpr int SCHEMA_VERSION = 9;
-constexpr const char * CONTRACT_HASH = "63c0862c95d36a97";
+constexpr int SCHEMA_VERSION = 10;
+constexpr const char * CONTRACT_HASH = "7c198498b323a829";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;
@@ -45,6 +45,9 @@ constexpr int OWNER_NONE = 0;
 constexpr int OWNER_SELF = 1;
 constexpr int DIMENSION_DOOR = 8;
 constexpr int TOWN_PORTAL = 9;
+constexpr int MEMORY_SLOTS = 8;
+constexpr int MEMORY_WIDTH = 64;
+constexpr int MEMORY_SCALE = 1048576;
 constexpr int TILE_ON_MAP = 1;
 constexpr int TILE_REVEALED = 2;
 constexpr int TILE_BLOCKED = 4;
@@ -273,6 +276,7 @@ enum class In : int
 	travel_days,
 	travel_mask,
 	option_mask,
+	mem,
 	COUNT
 };
 
@@ -403,6 +407,7 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"travel_days", DType::INT64, 4, {8, 2, 18, 18}, -1},
 	TensorSpec{"travel_mask", DType::BOOL, 4, {8, 2, 18, 18}, 0},
 	TensorSpec{"option_mask", DType::BOOL, 1, {8, 1, 1, 1}, 0},
+	TensorSpec{"mem", DType::INT64, 2, {8, 64, 1, 1}, 0},
 }};
 
 enum class Out : int
@@ -422,6 +427,7 @@ enum class Out : int
 	travel_logp,
 	option_logp,
 	value,
+	memory,
 	COUNT
 };
 
@@ -441,6 +447,7 @@ constexpr std::array<TensorSpec, static_cast<int>(Out::COUNT)> OUTPUTS = {{
 	TensorSpec{"travel_logp", DType::FLOAT32, 4, {8, 2, 18, 18}, 0},
 	TensorSpec{"option_logp", DType::FLOAT32, 1, {8, 1, 1, 1}, 0},
 	TensorSpec{"value", DType::FLOAT32, 1, {3, 1, 1, 1}, 0},
+	TensorSpec{"memory", DType::FLOAT32, 2, {8, 64, 1, 1}, 0},
 }};
 
 /// The table (output) and its legality mask (input) of an action type; END has none

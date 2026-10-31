@@ -175,6 +175,8 @@ INPUTS = (
 	_i("travel_days", (HO, L, TG, TG), "days x 100 the hero needs to reach each TRAVEL area's tile (the pathfinder's: whole days and the part of the last day's movement), -1 where TRAVEL is not legal", fill=-1),
 	_m("travel_mask", (HO, L, TG, TG), "TRAVEL: hero, level, area (TRAVEL_GRID): an area with a tile the hero reaches in a day or more"),
 	_m("option_mask", (O,), "the options of a question"),
+	# (last: a record of before it, schema 9, is this one without it: records.decode_wire gives it zeros)
+	_i("mem", (c.MEMORY_SLOTS, c.MEMORY_WIDTH), "the model's memory as this player's previous decision left it (its memory output) x MEMORY_SCALE; 0 at the start of a game"),
 )
 
 
@@ -198,6 +200,7 @@ OUTPUTS = (
 	_o("travel_logp", (HO, L, TG, TG), "log p(hero, level, area | TRAVEL)"),
 	_o("option_logp", (O,), "log p(option) of a question"),
 	_o("value", (c.N_VALUE_OFFSETS,), "predicted share of all empires' value VALUE_OFFSETS days after this day"),
+	_o("memory", (c.MEMORY_SLOTS, c.MEMORY_WIDTH), "the memory after this decision, -1..1: AlphaMapAI passes it back as the next decision's mem"),
 )
 
 # Each action type's table: (output, mask); END has none

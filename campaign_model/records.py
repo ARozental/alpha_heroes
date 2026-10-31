@@ -140,7 +140,7 @@ def decode_fields(decisions, names):
 	# was ~2.6 GB, and an update's games one after another took the PC's memory guard down (2026-10-30)
 	parts = {name: [] for name, *_ in fields}
 	for d in decisions:
-		row = zlib.decompress(d.inputs)
+		row = padded(zlib.decompress(d.inputs))
 		for name, _, _, _, start, nbytes in fields:
 			parts[name].append(row[start : start + nbytes])
 	return {name: np.frombuffer(b"".join(parts[name]), dtype=wire).astype(dtype).reshape((len(decisions),) + shape) for name, shape, wire, dtype, _, _ in fields}
@@ -149,7 +149,15 @@ def decode_fields(decisions, names):
 def decode_wire(decisions):
 	"""The decisions' inputs as sent, [N, IN_BYTES] uint8 (zlib only): for inputs_on_device, which cuts and converts
 	them on the GPU (half the bytes to copy there, and no dtype copies on the CPU: 2026-10-30, the trainer's thread)."""
-	return np.frombuffer(b"".join(zlib.decompress(d.inputs) for d in decisions), dtype=np.uint8).reshape(len(decisions), IN_BYTES)
+	return np.frombuffer(b"".join(padded(zlib.decompress(d.inputs)) for d in decisions), dtype=np.uint8).reshape(len(decisions), IN_BYTES)
+
+
+MEM_BYTES = IN_LAYOUT[-1][-1] if IN_LAYOUT[-1][0] == "mem" else 0
+
+
+def padded(row):
+	"""A decision's decompressed inputs, a record of schema 9 (before the memory, the last input) given zeros there."""
+	return row + bytes(MEM_BYTES) if MEM_BYTES and len(row) == IN_BYTES - MEM_BYTES else row
 
 
 def decode_inputs(decisions):

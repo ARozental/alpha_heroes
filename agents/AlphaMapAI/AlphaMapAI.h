@@ -142,6 +142,9 @@ class AlphaMapAI : public CAdventureAI
 	ObjectInstanceID activeHero;
 	int3 activeTarget;
 	int3 intendedExit; // the next tile of a path through a teleport
+	// The model's memory as its last decision left it (its memory output x MEMORY_SCALE), passed with the next decision
+	// (mem): what this player's decisions carry forward (model_v2.Memory); 0 at the start of the game
+	std::vector<int64_t> memory = std::vector<int64_t>(MapSchema::MEMORY_SLOTS * MapSchema::MEMORY_WIDTH, 0);
 	// Our previous turn decision today and whether it changed anything: echoed to the model (g_last_*), nothing more
 	Choice lastChoice;
 	int lastChanged = -1;

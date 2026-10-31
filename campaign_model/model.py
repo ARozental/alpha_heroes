@@ -1074,6 +1074,7 @@ class CampaignModel(nn.Module):
 		self.question(x, f, out, g, heroes, options)
 		self.action_types(x, f, out, g, offers)
 		self.value(x, f, out, g, own_heroes, own_towns)
+		out["memory"] = torch.zeros_like(x["mem"], dtype=torch.float32)  # (v1 has no memory: the contract's output, kept at 0)
 		return out
 
 	def move_and_travel(self, x, f, out, own_heroes, cells, areas, windows, n):

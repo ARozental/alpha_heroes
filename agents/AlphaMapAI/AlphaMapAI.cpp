@@ -519,6 +519,7 @@ Choice AlphaMapAI::decide(Decision & decision)
 	Choice choice;
 	try
 	{
+		decision.inputs.values[static_cast<size_t>(In::mem)] = memory;
 		const auto inputs = decision.inputs.wire();
 		std::string reply;
 		uint32_t version = 0;
@@ -553,6 +554,9 @@ Choice AlphaMapAI::decide(Decision & decision)
 			}
 		}
 		const auto outputs = Outputs::fromWire(reply);
+		const auto & next = outputs[Out::memory]; // (the memory this decision leaves, for the next one)
+		for(size_t i = 0; i < memory.size() && i < next.size(); ++i)
+			memory[i] = std::llround(std::clamp(next[i], -1.0f, 1.0f) * MEMORY_SCALE);
 		choice = sample(decision, outputs);
 		Record entry;
 		entry.day = cb->getDate(Date::DAY);
