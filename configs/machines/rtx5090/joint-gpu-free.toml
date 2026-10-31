@@ -17,15 +17,26 @@
 # To measure: runtime/measure.sh joint-free campaign_model.joint --run measure-joint-free --battle-from <checkpoint>
 #   --machine <this file>, and runtime/memwatch.sh alpha-measure; note update seconds and peak memory here.
 # generated_actors: the recipe's (4 since the campaign focus, 2026-10-29; its 8 campaign games are more than the 4 here).
-eval_workers = 12
+# MEASURED 2026-10-30 (joint5 resumed here, the Mac a worker with --local):
+#   - Inference on the GPU needs CUDA graphs (inference.py, ffa3f91): an eager forward was ~35 ms of launches at any
+#     batch up to 64 under WSL, and with several server processes (or the learner) beside it ~200 ms; graphed, one
+#     process serves ~800 campaign decisions/s (32 one-decision clients) and ~1300 battle ones (24). On the CPU a
+#     campaign decision costs ~13-19 ms of a core here, a battle one 6-11 ms (12 processes: all cores, ~9 GB).
+#   - RAM: WSL 28 GB (.wslconfig, raised with the user's leave). The memory guard stopped three starts: a whole game's
+#     inputs decompressed at once for labels (fixed, e7014c1), then the campaign learner at 256 decisions a micro-batch
+#     (v2: ~90 MB of activations a decision; 30.8 GB of the GPU, 10 GB of host for its buffers).
+eval_workers = 8
 inference_device = "cuda"
 inference_processes = 1
 buffer_decisions = 6000
 
 [campaign]
-games = 4
-# The campaign's inference on the GPU (inference_device "auto" is CUDA here, since 2026-10-29: on the CPU a decision cost
-# 5-10 ms of a core, the games' biggest share): one process batches every game's requests. NOT MEASURED YET
+games = 12
+# The campaign's inference on the GPU, graphed (above): one process batches every game's requests
+inference_device = "cuda"
 inference_processes = 1
-# The same gradient as the recipe's 4 parts (they are summed), in one: the 32 GB GPU has the memory. NOT MEASURED YET
-micro_batches = 1
+# 64 decisions a micro-batch (the batch's parts' gradients summed: the same gradient): at 256 the v2 model filled the
+# 32 GB GPU and took 10 GB of host memory (2026-10-30)
+batch_size = 512
+micro_batches = 8
+eval_parallel = 8

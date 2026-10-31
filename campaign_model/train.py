@@ -124,25 +124,39 @@ def chosen_logp(out, choice):
 
 def _prefetched(batches, decode, device):
 	"""(rows, inputs on device) of each batch of rows, decoded one batch ahead in a thread (zlib and numpy let the
-	training step go on meanwhile)."""
-	ready = queue.Queue(maxsize=2)
+	training step go on meanwhile). A consumer that stops early (the KL control) ends the thread: it was left blocked on
+	the full queue with its batches, every such update (2026-10-30)."""
+	ready, stop = queue.Queue(maxsize=2), threading.Event()
+
+	def put(item):
+		while not stop.is_set():
+			try:
+				ready.put(item, timeout=0.5)
+				return True
+			except queue.Full:
+				continue
+		return False
 
 	def work():
 		try:
 			for rows in batches:
 				inputs = {name: torch.from_numpy(value) for name, value in decode(rows).items()}
-				ready.put((rows, {name: value.pin_memory() for name, value in inputs.items()} if device.type == "cuda" else inputs))
+				if not put((rows, {name: value.pin_memory() for name, value in inputs.items()} if device.type == "cuda" else inputs)):
+					return
 		except BaseException as error:  # re-raised in the training thread
-			ready.put(error)
-		ready.put(None)
+			put(error)
+		put(None)
 
 	threading.Thread(target=work, daemon=True).start()
 	pinned = device.type == "cuda"  # (a copy from pageable memory waits for the GPU: ~100 of them a minibatch)
-	while (item := ready.get()) is not None:
-		if isinstance(item, BaseException):
-			raise item
-		rows, inputs = item
-		yield rows, {name: value.to(device, non_blocking=pinned) for name, value in inputs.items()}
+	try:
+		while (item := ready.get()) is not None:
+			if isinstance(item, BaseException):
+				raise item
+			rows, inputs = item
+			yield rows, {name: value.to(device, non_blocking=pinned) for name, value in inputs.items()}
+	finally:
+		stop.set()
 
 
 def make_optimizer(model, config=CampaignConfig()):
@@ -329,7 +343,12 @@ def ppo_update(
 		order = torch.randperm(n).numpy()
 		if n >= size:
 			order = order[: n - n % size]
-		for rows, inputs in _prefetched([order[i : i + size] for i in range(0, len(order), size)], decode, device):
+		# Decoded a micro-batch at a time (a minibatch at once held ~4 of them decoded in pinned memory, a campaign
+		# decision several MB: the PC's learner at 9.5 GB, 2026-10-30); the minibatch's gradient as before
+		minibatches = [order[i : i + size] for i in range(0, len(order), size)]
+		splits = [np.array_split(np.arange(len(rows)), max(1, min(config.micro_batches, len(rows)))) for rows in minibatches]
+		decoded = _prefetched([rows[part] for rows, parts in zip(minibatches, splits) for part in parts], decode, device)
+		for rows, parts_of_rows in zip(minibatches, splits):
 			index = torch.from_numpy(rows).to(device)
 			whole = (~unsound[index]).float()
 			# The minibatch's counts: each micro-batch's losses are its sums over these, so the micro-batches' gradients add
@@ -342,10 +361,11 @@ def ppo_update(
 				counts["end"] = end_valid[index].sum(dim=0)
 			optimizer.zero_grad()
 			parts = []
-			for part in np.array_split(np.arange(len(rows)), max(1, min(config.micro_batches, len(rows)))):
+			for part in parts_of_rows:
 				at = torch.from_numpy(part).to(device)
 				sub, keep = index[at], whole[at]
-				out = model({name: value[at] for name, value in inputs.items()})
+				_, inputs = next(decoded)
+				out = model(inputs)
 				logp, entropy = chosen_logp(out, {k: choice[k][sub] for k in ("kind", "action", "index", "cell")})
 				logp = torch.where(keep > 0, logp, choice["old_logp"][sub])
 				log_ratio = logp - choice["old_logp"][sub]
@@ -396,6 +416,7 @@ def ppo_update(
 			if config.target_kl and update_kl > 1.5 * config.target_kl:
 				stopped = True  # this update has moved the policy far enough
 				break
+		decoded.close()  # (its thread ends, its decoded batches freed)
 	model.eval()
 	if config.target_kl and steps:
 		if stopped:
