@@ -37,7 +37,7 @@ from battle_model.inference import InferenceServer
 from . import constants as c
 from .config import CampaignConfig
 from .empire import EmpireConfig, empire_value
-from .labels import COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, blend_credit, end_advantages, end_labels, end_steps, explained_variance, growth_labels, label, residual_variances
+from .labels import COLORS, GROWTH_CAP, PHI_FLOOR, SHARE_CHANGE_CAP, LabelConfig, blend_credit, end_advantages, end_labels, end_steps, explained_variance, growth_labels, label, residual_variances
 from .model import CampaignModel, build_model
 from .play import make_map, play
 from .graphs import Graphs, StepGraph
@@ -549,6 +549,7 @@ def ppo_update(
 	model.eval()
 	anchor, end_now, prior = torch.empty(n, device=device), torch.empty(n, device=device), torch.empty(n, device=device)
 	growth_now, log_phi = torch.zeros(n, device=device), torch.zeros(n, device=device)  # (G7's logit, our log value: the attributed credit's)
+	value_now = torch.zeros(n, device=device)  # (V7's logit: the schedule credit's share forecast)
 	# The same pass measures the value loss on these decisions before the update learns from them (the user, 2026-10-29:
 	# it should go down over time): every value head weighted as the loss below weighs it, above its targets' entropy
 	fresh = {"share": torch.zeros(n, c.N_VALUE_OFFSETS, device=device), "growth": torch.zeros(n, c.N_VALUE_OFFSETS, device=device), "end": torch.zeros(n, 1, device=device)}
@@ -565,6 +566,7 @@ def ppo_update(
 			end_now[index] = torch.sigmoid(out["end_logit"].float())
 			if "growth_logit" in out:
 				growth_now[index] = out["growth_logit"][:, -1].float()
+				value_now[index] = out["value_logit"][:, -1].float()
 				log_phi[index] = out["phi"].float().clamp(min=PHI_FLOOR).log()
 			prior[index] = 1.0 / inputs["g_players"].float().clamp(min=2) if config.share_target == "share" else 0.5  # the share heads' start: 1 / players (no change: 1/2)
 			fresh["share"][index] = excess_loss(out["value_logit"].float(), targets_t[index])
@@ -596,6 +598,18 @@ def ppo_update(
 		known = torch.isfinite(advantage)
 		if int(known.sum()) > 1:
 			attributed_stats = {"attributed_taken_share": float((taken[known] > 0).float().mean()), "attributed_taken_mean": float(taken[known].mean()), "attributed_own_std": float(own[known].std()), "attributed_taken_std": float(taken[known].std())}
+	schedule_stats = {}
+	if config.credit == "schedule" and growth_real is not None:  # (config.credit: the share's weight grows by the day)
+		real7 = torch.from_numpy(np.asarray(growth_real, dtype=np.float32)[:, -1]).to(device)
+		grow = (real7 - log_phi).clamp(-GROWTH_CAP, GROWTH_CAP) - (torch.sigmoid(growth_now) * 2 * GROWTH_CAP - GROWTH_CAP)
+		real_change = torch.from_numpy(np.asarray(targets, dtype=np.float32)[:, -1]).to(device) * 2 * SHARE_CHANGE_CAP - SHARE_CHANGE_CAP
+		change = real_change - (torch.sigmoid(value_now) * 2 * SHARE_CHANGE_CAP - SHARE_CHANGE_CAP)
+		day = torch.tensor([d.day for d in decisions], dtype=torch.float32, device=device)
+		w = (config.share_weight_start + config.share_weight_per_day * day).clamp(0.0, 1.0)
+		advantage = w * change + (1 - w) * grow  # (nan where a label is unknown: no credit)
+		known = torch.isfinite(advantage)
+		if int(known.sum()) > 1:
+			schedule_stats = {"schedule_share_weight": float(w[known].mean()), "schedule_share_std": float(change[known].std()), "schedule_growth_std": float(grow[known].std())}
 	if end is not None and end["weight"] > 0:  # the policy's credit moves toward the end's as V_end proves itself
 		turn = choices(decisions)["kind"] == c.DecisionKind.TURN
 		later = end_advantages(end_now.cpu().numpy(), end["step"], end["week"], end["real"], end["price"], turn, config.decision_price, end["outcome"])
@@ -603,7 +617,7 @@ def ppo_update(
 		# in the learner, as the 7-day credit's check: the end credit is two thirds of the advantage, and no check saw it)
 		values = end_now.cpu().numpy()
 		end_step_error = np.where(end["step"] >= 0, values[np.maximum(end["step"], 0)] - end["real"], np.nan).astype(np.float32)
-		if attributed is not None:  # (two units, log growth and share: each standardized before they mix)
+		if attributed is not None or config.credit == "schedule":  # (two units, log growth and share: each standardized before they mix)
 			advantage = torch.from_numpy(blend_credit(standardized(advantage.cpu().numpy()), standardized(later), end["weight"])).to(device)
 		else:
 			advantage = torch.from_numpy(blend_credit(advantage.cpu().numpy(), later, end["weight"])).to(device)
@@ -736,6 +750,7 @@ def ppo_update(
 		stopped_pass=stopped_pass,
 		noise=noise,  # (loss_noise's, when measured)
 		**attributed_stats,
+		**schedule_stats,
 		signal_ratio=signal_ratio(optimizer),  # (the steps' noise: the user's 2026-10-31 aim of 0.25+, with 4,096-decision steps)
 		end_step_error=end_step_error,
 		last_kl=update_kl,

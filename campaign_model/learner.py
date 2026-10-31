@@ -178,6 +178,8 @@ class CampaignLearner:
 		self.features_cpu = copy.deepcopy(self.model.features).cpu()
 		# The labels of each game as it arrives, in processes of their own (labeler.py): the trainer's thread never waits
 		self.labeler = Labeler(self.labels, self.empire, foresight=self.kwargs.get("architecture") == "v2", share_target=config.share_target)
+		if config.credit == "schedule" and config.share_target != "change":
+			raise SystemExit("campaign.credit 'schedule' reads the share heads as changes: it needs campaign.share_target 'change'")
 		if config.share_target == "change" and config.credit in ("horizon", "mix"):
 			raise SystemExit(f"campaign.share_target 'change' with credit '{config.credit}': that credit reads the heads as shares (use 'attributed')")
 		self.label_futures = {}  # id(game) -> its Future (precomputed takes it)
@@ -419,7 +421,9 @@ class CampaignLearner:
 					now, took = np.full(len(game.decisions), np.nan, np.float32), np.full(len(game.decisions), np.nan, np.float32)
 				attributed["share_now"].append(now[fresh])
 				attributed["taken"].append(took[fresh])
-			if self.config.credit in ("horizon", "attributed"):  # (its errors feed the credit check, kept for the record)
+			if self.config.credit == "schedule":  # (ppo_update makes the credit, from these labels and its prepass)
+				advantages.append(np.zeros(int(fresh.sum()), dtype=np.float32))
+			elif self.config.credit in ("horizon", "attributed"):  # (its errors feed the credit check, kept for the record)
 				a, error = horizon_advantages(game, t, price, self.trust(), self.labels, self.config.outcome_share_min, self.config.myopic_weight, self.credit_check, parts=True)
 				advantages.append(a[fresh])
 				errors.append(error[fresh])
@@ -438,7 +442,7 @@ class CampaignLearner:
 		if foresight is not None:
 			foresight = {name: np.concatenate([rows[name] for rows in foresight]) for name in foresight[0]}
 		row["trust"] = self.trust()
-		end["outcome"], end["weight"] = outcome, weight if self.config.credit == "horizon" else (self.config.attributed_end_weight if weight > 0 else 0.0) if self.config.credit == "attributed" else 0.0
+		end["outcome"], end["weight"] = outcome, weight if self.config.credit == "horizon" else (self.config.attributed_end_weight if weight > 0 else 0.0) if self.config.credit in ("attributed", "schedule") else 0.0
 		attributed = {name: np.concatenate(parts) for name, parts in attributed.items()} if self.config.credit == "attributed" else None
 		row["end_credit"] = end["weight"]
 		if errors:  # the credit check: the step's estimate against what then happened, by action type (labels.credit_evidence)
@@ -682,6 +686,9 @@ class CampaignLearner:
 		finally:
 			self.last_eval = time.monotonic()
 		evaluate.log(row, self.out / "eval.csv", self.writer)
+		if self.config.teacher_mix == "score" and self.teacher is not None and np.isfinite(row.get("score", np.nan)):
+			self.teacher_weight = teacher_weight_for(row["score"])  # (config.teacher_mix: the teacher's share by our strength)
+			print(f"campaign: the teacher's weight {self.teacher_weight:.2f} (its share of the loss {self.teacher_weight / (1 + self.teacher_weight):.2f}) for an eval score of {row['score']:.3f}", flush=True)
 		self.save(self.out / f"checkpoint_{version:05d}.pt")
 		return row
 
@@ -810,6 +817,14 @@ def start_forecasts(starts, real, growth, real_end):
 	index = np.array(index)
 	clipped = np.clip(growth[index] - np.array(log_value)[:, None], -GROWTH_CAP, GROWTH_CAP)
 	return np.stack(shares), real[index], np.stack(grown), clipped, np.array(end, dtype=np.float32), real_end[index], np.array(prior, dtype=np.float32)
+
+
+def teacher_weight_for(score):
+	"""The teacher KL's weight for an evaluation score against Nullkiller2 (config.teacher_mix "score"; 1 = an average
+	player of its game): its share of the loss lambda = clip(1.2 - score, 0.05, 0.95), the weight lambda / (1 - lambda)
+	against PPO's 1: 19 at a score of 0.25 or under, 2.3 at 0.5, 0.25 at 1 (as good as the teacher), 0.05 from 1.15 up."""
+	share = float(np.clip(1.2 - score, 0.05, 0.95))
+	return share / (1.0 - share)
 
 
 def adapted_teacher_weight(weight, kl, target):

@@ -79,7 +79,13 @@ class CampaignConfig:
 	# of our growth's credit 1,310 decisions early against the share's 2,979 and the horizon credit's 5,312; mid and late
 	# games no signal at all for the horizon credit. The end credit stays in at attributed_end_weight (denial, which no
 	# event records: racing them to a mine), both standardized first
+	# "schedule" (the user, 2026-10-31; needs share_target "change"): w x the share's surprise (its logit's real change
+	# over 7 days less V7's forecast) + (1 - w) x the growth's (our value's real log growth less G7's), w = min(1,
+	# share_weight_start + share_weight_per_day x day): early on growth counts most (the share moves with rivals we cannot
+	# see yet), late the share (destroying them); the end credit stays in at attributed_end_weight
 	credit: str = "horizon"
+	share_weight_start: float = 0.1
+	share_weight_per_day: float = 0.02
 	attributed_end_weight: float = 0.2
 	outcome_share_min: float = 0.25
 	myopic_weight: float = 0.5
@@ -135,6 +141,10 @@ class CampaignConfig:
 	# would walk nats away from the teacher in a day (~430 updates); a fixed weight is a guess at once too weak there and
 	# too strong where the credit is real
 	teacher_kl_target: float = 0.0
+	# "score" (the user, 2026-10-31: while the teacher is much better than us its loss dominates; when we are better it is
+	# small, not 0): after each evaluation against Nullkiller2 the teacher's share of the loss is lambda = clip(1.2 - score,
+	# 0.05, 0.95), its weight lambda / (1 - lambda) (PPO's 1); teacher_kl is the weight until the first evaluation
+	teacher_mix: str = ""
 	label_weights: tuple = (1 / 3, 1 / 3, 1 / 3)  # of the shares at VALUE_OFFSETS (labels.py)
 	decision_price: float = 1e-4  # share points per turn decision
 	# Evaluation against Nullkiller2 (evaluate.py): our models in one seat, Nullkiller2 in the others

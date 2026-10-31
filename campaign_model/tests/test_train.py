@@ -1,3 +1,4 @@
+import pytest
 import numpy as np
 import torch
 
@@ -250,3 +251,20 @@ def test_an_update_with_a_teacher_moves_toward_it():
 	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-3), decisions, targets, returns, config, decode=decode, teacher=teacher)
 	assert metrics["teacher_kl"] > 0
 	assert measure() < before
+
+
+def test_an_update_with_the_schedule_credit_weighs_the_share_by_the_day():
+	"""credit "schedule": w x the share's surprise + (1 - w) x the growth's, w = 10% + 2% a day (day 1 here: 12%)."""
+	from campaign_model.model import build_model
+
+	torch.manual_seed(3)
+	model = build_model({"dim": 32, "cell_dim": 16, "heads": 4, "layers": 1, "architecture": "v2", "share_target": "change"})
+	x = random_inputs(8, seed=11)
+	decisions = decisions_for(model.eval(), x)
+	targets = np.full((8, c.N_VALUE_OFFSETS), 0.55, dtype=np.float32)  # (the share's logit up 0.3 over each horizon)
+	growth_real = np.full((8, c.N_VALUE_OFFSETS), 10.0, dtype=np.float32)  # (log of our value days on)
+	config = CampaignConfig(batch_size=4, passes=1, credit="schedule", share_target="change")
+	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
+	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, np.zeros(8, dtype=np.float32), config, decode=decode, growth_real=growth_real)
+	assert metrics["schedule_share_weight"] == pytest.approx(0.12)
+	assert metrics["steps"] >= 1 and np.isfinite(metrics["kl"])

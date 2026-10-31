@@ -331,3 +331,11 @@ def test_the_teacher_weight_follows_its_kl_target():
 	assert adapted_teacher_weight(0.2, 0.1, 0.1) == 0.2  # near: kept
 	assert adapted_teacher_weight(0.2, 0.5, 0.0) == 0.2  # no target: the fixed weight
 	assert adapted_teacher_weight(9.0, 5.0, 0.1) == 10.0 and adapted_teacher_weight(0.01, 0.0, 0.1) == 0.01  # bounded
+
+
+def test_the_teachers_weight_follows_our_score_against_it():
+	from campaign_model.learner import teacher_weight_for
+
+	share = lambda score: teacher_weight_for(score) / (1 + teacher_weight_for(score))  # noqa: E731
+	assert share(0.1) == pytest.approx(0.95) and share(0.5) == pytest.approx(0.7)  # much better than us: it dominates
+	assert share(1.0) == pytest.approx(0.2) and share(2.0) == pytest.approx(0.05)  # as good or worse: small, never 0
