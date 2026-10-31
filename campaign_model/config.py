@@ -79,6 +79,11 @@ class CampaignConfig:
 	# the 7-day credit alone; as it learns, the credit moves to the end (the user: "maybe moving to use it late during
 	# training"). 0: V_end is trained and logged only
 	end_credit_max: float = 1.0
+	# The end credit's own check (b1, 2026-10-31): V_end's step estimate of the end is checked by action type as the 7-day
+	# one is (labels.credit_trust over learner.end_evidence); as it fails, the end credit's step part gives way to its week
+	# part, as the 7-day credit's step gives way to the week's outcome. Its steps were off by type as the 7-day ones (travel
+	# t +8, hire -7, end -5, move -5, build +3..8; ~0.003 of a share), and nothing held them back
+	end_credit_check: bool = True
 	# "turns" (the default since 2026-10-30): the campaign updates run between battle updates, on the battle learner's
 	# device and thread, whichever has its data first (battle_model/train.py: one GPU process for both models; on a
 	# Windows GPU every process is a time slice taken from the trainer). "process": in a process of their own

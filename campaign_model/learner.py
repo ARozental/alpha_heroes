@@ -109,7 +109,8 @@ class CampaignLearner:
 		self.value_ev = None  # the value heads' explained variance, smoothed over ~10 updates: how far the credit trusts them
 		self.credit_evidence = {}  # the credit check's (labels.credit_evidence): the step's errors by action type, kept
 		self.credit_check = 1.0  # and its verdict, how far the step's estimate may be trusted (labels.credit_trust)
-		self.end_evidence = {}  # the same for V_end's steps, the end credit's (logged only: campaign_end_credit/*)
+		self.end_evidence = {}  # the same for V_end's steps, the end credit's (campaign_end_credit/*)
+		self.end_check = 1.0  # and its verdict (end_credit: config.end_credit_check)
 		self.head_ev = {}  # each head's explained variance at the day starts, smoothed: how far it grades the next (grade_trust)
 		self.value_pool, self.head_pool = None, {}  # their parts (labels.pooled_ev): the residual variance and the variance, smoothed apart
 		latest = self.out / "checkpoint_latest.pt"
@@ -125,6 +126,8 @@ class CampaignLearner:
 			self.value_ev = state.get("value_ev")
 			self.credit_evidence = state.get("credit_evidence", {})
 			self.credit_check = credit_trust(credit_gaps(self.credit_evidence))
+			self.end_evidence = state.get("end_evidence", {})
+			self.end_check = credit_trust(credit_gaps(self.end_evidence))
 			self.head_ev = state.get("head_ev", {})
 			self.value_pool, self.head_pool = state.get("value_pool"), state.get("head_pool", {})
 			print(f"campaign: resuming at version {self.version}", flush=True)
@@ -406,6 +409,8 @@ class CampaignLearner:
 		if end_errors is not None and errors:  # the end credit's check, the 7-day one's for V_end's steps (logged only)
 			self.end_evidence = credit_evidence(decisions, end_errors, np.concatenate(players), getattr(self, "end_evidence", None))
 			row["end_credit_gaps"] = credit_gaps(self.end_evidence)
+			self.end_check = credit_trust(row["end_credit_gaps"])  # (for the next update's end credit: end_credit)
+			row["end_check"] = self.end_check
 		self._relabel_waiting()
 		memory.append(("updated", rss_gb()))
 		self._log(epoch, games, decisions, row, metrics, time.time() - started)
@@ -473,7 +478,8 @@ class CampaignLearner:
 		"""(the end credit's share of the policy's advantage, the week's share in the end credit): end_credit_max x the
 		trust in V_end, and 1 - (1 - outcome_share_min) x that trust (labels.end_advantages)."""
 		trust = self.grade_trust().get("Vend", 0.0)
-		return self.config.end_credit_max * trust, 1 - (1 - self.config.outcome_share_min) * trust
+		step = min(trust, getattr(self, "end_check", 1.0)) if self.config.end_credit_check else trust  # (its check moves the credit from V_end's steps to its weeks)
+		return self.config.end_credit_max * trust, 1 - (1 - self.config.outcome_share_min) * step
 
 	def _log(self, epoch, games, decisions, sums, metrics, seconds):
 		n = len(decisions)
@@ -546,6 +552,8 @@ class CampaignLearner:
 			self.writer.add_scalar(f"campaign_credit/{kind.lower()}", gap, self.version)
 		for kind, gap in sums.get("end_credit_gaps", {}).items():
 			self.writer.add_scalar(f"campaign_end_credit/{kind.lower()}", gap, self.version)
+		if "end_check" in sums:  # (how far the end credit's step part is used: 1 all of it, 0 its week part alone)
+			self.writer.add_scalar("campaign/end_check", sums["end_check"], self.version)
 		for skill, (picked, offered) in skill_picks(decisions).items():  # (how often each skill is taken when offered)
 			self.writer.add_scalar(f"campaign_skills/{skill}", picked / offered, self.version)
 		turns = max(1, sum(1 for d in decisions if d.action_type >= 0))
@@ -577,7 +585,7 @@ class CampaignLearner:
 	def _save(self, path):
 		state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
 		optimizer = {} if self.worker else {"optimizer": self.optimizer.state_dict()}  # (the process's is in checkpoint_latest.pt)
-		torch.save({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "model_kwargs": self.kwargs}, path)
+		torch.save({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "model_kwargs": self.kwargs}, path)
 
 	# ---- evaluation ----
 
