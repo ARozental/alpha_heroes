@@ -27,6 +27,13 @@ IN_BYTES = sum(entry[-1] for entry in IN_LAYOUT)
 HEADER = struct.Struct("<IIIIiiif" + "f" * c.N_VALUE_OFFSETS + "II")
 NO_EFFECT = 1  # the action was carried out and changed nothing
 TEACHER = 2  # Nullkiller2's decision (AlphaTeacherAI: agents/AlphaMapAI/Teacher.cpp): its choice, no model's logp
+# The questions the teacher's recorder records Nullkiller2's answers to (Teacher.cpp): the others are the model's own
+TEACHER_QUESTIONS = (c.DecisionKind.YES_NO, c.DecisionKind.SELECT, c.DecisionKind.LEVEL_UP)
+
+
+def decision_name(d):
+	"""A decision's kind for counts: its action type's name (a turn's), else its question's kind."""
+	return c.ActionType(d.action_type).name if d.action_type >= 0 else c.DecisionKind(d.kind).name
 
 
 @dataclass

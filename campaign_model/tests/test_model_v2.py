@@ -225,3 +225,15 @@ def test_the_memory_carries_what_a_later_decision_needs():
 	fresh = Memory(16, heads=2, slots=4, width=8)
 	tokens = torch.randn(3, 5, 16)
 	assert torch.equal(fresh.read(tokens, torch.rand(3, 4, 8)), tokens)
+
+
+def test_the_change_heads_start_at_no_change_whatever_the_players():
+	from campaign_model.model import build_model
+
+	torch.manual_seed(0)
+	model = build_model({"dim": 32, "cell_dim": 16, "heads": 4, "layers": 1, "architecture": "v2", "share_target": "change"}).eval()
+	x = {k: torch.from_numpy(v) for k, v in random_inputs(4, seed=2).items()}
+	x["g_players"] = torch.tensor([2, 3, 4, 8])
+	with torch.no_grad():
+		out = model(x)
+	assert torch.allclose(out["value"], torch.full_like(out["value"], 0.5))  # (a share's would be 1/2, 1/3, 1/4, 1/8)

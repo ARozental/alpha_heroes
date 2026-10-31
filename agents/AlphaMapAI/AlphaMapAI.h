@@ -155,6 +155,7 @@ class AlphaMapAI : public CAdventureAI
 	int teacherMatched = 0;
 	int teacherApproximate = 0;
 	std::map<std::string, int> teacherUnmatched;
+	std::map<QueryID, Decision> teacherQuestions; // (asked, not yet answered: under recordsMutex)
 	std::string teacherJson() const;
 
 public:
@@ -167,6 +168,10 @@ public:
 	void initTeacher(std::shared_ptr<Environment> environment, std::shared_ptr<CCallback> callback);
 	void teacherTurnStarts();
 	void observe(const CPackForServer * pack);
+	// The teacher's questions (Teacher.cpp): each encoded as it is asked, before Nullkiller2 answers it, and recorded
+	// with that answer (observe's QueryReply)
+	void teacherBlockingDialog(const std::string & text, const std::vector<Component> & components, QueryID askID, int soundID, bool selection, bool cancel);
+	void teacherLevelUp(const CGHeroInstance * hero, const std::vector<SecondarySkill> & skills, QueryID queryID);
 
 	std::string getBattleAIName() const override;
 	void initGameInterface(std::shared_ptr<Environment> env, std::shared_ptr<CCallback> callback) override;
@@ -224,6 +229,9 @@ private:
 	void encodeTurnActions(Decision & decision, PathfinderCache & paths);
 	void encodeArmyMoves(Decision & decision, const std::vector<std::pair<int, int>> & pairs);
 	void encodeOptionContext(Decision & decision, ObjectInstanceID hero, int3 target);
+	// The questions' decisions, as asked (the handlers decide them; the teacher's recorder keeps them for the answer)
+	Decision blockingQuestion(const std::string & text, const std::vector<Component> & components, int soundID, bool selection, bool cancel);
+	Decision levelUpQuestion(const CGHeroInstance * h, const std::vector<SecondarySkill> & skills);
 	int owner(PlayerColor color) const;
 
 	// Carrying out a choice (Actions.cpp); false when nothing happened

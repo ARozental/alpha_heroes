@@ -229,12 +229,13 @@ class Memory(nn.Module):
 class CampaignModelV2(nn.Module):
 	ARCHITECTURE = "v2"
 
-	def __init__(self, dim=64, cell_dim=16, heads=4, layers=2):
+	def __init__(self, dim=64, cell_dim=16, heads=4, layers=2, share_target="share"):
 		"""cell_dim: the map tiles' width (the U-Net's at full resolution; twice and four times it at half and a quarter):
 		16, as 32 cost 3x v1's inference on the CPU (2026-10-30: 27 ms a decision against 9 ms, the U-Net most of it)."""
 		super().__init__()
 		d, dc = dim, cell_dim
 		self.dim, self.cell_dim, self.heads = d, dc, heads
+		self.share_target = share_target  # (config.share_target: what V2, V5, V7 forecast)
 		# Every hero slot's window, absent heroes' masked out (windows_of): fixed shapes and no sync with the host, for a
 		# CUDA graph (inference.py sets it on CUDA); the same outputs, more windows computed
 		self.fixed_windows = False
@@ -638,7 +639,8 @@ class CampaignModelV2(nn.Module):
 		own_mean = (own * mine).sum(dim=1) / mine.sum(dim=1).clamp(min=1)
 		hidden = self.value_hidden(torch.cat([state.glob, own_mean, state.players[:, 0], known.phi], dim=-1))
 		share_prior = -torch.log(x["g_players"].clamp(min=2).float() - 1)
-		value_logit = self.value_heads(hidden) + share_prior.unsqueeze(-1)
+		# V2, V5, V7: a share from 1 / players, or its logit's change from none (config.share_target)
+		value_logit = self.value_heads(hidden) + (share_prior.unsqueeze(-1) if self.share_target == "share" else 0.0)
 		out["value_logit"] = value_logit
 		out["value"] = torch.sigmoid(value_logit)
 		out["growth_logit"] = self.growth_heads(hidden)

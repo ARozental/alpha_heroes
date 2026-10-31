@@ -115,6 +115,13 @@ class CampaignConfig:
 	model_layers: int = 2
 	seed: int = 0
 	init_from: str = ""  # a campaign checkpoint a new run starts from (its weights; a new optimizer)
+	# What the share heads V2, V5, V7 forecast (the model's "value" output; V_end is our share at the end either way):
+	#   "share"   our share of all empires' value VALUE_OFFSETS days on (from 1 / players)
+	#   "change"  how much the logit of that share changes by then (labels.share_change_labels; the user's design,
+	#             2026-10-31: our log growth less the others', so their value hidden from us cancels), from no change.
+	#             The ladder grades them on real outcomes only, and the horizon and mix credits refuse it (they read
+	#             the heads as shares); the attributed credit reads the growth heads
+	share_target: str = "share"
 	# The teacher's KL (AlphaStar's KL to its supervised policy, 2026-10-31: 1,020 -> 1,400 Elo in its ablation): each
 	# decision's KL(teacher || model) over the action type and each type's table (train.teacher_kl), at this weight in
 	# the loss, the teacher a frozen imitation of Nullkiller2 (imitate.py's bc_latest.pt: teacher_checkpoint). It keeps

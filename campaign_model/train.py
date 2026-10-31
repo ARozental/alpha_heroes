@@ -50,7 +50,9 @@ TURN_KINDS = (c.DecisionKind.TURN, c.DecisionKind.EXCHANGE)
 
 def model_kwargs(config):
 	kwargs = {"dim": config.model_dim, "cell_dim": config.model_cell_dim, "heads": config.model_heads, "layers": config.model_layers}
-	return {**kwargs, "architecture": config.model_architecture} if config.model_architecture != "v1" else kwargs
+	if config.model_architecture == "v1":
+		return kwargs
+	return {**kwargs, "architecture": config.model_architecture, **({"share_target": config.share_target} if config.share_target != "share" else {})}
 
 
 @contextlib.contextmanager
@@ -309,16 +311,16 @@ def excess_loss(logits, targets):
 
 STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl", "teacher_kl")  # a step's metrics, in ppo_update's order
 # The teacher's outputs its KL reads (teacher_kl), put in each micro-batch as "t:<name>"
-TEACHER_OUTPUTS = ("type_logp",) + tuple(output for output, _ in HEADS.values())
+TEACHER_OUTPUTS = ("type_logp", "option_logp") + tuple(output for output, _ in HEADS.values())
 
 
 def teacher_kl(out, batch):
 	"""KL(teacher || model) of each decision [N] (config.teacher_kl): a turn decision's, over the action type plus each
-	type's table weighted by the teacher's p(type); 0 for the others. The teacher learned turn decisions only (the
-	recorder takes Nullkiller2's turn requests, not its answers to questions or its exchanges: Teacher.cpp), so
-	elsewhere its outputs are its untrained start, which the KL would pull the answers to. An entry the teacher gives
-	no probability adds nothing (both models see the same legal masks); the model's log-probabilities are floored at
-	-50 there."""
+	type's table weighted by the teacher's p(type); a question's whose answers the teacher learned (records.
+	TEACHER_QUESTIONS: yes/no, selection, level up), over its options; 0 for the others (exchanges, the other
+	questions: there the teacher's outputs are its untrained start, which the KL would pull the answers to). An entry
+	the teacher gives no probability adds nothing (both models see the same legal masks); the model's
+	log-probabilities are floored at -50 there."""
 	def part(t, s):
 		p = t.exp()
 		return torch.where(p > 0, p * (t - s.clamp(min=-50.0)), torch.zeros_like(p)).sum(dim=-1)
@@ -330,7 +332,8 @@ def teacher_kl(out, batch):
 	p_type = t_type.exp()
 	for a, (output, _) in HEADS.items():
 		kl = kl + p_type[:, a] * part(batch["t:" + output].reshape(n, -1), out[output].reshape(n, -1))
-	return torch.where(kind == c.DecisionKind.TURN, kl, torch.zeros_like(kl))
+	answered = (kind == c.DecisionKind.YES_NO) | (kind == c.DecisionKind.SELECT) | (kind == c.DecisionKind.LEVEL_UP)  # (records.TEACHER_QUESTIONS)
+	return torch.where(kind == c.DecisionKind.TURN, kl, torch.where(answered, part(batch["t:option_logp"], out["option_logp"]), torch.zeros_like(kl)))
 
 
 def signal_ratio(optimizer):
@@ -563,7 +566,7 @@ def ppo_update(
 			if "growth_logit" in out:
 				growth_now[index] = out["growth_logit"][:, -1].float()
 				log_phi[index] = out["phi"].float().clamp(min=PHI_FLOOR).log()
-			prior[index] = 1.0 / inputs["g_players"].float().clamp(min=2)  # the share heads' start: 1 / players
+			prior[index] = 1.0 / inputs["g_players"].float().clamp(min=2) if config.share_target == "share" else 0.5  # the share heads' start: 1 / players (no change: 1/2)
 			fresh["share"][index] = excess_loss(out["value_logit"].float(), targets_t[index])
 			if growth is not None:
 				now = out["phi"].float().clamp(min=PHI_FLOOR).log().unsqueeze(-1)

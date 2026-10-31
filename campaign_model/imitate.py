@@ -33,21 +33,21 @@ import torch
 from . import constants as c
 from .config import CampaignConfig
 from .model import build_model
-from .labels import GROWTH_CAP, PHI_FLOOR, growth_labels, label
-from .records import TEACHER, decode_inputs
+from .labels import GROWTH_CAP, PHI_FLOOR, growth_labels, label, share_change_labels
+from .records import TEACHER, decision_name, decode_inputs
 from .schema import HEADS
 from .train import _prefetched, chosen_logp, head_loss, migrate_subtypes, model_kwargs
 
 
-def teacher_decisions(paths):
+def teacher_decisions(paths, share_target="change"):
 	"""The teacher's turn decisions of each game file, with their value labels: [(decisions, shares [n, N_VALUE_OFFSETS],
 	log growth [n, N_VALUE_OFFSETS])] (labels.label's real shares and labels.growth_labels', nan where there is none)."""
 	games = []
 	for path in paths:
 		with open(path, "rb") as f:
 			game = pickle.load(f)
-		shares, growth = label(game)[0], growth_labels(game)
-		keep = [i for i, d in enumerate(game.decisions) if d.flags & TEACHER and d.kind == c.DecisionKind.TURN]
+		shares, growth = (share_change_labels(game) if share_target == "change" else label(game)[0]), growth_labels(game)
+		keep = [i for i, d in enumerate(game.decisions) if d.flags & TEACHER]  # (turn decisions and its answers: TEACHER_QUESTIONS)
 		games.append(([game.decisions[i] for i in keep], shares[keep], growth[keep]))
 	return games
 
@@ -73,13 +73,14 @@ def choice_tensors(decisions, device):
 	}
 
 
-def mode_logp(out, n):
-	"""[N, N_ACTION_TYPES] the log-probability of each type's most likely entry (the type's own and its table's best);
-	its max over types is the model's most likely action's (a targeted spell's tile left out)."""
+def mode_logp(out, n, kind):
+	"""[N] the log-probability of the model's most likely choice: a turn's, the best over types of the type's own and its
+	table's best entry (a targeted spell's tile left out); a question's, its best option's."""
 	best = out["type_logp"].clone()
 	for a, (output, _) in HEADS.items():
 		best[:, a] = best[:, a] + out[output].reshape(n, -1).max(dim=1).values
-	return best
+	turn = (kind == c.DecisionKind.TURN) | (kind == c.DecisionKind.EXCHANGE)
+	return torch.where(turn, best.max(dim=1).values, out["option_logp"].max(dim=1).values)
 
 
 def player_streams(games):
@@ -134,14 +135,15 @@ def evaluate(model, streams, device, lanes, steps, growth_weight, memory_on=True
 			if fresh is not None:
 				memory = memory * torch.tensor([not f for f in fresh], device=device).float()[:, None, None]
 			out = model({**inputs, "mem_float": memory if memory_on else torch.zeros_like(memory)})
-			memory = out["memory"]
-			logp, _ = chosen_logp(out, choice_tensors(chosen, device))
-			best = mode_logp(out, len(chosen)).max(dim=1).values
+			choice = choice_tensors(chosen, device)
+			memory = torch.where((choice["kind"] == c.DecisionKind.TURN)[:, None, None], out["memory"], memory)  # (turn decisions write it: AlphaMapAI's rule)
+			logp, _ = chosen_logp(out, choice)
+			best = mode_logp(out, len(chosen), choice["kind"])
 			agreed = (logp >= best - 1e-4).float().cpu().numpy()
 			losses = (-logp).cpu().numpy()
 			for d, loss, ok, v in zip(chosen, losses, agreed, valid):
 				if v:
-					for key in ("all", c.ActionType(d.action_type).name):
+					for key in ("all", decision_name(d)):
 						sums[key] += (1.0, float(loss), float(ok))
 			rows = np.flatnonzero(valid)
 			values.append((len(rows), float(value_loss({k: v[torch.from_numpy(rows).to(device)] for k, v in out.items() if k in ("value_logit", "growth_logit", "phi")}, shares[rows], growth[rows], device, growth_weight))))
@@ -158,6 +160,7 @@ def main():
 	parser.add_argument("--out", required=True)
 	parser.add_argument("--init", default="", help="a campaign checkpoint to start from (none: a fresh model)")
 	parser.add_argument("--architecture", default="v2")
+	parser.add_argument("--share-target", default="change", help="what the share heads learn (config.share_target): change (the logit's change) or share")
 	parser.add_argument("--variants", default="64x2", help="the models trained side by side on the same batches, <dim>x<layers> each (a fresh model's); their checkpoints bc_latest_<variant>.pt when more than one")
 	parser.add_argument("--cell-dim", type=int, default=16)
 	parser.add_argument("--lr", type=float, default=1e-4)
@@ -186,7 +189,7 @@ def main():
 	rng.shuffle(paths)
 	paths = paths[: args.max_games] if args.max_games else paths
 	held = max(1, int(round(args.holdout * len(paths))))
-	val_games, train_games = teacher_decisions(paths[:held]), teacher_decisions(paths[held:])
+	val_games, train_games = teacher_decisions(paths[:held], args.share_target), teacher_decisions(paths[held:], args.share_target)
 	print(f"imitate: {sum(len(g[0]) for g in train_games)} decisions of {len(train_games)} games to train on, {sum(len(g[0]) for g in val_games)} of {len(val_games)} held out; {device}", flush=True)
 	from torch.utils.checkpoint import checkpoint
 
@@ -204,7 +207,7 @@ def main():
 		for variant in args.variants.split(","):  # "<dim>x<layers>", "-nomem": its memory held at 0
 			size, _, flag = variant.partition("-")
 			dim, layers = (int(v) for v in size.split("x"))
-			kwargs = model_kwargs(dataclasses.replace(config, model_architecture=args.architecture, model_cell_dim=args.cell_dim, model_dim=dim, model_layers=layers))
+			kwargs = model_kwargs(dataclasses.replace(config, model_architecture=args.architecture, model_cell_dim=args.cell_dim, model_dim=dim, model_layers=layers, share_target=args.share_target))
 			torch.manual_seed(args.seed)
 			models[variant] = (build_model(kwargs), kwargs, flag != "nomem")
 	models = {name: (model.to(device).train(), torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr), kwargs, on) for name, (model, kwargs, on) in models.items()}
@@ -259,7 +262,8 @@ def main():
 					memory = torch.zeros_like(memory)
 				loss, after = checkpoint(step, model, inputs, memory, choice, shares[rows], growth[rows], valid_t, use_reentrant=False)
 				pending[name].append((loss, float(valid.sum())))
-				memories[name] = torch.where(valid_t.bool()[:, None, None], after, memory)
+				writes = valid_t.bool() & (choice["kind"] == c.DecisionKind.TURN)  # (turn decisions write the memory: AlphaMapAI's rule)
+				memories[name] = torch.where(writes[:, None, None], after, memory)
 			seen += int(valid.sum())
 			if t == 0 and (steps_done % args.eval_every == 0 and steps_done > 0 or time.time() > deadline or seen >= args.epochs * total):
 				for name, (model, _, kwargs, on) in models.items():

@@ -49,7 +49,7 @@ from .failures import NAMES as FAILURES, failure_modes
 from .features import SKILLS
 from .labels import (
 	COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, attributed_labels, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
-	label, ladder_targets, pooled_ev, residual_variances,
+	label, ladder_targets, pooled_ev, residual_variances, share_change_labels,
 )
 from .foresight import labels_of
 from .labeler import Labeler
@@ -177,7 +177,9 @@ class CampaignLearner:
 		# foresight's labels, computed from decoded inputs on the CPU while the model trains on the GPU (learner "turns")
 		self.features_cpu = copy.deepcopy(self.model.features).cpu()
 		# The labels of each game as it arrives, in processes of their own (labeler.py): the trainer's thread never waits
-		self.labeler = Labeler(self.labels, self.empire, foresight=self.kwargs.get("architecture") == "v2")
+		self.labeler = Labeler(self.labels, self.empire, foresight=self.kwargs.get("architecture") == "v2", share_target=config.share_target)
+		if config.share_target == "change" and config.credit in ("horizon", "mix"):
+			raise SystemExit(f"campaign.share_target 'change' with credit '{config.credit}': that credit reads the heads as shares (use 'attributed')")
 		self.label_futures = {}  # id(game) -> its Future (precomputed takes it)
 		if config.learner == "process":
 			self.worker = UpdateProcess(config, self.kwargs, self.model, self.optimizer, self.lr_scale, latest)
@@ -380,12 +382,16 @@ class CampaignLearner:
 			pre = precomputed(future, game) if staleness <= MAX_LABEL_STALENESS and future is not None else None
 			if pre is None:
 				t, mixed, price = label(game, self.labels, self.empire)
+				if self.config.share_target == "change":
+					t = share_change_labels(game, self.empire)
 				z = growth_labels(game, self.empire)
 				real = end_labels(game, self.empire)
 				steps = end_steps(game)
 			else:
 				t, mixed, price, z, real, steps = pre["t"], pre["mixed"], pre["price"], pre["z"], pre["real"], (pre["step"], pre["week"])
-			graded, grown = ladder_targets(game, t, z, starts[g], trust, self.config.outcome_share_min)
+			# (the change heads are graded on real outcomes only: the ladder mixes a forecast in as a share)
+			ladder_trust = trust if self.config.share_target == "share" else {k: v for k, v in trust.items() if not k.startswith("V")}
+			graded, grown = ladder_targets(game, t, z, starts[g], ladder_trust, self.config.outcome_share_min)
 			forecasts.append(start_forecasts(starts[g], t, z, real))
 			fresh = np.array([d.version >= self.version - self.config.max_record_age for d in game.decisions])
 			row["dropped_old"] += int((~fresh).sum())
@@ -521,7 +527,8 @@ class CampaignLearner:
 		much of a share (1/2 in a 2-player game, 1/4 in a 4-player one), and the heads start there, so their plain
 		explained variance trusted them before they had learned anything (the growth heads start at a constant: 0)."""
 		shares, real, grown, real_growth, end, real_end, prior = (np.concatenate(part) for part in zip(*forecasts))
-		pairs = [(f"V{k}", shares[:, i] - prior, real[:, i] - prior) for i, k in enumerate(c.VALUE_OFFSETS)] + [(f"G{k}", grown[:, i], real_growth[:, i]) for i, k in enumerate(c.VALUE_OFFSETS)]
+		start = prior if self.config.share_target == "share" else np.full_like(prior, 0.5)  # (the change heads' start: no change)
+		pairs = [(f"V{k}", shares[:, i] - start, real[:, i] - start) for i, k in enumerate(c.VALUE_OFFSETS)] + [(f"G{k}", grown[:, i], real_growth[:, i]) for i, k in enumerate(c.VALUE_OFFSETS)]
 		for name, predicted, actual in pairs + [("Vend", end - prior, real_end - prior)]:
 			pool, ev = pooled_ev(self.head_pool.get(name), residual_variances(predicted, actual))
 			if pool is not None:

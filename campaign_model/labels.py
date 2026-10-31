@@ -49,6 +49,8 @@ class LabelConfig:
 
 GROWTH_CAP = math.log(10.0)  # the growth heads' range: our empire's value x10 to /10 of its value at the decision
 PHI_FLOOR = 1000.0  # gold: growth counts from at least this much (an empire below it is all but gone)
+SHARE_FLOOR = 1e-3  # a share counts from this much (logit -6.9): a player knocked out (0) is far below the change cap
+SHARE_CHANGE_CAP = 3.0  # the change heads' range: our share's odds x20 to /20 over a horizon
 
 
 def tables(game, empire=EmpireConfig()):
@@ -193,6 +195,36 @@ def blend_credit(seven, end, weight):
 	known = np.isfinite(seven) | np.isfinite(end)
 	mixed = np.where(np.isfinite(seven), (1 - weight) * seven, 0.0) + np.where(np.isfinite(end), weight * end, 0.0)
 	return np.where(known, mixed, np.nan).astype(np.float32)
+
+
+def share_logit(share):
+	"""logit of a share, floored at SHARE_FLOOR on both sides."""
+	share = min(max(share, SHARE_FLOOR), 1.0 - SHARE_FLOOR)
+	return math.log(share / (1.0 - share))
+
+
+def share_change_scale(change):
+	"""A change of our share's logit to the change heads' 0..1 (their cross-entropy's target): the odds /20 or less 0, no
+	change 1/2, x20 or more 1."""
+	return (np.clip(change, -SHARE_CHANGE_CAP, SHARE_CHANGE_CAP) + SHARE_CHANGE_CAP) / (2 * SHARE_CHANGE_CAP)
+
+
+def share_change_labels(game, empire=EmpireConfig()):
+	"""Per decision [N, N_VALUE_OFFSETS] (config.share_target "change", the user's design of 2026-10-31): how much our
+	share of all empires' value changes in logit from the decision's day to VALUE_OFFSETS days on, on the heads' 0..1
+	(share_change_scale); nan where label has none. logit(share) = log(ours) - log(the others' together), so the change
+	is our log growth less theirs: their value, hidden from us, cancels and only their growth is left (a player doomed
+	by a rival it has not seen still has its own part to learn), and a small share keeps its resolution (3% to 3.5% is
+	30% to 34%). Horizons add: the change over 5 days is the one over 3 and then 2."""
+	table, _, last, ended = tables(game, empire)
+	rows = []
+	for d in game.decisions:
+		# Now: as the decision's day began (its ledger is the end of the day before), else the first one there is
+		days = table.get(d.color, {})
+		before = [day for day in days if day <= min(d.day - 1, last)]
+		now = share_logit(days[max(before)] if before else days[min(days)] if days else 0.5)
+		rows.append([share_logit(share_at(table, d.color, d.day + k, last)) - now if ended or d.day + k <= last else np.nan for k in c.VALUE_OFFSETS])
+	return share_change_scale(np.array(rows, dtype=np.float32).reshape(-1, c.N_VALUE_OFFSETS)).astype(np.float32)
 
 
 def growth_scale(log_growth):

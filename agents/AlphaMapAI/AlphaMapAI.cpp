@@ -800,40 +800,46 @@ void AlphaMapAI::showBlockingDialog(const std::string & text, const std::vector<
 	}
 	runAsync("a dialog", [this, text, components, askID, soundID, selection, cancel]()
 	{
-		auto decision = encode(selection ? DecisionKind::SELECT : DecisionKind::YES_NO);
-		encodeOptionContext(decision, activeHero, activeTarget);
-		decision.inputs.at(In::d_number) = firstNumber(text);
-		decision.inputs.at(In::d_sound) = soundID;
-		auto & in = decision.inputs;
-		if(selection)
-		{
-			for(int i = 0; i < std::min<int>(components.size(), N_OPTIONS); ++i)
-			{
-				in.at(In::o_kind, i) = static_cast<int>(OptionKind::COMPONENT);
-				in.at(In::o_type, i) = static_cast<int>(components[i].type);
-				in.at(In::o_subtype, i) = components[i].subType.getNum();
-				in.at(In::o_amount, i) = components[i].value.value_or(0);
-				in.at(In::option_mask, i) = 1;
-				decision.answers.push_back(i + 1); // components are numbered from 1
-			}
-			if(cancel && decision.answers.size() < static_cast<size_t>(N_OPTIONS)) // declining is an answer too (0)
-			{
-				const int i = static_cast<int>(decision.answers.size());
-				in.at(In::o_kind, i) = static_cast<int>(OptionKind::NO);
-				in.at(In::option_mask, i) = 1;
-				decision.answers.push_back(0);
-			}
-		}
-		else
-		{
-			in.at(In::o_kind, 0) = static_cast<int>(OptionKind::YES);
-			in.at(In::o_kind, 1) = static_cast<int>(OptionKind::NO);
-			in.at(In::option_mask, 0) = in.at(In::option_mask, 1) = 1;
-			decision.answers = {1, 0};
-		}
+		auto decision = blockingQuestion(text, components, soundID, selection, cancel);
 		const auto choice = decide(decision);
 		answer(askID, choice.index >= 0 ? decision.answers[choice.index] : decision.answers.front());
 	});
+}
+
+Decision AlphaMapAI::blockingQuestion(const std::string & text, const std::vector<Component> & components, int soundID, bool selection, bool cancel)
+{
+	auto decision = encode(selection ? DecisionKind::SELECT : DecisionKind::YES_NO);
+	encodeOptionContext(decision, activeHero, activeTarget);
+	decision.inputs.at(In::d_number) = firstNumber(text);
+	decision.inputs.at(In::d_sound) = soundID;
+	auto & in = decision.inputs;
+	if(selection)
+	{
+		for(int i = 0; i < std::min<int>(components.size(), N_OPTIONS); ++i)
+		{
+			in.at(In::o_kind, i) = static_cast<int>(OptionKind::COMPONENT);
+			in.at(In::o_type, i) = static_cast<int>(components[i].type);
+			in.at(In::o_subtype, i) = components[i].subType.getNum();
+			in.at(In::o_amount, i) = components[i].value.value_or(0);
+			in.at(In::option_mask, i) = 1;
+			decision.answers.push_back(i + 1); // components are numbered from 1
+		}
+		if(cancel && decision.answers.size() < static_cast<size_t>(N_OPTIONS)) // declining is an answer too (0)
+		{
+			const int i = static_cast<int>(decision.answers.size());
+			in.at(In::o_kind, i) = static_cast<int>(OptionKind::NO);
+			in.at(In::option_mask, i) = 1;
+			decision.answers.push_back(0);
+		}
+	}
+	else
+	{
+		in.at(In::o_kind, 0) = static_cast<int>(OptionKind::YES);
+		in.at(In::o_kind, 1) = static_cast<int>(OptionKind::NO);
+		in.at(In::option_mask, 0) = in.at(In::option_mask, 1) = 1;
+		decision.answers = {1, 0};
+	}
+	return decision;
 }
 
 void AlphaMapAI::heroGotLevel(const CGHeroInstance * hero, PrimarySkill pskill, std::vector<SecondarySkill> & skills, QueryID queryID)
@@ -848,19 +854,25 @@ void AlphaMapAI::heroGotLevel(const CGHeroInstance * hero, PrimarySkill pskill, 
 			answer(queryID, 0);
 			return;
 		}
-		auto decision = encode(DecisionKind::LEVEL_UP);
-		encodeOptionContext(decision, heroID, h->visitablePos());
-		for(int i = 0; i < std::min<int>(skills.size(), N_OPTIONS); ++i)
-		{
-			decision.inputs.at(In::o_kind, i) = static_cast<int>(OptionKind::SKILL);
-			decision.inputs.at(In::o_type, i) = skills[i].getNum();
-			decision.inputs.at(In::o_subtype, i) = h->getSecSkillLevel(skills[i]) + 1;
-			decision.inputs.at(In::option_mask, i) = 1;
-			decision.answers.push_back(i);
-		}
+		auto decision = levelUpQuestion(h, skills);
 		const auto choice = decide(decision);
 		answer(queryID, choice.index >= 0 ? decision.answers[choice.index] : 0);
 	});
+}
+
+Decision AlphaMapAI::levelUpQuestion(const CGHeroInstance * h, const std::vector<SecondarySkill> & skills)
+{
+	auto decision = encode(DecisionKind::LEVEL_UP);
+	encodeOptionContext(decision, h->id, h->visitablePos());
+	for(int i = 0; i < std::min<int>(skills.size(), N_OPTIONS); ++i)
+	{
+		decision.inputs.at(In::o_kind, i) = static_cast<int>(OptionKind::SKILL);
+		decision.inputs.at(In::o_type, i) = skills[i].getNum();
+		decision.inputs.at(In::o_subtype, i) = h->getSecSkillLevel(skills[i]) + 1;
+		decision.inputs.at(In::option_mask, i) = 1;
+		decision.answers.push_back(i);
+	}
+	return decision;
 }
 
 void AlphaMapAI::commanderGotLevel(const CCommanderInstance * commander, std::vector<ui32> skills, QueryID queryID)

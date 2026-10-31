@@ -20,7 +20,7 @@ import sys
 import torch
 
 from .empire import EmpireConfig
-from .labels import LabelConfig, end_labels, end_steps, growth_labels, label
+from .labels import LabelConfig, end_labels, end_steps, growth_labels, label, share_change_labels
 
 LABEL_WORKERS = 2  # a game's labels take ~1 s of a core; ~15 games arrive a minute on the PC
 _features = None  # a labeler process's features module (model.CustomFeatures), the weights loaded per game
@@ -36,7 +36,7 @@ def _features_module(state):
 	return _features
 
 
-def precompute(game, features_state, labels=LabelConfig(), empire=EmpireConfig(), foresight=True):
+def precompute(game, features_state, labels=LabelConfig(), empire=EmpireConfig(), foresight=True, share_target="share"):
 	"""The labels of game (records.Game, every decision as recorded), over its usable decisions, as learner.step takes
 	them; None when it has none or no ledger."""
 	from .foresight import labels_of
@@ -49,6 +49,8 @@ def precompute(game, features_state, labels=LabelConfig(), empire=EmpireConfig()
 	g = copy.copy(game)
 	g.decisions, g.all_decisions = kept, full  # (labels_of: the battles' serials count every record; the kept rows come back)
 	t, mixed, price = label(g, labels, empire)
+	if share_target == "change":
+		t = share_change_labels(g, empire)
 	step, week = end_steps(g)
 	out = {"n": len(kept), "t": t, "mixed": mixed, "price": price, "z": growth_labels(g, empire), "real": end_labels(g, empire), "step": step, "week": week}
 	if foresight:
@@ -58,8 +60,8 @@ def precompute(game, features_state, labels=LabelConfig(), empire=EmpireConfig()
 
 
 class Labeler:
-	def __init__(self, labels=LabelConfig(), empire=EmpireConfig(), foresight=True, workers=LABEL_WORKERS):
-		self.labels, self.empire, self.foresight = labels, empire, foresight
+	def __init__(self, labels=LabelConfig(), empire=EmpireConfig(), foresight=True, workers=LABEL_WORKERS, share_target="share"):
+		self.labels, self.empire, self.foresight, self.share_target = labels, empire, foresight, share_target
 		context = multiprocessing.get_context("forkserver" if sys.platform != "win32" else "spawn")
 		self.pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=context)
 
@@ -67,7 +69,7 @@ class Labeler:
 		"""A Future of precompute(game) with the features module's weights as they are now (copied: the learner refreshes
 		them in place after each update)."""
 		state = {key: value.detach().clone() for key, value in features.state_dict().items()} if self.foresight else None
-		return self.pool.submit(precompute, game, state, self.labels, self.empire, self.foresight)
+		return self.pool.submit(precompute, game, state, self.labels, self.empire, self.foresight, self.share_target)
 
 	def close(self):
 		self.pool.shutdown(wait=False, cancel_futures=True)

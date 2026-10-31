@@ -22,7 +22,7 @@ from battle_model import play as battle_play
 from . import constants as c
 from .config import CampaignConfig
 from .play import GameRun, make_map
-from .records import TEACHER
+from .records import TEACHER, decision_name
 
 
 def tally(game, totals=None):
@@ -40,7 +40,7 @@ def tally(game, totals=None):
 	for d in game.decisions:
 		if d.flags & TEACHER:
 			totals["decisions"] += 1
-			totals["type:" + c.ActionType(d.action_type).name] += 1
+			totals["type:" + decision_name(d)] += 1
 	return totals
 
 

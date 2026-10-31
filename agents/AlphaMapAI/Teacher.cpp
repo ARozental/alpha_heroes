@@ -19,7 +19,9 @@ using namespace MapSchema;
 // turn decision there and matched to the legal entry of ours that does the same; the pair is recorded as a decision
 // (RECORD_TEACHER) for campaign_model/imitate.py. What has no equal among our actions is counted by kind and sent with
 // the player's summary ("teacher": records.py), so how much of the teacher the model can follow is measured, not
-// guessed. Questions (QueryReply) and battles (MakeAction) are not recorded.
+// guessed. Its answers to yes/no, selection and level-up questions are recorded too: each question encoded as it is
+// asked (on the client's thread, before Nullkiller2 has seen it), kept, and recorded with the option its QueryReply
+// chose. Battles (MakeAction: the battle model's) and the other questions are not recorded.
 
 namespace
 {
@@ -85,12 +87,75 @@ void AlphaMapAI::teacherTurnStarts()
 	lastChanged = -1;
 }
 
+void AlphaMapAI::teacherBlockingDialog(const std::string & text, const std::vector<Component> & components, QueryID askID, int soundID, bool selection, bool cancel)
+{
+	if(!teacher || stopping || (!selection && !cancel)) // (a dialog that only closes: no question)
+		return;
+	try
+	{
+		auto decision = blockingQuestion(text, components, soundID, selection, cancel);
+		std::scoped_lock lock(recordsMutex);
+		teacherQuestions[askID] = std::move(decision);
+	}
+	catch(const std::exception & e)
+	{
+		logAi->error("AlphaMapAI %s: the teacher's question was not encoded: %s", playerID.toString(), e.what());
+		++errors;
+	}
+}
+
+void AlphaMapAI::teacherLevelUp(const CGHeroInstance * hero, const std::vector<SecondarySkill> & skills, QueryID queryID)
+{
+	if(!teacher || stopping || skills.empty() || !hero)
+		return;
+	try
+	{
+		auto decision = levelUpQuestion(hero, skills);
+		std::scoped_lock lock(recordsMutex);
+		teacherQuestions[queryID] = std::move(decision);
+	}
+	catch(const std::exception & e)
+	{
+		logAi->error("AlphaMapAI %s: the teacher's level up was not encoded: %s", playerID.toString(), e.what());
+		++errors;
+	}
+}
+
 void AlphaMapAI::observe(const CPackForServer * pack)
 {
 	if(!teacher || stopping || (dayCap > 0 && cb->getDate(Date::DAY) > dayCap))
 		return;
-	if(dynamic_cast<const QueryReply *>(pack) || dynamic_cast<const MakeAction *>(pack))
-		return; // a question's answer, a battle's action: not turn decisions
+	if(dynamic_cast<const MakeAction *>(pack))
+		return; // a battle's action: the battle model's
+	if(const auto * reply = dynamic_cast<const QueryReply *>(pack))
+	{
+		// A question we encoded when it was asked: recorded with the option of ours its answer is; others (the turn's
+		// own query, dialogs that only close) are no decision
+		std::scoped_lock lock(recordsMutex);
+		const auto found = teacherQuestions.find(reply->qid);
+		if(found == teacherQuestions.end())
+			return;
+		auto decision = std::move(found->second);
+		teacherQuestions.erase(found);
+		const int answer = reply->reply.value_or(0);
+		const auto option = std::find(decision.answers.begin(), decision.answers.end(), answer);
+		if(option == decision.answers.end())
+		{
+			++teacherUnmatched["QueryReply (an answer not among our options)"];
+			return;
+		}
+		Record entry;
+		entry.day = cb->getDate(Date::DAY);
+		entry.kind = static_cast<int>(decision.kind);
+		entry.decisionsToday = decisionsToday;
+		entry.flags = RECORD_TEACHER;
+		entry.choice.index = static_cast<int>(option - decision.answers.begin());
+		entry.inputs = decision.inputs.wire();
+		entry.serial = entry.choice.record = ++recordSerial;
+		records.push_back(std::move(entry));
+		++teacherMatched;
+		return;
+	}
 	try
 	{
 		auto decision = encode(DecisionKind::TURN);
@@ -284,6 +349,18 @@ public:
 	{
 		recorder->teacherTurnStarts();
 		AIGateway::yourTurn(queryID);
+	}
+
+	void showBlockingDialog(const std::string & text, const std::vector<Component> & components, QueryID askID, const int soundID, bool selection, bool cancel, bool safeToAutoaccept) override
+	{
+		recorder->teacherBlockingDialog(text, components, askID, soundID, selection, cancel); // (before Nullkiller2 answers)
+		AIGateway::showBlockingDialog(text, components, askID, soundID, selection, cancel, safeToAutoaccept);
+	}
+
+	void heroGotLevel(const CGHeroInstance * hero, PrimarySkill pskill, std::vector<SecondarySkill> & skills, QueryID queryID) override
+	{
+		recorder->teacherLevelUp(hero, skills, queryID);
+		AIGateway::heroGotLevel(hero, pskill, skills, queryID);
 	}
 
 	void requestSent(const CPackForServer * pack, int requestID) override

@@ -250,3 +250,32 @@ def test_the_attributed_credit_takes_a_player_out_of_the_game():
 	assert taken_events(game)["RED"][0][0] == 3
 	now, taken = attributed_labels(game)
 	assert taken[0] > 0
+
+
+def test_the_share_change_is_the_logit_change_from_the_days_start():
+	"""The user's example: 5% now, 6% five days on is logit(0.06) - logit(0.05) = +0.192 (on the heads' scale, 1/2 plus
+	that over 2 x the cap); a share of 0 (knocked out) is capped, not infinite."""
+	import math
+
+	from campaign_model.labels import SHARE_CHANGE_CAP, share_change_scale, share_logit
+
+	change = share_logit(0.06) - share_logit(0.05)
+	assert change == pytest.approx(math.log(0.06 / 0.94) - math.log(0.05 / 0.95)) and change == pytest.approx(0.192, abs=1e-3)
+	assert share_change_scale(np.array([change]))[0] == pytest.approx(0.5 + change / (2 * SHARE_CHANGE_CAP))
+	assert share_change_scale(np.array([share_logit(0.0) - share_logit(0.3)]))[0] == 0.0
+	assert share_change_scale(np.array([0.0]))[0] == 0.5
+
+
+def test_share_change_labels_are_the_logit_change_from_the_start_of_the_decisions_day():
+	"""Red holds 1/2 as day 3 begins and 3/4 by the end of day 5 (its gold 3,000 against blue's 1,000): V2's label is
+	logit(3/4) - logit(1/2) = log 3 on the heads' scale; past the last day played, none."""
+	import math
+
+	from campaign_model.labels import SHARE_CHANGE_CAP, share_change_labels
+
+	ledgers = {day: snapshot(day, 1000 if day <= 3 else 3000, 1000) for day in range(1, 12)}  # (the day's start: red's 3,000 from day 4 on)
+	game = Game(decisions=[decision("RED", 3)], ledgers=ledgers, days=30)
+	labels = share_change_labels(game)
+	assert labels[0, 0] == pytest.approx(0.5 + math.log(3) / (2 * SHARE_CHANGE_CAP), abs=1e-5)
+	late = Game(decisions=[decision("RED", 10)], ledgers=ledgers, days=30)
+	assert np.isnan(share_change_labels(late)[0, -1])  # (day 17: past the last day played)
