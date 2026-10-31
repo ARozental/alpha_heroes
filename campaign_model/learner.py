@@ -87,6 +87,8 @@ def campaign_model_kwargs(config, out, resume=False):
 def game_problem(game, players):
 	"""Why a finished game must not be trained on (CampaignLearner._game_done), or None: an AI error, or fewer turn
 	decisions than half a decision a player and day."""
+	if not game.decisions:  # (a game that ended before its first decision: ALPHA_MAP_REQUIRE_MODEL's abort among them)
+		return "no decision"
 	errors = {color: summary.get("errors", 0) for color, summary in game.done.items() if summary.get("errors", 0)}
 	if errors:
 		return "AI errors " + ", ".join(f"{color} {n}" for color, n in sorted(errors.items()))
