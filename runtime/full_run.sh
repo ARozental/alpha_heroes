@@ -18,8 +18,8 @@ mkdir -p "$BC" runtime/train
 if [ ! -f "$BC/done" ]; then
 	init=""
 	[ -f "$BC/bc_latest.pt" ] && init="--init $BC/bc_latest.pt"
-	.venv/bin/python -m campaign_model.imitate --stream 12 --data none --out "$BC" $init --variants 128x2 --lanes 64 --steps 8 \
-		--eval-every 400 --until-plateau 0.003 --minutes 100000000 --decode-threads 8 >> runtime/teacher/bc_final.log 2>&1 &
+	.venv/bin/python -m campaign_model.imitate --stream 12 --data none --out "$BC" $init --variants 128x2 --lanes 128 --steps 8 \
+		--eval-every 200 --until-plateau 0.005 --plateau-periods 5 --minutes 100000000 --decode-threads 8 >> runtime/teacher/bc_final.log 2>&1 &
 	child=$!
 	wait "$child"
 	status=$?

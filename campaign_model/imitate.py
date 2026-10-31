@@ -313,7 +313,8 @@ def main():
 	parser.add_argument("--device", default="")
 	parser.add_argument("--decode-threads", type=int, default=3, help="batches decoded at once (zlib: ~0.3 s a 128-decision batch a thread)")
 	parser.add_argument("--stream", type=int, default=0, help="Nullkiller2's games played as needed by this many workers (TeacherPlay), not read from --data: each decision seen once, its loss before the update the held-out measure")
-	parser.add_argument("--until-plateau", type=float, default=0.0, help="streaming: stop once the last 3 periods' loss is under the 3 before by less than this fraction (0: never)")
+	parser.add_argument("--until-plateau", type=float, default=0.0, help="streaming: stop once the last --plateau-periods periods' loss is under the as many before by less than this fraction (0: never)")
+	parser.add_argument("--plateau-periods", type=int, default=5, help="the periods each side of the plateau's comparison (a period's loss varies from game to game)")
 	args = parser.parse_args()
 	assert args.lr <= 1e-4, "the user's rule: never above 1e-4"
 	from .learner import auto_device
@@ -447,9 +448,10 @@ def train_loop(args, models, memories, pool, train_streams, total, history, eval
 					torch.save({"model": model.state_dict(), "model_kwargs": kwargs, "step": steps_done, "version": 0}, out / f"bc_latest{suffix}.pt")
 				(out / "history.json").write_text(json.dumps(history, indent=1))
 				losses = [h["val"]["all"]["loss"] for h in next(iter(history.values())) if "all" in h["val"]]
-				plateau = bool(args.until_plateau) and len(losses) >= 6 and np.mean(losses[-3:]) > (1 - args.until_plateau) * np.mean(losses[-6:-3])
+				k = args.plateau_periods
+				plateau = bool(args.until_plateau) and len(losses) >= 2 * k and np.mean(losses[-k:]) > (1 - args.until_plateau) * np.mean(losses[-2 * k : -k])
 				if plateau:
-					print(f"imitate: the loss is on a plateau ({np.mean(losses[-6:-3]):.4f} -> {np.mean(losses[-3:]):.4f}): done", flush=True)
+					print(f"imitate: the loss is on a plateau ({np.mean(losses[-2 * k : -k]):.4f} -> {np.mean(losses[-k:]):.4f}): done", flush=True)
 				if time.time() > deadline or seen >= args.epochs * total or plateau:
 					done = True
 					break
