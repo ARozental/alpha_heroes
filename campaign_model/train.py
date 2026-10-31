@@ -259,6 +259,25 @@ def excess_loss(logits, targets):
 STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl")  # a step's metrics, in ppo_update's order
 
 
+def signal_ratio(optimizer):
+	"""The median over the weights that have had a gradient of |m| / sqrt(v) in Adam's state, bias-corrected (1: the
+	steps' gradients agree, 0: they cancel out; battle_model.train.signal_ratio's, without the ~half of this model's
+	weights no gradient reaches, embedding rows of ids never seen, which held its median at 0)."""
+	ratios = []
+	for group in optimizer.param_groups:
+		if "betas" not in group:  # (not Adam: no such state)
+			continue
+		beta1, beta2 = group["betas"]
+		for p in group["params"]:
+			state = optimizer.state.get(p, {})
+			if "exp_avg" in state:
+				step = float(state["step"])
+				v = state["exp_avg_sq"].flatten() / (1 - beta2**step)
+				live = v > 0
+				ratios.append((state["exp_avg"].flatten()[live] / (1 - beta1**step)).abs() / v[live].sqrt())
+	return float(torch.cat(ratios).median()) if ratios else float("nan")
+
+
 def micro_loss(out, batch, config, foresight_config=None):
 	"""A micro-batch's loss and metrics from the model's outputs and its rows, for the eager step and the recorded one
 	alike (graphs.StepGraph): (loss, the rest of STEP_PARTS [6], the foresight's parts [len(PART_NAMES)] or None, the
@@ -524,6 +543,7 @@ def ppo_update(
 		steps=steps,
 		stopped=stopped,
 		stopped_pass=stopped_pass,
+		signal_ratio=signal_ratio(optimizer),  # (the steps' noise: the user's 2026-10-31 aim of 0.25+, with 4,096-decision steps)
 		end_step_error=end_step_error,
 		last_kl=update_kl,
 		unsound=int(unsound.sum()),
