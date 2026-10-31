@@ -1195,9 +1195,11 @@ def train(config, resume=False):
 			# (a family without endpoints gets a server here, on inference_device: e.g. the battle model's on the CPU, the
 			# campaign's on the other machine whose cores it saturates, 2026-10-30)
 			print(f"inference: {config.inference_endpoints} served elsewhere" + (f"; {', '.join(f for f in ('battle', 'campaign') if f not in stores and (f == 'battle' or config.campaign.games))} served here on {config.inference_device}" if len(stores) < 1 + bool(config.campaign.games) else ""), flush=True)
-		elif config.inference == "server" and config.campaign.games:
+		elif config.inference == "server" and config.campaign.games and inference_device(config.campaign.inference_device) == inference_device(config.inference_device):
 			# One server process for both models (one GPU context: on a Windows GPU the trainer loses a time slice to
-			# every other process with work, 2026-10-30), the campaign's device the battle's
+			# every other process with work, 2026-10-30), when both are to run on the same device. On different ones
+			# (campaign.inference_device) each gets its own, as without endpoints below: the campaign's settings were
+			# ignored, its model served on the battle's 3 CPU processes (the 2026-10-31 review)
 			from campaign_model.learner import campaign_model_kwargs
 
 			from . import play as battle_play

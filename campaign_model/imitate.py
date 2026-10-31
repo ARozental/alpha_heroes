@@ -20,9 +20,12 @@ against the real outcomes the teacher's games had (labels.label, labels.growth_l
 them), so a run started from here credits its first updates against forecasts that already mean something. V_end is
 left to the run: these games end at one day cap (--days), the run's games at caps drawn per game."""
 import argparse
+import itertools
 import json
 import pickle
 import random
+import sys
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -45,11 +48,95 @@ def teacher_decisions(paths, share_target="change"):
 	games = []
 	for path in paths:
 		with open(path, "rb") as f:
-			game = pickle.load(f)
-		shares, growth = (share_change_labels(game) if share_target == "change" else label(game)[0]), growth_labels(game)
-		keep = [i for i, d in enumerate(game.decisions) if d.flags & TEACHER]  # (turn decisions and its answers: TEACHER_QUESTIONS)
-		games.append(([game.decisions[i] for i in keep], shares[keep], growth[keep]))
+			games.append(labelled(pickle.load(f), share_target))
 	return games
+
+
+def labelled(game, share_target="change"):
+	"""A game's teacher decisions (turns and its answers: records.TEACHER_QUESTIONS) with their value labels."""
+	shares, growth = (share_change_labels(game) if share_target == "change" else label(game)[0]), growth_labels(game)
+	keep = [i for i, d in enumerate(game.decisions) if d.flags & TEACHER]
+	return [game.decisions[i] for i in keep], shares[keep], growth[keep]
+
+
+class TeacherPlay(torch.utils.data.IterableDataset):
+	"""Nullkiller2's games played as they are needed (teacher.py's, nothing written to disk): each DataLoader worker plays
+	one at a time, on the training games' maps and day caps (config.CampaignConfig, learner.draw_days), and gives its
+	players' streams (player_streams') as it ends. A worker stopping ends its game (no VCMI outlives the run)."""
+
+	def __init__(self, seed, share_target="change", game_seconds=1800):
+		self.seed, self.share_target, self.game_seconds = seed, share_target, game_seconds
+
+	def __iter__(self):
+		from battle_model import play as battle_play
+
+		from .learner import draw_days
+		from .play import GameRun, make_map
+
+		info = torch.utils.data.get_worker_info()
+		worker = info.id if info is not None else 0
+		config, rng = CampaignConfig(), random.Random(self.seed * 1000 + worker)
+		for n in itertools.count():
+			seed = (self.seed * 100 + worker) * 100000 + n
+			players, size, days = rng.choice(config.players), rng.choice(config.sizes), draw_days(rng, config)
+			map_name = make_map(seed, players, size, config.levels, config.water)[0]
+			run = GameRun(battle_play.SOCKET_DIR / "teacher-none.sock", map_name, days, seed, max_seconds=self.game_seconds, battle_ai="BattleAI", game_key=f"s{seed}", teacher=True)
+			try:
+				while not run.poll():
+					time.sleep(0.5)
+				game, _ = run.result()
+			finally:
+				run.terminate()
+				(battle_play.USER_DIR / (map_name + ".vmap")).unlink(missing_ok=True)
+			game.days = days
+			for stream in player_streams([labelled(game, self.share_target)]):
+				if len(stream[0]):
+					yield stream
+
+
+def _worker_init(_):
+	import signal
+
+	signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # (the generator's finally ends the game being played)
+
+
+class StreamPool:
+	"""Players' streams as the workers end their games, taken in random order (so a step's lanes are mostly of different
+	games); filled by a thread, at most `size` waiting (the workers then wait too)."""
+
+	def __init__(self, loader, size, rng):
+		self.items, self.size, self.rng, self.lock = [], size, rng, threading.Condition()
+		self.loader, self.closed = loader, False
+		threading.Thread(target=self._fill, args=(loader,), daemon=True).start()
+
+	def _fill(self, loader):
+		for stream in loader:
+			with self.lock:
+				while len(self.items) >= self.size and not self.closed:
+					self.lock.wait()
+				if self.closed:
+					return
+				self.items.append(stream)
+				self.lock.notify_all()
+
+	def close(self):
+		"""Ends the workers, and with them the games they play (TeacherPlay's finally, on their SIGTERM): the iterator
+		holds them until it is collected, and a thread waiting on it kept that from happening (the process never ended,
+		2026-10-31). As supply.Supply.close does."""
+		with self.lock:
+			self.closed = True
+			self.lock.notify_all()
+		iterator = getattr(self.loader, "_iterator", None)
+		if iterator is not None:
+			iterator._shutdown_workers()
+
+	def take(self):
+		with self.lock:
+			while not self.items:
+				self.lock.wait()
+			stream = self.items.pop(self.rng.randrange(len(self.items)))
+			self.lock.notify_all()
+			return stream
 
 
 def value_loss(out, shares, growth, device, growth_weight):
@@ -136,26 +223,32 @@ class GameStreams:
 		return self.cache[path][color]
 
 
-def chunks(streams, lanes, steps, rng=None):
-	"""The chunks of the streams, `lanes` players at once: each (steps lists of the lanes' (stream, position), None for a
-	lane past its stream's end; the lanes whose memory starts afresh). A lane takes the next stream at a chunk's start."""
+def ordered(streams, rng=None):
+	"""next_stream for chunks over a folder's streams (a list, or GameStreams: each loaded as a lane takes it): each
+	once, in random order with rng; None once all are taken."""
 	order = list(range(len(streams)))
 	if rng is not None:
 		rng.shuffle(order)
-	length = streams.length if hasattr(streams, "length") else (lambda k: len(streams[k][0]))  # (GameStreams: without loading)
 	queue = iter(order)
-	stream, position, fresh = [next(queue, None) for _ in range(lanes)], [0] * lanes, [True] * lanes
-	while any(k is not None for k in stream):
-		yield [[(k, position[i] + t) if k is not None and position[i] + t < length(k) else None for i, k in enumerate(stream)] for t in range(steps)], fresh
+	return lambda: (lambda k: None if k is None else streams[k])(next(queue, None))
+
+
+def chunks(next_stream, lanes, steps):
+	"""The chunks of the streams next_stream gives (a folder's: ordered; live ones: StreamPool.take), `lanes` players at
+	once: each (steps lists of the lanes' (stream, position), None for a lane past its stream's end or without one;
+	the lanes whose memory starts afresh). A lane takes the next stream at a chunk's start."""
+	stream, position, fresh = [next_stream() for _ in range(lanes)], [0] * lanes, [True] * lanes
+	while any(s is not None for s in stream):
+		yield [[(s, position[i] + t) if s is not None and position[i] + t < len(s[0]) else None for i, s in enumerate(stream)] for t in range(steps)], fresh
 		fresh = [False] * lanes
-		for i, k in enumerate(stream):
-			if k is not None:
+		for i, s in enumerate(stream):
+			if s is not None:
 				position[i] += steps
-				if position[i] >= length(k):
-					stream[i], position[i], fresh[i] = next(queue, None), 0, True
+				if position[i] >= len(s[0]):
+					stream[i], position[i], fresh[i] = next_stream(), 0, True
 
 
-def step_batches(streams, schedule):
+def step_batches(schedule):
 	"""(step, its lanes' decisions (a lane past its end given the step's first decision, masked out), its valid mask
 	[lanes], its labels) of each step of each chunk, and the chunk's fresh lanes at its first step."""
 	for chunk, fresh in schedule:
@@ -164,7 +257,7 @@ def step_batches(streams, schedule):
 			if not known:
 				continue
 			filled = [entry or known[0] for entry in lanes]
-			yield t, [streams[k][0][p] for k, p in filled], np.array([entry is not None for entry in lanes]), np.stack([streams[k][1][p] for k, p in filled]), np.stack([streams[k][2][p] for k, p in filled]), fresh if t == 0 else None
+			yield t, [s[0][p] for s, p in filled], np.array([entry is not None for entry in lanes]), np.stack([s[1][p] for s, p in filled]), np.stack([s[2][p] for s, p in filled]), fresh if t == 0 else None
 
 
 def evaluate(model, streams, device, lanes, steps, growth_weight, memory_on=True):
@@ -175,7 +268,7 @@ def evaluate(model, streams, device, lanes, steps, growth_weight, memory_on=True
 	model.eval()
 	memory = torch.zeros(lanes, c.MEMORY_SLOTS, c.MEMORY_WIDTH, device=device)
 	with torch.no_grad():
-		for (t, chosen, valid, shares, growth, fresh), inputs in _prefetched(step_batches(streams, chunks(streams, lanes, steps)), lambda batch: decode_inputs(batch[1]), device):
+		for (t, chosen, valid, shares, growth, fresh), inputs in _prefetched(step_batches(chunks(ordered(streams), lanes, steps)), lambda batch: decode_inputs(batch[1]), device):
 			if fresh is not None:
 				memory = memory * torch.tensor([not f for f in fresh], device=device).float()[:, None, None]
 			out = model({**inputs, "mem_float": memory if memory_on else torch.zeros_like(memory)})
@@ -219,6 +312,8 @@ def main():
 	parser.add_argument("--seed", type=int, default=1)
 	parser.add_argument("--device", default="")
 	parser.add_argument("--decode-threads", type=int, default=3, help="batches decoded at once (zlib: ~0.3 s a 128-decision batch a thread)")
+	parser.add_argument("--stream", type=int, default=0, help="Nullkiller2's games played as needed by this many workers (TeacherPlay), not read from --data: each decision seen once, its loss before the update the held-out measure")
+	parser.add_argument("--until-plateau", type=float, default=0.0, help="streaming: stop once the last 3 periods' loss is under the 3 before by less than this fraction (0: never)")
 	args = parser.parse_args()
 	assert args.lr <= 1e-4, "the user's rule: never above 1e-4"
 	from .learner import auto_device
@@ -228,13 +323,23 @@ def main():
 		torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
 	out = Path(args.out)
 	out.mkdir(parents=True, exist_ok=True)
-	paths = sorted(p for folder in args.data.split(",") for p in Path(folder).glob("game_*.pkl"))  # (folders, comma-separated)
 	rng = random.Random(args.seed)
-	rng.shuffle(paths)
-	paths = paths[: args.max_games] if args.max_games else paths
-	held = max(1, int(round(args.holdout * len(paths))))
-	val_streams, train_streams = GameStreams(paths[:held], args.share_target), GameStreams(paths[held:], args.share_target, keep=2 * args.lanes)
-	print(f"imitate: {sum(n for *_, n in train_streams.index)} decisions of {len(paths) - held} games to train on, {sum(n for *_, n in val_streams.index)} of {held} held out; {device}", flush=True)
+	pool = None
+	if args.stream:
+		import multiprocessing
+
+		loader = torch.utils.data.DataLoader(TeacherPlay(args.seed, args.share_target), batch_size=None, num_workers=args.stream, worker_init_fn=_worker_init, persistent_workers=True, prefetch_factor=1, multiprocessing_context=multiprocessing.get_context("forkserver" if sys.platform != "win32" else "spawn"))
+		pool = StreamPool(loader, 2 * args.lanes, rng)
+		val_streams, train_streams, total = None, None, float("inf")
+		print(f"imitate: Nullkiller2's games played by {args.stream} workers, each decision seen once; {device}", flush=True)
+	else:
+		paths = sorted(p for folder in args.data.split(",") for p in Path(folder).glob("game_*.pkl"))  # (folders, comma-separated)
+		rng.shuffle(paths)
+		paths = paths[: args.max_games] if args.max_games else paths
+		held = max(1, int(round(args.holdout * len(paths))))
+		val_streams, train_streams = GameStreams(paths[:held], args.share_target), GameStreams(paths[held:], args.share_target, keep=2 * args.lanes)
+		total = sum(n for *_, n in train_streams.index)
+		print(f"imitate: {total} decisions of {len(paths) - held} games to train on, {sum(n for *_, n in val_streams.index)} of {held} held out; {device}", flush=True)
 	from torch.utils.checkpoint import checkpoint
 
 	models = {}  # name -> (model, optimizer, kwargs, memory on): each trained on the same decisions, decoded once
@@ -256,32 +361,49 @@ def main():
 			models[variant] = (build_model(kwargs), kwargs, flag != "nomem")
 	models = {name: (model.to(device).train(), torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr), kwargs, on) for name, (model, kwargs, on) in models.items()}
 	history = {name: [] for name in models}
-	evaluation = lambda model, on: evaluate(model, val_streams, device, args.lanes, args.steps, config.growth_weight, on)  # noqa: E731
-	for name, (model, _, _, on) in models.items():
-		report = evaluation(model, on)
-		history[name].append({"step": 0, "decisions": 0, "val": report})
-		print(f"imitate: {name} ({sum(p.numel() for p in model.parameters()):,} weights) step 0 held-out loss {report['all']['loss']:.3f} top-1 {report['all']['top1']:.3f} value {report['value']:.4f}", flush=True)
+	online = {name: defaultdict(lambda: np.zeros(3)) for name in models}  # (streaming: each decision's loss and top-1 before the update)
+	def evaluation(model, on, name):
+		if val_streams is not None:
+			return evaluate(model, val_streams, device, args.lanes, args.steps, config.growth_weight, on)
+		sums, online[name] = online[name], defaultdict(lambda: np.zeros(3))
+		return {key: {"decisions": int(v[0]), "loss": v[1] / max(v[0], 1), "top1": v[2] / max(v[0], 1)} for key, v in sorted(sums.items(), key=lambda kv: -kv[1][0])} | {"value": float("nan")}
+
+	if val_streams is not None:
+		for name, (model, _, _, on) in models.items():
+			report = evaluation(model, on, name)
+			history[name].append({"step": 0, "decisions": 0, "val": report})
+			print(f"imitate: {name} ({sum(p.numel() for p in model.parameters()):,} weights) step 0 held-out loss {report['all']['loss']:.3f} top-1 {report['all']['top1']:.3f} value {report['value']:.4f}", flush=True)
 
 	def step(model, inputs, memory, choice, shares, growth, valid):
-		"""One decision of each lane: (its loss summed over the valid lanes, the memory it leaves)."""
+		"""One decision of each lane: (its loss summed over the valid lanes, the memory it leaves, each lane's logp of the
+		teacher's choice and of the model's most likely one, without gradients)."""
 		out = model({**inputs, "mem_float": memory})
 		logp, _ = chosen_logp(out, choice)
 		loss = -(logp * valid).sum()
 		if args.value_weight > 0:
 			rows = valid.nonzero().squeeze(-1)
 			loss = loss + args.value_weight * valid.sum() * value_loss({k: out[k][rows] for k in ("value_logit", "growth_logit", "phi")}, shares, growth, device, config.growth_weight)
-		return loss, out["memory"]
+		return loss, out["memory"], logp.detach(), mode_logp(out, logp.shape[0], choice["kind"]).detach()
 
-	started, steps_done, seen, epoch = time.time(), 0, 0, 0
+	started = time.time()
 	deadline = started + 60 * args.minutes
 	memories = {name: torch.zeros(args.lanes, c.MEMORY_SLOTS, c.MEMORY_WIDTH, device=device) for name in models}
-	total = sum(n for *_, n in train_streams.index)
+	try:
+		train_loop(args, models, memories, pool, train_streams, total, history, evaluation, step, checkpoint, online, out, device, started, deadline)
+	finally:
+		if pool is not None:
+			pool.close()
+
+
+def train_loop(args, models, memories, pool, train_streams, total, history, evaluation, step, checkpoint, online, out, device, started, deadline):
+	"""imitate's training: chunk after chunk of each lane's decisions, until the deadline, the epochs or a plateau."""
+	steps_done, seen, epoch = 0, 0, 0
 	done = False
 	while not done:
 		pending = {name: [] for name in models}  # the chunk's steps: (loss, valid count)
 		running = {name: [] for name in models}
-		schedule = chunks(train_streams, args.lanes, args.steps, random.Random(args.seed + epoch))
-		for (t, chosen, valid, shares, growth, fresh), inputs in _prefetched(step_batches(train_streams, schedule), lambda batch: decode_inputs(batch[1]), device, threads=args.decode_threads):
+		schedule = chunks(pool.take if pool is not None else ordered(train_streams, random.Random(args.seed + epoch)), args.lanes, args.steps)
+		for (t, chosen, valid, shares, growth, fresh), inputs in _prefetched(step_batches(schedule), lambda batch: decode_inputs(batch[1]), device, threads=args.decode_threads):
 			valid_t = torch.from_numpy(valid).to(device).float()
 			rows = np.flatnonzero(valid)
 			choice = choice_tensors(chosen, device)
@@ -303,14 +425,20 @@ def main():
 					memory = memory * torch.tensor([not f for f in fresh], device=device).float()[:, None, None]
 				if not on:
 					memory = torch.zeros_like(memory)
-				loss, after = checkpoint(step, model, inputs, memory, choice, shares[rows], growth[rows], valid_t, use_reentrant=False)
+				loss, after, logp, best = checkpoint(step, model, inputs, memory, choice, shares[rows], growth[rows], valid_t, use_reentrant=False)
 				pending[name].append((loss, float(valid.sum())))
+				if pool is not None:  # (streaming: this decision is new to the model, its loss before the update a held-out one)
+					agreed, losses = (logp >= best - 1e-4).float().cpu().numpy(), (-logp).cpu().numpy()
+					for d, l_, ok, v in zip(chosen, losses, agreed, valid):
+						if v:
+							for key in ("all", decision_name(d)):
+								online[name][key] += (1.0, float(l_), float(ok))
 				writes = valid_t.bool() & (choice["kind"] == c.DecisionKind.TURN)  # (turn decisions write the memory: AlphaMapAI's rule)
 				memories[name] = torch.where(writes[:, None, None], after, memory)
 			seen += int(valid.sum())
 			if t == 0 and (steps_done % args.eval_every == 0 and steps_done > 0 or time.time() > deadline or seen >= args.epochs * total):
 				for name, (model, _, kwargs, on) in models.items():
-					report = evaluation(model, on)
+					report = evaluation(model, on, name)
 					history[name].append({"step": steps_done, "decisions": seen, "train_loss": float(np.mean(running[name])) if running[name] else float("nan"), "val": report})
 					by_type = ", ".join(f"{k} {v['top1']:.2f}" for k, v in report.items() if k not in ("all", "value"))
 					print(f"imitate: {name} step {steps_done} ({seen / max(1, total):.2f} epochs, {(time.time() - started) / 60:.0f} min): train loss {np.mean(running[name]) if running[name] else float('nan'):.3f}, held-out loss {report['all']['loss']:.3f} top-1 {report['all']['top1']:.3f} value {report['value']:.4f} ({by_type})", flush=True)
@@ -318,7 +446,11 @@ def main():
 					suffix = "" if len(models) == 1 else "_" + name
 					torch.save({"model": model.state_dict(), "model_kwargs": kwargs, "step": steps_done, "version": 0}, out / f"bc_latest{suffix}.pt")
 				(out / "history.json").write_text(json.dumps(history, indent=1))
-				if time.time() > deadline or seen >= args.epochs * total:
+				losses = [h["val"]["all"]["loss"] for h in next(iter(history.values())) if "all" in h["val"]]
+				plateau = bool(args.until_plateau) and len(losses) >= 6 and np.mean(losses[-3:]) > (1 - args.until_plateau) * np.mean(losses[-6:-3])
+				if plateau:
+					print(f"imitate: the loss is on a plateau ({np.mean(losses[-6:-3]):.4f} -> {np.mean(losses[-3:]):.4f}): done", flush=True)
+				if time.time() > deadline or seen >= args.epochs * total or plateau:
 					done = True
 					break
 		epoch += 1
