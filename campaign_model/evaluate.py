@@ -18,6 +18,7 @@ share is then 0 (labels.py).
 import csv
 import json
 import random
+from pathlib import Path
 import shutil
 import threading
 import time
@@ -50,11 +51,24 @@ def setups(count):
 	return games
 
 
+# The evaluation's maps, kept with the code: VCMI's generator is not deterministic by seed (2026-10-30: the same binary
+# and seed made 3 maps in 3 runs; the PC's eval maps shared no surface tile with the Mac's, so its scores were not the
+# Mac's), so every machine plays these, the Mac's set that v1-v36 were scored on
+EVAL_MAPS = Path(__file__).resolve().parent / "eval_maps"
+
+
 def eval_map(seed, players, config):
-	"""The game's map: generated once (the generator is deterministic by seed) and kept."""
+	"""The game's map: the kept one (EVAL_MAPS, copied into VCMI's maps when missing or different there), else one
+	generated and kept on this machine."""
 	for attempt in range(5):  # (make_map's next seeds when a player was left without a town)
 		name = f"Maps/alpha_random/s{EVAL_SIZE}-p{players}-l{config.levels}-{config.water}-{seed + 1_000_003 * attempt}"
-		if (battle_play.USER_DIR / (name + ".vmap")).exists():
+		kept, there = EVAL_MAPS / (name.rsplit("/", 1)[-1] + ".vmap"), battle_play.USER_DIR / (name + ".vmap")
+		if kept.exists():
+			if not there.exists() or there.read_bytes() != kept.read_bytes():
+				there.parent.mkdir(parents=True, exist_ok=True)
+				shutil.copyfile(kept, there)
+			return name
+		if there.exists():
 			return name
 	return make_map(seed, players, EVAL_SIZE, config.levels, config.water)[0]
 

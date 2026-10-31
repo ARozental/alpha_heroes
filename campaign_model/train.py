@@ -38,6 +38,7 @@ from .empire import EmpireConfig, empire_value
 from .labels import COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, blend_credit, end_advantages, end_labels, end_steps, explained_variance, growth_labels, label, residual_variances
 from .model import CampaignModel, build_model
 from .play import make_map, play
+from .graphs import Graphs
 from .records import NO_EFFECT, decode_inputs
 from .schema import HEADS
 
@@ -294,6 +295,9 @@ def ppo_update(
 	size = config.batch_size
 	# The KL control's anchor: each decision's choice under the model as the update starts; and V_end there (the end
 	# credit's)
+	graphs = None
+	if config.cuda_graphs and Graphs.usable(model, device):  # (recorded once a process: kept with the model)
+		graphs = model.__dict__.setdefault("_graphs", Graphs(model))
 	model.eval()
 	anchor, end_now, prior = torch.empty(n, device=device), torch.empty(n, device=device), torch.empty(n, device=device)
 	# The same pass measures the value loss on these decisions before the update learns from them (the user, 2026-10-29:
@@ -305,7 +309,7 @@ def ppo_update(
 		chunks = [np.arange(i, i + chunk).clip(max=n - 1) for i in range(0, n, chunk)]  # the last one padded: fixed shapes
 		for rows, inputs in _prefetched(chunks, decode, device):
 			index = torch.from_numpy(rows).to(device)
-			out = model(inputs)
+			out = graphs.eval(inputs) if graphs else model(inputs)
 			logp, _ = chosen_logp(out, {k: choice[k][index] for k in ("kind", "action", "index", "cell")})
 			anchor[index] = logp
 			end_now[index] = torch.sigmoid(out["end_logit"].float())
@@ -365,7 +369,8 @@ def ppo_update(
 				at = torch.from_numpy(part).to(device)
 				sub, keep = index[at], whole[at]
 				_, inputs = next(decoded)
-				out = model(inputs)
+				# (the gradient check's micro-batch eagerly: it runs backward through one forward three times)
+				out = graphs.train(inputs) if graphs and (checked or foresight_t is None) else model(inputs)
 				logp, entropy = chosen_logp(out, {k: choice[k][sub] for k in ("kind", "action", "index", "cell")})
 				logp = torch.where(keep > 0, logp, choice["old_logp"][sub])
 				log_ratio = logp - choice["old_logp"][sub]
