@@ -28,7 +28,8 @@ if [ ! -f "$BC/done" ]; then
 	init=""
 	[ -f "$BC/bc_latest.pt" ] && init="--init $BC/bc_latest.pt"
 	.venv/bin/python -m campaign_model.imitate --stream 10 --data none --out "$BC" $init --variants 128x2 --lanes 128 --steps 64 \
-		--eval-every 25 --until-plateau 0.005 --plateau-periods 5 --minutes 480 --decode-threads 8 >> runtime/teacher/bc_final.log 2>&1 &
+		--eval-every 25 --until-plateau 0.005 --plateau-periods 5 --minutes 480 --decode-threads 8 \
+		--tb runtime/train/fullrun-imitation/tensorboard >> runtime/teacher/bc_final.log 2>&1 &
 	child=$!
 	wait "$child"
 	status=$?

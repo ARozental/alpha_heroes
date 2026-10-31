@@ -296,6 +296,7 @@ def main():
 	parser.add_argument("--data", required=True, help="teacher.py's folder of game_*.pkl")
 	parser.add_argument("--out", required=True)
 	parser.add_argument("--init", default="", help="a campaign checkpoint to start from (none: a fresh model)")
+	parser.add_argument("--tb", default="", help="TensorBoard's folder (default: <out>/tensorboard); its x axis the decisions learned, counted on across --init")
 	parser.add_argument("--architecture", default="v2")
 	parser.add_argument("--share-target", default="change", help="what the share heads learn (config.share_target): change (the logit's change) or share")
 	parser.add_argument("--variants", default="64x2", help="the models trained side by side on the same batches, <dim>x<layers> each (a fresh model's); their checkpoints bc_latest_<variant>.pt when more than one")
@@ -350,9 +351,11 @@ def main():
 	from torch.utils.checkpoint import checkpoint
 
 	models = {}  # name -> (model, optimizer, kwargs, memory on): each trained on the same decisions, decoded once
+	learned = 0
 	if args.init:
 		state = torch.load(args.init, map_location="cpu")
 		kwargs = state.get("model_kwargs", {})
+		learned = int(state.get("decisions", 0))  # (the decisions this checkpoint has learned: TensorBoard's x axis goes on)
 		model = build_model(kwargs)
 		migrate_subtypes(state, model)
 		model.load_state_dict(state["model"], strict=False)  # (a checkpoint from before the memory: its parts fresh)
@@ -399,15 +402,19 @@ def main():
 	deadline = started + 60 * args.minutes
 	memories = {name: torch.zeros(args.lanes, c.MEMORY_SLOTS, c.MEMORY_WIDTH, device=device) for name in models}
 	try:
-		train_loop(args, models, memories, pool, train_streams, total, history, evaluation, step, checkpoint, online, out, device, started, deadline)
+		from torch.utils.tensorboard import SummaryWriter
+
+		writer = SummaryWriter(args.tb or out / "tensorboard")
+		train_loop(args, models, memories, pool, train_streams, total, history, evaluation, step, checkpoint, online, out, device, started, deadline, writer, learned)
 	finally:
 		if pool is not None:
 			pool.close()
 
 
-def train_loop(args, models, memories, pool, train_streams, total, history, evaluation, step, checkpoint, online, out, device, started, deadline):
+def train_loop(args, models, memories, pool, train_streams, total, history, evaluation, step, checkpoint, online, out, device, started, deadline, writer, learned):
 	"""imitate's training: chunk after chunk of each lane's decisions, until the deadline, the epochs or a plateau."""
 	steps_done, seen, epoch = 0, 0, 0
+	period_start, period_seen = time.time(), 0
 	done = False
 	while not done:
 		pending = {name: [] for name in models}  # the chunk's steps: (loss, valid count)
@@ -452,9 +459,21 @@ def train_loop(args, models, memories, pool, train_streams, total, history, eval
 					history[name].append({"step": steps_done, "decisions": seen, "train_loss": float(np.mean(running[name])) if running[name] else float("nan"), "val": report})
 					by_type = ", ".join(f"{k} {v['top1']:.2f}" for k, v in report.items() if k not in ("all", "value"))
 					print(f"imitate: {name} step {steps_done} ({seen / max(1, total):.2f} epochs, {(time.time() - started) / 60:.0f} min): train loss {np.mean(running[name]) if running[name] else float('nan'):.3f}, held-out loss {report['all']['loss']:.3f} top-1 {report['all']['top1']:.3f} value {report['value']:.4f} ({by_type})", flush=True)
+					x, prefix = learned + seen, "imitate/" + ("" if len(models) == 1 else name + "/")
+					writer.add_scalar(prefix + "held_out_loss", report["all"]["loss"], x)
+					writer.add_scalar(prefix + "top1", report["all"]["top1"], x)
+					if running[name]:
+						writer.add_scalar(prefix + "train_loss", float(np.mean(running[name])), x)
+					for kind, v in report.items():
+						if kind not in ("all", "value"):
+							writer.add_scalar(prefix + "top1_by_kind/" + kind, v["top1"], x)
+							writer.add_scalar(prefix + "loss_by_kind/" + kind, v["loss"], x)
+					writer.add_scalar(prefix + "decisions_per_second", (seen - period_seen) / max(time.time() - period_start, 1e-9), x)
 					running[name] = []
 					suffix = "" if len(models) == 1 else "_" + name
-					torch.save({"model": model.state_dict(), "model_kwargs": kwargs, "step": steps_done, "version": 0}, out / f"bc_latest{suffix}.pt")
+					torch.save({"model": model.state_dict(), "model_kwargs": kwargs, "step": steps_done, "version": 0, "decisions": learned + seen}, out / f"bc_latest{suffix}.pt")
+				writer.flush()
+				period_start, period_seen = time.time(), seen
 				(out / "history.json").write_text(json.dumps(history, indent=1))
 				losses = [h["val"]["all"]["loss"] for h in next(iter(history.values())) if "all" in h["val"]]
 				k = args.plateau_periods
