@@ -31,14 +31,17 @@ buffer_decisions = 8000
 # 4 since 2026-10-31: the campaign model is the one to train most (the user), the battle model's updates fewer and larger
 generated_actors = 4
 # The battle model's steps (the user, 2026-10-31): its eval flat at ~+0.09 for ~1,100 updates of 256-decision steps,
-# signal_ratio ~0.12 (mostly noise); each step averages ~3,072 decisions (12 minibatches accumulated), 3 passes. At 1e-5
-# it hardly moved (300 updates: weight change 7e-3 an update against 8e-2, KL 2e-5 against 3e-3, signal 0.22 against
-# 0.11): 1e-4, the cap, for the large batch (the square root of 12 from 3e-5 at 256), an update KL near 1e-3 the aim
-learning_rate = 1e-4
+# signal_ratio ~0.12 (mostly noise). 3,072-decision steps at 1e-5, 3 an update: it hardly moved (300 updates: weight
+# change 7e-3 an update against 8e-2, KL 2e-5 against 3e-3; signal 0.22). Now (the user: larger still, 3e-5, not the
+# cap): updates of 6,400 decisions, steps of 6,144 (24 minibatches accumulated), 4 passes (4 steps an update), Adam's
+# second moment over ~100 steps (adam_beta2): aims an update KL of ~1e-4-1e-3 and a signal ratio of 0.3+
+learning_rate = 3e-5
+adam_beta2 = 0.99
+decisions_per_update = 6400
 # The trainer's matmuls as TF32 (2026-10-31; full fp32 before): campaign updates were 86-111 s a ~35k-decision update
 tf32 = true
-accumulate = 12
-ppo_passes = 3
+accumulate = 24
+ppo_passes = 4
 # The battle evals' sets three times as large (2026-10-31: a set's standard error was ~0.03, the total's ~0.013, more than
 # the changes to see; with the generator, eval_seeds plays no part): ~600 battles an opponent, ~3x the eval's time on the
 # CPU beside training. A new set: its first eval also plays the opponent's own baseline once
@@ -47,8 +50,9 @@ eval_neutral_scenarios = 36
 eval_hard_scenarios = 72
 eval_real_scenarios = 40
 eval_castle_seeds = 48
-# Loader workers kept for the Mac's game slots (worker.py --slots): 2 slots there, its cores on inference
-remote_slots = 2
+# Loader workers kept for the Mac's game slots (worker.py --slots): none since 2026-10-31, the Mac serves the campaign's
+# inference only (its 2 slots' games took the cores its 11 servers needed, and their battles stalled past the watchdog)
+remote_slots = 0
 # Three updates' worth of campaign games finished and in flight (supply.py): with two, the permits emptied the pipeline
 # during each 150 s update (5 of 20 games running) and the trainer then waited for the next batch of games (GPU 62%
 # against 74%, 2026-10-31 01:14). Labels of games waiting two versions are redone in the labeler (learner._relabel_waiting)
@@ -57,7 +61,9 @@ ahead = 3.0
 [campaign]
 # Campaign games at once here, at most (a VCMI client ~0.15 GB and its loader worker ~0.17 GB real). 24 reached the memory
 # floor with 10 battle actors and 8-process evals (2026-10-31 00:29); with 8 actors and 4-process evals 20 left 8 GB free
-games = 24
+# 22 since 2026-10-31: the larger evals run in the trainer's process (~3-4 GB more during one), and at 24 games the
+# memory floor held new games back through each eval
+games = 22
 learner = "turns"
 inference_device = "cuda"
 inference_processes = 1
@@ -76,7 +82,7 @@ prepass_batch = 256
 cuda_graphs = true
 # The update's input decoding (zlib on the CPU, ~430 decisions/s a thread): 3 threads held the recorded step (15 s of waits
 # in a 74 s update, the CPU half idle, 2026-10-31); ~110 MB of pinned memory a thread
-decode_threads = 6
+decode_threads = 3
 # Two passes over 32,768 decisions of 20+ games an update (b1, 2026-10-31: the better use of an idle GPU; the KL stop
 # bounds the drift). Conditions: the update must stay shorter than the gap between updates (else the permits hold games
 # back), and the second pass must not be cut short by the KL stop in most updates (stopped_pass in the log and

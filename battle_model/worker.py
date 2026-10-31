@@ -293,7 +293,7 @@ def main():
 	parser.add_argument("--token", default="", help=f"the run's shared secret (default: {remote.TOKEN_FILE}, copied from the master)")
 	parser.add_argument("--machine", metavar="TOML", help="this machine's sizes (remote_slots: its slots; inference_processes...), applied over the run's")
 	parser.add_argument("--set", nargs="*", default=[], metavar="NAME=VALUE", help="more of this machine's sizes, e.g. inference_processes=2")
-	parser.add_argument("--slots", type=int, default=0, help="games at once, at most (default: the machine config's remote_slots, else 4)")
+	parser.add_argument("--slots", type=int, default=None, help="games at once, at most (default: the machine config's remote_slots, else 4); 0: none, its servers only (--local --serve)")
 	parser.add_argument("--once", action="store_true", help="end when the master goes away instead of waiting for it")
 	parser.add_argument("--local", action="store_true", help="the games ask inference servers on this machine's CPU, the master's weights (sizes: inference_processes, campaign.inference_processes)")
 	parser.add_argument("--serve", type=int, default=0, metavar="PORT", help="with --local: the servers also listen on PORT+1.. (battle) and PORT+51.. (campaign) for the master's own games (its inference_endpoints)")
@@ -304,7 +304,7 @@ def main():
 		raise SystemExit(f"no token: copy the master's {remote.TOKEN_FILE} here, or pass --token")
 	overrides = tuple((machine_overrides(args.machine) if args.machine else []) + args.set)
 	sizes = dict(o.split("=", 1) for o in overrides)
-	slots = args.slots or int(sizes.get("remote_slots", 0)) or 4
+	slots = args.slots if args.slots is not None else int(sizes.get("remote_slots", 0)) or 4  # (0: the Mac serving the PC's inference only, 2026-10-31: its 2 slots' games took the cores its 11 servers needed, and their battles stalled)
 	servers = {}  # (this machine's inference servers, kept across the master's connections)
 	try:
 		while True:

@@ -148,6 +148,10 @@ class TrainConfig:
 	# choices differ): learning a strategy rather than one battle.
 	random_seeds: bool = False
 	learning_rate: float = 1e-4  # Adam; 3e-4 (the usual PPO default) learned and then forgot this scenario
+	# Adam's second-moment decay: 0.999 averages ~1,000 steps' squared gradients. With few large steps (accumulate) that is
+	# hours, and the scale of each weight's step lags the gradients' (2026-10-31, the battle model's 3-6 steps an update:
+	# 0.99, ~100 steps). Set again after a checkpoint's optimizer is loaded (its saved betas would win)
+	adam_beta2: float = 0.999
 	lr_schedule: str = "constant"  # "linear": decay to 0 at the last epoch, as standard PPO does; Adam's steps stay ~lr even when the gradients are only noise
 	ppo_passes: int = 2  # optimisation passes over each epoch's decisions; PPO reuses its data a few times
 	batch_size: int = 256  # minibatch of decisions: on the GPU 1.15 ms a decision at 512, 1.8 at 64 (2026-10-26)
@@ -276,7 +280,7 @@ ACTION_KINDS = ("WAIT", "DEFEND", "MOVE", "MELEE", "SHOOT", "HERO_SPELL", "CREAT
 
 COLUMNS = [
 	"epoch", "attack_reward", "attack_outcome", "defence_reward", "defence_outcome", "mean_reward", "attack_raw_reward", "defence_raw_reward", "attack_win_rate", "defence_win_rate",
-	"decisions", "rounds", "policy_loss", "value_loss", "value_loss_fresh", "entropy", "below_floor", "approx_kl", "clip_fraction", "signal_ratio", "weight_change",
+	"decisions", "rounds", "policy_loss", "value_loss", "value_loss_fresh", "value_loss_fresh_real", "value_loss_fresh_generated", "entropy", "below_floor", "approx_kl", "clip_fraction", "signal_ratio", "weight_change",
 	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds", "data_seconds", "prepass_seconds", "steps_seconds", "publish_seconds",
 ] + [f"{side}_share_{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS] + [
 	f"{side}_{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")
@@ -312,7 +316,7 @@ TENSORBOARD_TAGS = {
 	"mean_reward": "reward/mean", "attack_reward": "reward/attack", "defence_reward": "reward/defence",
 	"attack_raw_reward": "raw_reward/attack", "defence_raw_reward": "raw_reward/defence",
 	"attack_win_rate": "won/attack", "defence_win_rate": "won/defence",
-	"policy_loss": "loss/policy", "value_loss": "loss/value", "value_loss_fresh": VALUE_LOSS_TAB, "entropy": "loss/entropy", "below_floor": "loss/entropy_below_floor",
+	"policy_loss": "loss/policy", "value_loss": "loss/value", "value_loss_fresh": VALUE_LOSS_TAB, "value_loss_fresh_real": VALUE_LOSS_TAB + "_real", "value_loss_fresh_generated": VALUE_LOSS_TAB + "_generated", "entropy": "loss/entropy", "below_floor": "loss/entropy_below_floor",
 	"signal_ratio": "stability/signal_ratio", "weight_change": "stability/weight_change", "approx_kl": "stability/approx_kl", "clip_fraction": "stability/clip_fraction",
 	"attack_advantage_std": "advantage_std/attack", "defence_advantage_std": "advantage_std/defence",
 	"attack_value_error": "value_error/attack", "defence_value_error": "value_error/defence",
@@ -1237,6 +1241,8 @@ def train(config, resume=False):
 		last_eval -= time.time() - (out / "eval_total.csv").stat().st_mtime
 	elapsed = lambda: elapsed_before + time.monotonic() - run_started
 	last_campaign = time.monotonic()  # (learner "turns": when the campaign's last update ended)
+	for group in optimizer.param_groups:
+		group["betas"] = (group["betas"][0], config.adam_beta2)
 	try:
 		for epoch in itertools.count(first_epoch):
 			if (config.run_hours and elapsed() >= config.run_hours * 3600) or (not config.run_hours and epoch > config.epochs):
@@ -1310,7 +1316,7 @@ def train(config, resume=False):
 						facts[key][i : i + rows] = value[:rows]
 					del chunk
 				epoch_data["facts"] = facts
-			fresh_value = float("nan")
+			fresh_value, fresh_by_source = float("nan"), {}
 			if epoch_data is not None:
 				# The KL control's anchor: this update's actions under the model as the update starts. Measured against the
 				# policy that played (old_log_prob, about one version back), the previous update's own move counted as
@@ -1326,6 +1332,9 @@ def train(config, resume=False):
 						excess.append(value_excess(out_rows, rows["value_labels"], ppo_config))
 					epoch_data["anchor_log_prob"] = torch.cat(anchors)[: len(examples)]
 					fresh_value = float(weighted_mean(torch.cat(excess)[: len(examples)], epoch_data.get("weight")))
+					if "real" in epoch_data:  # (by source: the campaign games' battles and the generated ones, 2026-10-31)
+						every, real, w = torch.cat(excess)[: len(examples)], epoch_data["real"] > 0, epoch_data.get("weight")
+						fresh_by_source = {name: float(weighted_mean(every[m], w[m] if w is not None else None)) if bool(m.any()) else float("nan") for name, m in (("real", real), ("generated", ~real))}
 					del anchors, excess, out_rows
 			sync(device)
 			marks.append(time.time())
@@ -1425,6 +1434,8 @@ def train(config, resume=False):
 				"policy_loss": round(mean["policy"], 5),
 				"value_loss": round(mean["value"], 5),
 				"value_loss_fresh": round(fresh_value, 5),
+				"value_loss_fresh_real": round(fresh_by_source.get("real", float("nan")), 5),
+				"value_loss_fresh_generated": round(fresh_by_source.get("generated", float("nan")), 5),
 				"entropy": round(mean["entropy"], 4),
 				"below_floor": round(mean["below_floor"], 4),
 				"approx_kl": round(mean["approx_kl"], 5),

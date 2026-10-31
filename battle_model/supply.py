@@ -155,6 +155,7 @@ def assemble(items, advantage_config):
 	groups = torch.cat([torch.full((n,), item["summary"].our_side + 2 * (item["source"] == "real")) for n, item in zip(rows, (i for i in items if i["data"]))])
 	battles = torch.cat([torch.full((n,), i) for i, n in enumerate(rows)])
 	batch["advantage"] = normalize_advantages(batch["advantage"], groups, battles, advantage_config)
+	batch["real"] = (groups >= 2).float()  # (each decision's source, for the fresh value loss by source)
 	return batch, [item["summary"] for item in items]
 
 
