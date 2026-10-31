@@ -178,6 +178,56 @@ def make_optimizer(model, config=CampaignConfig()):
 	return torch.optim.AdamW([{"params": rest, "weight_decay": 0.0}, {"params": corrections, "weight_decay": config.prior_decay}], lr=config.learning_rate)
 
 
+def migrate_subtypes(state, model):
+	"""A checkpoint (state: its "model" and "optimizer") from before the subtype tables changed (2026-10-31: SUBTYPE_HASH
+	rows each), for model, in place; returns the tables migrated.
+	- The (object, subtype) pairs' tables (PAIR_ROWS: constants.OBJECT_PAIRS): each pair's row is its old hashed one,
+	  exactly, Adam's moments too; PAIR_OTHER and PAIR_BLOCKED are the fresh model's
+	- The options' (SUBTYPE_ROWS, still hashed): a pair's row is its old one's modulo SUBTYPE_BUCKETS (features.bucket),
+	  each new row the mean of the old rows folded into it that a gradient ever reached (Adam's second moment above 0;
+	  every row without the optimizer's state), its moments alike; a row none reached keeps the fresh model's"""
+	own = model.state_dict()
+	names = [n for n, v in state["model"].items() if n in own and v.dim() == 2 and v.shape[0] == c.SUBTYPE_HASH and own[n].shape[0] in (c.SUBTYPE_ROWS, c.PAIR_ROWS)]
+	if not names:
+		return []
+	saved = state.get("optimizer")
+	index = {}  # a parameter's key in the optimizer's state: its place in make_optimizer's groups
+	if saved:
+		corrections = model.prior_corrections()
+		ids, by_id = {id(p) for p in corrections}, {id(p): n for n, p in model.named_parameters()}
+		order = [by_id[id(p)] for p in model.parameters() if id(p) not in ids] + [by_id[id(p)] for p in corrections]
+		flat = [i for group in saved["param_groups"] for i in group["params"]]
+		if len(flat) == len(order):
+			index = dict(zip(order, flat))
+	pairs = list(c.OBJECT_PAIRS.items())
+	for name in names:
+		old = state["model"][name]
+		device = old.device
+		moments = saved["state"].get(index[name]) if name in index else None
+		if own[name].shape[0] == c.PAIR_ROWS:  # (bucket(obj, obj, subtype) before: the pair's hashed row)
+			rows = torch.tensor([row for _, row in pairs], device=device)
+			hashed = torch.tensor([((o + 1) * 7919 + (o + 1) * 131 + t * 7) % c.SUBTYPE_HASH for (o, t), _ in pairs], device=device)
+
+			def moved(table, fresh):
+				out = fresh.to(device=device, dtype=table.dtype).clone()
+				out[rows] = table[hashed]
+				return out
+		else:
+			live = moments["exp_avg_sq"].sum(dim=1) > 0 if moments is not None else torch.ones(c.SUBTYPE_HASH, dtype=torch.bool, device=device)
+			fold = (torch.arange(c.SUBTYPE_HASH, device=device) % c.SUBTYPE_BUCKETS)[live]
+			count = torch.zeros(c.SUBTYPE_ROWS, device=device).index_add_(0, fold, torch.ones(len(fold), device=device)).unsqueeze(1)
+
+			def moved(table, fresh):
+				total = torch.zeros(c.SUBTYPE_ROWS, table.shape[1], device=device).index_add_(0, fold, table[live].float())
+				return torch.where(count > 0, total / count.clamp(min=1), fresh.to(device).float()).to(table.dtype)
+
+		state["model"][name] = moved(old, own[name])
+		if moments is not None:
+			for key in ("exp_avg", "exp_avg_sq"):
+				moments[key] = moved(moments[key], torch.zeros_like(own[name]))
+	return names
+
+
 def load_optimizer(optimizer, model, saved, saved_keys):
 	"""The optimizer's state from a checkpoint (saved: its state_dict; saved_keys: its model's state_dict keys). A model
 	that has gained parameters since (schema 7: hire_worth) keeps Adam's moments for the ones it had, matched by name

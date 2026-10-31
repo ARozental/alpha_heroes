@@ -55,7 +55,7 @@ from .foresight import labels_of
 from .labeler import Labeler
 from .model import build_model
 from .records import NO_EFFECT, decode_fields, decode_inputs
-from .train import _prefetched, load_optimizer, make_optimizer, model_kwargs, ppo_update, usable
+from .train import _prefetched, load_optimizer, make_optimizer, migrate_subtypes, model_kwargs, ppo_update, usable
 
 TYPES = [a.name.lower() for a in c.ActionType]
 FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answer") for part in ("battle", "score", "parts")) + ("foresight_hero_alive", "foresight_hero_army", "foresight_turn")
@@ -119,6 +119,8 @@ class CampaignLearner:
 			self.kwargs = state["model_kwargs"]
 			self.model = build_model(self.kwargs).to(device).eval()
 			self.optimizer = make_optimizer(self.model, config)
+			if migrated := migrate_subtypes(state, self.model):
+				print(f"campaign: subtype tables folded to {c.SUBTYPE_ROWS} rows (train.migrate_subtypes): {', '.join(migrated)}", flush=True)
 			self.model.load_state_dict(state["model"])
 			if "optimizer" in state:
 				load_optimizer(self.optimizer, self.model, state["optimizer"], state["model"].keys())
@@ -136,6 +138,7 @@ class CampaignLearner:
 			self.kwargs = state.get("model_kwargs") or self.kwargs
 			self.model = build_model(self.kwargs).to(device).eval()
 			self.optimizer = make_optimizer(self.model, config)
+			migrate_subtypes(state, self.model)
 			self.model.load_state_dict(state["model"])
 			print(f"campaign: starting from {config.init_from}", flush=True)
 		# The features module on the CPU (its priors' corrections are learned: refreshed after each update) for the
@@ -767,6 +770,7 @@ def _update_worker(config, kwargs, device_name, state, requests, results, latest
 	device = torch.device(device_name)
 	model = build_model(kwargs).to(device).eval()
 	optimizer = make_optimizer(model, config)
+	migrate_subtypes(state, model)
 	model.load_state_dict(state["model"])
 	if state.get("optimizer"):
 		optimizer.load_state_dict(state["optimizer"])

@@ -50,9 +50,25 @@ def one_hot(index, n):
 	return (index.unsqueeze(-1) == torch.arange(n, device=index.device)).float()
 
 
+def pair_table():
+	"""[OBJECT_VOCAB + 1, MAX_SUBTYPES + 1] an (object, subtype)'s row (constants.OBJECT_PAIRS), PAIR_OTHER outside it."""
+	table = torch.full((c.OBJECT_VOCAB + 1, c.MAX_SUBTYPES + 1), c.PAIR_OTHER, dtype=torch.long)
+	for (obj, subtype), row in c.OBJECT_PAIRS.items():
+		if obj < c.OBJECT_VOCAB:
+			table[obj, subtype] = row
+	return table
+
+
+def object_pair(table, obj, subtype):
+	"""The rows (pair_table: a module's buffer) of (object, subtype) id pairs."""
+	obj = torch.where((obj >= 0) & (obj < c.OBJECT_VOCAB), obj, torch.full_like(obj, c.OBJECT_VOCAB))
+	subtype = torch.where((subtype >= 0) & (subtype < c.MAX_SUBTYPES), subtype, torch.full_like(subtype, c.MAX_SUBTYPES))
+	return table[obj, subtype]
+
+
 def bucket(kind, value, subtype):
 	"""A hashed embedding row for (kind, value, subtype) id triples."""
-	return torch.remainder((kind + 1) * 7919 + (value + 1) * 131 + subtype.clamp(min=0) * 7, c.SUBTYPE_BUCKETS)
+	return torch.remainder(torch.remainder((kind + 1) * 7919 + (value + 1) * 131 + subtype.clamp(min=0) * 7, c.SUBTYPE_HASH), c.SUBTYPE_BUCKETS)
 
 
 def bounded(raw, low, high, start, step):

@@ -240,7 +240,8 @@ class CustomFeatures(nn.Module):
 		self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
-		self.object_subtype_delta = nn.Embedding(c.SUBTYPE_BUCKETS, 1)
+		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
+		self.register_buffer("pairs", ft.pair_table(), persistent=False)
 		for table in (self.object_type_gain, self.object_type_delta, self.object_subtype_delta):
 			nn.init.zeros_(table.weight)
 
@@ -331,7 +332,7 @@ class CustomFeatures(nn.Module):
 		if town_value is not None:
 			score = torch.where(obj == ft.OBJ_TOWN, town_value, score)
 		gain = self.gain(self.object_gain + self.object_type_gain(index).squeeze(-1))
-		raw_delta = self.object_type_delta(index).squeeze(-1) + self.object_subtype_delta(ft.bucket(obj, obj, subtype)).squeeze(-1)
+		raw_delta = self.object_type_delta(index).squeeze(-1) + self.object_subtype_delta(ft.object_pair(self.pairs, obj, subtype)).squeeze(-1)
 		return score * gain + ft.bounded(raw_delta, -5000.0, 5000.0, 0.0, CORRECTION_STEP)
 
 	def bank_guards(self, obj, subtype):
@@ -594,7 +595,7 @@ class MapEncoder(nn.Module):
 		super().__init__()
 		emb = small_embedding
 		self.object = emb(c.OBJECT_VOCAB + 1, object_dim)
-		self.subtype = emb(c.SUBTYPE_BUCKETS, object_dim)
+		self.subtype = emb(c.SUBTYPE_ROWS, object_dim)
 		self.owner = emb(c.OWNER_VOCAB + 1, object_dim)
 		self.creature = emb(c.CREATURE_VOCAB + 1, object_dim)
 		self.object_in = nn.Linear(OBJECT_FEATURES, object_dim)
@@ -753,7 +754,7 @@ class CampaignModel(nn.Module):
 		self.owner = emb(c.OWNER_VOCAB + 1, d)
 		self.kind = emb(c.N_KINDS + 1, d)
 		self.object = emb(c.OBJECT_VOCAB + 1, d)
-		self.subtype = emb(c.SUBTYPE_BUCKETS, d)
+		self.subtype = emb(c.SUBTYPE_ROWS, d)
 		self.sound = emb(c.SOUND_VOCAB + 1, d)
 		self.option_kind = emb(len(c.OptionKind) + 1, d)
 		self.global_in = nn.Linear(GLOBAL_FEATURES, d)
@@ -779,7 +780,7 @@ class CampaignModel(nn.Module):
 		self.cell_terrain = emb(c.TERRAIN_VOCAB + 1, dc)
 		self.cell_road = emb(c.ROAD_VOCAB + 1, dc)
 		self.cell_object = emb(c.OBJECT_VOCAB + 1, dc)
-		self.cell_subtype = emb(c.SUBTYPE_BUCKETS, dc)
+		self.cell_subtype = emb(c.SUBTYPE_ROWS, dc)
 		self.cell_owner = emb(c.OWNER_VOCAB + 1, dc)
 		self.cell_creature = emb(c.CREATURE_VOCAB + 1, dc)
 		self.cell_in = nn.Linear(CELL_FEATURES, dc)

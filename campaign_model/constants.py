@@ -215,7 +215,38 @@ HERO_CLASS_VOCAB = 32
 ARTIFACT_VOCAB = 160  # 0..143
 FACTION_VOCAB = 16
 OBJECT_VOCAB = 256  # Obj ids 0..231
-SUBTYPE_BUCKETS = 8191  # (object, subtype) pairs, hashed (1021 shared rows among ~800 pairs: 2026-10-28 review)
+# (object, subtype) pairs, hashed into SUBTYPE_HASH and folded to SUBTYPE_BUCKETS rows (features.bucket); one more row,
+# BLOCKED_SUBTYPE, for a tile blocked and not visitable (encoders.TileEncoder). 8191 rows each until 2026-10-31: ~800
+# pairs reached them, an obstacle's graphic variants among them, and 1.1M of the model's 2.2M weights were rows no
+# gradient ever reached (the user: "wasting 1M+ parameters for something we will not see ... is insane")
+SUBTYPE_HASH = 8191
+SUBTYPE_BUCKETS = 1021
+BLOCKED_SUBTYPE = SUBTYPE_BUCKETS
+SUBTYPE_ROWS = SUBTYPE_BUCKETS + 1
+
+
+def _object_pairs():
+	"""{(object id, subtype): its dense row}: every map object's subtypes in the engine's catalogue
+	(priors/object_subtypes.csv), in order."""
+	from pathlib import Path
+
+	pairs = {}
+	for line in (Path(__file__).resolve().parent / "priors" / "object_subtypes.csv").read_text().splitlines():
+		if line and not line.startswith(("#", "object,")):
+			obj, count = line.split(",")[:2]
+			for subtype in range(int(count)):
+				pairs[(int(obj), subtype)] = len(pairs)
+	return pairs
+
+
+# The map objects' (object, subtype) pairs, a row each (features.object_pair; 2026-10-31: the tiles' and the question's
+# object, and the empire value's correction, were hashed into 8191 rows): 733 in the engine's catalogue, then a row for a
+# pair outside it (or no object) and one for a tile blocked and not visitable (encoders.TileEncoder)
+OBJECT_PAIRS = _object_pairs()
+MAX_SUBTYPES = max(subtype for _, subtype in OBJECT_PAIRS) + 1
+PAIR_OTHER = len(OBJECT_PAIRS)
+PAIR_BLOCKED = PAIR_OTHER + 1
+PAIR_ROWS = PAIR_OTHER + 2
 TERRAIN_VOCAB = 16  # 0..9
 ROAD_VOCAB = 8  # 0..3
 COMPONENT_VOCAB = 32  # ComponentType

@@ -215,21 +215,33 @@ class TileEncoder(nn.Module):
 		self.terrain = small_embedding(c.TERRAIN_VOCAB + 1, dim)
 		self.road = small_embedding(c.ROAD_VOCAB + 1, dim)
 		self.object = small_embedding(c.OBJECT_VOCAB + 1, dim)
-		self.subtype = small_embedding(c.SUBTYPE_BUCKETS, dim)
+		self.subtype = small_embedding(c.PAIR_ROWS, dim)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
 		self.creature = small_embedding(c.CREATURE_VOCAB + 1, dim)
 		self.quantity = small_embedding(QUANTITY_IDS + 1, dim)
 		self.token = Tokenizer(c.N_TILE_FLAGS + AMOUNT_FEATURES, dim)
+		from .features import pair_table
+
+		self.register_buffer("pairs", pair_table(), persistent=False)
+		# The object ids of a class (constants.OBJECT_CLASSES): a blocked tile of one is part of it (a town's walls)
+		classed = torch.zeros(c.OBJECT_VOCAB + 1, dtype=torch.bool)
+		classed[[i for ids in c.OBJECT_CLASSES.values() for i in ids if i < c.OBJECT_VOCAB]] = True
+		self.register_buffer("classed", classed, persistent=False)
 
 	def forward(self, x):
-		from .features import bit, bucket
+		from .features import bit, object_pair
 
 		obj, flags = x["tile_object"], x["tile_flags"]
+		# A tile blocked and not visitable says so and nothing more (the user, 2026-10-31): an obstacle is no object, its
+		# graphic variant (subtype) no input; the blocked tiles of an object of a class keep the object, as part of it
+		blocked = bit(flags, c.TILE_BLOCKED) & ~bit(flags, c.TILE_VISITABLE)
+		obj = torch.where(blocked & ~self.classed[vocab_index(obj, c.OBJECT_VOCAB)], torch.full_like(obj, -1), obj)
+		subtype = torch.where(blocked, torch.full_like(obj, c.PAIR_BLOCKED), object_pair(self.pairs, obj, x["tile_subtype"]))
 		exact = bit(flags, c.TILE_EXACT_COUNT)
 		numbers, quantity = counts_seen(x["tile_count"], exact)
 		creature = x["tile_creature"]
 		embedded = (
 			self.terrain(vocab_index(x["tile_terrain"], c.TERRAIN_VOCAB)) + self.road(vocab_index(x["tile_road"], c.ROAD_VOCAB))
-			+ self.object(vocab_index(obj, c.OBJECT_VOCAB)) + self.subtype(bucket(obj, obj, x["tile_subtype"]))
+			+ self.object(vocab_index(obj, c.OBJECT_VOCAB)) + self.subtype(subtype)
 			+ (self.creature(vocab_index(creature, c.CREATURE_VOCAB)) + self.quantity(vocab_index(quantity, QUANTITY_IDS))) * (creature >= 0).unsqueeze(-1)
 		)
 		return self.token(embedded, torch.cat([bits(flags, c.N_TILE_FLAGS), numbers * (creature >= 0).unsqueeze(-1)], dim=-1)) * bit(flags, c.TILE_ON_MAP).unsqueeze(-1)
@@ -246,16 +258,19 @@ class GlobalEncoder(nn.Module):
 		self.kind = small_embedding(c.N_KINDS + 1, dim)
 		self.last = small_embedding(c.N_ACTION_TYPES + 1, dim)
 		self.object = small_embedding(c.OBJECT_VOCAB + 1, dim)
-		self.subtype = small_embedding(c.SUBTYPE_BUCKETS, dim)
+		self.subtype = small_embedding(c.PAIR_ROWS, dim)  # (the question's object, subtype: constants.OBJECT_PAIRS)
 		self.creature = small_embedding(c.CREATURE_VOCAB + 1, dim)
 		self.quantity = small_embedding(QUANTITY_IDS + 1, dim)
 		self.sound = small_embedding(c.SOUND_VOCAB + 1, dim)
+		from .features import pair_table
+
+		self.register_buffer("pairs", pair_table(), persistent=False)
 		self.owned = ArmyEncoder(dim)
 		self.dwellings = ArmyEncoder(dim)
 		self.token = Tokenizer(self.NUMBERS, dim)
 
 	def forward(self, x):
-		from .features import bucket
+		from .features import object_pair
 
 		day = x["g_day"].clamp(min=1)
 		week = torch.div(day - 1, 7, rounding_mode="floor") + 1
@@ -267,7 +282,7 @@ class GlobalEncoder(nn.Module):
 		creature = x["d_creature"]
 		embedded = (
 			self.kind(vocab_index(x["g_kind"], c.N_KINDS)) + self.last(vocab_index(x["g_last_type"], c.N_ACTION_TYPES)) + owned + dwellings
-			+ self.object(vocab_index(x["d_object"], c.OBJECT_VOCAB)) + self.subtype(bucket(x["d_object"], x["d_object"], x["d_subtype"]))
+			+ self.object(vocab_index(x["d_object"], c.OBJECT_VOCAB)) + self.subtype(object_pair(self.pairs, x["d_object"], x["d_subtype"]))
 			+ (self.creature(vocab_index(creature, c.CREATURE_VOCAB)) + self.quantity(vocab_index(quantity, QUANTITY_IDS))) * (creature >= 0).unsqueeze(-1)
 			+ self.sound(vocab_index(x["d_sound"], c.SOUND_VOCAB))
 		)
@@ -292,7 +307,7 @@ class OptionEncoder(nn.Module):
 	def __init__(self, dim):
 		super().__init__()
 		self.kind = small_embedding(len(c.OptionKind) + 1, dim)
-		self.subtype = small_embedding(c.SUBTYPE_BUCKETS, dim)
+		self.subtype = small_embedding(c.SUBTYPE_ROWS, dim)
 		self.token = Tokenizer(AMOUNT_FEATURES + 8 + 1, dim)
 
 	def forward(self, x):

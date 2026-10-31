@@ -1,0 +1,173 @@
+# Every map object type's subtype count, from the engine (battle_model/artifacts/vocab.json, object_types):
+# a dense row for each (object, subtype) pair in the model's object embeddings (constants.OBJECT_PAIRS)
+object,subtypes,name,handler
+0,1,"Nothing",generic
+2,1,"Altar of Sacrifice",market
+4,1,"Arena",configurable
+5,144,"Artifact",artifact
+6,1,"Pandora's Box",pandora
+7,1,"Black Market",market
+8,3,"Boat",boat
+9,8,"Border Guard",borderGuard
+10,8,"Keymaster's Tent",keymaster
+11,1,"Buoy",configurable
+12,1,"Campfire",configurable
+13,3,"Cartographer",configurable
+14,1,"Swan Pond",configurable
+15,1,"Cover of Darkness",configurable
+16,7,"Cyclops Stockpile",configurable
+17,80,"Basilisk Pit",dwelling
+20,2,"Elemental Conflux",dwelling
+21,1,"Cursed Ground",terrain
+22,1,"Corpse",configurable
+23,1,"Marletto Tower",configurable
+24,1,"Derelict Ship",configurable
+25,1,"Dragon Utopia",configurable
+26,1,"Event",event
+27,1,"Eye of the Magi",magi
+28,1,"Faerie Ring",configurable
+29,1,"Flotsam",configurable
+30,1,"Fountain of Fortune",configurable
+31,1,"Fountain of Youth",configurable
+32,1,"Garden of Revelation",configurable
+33,2,"Garrison",garrison
+34,18,"Knight",hero
+35,1,"Hill Fort",hillFort
+36,1,"Grail",generic
+37,1,"Hut of the Magi",magi
+38,1,"Idol of Fortune",configurable
+39,1,"Lean To",configurable
+41,1,"Library of Enlightenment",configurable
+42,1,"Lighthouse",flaggable
+43,8,"Monolith One Way Entrance",monolith
+44,8,"Monolith One Way Exit",monolith
+45,100,"Monolith Two Way",monolith
+46,1,"Magic Plains",terrain
+47,1,"School of Magic",configurable
+48,1,"Magic Spring",configurable
+49,1,"Magic Well",configurable
+50,1,"Market of Time",generic
+51,1,"Mercenary Camp",configurable
+52,1,"Mermaids",configurable
+53,8,"Mine",mine
+54,141,"Pikemen",monster
+55,1,"Mystical Garden",configurable
+56,1,"Oasis",configurable
+57,1,"Obelisk",obelisk
+58,1,"Redwood Observatory",configurable
+59,1,"Ocean Bottle",sign
+60,1,"Pillar of Fire",configurable
+61,1,"Star Axis",configurable
+62,1,"Prison",prison
+63,1,"Pyramid",configurable
+64,1,"Rally Flag",configurable
+65,1,"Random Artifact",randomArtifact
+66,1,"Random Treasure Artifact",randomArtifact
+67,1,"Random Minor Artifact",randomArtifact
+68,1,"Random Major Artifact",randomArtifact
+69,1,"Random Relic",randomArtifact
+70,1,"Random Hero",randomHero
+71,1,"Random Monster",randomMonster
+72,1,"Random Monster 1",randomMonster
+73,1,"Random Monster 2",randomMonster
+74,1,"Random Monster 3",randomMonster
+75,1,"Random Monster 4",randomMonster
+76,1,"Random Resource",randomResource
+77,1,"Random Town",randomTown
+78,1,"Refugee Camp",dwelling
+79,7,"Wood",resource
+80,1,"Sanctuary",generic
+81,1,"Scholar",configurable
+82,1,"Sea Chest",configurable
+83,3,"Seer's Hut",seerHut
+84,1,"Crypt",configurable
+85,1,"Shipwreck",configurable
+86,1,"Shipwreck Survivor",configurable
+87,1,"Shipyard",shipyard
+88,1,"Shrine of Magic Incantation",configurable
+89,1,"Shrine of Magic Gesture",configurable
+90,1,"Shrine of Magic Thought",configurable
+91,1,"Sign",sign
+92,1,"Sirens",siren
+93,1,"Spell Scroll",artifact
+94,1,"Stables",configurable
+95,1,"Tavern",generic
+96,1,"Temple",configurable
+97,1,"Den of Thieves",denOfThieves
+98,9,"Castle",town
+99,1,"Trading Post",market
+100,1,"Learning Stone",configurable
+101,1,"Treasure Chest",configurable
+102,1,"Tree of Knowledge",configurable
+103,1,"Subterranean Gate",subterraneanGate
+104,1,"University",market
+105,1,"Wagon",configurable
+106,1,"War Machine Factory",dwelling
+107,1,"School of War",configurable
+108,1,"Warrior's Tomb",configurable
+109,1,"Water Wheel",configurable
+110,1,"Watering Hole",configurable
+111,1,"Whirlpool",whirlpool
+112,1,"Windmill",configurable
+113,1,"Witch Hut",configurable
+116,1,"Cactus",static
+117,1,"Canyon",static
+118,1,"Crater",static
+119,1,"Dead Vegetation",static
+120,1,"Flowers",static
+121,1,"Frozen Lake",static
+124,1,"Hole",static
+125,1,"Kelp",static
+126,1,"Lake",static
+127,1,"Lava Flow",static
+128,1,"Lava Lake",static
+129,1,"Mushrooms",static
+130,1,"Log",static
+131,1,"Mandrake",static
+132,1,"Moss",static
+133,1,"Mound",static
+134,1,"Mountain",static
+135,1,"Oak Trees",static
+136,1,"Outcropping",static
+137,1,"Pine Trees",static
+143,1,"River Delta",static
+147,1,"Rock",static
+148,1,"Sand Dune",static
+149,1,"Sand Pit",static
+150,1,"Shrub",static
+151,1,"Skull",static
+153,1,"Stump",static
+155,1,"Trees",static
+158,1,"Volcano",static
+161,1,"Reef",static
+162,1,"Random Monster 5",randomMonster
+163,1,"Random Monster 6",randomMonster
+164,1,"Random Monster 7",randomMonster
+177,1,"Lake",static
+199,1,"Trees",static
+206,1,"Desert Hills",static
+207,1,"Dirt Hills",static
+208,1,"Grass Hills",static
+209,1,"Rough Hills",static
+210,1,"Subterranean Rocks",static
+211,1,"Swamp Foliage",static
+212,8,"Border Gate",borderGate
+213,1,"Freelancer's Guild",market
+214,1,"Hero Placeholder",heroPlaceholder
+215,1,"Quest Guard",questGuard
+216,1,"Random Dwelling",randomDwelling
+217,7,"",randomDwelling
+218,9,"",randomDwelling
+219,2,"Garrison",garrison
+220,1,"Mine",mine
+221,1,"Trading Post",market
+222,1,"Clover Field",terrain
+223,1,"Cursed Ground",terrain
+224,1,"Evil Fog",terrain
+225,1,"Favorable Winds",terrain
+226,1,"Fiery Fields",terrain
+227,1,"Holy Ground",terrain
+228,1,"Lucid Pools",terrain
+229,1,"Magic Clouds",terrain
+230,1,"Magic Plains",terrain
+231,1,"Rocklands",terrain
