@@ -73,6 +73,9 @@ def eval_map(seed, players, config):
 	return make_map(seed, players, EVAL_SIZE, config.levels, config.water)[0]
 
 
+STALLED = "killed: no log output"  # (scripts/headless.sh's status for a game silent past its stall limit)
+
+
 def score(game, color, players, days, empire=EmpireConfig()):
 	"""One game's results for our player (color), from the snapshot at the end of `days` or the game's last (a
 	knock-out ends the game for us: the end-of-game snapshot, after the day's)."""
@@ -116,10 +119,19 @@ def evaluate(config, server, battle, version, epoch, stop=None, model="current")
 	def play_one(i, seed, players, color):
 		try:
 			name = eval_map(seed, players, config)
-			game, info = play(
-				server.socket_for(i), name, config.eval_days, seed, max_seconds=config.eval_seconds, battle_ai="BattleAI", game_key=f"e{i}",
-				settings=battle.eval_settings(i) + (("ALPHA_MAP_MODEL", model),), temperature=config.eval_temperature, ours=(color,), stop=stop,
-			)
+			# A game the watchdog ended for silence is played again, then left out: it was scored at the last day it reached
+			# (as a time limit's is), and at a resume the inference was not ready yet: four games killed in their first
+			# minute stood in at day 1-3 (scores 0.28-0.72) and lifted v229's eval from 0.219 to 0.267 (2026-10-31)
+			for attempt in range(2):
+				game, info = play(
+					server.socket_for(i), name, config.eval_days, seed, max_seconds=config.eval_seconds, battle_ai="BattleAI", game_key=f"e{i}",
+					settings=battle.eval_settings(i) + (("ALPHA_MAP_MODEL", model),), temperature=config.eval_temperature, ours=(color,), stop=stop,
+				)
+				if not info.status.startswith(STALLED):
+					break
+				print(f"campaign eval: game {i} {info.status[:60]}" + (": played again" if not attempt else ": left out"), flush=True)
+			if info.status.startswith(STALLED):
+				raise RuntimeError(f"stalled twice ({info.status[:100]})")
 			results[i] = {**score(game, color, players, config.eval_days), "setup": i, "seed": seed, "map": name, "color": color, "temperature": config.eval_temperature, "empire": EMPIRE_VERSION, "seconds_limit": config.eval_seconds, "status": info.status, "seconds": round(info.seconds, 1), "failures": failure_counts(game.decisions)}
 			if info.status.startswith("stopped at day") or "exit code 0" in info.status:
 				shutil.rmtree(info.run_dir, ignore_errors=True)  # (a failed game's logs are kept)
