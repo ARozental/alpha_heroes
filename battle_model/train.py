@@ -1342,14 +1342,15 @@ def train(config, resume=False):
 					order = order[: len(examples) - len(examples) % whole]
 				firsts = list(range(0, len(order), config.batch_size))
 				for g in range(0, len(firsts), group):
-					members, corrupt = firsts[g : g + group], False
+					members, corrupt, kls = firsts[g : g + group], False, []
 					optimizer.zero_grad()
 					for first in members:
 						batch = select(epoch_data, order[first : first + config.batch_size])
 						# The minibatch's actions as the GPU holds them, before any use: on Apple's GPU they were twice garbage
 						# (action types of 30570, 10640) in a heavily swapping run, though valid on the CPU (data.check_record),
-						# and indexing with them stopped the run; such an update is now dropped with a note instead
-						if bool(((batch["action"]["type"] < 0) | (batch["action"]["type"] >= N_ACTION_TYPES)).any()):
+						# and indexing with them stopped the run; such an update is now dropped with a note instead. Apple's GPU
+						# only: the check reads the GPU, a wait for it every minibatch
+						if device.type == "mps" and bool(((batch["action"]["type"] < 0) | (batch["action"]["type"] >= N_ACTION_TYPES)).any()):
 							print(f"update {epoch}: a minibatch's actions are corrupt on the {device} (step {batches}): the rest of this update is dropped", flush=True)
 							corrupt = True
 							break
@@ -1370,13 +1371,7 @@ def train(config, resume=False):
 								parts_sum[key] += parts[key]  # summed on the device: no sync each step
 						batches += 1
 						if config.target_kl:
-							kl = float(kl_of(out_batch, batch))  # before this step: how far the update has moved so far
-							kl_sum += kl
-							recent.append(kl)
-							update_kl = sum(recent) / len(recent)  # the last KL_WINDOW minibatches': one's is noise
-							if update_kl > 1.5 * config.target_kl:
-								stopped = True  # this update has moved the policy far enough (after this step)
-								break
+							kls.append(kl_of(out_batch, batch).detach())  # before this step: how far the update has moved so far
 					if corrupt:
 						optimizer.zero_grad()
 						stopped = True
@@ -1384,6 +1379,12 @@ def train(config, resume=False):
 					torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 					optimizer.step()
 					steps += 1
+					# The KL control once a step, one read of the GPU (a float() of each minibatch's waited for it every minibatch)
+					for kl in torch.stack(kls).tolist() if kls else ():
+						kl_sum += kl
+						recent.append(kl)
+						update_kl = sum(recent) / len(recent)  # the last KL_WINDOW minibatches': one's is noise
+						stopped = stopped or update_kl > 1.5 * config.target_kl  # this update has moved the policy far enough
 					if stopped:
 						break
 			model.eval()
