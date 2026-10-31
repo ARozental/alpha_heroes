@@ -84,6 +84,9 @@ def campaign_model_kwargs(config, out, resume=False):
 	return model_kwargs(config)
 
 
+AI_ERRORS_MIN, AI_ERRORS_SHARE = 3, 0.25  # a game with a player's AI failing this often (and a quarter of its days) is left out (_game_done)
+
+
 class CampaignLearner:
 	def __init__(self, config, out, device, battle, resume=False, server=None):
 		"""out: the run's folder; battle: the battle learner's actors (actors.ActorPool: the evaluation's battle settings);
@@ -241,6 +244,17 @@ class CampaignLearner:
 		"""A finished game (one of this machine's, or a worker's: supply.Supply) for the next updates; its labels start now
 		(labeler.py), with the features as they are."""
 		self._log_game(key, map_name, players, game, info)
+		# A game whose AI failed its turns is left out: with the Mac's inference servers down (2026-10-31 13:09-13:20),
+		# 4,312 games ran to their day caps with ~8 decisions each, one error a player and day, and an update trained on
+		# them as finished games. A good game reports none
+		errors = max((summary.get("errors", 0) for summary in game.done.values()), default=0)
+		days = max(game.ledgers) if game.ledgers else 0
+		if errors >= max(AI_ERRORS_MIN, AI_ERRORS_SHARE * days):
+			with self.lock:
+				self.stats["ai_failed_games"] = left = self.stats.get("ai_failed_games", 0) + 1
+			if left == 1 or left % 100 == 0:
+				print(f"campaign: FAILURE: game {key} left out, its AI failed {errors} times in {days} days (the inference unreachable?); {left} such games so far", flush=True)
+			return
 		if getattr(self, "labeler", None):
 			game.labels_version = self.version
 			self.label_futures[id(game)] = self.labeler.submit(game, self.features_cpu)  # (not on the game: it is pickled to the labeler after this returns)
