@@ -277,7 +277,7 @@ def ppo_update(
 	advantages (labels.blend_credit) before they are normalized. decode(rows) gives the inputs of those decisions
 	(default: decode_inputs). Returns (metrics, the KL control's new lr_scale)."""
 	n, started = len(decisions), time.time()
-	clock = {"prepass": 0.0, "wait": 0.0, "steps": 0.0, "cpu": time.thread_time()}  # where the update's time goes (logged: the PC's step ran at half the GPU's pace, 2026-10-30)
+	clock = {"prepass": 0.0, "wait": 0.0, "steps": 0.0, "forward": 0.0, "losses": 0.0, "backward": 0.0, "optimizer": 0.0, "cpu": time.thread_time()}  # where the update's time goes (logged: the PC's step ran at half the GPU's pace, 2026-10-30)
 	# The foresight's labels (foresight.game_labels, v2), each decision's row: its loss joins the minibatch's, a share
 	# per micro-batch as the others'; the shared layers' gradient from it against the PPO losses', on the first one
 	from .foresight import ForesightConfig, foresight_loss, gradient_check
@@ -425,15 +425,21 @@ def ppo_update(
 					if check[1] is not None:
 						checked = gradient_check(model, check[0], share * check[1][0])
 					del check
+				mark = time.perf_counter()
 				out = graphs.train(inputs) if graphs else model(inputs)
+				clock["forward"] += time.perf_counter() - mark
+				mark = time.perf_counter()
 				loss, fs, policy, value, bonus, ratio, logp, entropy = losses(out)
 				if fs is not None:
 					fs_loss, fs_parts = fs
 					loss = loss + share * fs_loss
-					for name, part_value in fs_parts.items():
-						foresight_sums[name] += float(part_value) * share
+					for name, part_value in fs_parts.items():  # (summed on the device: a float() here waited for the GPU every micro-batch)
+						foresight_sums[name] = foresight_sums[name] + part_value.float() * share
 					foresight_sums["steps_seen"] += share
+				clock["losses"] += time.perf_counter() - mark
+				mark = time.perf_counter()
 				loss.backward()
+				clock["backward"] += time.perf_counter() - mark
 				drift = logp.detach() - anchor[sub].nan_to_num(neginf=0.0)
 				parts.append(torch.stack([  # (summed on the device: one sync a step, not six a micro-batch)
 					policy.detach(),
@@ -443,9 +449,11 @@ def ppo_update(
 					(((ratio - 1).abs() > config.clip).float() * keep).sum() / counts["keep"],  # clip_fraction
 					(((drift.exp() - 1) - drift) * keep).sum() / counts["keep"],  # kl: k3, before this step
 				]).float())
+			mark = time.perf_counter()
 			grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 			optimizer.step()
 			stepped = time.perf_counter()
+			clock["optimizer"] += stepped - mark
 			*sums, grad_norm = torch.cat([torch.stack(parts).sum(dim=0), grad_norm.detach().float().reshape(1)]).tolist()  # (a sync: the minibatch's GPU work is done here)
 			clock["steps"] += time.perf_counter() - stepped
 			step = Counter(dict(zip(STEP_PARTS, sums)))
@@ -486,8 +494,13 @@ def ppo_update(
 		prepass_seconds=clock["prepass"],
 		wait_seconds=clock["wait"],  # blocked on the decoded batches
 		sync_seconds=clock["steps"],  # blocked on the GPU at each minibatch's end
+		# The thread's time launching each part of the micro-batches (2026-10-31: the update was CPU-bound, the thread busy ~78%)
+		forward_seconds=clock["forward"],
+		losses_seconds=clock["losses"],
+		backward_seconds=clock["backward"],
+		optimizer_seconds=clock["optimizer"],
 		cpu_share=(time.thread_time() - clock["cpu"]) / max(time.time() - started, 1e-9),  # of the update's time this thread ran on the CPU
-		**{f"foresight_{name}": value / max(foresight_sums["steps_seen"], 1e-9) for name, value in foresight_sums.items() if name != "steps_seen"},
+		**{f"foresight_{name}": float(value) / max(foresight_sums["steps_seen"], 1e-9) for name, value in foresight_sums.items() if name != "steps_seen"},
 		**checked,
 		**{f"value_ev_d{k}": explained_variance(predicted[:, i], actual[:, i]) for i, k in enumerate(c.VALUE_OFFSETS)},
 		**{f"value_parts_d{k}": residual_variances(predicted[:, i], actual[:, i]) for i, k in enumerate(c.VALUE_OFFSETS)},

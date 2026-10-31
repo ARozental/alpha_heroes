@@ -534,13 +534,18 @@ class CampaignLearner:
 			csv.writer(f).writerow([round(row[k], 6) if isinstance(row[k], float) else row[k] for k in COLUMNS])
 		if row["value_loss_fresh"] == row["value_loss_fresh"]:  # the eval tab's (battle_model/train.py VALUE_LOSS_TAB)
 			self.writer.add_scalar("eval/campaign_value_loss", row["value_loss_fresh"], self.version)
-		for name in ("value_corr", "value_spread", "label_spread", "gpu_anchor_mb", "update_seconds", "prepass_seconds", "wait_seconds", "sync_seconds", "cpu_share", "stopped_pass"):
+		for name in ("value_corr", "value_spread", "label_spread", "gpu_anchor_mb", "update_seconds", "prepass_seconds", "wait_seconds", "sync_seconds", "cpu_share", "stopped_pass", "forward_seconds", "losses_seconds", "backward_seconds", "optimizer_seconds"):
 			if metrics.get(name, float("nan")) == metrics.get(name, float("nan")):
 				self.writer.add_scalar(f"campaign/{name}", metrics[name], self.version)
 		for kind, gap in sums.get("credit_gaps", {}).items():  # (the credit check's t-statistic per action type)
 			self.writer.add_scalar(f"campaign_credit/{kind.lower()}", gap, self.version)
 		for skill, (picked, offered) in skill_picks(decisions).items():  # (how often each skill is taken when offered)
 			self.writer.add_scalar(f"campaign_skills/{skill}", picked / offered, self.version)
+		turns = max(1, sum(1 for d in decisions if d.action_type >= 0))
+		for what, (count, rise) in cast_report(game for game, _ in games).items():  # (each spell's share of the turn decisions, V7's rise after it)
+			self.writer.add_scalar(f"campaign_casts/{what}", count / turns, self.version)
+			if rise == rise:
+				self.writer.add_scalar(f"campaign_casts/{what}_v7_rise", rise, self.version)
 		for key in COLUMNS[2:]:
 			value = row[key]
 			if isinstance(value, (int, float)) and not isinstance(value, bool) and value == value:
@@ -554,7 +559,7 @@ class CampaignLearner:
 			"  value ev " + "/".join(f"{row[f'head_ev_v{k}']:+.2f}" for k in c.VALUE_OFFSETS)
 			+ f" (this update {row[f'value_ev_d{c.VALUE_OFFSETS[-1]}']:+.2f}: corr {metrics.get('value_corr', float('nan')):+.2f}, spread {metrics.get('value_spread', float('nan')):.3f} vs {metrics.get('label_spread', float('nan')):.3f})"
 			+ "  growth ev " + "/".join(f"{row[f'head_ev_g{k}']:+.2f}" for k in c.VALUE_OFFSETS) + f"  end ev {row['head_ev_vend']:+.2f} (credit {row['end_credit']:.2f})"
-			+ f"  kl {row['last_kl']:.4f}  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%})  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
+			+ f"  kl {row['last_kl']:.4f}  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f})  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
 			flush=True,
 		)
 
@@ -631,6 +636,31 @@ def rss_gb():
 			return next(int(line.split()[1]) for line in status if line.startswith("VmRSS:")) / 2**20
 	except (OSError, StopIteration):
 		return float("nan")
+
+
+SPELL_NAMES = ("summon_boat", "scuttle_boat", "visions", "view_earth", "disguise", "view_air", "fly", "water_walk", "dimension_door", "town_portal")
+
+
+def cast_report(games):
+	"""{spell or "move": (decisions, the mean rise of V7 from it to the player's next turn decision that day)} over the
+	games' casts and moves (the recorded heads, as they played). Casting rose from 2% to 10% of joint5's turn decisions
+	while the credit check priced casts above what followed them (campaign_credit/cast ~+4, 2026-10-31): a spell that
+	only shows the map (View Air, View Earth, Visions) and lifts the heads would be credited for nothing."""
+	rises = {}
+	for game in games:
+		ds, latest = game.decisions, {}
+		following = [-1] * len(ds)
+		for i in reversed(range(len(ds))):
+			following[i] = latest.get((ds[i].color, ds[i].day), -1)
+			if ds[i].kind == c.DecisionKind.TURN:
+				latest[(ds[i].color, ds[i].day)] = i
+		for i, d in enumerate(ds):
+			if d.kind != c.DecisionKind.TURN or d.action_type not in (c.ActionType.CAST, c.ActionType.MOVE):
+				continue
+			what = SPELL_NAMES[d.index % c.N_ADVENTURE_SPELLS] if d.action_type == c.ActionType.CAST else "move"
+			j = following[i]
+			rises.setdefault(what, []).append(ds[j].value[-1] - d.value[-1] if j >= 0 else float("nan"))
+	return {what: (len(v), float(np.nanmean(v)) if np.isfinite(v).any() else float("nan")) for what, v in rises.items()}
 
 
 def skill_picks(decisions):
