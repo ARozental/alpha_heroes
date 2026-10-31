@@ -2,7 +2,8 @@
 # The campaign model's full run (2026-10-31), on the PC alone, no time limit:
 #   1. imitation of Nullkiller2 (campaign_model/imitate.py --stream): its games played by workers as they are needed
 #      (nothing written to disk), each decision seen once, the model with memory learning them in order (64 decisions
-#      a chunk, 128 players at once), until the held-out loss (each decision's, before the model trained on it) stops
+#      a chunk, 64 players at once: a chunk's inputs, kept for its backward pass, are ~3.7 GB), until the held-out loss
+#      (each decision's, before the model trained on it) stops
 #      improving or 8 hours pass; again from its checkpoint if this script starts again before the end
 #   2. joint6: self-play RL from that model (campaign_model/joint.py), the credit's share weight 10% + 2% a day,
 #      the teacher's KL (to that model) weighted by our score against Nullkiller2 (dominant while it is much better,
@@ -12,6 +13,8 @@
 # Stop:  systemctl --user stop alpha-full (the phase running stops as SIGINT stops it)
 cd "$HOME/projects/alpha_heroes"
 export MALLOC_ARENA_MAX=2
+# The memory guard: the unit stopped (as systemctl stop does) once WSL's available memory falls under 1.5 GB
+runtime/memwatch.sh alpha-full > /dev/null 2>&1 &
 child=
 # (TERM, not INT: bash starts a background job with SIGINT ignored; both Python programs stop on TERM as on INT)
 trap '[ -n "$child" ] && kill -TERM "$child" && wait "$child"; exit 0' INT TERM
@@ -20,7 +23,7 @@ mkdir -p "$BC" runtime/train
 if [ ! -f "$BC/done" ]; then
 	init=""
 	[ -f "$BC/bc_latest.pt" ] && init="--init $BC/bc_latest.pt"
-	.venv/bin/python -m campaign_model.imitate --stream 12 --data none --out "$BC" $init --variants 128x2 --lanes 128 --steps 64 \
+	.venv/bin/python -m campaign_model.imitate --stream 10 --data none --out "$BC" $init --variants 128x2 --lanes 64 --steps 64 \
 		--eval-every 25 --until-plateau 0.005 --plateau-periods 5 --minutes 480 --decode-threads 8 >> runtime/teacher/bc_final.log 2>&1 &
 	child=$!
 	wait "$child"

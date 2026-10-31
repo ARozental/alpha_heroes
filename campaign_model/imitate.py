@@ -37,7 +37,7 @@ from . import constants as c
 from .config import CampaignConfig
 from .model import build_model
 from .labels import GROWTH_CAP, PHI_FLOOR, growth_labels, label, share_change_labels
-from .records import TEACHER, decision_name, decode_inputs
+from .records import TEACHER, decision_name, decode_inputs, decode_wire, inputs_on_device
 from .schema import HEADS
 from .train import _prefetched, chosen_logp, head_loss, migrate_subtypes, model_kwargs
 
@@ -384,9 +384,10 @@ def main():
 	def step(model, inputs, memory, choice, shares, growth, valid):
 		"""One decision of each lane: (its loss summed over the valid lanes, the memory it leaves, each lane's logp of the
 		teacher's choice and of the model's most likely one, without gradients)."""
-		# (the inputs come on the CPU and go to the device here: the checkpoint keeps a chunk's steps' inputs to recompute
-		# them, ~0.9 MB a decision, which on the GPU was 7 GB at 128 lanes x 64 steps)
-		out = model({**{k: v.to(device, non_blocking=True) for k, v in inputs.items()}, "mem_float": memory})
+		# (the inputs come as their wire bytes on the CPU, ~0.9 MB a decision, and are made tensors on the device here: the
+		# checkpoint keeps a chunk's steps' inputs to recompute them; decoded on the CPU they were ~1.7 MB a decision, 14 GB
+		# a chunk at 128 lanes x 64 steps, which took the PC's memory to 0, 2026-10-31)
+		out = model({**inputs_on_device(inputs["wire"].to(device, non_blocking=True)), "mem_float": memory})
 		logp, _ = chosen_logp(out, choice)
 		loss = -(logp * valid).sum()
 		if args.value_weight > 0:
@@ -412,7 +413,7 @@ def train_loop(args, models, memories, pool, train_streams, total, history, eval
 		pending = {name: [] for name in models}  # the chunk's steps: (loss, valid count)
 		running = {name: [] for name in models}
 		schedule = chunks(pool.take if pool is not None else ordered(train_streams, random.Random(args.seed + epoch)), args.lanes, args.steps)
-		for (t, chosen, valid, shares, growth, fresh), inputs in _prefetched(step_batches(schedule), lambda batch: decode_inputs(batch[1]), torch.device("cpu"), threads=args.decode_threads):
+		for (t, chosen, valid, shares, growth, fresh), inputs in _prefetched(step_batches(schedule), lambda batch: decode_wire(batch[1]), torch.device("cpu"), threads=args.decode_threads):
 			valid_t = torch.from_numpy(valid).to(device).float()
 			rows = np.flatnonzero(valid)
 			choice = choice_tensors(chosen, device)
