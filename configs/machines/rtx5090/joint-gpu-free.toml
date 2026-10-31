@@ -31,8 +31,10 @@ buffer_decisions = 8000
 # 4 since 2026-10-31: the campaign model is the one to train most (the user), the battle model's updates fewer and larger
 generated_actors = 4
 # The battle model's steps (the user, 2026-10-31): its eval flat at ~+0.09 for ~1,100 updates of 256-decision steps,
-# signal_ratio ~0.12 (mostly noise); each step now averages ~3,072 decisions (12 minibatches accumulated), at 1e-5, 3 passes
-learning_rate = 1e-5
+# signal_ratio ~0.12 (mostly noise); each step averages ~3,072 decisions (12 minibatches accumulated), 3 passes. At 1e-5
+# it hardly moved (300 updates: weight change 7e-3 an update against 8e-2, KL 2e-5 against 3e-3, signal 0.22 against
+# 0.11): 1e-4, the cap, for the large batch (the square root of 12 from 3e-5 at 256), an update KL near 1e-3 the aim
+learning_rate = 1e-4
 # The trainer's matmuls as TF32 (2026-10-31; full fp32 before): campaign updates were 86-111 s a ~35k-decision update
 tf32 = true
 accumulate = 12
@@ -61,8 +63,12 @@ inference_device = "cuda"
 inference_processes = 1
 # 128 decisions a micro-batch: ~10.7 GB of the GPU. 256 (micro_batches 2) filled the card's 32 GB (an 18 GB peak of live
 # tensors plus the allocator's reserve and the graphs' pools) and the step was 1.5x slower a decision (2026-10-31 01:45)
-batch_size = 512
-micro_batches = 4
+# 4,096 decisions a step (32 micro-batches of 128 accumulated: the same recorded step and GPU work a decision), 16 steps an
+# update of ~33k over 2 passes; was 512 (128 steps): the steps' signal ratio was ~0.11, as the battle model's noisy one,
+# and 128 steps on the same ~20-28 games fit their luck (the user, 2026-10-31: the campaign's examples are noisier and
+# more dependent than the battles'); aims: a signal ratio of 0.25+, an update KL of ~0.002-0.005
+batch_size = 4096
+micro_batches = 32
 prepass_batch = 256
 # The campaign training graphs (graphs.py): the real update was launch-bound in eager mode (the trainer's thread on the
 # CPU 64% of the update, the GPU done before the next kernel came; the 146 ms benchmark used sparse synthetic states).
