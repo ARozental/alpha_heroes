@@ -328,6 +328,73 @@ def signal_ratio(optimizer):
 	return float(torch.cat(ratios).median()) if ratios else float("nan")
 
 
+NOISE_PHASES = (("days 1-14", 1, 14), ("days 15-35", 15, 35), ("days 36+", 36, 10**6))  # loss_noise's, by the decisions' day
+
+
+def loss_noise(model, decisions, decode, convert, device, t, config, rows=128, samples=12):
+	"""The gradient noise scale of each loss term, by the decisions' day: tr(cov) / |mean|^2 of the term's gradient over
+	`samples` micro-batches of `rows` decisions (McCandlish et al. 2018's B_simple; |mean|^2 less its bias, tr(cov) / samples),
+	times rows: the batch, in decisions, at which the term's gradient noise equals its signal; inf where no signal shows.
+	The user's question (2026-10-31): our empire value's growth against our share of all, early and late. Terms:
+	  policy         the clipped surrogate with the update's advantage (the credit the policy follows)
+	  policy_share   the same with the 7-day share's Monte Carlo advantage: our share at the end of day d + 7 - V7
+	  policy_growth  the same with our value's 7-day growth's: its log growth (the growth heads' 0..1 scale) - G7
+	  value_share, value_growth, value_end   the value heads' losses
+	t: the update's tensors (choice, advantage, credited, unsound, targets, share_valid; growth, growth_valid; end, end_valid;
+	labels: the real shares; growth_real: the real log values). The weights are left as they were (torch.autograd.grad)."""
+	params = [p for p in model.parameters() if p.requires_grad]
+	day = np.array([d.day for d in decisions])
+	result = {}
+	for phase, first, last in NOISE_PHASES:
+		pool = np.nonzero((day >= first) & (day <= last))[0]
+		if len(pool) < 2 * rows:
+			continue
+		rng = np.random.default_rng(len(pool))
+		sums, squares, n = {}, {}, 0
+		for _ in range(samples):
+			chunk = np.sort(rng.choice(pool, rows, replace=False))
+			raw = decode(chunk)
+			inputs = {name: torch.from_numpy(value).to(device) for name, value in raw.items()} if isinstance(raw, dict) else convert(torch.from_numpy(raw).to(device))
+			sub = torch.from_numpy(chunk).to(device)
+			keep = (~t["unsound"][sub]).float()
+			out = model(inputs)
+			old = t["choice"]["old_logp"][sub]
+			logp, _ = chosen_logp(out, {k: t["choice"][k][sub] for k in ("kind", "action", "index", "cell")})
+			ratio = (torch.where(keep > 0, logp, old) - old).exp()
+
+			def surrogate(a, valid):
+				w = keep * valid
+				return -(torch.minimum(ratio * a, ratio.clamp(1 - config.clip, 1 + config.clip) * a) * w).sum() / w.sum().clamp(min=1)
+
+			now = out["phi"].detach().float().clamp(min=PHI_FLOOR).log()
+			share7, real7 = t["labels"][sub, -1], t["growth_real"][sub, -1]
+			grown7 = ((real7 - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
+			terms = {
+				"policy": surrogate(t["advantage"][sub], t["credited"][sub]),
+				"policy_share": surrogate((share7 - torch.sigmoid(out["value_logit"][:, -1].float()).detach()).nan_to_num(0.0), torch.isfinite(share7).float()),
+				"policy_growth": surrogate((grown7 - torch.sigmoid(out["growth_logit"][:, -1].float()).detach()).nan_to_num(0.0), torch.isfinite(real7).float()),
+				"value_share": head_loss(out["value_logit"], t["targets"][sub], t["share_valid"][sub]).sum(),
+			}
+			if "growth" in t:
+				scaled = ((t["growth"][sub] - now.unsqueeze(-1)).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
+				terms["value_growth"] = head_loss(out["growth_logit"], scaled, t["growth_valid"][sub]).sum()
+			if "end" in t:
+				terms["value_end"] = head_loss(out["end_logit"].unsqueeze(-1), t["end"][sub].unsqueeze(-1), t["end_valid"][sub].unsqueeze(-1)).sum()
+			for name, term in terms.items():
+				grads = torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)
+				flat = torch.cat([(g if g is not None else torch.zeros_like(p)).flatten().float() for g, p in zip(grads, params)])
+				sums[name] = flat if name not in sums else sums[name] + flat
+				squares[name] = flat * flat if name not in squares else squares[name] + flat * flat
+			n += 1
+			del out, terms, logp, ratio
+		for name in sums:
+			mean = sums[name] / n
+			trace = float(((squares[name] / n - mean * mean).sum()) * n / (n - 1))
+			signal = float((mean * mean).sum()) - trace / n
+			result[f"{name} {phase}"] = trace / signal * rows if signal > 0 else float("inf")
+	return result
+
+
 def micro_loss(out, batch, config, foresight_config=None):
 	"""A micro-batch's loss and metrics from the model's outputs and its rows, for the eager step and the recorded one
 	alike (graphs.StepGraph): (loss, the rest of STEP_PARTS [6], the foresight's parts [len(PART_NAMES)] or None, the
@@ -377,7 +444,7 @@ def micro_loss(out, batch, config, foresight_config=None):
 
 def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
-	growth=None, labels=None, end=None, foresight=None,
+	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False,
 ):
 	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
 	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
@@ -486,6 +553,16 @@ def ppo_update(
 	advantage = torch.where(credited, advantage, torch.zeros_like(advantage))
 	unsound = ~torch.isfinite(anchor)  # a choice the model calls impossible now (its legality changed): left out
 	credited_f, anchor_safe, shares = credited.float(), anchor.nan_to_num(neginf=0.0), {}
+	noise = {}
+	if measure_noise and growth_real is not None and labels is not None:  # (the loss terms' gradient noise, at the update's start)
+		tensors = {"choice": choice, "advantage": advantage, "credited": credited_f, "unsound": unsound, "targets": targets_t, "share_valid": share_valid,
+			"labels": torch.from_numpy(np.asarray(labels, dtype=np.float32)).to(device), "growth_real": torch.from_numpy(np.asarray(growth_real, dtype=np.float32)).to(device)}
+		if growth is not None:
+			tensors.update(growth=growth_t, growth_valid=growth_valid)
+		if end is not None:
+			tensors.update(end=end_t, end_valid=end_valid)
+		model.train()
+		noise = loss_noise(model, decisions, decode, convert, device, tensors, config)
 	totals, steps, stopped, update_kl, recent = Counter(), 0, False, 0.0, deque(maxlen=KL_WINDOW)
 	stopped_pass = 0  # the pass the KL control ended (0: none; b1, 2026-10-31: with passes=2, a second pass mostly cut short adds nothing)
 	model.train()
@@ -593,6 +670,7 @@ def ppo_update(
 		steps=steps,
 		stopped=stopped,
 		stopped_pass=stopped_pass,
+		noise=noise,  # (loss_noise's, when measured)
 		signal_ratio=signal_ratio(optimizer),  # (the steps' noise: the user's 2026-10-31 aim of 0.25+, with 4,096-decision steps)
 		end_step_error=end_step_error,
 		last_kl=update_kl,

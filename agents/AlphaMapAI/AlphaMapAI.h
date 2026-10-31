@@ -89,6 +89,12 @@ class AlphaMapAI : public CAdventureAI
 	std::shared_ptr<CCallback> cb;
 	std::unique_ptr<AsyncRunner> asyncTasks;
 	std::unique_ptr<InferenceClient> inference;
+	std::string inferenceSocket;
+	/// ALPHA_MAP_REQUIRE_MODEL (training and evals): a game the model cannot play is ended, not played on with every turn
+	/// ended unasked (2026-10-31: whenever the inference servers were down, thousands of such games reached their day caps
+	/// with no decision and were taken as finished). The servers are waited for a minute first, then the process aborts
+	bool requireModel = false;
+	void connectInference(bool waiting);
 	std::mutex inferenceMutex;
 	std::string modelName = "current";
 	std::string recordSocket;

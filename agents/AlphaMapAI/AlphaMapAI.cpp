@@ -2,6 +2,8 @@
 #include "AlphaMapAI.h"
 
 #include "InferenceClient.h"
+#include <chrono>
+#include <thread>
 #include "Ledger.h"
 
 #include "lib/AsyncRunner.h"
@@ -135,18 +137,9 @@ void AlphaMapAI::initGameInterface(std::shared_ptr<Environment> environment, std
 	dayCap = std::stoi(::env("ALPHA_MAP_DAYS", "0"));
 	temperature = std::stod(::env("ALPHA_MAP_TEMPERATURE", "1"));
 	rng.seed(std::stoull(::env("ALPHA_MAP_SEED_" + color, std::to_string(std::random_device()()))));
-	const auto socketPath = ::env("ALPHA_MAP_INFERENCE_SOCKET");
-	try
-	{
-		if(socketPath.empty())
-			throw std::runtime_error("ALPHA_MAP_INFERENCE_SOCKET is not set");
-		inference = std::make_unique<InferenceClient>(socketPath, FAMILY, CONTRACT_HASH);
-	}
-	catch(const std::exception & e)
-	{
-		logAi->error("AlphaMapAI %s: no model: %s", color, e.what());
-		++errors;
-	}
+	inferenceSocket = ::env("ALPHA_MAP_INFERENCE_SOCKET");
+	requireModel = !::env("ALPHA_MAP_REQUIRE_MODEL", "").empty();
+	connectInference(requireModel);
 	logAi->info("AlphaMapAI %s: model %s, day cap %d", color, modelName, dayCap);
 }
 
@@ -490,19 +483,65 @@ void AlphaMapAI::gameOver(PlayerColor player, const EVictoryLossCheckResult & vi
 
 // ---- the model ----
 
+void AlphaMapAI::connectInference(bool waiting)
+{
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+	while(true)
+	{
+		try
+		{
+			if(inferenceSocket.empty())
+				throw std::runtime_error("ALPHA_MAP_INFERENCE_SOCKET is not set");
+			inference = std::make_unique<InferenceClient>(inferenceSocket, FAMILY, CONTRACT_HASH);
+			return;
+		}
+		catch(const std::exception & e)
+		{
+			if(!waiting)
+			{
+				logAi->error("AlphaMapAI %s: no model: %s", playerID.toString(), e.what());
+				++errors;
+				return;
+			}
+			if(std::chrono::steady_clock::now() > deadline)
+			{
+				logAi->error("AlphaMapAI %s: no model for a minute (%s): ALPHA_MAP_REQUIRE_MODEL is set, the game ends here", playerID.toString(), e.what());
+				std::abort();
+			}
+			logAi->warn("AlphaMapAI %s: no model yet (%s): waiting", playerID.toString(), e.what()); // (a log line: the stall watchdog's sign of life)
+			std::this_thread::sleep_for(std::chrono::seconds(2));
+		}
+	}
+}
+
 Choice AlphaMapAI::decide(Decision & decision)
 {
 	Choice choice;
 	try
 	{
-		if(!inference)
-			throw std::runtime_error("no model");
 		const auto inputs = decision.inputs.wire();
 		std::string reply;
 		uint32_t version = 0;
+		for(int attempt = 0;; ++attempt)
 		{
-			std::scoped_lock lock(inferenceMutex);
-			version = inference->request(modelName, 1, inputs, reply);
+			try
+			{
+				if(!inference)
+					throw std::runtime_error("no model");
+				std::scoped_lock lock(inferenceMutex);
+				version = inference->request(modelName, 1, inputs, reply);
+				break;
+			}
+			catch(const std::exception & e)
+			{
+				if(!requireModel)
+					throw;
+				// The server went away (a restart of the run or of a worker): connect again, a minute at most
+				logAi->error("AlphaMapAI %s: no decision (%s): connecting again", playerID.toString(), e.what());
+				std::scoped_lock lock(inferenceMutex);
+				inference.reset();
+				connectInference(true);
+			}
 		}
 		const auto outputs = Outputs::fromWire(reply);
 		choice = sample(decision, outputs);

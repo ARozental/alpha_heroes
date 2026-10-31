@@ -126,6 +126,7 @@ class GameRun:
 			ALPHA_MAP_RECORD_SOCKET=str(self.server.path),
 			ALPHA_MAP_RECORD_FORMAT="2",  # each decision compressed apart, kept as it comes (records.py)
 			ALPHA_MAP_GAME_KEY=game_key,
+			ALPHA_MAP_REQUIRE_MODEL="1",  # (a game the model cannot play ends: AlphaMapAI.h, never played on with every turn ended unasked)
 			ALPHA_MAP_DAYS=str(days),
 			ALPHA_MAP_TEMPERATURE=str(temperature),
 			SETTINGS=json.dumps({"server": {"seed": seed}, "ai": ai, **({"general": {"lastDifficulty": int(difficulty)}} if difficulty is not None else {})}),

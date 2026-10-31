@@ -84,7 +84,17 @@ def campaign_model_kwargs(config, out, resume=False):
 	return model_kwargs(config)
 
 
-AI_ERRORS_MIN, AI_ERRORS_SHARE = 3, 0.25  # a game with a player's AI failing this often (and a quarter of its days) is left out (_game_done)
+def game_problem(game, players):
+	"""Why a finished game must not be trained on (CampaignLearner._game_done), or None: an AI error, or fewer turn
+	decisions than half a decision a player and day."""
+	errors = {color: summary.get("errors", 0) for color, summary in game.done.items() if summary.get("errors", 0)}
+	if errors:
+		return "AI errors " + ", ".join(f"{color} {n}" for color, n in sorted(errors.items()))
+	days = max(game.ledgers) if game.ledgers else 0
+	turns = sum(1 for d in game.decisions if d.kind == c.DecisionKind.TURN)
+	if days and turns < 0.5 * players * days:
+		return f"{turns} turn decisions in {days} days of {players} players"
+	return None
 
 
 class CampaignLearner:
@@ -244,16 +254,17 @@ class CampaignLearner:
 		"""A finished game (one of this machine's, or a worker's: supply.Supply) for the next updates; its labels start now
 		(labeler.py), with the features as they are."""
 		self._log_game(key, map_name, players, game, info)
-		# A game whose AI failed its turns is left out: with the Mac's inference servers down (2026-10-31 13:09-13:20),
-		# 4,312 games ran to their day caps with ~8 decisions each, one error a player and day, and an update trained on
-		# them as finished games. A good game reports none
-		errors = max((summary.get("errors", 0) for summary in game.done.values()), default=0)
-		days = max(game.ledgers) if game.ledgers else 0
-		if errors >= max(AI_ERRORS_MIN, AI_ERRORS_SHARE * days):
+		# A game is checked before it is trained on, and one that fails the check is left out with a FAILURE: a sign of a
+		# bug elsewhere. Any AI error (a good game reports none: 8,118 of joint5's 10,206 games had none, 46 one or two),
+		# or fewer turn decisions than half a player-day's (a player in the game decides each day, if only to end its turn).
+		# 2,042 games ran with the inference servers down, ended every turn unasked and reached their day caps with no
+		# decision, and were taken as finished (2026-10-31)
+		problem = game_problem(game, players)
+		if problem:
 			with self.lock:
-				self.stats["ai_failed_games"] = left = self.stats.get("ai_failed_games", 0) + 1
+				self.stats["rejected_games"] = left = self.stats.get("rejected_games", 0) + 1
 			if left == 1 or left % 100 == 0:
-				print(f"campaign: FAILURE: game {key} left out, its AI failed {errors} times in {days} days (the inference unreachable?); {left} such games so far", flush=True)
+				print(f"campaign: FAILURE: game {key} left out ({problem}); {left} games left out so far", flush=True)
 			return
 		if getattr(self, "labeler", None):
 			game.labels_version = self.version
@@ -339,6 +350,7 @@ class CampaignLearner:
 		memory.append(("starts", rss_gb()))
 		foresight = [] if self.kwargs.get("architecture") == "v2" else None  # (v2's foresight labels, each game's)
 		decisions, targets, labels, growth, returns, advantages, errors, players, forecasts, row = [], [], [], [], [], [], [], [], [], Counter()
+		growth_real = []
 		end = {"targets": [], "real": [], "step": [], "week": [], "price": []}
 		for g, game in enumerate(played):
 			# The labeler's labels, as the game arrived (b1, 2026-10-30: a game's labels from one table version, one update
@@ -372,6 +384,7 @@ class CampaignLearner:
 			targets.append(graded[fresh])
 			labels.append(t[fresh])
 			growth.append(grown[fresh])
+			growth_real.append(z[fresh])  # (the real log values, for loss_noise's growth credit)
 			returns.append((mixed - price)[fresh])
 			if self.config.credit == "horizon":
 				a, error = horizon_advantages(game, t, price, self.trust(), self.labels, self.config.outcome_share_min, self.config.myopic_weight, self.credit_check, parts=True)
@@ -411,7 +424,7 @@ class CampaignLearner:
 				self._refresh_features()
 		else:
 			with self.model_lock:
-				metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight)
+				metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
 				if self.device.type == "mps":
 					torch.mps.empty_cache()  # (the battle learner's lesson: MPS keeps blocks of every size it saw)
 				self.version += 1
@@ -569,6 +582,11 @@ class CampaignLearner:
 			self.writer.add_scalar(f"campaign_credit/{kind.lower()}", gap, self.version)
 		for kind, gap in sums.get("end_credit_gaps", {}).items():
 			self.writer.add_scalar(f"campaign_end_credit/{kind.lower()}", gap, self.version)
+		noise = metrics.get("noise") or {}
+		for name, scale in noise.items():  # (train.loss_noise: each loss term's gradient noise scale, in decisions)
+			self.writer.add_scalar(f"campaign_noise/{name.replace(' ', '_')}", min(scale, 1e9), self.version)
+		if noise:
+			print("campaign noise scale (decisions, the batch where a term's gradient noise equals its signal): " + "  ".join(f"{name} {scale:.0f}" for name, scale in noise.items()), flush=True)
 		if "end_check" in sums:  # (how far the end credit's step part is used: 1 all of it, 0 its week part alone)
 			self.writer.add_scalar("campaign/end_check", sums["end_check"], self.version)
 		for skill, (picked, offered) in skill_picks(decisions).items():  # (how often each skill is taken when offered)

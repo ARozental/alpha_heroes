@@ -67,6 +67,28 @@ def available_gb():
 	return None
 
 
+def inference_ready(address, family):
+	"""Whether the inference server at address (a Unix socket or "tcp:<host>:<port>") answers for its current model.
+	A campaign game asking a server that was down ended every turn unasked and reached its day cap with no decision:
+	2,042 of joint5's games before 2026-10-31, each time the Mac's servers were down; and starting one in its place every
+	few seconds made thousands."""
+	from .inference import InferenceClient
+
+	before = socket.getdefaulttimeout()
+	socket.setdefaulttimeout(5)
+	try:
+		client = InferenceClient(address, family=family)
+		try:
+			client.run("current")
+		finally:
+			client.close()
+		return True
+	except Exception:
+		return False
+	finally:
+		socket.setdefaulttimeout(before)
+
+
 def memory_allows():
 	free = available_gb()
 	return free is None or free >= MEMORY_FLOOR_GB
@@ -99,10 +121,10 @@ def prepare(record, source, key, config, keep_record=False):
 
 	error = next((e for e in record.events if e.get("event") == "error"), None)
 	if error:
-		return None, f"a {source} battle had an error ({key}): {error.get('message', '')[:300]}"
+		return None, f"FAILURE: a {source} battle had an error ({key}): {error.get('message', '')[:300]}"
 	problem = check_record(record)
 	if problem:
-		return None, f"a {source} battle's record is unsound ({key}): {problem[:300]}"
+		return None, f"FAILURE: a {source} battle's record is unsound ({key}): {problem[:300]}"
 	examples, summary = battle_examples(record, config.reward, config.advantage)
 	chosen = [e for e in examples if not e["forced"]]
 	item = {
@@ -272,10 +294,17 @@ class Games(IterableDataset):
 		runner = Runner(self.config, self.run_dir, self.battle_sockets[index % len(self.battle_sockets)], self.campaign_sockets[index % len(self.campaign_sockets)] if self.campaign_sockets else None, self.link, f"w{index}", self.shared.version)
 		stop = self.shared.stop
 		n = 0
+		unreachable = 0.0  # (when this worker last said its campaign inference was unreachable)
 		try:
 			while not stop.is_set():
 				if self.kind == "campaign" and not self.permits_left():
 					time.sleep(0.5)
+					continue
+				if self.kind == "campaign" and runner.campaign_socket and not inference_ready(runner.campaign_socket, "campaign"):
+					if time.monotonic() - unreachable > 60:
+						unreachable = time.monotonic()
+						print(f"supply: FAILURE: campaign inference unreachable at {runner.campaign_socket}: no campaign game starts until it answers", flush=True)
+					time.sleep(5)
 					continue
 				placed = self.place()
 				if placed is None:
@@ -464,7 +493,7 @@ class Runner:
 				try:
 					record = parse_record(data)
 				except Exception as error:
-					yield {"kind": "failed", "what": "battle", "message": f"unreadable record from {record_key}: {error}"}
+					yield {"kind": "failed", "what": "battle", "message": f"FAILURE: unreadable record from {record_key}: {error}"}
 					continue
 				item, problem = prepare(record, "real", record_key.split(":", 1)[0], self.config)
 				yield item if item else {"kind": "failed", "what": "battle", "message": problem}

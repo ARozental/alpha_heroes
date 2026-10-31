@@ -49,6 +49,8 @@ class CampaignConfig:
 	# the step recorded whole the PC's update waited ~15 s for 3 of them, the CPU half idle (2026-10-31): each decision is
 	# decoded three times an update (the first pass, two passes)
 	decode_threads: int = 3
+	# Every this many updates, each loss term's gradient noise scale by game phase (train.loss_noise; ~40 s on the PC); 0: never
+	noise_every: int = 10
 	clip: float = 0.2
 	value_weight: float = 0.5
 	growth_weight: float = 0.5  # each growth head's weight in the value loss, a share head's 1 (labels.py: helpers)
