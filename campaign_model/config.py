@@ -83,7 +83,9 @@ class CampaignConfig:
 	# one is (labels.credit_trust over learner.end_evidence); as it fails, the end credit's step part gives way to its week
 	# part, as the 7-day credit's step gives way to the week's outcome. Its steps were off by type as the 7-day ones (travel
 	# t +8, hire -7, end -5, move -5, build +3..8; ~0.003 of a share), and nothing held them back
-	end_credit_check: bool = True
+	# Off by default: on since 10:29 together with an info-spell mask (10:05-10:44), and the eval against Nullkiller2 fell from
+	# 0.22 to 0.07, then 0.12 with the mask undone; to be tried alone against the 48-game eval (2026-10-31)
+	end_credit_check: bool = False
 	# "turns" (the default since 2026-10-30): the campaign updates run between battle updates, on the battle learner's
 	# device and thread, whichever has its data first (battle_model/train.py: one GPU process for both models; on a
 	# Windows GPU every process is a time slice taken from the trainer). "process": in a process of their own
