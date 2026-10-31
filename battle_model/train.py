@@ -122,6 +122,9 @@ class TrainConfig:
 	# The server's batch wait (inference.BATCH_WAIT): milliseconds a batch waits for more requests after its first. On a
 	# Windows GPU beside the trainer, 10-15 cut the trainer's loss to it from 54% to ~40% of its steps (2026-10-30)
 	inference_batch_wait_ms: float = 0.0
+	# The trainer's float32 matmuls on CUDA as TF32 (10-bit mantissa, fp32 accumulation: ~1e-3 relative error, under the
+	# updates' gradient noise and the value heads' spread of ~0.03); torch's default is full fp32
+	tf32: bool = False
 	# Inference served by other machines instead of a server here: "battle=tcp:host:port,...;campaign=tcp:host:port,..."
 	# (a worker's --local --serve: its servers get this run's weights from the hub, remote.py). Every game here asks them;
 	# no GPU process but the trainer's (inference.ModelStore). Empty: a server process here
@@ -953,6 +956,9 @@ def train(config, resume=False):
 	(out / "config.txt").write_text("\n".join(f"{k} = {v}" for k, v in asdict(config).items()) + "\n")
 	torch.manual_seed(config.seed)
 	device = resolve_device(config.device)
+	if device.type == "cuda" and config.tf32:  # (the trainer's matmuls, both models': every graph is captured after this)
+		torch.backends.cuda.matmul.allow_tf32 = True
+		torch.backends.cudnn.allow_tf32 = True
 	architecture = model_kwargs(config)
 	model = build_model(architecture).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)

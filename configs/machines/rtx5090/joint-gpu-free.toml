@@ -33,6 +33,8 @@ generated_actors = 4
 # The battle model's steps (the user, 2026-10-31): its eval flat at ~+0.09 for ~1,100 updates of 256-decision steps,
 # signal_ratio ~0.12 (mostly noise); each step now averages ~3,072 decisions (12 minibatches accumulated), at 1e-5, 3 passes
 learning_rate = 1e-5
+# The trainer's matmuls as TF32 (2026-10-31; full fp32 before): campaign updates were 86-111 s a ~35k-decision update
+tf32 = true
 accumulate = 12
 ppo_passes = 3
 # 48 battles a side an eval (16 before): a set's standard error was ~0.03 (the total's ~0.013), more than the changes to see
