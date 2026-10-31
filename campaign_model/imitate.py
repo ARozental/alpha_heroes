@@ -317,6 +317,12 @@ def main():
 	parser.add_argument("--plateau-periods", type=int, default=5, help="the periods each side of the plateau's comparison (a period's loss varies from game to game)")
 	args = parser.parse_args()
 	assert args.lr <= 1e-4, "the user's rule: never above 1e-4"
+	import signal
+
+	def stop(signum, _frame):  # (SIGTERM as SIGINT: the workers and their games end in the finally; a background job of
+		raise KeyboardInterrupt(f"signal {signum}")  # a script ignores SIGINT, so runtime/full_run.sh sends SIGTERM)
+
+	signal.signal(signal.SIGTERM, stop)
 	from .learner import auto_device
 
 	device = torch.device(args.device or auto_device())

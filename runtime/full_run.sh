@@ -12,7 +12,8 @@
 cd "$HOME/projects/alpha_heroes"
 export MALLOC_ARENA_MAX=2
 child=
-trap '[ -n "$child" ] && kill -INT "$child" && wait "$child"; exit 0' INT TERM
+# (TERM, not INT: bash starts a background job with SIGINT ignored; both Python programs stop on TERM as on INT)
+trap '[ -n "$child" ] && kill -TERM "$child" && wait "$child"; exit 0' INT TERM
 BC=runtime/teacher/bc_final
 mkdir -p "$BC" runtime/train
 if [ ! -f "$BC/done" ]; then
