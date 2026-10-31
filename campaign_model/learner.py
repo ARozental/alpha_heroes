@@ -55,7 +55,7 @@ from .maps import GAME_MAPS
 from .foresight import labels_of
 from .model import build_model
 from .play import make_map, play
-from .records import NO_EFFECT, decode_inputs
+from .records import NO_EFFECT, decode_fields, decode_inputs
 from .train import load_optimizer, make_optimizer, model_kwargs, ppo_update, usable
 
 TYPES = [a.name.lower() for a in c.ActionType]
@@ -300,7 +300,7 @@ class CampaignLearner:
 		games = self._take()
 		if games is None:
 			return False
-		started = time.time()
+		started, memory = time.time(), [("taken", rss_gb())]
 		played = []
 		for game, _ in games:
 			game.all_decisions = game.decisions  # (the foresight's labels count record serials: the battles' point at them)
@@ -310,6 +310,7 @@ class CampaignLearner:
 		if not played:
 			return False
 		starts, trust, (weight, outcome) = day_starts(self.model, played, self.model_lock), self.grade_trust(), self.end_credit()
+		memory.append(("starts", rss_gb()))
 		foresight = [] if self.kwargs.get("architecture") == "v2" else None  # (v2's foresight labels, each game's)
 		decisions, targets, labels, growth, returns, advantages, errors, players, forecasts, row = [], [], [], [], [], [], [], [], [], Counter()
 		end = {"targets": [], "real": [], "step": [], "week": [], "price": []}
@@ -348,6 +349,7 @@ class CampaignLearner:
 			row["price_sum"] += float(price[fresh].sum())
 		if not decisions:
 			return False
+		memory.append(("labels", rss_gb()))
 		self._note_head_ev(forecasts)  # (for the next update's grades: these were graded by the trust before them)
 		targets, labels, growth = np.concatenate(targets), np.concatenate(labels), np.concatenate(growth)
 		returns, advantages = np.concatenate(returns), np.concatenate(advantages)
@@ -383,7 +385,11 @@ class CampaignLearner:
 				self._save(self.out / "checkpoint_latest.pt")
 		if self.worker:  # (the process saved its checkpoint with the trust before this update: one update behind)
 			self._note_value_ev(metrics)
+		memory.append(("updated", rss_gb()))
 		self._log(epoch, games, decisions, row, metrics, time.time() - started)
+		memory.append(("logged", rss_gb()))
+		if all(value == value for _, value in memory):
+			print("campaign memory (GB, this process): " + "  ".join(f"{stage} {value:.1f}" for stage, value in memory), flush=True)
 		return True
 
 	def _note_value_ev(self, metrics):
@@ -547,6 +553,16 @@ class CampaignLearner:
 		return row
 
 
+def rss_gb():
+	"""This process's resident memory (GB) on Linux, else nan: the update's stages are logged with it (2026-10-30: the
+	PC's main process grew 7 GB in 20 s around an update, and the memory guard stopped the run)."""
+	try:
+		with open("/proc/self/status") as status:
+			return next(int(line.split()[1]) for line in status if line.startswith("VmRSS:")) / 2**20
+	except (OSError, StopIteration):
+		return float("nan")
+
+
 def skill_picks(decisions):
 	"""{skill: (times taken, times offered)} over the level-ups among the decisions: the user's worry (2026-10-28), that a
 	7-day horizon takes Estates too often and Offence, Earth Magic or Wisdom (high-level spells weeks on) too rarely,
@@ -554,7 +570,7 @@ def skill_picks(decisions):
 	ups = [d for d in decisions if d.kind == c.DecisionKind.LEVEL_UP and 0 <= d.index < c.N_OPTIONS]
 	if not ups:
 		return {}
-	x, counts = decode_inputs(ups), {}
+	x, counts = decode_fields(ups, ("o_kind", "o_type")), {}  # (two fields, not every decision's 1.7 MB decoded)
 	for b, d in enumerate(ups):
 		skill = x["o_kind"][b] == c.OptionKind.SKILL
 		for s in x["o_type"][b][skill]:
