@@ -37,8 +37,14 @@ learning_rate = 1e-5
 tf32 = true
 accumulate = 12
 ppo_passes = 3
-# 48 battles a side an eval (16 before): a set's standard error was ~0.03 (the total's ~0.013), more than the changes to see
-eval_seeds = 48
+# The battle evals' sets three times as large (2026-10-31: a set's standard error was ~0.03, the total's ~0.013, more than
+# the changes to see; with the generator, eval_seeds plays no part): ~600 battles an opponent, ~3x the eval's time on the
+# CPU beside training. A new set: its first eval also plays the opponent's own baseline once
+eval_scenarios = 72
+eval_neutral_scenarios = 36
+eval_hard_scenarios = 72
+eval_real_scenarios = 40
+eval_castle_seeds = 48
 # Loader workers kept for the Mac's game slots (worker.py --slots): 2 slots there, its cores on inference
 remote_slots = 2
 # Three updates' worth of campaign games finished and in flight (supply.py): with two, the permits emptied the pipeline
