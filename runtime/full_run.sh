@@ -14,6 +14,9 @@
 # Stop:  systemctl --user stop alpha-full (the phase running stops as SIGINT stops it)
 cd "$HOME/projects/alpha_heroes"
 export MALLOC_ARENA_MAX=2
+# (a step's shapes vary with its heroes' windows: without expandable segments the CUDA cache filled all 32 GB at 128
+# lanes, a fragmentation OOM waiting to happen)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # The memory guard: the unit stopped (as systemctl stop does) once WSL's available memory falls under 1.5 GB
 runtime/memwatch.sh alpha-full > /dev/null 2>&1 &
 child=
