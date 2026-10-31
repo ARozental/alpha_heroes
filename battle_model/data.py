@@ -188,6 +188,14 @@ class Record:
 RECORD_MAGIC = b"ALPHAREC1\n"
 
 
+def version_of(record):
+	"""The model version that played a record: "model_<v>.onnx" (ONNX) or "remote:<name>@<v>" (the inference server)
+	in its start event; -1 when unknown."""
+	start = next((e for e in record.events if e.get("event") == "start"), {})
+	match = re.search(r"model_(\d+)\.onnx|@(\d+)$", start.get("model", ""))
+	return int(match.group(1) or match.group(2)) if match else -1
+
+
 def parse_record(data):
 	"""A Record from the bytes AlphaBattleAI sends (agents/AlphaBattleAI/Dump.h BattleRecord): magic, then
 	entries of u32 name length, name, u64 size, bytes."""

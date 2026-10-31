@@ -74,12 +74,12 @@ class CampaignConfig:
 	# the 7-day credit alone; as it learns, the credit moves to the end (the user: "maybe moving to use it late during
 	# training"). 0: V_end is trained and logged only
 	end_credit_max: float = 1.0
-	# "process": the campaign updates run in a process of their own (learner.UpdateProcess) on `device` (Apple's GPU
-	# or CUDA work alongside the battle learner's: two processes, not two threads); "thread": in a thread of the battle
-	# trainer's process, on `device` ("cpu": Apple's GPU fails when two threads use it); "turns": between two battle
-	# updates, on the battle learner's device and thread (each campaign update, ~40 s, then held the battle learner
-	# up: its updates came every ~60 s instead of ~20)
-	learner: str = "process"
+	# "turns" (the default since 2026-10-30): the campaign updates run between battle updates, on the battle learner's
+	# device and thread, whichever has its data first (battle_model/train.py: one GPU process for both models; on a
+	# Windows GPU every process is a time slice taken from the trainer). "process": in a process of their own
+	# (learner.UpdateProcess) on `device`; "thread": in a thread of the battle trainer's process, on `device` ("cpu":
+	# Apple's GPU fails when two threads use it)
+	learner: str = "turns"
 	device: str = "auto"  # "auto": CUDA or Apple's GPU when there is one (process), the battle learner's (turns)
 	torch_threads: int = 8  # the campaign learner's CPU threads (torch's pool is shared by the process: 0 leaves it)
 	# "v1": model.CampaignModel; "v2": model_v2.CampaignModelV2 (docs/campaign_model_v2_draft.md: typed encoders, owners,

@@ -17,7 +17,9 @@ grade (nan: past the day cap) is left out, and so is a decision without credit f
 corrections of the model's fixed priors (model.prior_corrections): back to the prior unless the games keep pushing.
 """
 import argparse
+import collections
 import contextlib
+import itertools
 import json
 import queue
 import random
@@ -39,7 +41,7 @@ from .labels import COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, blend_credit, en
 from .model import CampaignModel, build_model
 from .play import make_map, play
 from .graphs import Graphs
-from .records import NO_EFFECT, decode_inputs
+from .records import NO_EFFECT, decode_inputs, decode_wire, inputs_on_device
 from .schema import HEADS
 
 RUNS = battle_play.ROOT / "runtime" / "campaign"
@@ -123,41 +125,45 @@ def chosen_logp(out, choice):
 	return logp, entropy
 
 
-def _prefetched(batches, decode, device):
-	"""(rows, inputs on device) of each batch of rows, decoded one batch ahead in a thread (zlib and numpy let the
-	training step go on meanwhile). A consumer that stops early (the KL control) ends the thread: it was left blocked on
-	the full queue with its batches, every such update (2026-10-30)."""
-	ready, stop = queue.Queue(maxsize=2), threading.Event()
+DECODE_THREADS = 3  # batches decoded at once: one thread's ~0.3 s a 128-decision micro-batch (110 MB of zlib and dtype copies, which release the interpreter lock) held the GPU's 146 ms step to it (2026-10-30, the PC)
 
-	def put(item):
-		while not stop.is_set():
-			try:
-				ready.put(item, timeout=0.5)
-				return True
-			except queue.Full:
-				continue
-		return False
 
-	def work():
-		try:
-			for rows in batches:
-				inputs = {name: torch.from_numpy(value) for name, value in decode(rows).items()}
-				if not put((rows, {name: value.pin_memory() for name, value in inputs.items()} if device.type == "cuda" else inputs)):
-					return
-		except BaseException as error:  # re-raised in the training thread
-			put(error)
-		put(None)
+def _prefetched(batches, decode, device, convert=None):
+	"""(rows, inputs on device) of each batch of rows, decoded ahead in DECODE_THREADS threads (zlib and numpy let the
+	training step go on meanwhile) and yielded in order. convert: applied on the device to what decode gave (the wire
+	bytes cut and converted there: records.inputs_on_device), else decode gives the inputs themselves. A consumer that
+	stops early (the KL control) ends the threads: they were left blocked on the full queue with their batches, every
+	such update (2026-10-30)."""
+	import concurrent.futures
 
-	threading.Thread(target=work, daemon=True).start()
+	stop = threading.Event()
 	pinned = device.type == "cuda"  # (a copy from pageable memory waits for the GPU: ~100 of them a minibatch)
+
+	def work(rows):
+		if stop.is_set():
+			return None
+		decoded = decode(rows)
+		inputs = {name: torch.from_numpy(value) for name, value in decoded.items()} if isinstance(decoded, dict) else {"wire": torch.from_numpy(decoded)}
+		return rows, ({name: value.pin_memory() for name, value in inputs.items()} if pinned else inputs)
+
+	pool = concurrent.futures.ThreadPoolExecutor(max_workers=DECODE_THREADS)
+	pending = collections.deque()
+	batches = iter(batches)
 	try:
-		while (item := ready.get()) is not None:
-			if isinstance(item, BaseException):
-				raise item
+		for rows in itertools.islice(batches, DECODE_THREADS + 1):
+			pending.append(pool.submit(work, rows))
+		while pending:
+			item = pending.popleft().result()
+			for rows in itertools.islice(batches, 1):
+				pending.append(pool.submit(work, rows))
+			if item is None:
+				break
 			rows, inputs = item
-			yield rows, {name: value.to(device, non_blocking=pinned) for name, value in inputs.items()}
+			inputs = {name: value.to(device, non_blocking=pinned) for name, value in inputs.items()}
+			yield rows, (convert(inputs["wire"]) if convert is not None and "wire" in inputs else inputs)
 	finally:
 		stop.set()
+		pool.shutdown(wait=False, cancel_futures=True)
 
 
 def make_optimizer(model, config=CampaignConfig()):
@@ -217,6 +223,12 @@ def gpu_held(device, release=False):
 	more than it used (2026-10-28), next to the battle learner's, and the machine swapped. Freeing them every step
 	doubled the update's time; the update process sets MPS's low watermark instead (learner.MPS_LOW_WATERMARK), so the
 	allocator frees them itself when it holds too much."""
+	if device.type == "cuda":  # the update's peak of live tensors (the card shows the allocator's reserve, which keeps the peak)
+		held = torch.cuda.max_memory_allocated(device) / 2**20
+		if release:
+			torch.cuda.reset_peak_memory_stats(device)
+			torch.cuda.empty_cache()
+		return held
 	if device.type != "mps":
 		return 0.0
 	held = torch.mps.driver_allocated_memory() / 2**20
@@ -265,6 +277,7 @@ def ppo_update(
 	advantages (labels.blend_credit) before they are normalized. decode(rows) gives the inputs of those decisions
 	(default: decode_inputs). Returns (metrics, the KL control's new lr_scale)."""
 	n, started = len(decisions), time.time()
+	clock = {"prepass": 0.0, "wait": 0.0, "steps": 0.0, "cpu": time.thread_time()}  # where the update's time goes (logged: the PC's step ran at half the GPU's pace, 2026-10-30)
 	# The foresight's labels (foresight.game_labels, v2), each decision's row: its loss joins the minibatch's, a share
 	# per micro-batch as the others'; the shared layers' gradient from it against the PPO losses', on the first one
 	from .foresight import ForesightConfig, foresight_loss, gradient_check
@@ -272,7 +285,9 @@ def ppo_update(
 	foresight_t = {name: torch.from_numpy(value).to(device) for name, value in foresight.items()} if foresight is not None else None
 	foresight_config = ForesightConfig(weight=getattr(config, "foresight_weight", ForesightConfig.weight))
 	foresight_sums, checked = Counter(), {}
-	decode = decode or (lambda rows: decode_inputs([decisions[r] for r in rows]))
+	# On CUDA the bytes as sent go to the device and are cut and converted there (half the copy, none of the CPU's dtype copies)
+	convert = inputs_on_device if decode is None and device.type == "cuda" else None
+	decode = decode or ((lambda rows: decode_wire([decisions[r] for r in rows])) if convert else (lambda rows: decode_inputs([decisions[r] for r in rows])))
 	choice = {name: torch.from_numpy(value).to(device) for name, value in choices(decisions).items()}
 	if advantages is None:
 		baseline = choice["old_value"] @ torch.tensor(weights, dtype=torch.float32, device=device)
@@ -307,7 +322,8 @@ def ppo_update(
 	with torch.no_grad():
 		chunk = config.prepass_batch or max(1, size // max(1, config.micro_batches))  # (no gradients, but at a whole minibatch it was the update's peak: 5.2 GB)
 		chunks = [np.arange(i, i + chunk).clip(max=n - 1) for i in range(0, n, chunk)]  # the last one padded: fixed shapes
-		for rows, inputs in _prefetched(chunks, decode, device):
+		prepass_started = time.perf_counter()
+		for rows, inputs in _prefetched(chunks, decode, device, convert):
 			index = torch.from_numpy(rows).to(device)
 			out = graphs.eval(inputs) if graphs else model(inputs)
 			logp, _ = chosen_logp(out, {k: choice[k][index] for k in ("kind", "action", "index", "cell")})
@@ -321,6 +337,9 @@ def ppo_update(
 			if end is not None:
 				fresh["end"][index] = excess_loss(out["end_logit"].float().unsqueeze(-1), end_t[index].unsqueeze(-1))
 			gpu_anchor_mb = max(gpu_anchor_mb, gpu_held(device))
+		if device.type == "cuda":
+			torch.cuda.synchronize(device)
+		clock["prepass"] = time.perf_counter() - prepass_started
 	masked = lambda x, valid: ((x * valid).sum(dim=0) / valid.sum(dim=0).clamp(min=1)).sum()
 	value_fresh, heads = masked(fresh["share"], share_valid), float(c.N_VALUE_OFFSETS)
 	if growth is not None:
@@ -340,8 +359,9 @@ def ppo_update(
 	advantage = torch.where(credited, advantage, torch.zeros_like(advantage))
 	unsound = ~torch.isfinite(anchor)  # a choice the model calls impossible now (its legality changed): left out
 	totals, steps, stopped, update_kl, recent = Counter(), 0, False, 0.0, deque(maxlen=KL_WINDOW)
+	stopped_pass = 0  # the pass the KL control ended (0: none; b1, 2026-10-31: with passes=2, a second pass mostly cut short adds nothing)
 	model.train()
-	for _ in range(config.passes):
+	for pass_number in range(1, config.passes + 1):
 		if stopped:
 			break
 		order = torch.randperm(n).numpy()
@@ -351,7 +371,7 @@ def ppo_update(
 		# decision several MB: the PC's learner at 9.5 GB, 2026-10-30); the minibatch's gradient as before
 		minibatches = [order[i : i + size] for i in range(0, len(order), size)]
 		splits = [np.array_split(np.arange(len(rows)), max(1, min(config.micro_batches, len(rows)))) for rows in minibatches]
-		decoded = _prefetched([rows[part] for rows, parts in zip(minibatches, splits) for part in parts], decode, device)
+		decoded = _prefetched([rows[part] for rows, parts in zip(minibatches, splits) for part in parts], decode, device, convert)
 		for rows, parts_of_rows in zip(minibatches, splits):
 			index = torch.from_numpy(rows).to(device)
 			whole = (~unsound[index]).float()
@@ -368,36 +388,50 @@ def ppo_update(
 			for part in parts_of_rows:
 				at = torch.from_numpy(part).to(device)
 				sub, keep = index[at], whole[at]
+				waited = time.perf_counter()
 				_, inputs = next(decoded)
-				# (the gradient check's micro-batch eagerly: it runs backward through one forward three times)
-				out = graphs.train(inputs) if graphs and (checked or foresight_t is None) else model(inputs)
-				logp, entropy = chosen_logp(out, {k: choice[k][sub] for k in ("kind", "action", "index", "cell")})
-				logp = torch.where(keep > 0, logp, choice["old_logp"][sub])
-				log_ratio = logp - choice["old_logp"][sub]
-				ratio = log_ratio.exp()
-				a, credit = advantage[sub], keep * credited[sub].float()
-				policy = -(torch.minimum(ratio * a, ratio.clamp(1 - config.clip, 1 + config.clip) * a) * credit).sum() / counts["credit"]
-				value, heads = head_loss(out["value_logit"], targets_t[sub], share_valid[sub], counts["share"]).sum(), float(c.N_VALUE_OFFSETS)
-				if growth is not None:  # our value's log growth from the decision, on the heads' 0..1 scale
-					now = out["phi"].detach().clamp(min=PHI_FLOOR).log().unsqueeze(-1)
-					scaled = ((growth_t[sub] - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
-					value = value + config.growth_weight * head_loss(out["growth_logit"], scaled, growth_valid[sub], counts["growth"]).sum()
-					heads += config.growth_weight * c.N_VALUE_OFFSETS
-				if end is not None:  # V_end, at a share head's weight
-					value = value + head_loss(out["end_logit"].unsqueeze(-1), end_t[sub].unsqueeze(-1), end_valid[sub].unsqueeze(-1), counts["end"].unsqueeze(-1)).sum()
-					heads += 1.0
-				value = value / heads
-				bonus = (entropy * keep).sum() / counts["keep"]
-				floor = (torch.relu(config.entropy_floor - entropy) * keep).sum() / counts["keep"]  # only decisions below it
-				loss = policy + config.value_weight * value - config.entropy_weight * bonus + config.entropy_floor_weight * floor
-				if foresight_t is not None and "fs_turn" in out:
-					fs_loss, fs_parts = foresight_loss(out, {name: value[sub] for name, value in foresight_t.items()}, foresight_config)
-					share = len(part) / len(rows)
-					if not checked:
-						checked = gradient_check(model, loss, share * fs_loss)
+				clock["wait"] += time.perf_counter() - waited
+				def losses(out):
+					"""The micro-batch's losses from the model's outputs: (loss without the foresight's, the foresight's loss and
+					parts or None, the policy's, the value's, the entropy bonus, the ratio, logp, entropy)."""
+					logp, entropy = chosen_logp(out, {k: choice[k][sub] for k in ("kind", "action", "index", "cell")})
+					logp = torch.where(keep > 0, logp, choice["old_logp"][sub])
+					ratio = (logp - choice["old_logp"][sub]).exp()
+					a, credit = advantage[sub], keep * credited[sub].float()
+					policy = -(torch.minimum(ratio * a, ratio.clamp(1 - config.clip, 1 + config.clip) * a) * credit).sum() / counts["credit"]
+					value, heads = head_loss(out["value_logit"], targets_t[sub], share_valid[sub], counts["share"]).sum(), float(c.N_VALUE_OFFSETS)
+					if growth is not None:  # our value's log growth from the decision, on the heads' 0..1 scale
+						now = out["phi"].detach().clamp(min=PHI_FLOOR).log().unsqueeze(-1)
+						scaled = ((growth_t[sub] - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
+						value = value + config.growth_weight * head_loss(out["growth_logit"], scaled, growth_valid[sub], counts["growth"]).sum()
+						heads += config.growth_weight * c.N_VALUE_OFFSETS
+					if end is not None:  # V_end, at a share head's weight
+						value = value + head_loss(out["end_logit"].unsqueeze(-1), end_t[sub].unsqueeze(-1), end_valid[sub].unsqueeze(-1), counts["end"].unsqueeze(-1)).sum()
+						heads += 1.0
+					value = value / heads
+					bonus = (entropy * keep).sum() / counts["keep"]
+					floor = (torch.relu(config.entropy_floor - entropy) * keep).sum() / counts["keep"]  # only decisions below it
+					loss = policy + config.value_weight * value - config.entropy_weight * bonus + config.entropy_floor_weight * floor
+					fs = foresight_loss(out, {name: value[sub] for name, value in foresight_t.items()}, foresight_config) if foresight_t is not None and "fs_turn" in out else None
+					return loss, fs, policy, value, bonus, ratio, logp, entropy
+
+				share = len(part) / len(rows)
+				if foresight_t is not None and not checked:
+					# The gradient check, once an update, on an eager forward of its own, through torch.autograd.grad; every tensor
+					# of that forward is dropped before the graphed step: its autograd graph alive (one tensor of it kept) made
+					# the parameters' AccumulateGrad nodes reference the default stream, and the capture refused them ("a stale
+					# reference to the default stream (stream 0) from warmup", 2026-10-30)
+					check = losses(model(inputs))
+					if check[1] is not None:
+						checked = gradient_check(model, check[0], share * check[1][0])
+					del check
+				out = graphs.train(inputs) if graphs else model(inputs)
+				loss, fs, policy, value, bonus, ratio, logp, entropy = losses(out)
+				if fs is not None:
+					fs_loss, fs_parts = fs
 					loss = loss + share * fs_loss
-					for name, value in fs_parts.items():
-						foresight_sums[name] += float(value) * share
+					for name, part_value in fs_parts.items():
+						foresight_sums[name] += float(part_value) * share
 					foresight_sums["steps_seen"] += share
 				loss.backward()
 				drift = logp.detach() - anchor[sub].nan_to_num(neginf=0.0)
@@ -411,7 +445,9 @@ def ppo_update(
 				]).float())
 			grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 			optimizer.step()
-			*sums, grad_norm = torch.cat([torch.stack(parts).sum(dim=0), grad_norm.detach().float().reshape(1)]).tolist()
+			stepped = time.perf_counter()
+			*sums, grad_norm = torch.cat([torch.stack(parts).sum(dim=0), grad_norm.detach().float().reshape(1)]).tolist()  # (a sync: the minibatch's GPU work is done here)
+			clock["steps"] += time.perf_counter() - stepped
 			step = Counter(dict(zip(STEP_PARTS, sums)))
 			gpu_mb = max(gpu_mb, gpu_held(device))
 			steps += 1
@@ -419,10 +455,11 @@ def ppo_update(
 			update_kl = float(np.mean(recent))  # the update's KL: the last KL_WINDOW minibatches', not one's
 			totals.update(step, grad_norm=grad_norm)
 			if config.target_kl and update_kl > 1.5 * config.target_kl:
-				stopped = True  # this update has moved the policy far enough
+				stopped, stopped_pass = True, pass_number  # this update has moved the policy far enough
 				break
 		decoded.close()  # (its thread ends, its decoded batches freed)
 	model.eval()
+	gpu_mb = max(gpu_mb, gpu_held(device, release=True))  # (CUDA: the peak logged, the cache released: the other GPU process keeps its headroom)
 	if config.target_kl and steps:
 		if stopped:
 			lr_scale = max(0.1, lr_scale / 1.5)
@@ -436,6 +473,7 @@ def ppo_update(
 	metrics.update(
 		steps=steps,
 		stopped=stopped,
+		stopped_pass=stopped_pass,
 		last_kl=update_kl,
 		unsound=int(unsound.sum()),
 		decisions=n,
@@ -445,6 +483,10 @@ def ppo_update(
 		gpu_mb=gpu_mb,
 		gpu_anchor_mb=gpu_anchor_mb,
 		update_seconds=time.time() - started,
+		prepass_seconds=clock["prepass"],
+		wait_seconds=clock["wait"],  # blocked on the decoded batches
+		sync_seconds=clock["steps"],  # blocked on the GPU at each minibatch's end
+		cpu_share=(time.thread_time() - clock["cpu"]) / max(time.time() - started, 1e-9),  # of the update's time this thread ran on the CPU
 		**{f"foresight_{name}": value / max(foresight_sums["steps_seen"], 1e-9) for name, value in foresight_sums.items() if name != "steps_seen"},
 		**checked,
 		**{f"value_ev_d{k}": explained_variance(predicted[:, i], actual[:, i]) for i, k in enumerate(c.VALUE_OFFSETS)},

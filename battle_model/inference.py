@@ -36,6 +36,10 @@ MAX_BATCH = 256  # decisions per forward pass
 # measured 2026-10-30 on the PC), and the games send one decision at a time
 GRAPH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128)
 MODEL_WAIT = 5.0  # seconds a request for a model not served yet waits for its weights (apply_control)
+# Seconds a batch waits for more requests after its first (0: none): fewer, larger forwards. Beside a trainer on a
+# Windows GPU (WSL) every submission to the GPU is a context switch away from the trainer's (2026-10-30: a server
+# answering one-decision requests as they came cost the trainer 54% of its step rate)
+BATCH_WAIT = float(os.environ.get("ALPHA_INFERENCE_BATCH_WAIT_MS", "0")) / 1000
 
 
 @dataclass(frozen=True)
@@ -106,19 +110,23 @@ def unpack(packed):
 # ---- the server process ----
 
 
-def _serve(socket_path, device_name, family_name, model_kwargs, control, threads, tcp=None):
-	"""tcp: (host, port) to listen on for clients on other machines too, or None."""
+def _serve(socket_path, device_name, family_names, model_kwargs, control, threads, tcp=None):
+	"""One process serving the models of family_names (model_kwargs: {family: kwargs}; a client says which it speaks in
+	its hello). tcp: (host, port) to listen on for clients on other machines too, or None. One process for every family
+	(2026-10-30): beside a trainer on a Windows GPU each process is a context the GPU is time-sliced between."""
 	import torch
 
 	torch.set_num_threads(threads)
 	torch_dtype = {np.dtype(t): getattr(torch, name) for t, name in ((np.uint8, "uint8"), (np.int32, "int32"), (np.float32, "float32"), (np.bool_, "bool"), (np.int64, "int64"))}
-	family = families()[family_name]
 	device = torch.device(device_name)
-	in_layout, out_layout = wire_layout(family.inputs, True), wire_layout(family.outputs, False)
-	in_bytes = sum(entry[-1] for entry in in_layout)
-	offsets = np.cumsum([0] + [entry[-1] for entry in in_layout])[:-1]
-	models = {}  # name -> [module, version]
-	requests = queue.Queue()  # (name, decisions, payload, reply): the worker puts its reply's bytes in reply[0], sets reply[1]
+	all_families = families()
+	served = {}  # family name -> (Family, in_layout, out_layout, in_bytes, offsets)
+	for name in family_names:
+		family = all_families[name]
+		in_layout, out_layout = wire_layout(family.inputs, True), wire_layout(family.outputs, False)
+		served[name] = (family, in_layout, out_layout, sum(entry[-1] for entry in in_layout), np.cumsum([0] + [entry[-1] for entry in in_layout])[:-1])
+	models = {}  # (family, name) -> [module, version]
+	requests = queue.Queue()  # (family, name, decisions, payload, reply): the worker puts its reply's bytes in reply[0], sets reply[1]
 	commands = queue.Queue()  # from the trainer, applied by the worker (the only thread that touches the device)
 
 	def control_reader():  # drains the pipe at once: a weights message (~1 MB) would block the trainer until read
@@ -132,9 +140,11 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 		"""One client's connection: its requests to the worker, the replies back (compressed here, not in the worker)."""
 		try:
 			hello = json.loads(read_message(conn))
-			if hello.get("family") != family_name or hello.get("contract_hash") != family.contract_hash:
-				send_message(conn, json.dumps({"error": f"this server runs {family_name} {family.contract_hash}, the client speaks {hello}"}).encode())
+			family_name = hello.get("family")
+			if family_name not in served or hello.get("contract_hash") != served[family_name][0].contract_hash:
+				send_message(conn, json.dumps({"error": f"this server runs {', '.join(f'{n} {f[0].contract_hash}' for n, f in served.items())}, the client speaks {hello}"}).encode())
 				return
+			in_bytes = served[family_name][3]
 			packed = hello.get("compress") == "zlib"
 			send_message(conn, json.dumps({"ok": True}).encode())
 			while True:
@@ -148,7 +158,7 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 					reply = struct.pack("<I", ERROR) + f"{decisions} decisions need {decisions * in_bytes} bytes, got {len(payload)}".encode()
 				else:
 					box = [None, threading.Event()]
-					requests.put((name, decisions, payload, box))
+					requests.put((family_name, name, decisions, payload, box))
 					box[1].wait()  # one request at a time per connection: the reply goes out before the next is read
 					reply = box[0]
 				send_message(conn, pack(reply) if packed else reply)
@@ -158,7 +168,7 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 			conn.close()
 
 	def apply_control(wait_for=None):
-		"""Applies the trainer's queued commands. wait_for: a model name not served yet, waited for up to MODEL_WAIT
+		"""Applies the trainer's queued commands. wait_for: a (family, name) not served yet, waited for up to MODEL_WAIT
 		seconds: set_model returns once the pipe has taken the weights, before control_reader has unpickled them, and a
 		request sent right after it found no model (every time on Linux)."""
 		deadline = time.monotonic() + MODEL_WAIT
@@ -171,20 +181,23 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 			except queue.Empty:
 				return
 			if command[0] == "set":
-				_, name, version, state = command
-				if name not in models:
-					models[name] = [family.build(model_kwargs).to(device).eval(), version]
-					if device.type == "cuda" and hasattr(models[name][0], "fixed_windows"):
-						models[name][0].fixed_windows = True  # (the same outputs in fixed shapes: model_v2.windows_of)
-				models[name][0].load_state_dict(state)
-				models[name][1] = version
+				_, family_name, name, version, state = command
+				key = (family_name, name)
+				if key not in models:
+					models[key] = [served[family_name][0].build(model_kwargs[family_name]).to(device).eval(), version]
+					if device.type == "cuda" and hasattr(models[key][0], "fixed_windows"):
+						models[key][0].fixed_windows = True  # (the same outputs in fixed shapes: model_v2.windows_of)
+				models[key][0].load_state_dict(state)
+				models[key][1] = version
 			elif command[0] == "drop":
-				models.pop(command[1], None)
-				for key in [key for key in graphs if key[0] == command[1]]:
-					del graphs[key]
+				key = (command[1], command[2])
+				models.pop(key, None)
+				for graph_key in [graph_key for graph_key in graphs if graph_key[0] == key]:
+					del graphs[graph_key]
 
-	def decode_on_device(on_device):
+	def decode_on_device(family_name, on_device):
 		"""The inputs of a batch's bytes [N, in_bytes] on the GPU, its columns cut and converted there."""
+		_, in_layout, _, _, offsets = served[family_name]
 		inputs, n = {}, on_device.shape[0]
 		for (input_name, shape, wire, dtype, nbytes), offset in zip(in_layout, offsets):
 			# (a copy always: one decision's slice counts as contiguous, so .contiguous() kept its odd row stride, the
@@ -193,30 +206,31 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 			inputs[input_name] = column.to(torch_dtype[np.dtype(dtype)]).reshape((n,) + shape)
 		return inputs
 
-	def forward_flat(model, inputs, n):
+	def forward_flat(family_name, model, inputs, n):
 		out = model(inputs)
-		return torch.cat([out[o_name].float().reshape(n, -1) for o_name, *_ in out_layout], dim=1)
+		return torch.cat([out[o_name].float().reshape(n, -1) for o_name, *_ in served[family_name][2]], dim=1)
 
-	graphs = {}  # (name, size) -> (flat outputs, graph), or None: eager (its capture failed)
+	graphs = {}  # ((family, name), size) -> (flat outputs, graph), or None: eager (its capture failed)
 	# A size's input bytes, pinned on the host and on the device, shared by every model's graph at that size (they run
 	# one at a time): one each a model was ~77 MB of both for the battle server's ~50 league models (2026-10-30)
-	graph_inputs = {}  # size -> (pinned host bytes, device bytes)
+	graph_inputs = {}  # (family, size) -> (pinned host bytes, device bytes)
 	graph_pool = [None]  # one memory pool for all, likewise
 
-	def graphed(name, model, data):
-		"""flat [N, out] on the host for the bytes data [N, in_bytes], through name's graph at the next size up (recorded
-		on first use), or None when there is none (too big, or its capture failed)."""
+	def graphed(key, model, data):
+		"""flat [N, out] on the host for the bytes data [N, in_bytes] of model key = (family, name), through its graph at
+		the next size up (recorded on first use), or None when there is none (too big, or its capture failed)."""
+		family_name, in_bytes = key[0], served[key[0]][3]
 		total = data.shape[0]
 		size = next((size for size in GRAPH_SIZES if size >= total), None)
-		key = (name, size)
-		if size is None or (key in graphs and graphs[key] is None):
+		graph_key = (key, size)
+		if size is None or (graph_key in graphs and graphs[graph_key] is None):
 			return None
-		if key not in graphs:
+		if graph_key not in graphs:
 			try:
-				if size not in graph_inputs:
+				if (family_name, size) not in graph_inputs:
 					host = torch.empty((size, in_bytes), dtype=torch.uint8).pin_memory()
-					graph_inputs[size] = (host, torch.empty((size, in_bytes), dtype=torch.uint8, device=device))
-				host, on_device = graph_inputs[size]
+					graph_inputs[(family_name, size)] = (host, torch.empty((size, in_bytes), dtype=torch.uint8, device=device))
+				host, on_device = graph_inputs[(family_name, size)]
 				host[:total] = torch.from_numpy(data)
 				host[total:] = host[:1]  # (the padding rows a real decision: their outputs are dropped)
 				on_device.copy_(host)
@@ -224,30 +238,32 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 				side.wait_stream(torch.cuda.current_stream())
 				with torch.cuda.stream(side), torch.inference_mode():
 					for _ in range(2):
-						forward_flat(model, decode_on_device(on_device), size)
+						forward_flat(family_name, model, decode_on_device(family_name, on_device), size)
 				torch.cuda.current_stream().wait_stream(side)
 				graph = torch.cuda.CUDAGraph()
 				with torch.inference_mode(), torch.cuda.graph(graph, pool=graph_pool[0]):
-					flat = forward_flat(model, decode_on_device(on_device), size)
+					flat = forward_flat(family_name, model, decode_on_device(family_name, on_device), size)
 				graph_pool[0] = graph.pool()
-				graphs[key] = (flat, graph)
+				graphs[graph_key] = (flat, graph)
 			except Exception as error:  # (eager from then on, for this model and size)
-				graphs[key] = None
-				print(f"inference: no CUDA graph for {name} at {size} ({type(error).__name__}: {str(error)[:200]}): eager", flush=True)
+				graphs[graph_key] = None
+				print(f"inference: no CUDA graph for {key} at {size} ({type(error).__name__}: {str(error)[:200]}): eager", flush=True)
 				return None
-		flat, graph = graphs[key]
-		host, on_device = graph_inputs[size]
+		flat, graph = graphs[graph_key]
+		host, on_device = graph_inputs[(family_name, size)]
 		host[:total] = torch.from_numpy(data)  # (the rows past total: an earlier batch's, real decisions)
 		on_device.copy_(host, non_blocking=True)
 		graph.replay()
 		return flat[:total].cpu().numpy()  # (one copy back, one sync)
 
-	def run(name, batch):
+	def run(key, batch):
 		"""The replies of one model's requests, run as one batch."""
-		model, version = models[name]
+		family_name = key[0]
+		_, in_layout, _, in_bytes, offsets = served[family_name]
+		model, version = models[key]
 		total = sum(decisions for _, decisions, _, _ in batch)
 		data = np.concatenate([np.frombuffer(payload, dtype=np.uint8).reshape(decisions, in_bytes) for _, decisions, payload, _ in batch])
-		outputs = graphed(name, model, data) if device.type == "cuda" else None
+		outputs = graphed(key, model, data) if device.type == "cuda" else None
 		if outputs is None:
 			inputs = {}
 			if device.type == "cpu":
@@ -255,9 +271,9 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 					column = np.ascontiguousarray(data[:, offset : offset + nbytes]).view(wire)
 					inputs[input_name] = torch.from_numpy(column.astype(dtype).reshape((total,) + shape))
 			else:  # the whole batch to the GPU in one copy, its columns cut and converted there (not one copy an input)
-				inputs = decode_on_device(torch.from_numpy(data).to(device))
+				inputs = decode_on_device(family_name, torch.from_numpy(data).to(device))
 			with torch.inference_mode():
-				flat = forward_flat(model, inputs, total)
+				flat = forward_flat(family_name, model, inputs, total)
 			outputs = flat.cpu().numpy()  # (one copy back, one sync)
 		replies, first = [], 0
 		for _, decisions, _, box in batch:
@@ -268,24 +284,25 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 	def worker():
 		while True:
 			pending = [requests.get()]
+			deadline = time.monotonic() + BATCH_WAIT
 			while len(pending) < MAX_BATCH:
 				try:
-					pending.append(requests.get_nowait())
+					pending.append(requests.get(timeout=max(0.0, deadline - time.monotonic())) if BATCH_WAIT else requests.get_nowait())
 				except queue.Empty:
 					break
 			apply_control()
-			by_name = {}
+			by_key = {}
 			for item in pending:
-				by_name.setdefault(item[0], []).append(item)
-			for name, batch in by_name.items():
+				by_key.setdefault((item[0], item[1]), []).append(item[1:])
+			for key, batch in by_key.items():
 				try:
-					if name not in models:
-						apply_control(wait_for=name)
-					if name not in models:
-						raise KeyError(f"no model named {name!r} (the server has {sorted(models)})")
-					replies = [(box, struct.pack("<I", models[name][1])) for _, decisions, _, box in batch if decisions == 0]
+					if key not in models:
+						apply_control(wait_for=key)
+					if key not in models:
+						raise KeyError(f"no model named {key[1]!r} of family {key[0]} (the server has {sorted(models)})")
+					replies = [(box, struct.pack("<I", models[key][1])) for _, decisions, _, box in batch if decisions == 0]
 					work = [item for item in batch if item[1] > 0]
-					replies += run(name, work) if work else []
+					replies += run(key, work) if work else []
 				except Exception as error:
 					replies = [(box, struct.pack("<I", ERROR) + str(error).encode()) for _, _, _, box in batch]
 				for box, payload in replies:  # (the connections' threads send them)
@@ -341,16 +358,26 @@ def _watch_parent(listeners):
 class InferenceServer:
 	"""Starts the server processes, each on its own socket (socket_paths; socket_path is the first); set_model gives
 	them all weights (state_dict) under a name. On the CPU one process does not scale past a core or two (its Python
-	and the model's many small operations), so several share the games; on a GPU one process batches them all."""
+	and the model's many small operations), so several share the games; on a GPU one process batches them all.
 
-	def __init__(self, socket_path, device="cpu", family="battle", model_kwargs=None, threads=2, processes=1, tcp_host=None, tcp_port=0):
+	One server can serve several families (families=("battle", "campaign"), model_kwargs {family: kwargs}): the
+	trainer's two models in one process, one GPU context (2026-10-30: a Windows GPU is time-sliced between processes).
+	view(family) is the handle one family's owner uses (its set_model, serving, socket_for)."""
+
+	def __init__(self, socket_path, device="cpu", family="battle", model_kwargs=None, threads=2, processes=1, tcp_host=None, tcp_port=0, families=None):
 		"""tcp_host, tcp_port: also listen there for clients on other machines (worker.py), process i on tcp_port + i."""
 		import multiprocessing
 
 		base = str(socket_path)
-		# What it serves, for workers that run their own servers (remote.Hub sends them the weights): name -> (version,
-		# state), and what builds the model
-		self.family, self.model_kwargs, self.served = family, dict(model_kwargs or {}), {}
+		self.families = tuple(families) if families else (family,)
+		kwargs = dict(model_kwargs or {})
+		self.kwargs = kwargs if families else {family: kwargs}  # family -> what builds its model
+		self.kwargs = {f: dict(self.kwargs.get(f) or {}) for f in self.families}
+		self.family = self.families[0]
+		self.model_kwargs = self.kwargs[self.family]  # (one family's handle: what workers that run their own servers build)
+		# What it serves, for workers that run their own servers (remote.Hub sends them the weights): (family, name) ->
+		# (version, state)
+		self.served = {}
 		self.socket_paths = [base] if processes == 1 else [base.replace(".sock", f"-{i}.sock") for i in range(processes)]
 		self.socket_path = self.socket_paths[0]
 		self.tcp_ports = [tcp_port + i for i in range(processes)] if tcp_port else []
@@ -362,7 +389,7 @@ class InferenceServer:
 				os.unlink(path)
 			control, child = context.Pipe()
 			tcp = (tcp_host or "0.0.0.0", self.tcp_ports[i]) if self.tcp_ports else None
-			process = context.Process(target=_serve, args=(path, device, family, dict(model_kwargs or {}), child, threads, tcp), daemon=True)
+			process = context.Process(target=_serve, args=(path, device, self.families, self.kwargs, child, threads, tcp), daemon=True)
 			process.start()
 			self.controls.append(control)
 			self.processes.append(process)
@@ -370,25 +397,32 @@ class InferenceServer:
 			if not control.poll(120) or control.recv() != ("ready",):
 				raise RuntimeError("the inference server did not start")
 
-	def set_model(self, name, version, model):
-		"""Serve model's current weights (a module or a state_dict) under name, as version."""
+	def view(self, family):
+		"""This server as one family's owner sees it."""
+		return _FamilyView(self, family)
+
+	def set_model(self, name, version, model, family=None):
+		"""Serve model's current weights (a module or a state_dict) under name, as version, for family (the first)."""
+		family = family or self.family
 		state = model.state_dict() if hasattr(model, "state_dict") else model
 		state = {key: value.detach().cpu() for key, value in state.items()}
 		with self.lock:
 			for control in self.controls:
-				control.send(("set", name, int(version), state))
-			self.served[name] = (int(version), state)
+				control.send(("set", family, name, int(version), state))
+			self.served[(family, name)] = (int(version), state)
 
-	def drop(self, name):
+	def drop(self, name, family=None):
+		family = family or self.family
 		with self.lock:
 			for control in self.controls:
-				control.send(("drop", name))
-			self.served.pop(name, None)
+				control.send(("drop", family, name))
+			self.served.pop((family, name), None)
 
-	def serving(self):
-		"""{name: (version, state)} as now served (a copy)."""
+	def serving(self, family=None):
+		"""{name: (version, state)} of a family (the first) as now served (a copy)."""
+		family = family or self.family
 		with self.lock:
-			return dict(self.served)
+			return {name: item for (f, name), item in self.served.items() if f == family}
 
 	def socket_for(self, index):
 		"""The socket of the index-th client (actor): the clients spread evenly over the processes."""
@@ -406,6 +440,77 @@ class InferenceServer:
 		for path in self.socket_paths:
 			if os.path.exists(path):
 				os.unlink(path)
+
+
+class ModelStore:
+	"""In place of an InferenceServer for a family whose inference other machines serve (TrainConfig.inference_endpoints;
+	2026-10-30: on the Windows PC every process on the GPU costs the trainer ~40% of its steps, while the Mac's cores idle
+	at 9-12 ms a campaign decision): keeps what is served, which remote.Hub sends to the workers' own servers
+	(--local --serve), and the endpoints ("tcp:<host>:<port>") the games here ask."""
+
+	def __init__(self, family, endpoints, model_kwargs=None):
+		self.family, self.model_kwargs = family, dict(model_kwargs or {})
+		self.socket_paths = list(endpoints)
+		self.socket_path, self.tcp_ports = self.socket_paths[0], []
+		self.served, self.lock = {}, threading.Lock()
+
+	def set_model(self, name, version, model):
+		state = model.state_dict() if hasattr(model, "state_dict") else model
+		with self.lock:
+			self.served[name] = (int(version), {key: value.detach().cpu() for key, value in state.items()})
+
+	def drop(self, name):
+		with self.lock:
+			self.served.pop(name, None)
+
+	def serving(self):
+		with self.lock:
+			return dict(self.served)
+
+	def socket_for(self, index):
+		return self.socket_paths[index % len(self.socket_paths)]
+
+	def endpoints(self, host):
+		return list(self.socket_paths)
+
+	def close(self):
+		pass
+
+
+def parse_endpoints(text):
+	"""TrainConfig.inference_endpoints, "battle=tcp:host:7901,tcp:host:7902;campaign=tcp:host:7951", as {family: [endpoints]}."""
+	out = {}
+	for part in filter(None, (p.strip() for p in text.split(";"))):
+		family, _, addresses = part.partition("=")
+		out[family.strip()] = [a.strip() for a in addresses.split(",") if a.strip()]
+	return out
+
+
+class _FamilyView:
+	"""One family's handle on a shared InferenceServer: the same calls, this family's models."""
+
+	def __init__(self, server, family):
+		self.server, self.family = server, family
+		self.model_kwargs = server.kwargs[family]
+		self.socket_paths, self.socket_path, self.tcp_ports = server.socket_paths, server.socket_path, server.tcp_ports
+
+	def set_model(self, name, version, model):
+		self.server.set_model(name, version, model, family=self.family)
+
+	def drop(self, name):
+		self.server.drop(name, family=self.family)
+
+	def serving(self):
+		return self.server.serving(self.family)
+
+	def socket_for(self, index):
+		return self.server.socket_for(index)
+
+	def endpoints(self, host):
+		return self.server.endpoints(host)
+
+	def close(self):
+		pass  # (the server's owner closes it)
 
 
 class InferenceClient:

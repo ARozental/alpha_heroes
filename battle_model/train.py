@@ -62,7 +62,7 @@ from torch.utils.tensorboard import SummaryWriter
 from campaign_model.config import CampaignConfig
 
 from . import generator, play, rules
-from .data import collate, credit_check, make_dataloader, summarize, widened
+from .data import collate, credit_check, make_dataloader, summarize, widened  # noqa: F401 (make_dataloader: the Producer's path)
 from .distributions import log_prob
 from .export import export, verify
 from .device import sync, use_fused
@@ -89,11 +89,17 @@ class TrainConfig:
 	eval_castle_seeds: int = 0  # generator evals: also castle_vs_inferno (`scenario`) on this many EVAL_SEEDS: regressions
 	eval_extra_opponents: tuple = ("MMAI",)  # also evaluated against these (eval_<name>.csv, TensorBoard eval_<name>/)
 	eval_workers: int = 12  # battle processes of an eval (play_eval; with actors the learner and the actors go on meanwhile)
-	# Training in updates from many battles at once (actors.py) instead of epochs of games_per_side battles: an
-	# "epoch" is then one update of decisions_per_update decisions, taken from the actors' buffer
+	# Training in updates from many battles at once (actors.py, supply.py) instead of epochs of games_per_side battles:
+	# an "epoch" is then one update of decisions_per_update decisions, taken from the actors' buffer
 	actors: bool = False
-	generated_actors: int = 10  # generated battles played at once (on 14 cores: 16 starved the learner, 6 left it waiting)
-	real_games: int = 0  # real games played at once (real_games.py); their battles are real_share of each update
+	generated_actors: int = 10  # generated battles played at once here, at most: this machine's ceiling (supply.py; the loader's workers)
+	# How far the games run ahead of the learners, in updates' worth of decisions (supply.py): generated battles waiting,
+	# campaign games finished and in flight. 2: a worker never idles through one update, and nothing older waits
+	ahead: float = 2.0
+	# Loader workers kept for other machines' game slots (worker.py --slots; remote_port): each plays a remote game at a
+	# time once this machine's games are at their ceiling. 0: this machine's games only
+	remote_slots: int = 0
+	real_games: int = 0  # (real_games.py, unused since 2026-10-30: training against the game's AI is out)
 	real_share: float = 0.5
 	real_game_seconds: int = 900
 	game_share: float = 0.125  # at most this share of an update from any one game
@@ -113,6 +119,13 @@ class TrainConfig:
 	inference_device: str = "auto"  # the server's: "auto" = CUDA if there is one, else the CPU; or e.g. "cpu", "cuda"
 	inference_threads: int = 1  # each server process's torch threads on the CPU (more threads barely help at small batches)
 	inference_processes: int = 0  # server processes; 0: one on a GPU, a fifth of the cores on the CPU
+	# The server's batch wait (inference.BATCH_WAIT): milliseconds a batch waits for more requests after its first. On a
+	# Windows GPU beside the trainer, 10-15 cut the trainer's loss to it from 54% to ~40% of its steps (2026-10-30)
+	inference_batch_wait_ms: float = 0.0
+	# Inference served by other machines instead of a server here: "battle=tcp:host:port,...;campaign=tcp:host:port,..."
+	# (a worker's --local --serve: its servers get this run's weights from the hub, remote.py). Every game here asks them;
+	# no GPU process but the trainer's (inference.ModelStore). Empty: a server process here
+	inference_endpoints: str = ""
 	persistent_battles: bool = True  # each generated actor plays its battles in one VCMI process (play.BattleProcess)
 	# Workers on other machines (remote.py, worker.py): they connect to this port (0: none), play with this machine's
 	# inference servers over the network and send their records here; remote_token: their shared secret (empty: the
@@ -260,7 +273,7 @@ COLUMNS = [
 	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds", "data_seconds", "prepass_seconds", "steps_seconds", "publish_seconds",
 ] + [f"{side}_share_{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS] + [
 	f"{side}_{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")
-] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow", "learning_rate", "ppo_steps", "update_kl", "outcome_share", "round_head_weight"] + [
+] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow", "battles_here", "battles_remote", "games_here", "games_remote", "game_permits", "games_in_flight", "learning_rate", "ppo_steps", "update_kl", "outcome_share", "round_head_weight"] + [
 	f"train_{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")
 ] + [f"value_gain_{kind}" for kind in VALUE_PRIOR_KINDS] + [f"foresight_{k}" for k in FORESIGHT_PARTS] + [
 	"grad_trunk_main", "grad_trunk_foresight", "grad_trunk_cosine", "grad_dead_share",
@@ -276,6 +289,7 @@ VALUE_LOSS_TAB = "eval/battle_value_loss"
 TENSORBOARD_TAGS = {
 	**{f"train_{name}": f"train_failures/{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")},
 	**{name: f"actors/{name}" for name in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow")},
+	**{name: f"supply/{name}" for name in ("battles_here", "battles_remote", "games_here", "games_remote", "game_permits", "games_in_flight")},
 	"learning_rate": "stability/learning_rate",
 	"ppo_steps": "stability/ppo_steps",  # fewer than the passes' when the KL control stopped the update
 	"update_kl": "stability/update_kl",
@@ -593,8 +607,22 @@ def melee_escapes(t, rows, actions):
 	return (here > 0) & (there < here)
 
 
-def failure_modes(records):
-	"""Signs of dumb play in a set of battle records (eval), each a share 0..1 (nan when it never came up):
+def failure_modes(records=None, counts=None):
+	"""failure_counts' shares, each 0..1 (nan when it never came up), of records or of counts summed over records."""
+	if counts is None:
+		counts = failure_counts(records)
+	return {name: round(hit / n, 4) if n else float("nan") for name, (hit, n) in counts.items()}
+
+
+def add_failure_counts(total, counts):
+	"""total += counts (failure_counts of other records); total may be empty."""
+	for name, (hit, n) in counts.items():
+		total[name] = [total.get(name, [0, 0])[0] + hit, total.get(name, [0, 0])[1] + n]
+	return total
+
+
+def failure_counts(records):
+	"""Signs of dumb play in a set of battle records (eval), {name: [times, chances]} (failure_modes: their shares):
 	escape_while_ahead    retreats and surrenders while our value head thought we were winning (V > 0)
 	shooter_not_shooting  of a shooter's decisions where it can shoot at full damage (a legal target within 10 hexes, or
 	                      no distance penalty), those that waste it (2026-10-29, the user): it defends; it moves without
@@ -645,7 +673,7 @@ def failure_modes(records):
 					cast.add(int(t["g_round"][i]))
 			counts["cast_skipped_on_loss"][0] += len(could - cast)
 			counts["cast_skipped_on_loss"][1] += len(could)
-	return {name: round(hit / n, 4) if n else float("nan") for name, (hit, n) in counts.items()}
+	return counts
 
 
 def eval_games(config, battle_map):
@@ -1126,30 +1154,62 @@ def train(config, resume=False):
 	# The model plays from one of two ONNX files: while battles run with one, the next export goes to the other
 	model_files = [out / "model_a.onnx", out / "model_b.onnx"]
 	current = 0
-	pool = None
-	if config.actors:  # actors play all the time; each update takes its battles from their buffer
-		from .actors import ActorPool
-		pool = ActorPool(config, out, generated_games, architecture, trained_epochs=first_epoch - 1)
-		pool.publish(model, lambda path: export(cpu_copy(model), path))
-		pool.start()
-	campaign = None
+	pool = supply = campaign = None
+	if config.actors:  # the supply's workers play all the time (supply.py); each update takes its battles from the pool's buffer
+		from .actors import ActorPool, inference_device, records_of
+		from .inference import InferenceServer
+		from .supply import Supply
+
+		server, stores = None, {}
+		if config.inference_batch_wait_ms > 0:
+			os.environ["ALPHA_INFERENCE_BATCH_WAIT_MS"] = str(config.inference_batch_wait_ms)  # (read by the server processes)
+		if config.inference_endpoints:  # other machines' servers play every game here: no GPU process but this one
+			from campaign_model.learner import campaign_model_kwargs
+			from .inference import ModelStore, parse_endpoints
+
+			endpoints = parse_endpoints(config.inference_endpoints)
+			if "battle" in endpoints:
+				stores["battle"] = ModelStore("battle", endpoints["battle"], architecture)
+			if config.campaign.games and "campaign" in endpoints:
+				stores["campaign"] = ModelStore("campaign", endpoints["campaign"], campaign_model_kwargs(config.campaign, out, resume))
+			# (a family without endpoints gets a server here, on inference_device: e.g. the battle model's on the CPU, the
+			# campaign's on the other machine whose cores it saturates, 2026-10-30)
+			print(f"inference: {config.inference_endpoints} served elsewhere" + (f"; {', '.join(f for f in ('battle', 'campaign') if f not in stores and (f == 'battle' or config.campaign.games))} served here on {config.inference_device}" if len(stores) < 1 + bool(config.campaign.games) else ""), flush=True)
+		elif config.inference == "server" and config.campaign.games:
+			# One server process for both models (one GPU context: on a Windows GPU the trainer loses a time slice to
+			# every other process with work, 2026-10-30), the campaign's device the battle's
+			from campaign_model.learner import campaign_model_kwargs
+
+			from . import play as battle_play
+			from .remote import BATTLE_PORT
+
+			battle_play.SOCKET_DIR.mkdir(parents=True, exist_ok=True)
+			device_name = inference_device(config.inference_device)
+			processes = config.inference_processes or (1 if device_name != "cpu" else max(1, (os.cpu_count() or 4) // 5))
+			server = InferenceServer(
+				battle_play.SOCKET_DIR / f"infer-{os.getpid()}.sock", device=device_name, families=("battle", "campaign"), model_kwargs={"battle": architecture, "campaign": campaign_model_kwargs(config.campaign, out, resume)},
+				threads=config.inference_threads, processes=processes, tcp_port=config.remote_port + BATTLE_PORT if config.remote_port else 0,
+			)
+		pool = ActorPool(config, out, generated_games, architecture, trained_epochs=first_epoch - 1, server=stores.get("battle") or (server.view("battle") if server else None))
+		pool.publish(model)
 	if config.campaign.games:  # the campaign model, trained alongside: its games' battles are our real battles
 		if not pool or not pool.server:
 			raise ValueError("campaign training needs actors=true and inference=server")
 		from campaign_model.learner import CampaignLearner
 
 		try:
-			campaign = CampaignLearner(config.campaign, out, device if config.campaign.device == "auto" else torch.device(config.campaign.device), pool, resume=resume)
-			if campaign.eval_due():  # the campaign model as the run starts, against Nullkiller2
-				pool.pause()
-				campaign.evaluate(first_epoch - 1)
-				pool.resume()
+			campaign = CampaignLearner(config.campaign, out, device if config.campaign.device == "auto" else torch.device(config.campaign.device), pool, resume=resume, server=stores.get("campaign") or (server.view("campaign") if server else None))
 			campaign.start()
 		except BaseException:
 			if campaign:
 				campaign.close()
 			pool.close()
 			raise
+	if pool:
+		supply = Supply(config, out, pool, campaign)
+		supply.start()
+		if campaign and campaign.eval_due():  # the campaign model as the run starts, against Nullkiller2 (beside training)
+			campaign.start_eval(first_epoch - 1)
 	hub = None
 	if config.remote_port and pool:  # workers on other machines
 		from .remote import Hub
@@ -1177,9 +1237,15 @@ def train(config, resume=False):
 			elif config.target_kl:
 				for group in optimizer.param_groups:
 					group["lr"] = config.learning_rate * lr_scale
-			actor_stats = {}
+			actor_stats, items = {}, None
 			if pool:
-				records, actor_stats = pool.take(config.decisions_per_update)
+				# Whichever is ready first: the battles of an update, or (learner "turns") a campaign update while they are not
+				while items is None:
+					items, actor_stats = pool.take(config.decisions_per_update, stop=(lambda: campaign.ready()) if campaign and config.campaign.learner == "turns" else None)
+					if items is None:
+						campaign.step(epoch - 1)
+						campaign.check()
+				records = []
 			else:
 				records = producer.take()
 			waited = time.time() - started
@@ -1193,17 +1259,27 @@ def train(config, resume=False):
 				advantage_config = replace(advantage_config, outcome_share=a.outcome_share_max - (a.outcome_share_max - a.outcome_share) * trust)
 			if a.fade_round_heads:
 				advantage_config = replace(advantage_config, policy_heads=tuple(w * (1 - trust) for w in a.policy_heads[:-1]) + (a.policy_heads[-1],))
-			loader, summaries, _ = make_dataloader(records, config.batch_size, True, reward_config, advantage_config)
+			if pool:  # the workers prepared each battle's arrays (supply.prepare): joined, the advantages normalised over the update
+				from .supply import assemble
+
+				batch_all, summaries = assemble(items, advantage_config)
+				n_examples = int(batch_all["advantage"].shape[0]) if batch_all is not None else 0
+			else:
+				loader, summaries, _ = make_dataloader(records, config.batch_size, True, reward_config, advantage_config)
+				examples = loader.dataset
+				batch_all = collate(examples, widen=False) if examples else None
+				n_examples = len(examples)
 
 			weights_before = flat_weights(model)
 			parts_sum, batches = {key: torch.zeros((), device=device) for key in ("policy", "value", "entropy", "below_floor", "approx_kl", "clip_fraction", *(f"foresight_{k}" for k in FORESIGHT_PARTS))}, 0
 			gradient_check = {}
 			trained = time.time()
 			model.train()
-			examples = loader.dataset
+			examples = range(n_examples)  # (its length: the update's decisions)
 			# Every decision of the epoch, moved to the GPU once, its int64 inputs as int32 (half the bytes to stack and to move:
 			# 1.9 GB of a 3,200-decision update in int64), widened a minibatch at a time
-			epoch_data = to_device(collate(examples, widen=False), device) if examples else None
+			epoch_data = to_device(batch_all, device) if n_examples else None
+			batch_all = None
 			marks = [time.time()]
 			# Every tensor shape on the GPU is fixed: MPS keeps a compiled graph per shape (~100 MB each, never freed), so
 			# a last batch of a new size every epoch filled memory and swap. The last chunk repeats its last decision;
@@ -1301,7 +1377,8 @@ def train(config, resume=False):
 				# handed a training step garbage); give them back after each update
 				torch.mps.empty_cache()
 			if pool:
-				pool.publish(model, lambda path: export(cpu_copy(model), path))
+				pool.publish(model)
+				supply.publish(pool.version)
 			else:
 				current = 1 - current
 				export(cpu_copy(model), model_files[current])
@@ -1332,23 +1409,32 @@ def train(config, resume=False):
 				"train_seconds": round(train_seconds, 1),
 				**{f"{part}_seconds": round(b - a, 2) for part, a, b in zip(("data", "prepass", "steps", "publish"), [trained] + marks, marks)},
 				**{k: actor_stats.get(k, "") for k in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow")},
+				**(supply_columns(supply.status()) if supply else {}),
 				"learning_rate": round(optimizer.param_groups[0]["lr"], 8),
 				"ppo_steps": batches,
 				"update_kl": round(kl_sum / max(batches, 1), 5),  # KL(start of the update || during it), what the KL control uses
 				"outcome_share": round(advantage_config.outcome_share, 3),
 				"round_head_weight": round(float(advantage_config.policy_heads[2]), 3),
 				**value_gains(model),
-				**{f"train_{k}": v for k, v in failure_modes(records).items()},  # the same signs of dumb play, in training
+				**{f"train_{k}": v for k, v in (failure_modes(counts=sum_failure_counts(items)) if pool else failure_modes(records)).items()},  # the same signs of dumb play, in training
 				**{f"foresight_{k}": round(mean[f"foresight_{k}"], 5) for k in FORESIGHT_PARTS},
 				**gradient_check,
 			}
 			for side, name in ((0, "attack"), (1, "defence")):
-				kinds = Counter(ActionType(a["type"]).name for r in records if r.events[0]["our_side"] == side for a in r.actions)
+				kinds = Counter()
+				if pool:
+					for item in items:
+						if item["summary"].our_side == side:
+							kinds.update(item["actions"])
+				else:
+					kinds = Counter(ActionType(a["type"]).name for r in records if r.events[0]["our_side"] == side for a in r.actions)
 				total = max(sum(kinds.values()), 1)
 				for kind in ACTION_KINDS:
 					row[f"{name}_share_{kind.lower()}"] = round(kinds[kind] / total, 4)
 			if config.eval_every and epoch % config.eval_every == 0 and config.opponent == play.SELF_PLAY:
-				write_traces(out, epoch, "selfplay", records[:2])  # one self-play battle, seen from both sides
+				traced = records_of(items)[:2] if pool else records[:2]
+				if traced:
+					write_traces(out, epoch, "selfplay", traced)  # a self-play battle, seen from both sides
 			for name, side_summaries in (("attack", by_side[0]), ("defence", by_side[1])):
 				raw = mean_of([s.reward for s in side_summaries])
 				row[f"{name}_reward"] = round(to_scale(raw, reward_config), 4)
@@ -1377,6 +1463,8 @@ def train(config, resume=False):
 				campaign.step(epoch)  # an update of the campaign model when its games are in (its own optimizer)
 			elif campaign:
 				campaign.note_epoch(epoch)  # (its updates run in its own thread)
+			if campaign:
+				campaign.check()  # (a background evaluation that failed)
 			if evals.error:
 				raise evals.error
 			idle = not evals.running()
@@ -1395,10 +1483,8 @@ def train(config, resume=False):
 				else:
 					evaluate_now(epoch)
 					last_eval = time.monotonic()
-			if campaign and campaign.eval_due() and not evals.running():  # against Nullkiller2, with the battle actors paused (after a battle eval)
-				pool.pause()
-				campaign.evaluate(epoch)
-				pool.resume()
+			if campaign and campaign.eval_due():  # against Nullkiller2, beside training (the models pinned: learner.evaluate)
+				campaign.start_eval(epoch)
 			save_checkpoint(latest, model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average)
 			if config.checkpoint_every and epoch % config.checkpoint_every == 0:
 				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average)
@@ -1407,10 +1493,33 @@ def train(config, resume=False):
 		evals.close()  # (stopped: no new eval battle; the ones playing end)
 		if hub:
 			hub.close()
+		if supply:
+			supply.close()  # (the workers and their games first: nothing plays against closing servers)
 		if campaign:
 			campaign.close()
 		if pool:
 			pool.close()
+		if config.actors and pool and pool.server is not None and hasattr(pool.server, "server"):
+			pool.server.server.close()  # (the shared server)
+
+
+SUPPLY_COLUMNS = ("battles_here", "battles_remote", "games_here", "games_remote", "game_permits", "games_in_flight")
+
+
+def supply_columns(status):
+	"""The supply's status (supply.Supply.status) as progress.csv columns."""
+	return {
+		"battles_here": status["here"].get("battle", 0), "battles_remote": status["remote"].get("battle", 0),
+		"games_here": status["here"].get("campaign", 0), "games_remote": status["remote"].get("campaign", 0),
+		"game_permits": status["permits"], "games_in_flight": status["in_flight"],
+	}
+
+
+def sum_failure_counts(items):
+	total = {}
+	for item in items:
+		add_failure_counts(total, item["failures"])
+	return total
 
 
 def stop_on_signals():

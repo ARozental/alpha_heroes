@@ -109,25 +109,21 @@ def directory_mb(path):
 	return sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file()) / 2**20 if path else 0.0
 
 
-def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_ai="BattleAI", game_key="g0", settings=(), niceness=0, temperature=1.0, ours=None, our_battle_ai="AlphaBattleAI", stop=None, neutral_ai="BattleAI", difficulty=None):
-	"""Play one game against the inference server at socket_path; returns (records.Game, GameInfo).
+class GameRun:
+	"""One game started in the background: what play() does, in steps, so a caller can do other things meanwhile (the
+	data workers of battle_model/supply.py hand the game's battles on as they end). poll() says whether it is over (and
+	ends its process then); result() gives (records.Game, GameInfo) once it is. The arguments are play()'s."""
 
-	battle_ai plays the players' battles, neutral_ai the wandering monsters' (the game's AI, as in a real game; the
-	monsters cannot flee, so AlphaBattleAI's stalemate retreat never ends a battle where ours keep away: joint2,
-	2026-10-29, battles of 1000+ decisions, mostly DEFEND and MOVE, ~0.4 MB of record each, killed 30-50% of the
-	campaign games through the stall watchdog); settings: more environment (e.g. the battle AI's
-	inference server and record keys). ours: None (every player is our AI), or the colors that are, the others
-	Nullkiller2 with battle_ai while ours fight with our_battle_ai (an evaluation). stop: an Event that ends the game
-	early (training is over). difficulty: the game's (VCMI's 0 easy .. 4 impossible; None: the settings' default, 1), the
-	AI players' resource bonus grows with it."""
-	with battle_play.RecordServer() as server:
+	def __init__(self, socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_ai="BattleAI", game_key="g0", settings=(), niceness=0, temperature=1.0, ours=None, our_battle_ai="AlphaBattleAI", neutral_ai="BattleAI", difficulty=None):
+		self.server = battle_play.RecordServer()
+		self.map_name, self.days, self.ours = map_name, days, ours
 		env = dict(os.environ)
 		ai = {"adventureEnemyAI": "AlphaMapAI", "adventureAlliedAI": "AlphaMapAI", "combatEnemyAI": battle_ai, "combatAlliedAI": battle_ai, "combatNeutralAI": neutral_ai}
 		if ours is not None:
 			ai.update(adventureEnemyAI="Nullkiller2", adventureAlliedAI="Nullkiller2")
 		env.update(
 			ALPHA_MAP_INFERENCE_SOCKET=str(socket_path),
-			ALPHA_MAP_RECORD_SOCKET=str(server.path),
+			ALPHA_MAP_RECORD_SOCKET=str(self.server.path),
 			ALPHA_MAP_RECORD_FORMAT="2",  # each decision compressed apart, kept as it comes (records.py)
 			ALPHA_MAP_GAME_KEY=game_key,
 			ALPHA_MAP_DAYS=str(days),
@@ -145,28 +141,59 @@ def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_
 		command = [str(ROOT / "scripts" / "headless.sh"), map_name, str(max_seconds), str(max_mb), "60"]
 		if niceness:
 			command = ["nice", "-n", str(niceness)] + command  # (nice execs the script: the same process id)
-		started = time.time()
-		process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-		status = "the game ended"
-		while process.poll() is None:
-			time.sleep(0.25)
-			if finished(server.records, days, ours):
-				status = f"stopped at day {latest_day(server.records)}"
-				break
-			if stop is not None and stop.is_set():
-				status = "stopped: training is over"
-				break
-		if process.poll() is None:
-			process.terminate()  # headless.sh kills the client on its way out
-		output = process.communicate(timeout=60)[0]
-		seconds = time.time() - started
-		if status == "the game ended":
-			status = next((line.split(":", 1)[1].strip() for line in output.splitlines() if line.startswith("status:")), "the game ended")
+		self.started = time.time()
+		self.process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+		self.status = "the game ended"
+
+	def poll(self, stop=None):
+		"""Whether the game is over: its process ended, every one of our players has sent its last records (the process
+		is then ended), or stop (an Event) is set (training is over)."""
+		if self.process.poll() is not None:
+			return True
+		if finished(self.server.records, self.days, self.ours):
+			self.status = f"stopped at day {latest_day(self.server.records)}"
+		elif stop is not None and stop.is_set():
+			self.status = "stopped: training is over"
+		else:
+			return False
+		self.process.terminate()  # headless.sh kills the client on its way out
+		return True
+
+	def terminate(self):
+		"""Ends the game now (a worker stopping): its result still reads what came in."""
+		if self.process.poll() is None:
+			self.status = "stopped: the worker is stopping"
+			self.process.terminate()
+
+	def result(self):
+		"""(records.Game, GameInfo) of the game poll() said was over; closes its record server."""
+		output = self.process.communicate(timeout=60)[0]
+		seconds = time.time() - self.started
+		if self.status == "the game ended":
+			self.status = next((line.split(":", 1)[1].strip() for line in output.splitlines() if line.startswith("status:")), "the game ended")
 		time.sleep(0.3)  # what the last connections still carry
-		messages = server.drain()
-	run = run_dir_of(process.pid)
-	game = collect(messages)
-	return game, GameInfo(map_name, "", seconds, status, str(run), directory_mb(run))
+		messages = self.server.drain()
+		self.server.__exit__(None, None, None)
+		run = run_dir_of(self.process.pid)
+		game = collect(messages)
+		return game, GameInfo(self.map_name, "", seconds, self.status, str(run), directory_mb(run))
+
+
+def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_ai="BattleAI", game_key="g0", settings=(), niceness=0, temperature=1.0, ours=None, our_battle_ai="AlphaBattleAI", stop=None, neutral_ai="BattleAI", difficulty=None):
+	"""Play one game against the inference server at socket_path; returns (records.Game, GameInfo).
+
+	battle_ai plays the players' battles, neutral_ai the wandering monsters' (the game's AI, as in a real game; the
+	monsters cannot flee, so AlphaBattleAI's stalemate retreat never ends a battle where ours keep away: joint2,
+	2026-10-29, battles of 1000+ decisions, mostly DEFEND and MOVE, ~0.4 MB of record each, killed 30-50% of the
+	campaign games through the stall watchdog); settings: more environment (e.g. the battle AI's
+	inference server and record keys). ours: None (every player is our AI), or the colors that are, the others
+	Nullkiller2 with battle_ai while ours fight with our_battle_ai (an evaluation). stop: an Event that ends the game
+	early (training is over). difficulty: the game's (VCMI's 0 easy .. 4 impossible; None: the settings' default, 1), the
+	AI players' resource bonus grows with it."""
+	run = GameRun(socket_path, map_name, days, seed, max_seconds, max_mb, battle_ai, game_key, settings, niceness, temperature, ours, our_battle_ai, neutral_ai, difficulty)
+	while not run.poll(stop):
+		time.sleep(0.25)
+	return run.result()
 
 
 def main():

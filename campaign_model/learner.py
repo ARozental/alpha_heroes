@@ -1,12 +1,12 @@
 """The campaign model's learner in a joint run (the user, 2026-10-27: "training the campaign comes alongside training
 the battle model (that has its own optimizer etc...)"): battle_model/train.py runs it when campaign.games > 0.
 
-	games        config.games self-play games at once, each on a new random map (2-4 players, water and the
-	             underground on, a day cap drawn per game: draw_days): every player our campaign model (this learner's inference server, family
-	             "campaign"), every player's battle our battle model (the battle learner's server; the wandering monsters BattleAI's).
-	             The battles' records go to the battle learner as real games' do (actors.py: its real_share, with the
-	             generated battles, hard cases among them, as the rest, so it does not forget them); the campaign
-	             decisions and the daily ledgers come here
+	games        self-play games, each on a new random map (2-4 players, water and the underground on, a day cap drawn
+	             per game: draw_days), played by battle_model/supply.py's loader workers as this learner takes them (up
+	             to config.games at once on this machine): every player our campaign model (the inference server,
+	             family "campaign"), every player's battle our battle model (the wandering monsters BattleAI's). The
+	             battles go to the battle learner as real games' (actors.py: its real_share, with the generated battles,
+	             hard cases among them, as the rest, so it does not forget them); the finished games come here (_game_done)
 	update       once decisions_per_update decisions of at least min_games_per_update finished games are in: their
 	             labels (labels.py: the real shares and our own growth, the longer heads graded against the shorter
 	             ones' forecasts at each player's day starts, made by the model as it is now: day_starts; the share
@@ -21,12 +21,12 @@ the battle model (that has its own optimizer etc...)"): battle_model/train.py ru
 Logs: <run>/campaign/progress.csv and eval.csv, TensorBoard <run>/tensorboard/campaign (campaign/..., campaign_eval/...),
 checkpoints <run>/campaign/checkpoint_latest.pt (and one per evaluation).
 """
+import copy
 import csv
 import json
 import math
 import multiprocessing
 import os
-import random
 import shutil
 import threading
 import time
@@ -51,12 +51,11 @@ from .labels import (
 	COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
 	label, ladder_targets, pooled_ev, residual_variances,
 )
-from .maps import GAME_MAPS
 from .foresight import labels_of
+from .labeler import Labeler
 from .model import build_model
-from .play import make_map, play
 from .records import NO_EFFECT, decode_fields, decode_inputs
-from .train import load_optimizer, make_optimizer, model_kwargs, ppo_update, usable
+from .train import _prefetched, load_optimizer, make_optimizer, model_kwargs, ppo_update, usable
 
 TYPES = [a.name.lower() for a in c.ActionType]
 FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answer") for part in ("battle", "score", "parts")) + ("foresight_hero_alive", "foresight_hero_army", "foresight_turn")
@@ -64,17 +63,32 @@ COLUMNS = [
 	"version", "epoch", "games", "decisions", "dropped_old", "unsound", "credited", "days", "players", "phi_end", "heroes", "label_mean", "price_mean",
 	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "clip_fraction", "grad_norm", "steps", "learning_rate",
 	*(f"value_ev_d{k}" for k in c.VALUE_OFFSETS), *(f"head_ev_{kind}{k}" for kind in "vg" for k in c.VALUE_OFFSETS), "head_ev_vend", "no_effect", "ai_errors", "failed_actions", "game_failures", "game_maps", "dropped_games",
-	"game_seconds", "record_mb", "seconds", "gpu_mb", *(f"share_{t}" for t in TYPES), *(f"failure_{k}" for k in FAILURES), "no_effect_types", "kinds",
+	"game_seconds", "record_mb", "seconds", "gpu_mb", "label_staleness", *(f"share_{t}" for t in TYPES), *(f"failure_{k}" for k in FAILURES), "no_effect_types", "kinds",
 	# v2's foresight losses (foresight.py) and the gradient check: the shared layers' gradient from the PPO losses and the
 	# foresight's, their cosine, the share of parameters no loss reaches
 	*FORESIGHT_COLUMNS, "grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share",
 ]
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
+DROP_BEYOND = 4  # updates' worth of finished games beyond which the oldest are dropped (_take)
+MAX_LABEL_STALENESS = 2  # model versions: older precomputed labels (labeler.py) are recomputed with the current tables
+
+
+def campaign_model_kwargs(config, out, resume=False):
+	"""What builds the campaign model this run trains: a resumed run's checkpoint says, else the config (model_kwargs);
+	for an inference server made before the learner (battle_model/train.py: one server for both models)."""
+	latest = Path(out) / "campaign" / "checkpoint_latest.pt"
+	if resume and latest.exists():
+		return torch.load(latest, map_location="cpu", weights_only=False)["model_kwargs"]
+	if config.init_from:
+		return torch.load(config.init_from, map_location="cpu", weights_only=False).get("model_kwargs") or model_kwargs(config)
+	return model_kwargs(config)
 
 
 class CampaignLearner:
-	def __init__(self, config, out, device, battle, resume=False):
-		"""out: the run's folder; battle: the battle learner's actors (actors.ActorPool) the games' battles go to."""
+	def __init__(self, config, out, device, battle, resume=False, server=None):
+		"""out: the run's folder; battle: the battle learner's actors (actors.ActorPool: the evaluation's battle settings);
+		server: an inference server view for the family "campaign" (a server shared with the battle model's), or None for
+		one of its own."""
 		self.config = config
 		self.run = Path(out)
 		self.out = self.run / "campaign"
@@ -120,6 +134,12 @@ class CampaignLearner:
 			self.optimizer = make_optimizer(self.model, config)
 			self.model.load_state_dict(state["model"])
 			print(f"campaign: starting from {config.init_from}", flush=True)
+		# The features module on the CPU (its priors' corrections are learned: refreshed after each update) for the
+		# foresight's labels, computed from decoded inputs on the CPU while the model trains on the GPU (learner "turns")
+		self.features_cpu = copy.deepcopy(self.model.features).cpu()
+		# The labels of each game as it arrives, in processes of their own (labeler.py): the trainer's thread never waits
+		self.labeler = Labeler(self.labels, self.empire, foresight=self.kwargs.get("architecture") == "v2")
+		self.label_futures = {}  # id(game) -> its Future (precomputed takes it)
 		if config.learner == "process":
 			self.worker = UpdateProcess(config, self.kwargs, self.model, self.optimizer, self.lr_scale, latest)
 		battle_play.SOCKET_DIR.mkdir(parents=True, exist_ok=True)
@@ -128,13 +148,18 @@ class CampaignLearner:
 		from battle_model import remote
 
 		port = battle.config.remote_port  # (workers on other machines: remote.py)
-		self.server = InferenceServer(battle_play.SOCKET_DIR / f"campaign-{os.getpid()}.sock", device=inference_device(config.inference_device), family="campaign", model_kwargs=self.kwargs, threads=config.inference_threads, processes=config.inference_processes, tcp_port=port + remote.CAMPAIGN_PORT if port else 0)
+		self.own_server = server is None
+		self.server = server or InferenceServer(battle_play.SOCKET_DIR / f"campaign-{os.getpid()}.sock", device=inference_device(config.inference_device), family="campaign", model_kwargs=self.kwargs, threads=config.inference_threads, processes=config.inference_processes, tcp_port=port + remote.CAMPAIGN_PORT if port else 0)
 		self.server.set_model("current", self.version, self.model)
-		self.finished = []  # finished games: (records.Game, play.GameInfo)
+		if self.device.type != "cpu":
+			use_fused(self.optimizer)
+		self.finished = []  # finished games: (records.Game, play.GameInfo), from supply.Supply
 		self.lock = threading.Condition()
 		self.stop = threading.Event()
-		self.running = threading.Event()  # cleared while an evaluation plays: no new self-play game starts
+		self.running = threading.Event()  # (kept for workers on the old protocol: always set, evaluations pause nothing)
 		self.running.set()
+		self.evaluation = None  # the evaluation's thread while one plays (start_eval)
+		self.eval_error = None
 		self.stats = Counter()
 		self.model_lock = threading.Lock()  # the learner thread's update against a checkpoint taken by an evaluation
 		self.battle_epoch = 0
@@ -162,8 +187,7 @@ class CampaignLearner:
 	# ---- games ----
 
 	def start(self):
-		for i in range(self.config.games):
-			self.threads.append(threading.Thread(target=self._game_actor, args=(i,), daemon=True))
+		"""The games are the supply's (battle_model/supply.py); here only the learner thread, in its modes."""
 		if self.config.learner in ("thread", "process"):
 			self.threads.append(threading.Thread(target=self._learn, daemon=True))
 		for thread in self.threads:
@@ -175,9 +199,14 @@ class CampaignLearner:
 			self.lock.notify_all()
 		for thread in self.threads:
 			thread.join(timeout=150)
+		if self.evaluation is not None:
+			self.evaluation.join(timeout=600)
+		if getattr(self, "labeler", None):
+			self.labeler.close()
 		if self.worker:
 			self.worker.close()
-		self.server.close()
+		if self.own_server:
+			self.server.close()
 		self.writer.close()
 
 	def note_epoch(self, epoch):
@@ -201,50 +230,13 @@ class CampaignLearner:
 				with self.lock:
 					self.lock.wait(timeout=5)
 
-	def _game_actor(self, index):
-		config = self.config
-		rng = random.Random(1_000_033 * (config.seed + 1) + 7919 * index + 104_729 * self.version)
-		n = 0
-		while not self.stop.is_set():
-			if not self.running.wait(timeout=1):
-				continue
-			n += 1
-			key = f"{self.key_prefix}c{index}_{n}"
-			players, size, seed = rng.choice(config.players), rng.choice(config.sizes), rng.randrange(1, 2**31)
-			game_map, days = rng.random() < config.game_map_share, draw_days(rng, config)
-			map_name = None
-			try:
-				if game_map:  # one of the game's own maps (kept), else a new generated one (deleted after its game)
-					map_name, players = rng.choice(sorted(GAME_MAPS.items()))
-					size = 36
-				else:
-					map_name, _ = make_map(seed, players, size, config.levels, config.water)
-				# Self-play only: never against Nullkiller2, the evaluation's opponent (the user, 2026-10-30: a model that
-				# learned to exploit its weaknesses is not one to play against)
-				game, info = play(
-					self.server.socket_for(index), map_name, days, seed, max_seconds=config.game_seconds, battle_ai="AlphaBattleAI", game_key=key,
-					settings=self.battle.campaign_settings(index, key, seed), niceness=config.niceness, temperature=config.temperature, stop=self.stop,
-				)
-			except Exception as error:  # one failed game does not stop training
-				self._failed(f"game {key}: {error}")
-				continue
-			finally:
-				if map_name and not game_map:
-					(battle_play.USER_DIR / (map_name + ".vmap")).unlink(missing_ok=True)
-			game.days = days
-			ok = info.status.startswith("stopped") or "exit code 0" in info.status  # (at the cap, or training is over)
-			if self.stop.is_set():
-				shutil.rmtree(info.run_dir, ignore_errors=True)
-				return
-			if ok:
-				shutil.rmtree(info.run_dir, ignore_errors=True)
-			else:  # its records up to then are still used: the labels take the last day it reached as its end
-				self._failed(f"game {key} ({map_name}, {players} players): {info.status} (run {info.run_dir})", info.run_dir)
-			self._game_done(key, map_name, players, game, info, game_map)
-
 	def _game_done(self, key, map_name, players, game, info, game_map):
-		"""A finished game (one of this machine's, or a worker's: remote.Hub) for the next updates."""
+		"""A finished game (one of this machine's, or a worker's: supply.Supply) for the next updates; its labels start now
+		(labeler.py), with the features as they are."""
 		self._log_game(key, map_name, players, game, info)
+		if getattr(self, "labeler", None):
+			game.labels_version = self.version
+			self.label_futures[id(game)] = self.labeler.submit(game, self.features_cpu)  # (not on the game: it is pickled to the labeler after this returns)
 		with self.lock:
 			self.finished.append((game, info))
 			self.stats["games"] += 1
@@ -275,15 +267,28 @@ class CampaignLearner:
 
 	# ---- updates ----
 
-	def _take(self):
-		"""The games of the next update (oldest first), or None while too few have finished. Games beyond two updates'
-		worth wait for none: the oldest are dropped (counted), so a learner slower than its games trains on recent
-		play, not on an ever older backlog."""
+	def waiting_decisions(self):
+		"""Decisions of the finished games no update has taken (the supply's permits keep them under `ahead` updates' worth)."""
+		with self.lock:
+			return sum(len(g.decisions) for g, _ in self.finished)
+
+	def ready(self):
+		"""Whether an update's games are in (what _take would take)."""
 		config = self.config
 		with self.lock:
-			while len(self.finished) > config.min_games_per_update and sum(len(g.decisions) for g, _ in self.finished[1:]) >= 2 * config.decisions_per_update:
+			return len(self.finished) >= config.min_games_per_update and sum(len(g.decisions) for g, _ in self.finished) >= config.decisions_per_update
+
+	def _take(self):
+		"""The games of the next update (oldest first), or None while too few have finished. The supply starts games only
+		while the finished and running ones hold under `ahead` updates' worth (supply.Supply.allow), so nothing is played
+		to be dropped; beyond DROP_BEYOND updates' worth (a safety: games already in flight when the learner stalled) the
+		oldest are dropped (counted)."""
+		config = self.config
+		with self.lock:
+			while len(self.finished) > config.min_games_per_update and sum(len(g.decisions) for g, _ in self.finished[1:]) >= DROP_BEYOND * config.decisions_per_update:
 				self.stats["dropped_games"] += 1
-				self.finished.pop(0)
+				dropped, _ = self.finished.pop(0)
+				getattr(self, "label_futures", {}).pop(id(dropped), None)
 			taken, decisions = [], 0
 			for game, info in self.finished:
 				if len(taken) >= config.min_games_per_update and decisions >= config.decisions_per_update:
@@ -315,24 +320,33 @@ class CampaignLearner:
 		decisions, targets, labels, growth, returns, advantages, errors, players, forecasts, row = [], [], [], [], [], [], [], [], [], Counter()
 		end = {"targets": [], "real": [], "step": [], "week": [], "price": []}
 		for g, game in enumerate(played):
-			t, mixed, price = label(game, self.labels, self.empire)
-			z = growth_labels(game, self.empire)
+			# The labeler's labels, as the game arrived (b1, 2026-10-30: a game's labels from one table version, one update
+			# old, act like a target network); past MAX_LABEL_STALENESS updates they are computed here with today's tables
+			staleness = self.version - getattr(game, "labels_version", self.version)
+			row["label_staleness"] = max(row["label_staleness"], staleness)
+			future = getattr(self, "label_futures", {}).pop(id(game), None)
+			pre = precomputed(future, game) if staleness <= MAX_LABEL_STALENESS and future is not None else None
+			if pre is None:
+				t, mixed, price = label(game, self.labels, self.empire)
+				z = growth_labels(game, self.empire)
+				real = end_labels(game, self.empire)
+				steps = end_steps(game)
+			else:
+				t, mixed, price, z, real, steps = pre["t"], pre["mixed"], pre["price"], pre["z"], pre["real"], (pre["step"], pre["week"])
 			graded, grown = ladder_targets(game, t, z, starts[g], trust, self.config.outcome_share_min)
-			real = end_labels(game, self.empire)
 			forecasts.append(start_forecasts(starts[g], t, z, real))
 			fresh = np.array([d.version >= self.version - self.config.max_record_age for d in game.decisions])
 			row["dropped_old"] += int((~fresh).sum())
 			# The end credit's steps, as rows of this update (a decision after a fresh one is fresh: versions only grow)
 			rows = np.where(fresh, len(decisions) + np.cumsum(fresh) - 1, -1)
-			for name, index in zip(("step", "week"), end_steps(game)):
+			for name, index in zip(("step", "week"), steps):
 				end[name].append(np.where(index >= 0, rows[np.maximum(index, 0)], -1)[fresh])
 			end["targets"].append(end_targets(game, real, starts[g], trust.get("Vend", 0.0), self.config.outcome_share_min)[fresh])
 			end["real"].append(real[fresh])
 			end["price"].append(price[fresh])
 			decisions += [d for d, keep in zip(game.decisions, fresh) if keep]
 			if foresight is not None:
-				with self.model_lock:
-					rows = labels_of(game, self.model.features)
+				rows = pre["foresight"] if pre is not None and "foresight" in pre else labels_of(game, self.features_cpu)
 				foresight.append({name: value[fresh] for name, value in rows.items()})
 			targets.append(graded[fresh])
 			labels.append(t[fresh])
@@ -373,6 +387,7 @@ class CampaignLearner:
 				self.version += 1
 				self.server.set_model("current", self.version, self.model)
 				self.games_used += len(games)
+				self._refresh_features()
 		else:
 			with self.model_lock:
 				metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight)
@@ -381,16 +396,34 @@ class CampaignLearner:
 				self.version += 1
 				self.server.set_model("current", self.version, self.model)
 				self.games_used += len(games)
+				self._refresh_features()
 				self._note_value_ev(metrics)
 				self._save(self.out / "checkpoint_latest.pt")
 		if self.worker:  # (the process saved its checkpoint with the trust before this update: one update behind)
 			self._note_value_ev(metrics)
+		self._relabel_waiting()
 		memory.append(("updated", rss_gb()))
 		self._log(epoch, games, decisions, row, metrics, time.time() - started)
 		memory.append(("logged", rss_gb()))
 		if all(value == value for _, value in memory):
 			print("campaign memory (GB, this process): " + "  ".join(f"{stage} {value:.1f}" for stage, value in memory), flush=True)
 		return True
+
+	def _relabel_waiting(self):
+		"""The games still waiting whose labels came from tables MAX_LABEL_STALENESS versions back or more: labelled again
+		now with the new tables, in the labeler (ready by their update; computed in the trainer's thread they were ~27 s
+		of GPU idle an update, 2026-10-31: with ahead=3 and back-to-back updates a game waits ~2 versions)."""
+		if not getattr(self, "labeler", None):
+			return
+		with self.lock:
+			waiting = [game for game, _ in self.finished if self.version - getattr(game, "labels_version", self.version) >= MAX_LABEL_STALENESS]
+		for game in waiting:
+			game.labels_version = self.version
+			self.label_futures[id(game)] = self.labeler.submit(game, self.features_cpu)
+
+	def _refresh_features(self):
+		"""The CPU features' weights as the model's are now (call with model_lock held)."""
+		self.features_cpu.load_state_dict({key: value.detach().cpu() for key, value in self.model.features.state_dict().items()})
 
 	def _note_value_ev(self, metrics):
 		"""The heads the step's estimate uses (V5, V7): their explained variance, its parts pooled over ~10 updates
@@ -489,7 +522,8 @@ class CampaignLearner:
 			"game_seconds": mean([info.seconds for _, info in games]),
 			"record_mb": sum(game.record_bytes for game, _ in games) / 2**20,
 			"seconds": seconds,
-			"gpu_mb": metrics.get("gpu_mb", float("nan")),  # the update's peak on Apple's GPU (train.gpu_held)
+			"gpu_mb": metrics.get("gpu_mb", float("nan")),  # the update's peak on the GPU (train.gpu_held)
+			"label_staleness": sums.get("label_staleness", 0),  # the oldest precomputed labels used, in model versions (labeler.py)
 			**{f"share_{t}": types[t] / max(len(turn), 1) for t in TYPES},
 			**{f"failure_{k}": v for k, v in failure_modes(decisions).items()},  # dumb decisions (failures.py)
 			"kinds": " ".join(f"{k}:{n}" for k, n in sorted(Counter(c.DecisionKind(d.kind).name for d in decisions).items())),
@@ -500,7 +534,7 @@ class CampaignLearner:
 			csv.writer(f).writerow([round(row[k], 6) if isinstance(row[k], float) else row[k] for k in COLUMNS])
 		if row["value_loss_fresh"] == row["value_loss_fresh"]:  # the eval tab's (battle_model/train.py VALUE_LOSS_TAB)
 			self.writer.add_scalar("eval/campaign_value_loss", row["value_loss_fresh"], self.version)
-		for name in ("value_corr", "value_spread", "label_spread", "gpu_anchor_mb", "update_seconds"):
+		for name in ("value_corr", "value_spread", "label_spread", "gpu_anchor_mb", "update_seconds", "prepass_seconds", "wait_seconds", "sync_seconds", "cpu_share", "stopped_pass"):
 			if metrics.get(name, float("nan")) == metrics.get(name, float("nan")):
 				self.writer.add_scalar(f"campaign/{name}", metrics[name], self.version)
 		for kind, gap in sums.get("credit_gaps", {}).items():  # (the credit check's t-statistic per action type)
@@ -520,7 +554,7 @@ class CampaignLearner:
 			"  value ev " + "/".join(f"{row[f'head_ev_v{k}']:+.2f}" for k in c.VALUE_OFFSETS)
 			+ f" (this update {row[f'value_ev_d{c.VALUE_OFFSETS[-1]}']:+.2f}: corr {metrics.get('value_corr', float('nan')):+.2f}, spread {metrics.get('value_spread', float('nan')):.3f} vs {metrics.get('label_spread', float('nan')):.3f})"
 			+ "  growth ev " + "/".join(f"{row[f'head_ev_g{k}']:+.2f}" for k in c.VALUE_OFFSETS) + f"  end ev {row['head_ev_vend']:+.2f} (credit {row['end_credit']:.2f})"
-			+ f"  kl {row['last_kl']:.4f}  steps {row['steps']}  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s)  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})",
+			+ f"  kl {row['last_kl']:.4f}  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%})  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
 			flush=True,
 		)
 
@@ -536,21 +570,57 @@ class CampaignLearner:
 	# ---- evaluation ----
 
 	def eval_due(self):
-		if not self.config.eval_minutes or not self.config.eval_games:
+		if not self.config.eval_minutes or not self.config.eval_games or self.evaluating():
 			return False
 		return self.last_eval is None or time.monotonic() - self.last_eval >= self.config.eval_minutes * 60
 
+	def evaluating(self):
+		return self.evaluation is not None and self.evaluation.is_alive()
+
 	def evaluate(self, epoch):
-		"""Games against Nullkiller2 (evaluate.py) with the current models; no new self-play game starts meanwhile."""
-		self.running.clear()
+		"""Games against Nullkiller2 (evaluate.py) with the models as they are now, pinned as "eval" on both servers so
+		the updates that land meanwhile do not change them under the evaluation (2026-10-30). Training goes on."""
+		with self.model_lock:
+			version = self.version
+			self.server.set_model("eval", version, self.model)
+			self.battle.pin_eval()
 		try:
-			row = evaluate.evaluate(self.config, self.server, self.battle, version=self.version, epoch=epoch, stop=self.stop)
+			row = evaluate.evaluate(self.config, self.server, self.battle, version=version, epoch=epoch, stop=self.stop, model="eval")
 		finally:
-			self.running.set()
 			self.last_eval = time.monotonic()
 		evaluate.log(row, self.out / "eval.csv", self.writer)
-		self.save(self.out / f"checkpoint_{self.version:05d}.pt")
+		self.save(self.out / f"checkpoint_{version:05d}.pt")
 		return row
+
+	def start_eval(self, epoch):
+		"""evaluate() in a thread of its own: training never waits for it (its error is raised by check())."""
+		def run():
+			try:
+				self.evaluate(epoch)
+			except BaseException as error:  # noqa: BLE001 (raised in the training thread)
+				self.eval_error = error
+
+		self.evaluation = threading.Thread(target=run, daemon=True, name="campaign-eval")
+		self.evaluation.start()
+
+	def check(self):
+		"""Raises the background evaluation's error, if one failed."""
+		if self.eval_error is not None:
+			error, self.eval_error = self.eval_error, None
+			raise error
+
+
+def precomputed(future, game=None):
+	"""The labeler's result (its Future, learner._game_done started it), or None: it failed (noted), or it does not match
+	the game's usable decisions (game: checked when given)."""
+	try:
+		pre = future.result(timeout=300)
+	except Exception as error:  # noqa: BLE001 (computed in the trainer's thread instead)
+		print(f"campaign: a game's labels failed in the labeler ({str(error)[:200]}): computed here", flush=True)
+		return None
+	if pre is None or (game is not None and pre["n"] != len(game.decisions)):
+		return None
+	return pre
 
 
 def rss_gb():
@@ -594,16 +664,17 @@ def day_starts(model, games, lock, batch=64):
 				seen.add((d.color, d.day))
 				rows.append((g, i))
 	starts, device = [{} for _ in games], next(model.parameters()).device
-	for k in range(0, len(rows), batch):
-		chunk = rows[k : k + batch]
-		x = decode_inputs([games[g].decisions[i] for g, i in chunk])
+	chunks = [rows[k : k + batch] for k in range(0, len(rows), batch)]
+	# (decoded in threads ahead of the forward, as the update's batches are: ~2,700 day starts an update on the PC, 2.3 GB
+	# of zlib in one thread was several seconds of the trainer's thread, 2026-10-30)
+	for chunk, inputs in _prefetched(chunks, lambda rows_: decode_inputs([games[g].decisions[i] for g, i in rows_]), device):
 		with lock, torch.no_grad():
-			out = model({name: torch.from_numpy(v).to(device) for name, v in x.items()})
+			out = model(inputs)
 		shares = out["value"].float().cpu().numpy()
 		grown = ((2 * torch.sigmoid(out["growth_logit"]) - 1) * GROWTH_CAP).float().cpu().numpy()
 		log_value = np.log(np.maximum(out["phi"].float().cpu().numpy(), PHI_FLOOR))
 		end = torch.sigmoid(out["end_logit"]).float().cpu().numpy()
-		prior = 1.0 / np.maximum(x["g_players"].astype(np.float32), 2.0)
+		prior = 1.0 / np.maximum(inputs["g_players"].float().cpu().numpy(), 2.0)
 		for j, (g, i) in enumerate(chunk):
 			d = games[g].decisions[i]
 			starts[g][(d.color, d.day)] = (i, shares[j], grown[j], float(log_value[j]), float(end[j]), float(prior[j]))

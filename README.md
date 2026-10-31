@@ -57,24 +57,29 @@ eval_details). Training itself is self-play, the wandering monsters BattleAI as 
 
 ### On several machines (one run)
 
-The machine with the GPU (the master) trains; others (workers) play games for it. A worker runs only VCMI: every
-decision is asked of the master's inference servers over the network (~4 KB a battle decision, compressed), and its
-battle records and finished campaign games go to the master (`battle_model/remote.py`, `battle_model/worker.py`).
+The machine with the GPU (the master) trains; others (workers) play games for it, as its data loader asks
+(`battle_model/supply.py`: the master's own cores play first, a remote slot gets a game when they are at their ceiling,
+and no game is played that the learners will not take). A worker runs VCMI and, with `--local`, inference servers on its
+own cores with the master's weights (without it every decision is asked of the master's server over the network, ~4 KB
+a battle decision, compressed); what it made (training arrays, finished games) goes back over the slot's connection
+(`battle_model/remote.py`, `battle_model/worker.py`).
 
 1. Every machine: the same code (`git pull`, the same `vcmi` submodule commit, rebuilt: `cmake --build build`) and the
    game data (`runtime/vcmi-user`, as above; the master refuses a worker whose model contracts differ from its own).
-2. The master: the run with `remote_port` set (it listens there, its battle inference on `remote_port + 1 + i`, the
-   campaign's on `remote_port + 51 + i`):
+2. The master: the run with `remote_port` set (it listens there, its inference server on `remote_port + 1`, the game
+   slots on `remote_port + 100`) and `remote_slots` (loader workers kept for the remote slots):
    ```sh
    .venv/bin/python -m campaign_model.joint --run NAME --hours 12 --machine configs/machines/rtx5090/joint-gpu-free.toml --set remote_port=7700
    ```
    The first such run writes the shared secret to `runtime/remote-token`; copy it to each worker's `runtime/`.
-3. Each worker, its own sizes (`configs/machines/<machine>/worker.toml` or `--set generated_actors=N campaign.games=M`):
+3. Each worker, its own sizes (`configs/machines/<machine>/worker.toml`: `remote_slots`, its games at once at most;
+   `inference_processes`, `[campaign] inference_processes` for `--local`):
    ```sh
-   .venv/bin/python -m battle_model.worker --master <master's address> --machine configs/machines/mac-m4/worker.toml
+   .venv/bin/python -m battle_model.worker --master <master's address> --machine configs/machines/mac-m4/worker.toml --local
    ```
    It waits for the master and reconnects after a stop and resume of the run. The master logs `remote: worker ... joined`
-   and, when one leaves, what it played.
+   and, when one leaves, what it played. From the Mac to the PC: `runtime/mac_slots.sh <unit>` (an SSH tunnel to WSL's
+   address for ports 7700, 7701 and 7800, the worker, and a stop with the PC's unit).
 4. The master in WSL2 (the RTX 5090 PC): other machines reach WSL only with mirrored networking (`networkingMode=mirrored`
    under `[wsl2]` in `C:\Users\<you>\.wslconfig`, then `wsl --shutdown`: it stops every WSL process) or a
    `netsh interface portproxy` per port. Inbound TCP 7700-7760 must pass Windows' firewall and, in mirrored mode, WSL's

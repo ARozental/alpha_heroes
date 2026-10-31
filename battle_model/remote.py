@@ -1,28 +1,34 @@
 """Training on several machines (2026-10-29): the master (the machine with the GPU: the learners, the inference servers,
 the evals) also trains on what workers on other machines play (worker.py). A worker runs only games: generated battles
-and campaign games, every decision asked of the master's inference servers over the network (no model and no GPU on
-the worker; a decision's request and reply are ~4 KB compressed), its records sent here. So the workers' cores go to
-VCMI alone, the work the master's own cores are too few for once the GPU trains faster than they play.
+and campaign games, every decision asked of inference servers (its own, with the master's weights: --local; or the
+master's over the network), what it made sent back. So the workers' cores go to VCMI, the work the master's own cores
+are too few for once the GPU trains faster than they play.
 
 	the master   battle_model.train / campaign_model.joint with remote_port (e.g. 7700): this Hub listens there, the
-	             battle inference servers on remote_port + 1 + i, the campaign's on remote_port + 51 + i
-	a worker     .venv/bin/python -m battle_model.worker --master <host>   (worker.py: its sizes, its token)
+	             inference server on remote_port + 1 (+ i a process), the game slots on remote_port + SLOT_PORT
+	a worker     .venv/bin/python -m battle_model.worker --master <host> --slots N --local   (worker.py: its sizes, its token)
 
-The hub's protocol, over TCP, every frame a u64 length and that many bytes:
+Since 2026-10-30 the games are asked, not pushed (supply.py): a worker holds `slots` connections open on the master's
+slot port, and the master's loader workers take one when they have a game to place there, send its spec, and read
+back what it made ("item" frames: supply.prepare's items and the finished game), then close it; the worker connects
+again. So a remote machine plays exactly what the master's learners will take, and the master's own cores play first.
+
+The hub (this file) is the control channel, over TCP, every frame a u64 length and that many bytes:
 	hello     worker: json {"protocol", "token", "name", "contracts": {family: hash}, "models": whether it serves its
 	          own games}; hub: json {"ok", "number", "name", "config" (the run's TrainConfig), "battle_ports",
 	          "campaign_ports", "model_kwargs": {family: kwargs}} or {"error"}. Only then pickles: a worker without the
 	          run's token never gets one unpickled
 	then      zlib (level 1) of a pickle, a tuple each:
-	          worker: ("battle", records, source, game)   checked and compacted records (ActorPool._check), for the buffer
-	                  ("campaign", key, map, players, game, info, game_map)   a finished campaign game (CampaignLearner)
-	                  ("failed", kind, message)   a battle or a game that failed (the actors' failure count)
-	          hub:    ("state", {...})   every STATE_SECONDS: the model's version, the league, whether to play (evals
-	                  pause generated battles), whether the buffer has room for generated battles (backpressure)
+	          worker: ("failed", kind, message)   a battle or a game that failed outside a slot (the failure count)
+	                  ("played", kind, decisions)   a slot's game done (the hub's count of what each worker played)
+	          hub:    ("state", {...})   every STATE_SECONDS: the models' versions, the league
 	                  ("models", family, {name: (version, state) or None})   to a worker with "models": the weights
 	                  the master's servers serve that changed since the last (None: dropped), before the state that
 	                  names them. Its games then ask its own servers on its own cores (2026-10-30: the master's CPU
 	                  servers were the limit, the Mac's cores idle at 16 ms a round trip)
+	a slot    (supply.py's loader worker <-> worker.py's slot thread, on remote_port + SLOT_PORT): the worker's hello
+	          (json, as above, without "models") and the master's {"ok"}; then pickles: master ("play", spec), worker
+	          ("item", item)..., ("done",) or ("failed", message)
 
 The token: TrainConfig.remote_token, else runtime/remote-token (made on the master's first remote run; copy it to each
 worker's runtime/). The records are the master's model versions, so the buffer's staleness rules hold for them alike.
@@ -38,8 +44,9 @@ import zlib
 from dataclasses import asdict
 from pathlib import Path
 
-PROTOCOL = 1
+PROTOCOL = 2
 BATTLE_PORT, CAMPAIGN_PORT = 1, 51  # the inference servers' ports past the hub's: remote_port + these + process
+SLOT_PORT = 100  # the game slots' port past the hub's (supply.py: a worker's connection waits there for a game to play)
 STATE_SECONDS = 1.0
 ROOT = Path(__file__).resolve().parent.parent
 TOKEN_FILE = ROOT / "runtime" / "remote-token"
@@ -131,16 +138,7 @@ class Hub:
 
 	def state(self):
 		pool, campaign = self.pool, self.campaign
-		with pool.lock:
-			room = pool.generated_waiting() < pool.generated_room()
-		return {
-			"version": pool.version,
-			"running": pool.running.is_set(),
-			"league": pool.past_versions(),
-			"room": room,
-			"campaign_version": campaign.version if campaign else 0,
-			"campaign_running": campaign.running.is_set() if campaign else False,
-		}
+		return {"version": pool.version, "league": pool.past_versions(), "campaign_version": campaign.version if campaign else 0}
 
 	def _accept(self):
 		while not self.stop.is_set():
@@ -178,23 +176,17 @@ class Hub:
 			while not self.stop.is_set():
 				message = read_message(conn)
 				kind = message[0]
-				if kind == "battle":
-					_, records, source, game = message
-					self.pool._add(records, source, f"{name}:{game}", checked=True)
-					with self.lock:
-						self.workers[name]["battles"] += 1
-						self.workers[name]["decisions"] += sum(r.decisions for r in records)
-				elif kind == "campaign" and self.campaign:
-					_, key, map_name, players, game, info, game_map = message
-					self.campaign._game_done(key, map_name, players, game, info, game_map)
-					with self.lock:
-						self.workers[name]["games"] += 1
-				elif kind == "failed":
+				if kind == "failed":
 					_, what, text = message
 					if what == "campaign" and self.campaign:
 						self.campaign._failed(f"{name}: {text}")
 					else:
 						self.pool._failed(f"{name}: {text}")
+				elif kind == "played":
+					_, what, decisions = message
+					with self.lock:
+						self.workers[name]["games" if what == "campaign" else "battles"] += 1
+						self.workers[name]["decisions"] += decisions
 		except (ConnectionError, OSError, EOFError, ValueError, pickle.UnpicklingError, zlib.error) as error:
 			if name:
 				with self.lock:

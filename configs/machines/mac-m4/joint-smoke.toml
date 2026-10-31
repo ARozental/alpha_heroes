@@ -1,0 +1,22 @@
+# A joint run's smallest shape on the MacBook Pro M4, to see the supply (supply.py) work end to end:
+#   .venv/bin/python -m campaign_model.joint --run smoke --hours 0.1 --machine configs/machines/mac-m4/joint-smoke.toml
+#     --set campaign.model_architecture=v2 campaign.model_cell_dim=16
+# Inference on the CPU (Apple's GPU is slower for these small batches), the campaign updates in the trainer's thread.
+eval_workers = 4
+generated_actors = 2
+inference_device = "cpu"
+inference_processes = 2
+decisions_per_update = 800
+buffer_decisions = 4000
+
+[campaign]
+games = 2
+learner = "turns"
+inference_device = "cpu"
+inference_processes = 2
+decisions_per_update = 1500
+min_games_per_update = 1
+eval_minutes = 0
+days_min = 7
+days_tail = 3.0
+days_max = 14

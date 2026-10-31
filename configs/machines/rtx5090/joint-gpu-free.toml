@@ -2,49 +2,61 @@
 #   .venv/bin/python -m campaign_model.joint --run NAME --machine configs/machines/rtx5090/joint-gpu-free.toml
 #
 # Machine: RTX 5090 32 GB (Windows WDDM driver 610.88; torch 2.14.1+cu130), AMD Ryzen 9 9900X 12 cores / 24 threads,
-#   31 GB RAM; Windows 11 + WSL2 Ubuntu 26.04 capped at 20 GB RAM + 8 GB swap (C:\Users\Owner\.wslconfig), repo on
+#   31 GB RAM; Windows 11 + WSL2 Ubuntu 26.04 capped at 28 GB RAM + 8 GB swap (C:\Users\Owner\.wslconfig), repo on
 #   WSL's ext4.
-# Case: nothing else on the GPU; WSL's ~19 GB for us.
+# Case: nothing else on the GPU; WSL's ~27 GB for us.
 #
-# NOT MEASURED YET (2026-10-29: Zonkey was training) - an estimate from joint-gpu-shared.toml's measurements:
-#   - RAM is the limit: the Mac's 6 games and 8 actors peaked at 16.7 GB here (beside Zonkey's ~3 GB: killed); alone
-#     that is about all of WSL's 20 GB with nothing left for the hourly evals. 4 games and 8 actors should leave ~3 GB.
-#   - campaign updates need 8,192 decisions of >= 4 games: fewer than 4 games at once starves the campaign learner.
-#   - inference on the GPU (a few ms alone, to check) leaves the cores to the games; the campaign's inference server
-#     too since 2026-10-29 ([campaign] below; it was always on the CPU).
-#   - More games: give WSL more memory (.wslconfig: memory=26GB, then `wsl --shutdown`; that stops every WSL process,
-#     Zonkey's too), then try the Mac's 6 games and 8 actors.
-# To measure: runtime/measure.sh joint-free campaign_model.joint --run measure-joint-free --battle-from <checkpoint>
-#   --machine <this file>, and runtime/memwatch.sh alpha-measure; note update seconds and peak memory here.
-# generated_actors: the recipe's (4 since the campaign focus, 2026-10-29; its 8 campaign games are more than the 4 here).
-# MEASURED 2026-10-30 (joint5 resumed here, the Mac a worker with --local):
-#   - Inference on the GPU needs CUDA graphs (inference.py, ffa3f91): an eager forward was ~35 ms of launches at any
-#     batch up to 64 under WSL, and with several server processes (or the learner) beside it ~200 ms; graphed, one
-#     process serves ~800 campaign decisions/s (32 one-decision clients) and ~1300 battle ones (24). On the CPU a
-#     campaign decision costs ~13-19 ms of a core here, a battle one 6-11 ms (12 processes: all cores, ~9 GB).
-#   - RAM: WSL 28 GB (.wslconfig, raised with the user's leave). The memory guard stopped three starts: a whole game's
-#     inputs decompressed at once for labels (fixed, e7014c1), then the campaign learner at 256 decisions a micro-batch
-#     (v2: ~90 MB of activations a decision; 30.8 GB of the GPU, 10 GB of host for its buffers).
-eval_workers = 8
-inference_device = "cuda"
-inference_processes = 1
-buffer_decisions = 6000
+# Since 2026-10-30 (supply.py): one trainer process holds both models and trains them in turns (campaign.learner
+# "turns"), the games are played by a DataLoader's worker processes, as many at once as the ceilings below while the
+# learners take them (no game is played to be dropped), and one inference server process serves both models.
+# MEASURED 2026-10-30 (the GPU alone, runtime/bench_mixed.py):
+#   - the campaign step: 146 ms a 128-decision micro-batch eager (~875 decisions/s); the battle step 36 ms a 256 (7,100/s).
+#   - inference beside the trainer: a second process on the GPU costs the trainer 54% of its steps when it answers
+#     requests as they come, ~40% when it waits 10-15 ms to batch them (inference_batch_wait_ms); the Windows GPU is
+#     time-sliced between processes by demand. In the trainer's own process (a thread) it cost 12x (the interpreter
+#     lock); on the CPU a campaign decision is 26 ms of a core under load (38/s a core: too slow for the games here).
+#     So: one server process on the GPU, batching, for both models.
+#   - RAM is the limit on games: a campaign game's VCMI client 0.35-0.8 GB, a battle actor's 0.2-1.3 GB, the trainer
+#     ~5 GB, the server ~3 GB, a loader worker ~0.1-0.3 GB. The workers start no game under 3 GB available.
+eval_workers = 4  # (8 battle processes of an eval were ~2.4 GB at the memory floor, 2026-10-31)
+# The battle model's inference on this machine's CPU (3 processes, ~13 ms a decision each: the battles need ~150
+# decisions/s), the campaign's on the Mac (runtime/joint5_endpoints.sh: inference_endpoints), whose cores it saturated
+# with 7 processes while its battle servers idled (2026-10-30 23:45). Without endpoints: one CUDA server for both
+inference_device = "cpu"
+inference_processes = 3
+inference_batch_wait_ms = 0
+buffer_decisions = 8000
+# Generated battles at once here, at most (the learner's demand decides how many play: supply.py). With the Mac serving
+# the inference (inference_endpoints), the battle learner waited 10-17 s an update on 6 (2026-10-30), 11 GB of RAM free
+generated_actors = 8
+# Loader workers kept for the Mac's game slots (worker.py --slots): 2 slots there, its cores on inference
+remote_slots = 2
+# Three updates' worth of campaign games finished and in flight (supply.py): with two, the permits emptied the pipeline
+# during each 150 s update (5 of 20 games running) and the trainer then waited for the next batch of games (GPU 62%
+# against 74%, 2026-10-31 01:14). Labels of games waiting two versions are redone in the labeler (learner._relabel_waiting)
+ahead = 3.0
 
 [campaign]
-games = 12
-# The campaign's inference on the GPU, graphed (above): one process batches every game's requests
+# Campaign games at once here, at most (a VCMI client ~0.15 GB and its loader worker ~0.17 GB real). 24 reached the memory
+# floor with 10 battle actors and 8-process evals (2026-10-31 00:29); with 8 actors and 4-process evals 20 left 8 GB free
+games = 24
+learner = "turns"
 inference_device = "cuda"
 inference_processes = 1
-# 128 decisions a micro-batch (the batch's parts' gradients summed: the same gradient): a step's cost under WSL is its ops' launches
-# (~2.3 s a micro-batch whatever its size, 60 ms of it the GPU's, 2026-10-30), so a bigger part is nearly free; at 256 the v2 model filled the
-# 32 GB GPU and took 10 GB of host memory (2026-10-30)
+# 128 decisions a micro-batch: ~10.7 GB of the GPU. 256 (micro_batches 2) filled the card's 32 GB (an 18 GB peak of live
+# tensors plus the allocator's reserve and the graphs' pools) and the step was 1.5x slower a decision (2026-10-31 01:45)
 batch_size = 512
 micro_batches = 4
-# The no-gradient first pass in 256s: its cost is likewise launches (~0.8 s a batch at 128, a quarter of an update)
 prepass_batch = 256
-# One pass over twice the decisions (24+ games an update): the learner trains ~1/8 of what the games play (2026-10-30:
-# 453 decisions/s played on the PC and the Mac, ~54 trained), so fresh games instead of each seen twice
-passes = 1
+# The campaign training graphs (graphs.py): the real update was launch-bound in eager mode (the trainer's thread on the
+# CPU 64% of the update, the GPU done before the next kernel came; the 146 ms benchmark used sparse synthetic states).
+# Validated 2026-10-30 (runtime/check_graphs.py, allow_unused_input): gradients match eager to 5e-4, a whole update 3.5x
+cuda_graphs = true
+# Two passes over 32,768 decisions of 20+ games an update (b1, 2026-10-31: the better use of an idle GPU; the KL stop
+# bounds the drift). Conditions: the update must stay shorter than the gap between updates (else the permits hold games
+# back), and the second pass must not be cut short by the KL stop in most updates (stopped_pass in the log and
+# TensorBoard: then back to 1). One pass before (fresh games rather than each seen twice; the games were then plenty)
+passes = 2
 decisions_per_update = 32768
 min_games_per_update = 20
-eval_parallel = 8
+eval_parallel = 4  # (the memory floor: 8 games at once were ~1.3 GB during an eval)

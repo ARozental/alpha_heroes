@@ -99,9 +99,10 @@ def score(game, color, players, days, empire=EmpireConfig()):
 	}
 
 
-def evaluate(config, server, battle, version, epoch, stop=None):
-	"""Play the evaluation games at once; returns the eval row. server: the campaign model's inference server;
-	battle: the battle learner's actors (actors.ActorPool.eval_settings: our battles, greedy, unrecorded)."""
+def evaluate(config, server, battle, version, epoch, stop=None, model="current"):
+	"""Play the evaluation games at once; returns the eval row. server: the campaign model's inference server, model:
+	the name it serves the evaluated weights under; battle: the battle learner's actors (actors.ActorPool.eval_settings:
+	our battles, greedy, unrecorded)."""
 	started = time.time()
 	games = setups(config.eval_games)
 	results = [None] * len(games)
@@ -117,7 +118,7 @@ def evaluate(config, server, battle, version, epoch, stop=None):
 			name = eval_map(seed, players, config)
 			game, info = play(
 				server.socket_for(i), name, config.eval_days, seed, max_seconds=config.eval_seconds, battle_ai="BattleAI", game_key=f"e{i}",
-				settings=battle.eval_settings(i), temperature=config.eval_temperature, ours=(color,), stop=stop,
+				settings=battle.eval_settings(i) + (("ALPHA_MAP_MODEL", model),), temperature=config.eval_temperature, ours=(color,), stop=stop,
 			)
 			results[i] = {**score(game, color, players, config.eval_days), "setup": i, "seed": seed, "map": name, "color": color, "temperature": config.eval_temperature, "empire": EMPIRE_VERSION, "seconds_limit": config.eval_seconds, "status": info.status, "seconds": round(info.seconds, 1), "failures": failure_counts(game.decisions)}
 			if info.status.startswith("stopped at day") or "exit code 0" in info.status:

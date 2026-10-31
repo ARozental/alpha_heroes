@@ -1,0 +1,605 @@
+"""Training data as a DataLoader makes it (the user, 2026-10-30: "all map creations triggered by workers from an
+IterableDataLoader ... the PyTorch way to ensure maximum efficiency for the GPU"): the games are the dataset, a
+DataLoader's worker processes play them and turn their records into training arrays, and the trainer pulls what it
+will train on, so no game is played to be dropped and none of this work shares the trainer's interpreter lock
+(2026-10-30, the PC: threads beside the trainer's eager launches slowed its step 12x).
+
+	Games          an IterableDataset of one kind: generated battles ("battle") or campaign games ("campaign"). Each
+	               worker (num_workers of them) plays one game at a time and yields what it made: for a battle, each
+	               side's item (its arrays, its summary, its failure counts); for a campaign game, every battle's item
+	               as it ends (source "real": the battle learner trains on them fresh) and then the game itself
+	where          before each game a worker decides where it plays: here while this machine's games of the kind are
+	               under its ceiling (the machine config's count) and memory is left (MEMORY_FLOOR_GB), else on a
+	               remote machine's slot (a worker there holds a connection open on remote_port + SLOT_PORT until it is
+	               given a game: worker.py --slots), else it waits. So the local cores are used first and the remote
+	               ones for the shortfall, and the remote plays exactly the games asked of it
+	throttle       generated battles: the loader's prefetch (prefetch_factor 1: a worker that has yielded one battle
+	               plays no other until the trainer took it) and the trainer's room for them (ActorPool.generated_room:
+	               what the next `ahead` updates take of generated battles, less than that while campaign battles are
+	               plenty). Campaign games cannot wait mid-game (their battles must flow), so they are throttled at
+	               the start: a worker starts one with a permit, which the trainer gives while the games finished and
+	               in flight hold less than `ahead` updates' worth of decisions (Supply.allow)
+	Supply         the trainer's side: the loaders, their threads that pull items into the learners (ActorPool's
+	               buffer, CampaignLearner's finished games), the shared counters, the listener for remote slots
+
+Items are plain dicts of numpy arrays and numbers (pickled by value between the processes; a battle's is a few MB).
+"""
+import json
+import math
+import multiprocessing
+import os
+import random
+import secrets
+import signal
+import socket
+import sys
+import threading
+import time
+import traceback
+from collections import Counter
+from dataclasses import replace
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+
+from . import generator, play, remote
+from .constants import MAX_UNITS, N_HEXES, ActionType
+from .data import SPARSE_INPUTS, Sparse, battle_examples, check_record, collate, compact_record, version_of
+from .losses import normalize_advantages
+
+MEMORY_FLOOR_GB = 4.5  # no new game here under this much available memory (Linux; elsewhere unknown: no limit). Games grow after they start (a VCMI client, the worker's arrays), and runtime/memwatch.sh stops a run under 1.5 GB: it did, 2026-10-30 23:27
+SLOT_HELLO_SECONDS = 30
+NEUTRAL_AI = "BattleAI"  # the wandering monsters' battle AI in generated battles, as in a campaign game
+TRACE_EVERY = 20  # worker 0 keeps the compact record of one battle in this many, for the run's traces
+
+
+def available_gb():
+	"""Memory available for new processes (GB; MemAvailable on Linux), or None where unknown."""
+	try:
+		with open("/proc/meminfo") as f:
+			for line in f:
+				if line.startswith("MemAvailable:"):
+					return int(line.split()[1]) / 2**20
+	except OSError:
+		pass
+	return None
+
+
+def memory_allows():
+	free = available_gb()
+	return free is None or free >= MEMORY_FLOOR_GB
+
+
+# ---- what a worker makes of a battle ----
+
+
+def prepare(record, source, key, config, keep_record=False):
+	"""(item, None) for one side's record of a battle, or (None, why) for one that is never trained on (an error,
+	an unsound record). The item: "data", the battle's training arrays as data.collate(widen=False) gives them (numpy,
+	the forced decisions left out), "summary" (data.BattleSummary), "failures" (train.failure_counts), "actions" (the
+	count of each action type), "version" (the model that played), "record" (compact, for traces, when asked)."""
+	from .train import failure_counts
+
+	error = next((e for e in record.events if e.get("event") == "error"), None)
+	if error:
+		return None, f"a {source} battle had an error ({key}): {error.get('message', '')[:300]}"
+	problem = check_record(record)
+	if problem:
+		return None, f"a {source} battle's record is unsound ({key}): {problem[:300]}"
+	examples, summary = battle_examples(record, config.reward, config.advantage)
+	chosen = [e for e in examples if not e["forced"]]
+	item = {
+		"kind": "battle", "source": source, "game": key, "version": version_of(record), "decisions": len(chosen), "summary": summary,
+		"failures": failure_counts([record]), "actions": Counter(ActionType(a["type"]).name for a in record.actions), "data": None, "record": None,
+	}
+	if chosen:
+		batch = collate(chosen, widen=False)
+		if "foresight" not in batch:  # (a battle of one decision: no next one; the same keys as the others')
+			n = len(chosen)
+			batch["foresight"] = {"dies": torch.zeros(n, MAX_UNITS), "lost": torch.zeros(n, MAX_UNITS), "dealt": torch.zeros(n, MAX_UNITS), "unit_mask": torch.zeros(n, MAX_UNITS), "hex_enemy": torch.zeros(n, N_HEXES), "valid": torch.zeros(n)}
+		batch.pop("search", None)
+		data = _numpy(batch)
+		for name in SPARSE_INPUTS:  # the big, mostly zero tables kept sparse while the item waits (data.compact_record's lesson: ~10x smaller)
+			if name in data["inputs"]:
+				data["inputs"][name] = Sparse(data["inputs"][name])
+		item["data"] = data
+	if keep_record:
+		item["record"] = compact_record(record)
+	return item, None
+
+
+def _numpy(value):
+	if isinstance(value, dict):
+		return {k: _numpy(v) for k, v in value.items()}
+	return value.numpy() if torch.is_tensor(value) else value
+
+
+def _tensors(value):
+	if isinstance(value, dict):
+		return {k: _tensors(v) for k, v in value.items()}
+	return torch.from_numpy(np.ascontiguousarray(value))
+
+
+def assemble(items, advantage_config):
+	"""One update's batch (as data.collate(widen=False) gives it, the int64 inputs int32) from the battle items taken, the
+	advantages normalised per side and source over the update (data.make_dataloader: the campaign games' battles got 50%
+	larger advantages than the generated ones' when normalised together); and the items' summaries, in order."""
+	parts = [item["data"] for item in items if item["data"]]
+	if not parts:
+		return None, [item["summary"] for item in items]
+
+	def join(values):
+		if isinstance(values[0], dict):
+			return {k: join([v[k] for v in values]) for k in values[0]}
+		return np.concatenate([v.dense() if isinstance(v, Sparse) else v for v in values])
+
+	batch = _tensors(join(parts))
+	rows = [item["decisions"] for item in items if item["data"]]
+	groups = torch.cat([torch.full((n,), item["summary"].our_side + 2 * (item["source"] == "real")) for n, item in zip(rows, (i for i in items if i["data"]))])
+	battles = torch.cat([torch.full((n,), i) for i, n in enumerate(rows)])
+	batch["advantage"] = normalize_advantages(batch["advantage"], groups, battles, advantage_config)
+	return batch, [item["summary"] for item in items]
+
+
+# ---- the games, played by the loader's workers ----
+
+
+class Shared:
+	"""Counters the workers and the trainer share (the loader's context: inherited by the workers)."""
+
+	def __init__(self, ctx, ceilings):
+		self.lock = ctx.Lock()
+		self.ceilings = dict(ceilings)  # kind -> games of it at once on this machine
+		self.local = {kind: ctx.Value("i", 0, lock=False) for kind in ceilings}  # playing here now
+		self.remote = {kind: ctx.Value("i", 0, lock=False) for kind in ceilings}  # playing on remote slots now
+		self.permits = ctx.Value("i", 0, lock=False)  # campaign games the trainer lets start (Supply.allow)
+		self.started = ctx.Value("i", 0, lock=False)  # campaign games started (in flight = this - what the trainer got)
+		self.version = ctx.Value("i", 0, lock=False)  # the battle model's version (the league's draw: no snapshot of it)
+		self.stop = ctx.Event()
+
+
+class Games(IterableDataset):
+	"""One kind of game ("battle": generated battles; "campaign": campaign games), each worker playing one at a time,
+	here or on a remote slot (the module's docstring). What a worker yields: items (prepare), campaign games
+	({"kind": "campaign", ...}), and {"kind": "failed", ...} for a game that failed (counted, never trained on)."""
+
+	def __init__(self, kind, config, run_dir, battle_sockets, campaign_sockets, shared, token, listener=None):
+		"""battle_sockets, campaign_sockets: the inference servers' addresses the games here ask (a Unix socket a server
+		process, or "tcp:<host>:<port>" of another machine's: inference.ModelStore), spread over the workers."""
+		self.kind, self.config, self.run_dir = kind, config, Path(run_dir)
+		self.battle_sockets, self.campaign_sockets = [str(s) for s in battle_sockets], [str(s) for s in campaign_sockets or ()]
+		self.shared, self.token, self.listener = shared, token, listener
+		self.link = self.run_dir / "models" / "current.onnx"  # (named in the env, never read: the servers play)
+
+	# -- where a game plays --
+
+	def place(self):
+		"""("here", None), ("remote", connection) or None (nothing free now): local first, then a remote slot."""
+		shared, kind = self.shared, self.kind
+		with shared.lock:
+			if shared.local[kind].value < shared.ceilings[kind] and memory_allows():
+				shared.local[kind].value += 1
+				return "here", None
+		if self.listener is not None:
+			conn = self._accept_slot()
+			if conn is not None:
+				with shared.lock:
+					shared.remote[kind].value += 1
+				return "remote", conn
+		return None
+
+	def release(self, where, conn):
+		with self.shared.lock:
+			(self.shared.local if where == "here" else self.shared.remote)[self.kind].value -= 1
+		if conn is not None:
+			conn.close()
+
+	def _accept_slot(self):
+		"""A remote slot's connection (its hello checked), or None when none waits."""
+		try:
+			self.listener.settimeout(0.5)
+			conn, address = self.listener.accept()
+		except (socket.timeout, OSError):
+			return None
+		try:
+			conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+			conn.settimeout(SLOT_HELLO_SECONDS)
+			hello = json.loads(remote.read_frame(conn))
+			problem = None
+			if hello.get("protocol") != remote.PROTOCOL:
+				problem = f"protocol {hello.get('protocol')}, the master speaks {remote.PROTOCOL}"
+			elif not secrets.compare_digest(str(hello.get("token", "")), self.token):
+				problem = "a wrong token (the master's runtime/remote-token)"
+			elif hello.get("contracts") != remote.contracts():
+				problem = f"other models' contracts than the master's (pull the master's code): {hello.get('contracts')} vs {remote.contracts()}"
+			if problem:
+				remote.send_frame(conn, json.dumps({"error": problem}).encode())
+				conn.close()
+				return None
+			remote.send_frame(conn, json.dumps({"ok": True}).encode())
+			conn.settimeout(None)
+			return conn
+		except (OSError, ValueError):
+			conn.close()
+			return None
+
+	def permit(self):
+		"""Campaign games start with a permit (Supply.allow gives them); generated battles always (the loader's prefetch
+		is their throttle)."""
+		if self.kind != "campaign":
+			return True
+		with self.shared.lock:
+			if self.shared.permits.value <= 0:
+				return False
+			self.shared.permits.value -= 1
+			self.shared.started.value += 1
+			return True
+
+	# -- the games --
+
+	def __iter__(self):
+		info = get_worker_info()
+		index = info.id if info else 0
+		rng = random.Random(1_000_003 * (self.config.seed + 1) + 7919 * index + (104_729 * self.config.campaign.seed if self.kind == "campaign" else 0))
+		runner = Runner(self.config, self.run_dir, self.battle_sockets[index % len(self.battle_sockets)], self.campaign_sockets[index % len(self.campaign_sockets)] if self.campaign_sockets else None, self.link, f"w{index}", self.shared.version)
+		stop = self.shared.stop
+		n = 0
+		try:
+			while not stop.is_set():
+				if self.kind == "campaign" and not self.permits_left():
+					time.sleep(0.5)
+					continue
+				placed = self.place()
+				if placed is None:
+					time.sleep(0.5)
+					continue
+				where, conn = placed
+				if not self.permit():  # (taken once a place is found: a permit held while looking counted as a game in flight)
+					self.release(where, conn)
+					time.sleep(0.5)
+					continue
+				n += 1
+				spec = runner.sample_battle(rng, index, n) if self.kind == "battle" else runner.sample_campaign(rng, index, n)
+				try:
+					if where == "here":
+						yield from (runner.battle(spec, keep_record=index == 0 and n % TRACE_EVERY == 0) if self.kind == "battle" else runner.campaign(spec, stop))
+					else:
+						yield from relay(conn, spec)
+				except Exception as error:  # one failed game does not stop the worker
+					# (a campaign game lost to an error yields no game item: "lost" lets the trainer count it as over)
+					yield {"kind": "failed", "what": self.kind, "message": f"{spec.get('key', '?')}: {str(error)[:400]}", "lost": self.kind == "campaign"}
+				finally:
+					self.release(where, conn)
+					trim_memory()
+		finally:
+			runner.close()
+
+	def permits_left(self):
+		with self.shared.lock:
+			return self.shared.permits.value > 0
+
+
+def relay(conn, spec):
+	"""A game on a remote slot: the spec sent, its items read back until the slot says it is done."""
+	remote.send_message(conn, ("play", spec))
+	while True:
+		message = remote.read_message(conn)
+		if message[0] == "done":
+			return
+		if message[0] == "item":
+			yield message[1]
+		elif message[0] == "failed":
+			raise RuntimeError(f"on the remote slot: {message[1]}")
+
+
+class Runner:
+	"""Plays games on this machine (a worker's, or a remote slot's: worker.py) and yields their items: one battle
+	process for the generated battles (play.BattleProcess), one record server for the campaign games' battles."""
+
+	def __init__(self, config, run_dir, battle_socket, campaign_socket, link, name, version=None):
+		self.config, self.run_dir, self.name = config, Path(run_dir), name
+		self.battle_socket, self.campaign_socket, self.link = battle_socket, campaign_socket, link
+		self.version = version  # a shared Value (the battle model's), or None
+		self.process = None  # play.BattleProcess, made on the first battle
+		self.records = None  # play.RecordServer for the campaign games' battles
+		self.game = None  # the campaign game running (play.GameRun), for close()
+
+	def close(self):
+		if self.game is not None:
+			self.game.terminate()
+		if self.process is not None:
+			self.process.close()
+		if self.records is not None:
+			self.records.__exit__(None, None, None)
+
+	def past_versions(self):
+		"""The league's past versions (server model names, "v350"): the run's snapshots, not the one being trained."""
+		version = self.version.value if self.version is not None else 10**9
+		return [f"v{int(p.stem.split('_')[1])}" for p in sorted((self.run_dir / "models").glob("snapshot_*.pt")) if 0 < int(p.stem.split("_")[1]) < version]
+
+	def sample_battle(self, rng, index, n):
+		"""One generated battle's spec: its scenario, the league's draw (actors.py: self-play, a past version, or a fixed
+		AI), our side, its seeds."""
+		config = self.config
+		scenario = generator.sample(rng)
+		self_play, past, fixed = config.league
+		roll, past_versions = rng.random() * (self_play + past + fixed), self.past_versions()
+		if roll < self_play or (roll < self_play + past and not past_versions):
+			opponent, past_model = play.SELF_PLAY, None
+		elif roll < self_play + past:
+			opponent, past_model = "AlphaBattleAI", rng.choice(past_versions)
+		else:
+			opponent, past_model = rng.choice(config.league_ais), None
+		our_side = 0 if opponent == play.SELF_PLAY else rng.randrange(2)
+		if "neutrals" in scenario:  # wandering monsters are the game's AI, never ours (campaign_model/play.py: neutral_ai)
+			opponent, past_model, our_side = NEUTRAL_AI, None, 0
+		return {"kind": "battle", "key": f"{self.name}_g{index}_{n}", "scenario": scenario, "opponent": opponent, "past": past_model, "our_side": our_side, "sampler_seed": rng.randrange(2**31)}
+
+	def sample_campaign(self, rng, index, n):
+		"""One campaign game's spec: its players, size and seed, one of the game's own maps or a generated one, its day
+		cap (learner.draw_days), its seeds. Self-play only: never against Nullkiller2, the evaluation's opponent."""
+		from campaign_model.learner import draw_days
+		from campaign_model.maps import GAME_MAPS
+
+		config = self.config.campaign
+		players, size, seed = rng.choice(config.players), rng.choice(config.sizes), rng.randrange(1, 2**31)
+		game_map, days = rng.random() < config.game_map_share, draw_days(rng, config)
+		spec = {"kind": "campaign", "key": f"{self.name}_c{index}_{n}", "players": players, "size": size, "seed": seed, "days": days, "map": None}
+		if game_map:
+			spec["map"], spec["players"] = rng.choice(sorted(GAME_MAPS.items()))
+			spec["size"] = 36
+		return spec
+
+	def battle(self, spec, keep_record=False):
+		"""Plays one generated battle here; yields its items (one a recorded side)."""
+		from .train import generated_games
+
+		config = self.config
+		if self.process is None:
+			self.process = play.BattleProcess()
+		scenario, opponent, our_side = spec["scenario"], spec["opponent"], spec["our_side"]
+		games, files = generated_games([scenario], spec["key"], config, our_sides=(our_side,), opponent=opponent, temperature=1.0)
+		try:
+			game = replace(games[0], settings=games[0].settings + (("ALPHA_BATTLE_INFERENCE_SOCKET", self.battle_socket),))
+			if spec["past"] is not None:  # the other side is our AI with an older model, not recorded
+				game = replace(game, settings=game.settings + ((f"ALPHA_BATTLE_INFERENCE_MODEL_{game.colors[1 - our_side]}", str(spec["past"])),))
+			game = replace(game, sampler_seed=spec["sampler_seed"])
+			records = self.process.play(game, self.link)
+		finally:
+			for path in files:
+				path.unlink(missing_ok=True)
+		for record in records:
+			item, problem = prepare(record, "generated", spec["key"], config, keep_record)
+			yield item if item else {"kind": "failed", "what": "battle", "message": problem}
+
+	def campaign_settings(self, key, seed):
+		"""The env of a campaign game's battles: every player's battle played by the current battle model and recorded
+		here as a real game's (under "<key>:<COLOR>"; the wandering monsters are BattleAI)."""
+		from campaign_model.play import COLORS
+
+		settings = {
+			"ALPHA_BATTLE_INFERENCE_SOCKET": self.battle_socket,
+			"ALPHA_BATTLE_MODEL": str(Path(self.link).absolute()),
+			"ALPHA_BATTLE_TEMPERATURE": "1",
+			"ALPHA_BATTLE_RECORD_SOCKET": str(self.records.path),
+			"ALPHA_BATTLE_REQUIRE_MODEL": "1",  # a battle without its model fails the game, never plays defending
+		}
+		for i, color in enumerate(COLORS):
+			settings[f"ALPHA_BATTLE_RECORD_KEY_{color}"] = f"{key}:{color}"
+			settings[f"ALPHA_BATTLE_SEED_{color}"] = str(seed * 101 + i)
+		return tuple(settings.items())
+
+	def campaign(self, spec, stop=None):
+		"""Plays one campaign game here (self-play, every player's battle by the battle model); yields each battle's
+		item as it ends, then the game: {"kind": "campaign", "key", "map", "players", "game" (records.Game), "info"
+		(play.GameInfo), "game_map"}."""
+		from campaign_model.play import GameRun, make_map
+		from battle_model import play as battle_play
+		import shutil
+
+		config = self.config.campaign
+		if self.records is None:
+			self.records = play.RecordServer(concurrent=True)
+		key, players, seed = spec["key"], spec["players"], spec["seed"]
+		game_map = spec["map"] is not None
+		map_name = spec["map"] if game_map else make_map(seed, players, spec["size"], config.levels, config.water)[0]
+		try:
+			self.game = GameRun(
+				self.campaign_socket, map_name, spec["days"], seed, max_seconds=config.game_seconds, battle_ai="AlphaBattleAI", game_key=key,
+				settings=self.campaign_settings(key, seed), niceness=config.niceness, temperature=config.temperature,
+			)
+			try:
+				while not self.game.poll(stop):
+					yield from self._battles(key)
+					time.sleep(0.25)
+				game, info = self.game.result()
+			finally:
+				self.game = None
+			yield from self._battles(key)
+		finally:
+			if not game_map:
+				(battle_play.USER_DIR / (map_name + ".vmap")).unlink(missing_ok=True)
+		game.days = spec["days"]
+		ok = info.status.startswith("stopped") or "exit code 0" in info.status  # (at the cap, or training is over)
+		if ok:
+			shutil.rmtree(info.run_dir, ignore_errors=True)
+		else:  # its records up to then are still used: the labels take the last day it reached as its end
+			yield {"kind": "failed", "what": "campaign", "message": f"game {key} ({map_name}, {players} players): {info.status} (run {info.run_dir})", "run_dir": info.run_dir}
+		yield {"kind": "campaign", "key": key, "map": map_name, "players": players, "game": game, "info": info, "game_map": game_map}
+
+	def _battles(self, key):
+		"""The campaign game's battles recorded so far, each as an item."""
+		from .data import parse_record
+
+		for record_key, records in self.records.drain().items():
+			for data in records:
+				try:
+					record = parse_record(data)
+				except Exception as error:
+					yield {"kind": "failed", "what": "battle", "message": f"unreadable record from {record_key}: {error}"}
+					continue
+				item, problem = prepare(record, "real", record_key.split(":", 1)[0], self.config)
+				yield item if item else {"kind": "failed", "what": "battle", "message": problem}
+
+
+def _worker_init(_index):
+	"""Each loader worker: on SIGTERM (the loader shutting it down) end the games it runs, so no VCMI outlives a run; the
+	objects inherited from the forkserver frozen, so the collector never writes to their pages (which would copy them:
+	40 workers' torch imports stay shared, 2026-10-30)."""
+	import gc
+
+	def stop(signum, frame):
+		raise SystemExit(0)  # (the generator's finally closes the runner)
+
+	signal.signal(signal.SIGTERM, stop)
+	signal.signal(signal.SIGINT, signal.SIG_IGN)  # (the trainer's Ctrl-C is the trainer's to handle)
+	gc.collect()
+	gc.freeze()
+
+
+def trim_memory():
+	"""The heap's freed pages back to the system (glibc keeps them: a worker's RSS stayed at its peak game, 0.7 GB)."""
+	import gc
+
+	gc.collect()
+	if sys.platform.startswith("linux"):
+		import ctypes
+
+		try:
+			ctypes.CDLL("libc.so.6").malloc_trim(0)
+		except OSError:
+			pass
+
+
+def _identity(item):
+	return item
+
+
+# ---- the trainer's side ----
+
+
+class Supply:
+	"""The loaders and what pulls from them: battle items into pool (actors.ActorPool: its buffer and take()), campaign
+	games into campaign (campaign_model.learner.CampaignLearner: _game_done) with their battles into the pool. start()
+	after both exist; close() ends the workers and their games."""
+
+	def __init__(self, config, out, pool, campaign=None):
+		self.config, self.out, self.pool, self.campaign = config, Path(out), pool, campaign
+		self.ctx = multiprocessing.get_context("forkserver" if sys.platform != "win32" else "spawn")
+		if hasattr(self.ctx, "set_forkserver_preload"):
+			self.ctx.set_forkserver_preload(["battle_model.supply"])  # (torch and the models' code imported once, inherited)
+		ceilings = {"battle": config.generated_actors, **({"campaign": config.campaign.games} if campaign else {})}
+		self.shared = Shared(self.ctx, ceilings)
+		self.shared.version.value = pool.version
+		self.token = remote.token(config)
+		self.listener = socket.create_server(("0.0.0.0", config.remote_port + remote.SLOT_PORT), backlog=64) if config.remote_port and config.remote_slots else None
+		battle_sockets = list(pool.server.socket_paths)
+		campaign_sockets = list(campaign.server.socket_paths) if campaign else None
+		self.datasets = {kind: Games(kind, config, out, battle_sockets, campaign_sockets, self.shared, self.token, self.listener) for kind in ceilings}
+		self.loaders, self.threads = {}, []
+		self.stop = threading.Event()
+		self.stats = Counter()
+		self.game_decisions = 1500.0  # a campaign game's decisions, a running mean (the permits' estimate)
+		self.received = 0  # campaign games got (in flight: started - this)
+
+	def workers(self, kind):
+		"""The loader's workers for a kind: this machine's ceiling, plus workers for the remote slots (the campaign's
+		all of them, the battles' half: the remote machines' slots are shared by both kinds, and a campaign game is the
+		longer use of one)."""
+		remote_workers = (self.config.remote_slots if kind == "campaign" else max(1, self.config.remote_slots // 2)) if self.listener is not None else 0
+		return self.shared.ceilings[kind] + remote_workers
+
+	def start(self):
+		for kind, dataset in self.datasets.items():
+			loader = DataLoader(
+				dataset, batch_size=None, num_workers=self.workers(kind), prefetch_factor=1 if kind == "battle" else 8, in_order=False, persistent_workers=True,
+				multiprocessing_context=self.ctx, timeout=60, collate_fn=_identity, worker_init_fn=_worker_init,
+			)
+			self.loaders[kind] = loader
+			thread = threading.Thread(target=self._pull, args=(kind, loader), daemon=True, name=f"supply-{kind}")
+			self.threads.append(thread)
+			thread.start()
+		if self.campaign:
+			self.allow()
+		print(f"supply: {self.workers('battle')} battle workers" + (f", {self.workers('campaign')} campaign workers" if self.campaign else "") + f" ({self.ctx.get_start_method()}); ceilings here {self.shared.ceilings}" + (f"; remote slots on port {self.config.remote_port + remote.SLOT_PORT}" if self.listener else ""), flush=True)
+
+	def close(self):
+		self.stop.set()
+		self.shared.stop.set()
+		if self.listener is not None:
+			self.listener.close()
+		for thread in self.threads:
+			thread.join(timeout=90)
+		for loader in self.loaders.values():
+			iterator = getattr(loader, "_iterator", None)
+			if iterator is not None:
+				iterator._shutdown_workers()
+
+	def publish(self, version):
+		"""The battle model's new version (the league's draw leaves its snapshot out)."""
+		self.shared.version.value = int(version)
+
+	def _pull(self, kind, loader):
+		iterator = iter(loader)
+		loader._iterator = iterator
+		pool = self.pool
+		while not self.stop.is_set():
+			if kind == "battle":  # (the loader's prefetch then parks the workers: each has one battle waiting)
+				with pool.lock:
+					while not self.stop.is_set() and pool.generated_waiting() >= pool.generated_room():
+						pool.lock.wait(timeout=1)
+				if self.stop.is_set():
+					return
+			try:
+				item = next(iterator)
+			except RuntimeError as error:  # the loader's timeout (nothing finished in a minute), or a worker died
+				if "timed out" not in str(error):
+					print(f"supply: the {kind} loader failed: {str(error)[:300]}", flush=True)
+					time.sleep(5)
+				continue
+			except StopIteration:
+				return
+			self._route(item)
+
+	def _route(self, item):
+		kind = item["kind"]
+		if kind == "battle":
+			self.pool.add_item(item)
+			self.stats["battles"] += 1
+		elif kind == "campaign":
+			self.received += 1
+			n = len(item["game"].decisions)
+			self.game_decisions += (n - self.game_decisions) * 0.1
+			self.campaign._game_done(item["key"], item["map"], item["players"], item["game"], item["info"], item["game_map"])
+			self.allow()
+		elif kind == "failed":
+			if item.get("lost"):  # a campaign game that never came: over, for the permits
+				self.received += 1
+				self.allow()
+			if item["what"] == "campaign" and self.campaign:
+				self.campaign._failed(item["message"], item.get("run_dir"))
+			else:
+				self.pool._failed(item["message"])
+
+	def allow(self):
+		"""The campaign games that may start now: what `ahead` updates take, less the decisions finished and waiting and
+		the games in flight (at the mean game's decisions)."""
+		if not self.campaign:
+			return
+		config = self.config.campaign
+		waiting = self.campaign.waiting_decisions()
+		with self.shared.lock:
+			in_flight = max(0, self.shared.started.value - self.received)
+			want = (self.config.ahead * config.decisions_per_update - waiting) / max(self.game_decisions, 1.0) - in_flight
+			self.shared.permits.value = max(0, int(math.ceil(want)))
+
+	def status(self):
+		"""For the logs: where games play now."""
+		s = self.shared
+		with s.lock:
+			here = {k: v.value for k, v in s.local.items()}
+			there = {k: v.value for k, v in s.remote.items()}
+			permits, started = s.permits.value, s.started.value
+		return {"here": here, "remote": there, "permits": permits, "in_flight": max(0, started - self.received)}

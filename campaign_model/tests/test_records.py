@@ -61,3 +61,27 @@ def test_a_damaged_ledger_snapshot_is_left_out_not_the_game():
 
 	game = collect({"g:ledger": [b'{"day": 1, "players": []}', b'{"day": 2, "players": [{"color": 0,']})
 	assert game.damaged == 1 and list(game.ledgers) == [1]
+
+
+def test_inputs_decoded_on_a_device_are_the_inputs():
+	"""(2026-10-30) The training update sends the bytes as recorded to the GPU and cuts and converts them there
+	(records.inputs_on_device): the same inputs as decode_inputs gives on the CPU."""
+	import numpy as np
+	import torch
+
+	from campaign_model.records import decode_inputs, decode_wire, inputs_on_device
+	from campaign_model.schema import random_inputs
+	from campaign_model.tests.test_model import encoded
+	from campaign_model.tests.test_train import decisions_for
+	from campaign_model.model import CampaignModel
+
+	model = CampaignModel(dim=32, cell_dim=16, layers=1).eval()
+	x = random_inputs(5, seed=3)
+	decisions = [d.__class__(**{**d.__dict__, "inputs": encoded(x, b)}) for b, d in enumerate(decisions_for(model, x))]
+	want = decode_inputs(decisions)
+	device = "mps" if torch.backends.mps.is_available() else "cpu"
+	got = inputs_on_device(torch.from_numpy(decode_wire(decisions)).to(device))
+	assert set(got) == set(want)
+	for name in want:
+		assert got[name].shape == want[name].shape and str(got[name].dtype).replace("torch.", "") == {"bool": "bool", "int64": "int64", "float32": "float32"}[str(want[name].dtype)]
+		np.testing.assert_array_equal(got[name].cpu().numpy(), want[name])

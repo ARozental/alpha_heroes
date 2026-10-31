@@ -67,23 +67,20 @@ def test_a_worker_without_the_token_or_on_other_code_is_refused(hub):
 		conn.close()
 
 
-def test_a_worker_gets_the_run_and_its_records_reach_the_buffer(hub):
+def test_a_worker_gets_the_run_and_its_reports_reach_the_master(hub):
 	h, pool = hub
 	conn, welcome = hello(h.config.remote_port)
 	assert welcome["ok"] and welcome["battle_ports"] == [7801] and welcome["campaign_ports"] == []
 	assert config_from_dict(welcome["config"]) == h.config
 	kind, state = remote.read_message(conn)
-	assert kind == "state" and state["version"] == 12 and state["league"] == ["v50"] and state["room"] and state["running"]
-
-	from battle_model.data import Record
-
-	remote.send_message(conn, ("battle", [Record([], [{}] * 5, {})], "generated", "g0_1"))
+	assert kind == "state" and state["version"] == 12 and state["league"] == ["v50"] and state["campaign_version"] == 0
+	# (the games themselves go through the slots, supply.py; the hub takes the counts and the failures)
+	remote.send_message(conn, ("played", "battle", 57))
 	remote.send_message(conn, ("failed", "battle", "a stall"))
 	deadline = time.time() + 10
-	while (not pool.added or not pool.failures) and time.time() < deadline:
+	while (not pool.failures or not h.workers[welcome["name"]]["battles"]) and time.time() < deadline:
 		time.sleep(0.05)
-	(records, source, game, checked), = pool.added
-	assert source == "generated" and game.endswith(":g0_1") and game.startswith(welcome["name"]) and checked
+	assert h.workers[welcome["name"]]["battles"] == 1 and h.workers[welcome["name"]]["decisions"] == 57
 	assert pool.failures and "a stall" in pool.failures[0]
 	conn.close()
 

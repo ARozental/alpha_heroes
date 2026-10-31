@@ -55,7 +55,9 @@ class Graphs:
 		if rows not in self.trained:
 			try:
 				flat = _Flat(self.model, self.names, self.outputs)
-				self.trained[rows] = torch.cuda.make_graphed_callables(flat, tuple(a.detach().clone() for a in args), num_warmup_iters=3)
+				# (allow_unused_input: parameters no output reaches, e.g. a head's the loss leaves out, failed the capture: "the
+				# differentiated Tensor ... appears to not have been used", 2026-10-30)
+				self.trained[rows] = torch.cuda.make_graphed_callables(flat, tuple(a.detach().clone() for a in args), num_warmup_iters=3, allow_unused_input=True)
 			except Exception as error:  # (eager from then on, at this size)
 				self.trained[rows] = None
 				print(f"campaign graphs: no training graph at {rows} rows ({type(error).__name__}: {str(error)[:200]}): eager", flush=True)

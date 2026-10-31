@@ -120,11 +120,19 @@ def test_maps_with_a_player_left_without_a_town_are_found(tmp_path):
 	assert players_without_a_town(path) == ["red"]
 
 
-def test_a_backlog_beyond_two_updates_drops_its_oldest_games():
+def test_a_backlog_beyond_four_updates_drops_its_oldest_games():
+	"""(2026-10-30) The supply starts games only while under `ahead` updates' worth wait (supply.Supply.allow), so the
+	learner drops nothing short of a safety cap of DROP_BEYOND (4) updates' worth: games that were in flight as it stalled."""
+	from campaign_model.learner import DROP_BEYOND
+
+	assert DROP_BEYOND == 4
 	learner = SimpleNamespace(config=CampaignConfig(decisions_per_update=100, min_games_per_update=2), lock=threading.Condition(), finished=[], stats=__import__("collections").Counter())
-	learner.finished = [(game_of(60), i) for i in range(8)]  # 480 decisions: room for 200
+	learner.finished = [(game_of(60), i) for i in range(8)]  # 480 decisions: one over four updates' worth past the oldest
 	taken = CampaignLearner._take(learner)
-	assert [info for _, info in taken] == [4, 5] and [info for _, info in learner.finished] == [6, 7] and learner.stats["dropped_games"] == 4
+	assert [info for _, info in taken] == [1, 2] and [info for _, info in learner.finished] == list(range(3, 8)) and learner.stats["dropped_games"] == 1
+	learner.finished = [(game_of(60), i) for i in range(12)]  # 720: five over
+	taken = CampaignLearner._take(learner)
+	assert [info for _, info in taken] == [5, 6] and learner.stats["dropped_games"] == 6
 
 
 def test_an_update_runs_with_the_horizon_credit_and_learns_how_far_to_trust_the_heads(tmp_path):
@@ -167,8 +175,9 @@ def test_an_update_runs_with_the_horizon_credit_and_learns_how_far_to_trust_the_
 		config=config, labels=LabelConfig(), empire=EmpireConfig(), version=1, finished=list(games), lock=threading.Condition(), stats=collections.Counter(),
 		model=model, optimizer=make_optimizer(model, config), device=torch.device("cpu"), worker=None, model_lock=threading.Lock(), lr_scale=1.0,
 		server=SimpleNamespace(set_model=lambda *args: None), games_used=0, out=tmp_path, kwargs=kwargs, value_ev=None, credit_evidence={}, credit_check=1.0, head_ev={"Vend": 0.2}, value_pool=None, head_pool={}, progress=tmp_path / "progress.csv", writer=Writer(),
+		features_cpu=model.features,
 	)
-	for name in ("_take", "trust", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit"):
+	for name in ("_take", "trust", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting"):
 		setattr(learner, name, getattr(CampaignLearner, name).__get__(learner))
 	learner.progress.write_text(",".join(COLUMNS) + "\n")
 	assert learner.trust() == 0.0  # nothing known yet: the credit leans on the real outcome
@@ -217,3 +226,50 @@ def test_skill_picks_count_each_skill_taken_and_offered():
 	ups = [dataclasses.replace(Decision("RED", 1, int(c.DecisionKind.LEVEL_UP), 0, 1, -1, i, -1, 0.0, (0.5,) * 3, 0, b""), inputs=encoded(x, b)) for b, i in ((0, 1), (1, 1))]
 	assert skill_picks(ups) == {"estates": (0, 1), "wisdom": (1, 2), "offence": (1, 1)}
 	assert skill_picks([]) == {}
+
+
+def test_the_labeler_computes_what_step_did(tmp_path):
+	"""(2026-10-30) The labels a game needs that no model forward gives are computed as it arrives, in a labeler process
+	(labeler.py), and are what learner.step computed in the trainer's thread: the same arrays."""
+	import dataclasses
+
+	import numpy as np
+	import torch
+
+	from campaign_model.foresight import labels_of
+	from campaign_model.labeler import Labeler, precompute
+	from campaign_model.labels import EmpireConfig, LabelConfig, end_labels, end_steps, growth_labels, label
+	from campaign_model.model import CampaignModel
+	from campaign_model.schema import random_inputs
+	from campaign_model.tests.test_model import encoded
+	from campaign_model.tests.test_train import decisions_for
+	from campaign_model.train import usable
+
+	torch.manual_seed(5)
+	model = CampaignModel(dim=32, cell_dim=16, layers=1).eval()
+	x = random_inputs(8, seed=20)
+	decisions = [dataclasses.replace(d, inputs=encoded(x, b), day=1 + b // 3) for b, d in enumerate(decisions_for(model, x, seed=0))]
+	game = Game(decisions=decisions, ledgers={d: snapshot(d, 1000 + 300 * d, 1000) for d in range(1, 14)}, days=12)
+	pre = precompute(game, model.features.state_dict(), LabelConfig(), EmpireConfig(), foresight=True)
+	kept = usable(game.decisions)
+	assert pre["n"] == len(kept) > 0
+	g = dataclasses.replace(game, decisions=kept)
+	g.all_decisions = game.decisions
+	t, mixed, price = label(g, LabelConfig(), EmpireConfig())
+	np.testing.assert_array_equal(pre["t"], t)
+	np.testing.assert_array_equal(pre["mixed"], mixed)
+	np.testing.assert_array_equal(pre["price"], price)
+	np.testing.assert_array_equal(pre["z"], growth_labels(g, EmpireConfig()))
+	np.testing.assert_array_equal(pre["real"], end_labels(g, EmpireConfig()))
+	for got, want in zip((pre["step"], pre["week"]), end_steps(g)):
+		np.testing.assert_array_equal(got, want)
+	rows = labels_of(g, model.features)
+	assert set(pre["foresight"]) == set(rows)
+	for name in rows:
+		np.testing.assert_array_equal(pre["foresight"][name], rows[name])
+	labeler = Labeler(foresight=True, workers=1)  # the same through a labeler process (the game pickled there and back)
+	try:
+		again = labeler.submit(game, model.features).result(timeout=120)
+	finally:
+		labeler.close()
+	assert again["n"] == pre["n"] and np.array_equal(again["t"], pre["t"]) and np.array_equal(again["foresight"]["turn"], pre["foresight"]["turn"])
