@@ -197,8 +197,11 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 		out = model(inputs)
 		return torch.cat([out[o_name].float().reshape(n, -1) for o_name, *_ in out_layout], dim=1)
 
-	graphs = {}  # (name, size) -> (pinned host bytes, device bytes, flat outputs, graph), or None: eager (capture failed)
-	graph_pool = [None]  # one memory pool for all: the graphs run one at a time
+	graphs = {}  # (name, size) -> (flat outputs, graph), or None: eager (its capture failed)
+	# A size's input bytes, pinned on the host and on the device, shared by every model's graph at that size (they run
+	# one at a time): one each a model was ~77 MB of both for the battle server's ~50 league models (2026-10-30)
+	graph_inputs = {}  # size -> (pinned host bytes, device bytes)
+	graph_pool = [None]  # one memory pool for all, likewise
 
 	def graphed(name, model, data):
 		"""flat [N, out] on the host for the bytes data [N, in_bytes], through name's graph at the next size up (recorded
@@ -210,10 +213,13 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 			return None
 		if key not in graphs:
 			try:
-				host = torch.empty((size, in_bytes), dtype=torch.uint8).pin_memory()
+				if size not in graph_inputs:
+					host = torch.empty((size, in_bytes), dtype=torch.uint8).pin_memory()
+					graph_inputs[size] = (host, torch.empty((size, in_bytes), dtype=torch.uint8, device=device))
+				host, on_device = graph_inputs[size]
 				host[:total] = torch.from_numpy(data)
 				host[total:] = host[:1]  # (the padding rows a real decision: their outputs are dropped)
-				on_device = host.to(device)
+				on_device.copy_(host)
 				side = torch.cuda.Stream()
 				side.wait_stream(torch.cuda.current_stream())
 				with torch.cuda.stream(side), torch.inference_mode():
@@ -224,12 +230,13 @@ def _serve(socket_path, device_name, family_name, model_kwargs, control, threads
 				with torch.inference_mode(), torch.cuda.graph(graph, pool=graph_pool[0]):
 					flat = forward_flat(model, decode_on_device(on_device), size)
 				graph_pool[0] = graph.pool()
-				graphs[key] = (host, on_device, flat, graph)
+				graphs[key] = (flat, graph)
 			except Exception as error:  # (eager from then on, for this model and size)
 				graphs[key] = None
 				print(f"inference: no CUDA graph for {name} at {size} ({type(error).__name__}: {str(error)[:200]}): eager", flush=True)
 				return None
-		host, on_device, flat, graph = graphs[key]
+		flat, graph = graphs[key]
+		host, on_device = graph_inputs[size]
 		host[:total] = torch.from_numpy(data)  # (the rows past total: an earlier batch's, real decisions)
 		on_device.copy_(host, non_blocking=True)
 		graph.replay()

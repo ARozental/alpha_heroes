@@ -150,3 +150,33 @@ def test_cuda_graphs_follow_new_weights(family):
 					assert np.allclose(np.where(np.isfinite(expected), value, 0), np.where(np.isfinite(expected), expected, 0), atol=2e-3), (family, version, batch, name)
 	finally:
 		server.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+def test_cuda_graphs_of_two_models_share_inputs_and_stay_apart():
+	"""The league's models share each size's input buffers on CUDA: asked in turn, each answers as itself."""
+	torch.manual_seed(0)
+	models = {"current": BattleModel().eval(), "v50": BattleModel().eval()}
+	server = InferenceServer(play.SOCKET_DIR / "test-graphs-two.sock", device="cuda", model_kwargs={"architecture": "v3"}, threads=1)
+	try:
+		for version, (name, model) in enumerate(models.items(), start=1):
+			server.set_model(name, version, model)
+		client = InferenceClient(server.socket_path)
+		deadline = time.time() + 20
+		while time.time() < deadline:
+			try:
+				client.run("v50")
+				break
+			except RuntimeError:
+				time.sleep(0.05)
+		for round_ in range(3):
+			for name, model in models.items():
+				x = random_inputs(batch=2, seed=round_)
+				_, out = client.run(name, x)
+				with torch.no_grad():
+					ref = model({k: torch.from_numpy(v) for k, v in x.items()})
+				for key, value in out.items():
+					expected = ref[key].numpy()
+					assert np.allclose(np.where(np.isfinite(expected), value, 0), np.where(np.isfinite(expected), expected, 0), atol=2e-3), (name, round_, key)
+	finally:
+		server.close()
