@@ -109,6 +109,7 @@ def main():
 	parser.add_argument("--out", required=True)
 	parser.add_argument("--init", default="", help="a campaign checkpoint to start from (none: a fresh model)")
 	parser.add_argument("--architecture", default="v2")
+	parser.add_argument("--variants", default="64x2", help="the models trained side by side on the same batches, <dim>x<layers> each (a fresh model's); their checkpoints bc_latest_<variant>.pt when more than one")
 	parser.add_argument("--cell-dim", type=int, default=16)
 	parser.add_argument("--lr", type=float, default=1e-4)
 	parser.add_argument("--value-weight", type=float, default=config.value_weight, help="the value heads' loss weight (0: the policy only)")
@@ -141,58 +142,66 @@ def main():
 	val_shares, val_growth = np.concatenate([g[1] for g in val_games]), np.concatenate([g[2] for g in val_games])
 	train_shares, train_growth = np.concatenate([g[1] for g in train_games]), np.concatenate([g[2] for g in train_games])
 	print(f"imitate: {len(train)} decisions of {len(train_games)} games to train on, {len(val)} of {len(val_games)} held out; {device}", flush=True)
+	models = {}  # name -> (model, optimizer, kwargs): each trained on the same batches, decoded once (--variants)
 	if args.init:
 		state = torch.load(args.init, map_location="cpu")
 		kwargs = state.get("model_kwargs", {})
 		model = build_model(kwargs)
 		migrate_subtypes(state, model)
 		model.load_state_dict(state["model"])
+		models["init"] = (model, kwargs)
 	else:
 		import dataclasses
 
-		kwargs = model_kwargs(dataclasses.replace(config, model_architecture=args.architecture, model_cell_dim=args.cell_dim))
-		torch.manual_seed(args.seed)
-		model = build_model(kwargs)
-	model = model.to(device).train()
-	optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
-	history = []
-	evaluation = lambda: evaluate(model, val, val_shares, val_growth, device, args.batch, config.growth_weight)  # noqa: E731
-	report = evaluation()
-	history.append({"step": 0, "decisions": 0, "val": report})
-	print(f"imitate: step 0 held-out loss {report['all']['loss']:.3f} top-1 {report['all']['top1']:.3f} value {report['value']:.4f}", flush=True)
+		for variant in args.variants.split(","):  # "<dim>x<layers>"
+			dim, layers = (int(v) for v in variant.split("x"))
+			kwargs = model_kwargs(dataclasses.replace(config, model_architecture=args.architecture, model_cell_dim=args.cell_dim, model_dim=dim, model_layers=layers))
+			torch.manual_seed(args.seed)
+			models[variant] = (build_model(kwargs), kwargs)
+	models = {name: (model.to(device).train(), torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr), kwargs) for name, (model, kwargs) in models.items()}
+	history = {name: [] for name in models}
+	evaluation = lambda model: evaluate(model, val, val_shares, val_growth, device, args.batch, config.growth_weight)  # noqa: E731
+	for name, (model, _, _) in models.items():
+		report = evaluation(model)
+		history[name].append({"step": 0, "decisions": 0, "val": report})
+		print(f"imitate: {name} ({sum(p.numel() for p in model.parameters()):,} weights) step 0 held-out loss {report['all']['loss']:.3f} top-1 {report['all']['top1']:.3f} value {report['value']:.4f}", flush=True)
 	started, step, seen = time.time(), 0, 0
 	deadline = started + 60 * args.minutes
 	order = list(range(len(train)))
+	running = {name: [] for name in models}
 	done = False
 	while not done:
 		rng.shuffle(order)
 		chunks = [order[i : i + args.batch] for i in range(0, len(order) - args.batch + 1, args.batch)]
-		running = []
 		for rows, inputs in _prefetched(chunks, lambda rows: decode_inputs([train[r] for r in rows]), device, threads=args.decode_threads):
 			chosen = [train[r] for r in rows]
-			outputs = model(inputs)
-			logp, _ = chosen_logp(outputs, choice_tensors(chosen, device))
-			loss = -logp.mean()
-			if args.value_weight > 0:
-				loss = loss + args.value_weight * value_loss(outputs, train_shares[rows], train_growth[rows], device, config.growth_weight)
-			optimizer.zero_grad(set_to_none=True)
-			loss.backward()
-			torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-			optimizer.step()
+			choice = choice_tensors(chosen, device)
+			for name, (model, optimizer, _) in models.items():
+				outputs = model(inputs)
+				logp, _ = chosen_logp(outputs, choice)
+				loss = -logp.mean()
+				if args.value_weight > 0:
+					loss = loss + args.value_weight * value_loss(outputs, train_shares[rows], train_growth[rows], device, config.growth_weight)
+				optimizer.zero_grad(set_to_none=True)
+				loss.backward()
+				torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+				optimizer.step()
+				running[name].append(float(loss.detach()))
+				del outputs, logp, loss
 			step, seen = step + 1, seen + len(rows)
-			running.append(float(loss.detach()))
 			if step % args.eval_every == 0 or time.time() > deadline or seen >= args.epochs * len(train):
-				report = evaluation()
-				history.append({"step": step, "decisions": seen, "train_loss": float(np.mean(running)), "val": report})
-				by_type = ", ".join(f"{k} {v['top1']:.2f}" for k, v in report.items() if k not in ("all", "value"))
-				print(f"imitate: step {step} ({seen / max(1, len(train)):.2f} epochs, {(time.time() - started) / 60:.0f} min): train loss {np.mean(running):.3f}, held-out loss {report['all']['loss']:.3f} top-1 {report['all']['top1']:.3f} value {report['value']:.4f} ({by_type})", flush=True)
-				running = []
-				torch.save({"model": model.state_dict(), "model_kwargs": kwargs, "step": step, "version": 0}, out / "bc_latest.pt")
+				for name, (model, _, kwargs) in models.items():
+					report = evaluation(model)
+					history[name].append({"step": step, "decisions": seen, "train_loss": float(np.mean(running[name])), "val": report})
+					by_type = ", ".join(f"{k} {v['top1']:.2f}" for k, v in report.items() if k not in ("all", "value"))
+					print(f"imitate: {name} step {step} ({seen / max(1, len(train)):.2f} epochs, {(time.time() - started) / 60:.0f} min): train loss {np.mean(running[name]):.3f}, held-out loss {report['all']['loss']:.3f} top-1 {report['all']['top1']:.3f} value {report['value']:.4f} ({by_type})", flush=True)
+					running[name] = []
+					suffix = "" if len(models) == 1 else "_" + name
+					torch.save({"model": model.state_dict(), "model_kwargs": kwargs, "step": step, "version": 0}, out / f"bc_latest{suffix}.pt")
 				(out / "history.json").write_text(json.dumps(history, indent=1))
 				if time.time() > deadline or seen >= args.epochs * len(train):
 					done = True
 					break
-
 
 if __name__ == "__main__":
 	main()
