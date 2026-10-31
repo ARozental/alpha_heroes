@@ -109,6 +109,7 @@ class CampaignLearner:
 		self.value_ev = None  # the value heads' explained variance, smoothed over ~10 updates: how far the credit trusts them
 		self.credit_evidence = {}  # the credit check's (labels.credit_evidence): the step's errors by action type, kept
 		self.credit_check = 1.0  # and its verdict, how far the step's estimate may be trusted (labels.credit_trust)
+		self.end_evidence = {}  # the same for V_end's steps, the end credit's (logged only: campaign_end_credit/*)
 		self.head_ev = {}  # each head's explained variance at the day starts, smoothed: how far it grades the next (grade_trust)
 		self.value_pool, self.head_pool = None, {}  # their parts (labels.pooled_ev): the residual variance and the variance, smoothed apart
 		latest = self.out / "checkpoint_latest.pt"
@@ -401,6 +402,10 @@ class CampaignLearner:
 				self._save(self.out / "checkpoint_latest.pt")
 		if self.worker:  # (the process saved its checkpoint with the trust before this update: one update behind)
 			self._note_value_ev(metrics)
+		end_errors = metrics.pop("end_step_error", None)
+		if end_errors is not None and errors:  # the end credit's check, the 7-day one's for V_end's steps (logged only)
+			self.end_evidence = credit_evidence(decisions, end_errors, np.concatenate(players), getattr(self, "end_evidence", None))
+			row["end_credit_gaps"] = credit_gaps(self.end_evidence)
 		self._relabel_waiting()
 		memory.append(("updated", rss_gb()))
 		self._log(epoch, games, decisions, row, metrics, time.time() - started)
@@ -539,6 +544,8 @@ class CampaignLearner:
 				self.writer.add_scalar(f"campaign/{name}", metrics[name], self.version)
 		for kind, gap in sums.get("credit_gaps", {}).items():  # (the credit check's t-statistic per action type)
 			self.writer.add_scalar(f"campaign_credit/{kind.lower()}", gap, self.version)
+		for kind, gap in sums.get("end_credit_gaps", {}).items():
+			self.writer.add_scalar(f"campaign_end_credit/{kind.lower()}", gap, self.version)
 		for skill, (picked, offered) in skill_picks(decisions).items():  # (how often each skill is taken when offered)
 			self.writer.add_scalar(f"campaign_skills/{skill}", picked / offered, self.version)
 		turns = max(1, sum(1 for d in decisions if d.action_type >= 0))

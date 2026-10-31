@@ -349,9 +349,14 @@ def ppo_update(
 	value_fresh = float(value_fresh) / heads
 	del fresh
 	gpu_mb = 0.0
+	end_step_error = None
 	if end is not None and end["weight"] > 0:  # the policy's credit moves toward the end's as V_end proves itself
 		turn = choices(decisions)["kind"] == c.DecisionKind.TURN
 		later = end_advantages(end_now.cpu().numpy(), end["step"], end["week"], end["real"], end["price"], turn, config.decision_price, end["outcome"])
+		# V_end's step estimate of the end against the end itself, for the end credit's check by action type (a diagnostic
+		# in the learner, as the 7-day credit's check: the end credit is two thirds of the advantage, and no check saw it)
+		values = end_now.cpu().numpy()
+		end_step_error = np.where(end["step"] >= 0, values[np.maximum(end["step"], 0)] - end["real"], np.nan).astype(np.float32)
 		advantage = torch.from_numpy(blend_credit(advantage.cpu().numpy(), later, end["weight"])).to(device)
 	credited = torch.isfinite(advantage)
 	if int(credited.sum()) > 1:
@@ -484,6 +489,7 @@ def ppo_update(
 		steps=steps,
 		stopped=stopped,
 		stopped_pass=stopped_pass,
+		end_step_error=end_step_error,
 		last_kl=update_kl,
 		unsound=int(unsound.sum()),
 		decisions=n,
