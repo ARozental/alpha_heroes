@@ -80,7 +80,9 @@ class Sides(nn.Module):
 
 	def forward(self, vectors, owner):
 		relation, rival = self.relation(owner)
-		return self.gamma[relation] * vectors + self.beta[relation] + self.rival[rival] * (relation == 2).unsqueeze(-1).float()
+		# (lookups as embeddings: a table indexed by a big tensor had CUDA's sorting backward, 95% of a training step's
+		# GPU time with the tile reader's, 2026-10-30; the same values)
+		return F.embedding(relation, self.gamma) * vectors + F.embedding(relation, self.beta) + F.embedding(rival, self.rival) * (relation == 2).unsqueeze(-1).float()
 
 
 class MapUNet(nn.Module):
@@ -155,7 +157,7 @@ class TileReader(nn.Module):
 		v = self.v(tiles).reshape(b, -1, h, dh)
 		logits = torch.einsum("bnhd,bmhd->bhnm", q, k) / math.sqrt(dh)
 		bucket = distance_buckets(tile_positions[None, None, :, :] - positions[:, :, None, :])  # [B, N, M]
-		logits = logits + self.distance[:, bucket].permute(1, 0, 2, 3)
+		logits = logits + F.embedding(bucket, self.distance.t()).permute(0, 3, 1, 2)  # (an embedding: Sides.forward)
 		if reach is not None:
 			logits = logits + reach.permute(0, 3, 1, 2)
 		att = logits.masked_fill(~valid[:, None, None, :], -1e4).softmax(dim=-1)
@@ -411,7 +413,7 @@ class CampaignModelV2(nn.Module):
 		rival_a, rival_b = a > c.OWNER_SELF, b_ > c.OWNER_SELF
 		relation = torch.where(ours_a & ours_b, 1, torch.where(rival_a & rival_b & (a == b_), 2, torch.where((ours_a & rival_b) | (rival_a & ours_b), 3, torch.where(rival_a & rival_b, 4, 5))))
 		relation = torch.where(owned[:, :, None] & owned[:, None, :], relation, torch.zeros_like(relation))
-		return self.pair_bias(positions, placed) + self.relation_bias[:, relation].permute(1, 0, 2, 3)
+		return self.pair_bias(positions, placed) + F.embedding(relation, self.relation_bias.t()).permute(0, 3, 1, 2)
 
 	def think(self, state):
 		tokens, valid, positions, placed, owners, kinds = self.tokens(state)
@@ -440,7 +442,7 @@ class CampaignModelV2(nn.Module):
 		flat = state.tiles.reshape(b * L * S * S, self.cell_dim)
 		decision = torch.div(known.windows, HO, rounding_mode="floor")
 		index = known.window_tiles
-		cells = torch.where((index >= 0).unsqueeze(-1), flat[(decision[:, None, None] * (L * S * S) + index.clamp(min=0)).reshape(-1)].reshape(k, W, W, -1), torch.zeros(k, W, W, self.cell_dim, device=flat.device, dtype=flat.dtype))
+		cells = torch.where((index >= 0).unsqueeze(-1), flat.index_select(0, (decision[:, None, None] * (L * S * S) + index.clamp(min=0)).reshape(-1)).reshape(k, W, W, -1), torch.zeros(k, W, W, self.cell_dim, device=flat.device, dtype=flat.dtype))
 		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach)
 
 	def foresee(self, state, known):
