@@ -309,26 +309,28 @@ def excess_loss(logits, targets):
 
 STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl", "teacher_kl")  # a step's metrics, in ppo_update's order
 # The teacher's outputs its KL reads (teacher_kl), put in each micro-batch as "t:<name>"
-TEACHER_OUTPUTS = ("type_logp", "option_logp") + tuple(output for output, _ in HEADS.values())
+TEACHER_OUTPUTS = ("type_logp",) + tuple(output for output, _ in HEADS.values())
 
 
 def teacher_kl(out, batch):
-	"""KL(teacher || model) of each decision [N] (config.teacher_kl): a turn's over the action type plus each type's
-	table weighted by the teacher's p(type); a question's over its options. An entry the teacher gives no probability
-	adds nothing (both models see the same legal masks); the model's log-probabilities are floored at -50 there."""
+	"""KL(teacher || model) of each decision [N] (config.teacher_kl): a turn decision's, over the action type plus each
+	type's table weighted by the teacher's p(type); 0 for the others. The teacher learned turn decisions only (the
+	recorder takes Nullkiller2's turn requests, not its answers to questions or its exchanges: Teacher.cpp), so
+	elsewhere its outputs are its untrained start, which the KL would pull the answers to. An entry the teacher gives
+	no probability adds nothing (both models see the same legal masks); the model's log-probabilities are floored at
+	-50 there."""
 	def part(t, s):
 		p = t.exp()
 		return torch.where(p > 0, p * (t - s.clamp(min=-50.0)), torch.zeros_like(p)).sum(dim=-1)
 
 	kind = batch["kind"]
 	n = kind.shape[0]
-	turn = (kind == c.DecisionKind.TURN) | (kind == c.DecisionKind.EXCHANGE)
 	t_type = batch["t:type_logp"]
 	kl = part(t_type, out["type_logp"])
 	p_type = t_type.exp()
 	for a, (output, _) in HEADS.items():
 		kl = kl + p_type[:, a] * part(batch["t:" + output].reshape(n, -1), out[output].reshape(n, -1))
-	return torch.where(turn, kl, part(batch["t:option_logp"], out["option_logp"]))
+	return torch.where(kind == c.DecisionKind.TURN, kl, torch.zeros_like(kl))
 
 
 def signal_ratio(optimizer):

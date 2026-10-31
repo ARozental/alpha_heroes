@@ -225,7 +225,9 @@ def test_the_teachers_kl_is_zero_against_itself_and_positive_against_another_mod
 	assert teacher_kl(out, batch).abs().max() < 1e-4
 	moved = other(x)
 	kl = teacher_kl(moved, batch)
-	assert torch.isfinite(kl).all() and (kl > 0).all()
+	turn = x["g_kind"] == c.DecisionKind.TURN
+	assert turn.any() and (~turn).any()  # (both kinds among the inputs)
+	assert torch.isfinite(kl).all() and (kl[turn] > 0).all() and (kl[~turn] == 0).all()  # (the teacher learned turns only)
 	kl.sum().backward()  # (masked entries: -inf in both, no nan reaches a gradient)
 	assert all(torch.isfinite(p.grad).all() for p in other.parameters() if p.grad is not None)
 

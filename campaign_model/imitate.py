@@ -120,11 +120,14 @@ def main():
 	parser.add_argument("--eval-every", type=int, default=500)
 	parser.add_argument("--seed", type=int, default=1)
 	parser.add_argument("--device", default="")
+	parser.add_argument("--decode-threads", type=int, default=3, help="batches decoded at once (zlib: ~0.3 s a 128-decision batch a thread)")
 	args = parser.parse_args()
 	assert args.lr <= 1e-4, "the user's rule: never above 1e-4"
 	from .learner import auto_device
 
 	device = torch.device(args.device or auto_device())
+	if device.type == "cuda":  # (as the trainer's tf32 setting: float32 matmuls as TF32)
+		torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
 	out = Path(args.out)
 	out.mkdir(parents=True, exist_ok=True)
 	paths = sorted(Path(args.data).glob("game_*.pkl"))
@@ -165,7 +168,7 @@ def main():
 		rng.shuffle(order)
 		chunks = [order[i : i + args.batch] for i in range(0, len(order) - args.batch + 1, args.batch)]
 		running = []
-		for rows, inputs in _prefetched(chunks, lambda rows: decode_inputs([train[r] for r in rows]), device):
+		for rows, inputs in _prefetched(chunks, lambda rows: decode_inputs([train[r] for r in rows]), device, threads=args.decode_threads):
 			chosen = [train[r] for r in rows]
 			outputs = model(inputs)
 			logp, _ = chosen_logp(outputs, choice_tensors(chosen, device))
