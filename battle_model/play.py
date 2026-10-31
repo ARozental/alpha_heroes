@@ -376,6 +376,10 @@ def start(game, model_path, records, max_seconds=300, max_mb=200):
 
 QUEUE_ENV_PREFIXES = ("ALPHA_BATTLE_", "VCMI_BATTLE_")  # a queued game's env replaces the previous game's
 BATTLE_NICENESS = 10  # BattleProcess's (the actors' generated battles; real games run at 15)
+# A client waiting for its next battle logs nothing, and headless.sh ends it after 60 s of silence: a battle sent while
+# it was being ended failed ("Broken pipe", or "exited (0)" once it had started; ~120 of joint5's battles in 5 h,
+# 2026-10-31, the actors idle through each ~100 s campaign update). A client idle this long is replaced before that.
+IDLE_SECONDS = 40
 
 
 class BattleProcess:
@@ -389,6 +393,7 @@ class BattleProcess:
 		self.process = self.conn = None
 		self.battles = 0
 		self.pending = b""
+		self.idle_since = 0.0  # (monotonic) since the client's last battle ended, or it started
 
 	def _start(self):
 		self.close_process()
@@ -399,7 +404,7 @@ class BattleProcess:
 		listener.listen(1)
 		env = {**os.environ, "VCMI_TEST_QUEUE": str(path)}
 		# The process lives for many battles: its watchdog's limits are the whole run's; a stall (60 s without a log
-		# line while idle, e.g. waiting for its next battle during an eval) ends it, and the next battle starts another
+		# line) ends it, and the next battle starts another (one idle IDLE_SECONDS is replaced before its watchdog does)
 		# At low priority: the actors make more battles than the learner takes, and the learner (and the inference
 		# server) starved for CPU (a learner update took 15 s in a run, 9.4 s alone)
 		command = ["nice", "-n", str(BATTLE_NICENESS), str(ROOT / "scripts" / "headless.sh"), "queue", str(24 * 3600), str(self.max_mb), "60"]
@@ -413,7 +418,7 @@ class BattleProcess:
 		finally:
 			listener.close()
 			path.unlink(missing_ok=True)
-		self.battles, self.pending = 0, b""
+		self.battles, self.pending, self.idle_since = 0, b"", time.monotonic()
 
 	def _line(self, timeout):
 		"""The client's next line ("ready" for the next game), or None if it did not come in time or the client ended."""
@@ -434,7 +439,7 @@ class BattleProcess:
 		"""Play one game; its records (data.Record), one per side in game.recorded_sides."""
 		from .data import parse_record
 
-		if self.process is None or self.process.poll() is not None or self.battles >= self.max_battles:
+		if self.process is None or self.process.poll() is not None or self.battles >= self.max_battles or time.monotonic() - self.idle_since > IDLE_SECONDS:
 			self._start()
 		if self._line(120) is None:  # the client asks for its next game when the last one is over
 			self._start()
@@ -446,7 +451,10 @@ class BattleProcess:
 		name, env, settings, prefix = game_setup(game, model_path, [{"socket": self.records.path, "key": key} for key in keys])
 		try:
 			job = {"map": name, "env": env, "settings": settings, "clear_env": list(QUEUE_ENV_PREFIXES)}
-			self.conn.sendall((json.dumps(job) + "\n").encode())
+			try:
+				self.conn.sendall((json.dumps(job) + "\n").encode())
+			except OSError as error:
+				raise RuntimeError(f"the VCMI battle process was gone before its battle ({error}; its runner: {self.close_process() or '?'}), map {name}") from error
 			deadline = time.monotonic() + self.battle_seconds
 			while True:
 				with self.records._lock:
@@ -455,17 +463,21 @@ class BattleProcess:
 					break
 				if time.monotonic() > deadline or self.process.poll() is not None:
 					status = "stalled" if self.process.poll() is None else f"exited ({self.process.poll()})"
-					self.close_process()
-					raise RuntimeError(f"battle did not finish cleanly ({status} in a battle process, map {name})")
+					# (the runner's own status says how the client ended: headless.sh exits 0 whatever happened to it)
+					raise RuntimeError(f"battle did not finish cleanly ({status} in a battle process; its runner: {self.close_process() or '?'}), map {name}")
 				time.sleep(0.02)
 		finally:
 			if prefix:
 				prefix.unlink(missing_ok=True)
+		self.idle_since = time.monotonic()
 		with self.records._lock:
 			received = {key: self.records.records.pop(key) for key in keys}
 		return [parse_record(received[key][-1]) for key in keys]
 
 	def close_process(self):
+		"""Ends the client; returns its runner's status line (headless.sh's "status:", e.g. "killed: no log output for
+		60s ..." or "finished (exit code 139)"), or "" when there was none."""
+		status = ""
 		if self.conn:
 			try:
 				self.conn.sendall(b"{}\n")  # no more games
@@ -482,9 +494,11 @@ class BattleProcess:
 		if self.process:
 			output = self.process.communicate()[0] if self.process.stdout and not self.process.stdout.closed else ""
 			run = next((line.split(":", 1)[1].strip() for line in (output or "").splitlines() if line.startswith("run:")), "")
+			status = next((line.split(":", 1)[1].strip() for line in (output or "").splitlines() if line.startswith("status:")), "")
 			if run:
 				shutil.rmtree(run, ignore_errors=True)
 		self.process = None
+		return status
 
 	def close(self):
 		self.close_process()

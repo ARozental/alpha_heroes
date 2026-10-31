@@ -160,6 +160,13 @@ class Slot:
 				conn = socket.create_connection((self.host, self.port), timeout=30)
 				conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 				remote.send_frame(conn, json.dumps({"protocol": remote.PROTOCOL, "token": self.token, "name": self.name, "contracts": remote.contracts()}).encode())
+				# The master answers when it places a game here, minutes away while its own games suffice: the connection
+				# waits as long as that takes. One given up after 30 s stayed queued on the master, which later placed
+				# a game on it ("closed": 22 battles lost in 5 h, 2026-10-31)
+				while not play.readable(conn, 1.0):
+					if self.stop.is_set() or self.channel.lost.is_set():
+						conn.close()
+						return
 				welcome = json.loads(remote.read_frame(conn))
 				if "error" in welcome:
 					print(f"slot {self.index}: refused: {welcome['error']}", flush=True)

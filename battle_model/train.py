@@ -887,6 +887,7 @@ def value_gains(model):
 
 
 GRADIENT_CHECK_EVERY = 5  # updates between gradient health checks (trunk_gradients), on an update's first minibatch
+CAMPAIGN_WAIT_SECONDS = 120  # learner "turns": the longest a campaign update that is ready waits behind battle updates
 
 
 def trunk_gradients(model, main, foresight):
@@ -1225,6 +1226,7 @@ def train(config, resume=False):
 	if resume and (out / "eval_total.csv").exists():  # the next eval eval_minutes after the last one, not after the resume
 		last_eval -= time.time() - (out / "eval_total.csv").stat().st_mtime
 	elapsed = lambda: elapsed_before + time.monotonic() - run_started
+	last_campaign = time.monotonic()  # (learner "turns": when the campaign's last update ended)
 	try:
 		for epoch in itertools.count(first_epoch):
 			if (config.run_hours and elapsed() >= config.run_hours * 3600) or (not config.run_hours and epoch > config.epochs):
@@ -1243,7 +1245,8 @@ def train(config, resume=False):
 				while items is None:
 					items, actor_stats = pool.take(config.decisions_per_update, stop=(lambda: campaign.ready()) if campaign and config.campaign.learner == "turns" else None)
 					if items is None:
-						campaign.step(epoch - 1)
+						if campaign.step(epoch - 1):
+							last_campaign = time.monotonic()
 						campaign.check()
 				records = []
 			else:
@@ -1460,7 +1463,13 @@ def train(config, resume=False):
 			)
 
 			if campaign and config.campaign.learner == "turns":
-				campaign.step(epoch)  # an update of the campaign model when its games are in (its own optimizer)
+				# An update of the campaign model when its games are in (its own optimizer), once the battles waiting cannot
+				# fill another update: a campaign update (~100 s) after every battle update held the battle learner to one
+				# update per campaign update (28-46 an hour against 90-158 before, 2026-10-31) while its campaign battles
+				# overflowed the buffer (148k decisions dropped in 5 h). Not past CAMPAIGN_WAIT_SECONDS of battles in a row
+				if not (pool and pool.ready(config.decisions_per_update)) or time.monotonic() - last_campaign > CAMPAIGN_WAIT_SECONDS:
+					if campaign.step(epoch):
+						last_campaign = time.monotonic()
 			elif campaign:
 				campaign.note_epoch(epoch)  # (its updates run in its own thread)
 			if campaign:

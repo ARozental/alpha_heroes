@@ -72,6 +72,21 @@ def memory_allows():
 	return free is None or free >= MEMORY_FLOOR_GB
 
 
+def peer_closed(conn):
+	"""Whether the other end of a connection has closed it (nothing more to read, and it said so). Without waiting: a
+	socket with a timeout would wait that long for data first."""
+	timeout = conn.gettimeout()
+	conn.setblocking(False)
+	try:
+		return conn.recv(1, socket.MSG_PEEK) == b""
+	except BlockingIOError:
+		return False
+	except OSError:
+		return True
+	finally:
+		conn.settimeout(timeout)
+
+
 # ---- what a worker makes of a battle ----
 
 
@@ -198,15 +213,25 @@ class Games(IterableDataset):
 
 	def _accept_slot(self):
 		"""A remote slot's connection (its hello checked), or None when none waits."""
-		try:
-			self.listener.settimeout(0.5)
-			conn, address = self.listener.accept()
-		except (socket.timeout, OSError):
-			return None
+		while True:
+			try:
+				self.listener.settimeout(0.5)
+				conn, address = self.listener.accept()
+			except (socket.timeout, OSError):
+				return None
+			conn = self._slot_hello(conn)
+			if conn is not None:
+				return conn
+
+	def _slot_hello(self, conn):
+		"""The connection, its hello checked and answered; None if it was refused or its slot is gone."""
 		try:
 			conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 			conn.settimeout(SLOT_HELLO_SECONDS)
 			hello = json.loads(remote.read_frame(conn))
+			if peer_closed(conn):  # a slot that gave up waiting, still queued here with its hello: the next one
+				conn.close()
+				return None
 			problem = None
 			if hello.get("protocol") != remote.PROTOCOL:
 				problem = f"protocol {hello.get('protocol')}, the master speaks {remote.PROTOCOL}"

@@ -176,3 +176,28 @@ def test_local_servers_serve_the_weights_sent():
 	finally:
 		for server in servers.values():
 			server.close()
+
+
+def test_a_slot_that_gave_up_waiting_is_passed_over(tmp_path):
+	"""A slot's connection closed after its hello (its worker gave up waiting, or its tunnel reopened) is still queued
+	on the master's slot port: the master skips it for the next one, which gets the answer (2026-10-31: games placed
+	on such connections failed, "closed")."""
+	from battle_model.supply import Games
+
+	listener = socket.create_server(("127.0.0.1", 0))
+	port = listener.getsockname()[1]
+	message = json.dumps({"protocol": remote.PROTOCOL, "token": "secret", "name": "test", "contracts": remote.contracts()}).encode()
+	gone = socket.create_connection(("127.0.0.1", port))
+	remote.send_frame(gone, message)
+	gone.close()
+	waiting = socket.create_connection(("127.0.0.1", port), timeout=5)
+	remote.send_frame(waiting, message)
+	time.sleep(0.2)
+	games = Games("battle", TrainConfig(), tmp_path, ["unused"], None, None, "secret", listener)
+	conn = games._accept_slot()
+	assert conn is not None
+	assert json.loads(remote.read_frame(waiting)) == {"ok": True}
+	assert games._accept_slot() is None  # (none left: the closed one was dropped)
+	conn.close()
+	waiting.close()
+	listener.close()
