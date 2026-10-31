@@ -219,6 +219,9 @@ def action_loss(predicted, target, battle, config, rows=None):
 	return fought, score, parts
 
 
+PART_NAMES = ("move_battle", "move_score", "move_parts", "answer_battle", "answer_score", "answer_parts", "hero_alive", "hero_army", "turn")  # foresight_loss's parts, in this order
+
+
 def foresight_loss(out, labels, config=ForesightConfig()):
 	"""(the loss, {part: its value}) of the foresight's predictions (out["fs_*"]) against a batch's labels (game_labels'
 	rows, as tensors on the device)."""

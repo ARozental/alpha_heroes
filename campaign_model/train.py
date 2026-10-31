@@ -40,7 +40,7 @@ from .empire import EmpireConfig, empire_value
 from .labels import COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, blend_credit, end_advantages, end_labels, end_steps, explained_variance, growth_labels, label, residual_variances
 from .model import CampaignModel, build_model
 from .play import make_map, play
-from .graphs import Graphs
+from .graphs import Graphs, StepGraph
 from .records import NO_EFFECT, decode_inputs, decode_wire, inputs_on_device
 from .schema import HEADS
 
@@ -259,6 +259,53 @@ def excess_loss(logits, targets):
 STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl")  # a step's metrics, in ppo_update's order
 
 
+def micro_loss(out, batch, config, foresight_config=None):
+	"""A micro-batch's loss and metrics from the model's outputs and its rows, for the eager step and the recorded one
+	alike (graphs.StepGraph): (loss, the rest of STEP_PARTS [6], the foresight's parts [len(PART_NAMES)] or None, the
+	foresight's share of the loss or None). batch: tensors on the device, each a row of the micro-batch (kind, action,
+	index, cell, old_logp, keep, advantage, credited, targets, share_valid, anchor; growth, growth_valid; end, end_valid;
+	"fs:<label>": the foresight's), and its minibatch's counts (count_credit, count_keep, count_share, count_growth,
+	count_end) and its share of the minibatch ("share"): the micro-batches' gradients add up to the minibatch's."""
+	from .foresight import PART_NAMES, ForesightConfig, foresight_loss
+
+	keep = batch["keep"]
+	logp, entropy = chosen_logp(out, {k: batch[k] for k in ("kind", "action", "index", "cell")})
+	logp = torch.where(keep > 0, logp, batch["old_logp"])
+	ratio = (logp - batch["old_logp"]).exp()
+	a, credit = batch["advantage"], keep * batch["credited"]
+	policy = -(torch.minimum(ratio * a, ratio.clamp(1 - config.clip, 1 + config.clip) * a) * credit).sum() / batch["count_credit"]
+	value, heads = head_loss(out["value_logit"], batch["targets"], batch["share_valid"], batch["count_share"]).sum(), float(c.N_VALUE_OFFSETS)
+	if "growth" in batch:  # our value's log growth from the decision, on the heads' 0..1 scale
+		now = out["phi"].detach().clamp(min=PHI_FLOOR).log().unsqueeze(-1)
+		scaled = ((batch["growth"] - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
+		value = value + config.growth_weight * head_loss(out["growth_logit"], scaled, batch["growth_valid"], batch["count_growth"]).sum()
+		heads += config.growth_weight * c.N_VALUE_OFFSETS
+	if "end" in batch:  # V_end, at a share head's weight
+		value = value + head_loss(out["end_logit"].unsqueeze(-1), batch["end"].unsqueeze(-1), batch["end_valid"].unsqueeze(-1), batch["count_end"].unsqueeze(-1)).sum()
+		heads += 1.0
+	value = value / heads
+	bonus = (entropy * keep).sum() / batch["count_keep"]
+	floor = (torch.relu(config.entropy_floor - entropy) * keep).sum() / batch["count_keep"]  # only decisions below it
+	loss = policy + config.value_weight * value - config.entropy_weight * bonus + config.entropy_floor_weight * floor
+	fs_parts = fs_share = None
+	labels = {name[3:]: value for name, value in batch.items() if name.startswith("fs:")}
+	if labels and "fs_turn" in out:
+		fs_loss, parts = foresight_loss(out, labels, foresight_config or ForesightConfig())
+		fs_share = batch["share"] * fs_loss
+		loss = loss + fs_share
+		fs_parts = torch.stack([parts[name].float() for name in PART_NAMES])
+	drift = logp.detach() - batch["anchor"]
+	metrics = torch.stack([
+		policy.detach(),
+		value.detach(),
+		bonus.detach(),
+		((entropy < config.entropy_floor).float() * keep).sum() / batch["count_keep"],  # below_floor
+		(((ratio - 1).abs() > config.clip).float() * keep).sum() / batch["count_keep"],  # clip_fraction
+		(((drift.exp() - 1) - drift) * keep).sum() / batch["count_keep"],  # kl: k3, before this step
+	]).float()
+	return loss, metrics, fs_parts, fs_share
+
+
 def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
 	growth=None, labels=None, end=None, foresight=None,
@@ -280,11 +327,11 @@ def ppo_update(
 	clock = {"prepass": 0.0, "wait": 0.0, "steps": 0.0, "forward": 0.0, "losses": 0.0, "backward": 0.0, "optimizer": 0.0, "cpu": time.thread_time()}  # where the update's time goes (logged: the PC's step ran at half the GPU's pace, 2026-10-30)
 	# The foresight's labels (foresight.game_labels, v2), each decision's row: its loss joins the minibatch's, a share
 	# per micro-batch as the others'; the shared layers' gradient from it against the PPO losses', on the first one
-	from .foresight import ForesightConfig, foresight_loss, gradient_check
+	from .foresight import PART_NAMES, ForesightConfig, gradient_check
 
 	foresight_t = {name: torch.from_numpy(value).to(device) for name, value in foresight.items()} if foresight is not None else None
 	foresight_config = ForesightConfig(weight=getattr(config, "foresight_weight", ForesightConfig.weight))
-	foresight_sums, checked = Counter(), {}
+	foresight_sums, foresight_sum, checked = Counter(), None, {}  # (foresight_sum: its parts, PART_NAMES' order, on the device)
 	# On CUDA the bytes as sent go to the device and are cut and converted there (half the copy, none of the CPU's dtype copies)
 	convert = inputs_on_device if decode is None and device.type == "cuda" else None
 	decode = decode or ((lambda rows: decode_wire([decisions[r] for r in rows])) if convert else (lambda rows: decode_inputs([decisions[r] for r in rows])))
@@ -313,6 +360,12 @@ def ppo_update(
 	graphs = None
 	if config.cuda_graphs and Graphs.usable(model, device):  # (recorded once a process: kept with the model)
 		graphs = model.__dict__.setdefault("_graphs", Graphs(model))
+	# A micro-batch's forward, loss and backward recorded as one graph (graphs.StepGraph), checked against the eager step
+	# the first time: the update launched ~1,000 small kernels a micro-batch outside the model's graph (its loss and the
+	# loss's backward: ~45 of a 76 s update, 2026-10-31)
+	steps_graph = None
+	if graphs is not None and config.step_graphs:
+		steps_graph = model.__dict__.setdefault("_step_graph", StepGraph(model, lambda out, batch: micro_loss(out, batch, config, foresight_config)[:3]))
 	model.eval()
 	anchor, end_now, prior = torch.empty(n, device=device), torch.empty(n, device=device), torch.empty(n, device=device)
 	# The same pass measures the value loss on these decisions before the update learns from them (the user, 2026-10-29:
@@ -363,6 +416,7 @@ def ppo_update(
 		advantage = (advantage - advantage[credited].mean()) / (advantage[credited].std() + 1e-8)
 	advantage = torch.where(credited, advantage, torch.zeros_like(advantage))
 	unsound = ~torch.isfinite(anchor)  # a choice the model calls impossible now (its legality changed): left out
+	credited_f, anchor_safe, shares = credited.float(), anchor.nan_to_num(neginf=0.0), {}
 	totals, steps, stopped, update_kl, recent = Counter(), 0, False, 0.0, deque(maxlen=KL_WINDOW)
 	stopped_pass = 0  # the pass the KL control ended (0: none; b1, 2026-10-31: with passes=2, a second pass mostly cut short adds nothing)
 	model.train()
@@ -391,71 +445,52 @@ def ppo_update(
 				counts["growth"] = growth_valid[index].sum(dim=0)
 			if end is not None:
 				counts["end"] = end_valid[index].sum(dim=0)
-			optimizer.zero_grad()
+			optimizer.zero_grad(set_to_none=False)  # (in place: a recorded step adds into these .grad tensors)
 			parts = []
 			for part in parts_of_rows:
 				sub, keep = index[part[0] : part[-1] + 1], whole[part[0] : part[-1] + 1]  # (array_split's parts: consecutive)
 				waited = time.perf_counter()
 				_, inputs = next(decoded)
 				clock["wait"] += time.perf_counter() - waited
-				def losses(out):
-					"""The micro-batch's losses from the model's outputs: (loss without the foresight's, the foresight's loss and
-					parts or None, the policy's, the value's, the entropy bonus, the ratio, logp, entropy)."""
-					logp, entropy = chosen_logp(out, {k: choice[k][sub] for k in ("kind", "action", "index", "cell")})
-					logp = torch.where(keep > 0, logp, choice["old_logp"][sub])
-					ratio = (logp - choice["old_logp"][sub]).exp()
-					a, credit = advantage[sub], keep * credited[sub].float()
-					policy = -(torch.minimum(ratio * a, ratio.clamp(1 - config.clip, 1 + config.clip) * a) * credit).sum() / counts["credit"]
-					value, heads = head_loss(out["value_logit"], targets_t[sub], share_valid[sub], counts["share"]).sum(), float(c.N_VALUE_OFFSETS)
-					if growth is not None:  # our value's log growth from the decision, on the heads' 0..1 scale
-						now = out["phi"].detach().clamp(min=PHI_FLOOR).log().unsqueeze(-1)
-						scaled = ((growth_t[sub] - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
-						value = value + config.growth_weight * head_loss(out["growth_logit"], scaled, growth_valid[sub], counts["growth"]).sum()
-						heads += config.growth_weight * c.N_VALUE_OFFSETS
-					if end is not None:  # V_end, at a share head's weight
-						value = value + head_loss(out["end_logit"].unsqueeze(-1), end_t[sub].unsqueeze(-1), end_valid[sub].unsqueeze(-1), counts["end"].unsqueeze(-1)).sum()
-						heads += 1.0
-					value = value / heads
-					bonus = (entropy * keep).sum() / counts["keep"]
-					floor = (torch.relu(config.entropy_floor - entropy) * keep).sum() / counts["keep"]  # only decisions below it
-					loss = policy + config.value_weight * value - config.entropy_weight * bonus + config.entropy_floor_weight * floor
-					fs = foresight_loss(out, {name: value[sub] for name, value in foresight_t.items()}, foresight_config) if foresight_t is not None and "fs_turn" in out else None
-					return loss, fs, policy, value, bonus, ratio, logp, entropy
-
 				share = len(part) / len(rows)
+				batch = {
+					**{k: choice[k][sub] for k in ("kind", "action", "index", "cell", "old_logp")},
+					"keep": keep, "advantage": advantage[sub], "credited": credited_f[sub], "targets": targets_t[sub], "share_valid": share_valid[sub], "anchor": anchor_safe[sub],
+					"count_credit": counts["credit"], "count_keep": counts["keep"], "count_share": counts["share"], "share": shares.setdefault(share, torch.full((), share, device=device)),
+				}
+				if growth is not None:
+					batch.update(growth=growth_t[sub], growth_valid=growth_valid[sub], count_growth=counts["growth"])
+				if end is not None:
+					batch.update(end=end_t[sub], end_valid=end_valid[sub], count_end=counts["end"])
+				if foresight_t is not None:
+					batch.update({"fs:" + name: value[sub] for name, value in foresight_t.items()})
 				if foresight_t is not None and not checked:
 					# The gradient check, once an update, on an eager forward of its own, through torch.autograd.grad; every tensor
 					# of that forward is dropped before the graphed step: its autograd graph alive (one tensor of it kept) made
 					# the parameters' AccumulateGrad nodes reference the default stream, and the capture refused them ("a stale
 					# reference to the default stream (stream 0) from warmup", 2026-10-30)
-					check = losses(model(inputs))
-					if check[1] is not None:
-						checked = gradient_check(model, check[0], share * check[1][0])
+					check = micro_loss(model(inputs), batch, config, foresight_config)
+					if check[3] is not None:
+						checked = gradient_check(model, check[0] - check[3], check[3])
 					del check
 				mark = time.perf_counter()
-				out = graphs.train(inputs) if graphs else model(inputs)
-				clock["forward"] += time.perf_counter() - mark
-				mark = time.perf_counter()
-				loss, fs, policy, value, bonus, ratio, logp, entropy = losses(out)
-				if fs is not None:
-					fs_loss, fs_parts = fs
-					loss = loss + share * fs_loss
-					for name, part_value in fs_parts.items():  # (summed on the device: a float() here waited for the GPU every micro-batch)
-						foresight_sums[name] = foresight_sums[name] + part_value.float() * share
+				recorded = steps_graph.run(inputs, batch) if steps_graph is not None else None
+				if recorded is not None:  # forward, loss and backward in one replay, its gradient added to .grad
+					metrics, fs_parts = recorded
+					clock["forward"] += time.perf_counter() - mark
+				else:
+					out = graphs.train(inputs) if graphs else model(inputs)
+					clock["forward"] += time.perf_counter() - mark
+					mark = time.perf_counter()
+					loss, metrics, fs_parts, _ = micro_loss(out, batch, config, foresight_config)
+					clock["losses"] += time.perf_counter() - mark
+					mark = time.perf_counter()
+					loss.backward()
+					clock["backward"] += time.perf_counter() - mark
+				if fs_parts is not None:  # (summed on the device: a float() here waited for the GPU every micro-batch)
+					foresight_sum = fs_parts * share if foresight_sum is None else foresight_sum + fs_parts * share
 					foresight_sums["steps_seen"] += share
-				clock["losses"] += time.perf_counter() - mark
-				mark = time.perf_counter()
-				loss.backward()
-				clock["backward"] += time.perf_counter() - mark
-				drift = logp.detach() - anchor[sub].nan_to_num(neginf=0.0)
-				parts.append(torch.stack([  # (summed on the device: one sync a step, not six a micro-batch)
-					policy.detach(),
-					value.detach(),
-					bonus.detach(),
-					((entropy < config.entropy_floor).float() * keep).sum() / counts["keep"],  # below_floor
-					(((ratio - 1).abs() > config.clip).float() * keep).sum() / counts["keep"],  # clip_fraction
-					(((drift.exp() - 1) - drift) * keep).sum() / counts["keep"],  # kl: k3, before this step
-				]).float())
+				parts.append(metrics)  # (summed on the device: one sync a step, not six a micro-batch)
 			mark = time.perf_counter()
 			grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 			optimizer.step()
@@ -508,7 +543,7 @@ def ppo_update(
 		backward_seconds=clock["backward"],
 		optimizer_seconds=clock["optimizer"],
 		cpu_share=(time.thread_time() - clock["cpu"]) / max(time.time() - started, 1e-9),  # of the update's time this thread ran on the CPU
-		**{f"foresight_{name}": float(value) / max(foresight_sums["steps_seen"], 1e-9) for name, value in foresight_sums.items() if name != "steps_seen"},
+		**({f"foresight_{name}": value / max(foresight_sums["steps_seen"], 1e-9) for name, value in zip(PART_NAMES, foresight_sum.tolist())} if foresight_sum is not None else {}),
 		**checked,
 		**{f"value_ev_d{k}": explained_variance(predicted[:, i], actual[:, i]) for i, k in enumerate(c.VALUE_OFFSETS)},
 		**{f"value_parts_d{k}": residual_variances(predicted[:, i], actual[:, i]) for i, k in enumerate(c.VALUE_OFFSETS)},
