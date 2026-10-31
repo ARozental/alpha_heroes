@@ -336,7 +336,7 @@ def main():
 		import multiprocessing
 
 		loader = torch.utils.data.DataLoader(TeacherPlay(args.seed, args.share_target), batch_size=None, num_workers=args.stream, worker_init_fn=_worker_init, persistent_workers=True, prefetch_factor=1, multiprocessing_context=multiprocessing.get_context("forkserver" if sys.platform != "win32" else "spawn"))
-		pool = StreamPool(loader, 2 * args.lanes, rng)
+		pool = StreamPool(loader, args.lanes + 32, rng)  # (a stream ~12 MB compressed: enough for the lanes ending a stream at once)
 		val_streams, train_streams, total = None, None, float("inf")
 		print(f"imitate: Nullkiller2's games played by {args.stream} workers, each decision seen once; {device}", flush=True)
 	else:
