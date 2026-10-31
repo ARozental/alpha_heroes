@@ -40,4 +40,11 @@ inference_processes = 1
 # 32 GB GPU and took 10 GB of host memory (2026-10-30)
 batch_size = 512
 micro_batches = 4
+# The no-gradient first pass in 256s: its cost is likewise launches (~0.8 s a batch at 128, a quarter of an update)
+prepass_batch = 256
+# One pass over twice the decisions (24+ games an update): the learner trains ~1/8 of what the games play (2026-10-30:
+# 453 decisions/s played on the PC and the Mac, ~54 trained), so fresh games instead of each seen twice
+passes = 1
+decisions_per_update = 32768
+min_games_per_update = 20
 eval_parallel = 8
