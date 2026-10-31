@@ -174,7 +174,7 @@ def test_an_update_runs_with_the_horizon_credit_and_learns_how_far_to_trust_the_
 	learner = SimpleNamespace(
 		config=config, labels=LabelConfig(), empire=EmpireConfig(), version=1, finished=list(games), lock=threading.Condition(), stats=collections.Counter(),
 		model=model, optimizer=make_optimizer(model, config), device=torch.device("cpu"), worker=None, model_lock=threading.Lock(), lr_scale=1.0,
-		server=SimpleNamespace(set_model=lambda *args: None), teacher=None, games_used=0, out=tmp_path, kwargs=kwargs, value_ev=None, credit_evidence={}, credit_check=1.0, head_ev={"Vend": 0.2}, value_pool=None, head_pool={}, progress=tmp_path / "progress.csv", writer=Writer(),
+		server=SimpleNamespace(set_model=lambda *args: None), teacher=None, teacher_weight=0.0, games_used=0, out=tmp_path, kwargs=kwargs, value_ev=None, credit_evidence={}, credit_check=1.0, head_ev={"Vend": 0.2}, value_pool=None, head_pool={}, progress=tmp_path / "progress.csv", writer=Writer(),
 		features_cpu=model.features,
 	)
 	for name in ("_take", "trust", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting"):
@@ -312,7 +312,7 @@ def test_an_update_runs_with_the_attributed_credit(tmp_path):
 	learner = SimpleNamespace(
 		config=config, labels=LabelConfig(), empire=EmpireConfig(), version=1, finished=list(games), lock=threading.Condition(), stats=collections.Counter(),
 		model=model, optimizer=make_optimizer(model, config), device=torch.device("cpu"), worker=None, model_lock=threading.Lock(), lr_scale=1.0,
-		server=SimpleNamespace(set_model=lambda *args: None), teacher=None, games_used=0, out=tmp_path, kwargs=kwargs, value_ev=None, credit_evidence={}, credit_check=1.0, head_ev={"Vend": 0.2}, value_pool=None, head_pool={}, progress=tmp_path / "progress.csv", writer=Writer(),
+		server=SimpleNamespace(set_model=lambda *args: None), teacher=None, teacher_weight=0.0, games_used=0, out=tmp_path, kwargs=kwargs, value_ev=None, credit_evidence={}, credit_check=1.0, head_ev={"Vend": 0.2}, value_pool=None, head_pool={}, progress=tmp_path / "progress.csv", writer=Writer(),
 		features_cpu=model.features,
 	)
 	for name in ("_take", "trust", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting"):
@@ -321,3 +321,13 @@ def test_an_update_runs_with_the_attributed_credit(tmp_path):
 	assert CampaignLearner.step(learner, epoch=1)
 	row = dict(zip(COLUMNS, learner.progress.read_text().splitlines()[1].split(",")))
 	assert learner.version == 2 and float(row["end_credit"]) == pytest.approx(config.attributed_end_weight)
+
+
+def test_the_teacher_weight_follows_its_kl_target():
+	from campaign_model.learner import adapted_teacher_weight
+
+	assert adapted_teacher_weight(0.2, 0.5, 0.1) == pytest.approx(0.3)  # far over: stronger
+	assert adapted_teacher_weight(0.2, 0.01, 0.1) == pytest.approx(0.2 / 1.5)  # far under: weaker
+	assert adapted_teacher_weight(0.2, 0.1, 0.1) == 0.2  # near: kept
+	assert adapted_teacher_weight(0.2, 0.5, 0.0) == 0.2  # no target: the fixed weight
+	assert adapted_teacher_weight(9.0, 5.0, 0.1) == 10.0 and adapted_teacher_weight(0.01, 0.0, 0.1) == 0.01  # bounded

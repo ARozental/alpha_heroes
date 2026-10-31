@@ -454,9 +454,9 @@ def micro_loss(out, batch, config, foresight_config=None):
 	floor = (torch.relu(config.entropy_floor - entropy) * keep).sum() / batch["count_keep"]  # only decisions below it
 	loss = policy + config.value_weight * value - config.entropy_weight * bonus + config.entropy_floor_weight * floor
 	teacher_part = torch.zeros((), device=keep.device)
-	if "t:type_logp" in batch:  # the teacher's KL (ppo_update's teacher)
+	if "t:type_logp" in batch:  # the teacher's KL (ppo_update's teacher), at its weight (a tensor: a recorded step reads it)
 		teacher_part = (teacher_kl(out, batch) * keep).sum() / batch["count_keep"]
-		loss = loss + config.teacher_kl * teacher_part
+		loss = loss + batch["teacher_weight"] * teacher_part
 	fs_parts = fs_share = None
 	labels = {name[3:]: value for name, value in batch.items() if name.startswith("fs:")}
 	if labels and "fs_turn" in out:
@@ -479,7 +479,7 @@ def micro_loss(out, batch, config, foresight_config=None):
 
 def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
-	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None, teacher=None,
+	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None, teacher=None, teacher_weight=None,
 ):
 	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
 	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
@@ -534,9 +534,10 @@ def ppo_update(
 	# A micro-batch's forward, loss and backward recorded as one graph (graphs.StepGraph), checked against the eager step
 	# the first time: the update launched ~1,000 small kernels a micro-batch outside the model's graph (its loss and the
 	# loss's backward: ~45 of a 76 s update, 2026-10-31)
-	teacher_graphs = None  # (teacher: a frozen model whose KL the loss adds, config.teacher_kl; its forward graphed apart)
+	teacher_graphs = None  # (teacher: a frozen model whose KL the loss adds at teacher_weight, else config.teacher_kl; its forward graphed apart)
 	if teacher is not None and graphs is not None:
 		teacher_graphs = teacher.__dict__.setdefault("_graphs", Graphs(teacher))
+	teacher_weight_t = torch.full((), float(config.teacher_kl if teacher_weight is None else teacher_weight), device=device)
 	steps_graph = None
 	if graphs is not None and config.step_graphs:
 		steps_graph = model.__dict__.setdefault("_step_graph", StepGraph(model, lambda out, batch: micro_loss(out, batch, config, foresight_config)[:3]))
@@ -664,10 +665,10 @@ def ppo_update(
 					batch.update(end=end_t[sub], end_valid=end_valid[sub], count_end=counts["end"])
 				if foresight_t is not None:
 					batch.update({"fs:" + name: value[sub] for name, value in foresight_t.items()})
-				if teacher is not None and config.teacher_kl > 0:  # the teacher's distributions on the same inputs
+				if teacher is not None:  # the teacher's distributions on the same inputs
 					with torch.no_grad():
 						t_out = teacher_graphs.eval(inputs) if teacher_graphs is not None else teacher(inputs)
-					batch.update({"t:" + name: t_out[name] for name in TEACHER_OUTPUTS})
+					batch.update({"t:" + name: t_out[name] for name in TEACHER_OUTPUTS}, teacher_weight=teacher_weight_t)
 				if foresight_t is not None and not checked:
 					# The gradient check, once an update, on an eager forward of its own, through torch.autograd.grad; every tensor
 					# of that forward is dropped before the graphed step: its autograd graph alive (one tensor of it kept) made

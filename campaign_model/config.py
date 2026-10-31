@@ -122,6 +122,12 @@ class CampaignConfig:
 	# leave it. 0: off
 	teacher_checkpoint: str = ""
 	teacher_kl: float = 0.0
+	# The KL a decision is kept near (0: teacher_kl stays the weight): after each update the weight is x1.5 when the
+	# update's teacher KL was over 1.5 x this, /1.5 when under 1/1.5 of it (the PPO KL control's rule), within 0.01..10.
+	# PPO moves the policy ~target_kl an update, in a random direction where the credit is noise: unanchored, the clone
+	# would walk nats away from the teacher in a day (~430 updates); a fixed weight is a guess at once too weak there and
+	# too strong where the credit is real
+	teacher_kl_target: float = 0.0
 	label_weights: tuple = (1 / 3, 1 / 3, 1 / 3)  # of the shares at VALUE_OFFSETS (labels.py)
 	decision_price: float = 1e-4  # share points per turn decision
 	# Evaluation against Nullkiller2 (evaluate.py): our models in one seat, Nullkiller2 in the others

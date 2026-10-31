@@ -61,7 +61,7 @@ TYPES = [a.name.lower() for a in c.ActionType]
 FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answer") for part in ("battle", "score", "parts")) + ("foresight_hero_alive", "foresight_hero_army", "foresight_turn")
 COLUMNS = [
 	"version", "epoch", "games", "decisions", "dropped_old", "unsound", "credited", "days", "players", "phi_end", "heroes", "label_mean", "price_mean",
-	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "teacher_kl", "clip_fraction", "grad_norm", "steps", "learning_rate",
+	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "teacher_kl", "teacher_weight", "clip_fraction", "grad_norm", "steps", "learning_rate",
 	*(f"value_ev_d{k}" for k in c.VALUE_OFFSETS), *(f"head_ev_{kind}{k}" for kind in "vg" for k in c.VALUE_OFFSETS), "head_ev_vend", "no_effect", "ai_errors", "failed_actions", "game_failures", "game_maps", "dropped_games",
 	"game_seconds", "record_mb", "seconds", "gpu_mb", "label_staleness", *(f"share_{t}" for t in TYPES), *(f"failure_{k}" for k in FAILURES), "no_effect_types", "kinds",
 	# v2's foresight losses (foresight.py) and the gradient check: the shared layers' gradient from the PPO losses and the
@@ -123,6 +123,7 @@ class CampaignLearner:
 		self.model = build_model(self.kwargs).to(device).eval()
 		self.optimizer = make_optimizer(self.model, config)
 		self.version, self.lr_scale, self.games_used = 1, 1.0, 0  # version: the served model's (1: as the run starts)
+		self.teacher_weight = config.teacher_kl  # (the teacher KL's weight, adapted after each update: config.teacher_kl_target)
 		self.value_ev = None  # the value heads' explained variance, smoothed over ~10 updates: how far the credit trusts them
 		self.credit_evidence = {}  # the credit check's (labels.credit_evidence): the step's errors by action type, kept
 		self.credit_check = 1.0  # and its verdict, how far the step's estimate may be trusted (labels.credit_trust)
@@ -142,6 +143,7 @@ class CampaignLearner:
 			if "optimizer" in state:
 				load_optimizer(self.optimizer, self.model, state["optimizer"], state["model"].keys())
 			self.version, self.lr_scale, self.games_used = state["version"], state.get("lr_scale", 1.0), state.get("games_used", 0)
+			self.teacher_weight = state.get("teacher_weight", config.teacher_kl)
 			self.value_ev = state.get("value_ev")
 			self.credit_evidence = state.get("credit_evidence", {})
 			self.credit_check = credit_trust(credit_gaps(self.credit_evidence))
@@ -161,6 +163,8 @@ class CampaignLearner:
 		# The teacher (config.teacher_kl): a frozen imitation of Nullkiller2 whose KL the update adds
 		self.teacher = None
 		if config.teacher_kl > 0:
+			if config.learner == "process":
+				raise SystemExit("campaign.teacher_kl: the 'process' learner does not take the teacher (use 'turns' or 'thread')")
 			if not config.teacher_checkpoint:
 				raise SystemExit("campaign.teacher_kl needs campaign.teacher_checkpoint (imitate.py's bc_latest.pt)")
 			state = torch.load(config.teacher_checkpoint, map_location="cpu")
@@ -448,7 +452,7 @@ class CampaignLearner:
 				self._refresh_features()
 		else:
 			with self.model_lock:
-				metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
+				metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.teacher_weight, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
 				if self.device.type == "mps":
 					torch.mps.empty_cache()  # (the battle learner's lesson: MPS keeps blocks of every size it saw)
 				self.version += 1
@@ -456,6 +460,7 @@ class CampaignLearner:
 				self.games_used += len(games)
 				self._refresh_features()
 				self._note_value_ev(metrics)
+				self.teacher_weight = adapted_teacher_weight(self.teacher_weight, metrics.get("teacher_kl"), self.config.teacher_kl_target)
 				self._save(self.out / "checkpoint_latest.pt")
 		if self.worker:  # (the process saved its checkpoint with the trust before this update: one update behind)
 			self._note_value_ev(metrics)
@@ -571,6 +576,7 @@ class CampaignLearner:
 			"below_floor": metrics.get("below_floor", float("nan")),
 			"kl": metrics.get("kl", float("nan")),
 			"teacher_kl": metrics.get("teacher_kl", float("nan")),  # (KL(teacher || model) a decision; 0 without a teacher)
+			"teacher_weight": self.teacher_weight,
 			"last_kl": metrics["last_kl"],
 			"clip_fraction": metrics.get("clip_fraction", float("nan")),
 			"grad_norm": metrics.get("grad_norm", float("nan")),
@@ -634,7 +640,7 @@ class CampaignLearner:
 			"  value ev " + "/".join(f"{row[f'head_ev_v{k}']:+.2f}" for k in c.VALUE_OFFSETS)
 			+ f" (this update {row[f'value_ev_d{c.VALUE_OFFSETS[-1]}']:+.2f}: corr {metrics.get('value_corr', float('nan')):+.2f}, spread {metrics.get('value_spread', float('nan')):.3f} vs {metrics.get('label_spread', float('nan')):.3f})"
 			+ "  growth ev " + "/".join(f"{row[f'head_ev_g{k}']:+.2f}" for k in c.VALUE_OFFSETS) + f"  end ev {row['head_ev_vend']:+.2f} (credit {row['end_credit']:.2f})"
-			+ f"  kl {row['last_kl']:.4f}" + (f"  teacher kl {row['teacher_kl']:.3f}" if self.teacher is not None else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f}  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f})  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
+			+ f"  kl {row['last_kl']:.4f}" + (f"  teacher kl {row['teacher_kl']:.3f} (weight {row['teacher_weight']:.2f})" if self.teacher is not None else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f}  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f})  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
 			flush=True,
 		)
 
@@ -645,7 +651,7 @@ class CampaignLearner:
 	def _save(self, path):
 		state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
 		optimizer = {} if self.worker else {"optimizer": self.optimizer.state_dict()}  # (the process's is in checkpoint_latest.pt)
-		torch.save({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "model_kwargs": self.kwargs}, path)
+		torch.save({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "model_kwargs": self.kwargs}, path)
 
 	# ---- evaluation ----
 
@@ -797,6 +803,18 @@ def start_forecasts(starts, real, growth, real_end):
 	index = np.array(index)
 	clipped = np.clip(growth[index] - np.array(log_value)[:, None], -GROWTH_CAP, GROWTH_CAP)
 	return np.stack(shares), real[index], np.stack(grown), clipped, np.array(end, dtype=np.float32), real_end[index], np.array(prior, dtype=np.float32)
+
+
+def adapted_teacher_weight(weight, kl, target):
+	"""The teacher KL's weight after an update whose KL from the teacher was kl (config.teacher_kl_target): x1.5 over
+	1.5 x target, /1.5 under target / 1.5, within 0.01..10; unchanged with no target or no KL measured."""
+	if not target or kl is None or not np.isfinite(kl):
+		return weight
+	if kl > 1.5 * target:
+		weight *= 1.5
+	elif kl < target / 1.5:
+		weight /= 1.5
+	return float(min(10.0, max(0.01, weight)))
 
 
 def draw_days(rng, config):
