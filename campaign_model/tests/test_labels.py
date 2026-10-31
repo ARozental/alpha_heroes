@@ -203,3 +203,32 @@ def test_explained_variance_pools_its_parts_not_its_ratios():
 	assert pooled_ev(pool, (float("nan"), float("nan")))[0] == pool  # nothing measured: unchanged
 	res, var = residual_variances(np.array([0.1, 0.2, 0.3]), np.array([0.2, 0.4, np.nan]))  # (no outcome: left out)
 	assert var == pytest.approx(np.var([0.2, 0.4])) and res == pytest.approx(np.var([0.1, 0.2]))
+
+
+def test_the_attributed_credit_counts_what_we_take_after_each_decision():
+	"""(2026-10-31) attributed_labels: our share as the day starts, and what we took from the others in the 7 days from
+	each decision: a battle won against their hero (after the decision: its serial), a town of theirs that became ours."""
+	from campaign_model.labels import attributed_labels, taken_events
+
+	def town():
+		return {"faction": 0, "built": [0, 1, 10], "garrison": [], "available": []}
+
+	def snap(day, red_towns, blue_towns):
+		s = snapshot(day, 10000, 10000)
+		s["players"][0]["towns"], s["players"][1]["towns"] = [town() for _ in range(red_towns)], [town() for _ in range(blue_towns)]
+		return s
+
+	ledgers = {d: snap(d, 1 if d <= 5 else 2, 2 if d <= 5 else 1) for d in range(1, 12)}  # red takes a town of blue's on day 5
+	battle = {"serial": 2, "day": 3, "side": 0, "armies": [[[1, 10]], [[1, 20]]], "heroes": [{"level": 2, "mana": 0, "power": 1, "artifacts": []}, {"level": 3, "mana": 10, "power": 2, "artifacts": []}],
+		"result": 0, "winner": 0, "casualties": [[[1, 2]], [[1, 20]]], "exp": [0, 0]}
+	game = Game(ledgers=ledgers, battles={"RED": [battle]})
+	game.decisions = [decision("RED", 1), decision("RED", 3), decision("RED", 4), decision("RED", 9), decision("BLUE", 3)]
+	events = taken_events(game)
+	assert len(events["RED"]) == 2 and "BLUE" not in events  # the battle, the town
+	now, taken = attributed_labels(game)
+	battle_part, town_part = (f for _, _, f in sorted(events["RED"], key=lambda e: e[0]))
+	assert 0.0 < now[0] < 0.5  # (red's one town against blue's two)
+	assert taken[0] == pytest.approx(battle_part + town_part)  # day 1: both within 7 days, the battle after it
+	assert taken[1] == pytest.approx(battle_part + town_part)  # serial 2 led to the battle
+	assert taken[2] == pytest.approx(town_part)  # after the battle
+	assert taken[3] == 0.0 and taken[4] == 0.0  # past it all; blue took nothing

@@ -88,6 +88,10 @@ decode_threads = 3
 # back), and the second pass must not be cut short by the KL stop in most updates (stopped_pass in the log and
 # TensorBoard: then back to 1). One pass before (fresh games rather than each seen twice; the games were then plenty)
 passes = 2
+# The policy's credit (2026-10-31): the parts of our log share's change our decisions make, our value's growth and what
+# we take from the others (CampaignConfig.credit "attributed"); the horizon credit's gradient noise scale was 5,312
+# decisions early and showed no signal at all past day 14 (train.loss_noise, v331)
+credit = "attributed"
 decisions_per_update = 32768
 min_games_per_update = 20
 eval_parallel = 4  # (the memory floor: 8 games at once were ~1.3 GB during an eval)

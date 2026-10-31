@@ -331,6 +331,14 @@ def signal_ratio(optimizer):
 NOISE_PHASES = (("days 1-14", 1, 14), ("days 15-35", 15, 35), ("days 36+", 36, 10**6))  # loss_noise's, by the decisions' day
 
 
+def standardized(values):
+	"""values [N] less their mean over the finite ones, over their standard deviation; nan stays nan."""
+	known = np.isfinite(values)
+	if known.sum() < 2:
+		return values
+	return ((values - values[known].mean()) / (values[known].std() + 1e-8)).astype(np.float32)
+
+
 def loss_noise(model, decisions, decode, convert, device, t, config, rows=128, samples=12):
 	"""The gradient noise scale of each loss term, by the decisions' day: tr(cov) / |mean|^2 of the term's gradient over
 	`samples` micro-batches of `rows` decisions (McCandlish et al. 2018's B_simple; |mean|^2 less its bias, tr(cov) / samples),
@@ -444,7 +452,7 @@ def micro_loss(out, batch, config, foresight_config=None):
 
 def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
-	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False,
+	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None,
 ):
 	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
 	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
@@ -504,6 +512,7 @@ def ppo_update(
 		steps_graph = model.__dict__.setdefault("_step_graph", StepGraph(model, lambda out, batch: micro_loss(out, batch, config, foresight_config)[:3]))
 	model.eval()
 	anchor, end_now, prior = torch.empty(n, device=device), torch.empty(n, device=device), torch.empty(n, device=device)
+	growth_now, log_phi = torch.zeros(n, device=device), torch.zeros(n, device=device)  # (G7's logit, our log value: the attributed credit's)
 	# The same pass measures the value loss on these decisions before the update learns from them (the user, 2026-10-29:
 	# it should go down over time): every value head weighted as the loss below weighs it, above its targets' entropy
 	fresh = {"share": torch.zeros(n, c.N_VALUE_OFFSETS, device=device), "growth": torch.zeros(n, c.N_VALUE_OFFSETS, device=device), "end": torch.zeros(n, 1, device=device)}
@@ -518,6 +527,9 @@ def ppo_update(
 			logp, _ = chosen_logp(out, {k: choice[k][index] for k in ("kind", "action", "index", "cell")})
 			anchor[index] = logp
 			end_now[index] = torch.sigmoid(out["end_logit"].float())
+			if "growth_logit" in out:
+				growth_now[index] = out["growth_logit"][:, -1].float()
+				log_phi[index] = out["phi"].float().clamp(min=PHI_FLOOR).log()
 			prior[index] = 1.0 / inputs["g_players"].float().clamp(min=2)  # the share heads' start: 1 / players
 			fresh["share"][index] = excess_loss(out["value_logit"].float(), targets_t[index])
 			if growth is not None:
@@ -539,6 +551,15 @@ def ppo_update(
 	del fresh
 	gpu_mb = 0.0
 	end_step_error = None
+	attributed_stats = {}
+	if attributed is not None and growth_real is not None:  # (config.credit "attributed": the parts of our log share's change we make)
+		real7 = torch.from_numpy(np.asarray(growth_real, dtype=np.float32)[:, -1]).to(device)
+		own = (1 - torch.from_numpy(attributed["share_now"]).to(device)) * ((real7 - log_phi).clamp(-GROWTH_CAP, GROWTH_CAP) - (torch.sigmoid(growth_now) * 2 * GROWTH_CAP - GROWTH_CAP))
+		taken = torch.from_numpy(attributed["taken"]).to(device)
+		advantage = own + taken  # (nan where our value 7 days on is unknown: no credit)
+		known = torch.isfinite(advantage)
+		if int(known.sum()) > 1:
+			attributed_stats = {"attributed_taken_share": float((taken[known] > 0).float().mean()), "attributed_taken_mean": float(taken[known].mean()), "attributed_own_std": float(own[known].std()), "attributed_taken_std": float(taken[known].std())}
 	if end is not None and end["weight"] > 0:  # the policy's credit moves toward the end's as V_end proves itself
 		turn = choices(decisions)["kind"] == c.DecisionKind.TURN
 		later = end_advantages(end_now.cpu().numpy(), end["step"], end["week"], end["real"], end["price"], turn, config.decision_price, end["outcome"])
@@ -546,7 +567,10 @@ def ppo_update(
 		# in the learner, as the 7-day credit's check: the end credit is two thirds of the advantage, and no check saw it)
 		values = end_now.cpu().numpy()
 		end_step_error = np.where(end["step"] >= 0, values[np.maximum(end["step"], 0)] - end["real"], np.nan).astype(np.float32)
-		advantage = torch.from_numpy(blend_credit(advantage.cpu().numpy(), later, end["weight"])).to(device)
+		if attributed is not None:  # (two units, log growth and share: each standardized before they mix)
+			advantage = torch.from_numpy(blend_credit(standardized(advantage.cpu().numpy()), standardized(later), end["weight"])).to(device)
+		else:
+			advantage = torch.from_numpy(blend_credit(advantage.cpu().numpy(), later, end["weight"])).to(device)
 	credited = torch.isfinite(advantage)
 	if int(credited.sum()) > 1:
 		advantage = (advantage - advantage[credited].mean()) / (advantage[credited].std() + 1e-8)
@@ -671,6 +695,7 @@ def ppo_update(
 		stopped=stopped,
 		stopped_pass=stopped_pass,
 		noise=noise,  # (loss_noise's, when measured)
+		**attributed_stats,
 		signal_ratio=signal_ratio(optimizer),  # (the steps' noise: the user's 2026-10-31 aim of 0.25+, with 4,096-decision steps)
 		end_step_error=end_step_error,
 		last_kl=update_kl,

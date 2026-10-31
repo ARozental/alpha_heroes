@@ -354,3 +354,81 @@ def credit_trust(gaps, limit=CREDIT_T):
 	linearly to 0 at twice the limit."""
 	worst = max((abs(t) for t in gaps.values()), default=0.0)
 	return float(min(1.0, max(0.0, 2.0 - worst / limit)))
+
+
+# ---- what we take from the other players: the "attributed" credit (train.ppo_update) ----
+
+def _battle_loss(battle, side):
+	"""What a side of one of our battles lost (gold, its assets as the battle reward prices them: its army's casualties,
+	its hero and mana if it lost them). foresight.battle_score's terms, without its torch imports."""
+	import game_values
+	from battle_model import reward
+
+	army = sum(count * game_values.creature_value(creature) for creature, count in battle["armies"][side])
+	hero, mana = 0.0, 0.0
+	if battle["heroes"][side]:
+		h = battle["heroes"][side]
+		artifacts = sum(game_values.artifact_price(a) for a in h.get("artifacts", []))
+		hero, mana = reward.hero_asset(h.get("level", 1), artifacts), reward.mana_value(h.get("mana", 0), h.get("power", 0))
+	lost = sum(count * game_values.creature_value(creature) for creature, count in battle["casualties"][side])
+	outcome = reward.Outcome.WIN if battle["winner"] == side else {1: reward.Outcome.RETREAT, 2: reward.Outcome.SURRENDER}.get(battle["result"], reward.Outcome.LOSS)
+	return max(army + hero + mana - reward.assets_after(outcome, max(army - lost, 0.0), hero, mana), 0.0)
+
+
+def taken_events(game, empire=EmpireConfig()):
+	"""{color: [(day, serial or None, what it took from the other players then, as a share of all players' value)]}:
+	- a battle against another player's hero: the value that side lost (_battle_loss), serial: the battle's
+	- a town of another player's that became ours that day (our towns +1, theirs -1): its buildings' and income's value
+	  as they lost it (split between the day's gainers)
+	- a player's income that became ours that day (ours up, theirs down, no town changing hands): the smaller change
+	Value over all players' as the day starts (tables'). Wandering monsters and a garrison without a hero are no player's
+	loss here; the snapshots carry no ids, so a capture is read from the counts and the parts."""
+	_, value, last, _ = tables(game, empire)
+	colors = sorted(value)
+	total = lambda day: max(sum(share_at(value, color, day, last) for color in colors), 1.0)  # noqa: E731 (the end of `day`)
+	events = {}
+	for color, battles in game.battles.items():
+		for battle in battles:
+			enemy = 1 - battle["side"]
+			if battle.get("heroes") and battle["heroes"][enemy] and battle.get("casualties"):
+				loss = _battle_loss(battle, enemy)
+				if loss > 0:
+					events.setdefault(color, []).append((battle["day"], battle["serial"], loss / total(battle["day"] - 1)))
+	days = sorted(game.ledgers)
+	for first, then in zip(days, days[1:]):
+		before = {COLORS[p["color"]]: p for p in game.ledgers[first]["players"]}
+		after = {COLORS[p["color"]]: p for p in game.ledgers[then]["players"]}
+		parts = {color: (empire_value(before[color], empire), empire_value(after[color], empire)) for color in before if color in after}
+		towns = {color: len(after[color]["towns"]) - len(before[color]["towns"]) for color in parts}
+		income = {color: parts[color][1]["income"] - parts[color][0]["income"] for color in parts}
+		day, all_value = first, total(first - 1)
+		gainers = [color for color in parts if towns[color] > 0]
+		for loser in (color for color in parts if towns[color] < 0):
+			lost = max(parts[loser][0]["buildings"] - parts[loser][1]["buildings"], 0.0) + max(-income[loser], 0.0)
+			for color in gainers:
+				events.setdefault(color, []).append((day, None, lost / len(gainers) / all_value))
+		for color in (color for color in parts if towns[color] == 0 and income[color] > 0):
+			for loser in (other for other in parts if other != color and towns[other] == 0 and income[other] < 0):
+				events.setdefault(color, []).append((day, None, min(income[color], -income[loser]) / all_value))
+	return events
+
+
+def attributed_labels(game, empire=EmpireConfig(), horizon=c.VALUE_OFFSETS[-1]):
+	"""Per decision (game.decisions' order; the battles' serials count game.all_decisions when it is set): (our share as
+	its day starts [N], what we took from the other players in the `horizon` days from it [N]: taken_events after the
+	decision, as shares of all players' value). With our log growth over the same days these are the parts of our log
+	share's change our decisions make: d log share = (1 - share) d log V_ours + taken / V_all - the others' own growth
+	(the last no decision of ours makes, and it carries the luck we cannot see: the user and e5's idea, 2026-10-31)."""
+	share, _, last, _ = tables(game, empire)
+	events = taken_events(game, empire)
+	full = getattr(game, "all_decisions", game.decisions)
+	serial, position = {}, {}
+	for d in full:
+		serial[id(d)] = position[d.color] = position.get(d.color, 0) + 1
+	rows = [d for d in game.decisions]
+	now = np.array([share_at(share, d.color, d.day - 1, last) for d in rows], dtype=np.float32)
+	taken = np.zeros(len(rows), dtype=np.float32)
+	for i, d in enumerate(rows):
+		s = serial.get(id(d), 0)
+		taken[i] = sum(f for day, at, f in events.get(d.color, ()) if d.day <= day <= d.day + horizon and (at is None or at >= s))
+	return now, taken

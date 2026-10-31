@@ -48,7 +48,7 @@ from .empire import EmpireConfig, empire_value
 from .failures import NAMES as FAILURES, failure_modes
 from .features import SKILLS
 from .labels import (
-	COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
+	COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, attributed_labels, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
 	label, ladder_targets, pooled_ev, residual_variances,
 )
 from .foresight import labels_of
@@ -352,7 +352,7 @@ class CampaignLearner:
 		memory.append(("starts", rss_gb()))
 		foresight = [] if self.kwargs.get("architecture") == "v2" else None  # (v2's foresight labels, each game's)
 		decisions, targets, labels, growth, returns, advantages, errors, players, forecasts, row = [], [], [], [], [], [], [], [], [], Counter()
-		growth_real = []
+		growth_real, attributed = [], {"share_now": [], "taken": []}
 		end = {"targets": [], "real": [], "step": [], "week": [], "price": []}
 		for g, game in enumerate(played):
 			# The labeler's labels, as the game arrived (b1, 2026-10-30: a game's labels from one table version, one update
@@ -388,7 +388,11 @@ class CampaignLearner:
 			growth.append(grown[fresh])
 			growth_real.append(z[fresh])  # (the real log values, for loss_noise's growth credit)
 			returns.append((mixed - price)[fresh])
-			if self.config.credit == "horizon":
+			if self.config.credit == "attributed":  # (our share as the day starts, what we took: ppo_update makes the credit)
+				now, took = attributed_labels(game, self.empire)
+				attributed["share_now"].append(now[fresh])
+				attributed["taken"].append(took[fresh])
+			if self.config.credit in ("horizon", "attributed"):  # (its errors feed the credit check, kept for the record)
 				a, error = horizon_advantages(game, t, price, self.trust(), self.labels, self.config.outcome_share_min, self.config.myopic_weight, self.credit_check, parts=True)
 				advantages.append(a[fresh])
 				errors.append(error[fresh])
@@ -407,7 +411,8 @@ class CampaignLearner:
 		if foresight is not None:
 			foresight = {name: np.concatenate([rows[name] for rows in foresight]) for name in foresight[0]}
 		row["trust"] = self.trust()
-		end["outcome"], end["weight"] = outcome, weight if self.config.credit == "horizon" else 0.0
+		end["outcome"], end["weight"] = outcome, weight if self.config.credit == "horizon" else (self.config.attributed_end_weight if weight > 0 else 0.0) if self.config.credit == "attributed" else 0.0
+		attributed = {name: np.concatenate(parts) for name, parts in attributed.items()} if self.config.credit == "attributed" else None
 		row["end_credit"] = end["weight"]
 		if errors:  # the credit check: the step's estimate against what then happened, by action type (labels.credit_evidence)
 			self.credit_evidence = credit_evidence(decisions, np.concatenate(errors), np.concatenate(players), self.credit_evidence)
@@ -426,7 +431,7 @@ class CampaignLearner:
 				self._refresh_features()
 		else:
 			with self.model_lock:
-				metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
+				metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
 				if self.device.type == "mps":
 					torch.mps.empty_cache()  # (the battle learner's lesson: MPS keeps blocks of every size it saw)
 				self.version += 1
@@ -577,7 +582,7 @@ class CampaignLearner:
 			csv.writer(f).writerow([round(row[k], 6) if isinstance(row[k], float) else row[k] for k in COLUMNS])
 		if row["value_loss_fresh"] == row["value_loss_fresh"]:  # the eval tab's (battle_model/train.py VALUE_LOSS_TAB)
 			self.writer.add_scalar("eval/campaign_value_loss", row["value_loss_fresh"], self.version)
-		for name in ("value_corr", "value_spread", "label_spread", "gpu_anchor_mb", "update_seconds", "prepass_seconds", "wait_seconds", "sync_seconds", "cpu_share", "stopped_pass", "signal_ratio", "forward_seconds", "losses_seconds", "backward_seconds", "optimizer_seconds"):
+		for name in ("value_corr", "value_spread", "label_spread", "gpu_anchor_mb", "update_seconds", "prepass_seconds", "wait_seconds", "sync_seconds", "cpu_share", "stopped_pass", "signal_ratio", "attributed_taken_share", "attributed_taken_mean", "attributed_own_std", "attributed_taken_std", "forward_seconds", "losses_seconds", "backward_seconds", "optimizer_seconds"):
 			if metrics.get(name, float("nan")) == metrics.get(name, float("nan")):
 				self.writer.add_scalar(f"campaign/{name}", metrics[name], self.version)
 		for kind, gap in sums.get("credit_gaps", {}).items():  # (the credit check's t-statistic per action type)

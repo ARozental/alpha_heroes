@@ -71,7 +71,16 @@ class CampaignConfig:
 	# outcome's share falls from all of it to outcome_share_min, and the 2-day shortcut (myopic_weight) fades to 0.
 	# outcome_share_min and trust_full_ev set the value heads' grades too (labels.ladder_targets, learner.grade_trust).
 	# "mix": the old advantage, the flat mix of the shares 2, 5 and 7 days on minus the mix of the heads
+	# "attributed" (2026-10-31, the user and e5's idea; train.ppo_update): the parts of our log share's change over 7 days
+	# that our decisions make, d log share = (1 - share) d log V_ours + taken / V_all - the others' own growth: our value's
+	# log growth less the growth head G7's forecast, times (1 - our share), plus what we took from the other players
+	# (labels.attributed_labels: battles against their heroes, their towns and income that became ours); the others' own
+	# growth, and the luck we cannot see in it, left out. Measured first (train.loss_noise, v331): the gradient noise scale
+	# of our growth's credit 1,310 decisions early against the share's 2,979 and the horizon credit's 5,312; mid and late
+	# games no signal at all for the horizon credit. The end credit stays in at attributed_end_weight (denial, which no
+	# event records: racing them to a mine), both standardized first
 	credit: str = "horizon"
+	attributed_end_weight: float = 0.2
 	outcome_share_min: float = 0.25
 	myopic_weight: float = 0.5
 	trust_full_ev: float = 0.4

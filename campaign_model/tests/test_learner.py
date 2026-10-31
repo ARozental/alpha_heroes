@@ -273,3 +273,51 @@ def test_the_labeler_computes_what_step_did(tmp_path):
 	finally:
 		labeler.close()
 	assert again["n"] == pre["n"] and np.array_equal(again["t"], pre["t"]) and np.array_equal(again["foresight"]["turn"], pre["foresight"]["turn"])
+
+
+def test_an_update_runs_with_the_attributed_credit(tmp_path):
+	"""CampaignLearner.step end to end with credit "attributed" (2026-10-31): our share and what we took per decision, the
+	growth head's forecast at the update's start, the end credit standardized and mixed in, one PPO update."""
+	import collections
+	import dataclasses
+
+	import torch
+
+	from campaign_model.empire import EmpireConfig
+	from campaign_model.labels import LabelConfig
+	from campaign_model.learner import COLUMNS
+	from campaign_model.model import CampaignModel
+	from campaign_model.schema import random_inputs
+	from campaign_model.tests.test_model import encoded
+	from campaign_model.tests.test_train import decisions_for
+	from campaign_model.train import make_optimizer
+
+	torch.manual_seed(6)
+	kwargs = {"dim": 32, "cell_dim": 16, "layers": 1}
+	model = CampaignModel(**kwargs).eval()
+	config = CampaignConfig(decisions_per_update=8, min_games_per_update=2, batch_size=4, passes=1, learner="thread", device="cpu", credit="attributed", noise_every=0)
+	games = []
+	for g in range(2):
+		x = random_inputs(8, seed=30 + g)
+		decisions = [dataclasses.replace(d, inputs=encoded(x, b), day=1 + b // 3) for b, d in enumerate(decisions_for(model, x, seed=g))]
+		games.append((Game(decisions=decisions, ledgers={d: snapshot(d, 1000 + 300 * d, 1000) for d in range(1, 14)}, days=12), SimpleNamespace(seconds=1.0, map_name="Maps/alpha_random/x")))
+
+	class Writer:
+		def add_scalar(self, *args):
+			pass
+
+		def flush(self):
+			pass
+
+	learner = SimpleNamespace(
+		config=config, labels=LabelConfig(), empire=EmpireConfig(), version=1, finished=list(games), lock=threading.Condition(), stats=collections.Counter(),
+		model=model, optimizer=make_optimizer(model, config), device=torch.device("cpu"), worker=None, model_lock=threading.Lock(), lr_scale=1.0,
+		server=SimpleNamespace(set_model=lambda *args: None), games_used=0, out=tmp_path, kwargs=kwargs, value_ev=None, credit_evidence={}, credit_check=1.0, head_ev={"Vend": 0.2}, value_pool=None, head_pool={}, progress=tmp_path / "progress.csv", writer=Writer(),
+		features_cpu=model.features,
+	)
+	for name in ("_take", "trust", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting"):
+		setattr(learner, name, getattr(CampaignLearner, name).__get__(learner))
+	learner.progress.write_text(",".join(COLUMNS) + "\n")
+	assert CampaignLearner.step(learner, epoch=1)
+	row = dict(zip(COLUMNS, learner.progress.read_text().splitlines()[1].split(",")))
+	assert learner.version == 2 and float(row["end_credit"]) == pytest.approx(config.attributed_end_weight)
