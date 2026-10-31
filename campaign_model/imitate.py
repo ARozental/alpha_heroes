@@ -93,21 +93,65 @@ def player_streams(games):
 	return streams
 
 
+class GameStreams:
+	"""Each player's stream of each game file (player_streams'), loaded only while one of its players is used: an index
+	of (file, color, decisions) made once (index.json in each folder), the games kept in a cache of the last `keep`
+	(~35 MB each); streams[k] as player_streams' k-th, length(k) without loading it."""
+
+	def __init__(self, paths, share_target="change", keep=64):
+		self.share_target, self.keep, self.cache = share_target, keep, {}
+		self.index = []
+		folders = {}
+		for path in paths:
+			folders.setdefault(path.parent, []).append(path)
+		for folder, files in folders.items():
+			known_path = folder / "index.json"
+			known = json.loads(known_path.read_text()) if known_path.exists() else {}
+			for path in files:
+				if path.name not in known:
+					with open(path, "rb") as f:
+						game = pickle.load(f)
+					counts = {}
+					for d in game.decisions:
+						if d.flags & TEACHER:
+							counts[d.color] = counts.get(d.color, 0) + 1
+					known[path.name] = counts
+					del game
+				self.index += [(path, color, n) for color, n in sorted(known[path.name].items())]
+			known_path.write_text(json.dumps(known))
+
+	def __len__(self):
+		return len(self.index)
+
+	def length(self, k):
+		return self.index[k][2]
+
+	def __getitem__(self, k):
+		path, color, _ = self.index[k]
+		if path not in self.cache:
+			if len(self.cache) >= self.keep:
+				self.cache.pop(next(iter(self.cache)))  # (the oldest loaded)
+			(decisions, shares, growth), = teacher_decisions([path], self.share_target)
+			self.cache[path] = {c_: ([decisions[i] for i in rows], shares[rows], growth[rows]) for c_ in sorted({d.color for d in decisions}) for rows in [[i for i, d in enumerate(decisions) if d.color == c_]]}
+		return self.cache[path][color]
+
+
 def chunks(streams, lanes, steps, rng=None):
 	"""The chunks of the streams, `lanes` players at once: each (steps lists of the lanes' (stream, position), None for a
 	lane past its stream's end; the lanes whose memory starts afresh). A lane takes the next stream at a chunk's start."""
 	order = list(range(len(streams)))
 	if rng is not None:
 		rng.shuffle(order)
+	length = streams.length if hasattr(streams, "length") else (lambda k: len(streams[k][0]))  # (GameStreams: without loading)
 	queue = iter(order)
 	stream, position, fresh = [next(queue, None) for _ in range(lanes)], [0] * lanes, [True] * lanes
 	while any(k is not None for k in stream):
-		yield [[(k, position[i] + t) if k is not None and position[i] + t < len(streams[k][0]) else None for i, k in enumerate(stream)] for t in range(steps)], fresh
+		yield [[(k, position[i] + t) if k is not None and position[i] + t < length(k) else None for i, k in enumerate(stream)] for t in range(steps)], fresh
 		fresh = [False] * lanes
 		for i, k in enumerate(stream):
 			if k is not None:
 				position[i] += steps
-				if position[i] >= len(streams[k][0]):
+				if position[i] >= length(k):
 					stream[i], position[i], fresh[i] = next(queue, None), 0, True
 
 
@@ -184,13 +228,13 @@ def main():
 		torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
 	out = Path(args.out)
 	out.mkdir(parents=True, exist_ok=True)
-	paths = sorted(Path(args.data).glob("game_*.pkl"))
+	paths = sorted(p for folder in args.data.split(",") for p in Path(folder).glob("game_*.pkl"))  # (folders, comma-separated)
 	rng = random.Random(args.seed)
 	rng.shuffle(paths)
 	paths = paths[: args.max_games] if args.max_games else paths
 	held = max(1, int(round(args.holdout * len(paths))))
-	val_games, train_games = teacher_decisions(paths[:held], args.share_target), teacher_decisions(paths[held:], args.share_target)
-	print(f"imitate: {sum(len(g[0]) for g in train_games)} decisions of {len(train_games)} games to train on, {sum(len(g[0]) for g in val_games)} of {len(val_games)} held out; {device}", flush=True)
+	val_streams, train_streams = GameStreams(paths[:held], args.share_target), GameStreams(paths[held:], args.share_target, keep=2 * args.lanes)
+	print(f"imitate: {sum(n for *_, n in train_streams.index)} decisions of {len(paths) - held} games to train on, {sum(n for *_, n in val_streams.index)} of {held} held out; {device}", flush=True)
 	from torch.utils.checkpoint import checkpoint
 
 	models = {}  # name -> (model, optimizer, kwargs, memory on): each trained on the same decisions, decoded once
@@ -211,7 +255,6 @@ def main():
 			torch.manual_seed(args.seed)
 			models[variant] = (build_model(kwargs), kwargs, flag != "nomem")
 	models = {name: (model.to(device).train(), torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr), kwargs, on) for name, (model, kwargs, on) in models.items()}
-	train_streams, val_streams = player_streams(train_games), player_streams(val_games)
 	history = {name: [] for name in models}
 	evaluation = lambda model, on: evaluate(model, val_streams, device, args.lanes, args.steps, config.growth_weight, on)  # noqa: E731
 	for name, (model, _, _, on) in models.items():
@@ -232,7 +275,7 @@ def main():
 	started, steps_done, seen, epoch = time.time(), 0, 0, 0
 	deadline = started + 60 * args.minutes
 	memories = {name: torch.zeros(args.lanes, c.MEMORY_SLOTS, c.MEMORY_WIDTH, device=device) for name in models}
-	total = sum(len(st[0]) for st in train_streams)
+	total = sum(n for *_, n in train_streams.index)
 	done = False
 	while not done:
 		pending = {name: [] for name in models}  # the chunk's steps: (loss, valid count)
