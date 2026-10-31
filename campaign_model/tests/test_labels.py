@@ -232,3 +232,21 @@ def test_the_attributed_credit_counts_what_we_take_after_each_decision():
 	assert taken[1] == pytest.approx(battle_part + town_part)  # serial 2 led to the battle
 	assert taken[2] == pytest.approx(town_part)  # after the battle
 	assert taken[3] == 0.0 and taken[4] == 0.0  # past it all; blue took nothing
+
+
+def test_the_attributed_credit_takes_a_player_out_of_the_game():
+	"""A player knocked out (its empire value {"total": 0}, no parts) loses its towns to us: the capture counts, no
+	KeyError (it stopped joint5, 2026-10-31 14:00)."""
+	from campaign_model.labels import attributed_labels, taken_events
+
+	def snap(day, blue_status):
+		s = snapshot(day, 10000, 10000, blue_status=blue_status)
+		s["players"][0]["towns"] = [{"faction": 0, "built": [0, 1], "garrison": [], "available": []} for _ in range(1 if day <= 3 else 2)]
+		s["players"][1]["towns"] = [{"faction": 0, "built": [0, 1], "garrison": [], "available": []}] if day <= 3 else []
+		return s
+
+	game = Game(ledgers={d: snap(d, 0 if d <= 3 else 1) for d in range(1, 8)})
+	game.decisions = [decision("RED", 2)]
+	assert taken_events(game)["RED"][0][0] == 3
+	now, taken = attributed_labels(game)
+	assert taken[0] > 0

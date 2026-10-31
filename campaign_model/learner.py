@@ -389,7 +389,11 @@ class CampaignLearner:
 			growth_real.append(z[fresh])  # (the real log values, for loss_noise's growth credit)
 			returns.append((mixed - price)[fresh])
 			if self.config.credit == "attributed":  # (our share as the day starts, what we took: ppo_update makes the credit)
-				now, took = attributed_labels(game, self.empire)
+				try:
+					now, took = attributed_labels(game, self.empire)
+				except Exception as error:  # (a game whose labels fail is no credit, never the trainer's end: a FAILURE to look into)
+					print(f"campaign: FAILURE: attributed labels of a game failed ({type(error).__name__}: {str(error)[:200]}): no credit from it", flush=True)
+					now, took = np.full(len(game.decisions), np.nan, np.float32), np.full(len(game.decisions), np.nan, np.float32)
 				attributed["share_now"].append(now[fresh])
 				attributed["taken"].append(took[fresh])
 			if self.config.credit in ("horizon", "attributed"):  # (its errors feed the credit check, kept for the record)

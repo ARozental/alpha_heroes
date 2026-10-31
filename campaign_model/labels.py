@@ -400,11 +400,11 @@ def taken_events(game, empire=EmpireConfig()):
 		after = {COLORS[p["color"]]: p for p in game.ledgers[then]["players"]}
 		parts = {color: (empire_value(before[color], empire), empire_value(after[color], empire)) for color in before if color in after}
 		towns = {color: len(after[color]["towns"]) - len(before[color]["towns"]) for color in parts}
-		income = {color: parts[color][1]["income"] - parts[color][0]["income"] for color in parts}
+		income = {color: parts[color][1].get("income", 0.0) - parts[color][0].get("income", 0.0) for color in parts}  # (a player out of the game: {"total": 0})
 		day, all_value = first, total(first - 1)
 		gainers = [color for color in parts if towns[color] > 0]
 		for loser in (color for color in parts if towns[color] < 0):
-			lost = max(parts[loser][0]["buildings"] - parts[loser][1]["buildings"], 0.0) + max(-income[loser], 0.0)
+			lost = max(parts[loser][0].get("buildings", 0.0) - parts[loser][1].get("buildings", 0.0), 0.0) + max(-income[loser], 0.0)
 			for color in gainers:
 				events.setdefault(color, []).append((day, None, lost / len(gainers) / all_value))
 		for color in (color for color in parts if towns[color] == 0 and income[color] > 0):
