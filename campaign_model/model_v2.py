@@ -267,6 +267,8 @@ class CampaignModelV2(nn.Module):
 		self.growth_heads = zero_output(nn.Linear(d, c.N_VALUE_OFFSETS))
 		self.end_head = zero_output(nn.Linear(d, 1))
 		self.register_buffer("tile_positions", tile_positions(), persistent=False)
+		# The adventure spells the model may cast: not the ones that only show the map (constants.INFO_SPELLS)
+		self.register_buffer("castable", torch.tensor([s not in c.INFO_SPELLS for s in range(c.N_ADVENTURE_SPELLS)]), persistent=False)
 
 	def prior_corrections(self):
 		"""The parameters that correct a fixed prior (model.CustomFeatures): weight decay pulls them back to it."""
@@ -569,6 +571,8 @@ class CampaignModelV2(nn.Module):
 				continue
 			name, mask_name = HEADS[action]
 			mask = x[mask_name]
+			if action == A_.CAST:  # (a hero with only those left has no CAST)
+				mask = mask & self.castable
 			out[name] = flat_log_softmax(learned[action] + prior[action], mask)
 			scores.append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action], mask))
 			legal_types.append(mask.reshape(b, -1).any(dim=-1))
