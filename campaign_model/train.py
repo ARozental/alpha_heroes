@@ -372,8 +372,11 @@ def ppo_update(
 		minibatches = [order[i : i + size] for i in range(0, len(order), size)]
 		splits = [np.array_split(np.arange(len(rows)), max(1, min(config.micro_batches, len(rows)))) for rows in minibatches]
 		decoded = _prefetched([rows[part] for rows, parts in zip(minibatches, splits) for part in parts], decode, device, convert)
-		for rows, parts_of_rows in zip(minibatches, splits):
-			index = torch.from_numpy(rows).to(device)
+		# The pass's order on the device once: a minibatch's and each micro-batch's rows as slices of it (each copy of a
+		# small index array from pageable memory waited for the GPU: five a minibatch, 2026-10-31)
+		order_t = torch.from_numpy(order).to(device)
+		for first, (rows, parts_of_rows) in zip(range(0, len(order), size), zip(minibatches, splits)):
+			index = order_t[first : first + len(rows)]
 			whole = (~unsound[index]).float()
 			# The minibatch's counts: each micro-batch's losses are its sums over these, so the micro-batches' gradients add
 			# up to the whole minibatch's, at 1 / micro_batches of its peak memory (2026-10-28: the update's ~8 GB on
@@ -386,8 +389,7 @@ def ppo_update(
 			optimizer.zero_grad()
 			parts = []
 			for part in parts_of_rows:
-				at = torch.from_numpy(part).to(device)
-				sub, keep = index[at], whole[at]
+				sub, keep = index[part[0] : part[-1] + 1], whole[part[0] : part[-1] + 1]  # (array_split's parts: consecutive)
 				waited = time.perf_counter()
 				_, inputs = next(decoded)
 				clock["wait"] += time.perf_counter() - waited

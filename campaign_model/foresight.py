@@ -209,37 +209,32 @@ def masked_mean(values, mask):
 	return (values * mask).sum() / mask.sum().clamp(min=1.0)
 
 
-def action_loss(predicted, target, battle, config):
-	"""[K, ACTION_TARGETS] predictions against their targets: BCE on the battle, Huber on its score where there was one,
-	Huber on the parts' changes."""
-	fought = F.binary_cross_entropy_with_logits(predicted[:, 0], target[:, 0])
-	score = masked_mean(F.huber_loss(predicted[:, 1], target[:, 1], reduction="none", delta=config.huber), battle)
-	parts = F.huber_loss(predicted[:, 2:], target[:, 2:], delta=config.huber)
+def action_loss(predicted, target, battle, config, rows=None):
+	"""[K, ACTION_TARGETS] predictions against their targets, over the rows where rows [K] is set (all by default): BCE
+	on the battle, Huber on its score where there was one, Huber on the parts' changes; 0 with no row."""
+	rows = torch.ones_like(battle) if rows is None else rows
+	fought = masked_mean(F.binary_cross_entropy_with_logits(predicted[:, 0], target[:, 0], reduction="none"), rows)
+	score = masked_mean(F.huber_loss(predicted[:, 1], target[:, 1], reduction="none", delta=config.huber), battle & rows)
+	parts = masked_mean(F.huber_loss(predicted[:, 2:], target[:, 2:], reduction="none", delta=config.huber), rows.unsqueeze(-1).expand(-1, predicted.shape[1] - 2))
 	return fought, score, parts
 
 
 def foresight_loss(out, labels, config=ForesightConfig()):
 	"""(the loss, {part: its value}) of the foresight's predictions (out["fs_*"]) against a batch's labels (game_labels'
 	rows, as tensors on the device)."""
+	# Every part over every row, its mask weighting it (0 with none): no host read of the masks (bool(mask.any()) and
+	# torch.nonzero each waited for the GPU, five times a micro-batch: the trainer's thread could not run ahead of it,
+	# 2026-10-31). The labels of the rows a part does not apply to are zeros, valid indices among them (game_labels)
 	parts, zero = {}, out["fs_turn"].sum() * 0.0
-	move = labels["move_mask"]
-	if bool(move.any()):
-		rows = torch.nonzero(move).squeeze(-1)
-		at = labels["move_at"][rows]
-		predicted = out["fs_move"][rows, at[:, 0], at[:, 1], at[:, 2]]
-		parts["move_battle"], parts["move_score"], parts["move_parts"] = action_loss(predicted, labels["move"][rows], labels["move_battle"][rows], config)
-	answer = labels["answer_mask"]
-	if bool(answer.any()):
-		rows = torch.nonzero(answer).squeeze(-1)
-		predicted = out["fs_answer"][rows, labels["option"][rows]]
-		parts["answer_battle"], parts["answer_score"], parts["answer_parts"] = action_loss(predicted, labels["answer"][rows], labels["answer_battle"][rows], config)
-	hero_mask = labels["hero_mask"]
-	if bool(hero_mask.any()):
-		predicted = out["fs_hero"][:, :HO]
-		parts["hero_alive"] = masked_mean(F.binary_cross_entropy_with_logits(predicted[..., 0], labels["hero"][..., 0], reduction="none"), hero_mask)
-		parts["hero_army"] = masked_mean(F.huber_loss(predicted[..., 1], labels["hero"][..., 1], reduction="none", delta=config.huber), labels["hero_alive"])
-	turn_mask = labels["turn_mask"]
-	if bool(turn_mask.any()):
-		parts["turn"] = masked_mean(F.huber_loss(out["fs_turn"], labels["turn"], reduction="none", delta=config.huber), turn_mask)
+	every = torch.arange(out["fs_turn"].shape[0], device=out["fs_turn"].device)
+	at = labels["move_at"]
+	predicted = out["fs_move"][every, at[:, 0], at[:, 1], at[:, 2]]
+	parts["move_battle"], parts["move_score"], parts["move_parts"] = action_loss(predicted, labels["move"], labels["move_battle"], config, labels["move_mask"])
+	predicted = out["fs_answer"][every, labels["option"]]
+	parts["answer_battle"], parts["answer_score"], parts["answer_parts"] = action_loss(predicted, labels["answer"], labels["answer_battle"], config, labels["answer_mask"])
+	predicted = out["fs_hero"][:, :HO]
+	parts["hero_alive"] = masked_mean(F.binary_cross_entropy_with_logits(predicted[..., 0], labels["hero"][..., 0], reduction="none"), labels["hero_mask"])
+	parts["hero_army"] = masked_mean(F.huber_loss(predicted[..., 1], labels["hero"][..., 1], reduction="none", delta=config.huber), labels["hero_alive"])
+	parts["turn"] = masked_mean(F.huber_loss(out["fs_turn"], labels["turn"], reduction="none", delta=config.huber), labels["turn_mask"])
 	total = sum(parts.values(), zero)
 	return config.weight * total, {k: v.detach() for k, v in parts.items()}
