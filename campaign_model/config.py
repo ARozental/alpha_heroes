@@ -45,6 +45,10 @@ class CampaignConfig:
 	prepass_batch: int = 0  # the update's first pass (no gradients: the KL anchor, the old values) in batches of this many; 0: a micro-batch's
 	cuda_graphs: bool = True  # on CUDA: the update's forward and backward replayed from recorded graphs (graphs.py: launches cost under WSL)
 	step_graphs: bool = True  # with cuda_graphs: a micro-batch's forward, loss and backward as one recorded graph (graphs.StepGraph)
+	# The update's inputs decoded ahead in this many threads (train._prefetched: zlib, ~430 decisions/s a thread on the PC). With
+	# the step recorded whole the PC's update waited ~15 s for 3 of them, the CPU half idle (2026-10-31): each decision is
+	# decoded three times an update (the first pass, two passes)
+	decode_threads: int = 3
 	clip: float = 0.2
 	value_weight: float = 0.5
 	growth_weight: float = 0.5  # each growth head's weight in the value loss, a share head's 1 (labels.py: helpers)

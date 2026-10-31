@@ -128,8 +128,8 @@ def chosen_logp(out, choice):
 DECODE_THREADS = 3  # batches decoded at once: one thread's ~0.3 s a 128-decision micro-batch (110 MB of zlib and dtype copies, which release the interpreter lock) held the GPU's 146 ms step to it (2026-10-30, the PC)
 
 
-def _prefetched(batches, decode, device, convert=None):
-	"""(rows, inputs on device) of each batch of rows, decoded ahead in DECODE_THREADS threads (zlib and numpy let the
+def _prefetched(batches, decode, device, convert=None, threads=DECODE_THREADS):
+	"""(rows, inputs on device) of each batch of rows, decoded ahead in `threads` threads (zlib and numpy let the
 	training step go on meanwhile) and yielded in order. convert: applied on the device to what decode gave (the wire
 	bytes cut and converted there: records.inputs_on_device), else decode gives the inputs themselves. A consumer that
 	stops early (the KL control) ends the threads: they were left blocked on the full queue with their batches, every
@@ -146,11 +146,11 @@ def _prefetched(batches, decode, device, convert=None):
 		inputs = {name: torch.from_numpy(value) for name, value in decoded.items()} if isinstance(decoded, dict) else {"wire": torch.from_numpy(decoded)}
 		return rows, ({name: value.pin_memory() for name, value in inputs.items()} if pinned else inputs)
 
-	pool = concurrent.futures.ThreadPoolExecutor(max_workers=DECODE_THREADS)
+	pool = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
 	pending = collections.deque()
 	batches = iter(batches)
 	try:
-		for rows in itertools.islice(batches, DECODE_THREADS + 1):
+		for rows in itertools.islice(batches, threads + 1):
 			pending.append(pool.submit(work, rows))
 		while pending:
 			item = pending.popleft().result()
@@ -376,7 +376,7 @@ def ppo_update(
 		chunk = config.prepass_batch or max(1, size // max(1, config.micro_batches))  # (no gradients, but at a whole minibatch it was the update's peak: 5.2 GB)
 		chunks = [np.arange(i, i + chunk).clip(max=n - 1) for i in range(0, n, chunk)]  # the last one padded: fixed shapes
 		prepass_started = time.perf_counter()
-		for rows, inputs in _prefetched(chunks, decode, device, convert):
+		for rows, inputs in _prefetched(chunks, decode, device, convert, config.decode_threads):
 			index = torch.arange(int(rows[0]), int(rows[0]) + len(rows), device=device).clamp(max=n - 1)  # (made there: a copy from pageable memory waited for the GPU)
 			out = graphs.eval(inputs) if graphs else model(inputs)
 			logp, _ = chosen_logp(out, {k: choice[k][index] for k in ("kind", "action", "index", "cell")})
@@ -430,7 +430,7 @@ def ppo_update(
 		# decision several MB: the PC's learner at 9.5 GB, 2026-10-30); the minibatch's gradient as before
 		minibatches = [order[i : i + size] for i in range(0, len(order), size)]
 		splits = [np.array_split(np.arange(len(rows)), max(1, min(config.micro_batches, len(rows)))) for rows in minibatches]
-		decoded = _prefetched([rows[part] for rows, parts in zip(minibatches, splits) for part in parts], decode, device, convert)
+		decoded = _prefetched([rows[part] for rows, parts in zip(minibatches, splits) for part in parts], decode, device, convert, config.decode_threads)
 		# The pass's order on the device once: a minibatch's and each micro-batch's rows as slices of it (each copy of a
 		# small index array from pageable memory waited for the GPU: five a minibatch, 2026-10-31)
 		order_t = torch.from_numpy(order).to(device)

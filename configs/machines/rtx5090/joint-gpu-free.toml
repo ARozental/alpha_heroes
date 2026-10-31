@@ -62,6 +62,9 @@ prepass_batch = 256
 # CPU 64% of the update, the GPU done before the next kernel came; the 146 ms benchmark used sparse synthetic states).
 # Validated 2026-10-30 (runtime/check_graphs.py, allow_unused_input): gradients match eager to 5e-4, a whole update 3.5x
 cuda_graphs = true
+# The update's input decoding (zlib on the CPU, ~430 decisions/s a thread): 3 threads held the recorded step (15 s of waits
+# in a 74 s update, the CPU half idle, 2026-10-31); ~110 MB of pinned memory a thread
+decode_threads = 6
 # Two passes over 32,768 decisions of 20+ games an update (b1, 2026-10-31: the better use of an idle GPU; the KL stop
 # bounds the drift). Conditions: the update must stay shorter than the gap between updates (else the permits hold games
 # back), and the second pass must not be cut short by the KL stop in most updates (stopped_pass in the log and
