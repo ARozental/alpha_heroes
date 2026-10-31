@@ -304,7 +304,7 @@ def main():
 		raise SystemExit(f"no token: copy the master's {remote.TOKEN_FILE} here, or pass --token")
 	overrides = tuple((machine_overrides(args.machine) if args.machine else []) + args.set)
 	sizes = dict(o.split("=", 1) for o in overrides)
-	slots = args.slots if args.slots is not None else int(sizes.get("remote_slots", 0)) or 4  # (0: the Mac serving the PC's inference only, 2026-10-31: its 2 slots' games took the cores its 11 servers needed, and their battles stalled)
+	slots = args.slots if args.slots is not None else int(sizes.get("remote_slots", 4))  # (0: the Mac serving the PC's inference only, 2026-10-31: its 2 slots' games took the cores its 11 servers needed, and their battles stalled)
 	servers = {}  # (this machine's inference servers, kept across the master's connections)
 	try:
 		while True:

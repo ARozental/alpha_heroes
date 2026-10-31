@@ -142,7 +142,11 @@ class ActorPool:
 		the generated actors held at their 60% the learner waited 13-50 s an update for the campaign's battles)."""
 		config = self.config
 		real = sum(b["decisions"] for b in self.buffer if b["source"] == "real" and b["version"] >= self.version - config.max_record_age)
-		return config.ahead * max((1 - config.real_share) * config.decisions_per_update, config.decisions_per_update - real / config.ahead)
+		room = config.ahead * max((1 - config.real_share) * config.decisions_per_update, config.decisions_per_update - real / config.ahead)
+		# No more than the buffer keeps: take() drops whatever is over buffer_decisions, oldest first, so a room past it
+		# had battles played to be dropped (2026-10-31 review: the PC's 3 x 6,400 against a buffer of 8,000)
+		waiting_real = sum(b["decisions"] for b in self.buffer if b["source"] == "real")
+		return min(room, max(0, config.buffer_decisions - waiting_real))
 
 	def generated_waiting(self):
 		"""Decisions of generated battles in the buffer, young enough to be used (call with self.lock held)."""

@@ -26,6 +26,7 @@ IN_LAYOUT = wire_layout(INPUTS, True)
 IN_BYTES = sum(entry[-1] for entry in IN_LAYOUT)
 HEADER = struct.Struct("<IIIIiiif" + "f" * c.N_VALUE_OFFSETS + "II")
 NO_EFFECT = 1  # the action was carried out and changed nothing
+TEACHER = 2  # Nullkiller2's decision (AlphaTeacherAI: agents/AlphaMapAI/Teacher.cpp): its choice, no model's logp
 
 
 @dataclass

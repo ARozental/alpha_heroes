@@ -85,6 +85,8 @@ def main():
 	if args.checkpoint:
 		state = torch.load(args.checkpoint, map_location="cpu")
 		model = build_model(state.get("model_kwargs", {}))
+		from .train import migrate_subtypes  # (here: train imports this module's neighbours)
+		migrate_subtypes(state, model)  # (a checkpoint from before the dense subtype tables, 2026-10-31)
 		model.load_state_dict(state["model"])
 	path = export(model, args.out)
 	print(f"wrote {path}; largest difference from torch {verify(model, path):.2e}")

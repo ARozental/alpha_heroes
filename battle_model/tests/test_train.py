@@ -35,7 +35,7 @@ def test_generated_actors_fill_what_the_real_games_leave_short():
 
 	from battle_model.actors import ActorPool
 
-	pool = SimpleNamespace(config=SimpleNamespace(real_share=0.4, decisions_per_update=3200, max_record_age=3, ahead=1.0), version=10, buffer=[])
+	pool = SimpleNamespace(config=SimpleNamespace(real_share=0.4, decisions_per_update=3200, max_record_age=3, ahead=1.0, buffer_decisions=100_000), version=10, buffer=[])
 	room = lambda: ActorPool.generated_room(pool)  # noqa: E731
 	assert room() == 3200  # no real battles waiting: the whole update
 	pool.buffer = [{"source": "real", "decisions": 600, "version": 10}, {"source": "real", "decisions": 900, "version": 2}]  # (the second too old)
@@ -46,6 +46,8 @@ def test_generated_actors_fill_what_the_real_games_leave_short():
 	assert room() == 2 * 0.6 * 3200
 	pool.buffer = [{"source": "real", "decisions": 600, "version": 10}]
 	assert room() == 2 * 3200 - 600
+	pool.config.buffer_decisions = 5000  # never more than the buffer keeps (take() drops the rest): 5,000 less the 600 real
+	assert room() == 4400
 
 
 def test_an_old_checkpoints_optimizer_keeps_its_moments_for_the_parameters_it_had():

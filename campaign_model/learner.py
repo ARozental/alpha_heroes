@@ -54,14 +54,14 @@ from .labels import (
 from .foresight import labels_of
 from .labeler import Labeler
 from .model import build_model
-from .records import NO_EFFECT, decode_fields, decode_inputs
+from .records import NO_EFFECT, TEACHER, decode_fields, decode_inputs
 from .train import _prefetched, load_optimizer, make_optimizer, migrate_subtypes, model_kwargs, ppo_update, usable
 
 TYPES = [a.name.lower() for a in c.ActionType]
 FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answer") for part in ("battle", "score", "parts")) + ("foresight_hero_alive", "foresight_hero_army", "foresight_turn")
 COLUMNS = [
 	"version", "epoch", "games", "decisions", "dropped_old", "unsound", "credited", "days", "players", "phi_end", "heroes", "label_mean", "price_mean",
-	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "clip_fraction", "grad_norm", "steps", "learning_rate",
+	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "teacher_kl", "clip_fraction", "grad_norm", "steps", "learning_rate",
 	*(f"value_ev_d{k}" for k in c.VALUE_OFFSETS), *(f"head_ev_{kind}{k}" for kind in "vg" for k in c.VALUE_OFFSETS), "head_ev_vend", "no_effect", "ai_errors", "failed_actions", "game_failures", "game_maps", "dropped_games",
 	"game_seconds", "record_mb", "seconds", "gpu_mb", "label_staleness", *(f"share_{t}" for t in TYPES), *(f"failure_{k}" for k in FAILURES), "no_effect_types", "kinds",
 	# v2's foresight losses (foresight.py) and the gradient check: the shared layers' gradient from the PPO losses and the
@@ -89,6 +89,8 @@ def game_problem(game, players):
 	decisions than half a decision a player and day."""
 	if not game.decisions:  # (a game that ended before its first decision: ALPHA_MAP_REQUIRE_MODEL's abort among them)
 		return "no decision"
+	if any(d.flags & TEACHER for d in game.decisions):  # (its choices are Nullkiller2's: no policy probability to train on)
+		return "a teacher's game (AlphaTeacherAI)"
 	errors = {color: summary.get("errors", 0) for color, summary in game.done.items() if summary.get("errors", 0)}
 	if errors:
 		return "AI errors " + ", ".join(f"{color} {n}" for color, n in sorted(errors.items()))
@@ -156,6 +158,17 @@ class CampaignLearner:
 			migrate_subtypes(state, self.model)
 			self.model.load_state_dict(state["model"])
 			print(f"campaign: starting from {config.init_from}", flush=True)
+		# The teacher (config.teacher_kl): a frozen imitation of Nullkiller2 whose KL the update adds
+		self.teacher = None
+		if config.teacher_kl > 0:
+			if not config.teacher_checkpoint:
+				raise SystemExit("campaign.teacher_kl needs campaign.teacher_checkpoint (imitate.py's bc_latest.pt)")
+			state = torch.load(config.teacher_checkpoint, map_location="cpu")
+			self.teacher = build_model(state.get("model_kwargs") or self.kwargs)
+			migrate_subtypes(state, self.teacher)
+			self.teacher.load_state_dict(state["model"])
+			self.teacher = self.teacher.to(device).eval().requires_grad_(False)
+			print(f"campaign: the teacher's KL at {config.teacher_kl}, the teacher {config.teacher_checkpoint}", flush=True)
 		# The features module on the CPU (its priors' corrections are learned: refreshed after each update) for the
 		# foresight's labels, computed from decoded inputs on the CPU while the model trains on the GPU (learner "turns")
 		self.features_cpu = copy.deepcopy(self.model.features).cpu()
@@ -435,7 +448,7 @@ class CampaignLearner:
 				self._refresh_features()
 		else:
 			with self.model_lock:
-				metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
+				metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
 				if self.device.type == "mps":
 					torch.mps.empty_cache()  # (the battle learner's lesson: MPS keeps blocks of every size it saw)
 				self.version += 1
@@ -557,6 +570,7 @@ class CampaignLearner:
 			"entropy": metrics.get("entropy", float("nan")),
 			"below_floor": metrics.get("below_floor", float("nan")),
 			"kl": metrics.get("kl", float("nan")),
+			"teacher_kl": metrics.get("teacher_kl", float("nan")),  # (KL(teacher || model) a decision; 0 without a teacher)
 			"last_kl": metrics["last_kl"],
 			"clip_fraction": metrics.get("clip_fraction", float("nan")),
 			"grad_norm": metrics.get("grad_norm", float("nan")),
@@ -620,7 +634,7 @@ class CampaignLearner:
 			"  value ev " + "/".join(f"{row[f'head_ev_v{k}']:+.2f}" for k in c.VALUE_OFFSETS)
 			+ f" (this update {row[f'value_ev_d{c.VALUE_OFFSETS[-1]}']:+.2f}: corr {metrics.get('value_corr', float('nan')):+.2f}, spread {metrics.get('value_spread', float('nan')):.3f} vs {metrics.get('label_spread', float('nan')):.3f})"
 			+ "  growth ev " + "/".join(f"{row[f'head_ev_g{k}']:+.2f}" for k in c.VALUE_OFFSETS) + f"  end ev {row['head_ev_vend']:+.2f} (credit {row['end_credit']:.2f})"
-			+ f"  kl {row['last_kl']:.4f}  signal {metrics.get('signal_ratio', float('nan')):.3f}  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f})  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
+			+ f"  kl {row['last_kl']:.4f}" + (f"  teacher kl {row['teacher_kl']:.3f}" if self.teacher is not None else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f}  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f})  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
 			flush=True,
 		)
 

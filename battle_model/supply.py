@@ -471,6 +471,9 @@ class Runner:
 					time.sleep(0.25)
 				game, info = self.game.result()
 			finally:
+				# Ended first if still running: an exception here (the worker's SIGTERM in the sleep, a remote slot's
+				# send failing) left the game unreferenced, so close() could not end its VCMI (2026-10-31 review)
+				self.game.terminate()
 				self.game = None
 			yield from self._battles(key)
 		finally:

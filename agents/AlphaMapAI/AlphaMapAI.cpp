@@ -522,13 +522,14 @@ Choice AlphaMapAI::decide(Decision & decision)
 		const auto inputs = decision.inputs.wire();
 		std::string reply;
 		uint32_t version = 0;
-		for(int attempt = 0;; ++attempt)
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+		for(;;)
 		{
 			try
 			{
+				std::scoped_lock lock(inferenceMutex);
 				if(!inference)
 					throw std::runtime_error("no model");
-				std::scoped_lock lock(inferenceMutex);
 				version = inference->request(modelName, 1, inputs, reply);
 				break;
 			}
@@ -536,8 +537,16 @@ Choice AlphaMapAI::decide(Decision & decision)
 			{
 				if(!requireModel)
 					throw;
-				// The server went away (a restart of the run or of a worker): connect again, a minute at most
+				// The server went away (a restart of the run or of a worker): connect again, for a minute at most. A
+				// request that keeps failing (the server's ERROR for this decision) ends the game as well: it was asked
+				// again at once, forever, each failure logged as a sign of life for the stall watchdog (2026-10-31 review)
+				if(std::chrono::steady_clock::now() > deadline)
+				{
+					logAi->error("AlphaMapAI %s: no decision for a minute (%s): ending the game (ALPHA_MAP_REQUIRE_MODEL)", playerID.toString(), e.what());
+					std::abort();
+				}
 				logAi->error("AlphaMapAI %s: no decision (%s): connecting again", playerID.toString(), e.what());
+				std::this_thread::sleep_for(std::chrono::seconds(1));
 				std::scoped_lock lock(inferenceMutex);
 				inference.reset();
 				connectInference(true);
@@ -655,6 +664,16 @@ Choice AlphaMapAI::sample(const Decision & decision, const Outputs & outputs)
 	return choice;
 }
 
+std::string AlphaMapAI::teacherJson() const
+{
+	if(!teacher)
+		return "";
+	std::string unmatched;
+	for(const auto & [kind, count] : teacherUnmatched)
+		unmatched += (unmatched.empty() ? "\"" : ", \"") + kind + "\": " + std::to_string(count);
+	return ", \"teacher\": {\"matched\": " + std::to_string(teacherMatched) + ", \"approximate\": " + std::to_string(teacherApproximate) + ", \"unmatched\": {" + unmatched + "}}";
+}
+
 void AlphaMapAI::noEffect(const Choice & choice)
 {
 	++failedActions;
@@ -748,7 +767,7 @@ void AlphaMapAI::sendRecords(bool final)
 			sendToRecordServer(recordSocket, gameKey + ":" + color + ":battle#" + std::to_string(battlesSent++), battleJson);
 		if(final)
 		{
-			const auto summary = "{\"errors\": " + std::to_string(errors) + ", \"failed_actions\": " + std::to_string(failedActions) + "}";
+			const auto summary = "{\"errors\": " + std::to_string(errors) + ", \"failed_actions\": " + std::to_string(failedActions) + teacherJson() + "}";
 			sendToRecordServer(recordSocket, gameKey + ":" + color + ":done", summary);
 		}
 	}

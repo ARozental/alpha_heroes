@@ -114,13 +114,15 @@ class GameRun:
 	data workers of battle_model/supply.py hand the game's battles on as they end). poll() says whether it is over (and
 	ends its process then); result() gives (records.Game, GameInfo) once it is. The arguments are play()'s."""
 
-	def __init__(self, socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_ai="BattleAI", game_key="g0", settings=(), niceness=0, temperature=1.0, ours=None, our_battle_ai="AlphaBattleAI", neutral_ai="BattleAI", difficulty=None):
+	def __init__(self, socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_ai="BattleAI", game_key="g0", settings=(), niceness=0, temperature=1.0, ours=None, our_battle_ai="AlphaBattleAI", neutral_ai="BattleAI", difficulty=None, teacher=False):
 		self.server = battle_play.RecordServer()
 		self.map_name, self.days, self.ours = map_name, days, ours
 		env = dict(os.environ)
 		ai = {"adventureEnemyAI": "AlphaMapAI", "adventureAlliedAI": "AlphaMapAI", "combatEnemyAI": battle_ai, "combatAlliedAI": battle_ai, "combatNeutralAI": neutral_ai}
 		if ours is not None:
 			ai.update(adventureEnemyAI="Nullkiller2", adventureAlliedAI="Nullkiller2")
+		if teacher:  # every player Nullkiller2, its turn requests recorded as our decisions (agents/AlphaMapAI/Teacher.cpp)
+			ai.update(adventureEnemyAI="AlphaTeacherAI", adventureAlliedAI="AlphaTeacherAI")
 		env.update(
 			ALPHA_MAP_INFERENCE_SOCKET=str(socket_path),
 			ALPHA_MAP_RECORD_SOCKET=str(self.server.path),
@@ -180,7 +182,7 @@ class GameRun:
 		return game, GameInfo(self.map_name, "", seconds, self.status, str(run), directory_mb(run))
 
 
-def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_ai="BattleAI", game_key="g0", settings=(), niceness=0, temperature=1.0, ours=None, our_battle_ai="AlphaBattleAI", stop=None, neutral_ai="BattleAI", difficulty=None):
+def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_ai="BattleAI", game_key="g0", settings=(), niceness=0, temperature=1.0, ours=None, our_battle_ai="AlphaBattleAI", stop=None, neutral_ai="BattleAI", difficulty=None, teacher=False):
 	"""Play one game against the inference server at socket_path; returns (records.Game, GameInfo).
 
 	battle_ai plays the players' battles, neutral_ai the wandering monsters' (the game's AI, as in a real game; the
@@ -190,8 +192,8 @@ def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_
 	inference server and record keys). ours: None (every player is our AI), or the colors that are, the others
 	Nullkiller2 with battle_ai while ours fight with our_battle_ai (an evaluation). stop: an Event that ends the game
 	early (training is over). difficulty: the game's (VCMI's 0 easy .. 4 impossible; None: the settings' default, 1), the
-	AI players' resource bonus grows with it."""
-	run = GameRun(socket_path, map_name, days, seed, max_seconds, max_mb, battle_ai, game_key, settings, niceness, temperature, ours, our_battle_ai, neutral_ai, difficulty)
+	AI players' resource bonus grows with it. teacher: every player is Nullkiller2, recorded (campaign_model/teacher.py)."""
+	run = GameRun(socket_path, map_name, days, seed, max_seconds, max_mb, battle_ai, game_key, settings, niceness, temperature, ours, our_battle_ai, neutral_ai, difficulty, teacher)
 	while not run.poll(stop):
 		time.sleep(0.25)
 	return run.result()

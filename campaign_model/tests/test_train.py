@@ -212,3 +212,39 @@ def test_the_fresh_value_loss_is_zero_only_for_exact_predictions():
 	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
 	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, np.zeros(8, np.float32), CampaignConfig(batch_size=4, passes=1), decode=decode, growth=growth)
 	assert np.isfinite(metrics["value_fresh"]) and metrics["value_fresh"] > 0
+
+
+def test_the_teachers_kl_is_zero_against_itself_and_positive_against_another_model():
+	from campaign_model.train import TEACHER_OUTPUTS, teacher_kl
+
+	torch.manual_seed(4)
+	model, other = CampaignModel(dim=32, cell_dim=16, layers=1).eval(), CampaignModel(dim=32, cell_dim=16, layers=1).eval()
+	x = {k: torch.from_numpy(v) for k, v in random_inputs(8, seed=9).items()}
+	out = model(x)
+	batch = {"kind": x["g_kind"].long(), **{"t:" + name: out[name].detach() for name in TEACHER_OUTPUTS}}
+	assert teacher_kl(out, batch).abs().max() < 1e-4
+	moved = other(x)
+	kl = teacher_kl(moved, batch)
+	assert torch.isfinite(kl).all() and (kl > 0).all()
+	kl.sum().backward()  # (masked entries: -inf in both, no nan reaches a gradient)
+	assert all(torch.isfinite(p.grad).all() for p in other.parameters() if p.grad is not None)
+
+
+def test_an_update_with_a_teacher_moves_toward_it():
+	"""With only the teacher's KL to learn from (no credit), an update brings the model's choices closer to the teacher's."""
+	from campaign_model.train import TEACHER_OUTPUTS, teacher_kl
+
+	torch.manual_seed(5)
+	model, teacher = CampaignModel(dim=32, cell_dim=16, layers=1), CampaignModel(dim=32, cell_dim=16, layers=1).eval()
+	x = random_inputs(16, seed=10)
+	tensors = {k: torch.from_numpy(v) for k, v in x.items()}
+	decisions = decisions_for(model.eval(), x)
+	measure = lambda: float(teacher_kl(model.eval()(tensors), {"kind": tensors["g_kind"].long(), **{"t:" + n: o.detach() for n, o in teacher(tensors).items() if n in TEACHER_OUTPUTS}}).mean())  # noqa: E731
+	before = measure()
+	targets = np.full((16, c.N_VALUE_OFFSETS), 0.5, dtype=np.float32)
+	returns = np.full(16, 0.5, dtype=np.float32)
+	config = CampaignConfig(batch_size=8, passes=4, teacher_kl=1.0, target_kl=0.0)
+	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
+	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-3), decisions, targets, returns, config, decode=decode, teacher=teacher)
+	assert metrics["teacher_kl"] > 0
+	assert measure() < before

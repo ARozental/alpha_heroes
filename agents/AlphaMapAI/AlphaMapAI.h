@@ -77,6 +77,7 @@ struct Record
 };
 
 constexpr uint32_t RECORD_NO_EFFECT = 1;
+constexpr uint32_t RECORD_TEACHER = 2; // Nullkiller2's decision (Teacher.cpp): its choice is the teacher's, no model's probability
 
 /// Adventure-map AI: every decision is the campaign model's (campaign_model/), asked of the inference server; battles
 /// are played by the configured battle AI. Built on Nullkiller2's patterns for threads and queries (AIGateway).
@@ -145,9 +146,24 @@ class AlphaMapAI : public CAdventureAI
 	Choice lastChoice;
 	int lastChanged = -1;
 
+	// The teacher's recorder (Teacher.cpp): the requests of Nullkiller2's with no equal among our actions, by kind; the
+	// matched ones, and those matched to our nearest amount (recruits, trades, splits) or area (a move out of reach)
+	bool teacher = false;
+	int teacherMatched = 0;
+	int teacherApproximate = 0;
+	std::map<std::string, int> teacherUnmatched;
+	std::string teacherJson() const;
+
 public:
 	AlphaMapAI();
 	~AlphaMapAI() override;
+
+	// Nullkiller2 as the campaign model's teacher (Teacher.cpp, the AlphaTeacherAI library): Nullkiller2 plays, and each
+	// of its turn requests is recorded as the turn decision of ours that does the same, our inputs as they were then
+	// (RECORD_TEACHER; campaign_model/imitate.py learns from them). This object only encodes and records, never acts
+	void initTeacher(std::shared_ptr<Environment> environment, std::shared_ptr<CCallback> callback);
+	void teacherTurnStarts();
+	void observe(const CPackForServer * pack);
 
 	std::string getBattleAIName() const override;
 	void initGameInterface(std::shared_ptr<Environment> env, std::shared_ptr<CCallback> callback) override;

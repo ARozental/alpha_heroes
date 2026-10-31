@@ -115,6 +115,13 @@ class CampaignConfig:
 	model_layers: int = 2
 	seed: int = 0
 	init_from: str = ""  # a campaign checkpoint a new run starts from (its weights; a new optimizer)
+	# The teacher's KL (AlphaStar's KL to its supervised policy, 2026-10-31: 1,020 -> 1,400 Elo in its ablation): each
+	# decision's KL(teacher || model) over the action type and each type's table (train.teacher_kl), at this weight in
+	# the loss, the teacher a frozen imitation of Nullkiller2 (imitate.py's bc_latest.pt: teacher_checkpoint). It keeps
+	# what the teacher does (attacks among it: self-play never attacks, 2026-10-27) unless the games' credit pays to
+	# leave it. 0: off
+	teacher_checkpoint: str = ""
+	teacher_kl: float = 0.0
 	label_weights: tuple = (1 / 3, 1 / 3, 1 / 3)  # of the shares at VALUE_OFFSETS (labels.py)
 	decision_price: float = 1e-4  # share points per turn decision
 	# Evaluation against Nullkiller2 (evaluate.py): our models in one seat, Nullkiller2 in the others
