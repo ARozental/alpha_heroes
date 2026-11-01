@@ -53,3 +53,20 @@ def test_an_eval_waiting_for_memory_holds_training_games_back_but_never_the_last
 	(tmp_path / "drain").touch()
 	shared.local["campaign"].value, shared.eval_waiting.value = 0, 0
 	assert games.place() is None  # draining: nothing starts
+
+
+def test_the_permits_are_counted_again_with_no_game_event(monkeypatch):
+	# the trap of 2026-11-01 15:58: the update took the waiting games while none played; no game event came again
+	import threading
+	import time
+
+	s = supply.Supply.__new__(supply.Supply)
+	s.stop, calls = threading.Event(), []
+	s.allow = lambda: calls.append(1)
+	monkeypatch.setattr(supply, "PERMITS_EVERY", 0.01)
+	thread = threading.Thread(target=s._keep_allowing, daemon=True)
+	thread.start()
+	time.sleep(0.2)
+	s.stop.set()
+	thread.join(timeout=1)
+	assert len(calls) >= 5 and not thread.is_alive()

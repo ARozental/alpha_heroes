@@ -14,7 +14,7 @@ cg=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/alpha-j
 started=$(date +%s)
 while true; do
 	here=$(on_pc "for p in \$(cat $cg/cgroup.procs); do cat /proc/\$p/comm 2>/dev/null; done | grep -c vcmiclient")
-	mac=$(pgrep -f vcmiclient | wc -l | tr -d ' ')
+	mac=$(pgrep -x vcmiclient | wc -l | tr -d ' ')  # (the process name: -f matched a shell whose command quoted the word, 2026-11-01)
 	[ "${here:-1}" -eq 0 ] && [ "$mac" -eq 0 ] && break
 	[ $(($(date +%s) - started)) -ge $max ] && { echo "$(date +%T) still playing after ${1:-45} min (PC $here, Mac $mac): stopping anyway"; break; }
 	sleep 15

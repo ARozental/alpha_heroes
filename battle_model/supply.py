@@ -102,6 +102,7 @@ def process_gb(pid, field):
 SHARED = None  # the trainer's Shared (Supply sets it): memory_allows() in the trainer's process (the campaign eval)
 PEAK_WINDOW = 20 * 60  # s: the trainer's recent peak, over 2-3 campaign updates (each ~5-9 minutes apart)
 PEAK_EVERY = 5  # s between its samples (an update's peak lasts minutes)
+PERMITS_EVERY = 10  # s: the campaign permits counted again at least this often (Supply._keep_allowing)
 
 
 def memory_allows(shared=None, playing=None):
@@ -650,6 +651,7 @@ class Supply:
 			thread.start()
 		if self.campaign:
 			self.allow()
+			threading.Thread(target=self._keep_allowing, daemon=True, name="supply-permits").start()
 		print(f"supply: {self.workers('battle')} battle workers" + (f", {self.workers('campaign')} campaign workers" if self.campaign else "") + f" ({self.ctx.get_start_method()}); ceilings here {self.shared.ceilings}" + (f"; remote slots on port {self.config.remote_port + remote.SLOT_PORT}" if self.listener else ""), flush=True)
 
 	def close(self):
@@ -709,6 +711,15 @@ class Supply:
 				self.campaign._failed(item["message"], item.get("run_dir"))
 			else:
 				self.pool._failed(item["message"])
+
+	def _keep_allowing(self):
+		"""allow() every PERMITS_EVERY: it ran only as a game finished, so an update that took the waiting games while
+		none was playing left the permits at 0 for good (2026-11-01 15:58-16:16 CST: no campaign game for 18 minutes)."""
+		while not self.stop.wait(PERMITS_EVERY):
+			try:
+				self.allow()
+			except Exception as error:  # (the next one tries again)
+				print(f"supply: the permits not counted: {str(error)[:200]}", flush=True)
 
 	def allow(self):
 		"""The campaign games that may start now: what `ahead` updates take, less the decisions finished and waiting and
