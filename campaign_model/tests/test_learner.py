@@ -339,3 +339,13 @@ def test_the_teachers_weight_follows_our_score_against_it():
 	share = lambda score: teacher_weight_for(score) / (1 + teacher_weight_for(score))  # noqa: E731
 	assert share(0.1) == pytest.approx(0.95) and share(0.5) == pytest.approx(0.7)  # much better than us: it dominates
 	assert share(1.0) == pytest.approx(0.2) and share(2.0) == pytest.approx(0.05)  # as good or worse: small, never 0
+
+
+def test_an_end_agrees_with_the_advice_of_an_end_whatever_its_index():
+	from campaign_model.learner import agrees
+
+	ours = lambda action, index, advice: SimpleNamespace(action_type=action, index=index, advice=advice)  # noqa: E731
+	assert agrees(ours(c.ActionType.END, -1, (c.ActionType.END, 0, -1)))  # (ours has no index, the advice's is 0)
+	assert agrees(ours(c.ActionType.ARMY, 7, (c.ActionType.ARMY, 7, -1)))
+	assert not agrees(ours(c.ActionType.ARMY, 7, (c.ActionType.ARMY, 8, -1)))
+	assert not agrees(ours(c.ActionType.ARMY, 7, (c.ActionType.END, 0, -1)))

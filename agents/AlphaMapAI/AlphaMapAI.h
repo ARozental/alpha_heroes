@@ -159,18 +159,23 @@ class AlphaMapAI : public CAdventureAI
 	std::map<std::string, int> teacherUnmatched;
 	std::map<QueryID, Decision> teacherQuestions; // (asked, not yet answered: under recordsMutex)
 
-	// Nullkiller2's advice (Advice.cpp; ALPHA_MAP_NK2_ADVICE: the chance a turn decision gets it, 0 off): a Nullkiller2
-	// of this player's, its requests going to a client that sends none; asked before a sampled decision of ours what
-	// it would do there, its first request stops it and is matched to our legal entry (matchRequest)
+	// Nullkiller2's advice (Advice.cpp; ALPHA_MAP_NK2_ADVICE: the chance a turn or exchange decision gets it, 0 off): a
+	// Nullkiller2 of this player's, its requests going to a client that sends none; asked before a sampled decision of
+	// ours what it would do there, its first request stops it and is matched to our legal entry (matchRequest)
 	struct Advisor;
 	std::shared_ptr<Advisor> advisor;
 	double adviceProbability = 0;
 	int advised = 0;
 	int adviceMatched = 0;
+	int exchangeAdvised = 0;
+	int exchangeAdviceMatched = 0;
+	int exchangeAdviceEnds = 0;
 	double adviceSeconds = 0;
 	std::map<std::string, int> adviceUnmatched;
 	void initAdvice();
+	bool adviceDrawn(); // this decision gets the advice (at adviceProbability)
 	std::optional<Choice> advise(const Decision & decision);
+	std::optional<Choice> adviseExchange(const Decision & decision, ObjectInstanceID first, ObjectInstanceID second);
 	std::string adviceJson() const;
 	// A request of Nullkiller2's as our turn decision's legal entry doing the same; false (unmatched: why) when none
 	bool matchRequest(const Decision & decision, const CPackForServer * pack, Choice & choice, bool & exact, std::string & unmatched) const;

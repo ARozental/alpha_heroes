@@ -241,17 +241,8 @@ void AlphaMapAI::makeTurn()
 				return;
 			auto decision = encode(DecisionKind::TURN);
 			std::optional<Choice> advice; // (Nullkiller2's, at this decision's chance: before ours, in the same state)
-			if(advisor)
-			{
-				std::uniform_real_distribution<double> uniform(0.0, 1.0);
-				bool asked;
-				{
-					std::scoped_lock lock(rngMutex);
-					asked = uniform(rng) < adviceProbability;
-				}
-				if(asked)
-					advice = advise(decision);
-			}
+			if(adviceDrawn())
+				advice = advise(decision);
 			const auto choice = decide(decision, advice);
 			if(choice.type <= static_cast<int>(ActionType::END))
 				break;
@@ -1037,7 +1028,10 @@ void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, Query
 		auto decision = encode(DecisionKind::EXCHANGE, first, second);
 		if(!decision.inputs.any(In::army_mask))
 			break;
-		const auto choice = decide(decision);
+		std::optional<Choice> advice;
+		if(adviceDrawn())
+			advice = adviseExchange(decision, first, second);
+		const auto choice = decide(decision, advice);
 		if(choice.type != static_cast<int>(ActionType::ARMY))
 			break;
 		if(!execute(decision, choice))

@@ -9,6 +9,8 @@
 #include "lib/callback/CCallback.h"
 #include "lib/callback/IClient.h"
 #include "lib/gameState/CGameState.h"
+#include "lib/mapObjects/CGHeroInstance.h"
+#include "lib/mapping/TerrainTile.h"
 #include "lib/networkPacks/PacksForServer.h"
 #endif
 
@@ -23,6 +25,8 @@ using namespace MapSchema;
 // (matchRequest, as the teacher's recorder does) and stops it there. Its turn starts again each time: Nullkiller2
 // plans from the state (and remembers the objects it can see: memorizeVisitableObjs), so it needs none of our events.
 // Our decision's record carries it (RECORD_ADVICE); the trainer takes a loss toward it (campaign.nk2_advice).
+// An exchange between two of our heroes gets Nullkiller2's as well (adviseExchange): the troop move toward the army it
+// would leave the one hero, or the end of the exchange once that army is there.
 
 namespace
 {
@@ -92,6 +96,15 @@ void AlphaMapAI::initAdvice()
 #endif
 }
 
+bool AlphaMapAI::adviceDrawn()
+{
+	if(!advisor)
+		return false;
+	std::uniform_real_distribution<double> uniform(0.0, 1.0);
+	std::scoped_lock lock(rngMutex);
+	return uniform(rng) < adviceProbability;
+}
+
 std::optional<Choice> AlphaMapAI::advise(const Decision & decision)
 {
 #ifdef ALPHA_MAP_NK2_ADVICE
@@ -141,6 +154,113 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision)
 #endif
 }
 
+std::optional<Choice> AlphaMapAI::adviseExchange(const Decision & decision, ObjectInstanceID first, ObjectInstanceID second)
+{
+#ifdef ALPHA_MAP_NK2_ADVICE
+	const auto * one = cb->getHero(first);
+	const auto * two = cb->getHero(second);
+	if(!advisor || !one || !two || one->tempOwner != two->tempOwner)
+		return std::nullopt;
+	// Nullkiller2's exchange (AIGateway::heroExchangeStarted, pickBestCreatures): one hero gets the best army of the
+	// two (ArmyManager::getBestArmy; the other keeps its fastest creature, one, when it would have none). Its own
+	// requests for it are not matched as they come: most are swaps into a slot of the order it wants or moves within
+	// one army, none of them ours (a move of ours takes the creature's own slot or the first free one), so the advice is
+	// our legal move toward its army: the missing troops of its strongest creature still missing from the source, else
+	// troops it would not keep back to the source, else (its army is there) the end. (Its dismissal of small unwanted
+	// stacks and its artifacts are not ours.)
+	// Which hero: the higher level, else the stronger army, else Nullkiller2's own (the one met: its hero chains, a
+	// scout bringing troops to its main hero). Its own alone gave the army to whichever hero our model walked into,
+	// which it does with any two heroes: the army went back and forth between two heroes, 2026-11-01
+	const auto started = std::chrono::steady_clock::now();
+	const auto * destination = activeHero == first ? two : one;
+	if(one->level != two->level)
+		destination = one->level > two->level ? one : two;
+	else if(one->getArmyStrength() != two->getArmyStrength())
+		destination = one->getArmyStrength() > two->getArmyStrength() ? one : two;
+	const auto * source = destination == one ? two : one;
+	std::vector<NK2AI::SlotInfo> best;
+	if(source->stacksCount() > 0)
+		best = advisor->nk2->nullkiller->armyManager->getBestArmy(destination, destination, source, cb->getTile(source->visitablePos())->getTerrainID());
+	std::map<CreatureID, int> wanted, has;
+	for(const auto & slot : best)
+		wanted[slot.creature->getId()] += slot.count;
+	for(const auto & [slot, stack] : destination->Slots())
+		has[stack->getId()] += stack->getCount();
+	const auto & moves = decision.entries[static_cast<int>(ActionType::ARMY)];
+	// The move of `from`'s troops of `creature` to `to` whose amount is nearest `amount` (on a log scale); -1 none
+	const auto nearestMove = [&moves](const CGHeroInstance * from, const CGHeroInstance * to, CreatureID creature, int amount)
+	{
+		int found = -1;
+		double gap = 1e18;
+		for(const auto & [index, e] : moves)
+		{
+			if(e.first != from->id || e.second != to->id || from->getCreature(SlotID(e.a)) == nullptr || from->getCreature(SlotID(e.a))->getId() != creature)
+				continue;
+			const double g = std::abs(std::log(std::max(1, e.c)) - std::log(std::max(1, amount)));
+			if(g < gap || (g == gap && index < found))
+			{
+				gap = g;
+				found = index;
+			}
+		}
+		return found;
+	};
+	bool needed = false;
+	int move = -1;
+	for(const auto & slot : best) // (strongest first)
+	{
+		const auto creature = slot.creature->getId();
+		const int missing = wanted[creature] - has[creature];
+		if(missing <= 0)
+			continue;
+		needed = true;
+		move = nearestMove(source, destination, creature, missing);
+		if(move >= 0)
+			break;
+	}
+	if(move < 0)
+		for(const auto & [creature, count] : has)
+		{
+			const int over = count - wanted[creature];
+			if(over <= 0)
+				continue;
+			needed = true;
+			move = nearestMove(destination, source, creature, over);
+			if(move >= 0)
+				break;
+		}
+	std::optional<Choice> advice;
+	if(move >= 0)
+	{
+		Choice choice;
+		choice.type = static_cast<int>(ActionType::ARMY);
+		choice.index = move;
+		advice = choice;
+	}
+	else if(!needed)
+	{
+		Choice choice;
+		choice.type = static_cast<int>(ActionType::END);
+		choice.index = 0; // (as the end of a turn's advice: matchRequest)
+		advice = choice;
+		++exchangeAdviceEnds;
+	}
+	adviceSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+	++advised;
+	++exchangeAdvised;
+	if(advice)
+	{
+		++adviceMatched;
+		++exchangeAdviceMatched;
+	}
+	else
+		++adviceUnmatched["exchange (no move of ours toward its army)"];
+	return advice;
+#else
+	return std::nullopt;
+#endif
+}
+
 std::string AlphaMapAI::adviceJson() const
 {
 	if(advised == 0)
@@ -148,7 +268,7 @@ std::string AlphaMapAI::adviceJson() const
 	std::string unmatched;
 	for(const auto & [kind, count] : adviceUnmatched)
 		unmatched += (unmatched.empty() ? "\"" : ", \"") + kind + "\": " + std::to_string(count);
-	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
+	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + "}, \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
 }
 
 // The events of a seated Nullkiller2's memory (AlphaMapAI.h), passed on to the advising one; none of our own uses them
