@@ -18,8 +18,8 @@ def shared_at(monkeypatch, available, rss, peak):
 def test_the_trainers_way_back_to_its_recent_peak_is_kept_free(monkeypatch):
 	# 12 GB available, the trainer at 9 of its recent 14 GB: 7 GB left for games, over the floor
 	assert supply.memory_allows(shared_at(monkeypatch, available=12.0, rss=9.0, peak=14.0))
-	# 10 GB available looks free, but the trainer takes 5 back at its next update: 5 GB, under the floor
-	assert not supply.memory_allows(shared_at(monkeypatch, available=10.0, rss=9.0, peak=14.0))
+	# 9 GB available looks free, but the trainer takes 5 back at its next update: 4 GB, under the floor
+	assert not supply.memory_allows(shared_at(monkeypatch, available=9.0, rss=9.0, peak=14.0))
 	# at its peak nothing is owed
 	assert supply.memory_allows(shared_at(monkeypatch, available=supply.MEMORY_FLOOR_GB, rss=14.0, peak=14.0))
 
@@ -31,3 +31,12 @@ def test_a_fresh_trainer_owes_nothing_yet(monkeypatch):
 
 def test_unknown_memory_never_holds_games_back(monkeypatch):
 	assert supply.memory_allows(shared_at(monkeypatch, available=None, rss=9.0, peak=14.0))
+
+
+def test_one_game_of_a_kind_always_plays_over_the_last_game_level(monkeypatch):
+	# the trainer at its peak holding what only games would free: 4 GB is under the floor, but with none playing one
+	# starts (13:38-15:00 CST on 2026-11-01 no game could, and the trainer waited for games)
+	shared = shared_at(monkeypatch, available=4.0, rss=13.0, peak=13.5)
+	assert not supply.memory_allows(shared, playing=1)
+	assert supply.memory_allows(shared, playing=0)
+	assert not supply.memory_allows(shared_at(monkeypatch, available=3.0, rss=13.0, peak=13.5), playing=0)

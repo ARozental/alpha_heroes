@@ -49,7 +49,8 @@ from .constants import MAX_UNITS, N_HEXES, ActionType
 from .data import SPARSE_INPUTS, Sparse, battle_examples, check_record, collate, compact_record, version_of
 from .losses import normalize_advantages
 
-MEMORY_FLOOR_GB = 6.0  # no new game here under this much available memory (Linux; elsewhere unknown: no limit). Games grow after they start (a VCMI client, the worker's arrays), and runtime/memwatch.sh stops a run under 1.5 GB: it did, 2026-10-30 23:27. The trainer's own swing is kept free besides (memory_allows); the floor is for the games' growth after they start (6, not 4.5, since 2026-11-01 13:20 CST), and what still runs past it the guard sheds a game at a time (runtime/memwatch.sh)
+MEMORY_FLOOR_GB = 4.5  # no new game here under this much available memory (Linux; elsewhere unknown: no limit). Games grow after they start (a VCMI client, the worker's arrays), and runtime/memwatch.sh stops a run under 1.5 GB: it did, 2026-10-30 23:27. The trainer's own swing is kept free besides (memory_allows); what still runs past the floor the guard sheds a game at a time (runtime/memwatch.sh). (6 GB on 2026-11-01 13:38-15:00 CST deadlocked joint7: the trainer at its peak, 5.6 GB left, no game could start, and it waited for games)
+LAST_GAME_GB = 3.5  # one game of a kind plays while this much is available, whatever the floor says: the run never waits for memory only games would free (over the guard's shedding level, 3 GB)
 SLOT_HELLO_SECONDS = 30
 NEUTRAL_AI = "BattleAI"  # the wandering monsters' battle AI in generated battles, as in a campaign game
 TRACE_EVERY = 20  # worker 0 keeps the compact record of one battle in this many, for the run's traces
@@ -103,16 +104,19 @@ PEAK_WINDOW = 20 * 60  # s: the trainer's recent peak, over 2-3 campaign updates
 PEAK_EVERY = 5  # s between its samples (an update's peak lasts minutes)
 
 
-def memory_allows(shared=None):
+def memory_allows(shared=None, playing=None):
 	"""Whether a game may start here: the memory available, less the trainer's way back to its recent peak, over the
 	floor. The trainer's memory swings ~5 GB each campaign update (it frees the update's buffers after it, takes them
 	back in the next); games let in at its low point took what the next update needed, and the guard stopped joint7 at
 	1.06 GB (2026-11-01 12:21 CST: the trainer 9.6 -> 13.2 GB in update 49, the unit 18.9 -> 25.1 GB in 4.5 minutes).
 	Its recent peak (Supply._watch_trainer: the highest of the last PEAK_WINDOW), not its highest ever: much of that is
 	the finished games it holds, which only games played bring back; kept free after a restart (14.3 GB, the trainer
-	at 3.9), it let 1 game of 14 play (13:38-13:55 CST)."""
+	at 3.9), it let 1 game of 14 play (13:38-13:55 CST). playing: games of the kind playing here now (none: LAST_GAME_GB
+	is enough)."""
 	free = available_gb()
 	if free is None:
+		return True
+	if playing == 0 and free >= LAST_GAME_GB:
 		return True
 	shared = shared or SHARED
 	rss = process_gb(shared.trainer, "VmRSS") if shared is not None else None
@@ -248,7 +252,7 @@ class Games(IterableDataset):
 		"""("here", None), ("remote", connection) or None (nothing free now): local first, then a remote slot."""
 		shared, kind = self.shared, self.kind
 		with shared.lock:
-			if shared.local[kind].value < shared.ceilings[kind] and memory_allows(shared):
+			if shared.local[kind].value < shared.ceilings[kind] and memory_allows(shared, shared.local[kind].value + shared.remote[kind].value):
 				shared.local[kind].value += 1
 				return "here", None
 		# A remote slot's game takes memory here too (its worker holds what it played), so it waits for the floor as well
