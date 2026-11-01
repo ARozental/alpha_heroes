@@ -975,7 +975,7 @@ def train(config, resume=False):
 		torch.backends.cuda.matmul.allow_tf32 = True
 		torch.backends.cudnn.allow_tf32 = True
 	if device.type == "cuda" and config.cuda_memory_fraction > 0:
-		torch.cuda.set_per_process_memory_fraction(config.cuda_memory_fraction, device)
+		torch.cuda.set_per_process_memory_fraction(config.cuda_memory_fraction, device.index if device.index is not None else torch.cuda.current_device())  # (an index: "cuda" alone is refused)
 		print(f"cuda: this process holds {config.cuda_memory_fraction:.0%} of the GPU's {torch.cuda.get_device_properties(device).total_memory / 2**30:.1f} GB at most", flush=True)
 	architecture = model_kwargs(config)
 	model = build_model(architecture).to(device)
