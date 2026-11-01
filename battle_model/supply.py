@@ -661,6 +661,7 @@ class Supply:
 						types = now if now - types >= CENSUS_TYPES_EVERY else types
 					except Exception as error:  # (a diagnostic: never the run's end)
 						print(f"trainer memory: census failed: {str(error)[:200]}", flush=True)
+					trim_memory()  # (what the trainer freed meanwhile, the waiting games' inputs (strip_inputs) among it, back to the system)
 			self.stop.wait(PEAK_EVERY)
 
 	def memory_census(self, rss, by_type=False):
@@ -675,7 +676,8 @@ class Supply:
 				waiting = list(campaign.finished)
 			futures = list(getattr(campaign, "label_futures", {}).values())
 			labels = sum(held_bytes(f.result()) for f in futures if f.done() and not f.cancelled() and f.exception() is None)
-			parts.append(f"campaign waiting {len(waiting)} games, {sum(len(g.decisions) for g, _ in waiting)} decisions, inputs {sum(len(d.inputs) for g, _ in waiting for d in g.decisions) / 2**20:.0f} MB; label results {len(futures)} ({labels / 2**20:.0f} MB)")
+			held = sum(len(d.inputs) for g, _ in waiting for d in g.decisions if d.inputs is not None)  # (strip_inputs: none, mostly)
+			parts.append(f"campaign waiting {len(waiting)} games, {sum(len(g.decisions) for g, _ in waiting)} decisions, inputs {held / 2**20:.0f} MB; label results {len(futures)} ({labels / 2**20:.0f} MB)")
 		with self.pool.lock:
 			buffer = list(self.pool.buffer)
 		parts.append(f"battle buffer {len(buffer)} battles, {sum(b['decisions'] for b in buffer)} decisions, {sum(held_bytes(b.get('data')) for b in buffer) / 2**20:.0f} MB")

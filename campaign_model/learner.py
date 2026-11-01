@@ -269,7 +269,8 @@ class CampaignLearner:
 			game.spool_path = str(path)
 			if getattr(self, "labeler", None):
 				game.labels_version = self.version
-				self.label_futures[id(game)] = self.labeler.submit(game, self.features_cpu)
+				self.label_futures[id(game)] = self.labeler.submit(label_source(game), self.features_cpu)
+			strip_inputs(game)
 			self.finished.append((game, info))
 		if paths:
 			print(f"campaign: {len(self.finished)} finished games from before the stop back in the queue ({sum(len(g.decisions) for g, _ in self.finished)} decisions)", flush=True)
@@ -337,7 +338,8 @@ class CampaignLearner:
 		self._spool_game(game, info)
 		if getattr(self, "labeler", None):
 			game.labels_version = self.version
-			self.label_futures[id(game)] = self.labeler.submit(game, self.features_cpu)  # (not on the game: it is pickled to the labeler after this returns)
+			self.label_futures[id(game)] = self.labeler.submit(label_source(game), self.features_cpu)  # (not on the game: it is pickled to the labeler after this returns)
+		strip_inputs(game)
 		with self.lock:
 			self.finished.append((game, info))
 			self.stats["games"] += 1
@@ -415,7 +417,12 @@ class CampaignLearner:
 		games = self._take()
 		if games is None:
 			return False
-		started, memory = time.time(), [("taken", rss_gb())]
+		started, memory = time.time(), [("waited", rss_gb())]
+		unread = [game for game, _ in games if not restore_inputs(game)]  # (strip_inputs: only their spool files had them)
+		if unread:
+			games = [(game, info) for game, info in games if not any(game is u for u in unread)]
+			unspool(unread)
+		memory.append(("taken", rss_gb()))
 		played = []
 		for game, _ in games:
 			game.all_decisions = game.decisions  # (the foresight's labels count record serials: the battles' point at them)
@@ -578,7 +585,7 @@ class CampaignLearner:
 			waiting = [game for game, _ in self.finished if self.version - getattr(game, "labels_version", self.version) >= MAX_LABEL_STALENESS]
 		for game in waiting:
 			game.labels_version = self.version
-			self.label_futures[id(game)] = self.labeler.submit(game, self.features_cpu)
+			self.label_futures[id(game)] = self.labeler.submit(label_source(game), self.features_cpu)
 
 	def _refresh_features(self):
 		"""The CPU features' weights as the model's are now (call with model_lock held)."""
@@ -808,6 +815,40 @@ def precomputed(future, game=None):
 	if pre is None or (game is not None and pre["n"] != len(game.decisions)):
 		return None
 	return pre
+
+
+def label_source(game):
+	"""What the labeler reads a game from: its spool file (the trainer keeps no inputs of a waiting game), else the game."""
+	return getattr(game, "spool_path", None) or game
+
+
+def strip_inputs(game):
+	"""A waiting game's inputs out of the trainer's memory, when its spool file has them (restore_inputs takes them back
+	when an update takes it): 9 waiting games held 1.16 GB of inputs (2026-11-01 17:20 CST, ~14 KB a decision), and the
+	trainer grew from ~2 GB after each start to ~12 GB as up to ~30 waited."""
+	if getattr(game, "spool_path", None):
+		for d in game.decisions:
+			d.inputs = None
+		game.inputs_stripped = True
+
+
+def restore_inputs(game):
+	"""The game's inputs back from its spool file (strip_inputs); False when it cannot be read (noted)."""
+	if not getattr(game, "inputs_stripped", False):
+		return True
+	try:
+		with open(game.spool_path, "rb") as f:
+			saved = pickle.load(f)[0]
+	except Exception as error:  # noqa: BLE001
+		print(f"campaign: FAILURE: a game's inputs not read back from {game.spool_path}: {str(error)[:200]}", flush=True)
+		return False
+	if len(saved.decisions) != len(game.decisions):
+		print(f"campaign: FAILURE: {game.spool_path} has {len(saved.decisions)} decisions, the game {len(game.decisions)}", flush=True)
+		return False
+	for d, s in zip(game.decisions, saved.decisions):
+		d.inputs = s.inputs
+	game.inputs_stripped = False
+	return True
 
 
 def unspool(games):

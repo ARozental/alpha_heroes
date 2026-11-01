@@ -37,9 +37,16 @@ def _features_module(state):
 
 
 def precompute(game, features_state, labels=LabelConfig(), empire=EmpireConfig(), foresight=True, share_target="share"):
-	"""The labels of game (records.Game, every decision as recorded), over its usable decisions, as learner.step takes
-	them; None when it has none or no ledger."""
+	"""The labels of game (records.Game, every decision as recorded; or the path of its file in the learner's spool,
+	read here: the trainer keeps no inputs of a waiting game), over its usable decisions, as learner.step takes them;
+	None when it has none or no ledger."""
 	from .foresight import labels_of
+
+	if isinstance(game, str):
+		import pickle
+
+		with open(game, "rb") as f:
+			game = pickle.load(f)[0]
 	from .train import usable
 
 	full = game.decisions
@@ -66,8 +73,8 @@ class Labeler:
 		self.pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=context)
 
 	def submit(self, game, features):
-		"""A Future of precompute(game) with the features module's weights as they are now (copied: the learner refreshes
-		them in place after each update)."""
+		"""A Future of precompute(game) (a records.Game, or its spool file's path) with the features module's weights as
+		they are now (copied: the learner refreshes them in place after each update)."""
 		state = {key: value.detach().clone() for key, value in features.state_dict().items()} if self.foresight else None
 		return self.pool.submit(precompute, game, state, self.labels, self.empire, self.foresight, self.share_target)
 

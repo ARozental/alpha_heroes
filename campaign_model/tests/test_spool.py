@@ -16,7 +16,7 @@ def learner(tmp_path):
 
 def test_finished_games_survive_a_stop_until_trained(tmp_path):
 	first = learner(tmp_path)
-	games = [SimpleNamespace(decisions=[1] * n) for n in (3, 5, 7)]
+	games = [SimpleNamespace(decisions=[SimpleNamespace(inputs=b"x") for _ in range(n)]) for n in (3, 5, 7)]
 	for game in games:
 		first._spool_game(game, {"key": len(game.decisions)})
 	unspool(games[:1])  # trained on (its update checkpointed)
@@ -45,3 +45,19 @@ def test_the_battle_buffer_survives_a_stop(tmp_path):
 	after.load_buffer(tmp_path / "battle-buffer.pt")
 	assert [b["decisions"] for b in after.buffer] == [2, 1]
 	assert not (tmp_path / "battle-buffer.pt").exists()
+
+
+def test_a_waiting_games_inputs_live_on_disk_only(tmp_path):
+	from campaign_model.learner import label_source, restore_inputs, strip_inputs
+
+	spooled = learner(tmp_path)
+	game = SimpleNamespace(decisions=[SimpleNamespace(inputs=bytes([i]) * 100) for i in range(4)])
+	spooled._spool_game(game, {"key": 1})
+	assert label_source(game) == game.spool_path  # the labeler reads it from the spool
+	strip_inputs(game)
+	assert all(d.inputs is None for d in game.decisions)
+	assert restore_inputs(game) and [d.inputs for d in game.decisions] == [bytes([i]) * 100 for i in range(4)]
+	assert restore_inputs(game)  # (nothing to do the second time)
+	unspooled = SimpleNamespace(decisions=[SimpleNamespace(inputs=b"x")])
+	strip_inputs(unspooled)  # no spool file: the inputs stay
+	assert unspooled.decisions[0].inputs == b"x" and label_source(unspooled) is unspooled
