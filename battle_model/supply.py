@@ -652,9 +652,13 @@ class Supply:
 			return
 		config = self.config.campaign
 		waiting = self.campaign.waiting_decisions()
+		games = self.campaign.waiting_games() if hasattr(self.campaign, "waiting_games") else 0
 		with self.shared.lock:
 			in_flight = max(0, self.shared.started.value - self.received)
 			want = (self.config.ahead * config.decisions_per_update - waiting) / max(self.game_decisions, 1.0) - in_flight
+			# And enough games for an update: with long games (joint7's ~7,000 decisions) a few were the decisions of
+			# `ahead` updates, the permits fell to 0, and the learner waited for its min_games_per_update forever
+			want = max(want, config.min_games_per_update - games - in_flight)
 			self.shared.permits.value = max(0, int(math.ceil(want)))
 
 	def status(self):

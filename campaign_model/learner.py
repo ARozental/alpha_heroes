@@ -327,6 +327,11 @@ class CampaignLearner:
 		with self.lock:
 			return sum(len(g.decisions) for g, _ in self.finished)
 
+	def waiting_games(self):
+		"""Finished games no update has taken (the supply's permits keep at least min_games_per_update coming)."""
+		with self.lock:
+			return len(self.finished)
+
 	def ready(self):
 		"""Whether an update's games are in (what _take would take)."""
 		config = self.config

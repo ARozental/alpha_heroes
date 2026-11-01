@@ -75,3 +75,19 @@ def test_an_old_checkpoints_optimizer_keeps_its_moments_for_the_parameters_it_ha
 	first = next(i for i, n in enumerate(names) if not n.endswith("value_gains"))
 	assert torch.equal(kept[first]["exp_avg"], old.state_dict()["state"][0]["exp_avg"])
 	assert value_gains(model) == {"value_gain_shot": 1.0, "value_gain_melee": 1.0, "value_gain_spell": 1.0, "value_gain_creature_spell": 1.0}
+
+
+def test_campaign_permits_cover_the_games_an_update_needs():
+	"""Long games (joint7's ~7,000 decisions): the decisions of `ahead` updates were in from a few games, the permits
+	fell to 0 and the learner waited for its min_games_per_update forever. The permits now cover those games too."""
+	import threading
+	from types import SimpleNamespace
+
+	from battle_model.supply import Supply
+
+	value = lambda v: SimpleNamespace(value=v)  # noqa: E731
+	shared = SimpleNamespace(lock=threading.Lock(), started=value(3), permits=value(0))
+	learner = SimpleNamespace(waiting_decisions=lambda: 100_000, waiting_games=lambda: 12)
+	supply = SimpleNamespace(campaign=learner, shared=shared, received=0, game_decisions=7000.0, config=SimpleNamespace(ahead=3.0, campaign=SimpleNamespace(decisions_per_update=32768, min_games_per_update=20)))
+	Supply.allow(supply)
+	assert shared.permits.value == 20 - 12 - 3  # (the decisions alone wanted none)
