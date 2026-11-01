@@ -5,7 +5,7 @@ games it never trained on, how often its most likely action is the teacher's, an
 	.venv/bin/python -m campaign_model.imitate --data runtime/teacher/t1 --out runtime/teacher/bc1 --minutes 60
 
 The loss is the teacher's choice's negative log-probability under the model (train.chosen_logp: the type's and its
-table entry's), Adam at --lr (never above 1e-4: the user's rule). One game in --holdout is never trained on (so a
+table entry's), Adam at --lr (at most 3e-5, 1e-5 recommended: the user's rule, 2026-10-31). One game in --holdout is never trained on (so a
 map's decisions are not on both sides). Each player's decisions are taken in their order, with the model's memory
 (model_v2.Memory) carried from one to the next: --lanes players at once, --steps decisions of each a chunk, the
 gradient through the chunk's memory (truncated backpropagation through time; each step's activations recomputed in
@@ -301,7 +301,7 @@ def main():
 	parser.add_argument("--share-target", default="change", help="what the share heads learn (config.share_target): change (the logit's change) or share")
 	parser.add_argument("--variants", default="64x2", help="the models trained side by side on the same batches, <dim>x<layers> each (a fresh model's); their checkpoints bc_latest_<variant>.pt when more than one")
 	parser.add_argument("--cell-dim", type=int, default=16)
-	parser.add_argument("--lr", type=float, default=1e-4)
+	parser.add_argument("--lr", type=float, default=1e-5)
 	parser.add_argument("--value-weight", type=float, default=config.value_weight, help="the value heads' loss weight (0: the policy only)")
 	parser.add_argument("--lanes", type=int, default=32, help="players taken at once (each decision of a step one of theirs)")
 	parser.add_argument("--steps", type=int, default=8, help="each player's decisions a chunk: the memory's gradient goes back this far")
@@ -317,7 +317,7 @@ def main():
 	parser.add_argument("--until-plateau", type=float, default=0.0, help="streaming: stop once the last --plateau-periods periods' loss is under the as many before by less than this fraction (0: never)")
 	parser.add_argument("--plateau-periods", type=int, default=5, help="the periods each side of the plateau's comparison (a period's loss varies from game to game)")
 	args = parser.parse_args()
-	assert args.lr <= 1e-4, "the user's rule: never above 1e-4"
+	assert args.lr <= 3e-5, "the user's rule (2026-10-31): at most 3e-5, 1e-5 recommended"
 	import signal
 
 	def stop(signum, _frame):  # (SIGTERM as SIGINT: the workers and their games end in the finally; a background job of

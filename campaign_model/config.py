@@ -36,7 +36,7 @@ class CampaignConfig:
 	decisions_per_update: int = 8192
 	min_games_per_update: int = 4  # one game's decisions are alike: an update takes several games
 	max_record_age: int = 4  # model versions: older decisions are dropped
-	learning_rate: float = 1e-4  # never above (the user's rule)
+	learning_rate: float = 1e-5  # at most 3e-5, 1e-5 recommended (the user's rule, 2026-10-31; was 1e-4)
 	target_kl: float = 0.015
 	lr_scale_max: float = 1.0
 	passes: int = 2

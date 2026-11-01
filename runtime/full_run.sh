@@ -7,9 +7,10 @@
 #      the noise floor of that rate), until the held-out loss
 #      (each decision's, before the model trained on it) stops
 #      improving or 8 hours pass; again from its checkpoint if this script starts again before the end
-#   2. joint6: self-play RL from that model (campaign_model/joint.py), the credit's share weight 10% + 2% a day,
-#      the teacher's KL (to that model) weighted by our score against Nullkiller2 (dominant while it is much better,
-#      5% once we are), the battle model from joint5's best (7295, +0.096); resumed if it has begun
+#   2. joint6: self-play RL from that model (campaign_model/joint.py), the credit's share weight 10% + 2% a day, no
+#      teacher (the user, 2026-10-31: not the imitation as a teacher; the real teacher is Nullkiller2's own labels, on
+#      branch nk2-advice), the battle model from joint5's best (7295, +0.096); resumed if it has begun
+# (2026-10-31 evening: imitation runs on with no end, at 1e-5: the backup run until Nullkiller2's labels work)
 # Start: systemd-run --user --unit=alpha-full -p KillSignal=SIGINT -p TimeoutStopSec=900 -p KillMode=mixed \
 #          -p LimitNOFILE=65536 ~/projects/alpha_heroes/runtime/full_run.sh
 # Stop:  systemctl --user stop alpha-full (the phase running stops as SIGINT stops it)
@@ -28,8 +29,8 @@ mkdir -p "$BC" runtime/train
 if [ ! -f "$BC/done" ]; then
 	init=""
 	[ -f "$BC/bc_latest.pt" ] && init="--init $BC/bc_latest.pt"
-	.venv/bin/python -m campaign_model.imitate --stream 10 --data none --out "$BC" $init --variants 128x2 --lanes 128 --steps 64 --lr 3e-5 \
-		--eval-every 25 --until-plateau 0.005 --plateau-periods 5 --minutes 480 --decode-threads 8 \
+	.venv/bin/python -m campaign_model.imitate --stream 10 --data none --out "$BC" $init --variants 128x2 --lanes 128 --steps 64 --lr 1e-5 \
+		--eval-every 25 --minutes 100000000 --decode-threads 8 \
 		--tb runtime/train/fullrun-imitation/tensorboard >> runtime/teacher/bc_final.log 2>&1 &
 	child=$!
 	wait "$child"
@@ -43,9 +44,8 @@ ls -d runtime/train/*-joint6 > /dev/null 2>&1 && resume="--resume"
 .venv/bin/python -m campaign_model.joint --run joint6 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
 	--battle-from runtime/saved/battle_joint5_07295.pt \
 	--set inference_device=cuda inference_processes=1 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
-		campaign.share_target=change campaign.init_from="$BC/bc_latest.pt" campaign.teacher_checkpoint="$BC/bc_latest.pt" \
-		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.02 \
-		campaign.teacher_kl=19 campaign.teacher_mix=score campaign.teacher_kl_target=0 campaign.entropy_floor_weight=0 \
+		campaign.share_target=change campaign.init_from="$BC/bc_latest.pt" \
+		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.02 campaign.entropy_floor_weight=0 \
 	>> runtime/train/joint6.log 2>&1 < /dev/null &
 child=$!
 wait "$child"
