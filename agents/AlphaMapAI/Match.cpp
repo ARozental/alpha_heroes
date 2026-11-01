@@ -42,7 +42,7 @@ int nearest(const std::unordered_map<int, Entry> & entries, Key key, Amount amou
 }
 }
 
-bool AlphaMapAI::matchRequest(const Decision & decision, const CPackForServer * pack, Choice & choice, bool & exact, std::string & unmatched) const
+bool AlphaMapAI::matchRequest(const Decision & decision, const CPackForServer * pack, Choice & choice, bool & exact, std::string & unmatched, int3 intended) const
 {
 	exact = true;
 	const auto & entries = [&decision](ActionType type) -> const std::unordered_map<int, Entry> & { return decision.entries[static_cast<int>(type)]; };
@@ -59,8 +59,11 @@ bool AlphaMapAI::matchRequest(const Decision & decision, const CPackForServer * 
 	else if(const auto * p = dynamic_cast<const MoveHero *>(pack))
 	{
 		const auto * h = cb->getHero(p->hid);
-		const int3 target = h && !p->path.empty() ? h->convertToVisitablePos(p->path.back()) : int3(-1, -1, -1);
-		if(!h || p->path.empty())
+		// Where it is going (intended: its plan's tile for this hero, the caller's), else where this request goes: its
+		// moves go a tile a request (AIGateway::moveHeroToTile), so the request's own tile is the path's first step
+		const bool planned = h && intended.isValid() && intended != h->visitablePos();
+		const int3 target = planned ? intended : h && !p->path.empty() ? h->convertToVisitablePos(p->path.back()) : int3(-1, -1, -1);
+		if(!h || (p->path.empty() && !planned))
 			unmatched = "MoveHero (no hero or path)";
 		else if(target == h->visitablePos())
 			unmatched = "MoveHero (into a teleport)"; // (our moves go through teleports as part of a path)

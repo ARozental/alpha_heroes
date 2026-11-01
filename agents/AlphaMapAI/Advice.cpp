@@ -118,7 +118,15 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision)
 		Choice choice;
 		bool exact = true;
 		unmatched.clear();
-		if(matchRequest(decision, &pack, choice, exact, unmatched))
+		// A move's label is where it is going: its moves go a tile a request (AIGateway::moveHeroToTile), and the first
+		// tile, matched as a move there, taught our model to walk a tile a decision (2026-11-01: our move its tile in 5%
+		// of its moves, ~60 decisions a player and day). Its plan sets the hero and the tile before moving
+		// (Nullkiller::setActive in ExecuteHeroChain: the chain node's tile, possibly days away: a travel then)
+		int3 intended(-1, -1, -1);
+		if(const auto * move = dynamic_cast<const MoveHero *>(&pack))
+			if(const auto * hero = cb->getHero(move->hid); hero && advisor->nk2->nullkiller->isActive(hero))
+				intended = advisor->nk2->nullkiller->getTargetTile();
+		if(matchRequest(decision, &pack, choice, exact, unmatched, intended))
 			advice = choice;
 	};
 	try

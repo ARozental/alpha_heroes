@@ -177,8 +177,9 @@ class AlphaMapAI : public CAdventureAI
 	std::optional<Choice> advise(const Decision & decision);
 	std::optional<Choice> adviseExchange(const Decision & decision, ObjectInstanceID first, ObjectInstanceID second);
 	std::string adviceJson() const;
-	// A request of Nullkiller2's as our turn decision's legal entry doing the same; false (unmatched: why) when none
-	bool matchRequest(const Decision & decision, const CPackForServer * pack, Choice & choice, bool & exact, std::string & unmatched) const;
+	// A request of Nullkiller2's as our turn decision's legal entry doing the same; false (unmatched: why) when none.
+	// intended: a move's destination when the caller knows it (its plan's tile), else the request's own tile is taken
+	bool matchRequest(const Decision & decision, const CPackForServer * pack, Choice & choice, bool & exact, std::string & unmatched, int3 intended = int3(-1, -1, -1)) const;
 	std::string teacherJson() const;
 
 public:
