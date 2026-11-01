@@ -63,7 +63,7 @@ ahead = 3.0
 # floor with 10 battle actors and 8-process evals (2026-10-31 00:29); with 8 actors and 4-process evals 20 left 8 GB free
 # 22 since 2026-10-31: the larger evals run in the trainer's process (~3-4 GB more during one), and at 24 games the
 # memory floor held new games back through each eval
-games = 22
+games = 16  # (22 with the Mac serving the campaign's inference; on the PC alone its CUDA server and the 128-wide model take the RAM 6 games did: joint5 used ~23 of 27 GB, 2026-10-31)
 learner = "turns"
 inference_device = "cuda"
 inference_processes = 1
