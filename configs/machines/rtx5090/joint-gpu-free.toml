@@ -77,8 +77,12 @@ inference_processes = 1
 # and 128 steps on the same ~20-28 games fit their luck (the user, 2026-10-31: the campaign's examples are noisier and
 # more dependent than the battles'); aims: a signal ratio of 0.25+, an update KL of ~0.002-0.005
 batch_size = 8192  # (the user, 2026-10-31: the GPU had memory to spare)
-micro_batches = 64  # (128 decisions each, as before: at 256 the step graph's recording ran out of GPU memory, next to the CUDA inference server, and the steps went eager)
-prepass_batch = 256
+# 64 decisions a micro-batch (128 micro-batches), and the first pass at 128 (2026-11-01): under the 27 GB cap
+# (cuda_memory_fraction) joint7's first update failed out of memory at 128 and 256: 25.1 GB held, 16.7 GB of it the
+# graphs' pools (the recorded step's ~9-10 GB, the first pass's), when the recorded step's first replay ran its eager
+# check beside them (~9 GB more). Without the cap that had spilled into the PC's RAM: updates ran at the spill's pace
+micro_batches = 128
+prepass_batch = 128
 # The campaign training graphs (graphs.py): the real update was launch-bound in eager mode (the trainer's thread on the
 # CPU 64% of the update, the GPU done before the next kernel came; the 146 ms benchmark used sparse synthetic states).
 # Validated 2026-10-30 (runtime/check_graphs.py, allow_unused_input): gradients match eager to 5e-4, a whole update 3.5x
