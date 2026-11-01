@@ -251,6 +251,8 @@ class Games(IterableDataset):
 	def place(self):
 		"""("here", None), ("remote", connection) or None (nothing free now): local first, then a remote slot."""
 		shared, kind = self.shared, self.kind
+		if (self.run_dir / "drain").exists():  # (runtime/drain_restart.sh: the games playing finish, no new one starts)
+			return None
 		with shared.lock:
 			if shared.local[kind].value < shared.ceilings[kind] and memory_allows(shared, shared.local[kind].value + shared.remote[kind].value):
 				shared.local[kind].value += 1

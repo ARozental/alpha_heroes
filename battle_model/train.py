@@ -1223,6 +1223,8 @@ def train(config, resume=False):
 			)
 		pool = ActorPool(config, out, generated_games, architecture, trained_epochs=first_epoch - 1, server=stores.get("battle") or (server.view("battle") if server else None))
 		pool.publish(model)
+		if resume:
+			pool.load_buffer(out / "battle-buffer.pt")
 	if config.campaign.games:  # the campaign model, trained alongside: its games' battles are our real battles
 		if not pool or not pool.server:
 			raise ValueError("campaign training needs actors=true and inference=server")
@@ -1558,6 +1560,10 @@ def train(config, resume=False):
 		if campaign:
 			campaign.close()
 		if pool:
+			try:
+				pool.save_buffer(out / "battle-buffer.pt")  # (the workers are gone: nothing more comes in)
+			except Exception as error:
+				print(f"actors: FAILURE: the buffer not saved: {str(error)[:200]}", flush=True)
 			pool.close()
 		if config.actors and pool and pool.server is not None and hasattr(pool.server, "server"):
 			pool.server.server.close()  # (the shared server)

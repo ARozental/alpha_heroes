@@ -27,6 +27,7 @@ cd "$HOME/projects/alpha_heroes"
 export MALLOC_ARENA_MAX=2
 # (no expandable CUDA segments here: the learner's step graph failed to record with them, "device not ready"; the
 # joint run's shapes are padded, fixed, so it does not fragment as imitation did)
+rm -f runtime/train/*-joint7/drain  # (runtime/drain_restart.sh's: a start always plays)
 runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"

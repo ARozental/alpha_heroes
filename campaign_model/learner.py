@@ -27,6 +27,7 @@ import json
 import math
 import multiprocessing
 import os
+import pickle
 import shutil
 import threading
 import time
@@ -226,8 +227,51 @@ class CampaignLearner:
 
 			upgrade_csv(evals, evaluate.COLUMNS)
 		self.last_eval = time.monotonic() - (time.time() - evals.stat().st_mtime) if resume and evals.exists() else None
+		# Each finished game is on disk from its arrival until the checkpoint of the update that trained on it is saved,
+		# and a resumed run takes them back: a stop (a crash, the memory guard, a restart) loses no finished game (until
+		# 2026-11-01 each restart lost the ~20-40 finished games waiting for their update)
+		self.spool = self.out / "finished"
+		self.spool.mkdir(exist_ok=True)
+		if resume:
+			self._reload_spool()
+		else:
+			for path in self.spool.glob("*.pkl"):
+				path.unlink()
 
 	# ---- games ----
+
+	def _spool_game(self, game, info):
+		"""Writes the game to the spool (whole, or not at all: a stop while it is written leaves only its .tmp)."""
+		path = self.spool / f"{time.time_ns()}-{id(game)}.pkl"
+		tmp = path.with_suffix(".tmp")
+		try:
+			with tmp.open("wb") as f:
+				pickle.dump((game, info), f, protocol=pickle.HIGHEST_PROTOCOL)
+			tmp.rename(path)
+			game.spool_path = str(path)
+		except OSError as error:
+			print(f"campaign: FAILURE: a finished game not written to {self.spool}: {error}", flush=True)
+
+	def _reload_spool(self):
+		"""The finished games a stopped run had not trained on, back in the queue (oldest first), labeled again."""
+		for tmp in self.spool.glob("*.tmp"):  # (cut off as it was written: the game's in-memory copy was its only one)
+			tmp.unlink()
+		paths = sorted(self.spool.glob("*.pkl"))
+		for path in paths:
+			try:
+				with path.open("rb") as f:
+					game, info = pickle.load(f)
+			except Exception as error:
+				print(f"campaign: FAILURE: {path.name} unreadable, left out: {str(error)[:200]}", flush=True)
+				path.unlink()
+				continue
+			game.spool_path = str(path)
+			if getattr(self, "labeler", None):
+				game.labels_version = self.version
+				self.label_futures[id(game)] = self.labeler.submit(game, self.features_cpu)
+			self.finished.append((game, info))
+		if paths:
+			print(f"campaign: {len(self.finished)} finished games from before the stop back in the queue ({sum(len(g.decisions) for g, _ in self.finished)} decisions)", flush=True)
 
 	def start(self):
 		"""The games are the supply's (battle_model/supply.py); here only the learner thread, in its modes."""
@@ -289,6 +333,7 @@ class CampaignLearner:
 			if left == 1 or left % 100 == 0:
 				print(f"campaign: FAILURE: game {key} left out ({problem}); {left} games left out so far", flush=True)
 			return
+		self._spool_game(game, info)
 		if getattr(self, "labeler", None):
 			game.labels_version = self.version
 			self.label_futures[id(game)] = self.labeler.submit(game, self.features_cpu)  # (not on the game: it is pickled to the labeler after this returns)
@@ -352,6 +397,7 @@ class CampaignLearner:
 				self.stats["dropped_games"] += 1
 				dropped, _ = self.finished.pop(0)
 				getattr(self, "label_futures", {}).pop(id(dropped), None)
+				unspool([dropped])
 			taken, decisions = [], 0
 			for game, info in self.finished:
 				if len(taken) >= config.min_games_per_update and decisions >= config.decisions_per_update:
@@ -376,6 +422,7 @@ class CampaignLearner:
 			if game.decisions and game.ledgers:
 				played.append(game)
 		if not played:
+			unspool(game for game, _ in games)
 			return False
 		starts, trust, (weight, outcome) = day_starts(self.model, played, self.model_lock), self.grade_trust(), self.end_credit()
 		memory.append(("starts", rss_gb()))
@@ -481,6 +528,7 @@ class CampaignLearner:
 				# steps it took, served with the next update
 				torch.cuda.empty_cache()
 				print(f"campaign update {self.version + 1}: out of GPU memory, its {len(games)} games dropped: {out_of_memory}", flush=True)
+				unspool(game for game, _ in games)
 				return False
 			with self.model_lock:
 				if self.device.type == "mps":
@@ -492,6 +540,7 @@ class CampaignLearner:
 				self._note_value_ev(metrics)
 				self.teacher_weight = adapted_teacher_weight(self.teacher_weight, metrics.get("teacher_kl"), self.config.teacher_kl_target)
 				self._save(self.out / "checkpoint_latest.pt")
+		unspool(game for game, _ in games)  # (in the checkpoint now: this process's, or the update process's)
 		if self.worker:  # (the process saved its checkpoint with the trust before this update: one update behind)
 			self._note_value_ev(metrics)
 		end_errors = metrics.pop("end_step_error", None)
@@ -749,6 +798,14 @@ def precomputed(future, game=None):
 	if pre is None or (game is not None and pre["n"] != len(game.decisions)):
 		return None
 	return pre
+
+
+def unspool(games):
+	"""Removes the games' files from the learner's spool: trained on (in a saved checkpoint), or dropped on purpose."""
+	for game in games:
+		path = getattr(game, "spool_path", None)
+		if path:
+			Path(path).unlink(missing_ok=True)
 
 
 def rss_gb():

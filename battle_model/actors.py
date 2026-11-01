@@ -110,6 +110,32 @@ class ActorPool:
 
 	# ---- the buffer ----
 
+	def save_buffer(self, path):
+		"""The battles not trained on yet, to path (at the run's stop: load_buffer takes them back at its resume)."""
+		import torch
+
+		with self.lock:
+			buffer = list(self.buffer)
+		if buffer:
+			torch.save(buffer, str(path) + ".tmp")
+			os.replace(str(path) + ".tmp", path)
+			print(f"actors: {len(buffer)} battles not trained on yet saved ({sum(b['decisions'] for b in buffer)} decisions)", flush=True)
+
+	def load_buffer(self, path):
+		import torch
+
+		if not Path(path).exists():
+			return
+		try:
+			buffer = torch.load(path, map_location="cpu", weights_only=False)
+		except Exception as error:
+			print(f"actors: FAILURE: {path} unreadable: {str(error)[:200]}", flush=True)
+			buffer = []
+		with self.lock:
+			self.buffer = buffer + self.buffer
+		Path(path).unlink()
+		print(f"actors: {len(buffer)} battles from before the stop back in the buffer", flush=True)
+
 	def add_item(self, item):
 		"""A battle from the supply (supply.prepare's item), into the buffer. The campaign games' battles come whatever
 		the learner takes (a game cannot wait mid-way), so beyond buffer_decisions of them the oldest go at once, as
