@@ -73,7 +73,7 @@ inference_processes = 1
 # update of ~33k over 2 passes; was 512 (128 steps): the steps' signal ratio was ~0.11, as the battle model's noisy one,
 # and 128 steps on the same ~20-28 games fit their luck (the user, 2026-10-31: the campaign's examples are noisier and
 # more dependent than the battles'); aims: a signal ratio of 0.25+, an update KL of ~0.002-0.005
-batch_size = 4096
+batch_size = 8192  # (the user, 2026-10-31: the GPU had memory to spare, 14 of 32 GB; 256 decisions a micro-batch)
 micro_batches = 32
 prepass_batch = 256
 # The campaign training graphs (graphs.py): the real update was launch-bound in eager mode (the trainer's thread on the

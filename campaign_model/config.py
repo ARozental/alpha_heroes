@@ -155,6 +155,9 @@ class CampaignConfig:
 	decision_price: float = 1e-4  # share points per turn decision
 	# Evaluation against Nullkiller2 (evaluate.py): our models in one seat, Nullkiller2 in the others
 	eval_minutes: float = 60.0  # 0: none
+	# The evaluation's games at a lower priority than the training's (niceness 10): they take the CPU the training leaves
+	# (the user, 2026-10-31: no slowdown from evaluations; at 0 they took it first, ~50 minutes an evaluation)
+	eval_niceness: int = 15
 	# 2, 3 and 4 players in turn (the setups of before, so paired comparisons go on).
 	# 24, not 48: since the games have taverns and dwellings (vcmi 47c9d57eb) and hires pay, a game has ~4.5x the
 	# decisions (2-4 minutes, 24 at once), and 48 of them held the machine for most of 20 minutes an hour

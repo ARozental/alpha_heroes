@@ -126,6 +126,7 @@ def evaluate(config, server, battle, version, epoch, stop=None, model="current")
 				game, info = play(
 					server.socket_for(i), name, config.eval_days, seed, max_seconds=config.eval_seconds, battle_ai="BattleAI", game_key=f"e{i}",
 					settings=battle.eval_settings(i) + (("ALPHA_MAP_MODEL", model),), temperature=config.eval_temperature, ours=(color,), stop=stop,
+					niceness=config.eval_niceness,
 				)
 				if not info.status.startswith(STALLED):
 					break

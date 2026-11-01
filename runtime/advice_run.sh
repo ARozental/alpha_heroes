@@ -8,7 +8,8 @@
 #          -p LimitNOFILE=65536 ~/projects/alpha_heroes/runtime/advice_run.sh
 cd "$HOME/projects/alpha_heroes"
 export MALLOC_ARENA_MAX=2
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# (no expandable CUDA segments here: the learner's step graph failed to record with them, "device not ready"; the
+# joint run's shapes are padded, fixed, so it does not fragment as imitation did)
 runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
