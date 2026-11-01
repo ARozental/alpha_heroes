@@ -2,11 +2,15 @@
 # joint7 (2026-10-31 night): the campaign model from its imitation of Nullkiller2 (runtime/saved/campaign_imitation.pt),
 # self-play RL with Nullkiller2's own advice as the teacher (50% of turn and exchange decisions: Advice.cpp; its cross-entropy weighted
 # by our score against it, teacher_mix "score": dominant while it is much better), the credit's share weight 10% + 2% a
-# day, the battle model from joint5's best (7295, trained on); 16 games on the PC, their campaign decisions served by the
-# Mac's 11 servers (runtime/mac_slots.sh: on the PC's GPU the inference server, time-sliced against the learner, made
-# games hit their 20-minute limit), the battle model's on the PC's CPU; no time limit, the memory guard on.
+# day, the battle model from joint5's best (7295, trained on); no time limit, the memory guard on. (Until 2026-11-01 09:30
+# the campaign's decisions were served by the Mac's 11 servers: on the PC's GPU, time-sliced against the learner, games of
+# ~16,000 decisions hit their 20-minute limit; games are ~4,000 decisions since the move labels' fix.)
 # Advice on 50% of turn and exchange decisions, not 20% (2026-11-01 01:30 CST, after v6): the teacher's labels are 95% of
 # the loss and games the bottleneck; at 20% the advice took ~3% of a game's CPU
+# The PC alone (the user, 2026-11-01 09:30 CST: "the assumption is that for a lot of time only the PC is available and it
+# still needs to work"): every model's inference here (the campaign's on the GPU, the battles' on the CPU); a Mac adds
+# game slots when it is up (remote_slots=4: runtime/mac_slots.sh with SLOTS=4, its own servers mirroring these models),
+# never anything the run waits on. 10 games here: the campaign's server here and the 4 slots' idle workers take ~2.5 GB
 # 11 games since 2026-11-01 05:50 CST: the permits keep games playing through an update now (supply.allow), and an update
 # takes ~6 GB more (3.7 GB was left with no game playing): 2 fewer games for the memory guard's margin
 # 13 games, not the machine's 16 (2026-11-01 01:47): the memory guard stopped the run at 1.4 GB available as the 20
@@ -26,6 +30,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 	--set remote_port=7700 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.02 campaign.entropy_floor_weight=0 \
-		campaign.nk2_advice=0.5 campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=11 \
-		'inference_endpoints=campaign=tcp:192.168.1.131:7951,tcp:192.168.1.131:7952,tcp:192.168.1.131:7953,tcp:192.168.1.131:7954,tcp:192.168.1.131:7955,tcp:192.168.1.131:7956,tcp:192.168.1.131:7957,tcp:192.168.1.131:7958,tcp:192.168.1.131:7959,tcp:192.168.1.131:7960,tcp:192.168.1.131:7961' \
+		campaign.nk2_advice=0.5 campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=10 remote_slots=4 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
