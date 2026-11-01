@@ -603,6 +603,12 @@ class Supply:
 		threading.Thread(target=self._watch_trainer, daemon=True).start()
 		self.stats = Counter()
 		self.game_decisions = 1500.0  # a campaign game's decisions, a running mean (the permits' estimate)
+		# From the finished games a resumed run took back (learner.py's spool), when there are: at 1,500 against 14 of
+		# ~7,900 decisions the waiting looked like 3 updates' worth, the permits stayed 0 and no game played until those
+		# were trained (2026-11-01 15:46-16:00 CST)
+		waiting = [len(game.decisions) for game, _ in getattr(campaign, "finished", ())]
+		if waiting:
+			self.game_decisions = float(np.mean(waiting))
 		self.received = 0  # campaign games got (in flight: started - this)
 
 	def _watch_trainer(self):
