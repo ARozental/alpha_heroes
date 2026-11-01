@@ -36,7 +36,7 @@ import sys
 import threading
 import time
 import traceback
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import replace
 from pathlib import Path
 
@@ -99,30 +99,26 @@ def process_gb(pid, field):
 
 
 SHARED = None  # the trainer's Shared (Supply sets it): memory_allows() in the trainer's process (the campaign eval)
+PEAK_WINDOW = 20 * 60  # s: the trainer's recent peak, over 2-3 campaign updates (each ~5-9 minutes apart)
+PEAK_EVERY = 5  # s between its samples (an update's peak lasts minutes)
 
 
 def memory_allows(shared=None):
-	"""Whether a game may start here: the memory available, less the trainer's way back to its peak, over the floor.
-	The trainer's memory swings ~5 GB each campaign update (it frees the update's buffers after it, takes them back in
-	the next); games let in at its low point took what the next update needed, and the guard stopped joint7 at 1.06 GB
-	(2026-11-01 12:21 CST: the trainer 9.6 -> 13.2 GB in update 49, the unit 18.9 -> 25.1 GB in 4.5 minutes). Its
-	peak: its own (VmHWM), or the one recorded in the run's directory by an earlier process of the run, the higher."""
+	"""Whether a game may start here: the memory available, less the trainer's way back to its recent peak, over the
+	floor. The trainer's memory swings ~5 GB each campaign update (it frees the update's buffers after it, takes them
+	back in the next); games let in at its low point took what the next update needed, and the guard stopped joint7 at
+	1.06 GB (2026-11-01 12:21 CST: the trainer 9.6 -> 13.2 GB in update 49, the unit 18.9 -> 25.1 GB in 4.5 minutes).
+	Its recent peak (Supply._watch_trainer: the highest of the last PEAK_WINDOW), not its highest ever: much of that is
+	the finished games it holds, which only games played bring back; kept free after a restart (14.3 GB, the trainer
+	at 3.9), it let 1 game of 14 play (13:38-13:55 CST)."""
 	free = available_gb()
 	if free is None:
 		return True
 	shared = shared or SHARED
-	if shared is None:
+	rss = process_gb(shared.trainer, "VmRSS") if shared is not None else None
+	if rss is None:
 		return free >= MEMORY_FLOOR_GB
-	rss, peak = process_gb(shared.trainer, "VmRSS"), process_gb(shared.trainer, "VmHWM")
-	if rss is None or peak is None:
-		return free >= MEMORY_FLOOR_GB
-	if peak > shared.peak.value + 0.1:  # a new peak, for the run's next process
-		shared.peak.value = peak
-		try:
-			Path(shared.peak_file).write_text(f"{peak:.2f}\n")
-		except OSError:
-			pass
-	return free - max(0.0, max(peak, shared.peak.value) - rss) >= MEMORY_FLOOR_GB
+	return free - max(0.0, shared.peak.value - rss) >= MEMORY_FLOOR_GB
 
 
 def peer_closed(conn):
@@ -220,15 +216,10 @@ def assemble(items, advantage_config):
 class Shared:
 	"""Counters the workers and the trainer share (the loader's context: inherited by the workers)."""
 
-	def __init__(self, ctx, ceilings, peak_file):
+	def __init__(self, ctx, ceilings):
 		self.lock = ctx.Lock()
-		self.trainer = os.getpid()  # (memory_allows: its peak is kept free)
-		self.peak_file = str(peak_file)
-		try:
-			peak = float(Path(peak_file).read_text())
-		except (OSError, ValueError):
-			peak = 0.0
-		self.peak = ctx.Value("d", peak, lock=False)  # the trainer's highest memory in this run (GB), any of its processes
+		self.trainer = os.getpid()  # (memory_allows: its recent peak is kept free)
+		self.peak = ctx.Value("d", 0.0, lock=False)  # the trainer's highest memory in the last PEAK_WINDOW (GB)
 		self.ceilings = dict(ceilings)  # kind -> games of it at once on this machine
 		self.local = {kind: ctx.Value("i", 0, lock=False) for kind in ceilings}  # playing here now
 		self.remote = {kind: ctx.Value("i", 0, lock=False) for kind in ceilings}  # playing on remote slots now
@@ -592,7 +583,7 @@ class Supply:
 		if hasattr(self.ctx, "set_forkserver_preload"):
 			self.ctx.set_forkserver_preload(["battle_model.supply"])  # (torch and the models' code imported once, inherited)
 		ceilings = {"battle": config.generated_actors, **({"campaign": config.campaign.games} if campaign else {})}
-		self.shared = Shared(self.ctx, ceilings, self.out / "memory-peak-gb")
+		self.shared = Shared(self.ctx, ceilings)
 		self.shared.version.value = pool.version
 		global SHARED
 		SHARED = self.shared
@@ -603,9 +594,24 @@ class Supply:
 		self.datasets = {kind: Games(kind, config, out, battle_sockets, campaign_sockets, self.shared, self.token, self.listener) for kind in ceilings}
 		self.loaders, self.threads = {}, []
 		self.stop = threading.Event()
+		threading.Thread(target=self._watch_trainer, daemon=True).start()
 		self.stats = Counter()
 		self.game_decisions = 1500.0  # a campaign game's decisions, a running mean (the permits' estimate)
 		self.received = 0  # campaign games got (in flight: started - this)
+
+	def _watch_trainer(self):
+		"""shared.peak: this process's (the trainer's) highest resident memory over the last PEAK_WINDOW, sampled every
+		PEAK_EVERY (memory_allows keeps the way back to it free)."""
+		samples = deque()
+		while not self.stop.is_set():
+			rss = process_gb(os.getpid(), "VmRSS")
+			if rss is not None:
+				now = time.time()
+				samples.append((now, rss))
+				while samples[0][0] < now - PEAK_WINDOW:
+					samples.popleft()
+				self.shared.peak.value = max(value for _, value in samples)
+			self.stop.wait(PEAK_EVERY)
 
 	def workers(self, kind):
 		"""The loader's workers for a kind: this machine's ceiling, plus workers for the remote slots (the campaign's
