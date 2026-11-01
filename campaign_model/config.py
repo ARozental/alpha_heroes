@@ -22,7 +22,7 @@ class CampaignConfig:
 	game_map_share: float = 1 / 3  # games on one of the game's own maps (maps.GAME_MAPS), the rest on generated ones
 	levels: int = 2  # with the underground (the user: water and underground stay on)
 	water: str = "random"
-	game_seconds: int = 1200  # headless.sh's limit for one game (what it recorded until then is used); since the games have taverns and dwellings (2026-10-29) a 56-day game takes ~200 s (~2,200 decisions) and a 113-day one ~560 s
+	game_seconds: int = 2400  # headless.sh's limit for one game; 2400, not 1200, since 2026-11-01: joint7's games of long day caps reached days 64-105 of ~112 by 1200 s and were killed, 74 of ~1,170 (their records not trained on). Since the games have taverns and dwellings (2026-10-29) a 56-day game takes ~200 s (~2,200 decisions) and a 113-day one ~560 s
 	niceness: int = 10  # as the generated battles'
 	temperature: float = 1.0
 	# The campaign family's inference server

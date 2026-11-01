@@ -40,3 +40,16 @@ def test_one_game_of_a_kind_always_plays_over_the_last_game_level(monkeypatch):
 	assert not supply.memory_allows(shared, playing=1)
 	assert supply.memory_allows(shared, playing=0)
 	assert not supply.memory_allows(shared_at(monkeypatch, available=3.0, rss=13.0, peak=13.5), playing=0)
+
+
+def test_an_eval_waiting_for_memory_holds_training_games_back_but_never_the_last(tmp_path, monkeypatch):
+	shared = shared_at(monkeypatch, available=12.0, rss=9.0, peak=9.0)
+	games = supply.Games("campaign", None, tmp_path, [], [], shared, token=None)
+	assert games.place() == ("here", None)  # nothing waits: it starts
+	shared.eval_waiting.value = 1
+	assert games.place() is None  # an eval game waits: the freed memory is its first
+	shared.local["campaign"].value = 0
+	assert games.place() == ("here", None)  # but a kind's last game always plays (the trainer waits for games)
+	(tmp_path / "drain").touch()
+	shared.local["campaign"].value, shared.eval_waiting.value = 0, 0
+	assert games.place() is None  # draining: nothing starts

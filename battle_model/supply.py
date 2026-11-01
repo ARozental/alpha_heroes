@@ -224,6 +224,9 @@ class Shared:
 		self.lock = ctx.Lock()
 		self.trainer = os.getpid()  # (memory_allows: its recent peak is kept free)
 		self.peak = ctx.Value("d", 0.0, lock=False)  # the trainer's highest memory in the last PEAK_WINDOW (GB)
+		# Eval games waiting for memory (evaluate.py): no training game starts here meanwhile, or the training's took each
+		# freed GB first and eval 53's 48 games waited 17 minutes without one starting (2026-11-01 15:20-15:37 CST)
+		self.eval_waiting = ctx.Value("i", 0, lock=False)
 		self.ceilings = dict(ceilings)  # kind -> games of it at once on this machine
 		self.local = {kind: ctx.Value("i", 0, lock=False) for kind in ceilings}  # playing here now
 		self.remote = {kind: ctx.Value("i", 0, lock=False) for kind in ceilings}  # playing on remote slots now
@@ -254,7 +257,10 @@ class Games(IterableDataset):
 		if (self.run_dir / "drain").exists():  # (runtime/drain_restart.sh: the games playing finish, no new one starts)
 			return None
 		with shared.lock:
-			if shared.local[kind].value < shared.ceilings[kind] and memory_allows(shared, shared.local[kind].value + shared.remote[kind].value):
+			# (while an eval game waits for memory only a kind's last game starts: memory_allows' LAST_GAME_GB, so the
+			# trainer, waiting for games, never waits on the eval)
+			playing = shared.local[kind].value + shared.remote[kind].value
+			if shared.local[kind].value < shared.ceilings[kind] and (shared.eval_waiting.value == 0 or playing == 0) and memory_allows(shared, playing):
 				shared.local[kind].value += 1
 				return "here", None
 		# A remote slot's game takes memory here too (its worker holds what it played), so it waits for the floor as well

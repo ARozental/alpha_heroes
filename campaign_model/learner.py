@@ -520,7 +520,7 @@ class CampaignLearner:
 			out_of_memory = None
 			with self.model_lock:
 				try:
-					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.teacher_weight, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
+					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.teacher_weight, share_trust=self.trust(), measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
 				except torch.OutOfMemoryError as error:  # (handled below, once the error's frames, and their tensors, are gone)
 					out_of_memory = str(error)[:200]
 			if out_of_memory is not None:
@@ -768,6 +768,8 @@ class CampaignLearner:
 			row = evaluate.evaluate(self.config, self.server, self.battle, version=version, epoch=epoch, stop=self.stop, model="eval")
 		finally:
 			self.last_eval = time.monotonic()
+		if row is None:  # (stopped with the run)
+			return None
 		evaluate.log(row, self.out / "eval.csv", self.writer)
 		if self.config.teacher_mix == "score" and (self.teacher is not None or self.config.nk2_advice > 0) and np.isfinite(row.get("score", np.nan)):
 			self.teacher_weight = teacher_weight_for(row["score"])  # (config.teacher_mix: the teacher's share by our strength)

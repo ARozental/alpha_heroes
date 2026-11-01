@@ -26,6 +26,7 @@ import time
 import numpy as np
 
 from battle_model import play as battle_play
+from battle_model import supply
 from battle_model.supply import memory_allows
 
 from .empire import EMPIRE_VERSION, STATUS_INGAME, STATUS_LOST, EmpireConfig, empire_value
@@ -103,6 +104,13 @@ def score(game, color, players, days, empire=EmpireConfig()):
 	}
 
 
+def count_waiting(shared, change):
+	"""The eval games waiting for memory, in the trainer's supply.Shared (none: no supply, nothing to hold back)."""
+	if shared is not None:
+		with shared.lock:
+			shared.eval_waiting.value += change
+
+
 def evaluate(config, server, battle, version, epoch, stop=None, model="current"):
 	"""Play the evaluation games at once; returns the eval row. server: the campaign model's inference server, model:
 	the name it serves the evaluated weights under; battle: the battle learner's actors (actors.ActorPool.eval_settings:
@@ -111,14 +119,30 @@ def evaluate(config, server, battle, version, epoch, stop=None, model="current")
 	games = setups(config.eval_games)
 	results = [None] * len(games)
 	slots = threading.Semaphore(max(1, config.eval_parallel))
+	lock, playing = threading.Lock(), [0]  # (eval games playing now)
 
 	def work(i):
 		seed, players, color = games[i]
 		with slots:
-			# Under the memory floor as the training's games are (supply.memory_allows: the trainer's peak kept free)
-			while not memory_allows() and not (stop is not None and stop.is_set()):
-				time.sleep(5)
-			play_one(i, seed, players, color)
+			# Under the memory floor as the training's games are (supply.memory_allows: the trainer's peak kept free), and
+			# first to the memory freed meanwhile (supply.Shared.eval_waiting: no training game starts while one waits)
+			# (one eval game always plays while supply.LAST_GAME_GB is available: the memory may be the trainer's, which only
+			# games bring back)
+			shared = supply.SHARED
+			if not memory_allows(playing=playing[0]):
+				count_waiting(shared, +1)
+				try:
+					while not memory_allows(playing=playing[0]) and not (stop is not None and stop.is_set()):
+						time.sleep(5)
+				finally:
+					count_waiting(shared, -1)
+			with lock:
+				playing[0] += 1
+			try:
+				play_one(i, seed, players, color)
+			finally:
+				with lock:
+					playing[0] -= 1
 
 	def play_one(i, seed, players, color):
 		try:
@@ -148,6 +172,11 @@ def evaluate(config, server, battle, version, epoch, stop=None, model="current")
 		thread.start()
 	for thread in threads:
 		thread.join()
+	if stop is not None and stop.is_set():
+		# Cut by the run's stop: no row (as the battle evals). Eval 53 of joint7 (2026-11-01 15:37 CST, a restart) scored
+		# its 48 games "stopped: training is over" as eliminated: 0.000, and the teacher's weight went 16.4 -> 19 by it
+		print(f"campaign eval: stopped with the run after {time.time() - started:.0f}s: no row", flush=True)
+		return None
 	played = [r for r in results if r is not None]
 	mean = lambda values: float(np.mean(values)) if len(values) else float("nan")  # noqa: E731
 	scores = [r["score"] for r in played]
