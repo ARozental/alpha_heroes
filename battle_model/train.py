@@ -1201,17 +1201,6 @@ def train(config, resume=False):
 				stores["battle"] = ModelStore("battle", endpoints["battle"], architecture)
 			if config.campaign.games and "campaign" in endpoints:
 				stores["campaign"] = ModelStore("campaign", endpoints["campaign"], campaign_model_kwargs(config.campaign, out, resume))
-				if config.campaign.fallback_device:  # (a server here too, for when those machines are down)
-					from . import play as battle_play
-					from .inference import FallbackStore
-
-					battle_play.SOCKET_DIR.mkdir(parents=True, exist_ok=True)
-					local = InferenceServer(
-						battle_play.SOCKET_DIR / f"campaign-fallback-{os.getpid()}.sock", device=inference_device(config.campaign.fallback_device), family="campaign",
-						model_kwargs=stores["campaign"].model_kwargs, threads=config.campaign.inference_threads, processes=1,
-					)
-					stores["campaign"] = FallbackStore(stores["campaign"], local.view("campaign"), local)
-					print(f"inference: the campaign's fallback served here on {inference_device(config.campaign.fallback_device)} ({local.socket_path})", flush=True)
 			# (a family without endpoints gets a server here, on inference_device: e.g. the battle model's on the CPU, the
 			# campaign's on the other machine whose cores it saturates, 2026-10-30)
 			print(f"inference: {config.inference_endpoints} served elsewhere" + (f"; {', '.join(f for f in ('battle', 'campaign') if f not in stores and (f == 'battle' or config.campaign.games))} served here on {config.inference_device}" if len(stores) < 1 + bool(config.campaign.games) else ""), flush=True)

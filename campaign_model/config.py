@@ -32,10 +32,6 @@ class CampaignConfig:
 	# costs 5-10 ms of a core, the machine's games' biggest share), else the CPU (Apple's GPU is slower for these small
 	# batches and cannot be shared between threads); or e.g. "cpu", "cuda"
 	inference_device: str = "auto"
-	# With the campaign's inference on other machines (TrainConfig.inference_endpoints): also a server here on this device
-	# ("cuda", "cpu"; "" none) that every model goes to, asked by the games here while their own endpoint does not answer
-	# (supply.campaign_socket; the user, 2026-11-01: the training goes on when the Mac stops being available)
-	fallback_device: str = ""
 	# Updates (train.ppo_update), with their own optimizer
 	decisions_per_update: int = 8192
 	min_games_per_update: int = 4  # one game's decisions are alike: an update takes several games
