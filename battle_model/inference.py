@@ -477,6 +477,42 @@ class ModelStore:
 		pass
 
 
+class FallbackStore:
+	"""A family other machines serve (primary: its ModelStore) with a server here for when they are down (fallback: that
+	server's view): every model goes to both, and a game asks its primary endpoint while it answers, else the fallback
+	(the user, 2026-11-01: the training goes on when the Mac stops being available)."""
+
+	def __init__(self, primary, fallback, server):
+		self.primary, self.fallback, self.server = primary, fallback, server
+		self.family, self.model_kwargs = primary.family, primary.model_kwargs
+		self.socket_paths, self.socket_path, self.tcp_ports = primary.socket_paths, primary.socket_path, primary.tcp_ports
+		self.fallback_paths = list(fallback.socket_paths)
+
+	def set_model(self, name, version, model):
+		self.primary.set_model(name, version, model)
+		self.fallback.set_model(name, version, model)
+
+	def drop(self, name):
+		self.primary.drop(name)
+		self.fallback.drop(name)
+
+	def serving(self):
+		return self.primary.serving()  # (what remote.Hub sends the other machines' servers)
+
+	def socket_for(self, index):
+		from .supply import campaign_socket
+
+		return campaign_socket(self.primary.socket_for(index), self.fallback_paths, index, self.family) or self.fallback_paths[index % len(self.fallback_paths)]
+
+	def endpoints(self, host):
+		return self.primary.endpoints(host)
+
+	def close(self):
+		if self.server is not None:
+			self.server.close()
+			self.server = None
+
+
 def parse_endpoints(text):
 	"""TrainConfig.inference_endpoints, "battle=tcp:host:7901,tcp:host:7902;campaign=tcp:host:7951", as {family: [endpoints]}."""
 	out = {}

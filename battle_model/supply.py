@@ -89,6 +89,18 @@ def inference_ready(address, family):
 		socket.setdefaulttimeout(before)
 
 
+def campaign_socket(primary, fallbacks, index=0, family="campaign"):
+	"""The inference server a campaign game asks: primary while it answers, else a fallback that does (index's first:
+	TrainConfig.campaign.fallback_device), else None (no game starts)."""
+	if inference_ready(primary, family):
+		return primary
+	for k in range(len(fallbacks)):
+		address = fallbacks[(index + k) % len(fallbacks)]
+		if inference_ready(address, family):
+			return address
+	return None
+
+
 def memory_allows():
 	free = available_gb()
 	return free is None or free >= MEMORY_FLOOR_GB
@@ -205,11 +217,12 @@ class Games(IterableDataset):
 	here or on a remote slot (the module's docstring). What a worker yields: items (prepare), campaign games
 	({"kind": "campaign", ...}), and {"kind": "failed", ...} for a game that failed (counted, never trained on)."""
 
-	def __init__(self, kind, config, run_dir, battle_sockets, campaign_sockets, shared, token, listener=None):
+	def __init__(self, kind, config, run_dir, battle_sockets, campaign_sockets, shared, token, listener=None, campaign_fallback=()):
 		"""battle_sockets, campaign_sockets: the inference servers' addresses the games here ask (a Unix socket a server
 		process, or "tcp:<host>:<port>" of another machine's: inference.ModelStore), spread over the workers."""
 		self.kind, self.config, self.run_dir = kind, config, Path(run_dir)
 		self.battle_sockets, self.campaign_sockets = [str(s) for s in battle_sockets], [str(s) for s in campaign_sockets or ()]
+		self.campaign_fallback = [str(s) for s in campaign_fallback or ()]  # (servers here for when campaign_sockets' are down)
 		self.shared, self.token, self.listener = shared, token, listener
 		self.link = self.run_dir / "models" / "current.onnx"  # (named in the env, never read: the servers play)
 
@@ -297,17 +310,23 @@ class Games(IterableDataset):
 		stop = self.shared.stop
 		n = 0
 		unreachable = 0.0  # (when this worker last said its campaign inference was unreachable)
+		primary = runner.campaign_socket
 		try:
 			while not stop.is_set():
 				if self.kind == "campaign" and not self.permits_left():
 					time.sleep(0.5)
 					continue
-				if self.kind == "campaign" and runner.campaign_socket and not inference_ready(runner.campaign_socket, "campaign"):
-					if time.monotonic() - unreachable > 60:
+				if self.kind == "campaign" and primary:
+					# Its own server while it answers, else one here (campaign_fallback): the Mac's servers going away
+					# stopped every campaign game (2026-11-01)
+					address = campaign_socket(primary, self.campaign_fallback, index)
+					if address != primary and time.monotonic() - unreachable > 60:
 						unreachable = time.monotonic()
-						print(f"supply: FAILURE: campaign inference unreachable at {runner.campaign_socket}: no campaign game starts until it answers", flush=True)
-					time.sleep(5)
-					continue
+						print(f"supply: FAILURE: campaign inference unreachable at {primary}: " + (f"games here ask {address} meanwhile" if address else "no campaign game starts until it answers"), flush=True)
+					if address is None:
+						time.sleep(5)
+						continue
+					runner.campaign_socket = address
 				placed = self.place()
 				if placed is None:
 					time.sleep(0.5)
@@ -559,7 +578,8 @@ class Supply:
 		self.listener = socket.create_server(("0.0.0.0", config.remote_port + remote.SLOT_PORT), backlog=64) if config.remote_port and config.remote_slots else None
 		battle_sockets = list(pool.server.socket_paths)
 		campaign_sockets = list(campaign.server.socket_paths) if campaign else None
-		self.datasets = {kind: Games(kind, config, out, battle_sockets, campaign_sockets, self.shared, self.token, self.listener) for kind in ceilings}
+		campaign_fallback = list(getattr(campaign.server, "fallback_paths", ())) if campaign else []
+		self.datasets = {kind: Games(kind, config, out, battle_sockets, campaign_sockets, self.shared, self.token, self.listener, campaign_fallback) for kind in ceilings}
 		self.loaders, self.threads = {}, []
 		self.stop = threading.Event()
 		self.stats = Counter()

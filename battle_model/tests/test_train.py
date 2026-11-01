@@ -109,3 +109,36 @@ def test_campaign_permits_keep_games_playing_while_an_update_waits_and_runs():
 	supply = SimpleNamespace(campaign=learner, shared=shared, received=0, game_decisions=12_000.0, config=SimpleNamespace(ahead=3.0, campaign=SimpleNamespace(decisions_per_update=32768, min_games_per_update=20)))
 	Supply.allow(supply)
 	assert shared.permits.value == 40  # (3 updates of 20 games, one of them in)
+
+
+def test_a_campaign_game_asks_the_fallback_while_its_own_server_is_down(monkeypatch):
+	"""The user (2026-11-01): the training goes on when the Mac stops being available. A game asks its own endpoint
+	while it answers, else a server here (campaign.fallback_device), else none starts."""
+	from battle_model import supply
+
+	up = {"tcp:mac:7951"}
+	monkeypatch.setattr(supply, "inference_ready", lambda address, family: address in up)
+	assert supply.campaign_socket("tcp:mac:7951", ["/here/a.sock"]) == "tcp:mac:7951"
+	up = {"/here/a.sock"}
+	assert supply.campaign_socket("tcp:mac:7951", ["/here/a.sock"]) == "/here/a.sock"
+	up = set()
+	assert supply.campaign_socket("tcp:mac:7951", ["/here/a.sock"]) is None
+
+
+def test_the_fallback_store_gives_every_model_to_both_servers(monkeypatch):
+	from types import SimpleNamespace
+
+	from battle_model import supply
+	from battle_model.inference import FallbackStore, ModelStore
+
+	got = []
+	fallback = SimpleNamespace(socket_paths=["/here/a.sock"], set_model=lambda name, version, model: got.append((name, version)), drop=lambda name: got.append(("drop", name)))
+	closed = []
+	store = FallbackStore(ModelStore("campaign", ["tcp:mac:7951", "tcp:mac:7952"], {"dim": 8}), fallback, SimpleNamespace(close=lambda: closed.append(1)))
+	store.set_model("current", 3, {"w": torch.zeros(2)})
+	assert got == [("current", 3)] and store.serving()["current"][0] == 3 and store.model_kwargs == {"dim": 8}
+	monkeypatch.setattr(supply, "inference_ready", lambda address, family: address == "tcp:mac:7952")
+	assert store.socket_for(1) == "tcp:mac:7952" and store.socket_for(0) == "/here/a.sock"  # (7951 down: the fallback)
+	store.close()
+	store.close()
+	assert closed == [1]
