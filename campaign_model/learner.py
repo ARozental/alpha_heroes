@@ -42,6 +42,7 @@ from torch.utils.tensorboard import SummaryWriter
 from battle_model import play as battle_play
 from battle_model.device import use_fused
 from battle_model.inference import InferenceServer
+from battle_model.supply import trim_memory
 
 from . import constants as c
 from . import evaluate
@@ -553,6 +554,11 @@ class CampaignLearner:
 		memory.append(("updated", rss_gb()))
 		self._log(epoch, games, decisions, row, metrics, time.time() - started)
 		memory.append(("logged", rss_gb()))
+		# The update's freed memory back to the system: glibc kept it, and the trainer climbed from ~4 GB after each
+		# restart to 11-14 GB within ~4 updates (2026-11-01), memory the games here could not have
+		del games, decisions
+		trim_memory()
+		memory.append(("trimmed", rss_gb()))
 		if all(value == value for _, value in memory):
 			print("campaign memory (GB, this process): " + "  ".join(f"{stage} {value:.1f}" for stage, value in memory), flush=True)
 		if self.device.type == "cuda":  # (the allocator's live tensors and its reserve, and what the card has left)
