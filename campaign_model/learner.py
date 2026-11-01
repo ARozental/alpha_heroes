@@ -228,6 +228,16 @@ class CampaignLearner:
 
 			upgrade_csv(evals, evaluate.COLUMNS)
 		self.last_eval = time.monotonic() - (time.time() - evals.stat().st_mtime) if resume and evals.exists() else None
+		if resume and evals.exists() and config.teacher_mix == "score" and (getattr(self, "teacher", None) is not None or config.nk2_advice > 0):
+			# The teacher's weight from the last evaluation's score, its source (evaluate): the checkpoint is the updates',
+			# and a weight an evaluation set after the last update came back unchanged (2026-11-01 16:16 CST: 19, not eval
+			# 56's 13.76)
+			with evals.open(newline="") as f:
+				rows = list(csv.DictReader(f))
+			score = float(rows[-1].get("score") or "nan") if rows else float("nan")
+			if np.isfinite(score):
+				self.teacher_weight = teacher_weight_for(score)
+				print(f"campaign: the teacher's weight {self.teacher_weight:.2f} from the last eval's score {score:.3f}", flush=True)
 		# Each finished game is on disk from its arrival until the checkpoint of the update that trained on it is saved,
 		# and a resumed run takes them back: a stop (a crash, the memory guard, a restart) loses no finished game (until
 		# 2026-11-01 each restart lost the ~20-40 finished games waiting for their update)
