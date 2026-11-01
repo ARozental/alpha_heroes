@@ -3,7 +3,8 @@
 #   1. imitation of Nullkiller2 (campaign_model/imitate.py --stream): its games played by workers as they are needed
 #      (nothing written to disk), each decision seen once, the model with memory learning them in order (64 decisions
 #      a chunk, 128 players at once: a chunk's inputs, kept for its backward pass as wire bytes, are ~7.4 GB of RAM; at
-#      64 the GPU was 27% busy, its time kernel launches), until the held-out loss
+#      64 the GPU was 27% busy, its time kernel launches), at 3e-5 (at 1e-4 its loss stopped at ~1.97 after 2.5 hours,
+#      the noise floor of that rate), until the held-out loss
 #      (each decision's, before the model trained on it) stops
 #      improving or 8 hours pass; again from its checkpoint if this script starts again before the end
 #   2. joint6: self-play RL from that model (campaign_model/joint.py), the credit's share weight 10% + 2% a day,
@@ -27,7 +28,7 @@ mkdir -p "$BC" runtime/train
 if [ ! -f "$BC/done" ]; then
 	init=""
 	[ -f "$BC/bc_latest.pt" ] && init="--init $BC/bc_latest.pt"
-	.venv/bin/python -m campaign_model.imitate --stream 10 --data none --out "$BC" $init --variants 128x2 --lanes 128 --steps 64 \
+	.venv/bin/python -m campaign_model.imitate --stream 10 --data none --out "$BC" $init --variants 128x2 --lanes 128 --steps 64 --lr 3e-5 \
 		--eval-every 25 --until-plateau 0.005 --plateau-periods 5 --minutes 480 --decode-threads 8 \
 		--tb runtime/train/fullrun-imitation/tensorboard >> runtime/teacher/bc_final.log 2>&1 &
 	child=$!
