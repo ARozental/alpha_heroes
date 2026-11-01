@@ -14,8 +14,11 @@
 # Both models' inference on the PC's CPU (one server, 6 processes), the GPU the learner's alone: the campaign's on the
 # GPU (09:27-09:45) time-sliced the learner, ~2x its time a decision (v34: 72k decisions in 499 s, against ~114k in
 # ~400 s), and the permits then held games back (4 of 14 slots playing) while the CPU idled
-# 13 games since 2026-11-01 16:45 CST: the trainer gives an update's memory back after it (it peaked at 7.4 GB, was 11-14),
-# 9.5 GB was the least available with 10 here and 4 on the Mac, and the games and the trainer were about even
+# 10 games, not 13 (13 at 16:43-16:55 CST on 2026-11-01: the memory guard stopped the run at 1.13 GB, its games in flight
+# lost). The budget: ~26.6 GB available with nothing running, less the inference servers (4.0), the trainer at its peak
+# (9.3 GB before its first update after a start, 11.75 seen at 15:46) and the guard's 3 GB, leaves ~10 GB for slots
+# here at ~0.65 GB each (a loader worker ~0.4 GB PSS, its VCMI client 0.15-0.25) and the Mac's (a worker each here):
+# 10 campaign + 4 battle slots + the Mac's 4 is what fits (least available 4.2 GB at a start, 15:46)
 # 11 games since 2026-11-01 05:50 CST: the permits keep games playing through an update now (supply.allow), and an update
 # takes ~6 GB more (3.7 GB was left with no game playing): 2 fewer games for the memory guard's margin
 # 13 games, not the machine's 16 (2026-11-01 01:47): the memory guard stopped the run at 1.4 GB available as the 20
@@ -38,5 +41,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 	--set remote_port=7700 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.02 campaign.entropy_floor_weight=0 \
-		campaign.nk2_advice=0.5 campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=13 remote_slots=4 campaign.inference_device=cpu inference_processes=6 \
+		campaign.nk2_advice=0.5 campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=10 remote_slots=4 campaign.inference_device=cpu inference_processes=6 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
