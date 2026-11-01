@@ -126,13 +126,14 @@ def test_a_backlog_beyond_four_updates_drops_its_oldest_games():
 	from campaign_model.learner import DROP_BEYOND
 
 	assert DROP_BEYOND == 4
+	# (an update's worth: what it takes, 2 games of 60 here, 120 decisions, over decisions_per_update's 100: 2026-11-01)
 	learner = SimpleNamespace(config=CampaignConfig(decisions_per_update=100, min_games_per_update=2), lock=threading.Condition(), finished=[], stats=__import__("collections").Counter())
-	learner.finished = [(game_of(60), i) for i in range(8)]  # 480 decisions: one over four updates' worth past the oldest
+	learner.finished = [(game_of(60), i) for i in range(9)]  # 540 decisions: 480 past the oldest, four updates' worth
 	taken = CampaignLearner._take(learner)
-	assert [info for _, info in taken] == [1, 2] and [info for _, info in learner.finished] == list(range(3, 8)) and learner.stats["dropped_games"] == 1
-	learner.finished = [(game_of(60), i) for i in range(12)]  # 720: five over
+	assert [info for _, info in taken] == [1, 2] and [info for _, info in learner.finished] == list(range(3, 9)) and learner.stats["dropped_games"] == 1
+	learner.finished = [(game_of(60), i) for i in range(12)]  # 720: four more past it
 	taken = CampaignLearner._take(learner)
-	assert [info for _, info in taken] == [5, 6] and learner.stats["dropped_games"] == 6
+	assert [info for _, info in taken] == [4, 5] and learner.stats["dropped_games"] == 5
 
 
 def test_an_update_runs_with_the_horizon_credit_and_learns_how_far_to_trust_the_heads(tmp_path):
