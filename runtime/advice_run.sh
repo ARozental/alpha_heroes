@@ -10,7 +10,10 @@
 # The PC alone (the user, 2026-11-01 09:30 CST: "the assumption is that for a lot of time only the PC is available and it
 # still needs to work"): every model's inference here (the campaign's on the GPU, the battles' on the CPU); a Mac adds
 # game slots when it is up (remote_slots=4: runtime/mac_slots.sh with SLOTS=4, its own servers mirroring these models),
-# never anything the run waits on. 10 games here: the campaign's server here and the 4 slots' idle workers take ~2.5 GB
+# never anything the run waits on. 10 games here: the campaign's server here and the 4 slots' idle workers take ~2.5 GB.
+# Both models' inference on the PC's CPU (one server, 6 processes), the GPU the learner's alone: the campaign's on the
+# GPU (09:27-09:45) time-sliced the learner, ~2x its time a decision (v34: 72k decisions in 499 s, against ~114k in
+# ~400 s), and the permits then held games back (4 of 14 slots playing) while the CPU idled
 # 11 games since 2026-11-01 05:50 CST: the permits keep games playing through an update now (supply.allow), and an update
 # takes ~6 GB more (3.7 GB was left with no game playing): 2 fewer games for the memory guard's margin
 # 13 games, not the machine's 16 (2026-11-01 01:47): the memory guard stopped the run at 1.4 GB available as the 20
@@ -30,5 +33,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 	--set remote_port=7700 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.02 campaign.entropy_floor_weight=0 \
-		campaign.nk2_advice=0.5 campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=10 remote_slots=4 \
+		campaign.nk2_advice=0.5 campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=10 remote_slots=4 campaign.inference_device=cpu inference_processes=6 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
