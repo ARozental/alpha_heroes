@@ -1028,9 +1028,11 @@ void AlphaMapAI::heroExchangeStarted(ObjectInstanceID hero1, ObjectInstanceID he
 
 void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, QueryID queryID)
 {
-	// Troop moves between the two armies while the server holds the exchange open, until the model ends it
+	// Troop moves between the two armies while the server holds the exchange open, until the model ends it, 8 at
+	// most (it was 32: joint7's model, never taught exchanges, used all 32 in nearly every one, 55% of its decisions,
+	// 2026-11-01; Nullkiller2 makes a few)
 	futile.clear();
-	for(int n = 0; n < 32 && !stopping; ++n)
+	for(int n = 0; n < 8 && !stopping; ++n)
 	{
 		auto decision = encode(DecisionKind::EXCHANGE, first, second);
 		if(!decision.inputs.any(In::army_mask))
