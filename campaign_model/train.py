@@ -5,7 +5,8 @@
 PPO as the battle model's (battle_model/train.py): the clipped surrogate on advantages normalized over the update,
 passes over minibatches of fixed size, the KL control (an update stops once its KL from the policy at its start passes
 1.5 x target_kl, and the rate's scale is cut by 1.5, or raised back by 1.5 after an update that ended under half of it,
-never above lr_scale_max: the user's rule, never above 1e-4). Entropy: a floor, not a bonus (battle_model/losses.py's
+never above lr_scale_max: the user's rule, never above 3e-5; with a teacher, its advice or its KL at teacher_weight
+against PPO's 1, the target is (1 + teacher_weight) x target_kl: kl_target). Entropy: a floor, not a bonus (battle_model/losses.py's
 lesson of 2026-10-28: a constant bonus is a consistent push that beats a noise-level policy gradient), with the
 parents' probabilities detached (a type's table entropy weighs by p(type), which gets no gradient from it:
 test_entropy_bonus_does_not_favour_types_with_many_options). The value heads are trained with cross-entropy (the
@@ -558,6 +559,11 @@ def ppo_update(
 	if teacher is not None and graphs is not None:
 		teacher_graphs = teacher.__dict__.setdefault("_graphs", Graphs(teacher))
 	teacher_weight_t = torch.full((), float(config.teacher_kl if teacher_weight is None else teacher_weight), device=device)
+	# The KL control's target: target_kl bounds how far PPO's part of the loss, noise where the credit is, moves the policy
+	# an update; a teacher's pull (its advice, its KL) is supervised, not noise. At teacher_weight against PPO's 1 the
+	# update may move (1 + teacher_weight) x as far: at the teacher's 95% of the loss, PPO's target alone stopped every
+	# joint7 update after 2-6 of its ~56 steps and cut the rate 1.5x each time (1e-5 to 3e-6 in 3 updates, 2026-11-01)
+	kl_target = config.target_kl * (1.0 + float(teacher_weight_t)) if advice_t is not None or teacher is not None else config.target_kl
 	steps_graph = None
 	if graphs is not None and config.step_graphs:
 		steps_graph = model.__dict__.setdefault("_step_graph", StepGraph(model, lambda out, batch: micro_loss(out, batch, config, foresight_config)[:3]))
@@ -747,7 +753,7 @@ def ppo_update(
 			recent.append(step["kl"])
 			update_kl = float(np.mean(recent))  # the update's KL: the last KL_WINDOW minibatches', not one's
 			totals.update(step, grad_norm=grad_norm)
-			if config.target_kl and update_kl > 1.5 * config.target_kl:
+			if config.target_kl and update_kl > 1.5 * kl_target:
 				stopped, stopped_pass = True, pass_number  # this update has moved the policy far enough
 				break
 		decoded.close()  # (its thread ends, its decoded batches freed)
@@ -756,7 +762,7 @@ def ppo_update(
 	if config.target_kl and steps:
 		if stopped:
 			lr_scale = max(0.1, lr_scale / 1.5)
-		elif update_kl < config.target_kl / 2:
+		elif update_kl < kl_target / 2:
 			lr_scale = min(config.lr_scale_max, lr_scale * 1.5)
 	# The share heads' explained variance over the share prior's: the player count alone explains much of a share (1/2 in
 	# a 2-player game, 1/4 in a 4-player one), and the heads start there, so plain EV trusted them before they learned
@@ -773,6 +779,7 @@ def ppo_update(
 		signal_ratio=signal_ratio(optimizer),  # (the steps' noise: the user's 2026-10-31 aim of 0.25+, with 4,096-decision steps)
 		end_step_error=end_step_error,
 		last_kl=update_kl,
+		kl_target=kl_target,
 		unsound=int(unsound.sum()),
 		decisions=n,
 		value_fresh=value_fresh,

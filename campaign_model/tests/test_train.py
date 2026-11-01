@@ -98,6 +98,26 @@ def test_the_kl_control_stops_an_update_that_moves_too_far():
 	assert metrics["stopped"] and metrics["steps"] < 80 and scale == 1 / 1.5
 
 
+def test_a_teachers_weight_widens_the_kl_target_by_one_plus_it():
+	"""An update with Nullkiller2's advice at teacher_weight w may move (1 + w) x target_kl: its pull is supervised."""
+	import dataclasses
+
+	torch.manual_seed(3)
+	model = CampaignModel(dim=32, cell_dim=16, layers=1)
+	x = random_inputs(16, seed=7)
+	decisions = [dataclasses.replace(d, advice=(d.action_type, d.index, d.cell)) for d in decisions_for(model.eval(), x)]
+	targets = np.full((16, c.N_VALUE_OFFSETS), 0.5, dtype=np.float32)
+	returns = np.linspace(-1, 1, 16).astype(np.float32)
+	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
+	config = CampaignConfig(batch_size=4, passes=20, learning_rate=0.05, target_kl=1e-4)
+	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters()), decisions, targets, returns, config, decode=decode, teacher_weight=19.0)
+	assert metrics["kl_target"] == pytest.approx(20 * 1e-4)
+	assert not metrics["stopped"] or metrics["last_kl"] > 1.5 * 20 * 1e-4  # (stopped only past the wider target)
+	plain = [dataclasses.replace(d, advice=None) for d in decisions]
+	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters()), plain, targets, returns, config, decode=decode, teacher_weight=19.0)
+	assert metrics["kl_target"] == pytest.approx(1e-4)  # (no teacher: PPO's own)
+
+
 def test_head_loss_counts_only_the_decisions_with_a_grade():
 	from campaign_model.train import head_loss
 
