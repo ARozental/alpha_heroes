@@ -1,18 +1,18 @@
 #!/bin/bash
 # Samples a unit's memory every 10 s into runtime/memwatch-<unit>.csv (time, unit GB, WSL available GB, swap used GB,
 # GB by process name, and the trainer's (the unit's main process) resident memory and peak), and keeps the kernel from
-# ever choosing what to kill:
-# - under SHED_AVAILABLE_GB (default 3) it ends the youngest game (its VCMI client: the least play lost; the run counts
-#   it as failed, never trains on it), one each 20 s while memory stays under: a game lost, not the run;
-# - under MIN_AVAILABLE_GB (default 1.5) it stops the unit (the last resort: shedding did not keep up).
+# ever choosing what to kill: it stops the unit only when WSL's available memory is under MIN_AVAILABLE_GB (0.5) and its
+# free swap under MIN_SWAP_FREE_GB (2): the RAM full and the swap nearly. Until 2026-11-01 17:05 CST it stopped at 1.5
+# GB available with 7.4 GB of swap free, which the kernel would have used for a short peak: at 16:55 it stopped joint7
+# so, its games in flight lost (the trainer at a 12 GB peak). SHED_AVAILABLE_GB (default 0: off) ends the youngest game
+# under it: it never freed what mattered (the youngest was always a battle client, restarted at once, ~0.2 GB).
 # Each shed or stop writes what held the memory, process by process, to runtime/memwatch-<unit>-events.log.
-# (The run's admission keeps the trainer's peak free and games under a floor: battle_model/supply.py, memory_allows;
-# joint7 was stopped at 1.06 GB on 2026-11-01 12:21 CST, games let in at the trainer's low point between updates.)
 # Usage: runtime/memwatch.sh <unit>    (ends with the unit)
 cd "$(dirname "$0")/.."
 unit="$1"
-min="${MIN_AVAILABLE_GB:-1.5}"
-shed="${SHED_AVAILABLE_GB:-3}"
+min="${MIN_AVAILABLE_GB:-0.5}"
+min_swap="${MIN_SWAP_FREE_GB:-2}"
+shed="${SHED_AVAILABLE_GB:-0}"
 out="runtime/memwatch-$unit.csv"
 events="runtime/memwatch-$unit-events.log"
 cg=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/$unit.service
@@ -34,9 +34,10 @@ while [ "$(systemctl --user show "$unit" -p ActiveState --value)" = active ]; do
 	main=$(systemctl --user show "$unit" -p MainPID --value)
 	trainer=$(awk '/^VmRSS:/ {r=$2} /^VmHWM:/ {h=$2} END {if (r) printf "trainer_rss:%.2f trainer_peak:%.2f", r/2^20, h/2^20}' /proc/$main/status 2>/dev/null)
 	echo "$(date +%H:%M:%S),$unit_gb,$available,$swap,$procs$trainer" >> "$out"
-	if under "$available" "$min"; then
-		echo "$(date +%H:%M:%S),stopping: available $available GB < $min GB" >> "$out"
-		snapshot "stopping $unit: available $available GB < $min GB" >> "$events"
+	swap_free=$(awk '/SwapFree/ {printf "%.2f", $2/2^20}' /proc/meminfo)
+	if under "$available" "$min" && under "$swap_free" "$min_swap"; then
+		echo "$(date +%H:%M:%S),stopping: available $available GB < $min GB and swap free $swap_free GB < $min_swap GB" >> "$out"
+		snapshot "stopping $unit: available $available GB < $min GB, swap free $swap_free GB < $min_swap GB" >> "$events"
 		systemctl --user stop "$unit"
 		break
 	fi

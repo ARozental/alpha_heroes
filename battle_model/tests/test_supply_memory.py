@@ -70,3 +70,18 @@ def test_the_permits_are_counted_again_with_no_game_event(monkeypatch):
 	s.stop.set()
 	thread.join(timeout=1)
 	assert len(calls) >= 5 and not thread.is_alive()
+
+
+def test_the_memory_census_counts_what_the_trainer_holds():
+	import threading
+	from types import SimpleNamespace
+
+	import numpy as np
+	import torch
+
+	assert supply.held_bytes({"a": np.zeros(1000, np.float32), "b": [torch.zeros(10, dtype=torch.float64), b"xyz"]}) == 4000 + 80 + 3
+	s = supply.Supply.__new__(supply.Supply)
+	s.campaign = SimpleNamespace(lock=threading.Lock(), finished=[(SimpleNamespace(decisions=[SimpleNamespace(inputs=b"x" * 2**20)] * 3), None)], label_futures={})
+	s.pool = SimpleNamespace(lock=threading.Lock(), buffer=[{"decisions": 7, "data": {"x": np.zeros(2**18, np.float32)}}])
+	line = s.memory_census(5.0, by_type=True)
+	assert "campaign waiting 1 games, 3 decisions, inputs 3 MB" in line and "battle buffer 1 battles, 7 decisions, 1 MB" in line and "objects " in line

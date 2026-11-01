@@ -558,6 +558,8 @@ class CampaignLearner:
 		# restart to 11-14 GB within ~4 updates (2026-11-01), memory the games here could not have
 		del games, decisions
 		trim_memory()
+		if self.device.type == "cuda" and hasattr(torch._C, "_host_emptyCache"):
+			torch._C._host_emptyCache()  # (the pinned staging's cached blocks: the trainer held 1.85 GB of such mappings)
 		memory.append(("trimmed", rss_gb()))
 		if all(value == value for _, value in memory):
 			print("campaign memory (GB, this process): " + "  ".join(f"{stage} {value:.1f}" for stage, value in memory), flush=True)

@@ -103,6 +103,30 @@ SHARED = None  # the trainer's Shared (Supply sets it): memory_allows() in the t
 PEAK_WINDOW = 20 * 60  # s: the trainer's recent peak, over 2-3 campaign updates (each ~5-9 minutes apart)
 PEAK_EVERY = 5  # s between its samples (an update's peak lasts minutes)
 PERMITS_EVERY = 10  # s: the campaign permits counted again at least this often (Supply._keep_allowing)
+CENSUS_EVERY = 120  # s between the trainer's memory census lines (Supply.memory_census)
+CENSUS_TYPES_EVERY = 600  # s between its counts of objects by type (gc.get_objects: seconds on a big heap)
+
+
+def held_bytes(obj, depth=0):
+	"""The bytes of the arrays and tensors in obj (dicts, lists, tuples, objects' attributes and slots, a few levels)."""
+	if obj is None or depth > 6:
+		return 0
+	if isinstance(obj, np.ndarray):
+		return obj.nbytes
+	if isinstance(obj, torch.Tensor):
+		return obj.element_size() * obj.nelement()
+	if isinstance(obj, (bytes, bytearray)):
+		return len(obj)
+	if isinstance(obj, dict):
+		return sum(held_bytes(v, depth + 1) for v in obj.values())
+	if isinstance(obj, (list, tuple)):
+		return sum(held_bytes(v, depth + 1) for v in obj)
+	slots = getattr(type(obj), "__slots__", ())
+	if slots:
+		return sum(held_bytes(getattr(obj, s, None), depth + 1) for s in slots)
+	if hasattr(obj, "__dict__"):
+		return sum(held_bytes(v, depth + 1) for v in vars(obj).values())
+	return 0
 
 
 def memory_allows(shared=None, playing=None):
@@ -621,7 +645,7 @@ class Supply:
 	def _watch_trainer(self):
 		"""shared.peak: this process's (the trainer's) highest resident memory over the last PEAK_WINDOW, sampled every
 		PEAK_EVERY (memory_allows keeps the way back to it free)."""
-		samples = deque()
+		samples, census, types = deque(), 0.0, 0.0
 		while not self.stop.is_set():
 			rss = process_gb(os.getpid(), "VmRSS")
 			if rss is not None:
@@ -630,7 +654,39 @@ class Supply:
 				while samples[0][0] < now - PEAK_WINDOW:
 					samples.popleft()
 				self.shared.peak.value = max(value for _, value in samples)
+				if now - census >= CENSUS_EVERY:
+					census = now
+					try:
+						print(self.memory_census(rss, by_type=now - types >= CENSUS_TYPES_EVERY), flush=True)
+						types = now if now - types >= CENSUS_TYPES_EVERY else types
+					except Exception as error:  # (a diagnostic: never the run's end)
+						print(f"trainer memory: census failed: {str(error)[:200]}", flush=True)
 			self.stop.wait(PEAK_EVERY)
+
+	def memory_census(self, rss, by_type=False):
+		"""One line of what the trainer holds (2026-11-01: it grew from ~2 GB after each start to ~12 GB within ~20
+		minutes and kept it after its updates, and the memory guard stopped joint7: what it was, nothing logged said)."""
+		import gc
+
+		parts = [f"trainer memory: rss {rss:.2f} GB"]
+		campaign = self.campaign
+		if campaign is not None:
+			with campaign.lock:
+				waiting = list(campaign.finished)
+			futures = list(getattr(campaign, "label_futures", {}).values())
+			labels = sum(held_bytes(f.result()) for f in futures if f.done() and not f.cancelled() and f.exception() is None)
+			parts.append(f"campaign waiting {len(waiting)} games, {sum(len(g.decisions) for g, _ in waiting)} decisions, inputs {sum(len(d.inputs) for g, _ in waiting for d in g.decisions) / 2**20:.0f} MB; label results {len(futures)} ({labels / 2**20:.0f} MB)")
+		with self.pool.lock:
+			buffer = list(self.pool.buffer)
+		parts.append(f"battle buffer {len(buffer)} battles, {sum(b['decisions'] for b in buffer)} decisions, {sum(held_bytes(b.get('data')) for b in buffer) / 2**20:.0f} MB")
+		if torch.cuda.is_available():
+			host = torch.cuda.host_memory_stats()
+			parts.append(f"pinned host {host.get('reserved_bytes.current', host.get('allocated_bytes.current', 0)) / 2**30:.2f} GB")
+		if by_type:
+			started = time.perf_counter()
+			counts = Counter(type(o).__name__ for o in gc.get_objects())
+			parts.append("objects " + ", ".join(f"{name} {n}" for name, n in counts.most_common(6)) + f" ({time.perf_counter() - started:.1f}s)")
+		return "; ".join(parts)
 
 	def workers(self, kind):
 		"""The loader's workers for a kind: this machine's ceiling, plus workers for the remote slots (the campaign's
