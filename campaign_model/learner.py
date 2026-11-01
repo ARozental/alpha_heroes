@@ -466,8 +466,20 @@ class CampaignLearner:
 				self.games_used += len(games)
 				self._refresh_features()
 		else:
+			out_of_memory = None
 			with self.model_lock:
-				metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.teacher_weight, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
+				try:
+					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.teacher_weight, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
+				except torch.OutOfMemoryError as error:  # (handled below, once the error's frames, and their tensors, are gone)
+					out_of_memory = str(error)[:200]
+			if out_of_memory is not None:
+				# The run goes on (2026-11-01: two of joint7's updates ran out of the GPU's 27 GB and ended it, and their
+				# games with it): this update's games are dropped, as games with no decisions are; the weights keep the
+				# steps it took, served with the next update
+				torch.cuda.empty_cache()
+				print(f"campaign update {self.version + 1}: out of GPU memory, its {len(games)} games dropped: {out_of_memory}", flush=True)
+				return False
+			with self.model_lock:
 				if self.device.type == "mps":
 					torch.mps.empty_cache()  # (the battle learner's lesson: MPS keeps blocks of every size it saw)
 				self.version += 1

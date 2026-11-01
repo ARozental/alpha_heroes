@@ -657,7 +657,15 @@ def ppo_update(
 		if end is not None:
 			tensors.update(end=end_t, end_valid=end_valid)
 		model.train()
-		noise = loss_noise(model, decisions, decode, convert, device, tensors, config)
+		# At the update's micro-batch (not loss_noise's 128) and never the update's end: a diagnostic. At 128 rows, eager,
+		# beside the recorded step's pool, it ran out of the 27 GB (joint7's v11, 2026-11-01) and ended the run
+		try:
+			noise = loss_noise(model, decisions, decode, convert, device, tensors, config, rows=max(1, size // max(1, config.micro_batches)))
+		except torch.OutOfMemoryError as error:
+			noise = {}
+			print(f"campaign: the loss noise not measured (out of GPU memory: {str(error)[:120]})", flush=True)
+		if device.type == "cuda":
+			torch.cuda.empty_cache()
 	totals, steps, stopped, update_kl, recent = Counter(), 0, False, 0.0, deque(maxlen=KL_WINDOW)
 	stopped_pass = 0  # the pass the KL control ended (0: none; b1, 2026-10-31: with passes=2, a second pass mostly cut short adds nothing)
 	model.train()
