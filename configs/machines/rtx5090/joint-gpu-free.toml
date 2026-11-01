@@ -94,7 +94,9 @@ decode_threads = 3
 # bounds the drift). Conditions: the update must stay shorter than the gap between updates (else the permits hold games
 # back), and the second pass must not be cut short by the KL stop in most updates (stopped_pass in the log and
 # TensorBoard: then back to 1). One pass before (fresh games rather than each seen twice; the games were then plenty)
-passes = 2
+# Three since 2026-11-01 04:10 CST (joint7, v9): games the bottleneck, the GPU idle ~2/3 of the time between ~8-minute
+# updates every ~20-25, the KL 0.03-0.05 an update against the teacher's 0.3 target, no update cut short
+passes = 3
 # The policy's credit (2026-10-31): the parts of our log share's change our decisions make, our value's growth and what
 # we take from the others (CampaignConfig.credit "attributed"); the horizon credit's gradient noise scale was 5,312
 # decisions early and showed no signal at all past day 14 (train.loss_noise, v331)
