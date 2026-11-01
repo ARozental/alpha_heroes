@@ -491,6 +491,9 @@ class CampaignLearner:
 		memory.append(("logged", rss_gb()))
 		if all(value == value for _, value in memory):
 			print("campaign memory (GB, this process): " + "  ".join(f"{stage} {value:.1f}" for stage, value in memory), flush=True)
+		if self.device.type == "cuda":  # (the allocator's live tensors and its reserve, and what the card has left)
+			free, total = torch.cuda.mem_get_info(self.device)
+			print(f"campaign gpu memory (GB): allocated {torch.cuda.memory_allocated(self.device) / 2**30:.1f}  reserved {torch.cuda.memory_reserved(self.device) / 2**30:.1f}  card free {free / 2**30:.1f} of {total / 2**30:.1f}", flush=True)
 		return True
 
 	def _relabel_waiting(self):

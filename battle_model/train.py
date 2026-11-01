@@ -130,6 +130,12 @@ class TrainConfig:
 	# The trainer's float32 matmuls on CUDA as TF32 (10-bit mantissa, fp32 accumulation: ~1e-3 relative error, under the
 	# updates' gradient noise and the value heads' spread of ~0.03); torch's default is full fp32
 	tf32: bool = False
+	# The share of the GPU's memory this process may hold (torch.cuda.set_per_process_memory_fraction; 0: no cap). On a
+	# Windows GPU the driver never fails an allocation past the card: it spills to the machine's RAM and the GPU crawls
+	# (2026-11-01: 31.2 GB on the 5090 and 7.9 GB spilled, a ~7-minute campaign update not done in 30). Under a cap
+	# the allocator frees its cached blocks and retries before it fails, so the cache gives memory back instead of
+	# growing past the card, and only a real shortage shows up, as an out-of-memory error
+	cuda_memory_fraction: float = 0.0
 	# Inference served by other machines instead of a server here: "battle=tcp:host:port,...;campaign=tcp:host:port,..."
 	# (a worker's --local --serve: its servers get this run's weights from the hub, remote.py). Every game here asks them;
 	# no GPU process but the trainer's (inference.ModelStore). Empty: a server process here
@@ -968,6 +974,9 @@ def train(config, resume=False):
 	if device.type == "cuda" and config.tf32:  # (the trainer's matmuls, both models': every graph is captured after this)
 		torch.backends.cuda.matmul.allow_tf32 = True
 		torch.backends.cudnn.allow_tf32 = True
+	if device.type == "cuda" and config.cuda_memory_fraction > 0:
+		torch.cuda.set_per_process_memory_fraction(config.cuda_memory_fraction, device)
+		print(f"cuda: this process holds {config.cuda_memory_fraction:.0%} of the GPU's {torch.cuda.get_device_properties(device).total_memory / 2**30:.1f} GB at most", flush=True)
 	architecture = model_kwargs(config)
 	model = build_model(architecture).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)

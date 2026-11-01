@@ -40,6 +40,9 @@ adam_beta2 = 0.99
 decisions_per_update = 6400
 # The trainer's matmuls as TF32 (2026-10-31; full fp32 before): campaign updates were 86-111 s a ~35k-decision update
 tf32 = true
+# 85% of the 32 GB card (~27 GB) for the trainer, the rest for the CUDA context and the driver: past the card Windows
+# spills to RAM and the GPU crawls (2026-11-01, campaign v8: 31.2 GB + 7.9 GB spilled; the update's live peak was 16 GB)
+cuda_memory_fraction = 0.85
 accumulate = 24
 ppo_passes = 4
 # The battle evals' sets three times as large (2026-10-31: a set's standard error was ~0.03, the total's ~0.013, more than
