@@ -21,6 +21,8 @@
 # eval ran in its process; 16.7 GB was available at the start
 # Start: systemd-run --user --unit=alpha-joint7 -p KillSignal=SIGINT -p TimeoutStopSec=900 -p KillMode=mixed \
 #          -p LimitNOFILE=65536 ~/projects/alpha_heroes/runtime/advice_run.sh
+#        and its keeper (starts it again after a memory-guard stop):
+#        systemd-run --user --unit=alpha-joint7-keeper ~/projects/alpha_heroes/runtime/keeper.sh alpha-joint7 runtime/advice_run.sh
 cd "$HOME/projects/alpha_heroes"
 export MALLOC_ARENA_MAX=2
 # (no expandable CUDA segments here: the learner's step graph failed to record with them, "device not ready"; the

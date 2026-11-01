@@ -49,7 +49,7 @@ from .constants import MAX_UNITS, N_HEXES, ActionType
 from .data import SPARSE_INPUTS, Sparse, battle_examples, check_record, collate, compact_record, version_of
 from .losses import normalize_advantages
 
-MEMORY_FLOOR_GB = 4.5  # no new game here under this much available memory (Linux; elsewhere unknown: no limit). Games grow after they start (a VCMI client, the worker's arrays), and runtime/memwatch.sh stops a run under 1.5 GB: it did, 2026-10-30 23:27
+MEMORY_FLOOR_GB = 6.0  # no new game here under this much available memory (Linux; elsewhere unknown: no limit). Games grow after they start (a VCMI client, the worker's arrays), and runtime/memwatch.sh stops a run under 1.5 GB: it did, 2026-10-30 23:27. 6, not 4.5 (2026-11-01 12:21 CST): joint7 sat at the floor from 11:30, and a campaign update's growth (~3.5 GB at 104k decisions) with an eval beside it took the rest
 SLOT_HELLO_SECONDS = 30
 NEUTRAL_AI = "BattleAI"  # the wandering monsters' battle AI in generated battles, as in a campaign game
 TRACE_EVERY = 20  # worker 0 keeps the compact record of one battle in this many, for the run's traces

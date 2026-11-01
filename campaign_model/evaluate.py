@@ -26,6 +26,7 @@ import time
 import numpy as np
 
 from battle_model import play as battle_play
+from battle_model.supply import memory_allows
 
 from .empire import EMPIRE_VERSION, STATUS_INGAME, STATUS_LOST, EmpireConfig, empire_value
 from .failures import NAMES as FAILURES, failure_counts, failure_modes
@@ -114,6 +115,11 @@ def evaluate(config, server, battle, version, epoch, stop=None, model="current")
 	def work(i):
 		seed, players, color = games[i]
 		with slots:
+			# Under the memory floor as the training's games are: 4 eval games of 3-4 VCMI clients each, started at once
+			# beside a 104k-decision update, took the PC from 4.7 to 1.06 GB available and the guard stopped joint7
+			# (2026-11-01 12:21 CST)
+			while not memory_allows() and not (stop is not None and stop.is_set()):
+				time.sleep(5)
 			play_one(i, seed, players, color)
 
 	def play_one(i, seed, players, color):
