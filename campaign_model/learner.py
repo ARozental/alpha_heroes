@@ -162,11 +162,11 @@ class CampaignLearner:
 			print(f"campaign: starting from {config.init_from}", flush=True)
 		# The teacher (config.teacher_kl): a frozen imitation of Nullkiller2 whose KL the update adds
 		self.teacher = None
-		if config.teacher_kl > 0:
-			if config.learner == "process":
-				raise SystemExit("campaign.teacher_kl: the 'process' learner does not take the teacher (use 'turns' or 'thread')")
-			if not config.teacher_checkpoint:
-				raise SystemExit("campaign.teacher_kl needs campaign.teacher_checkpoint (imitate.py's bc_latest.pt)")
+		if config.teacher_kl > 0 and config.learner == "process":
+			raise SystemExit("campaign.teacher_kl: the 'process' learner does not take the teacher (use 'turns' or 'thread')")
+		if config.teacher_kl > 0 and not config.teacher_checkpoint and config.nk2_advice <= 0:
+			raise SystemExit("campaign.teacher_kl needs a teacher: campaign.teacher_checkpoint (a model's KL) or campaign.nk2_advice (Nullkiller2's own)")
+		if config.teacher_kl > 0 and config.teacher_checkpoint:  # (with nk2_advice alone, teacher_kl is only the teacher's weight)
 			state = torch.load(config.teacher_checkpoint, map_location="cpu")
 			self.teacher = build_model(state.get("model_kwargs") or self.kwargs)
 			migrate_subtypes(state, self.teacher)
