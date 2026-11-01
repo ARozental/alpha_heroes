@@ -1,3 +1,4 @@
+import math
 import torch
 
 from battle_model.train import WeightAverage
@@ -90,4 +91,21 @@ def test_campaign_permits_cover_the_games_an_update_needs():
 	learner = SimpleNamespace(waiting_decisions=lambda: 100_000, waiting_games=lambda: 12)
 	supply = SimpleNamespace(campaign=learner, shared=shared, received=0, game_decisions=7000.0, config=SimpleNamespace(ahead=3.0, campaign=SimpleNamespace(decisions_per_update=32768, min_games_per_update=20)))
 	Supply.allow(supply)
-	assert shared.permits.value == 20 - 12 - 3  # (the decisions alone wanted none)
+	assert shared.permits.value == math.ceil((3.0 * 20 * 7000 - 100_000) / 7000 - 3)  # (`ahead` updates of 20 games, not of 32,768 decisions)
+
+
+def test_campaign_permits_keep_games_playing_while_an_update_waits_and_runs():
+	"""joint7 (2026-11-01, ~12,000 decisions a game): `ahead` updates of decisions alone were 8 games, so once an
+	update's 20 were in or playing no game started, and the slots stayed empty through the update. With the update's 20
+	games in and none playing, the permits keep the slots full."""
+	import threading
+	from types import SimpleNamespace
+
+	from battle_model.supply import Supply
+
+	value = lambda v: SimpleNamespace(value=v)  # noqa: E731
+	shared = SimpleNamespace(lock=threading.Lock(), started=value(0), permits=value(0))
+	learner = SimpleNamespace(waiting_decisions=lambda: 240_000, waiting_games=lambda: 20)
+	supply = SimpleNamespace(campaign=learner, shared=shared, received=0, game_decisions=12_000.0, config=SimpleNamespace(ahead=3.0, campaign=SimpleNamespace(decisions_per_update=32768, min_games_per_update=20)))
+	Supply.allow(supply)
+	assert shared.permits.value == 40  # (3 updates of 20 games, one of them in)

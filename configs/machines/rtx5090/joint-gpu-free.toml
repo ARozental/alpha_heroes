@@ -59,7 +59,9 @@ remote_slots = 0
 # Three updates' worth of campaign games finished and in flight (supply.py): with two, the permits emptied the pipeline
 # during each 150 s update (5 of 20 games running) and the trainer then waited for the next batch of games (GPU 62%
 # against 74%, 2026-10-31 01:14). Labels of games waiting two versions are redone in the labeler (learner._relabel_waiting)
-ahead = 3.0
+# 1.5 since 2026-11-01 (the permits now count an update as its 20 games' decisions, ~240k, not 32,768: 3 of those would
+# hold 60 long games' records in the learner, ~140 MB each, on a machine the memory guard stopped at 3 waiting updates)
+ahead = 1.5
 
 [campaign]
 # Campaign games at once here, at most (a VCMI client ~0.15 GB and its loader worker ~0.17 GB real). 24 reached the memory

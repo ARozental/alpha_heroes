@@ -345,7 +345,10 @@ class CampaignLearner:
 		oldest are dropped (counted)."""
 		config = self.config
 		with self.lock:
-			while len(self.finished) > config.min_games_per_update and sum(len(g.decisions) for g, _ in self.finished[1:]) >= DROP_BEYOND * config.decisions_per_update:
+			# (an update's worth: its decisions or its games' as the permits count it, whichever is more)
+			mean = sum(len(g.decisions) for g, _ in self.finished) / max(1, len(self.finished))
+			update = max(config.decisions_per_update, config.min_games_per_update * mean)
+			while len(self.finished) > config.min_games_per_update and sum(len(g.decisions) for g, _ in self.finished[1:]) >= DROP_BEYOND * update:
 				self.stats["dropped_games"] += 1
 				dropped, _ = self.finished.pop(0)
 				getattr(self, "label_futures", {}).pop(id(dropped), None)

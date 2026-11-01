@@ -655,7 +655,12 @@ class Supply:
 		games = self.campaign.waiting_games() if hasattr(self.campaign, "waiting_games") else 0
 		with self.shared.lock:
 			in_flight = max(0, self.shared.started.value - self.received)
-			want = (self.config.ahead * config.decisions_per_update - waiting) / max(self.game_decisions, 1.0) - in_flight
+			# An update takes decisions_per_update decisions and min_games_per_update games, whichever is more: with long
+			# games (joint7's ~12,000 decisions) `ahead` updates of decisions alone were 8 games, fewer than one update's
+			# 20, so once 20 were in or playing none started, the slots emptied while the update waited for the slowest
+			# and stayed empty through it (2026-11-01: 0 games for the 15 minutes of an update)
+			update = max(config.decisions_per_update, config.min_games_per_update * self.game_decisions)
+			want = (self.config.ahead * update - waiting) / max(self.game_decisions, 1.0) - in_flight
 			# And enough games for an update: with long games (joint7's ~7,000 decisions) a few were the decisions of
 			# `ahead` updates, the permits fell to 0, and the learner waited for its min_games_per_update forever
 			want = max(want, config.min_games_per_update - games - in_flight)
