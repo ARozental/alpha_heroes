@@ -209,6 +209,15 @@ public:
 
 	void playerBlocked(int reason, bool start) override;
 	void heroVisit(const CGHeroInstance * visitor, const CGObjectInstance * visitedObj, bool start) override;
+	// The events Nullkiller2's memory follows, passed on to the advising one (Advice.cpp): it knows what a seated
+	// Nullkiller2 would (the user, 2026-10-31: better too much than too little). Only these: its handlers of questions
+	// and visits keep the status its actions wait on
+	void objectRemoved(const CGObjectInstance * obj, const PlayerColor & initiator) override;
+	void newObject(const CGObjectInstance * obj) override;
+	void tileRevealed(const FowTilesType & pos) override;
+	void tileHidden(const FowTilesType & pos) override;
+	void objectPropertyChanged(const SetObjectProperty * sop) override;
+	void heroCreated(const CGHeroInstance * hero) override;
 	void battleStart(const BattleID & battleID, const CCreatureSet * army1, const CCreatureSet * army2, int3 tile, const CGHeroInstance * hero1, const CGHeroInstance * hero2, BattleSide side, bool replayAllowed) override;
 	void battleEnd(const BattleID & battleID, const BattleResult * br, QueryID queryID) override;
 	void battleResultsApplied() override;

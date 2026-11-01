@@ -150,3 +150,42 @@ std::string AlphaMapAI::adviceJson() const
 		unmatched += (unmatched.empty() ? "\"" : ", \"") + kind + "\": " + std::to_string(count);
 	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
 }
+
+// The events of a seated Nullkiller2's memory (AlphaMapAI.h), passed on to the advising one; none of our own uses them
+#ifdef ALPHA_MAP_NK2_ADVICE
+#define ALPHA_ADVISE(call) \
+	if(advisor) \
+		advisor->nk2->call;
+#else
+#define ALPHA_ADVISE(call)
+#endif
+
+void AlphaMapAI::objectRemoved(const CGObjectInstance * obj, const PlayerColor & initiator)
+{
+	ALPHA_ADVISE(objectRemoved(obj, initiator))
+}
+
+void AlphaMapAI::newObject(const CGObjectInstance * obj)
+{
+	ALPHA_ADVISE(newObject(obj))
+}
+
+void AlphaMapAI::tileRevealed(const FowTilesType & pos)
+{
+	ALPHA_ADVISE(tileRevealed(pos))
+}
+
+void AlphaMapAI::tileHidden(const FowTilesType & pos)
+{
+	ALPHA_ADVISE(tileHidden(pos))
+}
+
+void AlphaMapAI::objectPropertyChanged(const SetObjectProperty * sop)
+{
+	ALPHA_ADVISE(objectPropertyChanged(sop))
+}
+
+void AlphaMapAI::heroCreated(const CGHeroInstance * hero)
+{
+	ALPHA_ADVISE(heroCreated(hero))
+}
