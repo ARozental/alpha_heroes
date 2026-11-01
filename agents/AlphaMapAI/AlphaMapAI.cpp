@@ -3,6 +3,7 @@
 
 #include "InferenceClient.h"
 #include <chrono>
+#include <optional>
 #include <thread>
 #include "Ledger.h"
 
@@ -140,6 +141,7 @@ void AlphaMapAI::initGameInterface(std::shared_ptr<Environment> environment, std
 	inferenceSocket = ::env("ALPHA_MAP_INFERENCE_SOCKET");
 	requireModel = !::env("ALPHA_MAP_REQUIRE_MODEL", "").empty();
 	connectInference(requireModel);
+	initAdvice();
 	logAi->info("AlphaMapAI %s: model %s, day cap %d", color, modelName, dayCap);
 }
 
@@ -238,7 +240,19 @@ void AlphaMapAI::makeTurn()
 			if(cb->getPlayerStatus(playerID, false) != EPlayerStatus::INGAME)
 				return;
 			auto decision = encode(DecisionKind::TURN);
-			const auto choice = decide(decision);
+			std::optional<Choice> advice; // (Nullkiller2's, at this decision's chance: before ours, in the same state)
+			if(advisor)
+			{
+				std::uniform_real_distribution<double> uniform(0.0, 1.0);
+				bool asked;
+				{
+					std::scoped_lock lock(rngMutex);
+					asked = uniform(rng) < adviceProbability;
+				}
+				if(asked)
+					advice = advise(decision);
+			}
+			const auto choice = decide(decision, advice);
 			if(choice.type <= static_cast<int>(ActionType::END))
 				break;
 			const bool changed = execute(decision, choice);
@@ -514,7 +528,7 @@ void AlphaMapAI::connectInference(bool waiting)
 	}
 }
 
-Choice AlphaMapAI::decide(Decision & decision)
+Choice AlphaMapAI::decide(Decision & decision, const std::optional<Choice> & advice)
 {
 	Choice choice;
 	try
@@ -570,6 +584,11 @@ Choice AlphaMapAI::decide(Decision & decision)
 		entry.decisionsToday = decisionsToday;
 		entry.version = version;
 		entry.choice = choice;
+		if(advice)
+		{
+			entry.advice = advice;
+			entry.flags |= RECORD_ADVICE;
+		}
 		for(int k = 0; k < N_VALUE_OFFSETS; ++k)
 			entry.value[k] = outputs[Out::value][k];
 		entry.inputs = inputs;
@@ -735,6 +754,12 @@ void AlphaMapAI::sendRecords(bool final)
 					put<float>(out, v);
 				put<uint32_t>(out, r.flags);
 				put<uint32_t>(out, static_cast<uint32_t>(r.inputs.size()));
+				if(r.flags & RECORD_ADVICE) // (Nullkiller2's choice there: its type, entry, tile)
+				{
+					put<int32_t>(out, r.advice->type);
+					put<int32_t>(out, r.advice->index);
+					put<int32_t>(out, r.advice->cell);
+				}
 			};
 			auto deflate = [](const std::string & raw)
 			{
@@ -777,7 +802,7 @@ void AlphaMapAI::sendRecords(bool final)
 			sendToRecordServer(recordSocket, gameKey + ":" + color + ":battle#" + std::to_string(battlesSent++), battleJson);
 		if(final)
 		{
-			const auto summary = "{\"errors\": " + std::to_string(errors) + ", \"failed_actions\": " + std::to_string(failedActions) + teacherJson() + "}";
+			const auto summary = "{\"errors\": " + std::to_string(errors) + ", \"failed_actions\": " + std::to_string(failedActions) + teacherJson() + adviceJson() + "}";
 			sendToRecordServer(recordSocket, gameKey + ":" + color + ":done", summary);
 		}
 	}

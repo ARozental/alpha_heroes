@@ -309,7 +309,7 @@ def excess_loss(logits, targets):
 	return F.binary_cross_entropy_with_logits(logits, targets, reduction="none") - floor
 
 
-STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl", "teacher_kl")  # a step's metrics, in ppo_update's order
+STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl", "teacher_kl", "teacher_ce")  # a step's metrics, in ppo_update's order
 # The teacher's outputs its KL reads (teacher_kl), put in each micro-batch as "t:<name>"
 TEACHER_OUTPUTS = ("type_logp", "option_logp") + tuple(output for output, _ in HEADS.values())
 
@@ -462,6 +462,12 @@ def micro_loss(out, batch, config, foresight_config=None):
 	if "t:type_logp" in batch:  # the teacher's KL (ppo_update's teacher), at its weight (a tensor: a recorded step reads it)
 		teacher_part = (teacher_kl(out, batch) * keep).sum() / batch["count_keep"]
 		loss = loss + batch["teacher_weight"] * teacher_part
+	advice_part = torch.zeros((), device=keep.device)
+	if "advice_action" in batch:  # Nullkiller2's advice (config.nk2_advice): its choice's cross-entropy, at the teacher's weight
+		advised = batch["advised"] * keep
+		advice_logp, _ = chosen_logp(out, {"kind": batch["kind"], "action": batch["advice_action"], "index": batch["advice_index"], "cell": batch["advice_cell"]})
+		advice_part = -(torch.where(advised > 0, advice_logp, torch.zeros_like(advice_logp)) * advised).sum() / batch["count_advised"]
+		loss = loss + batch["teacher_weight"] * advice_part
 	fs_parts = fs_share = None
 	labels = {name[3:]: value for name, value in batch.items() if name.startswith("fs:")}
 	if labels and "fs_turn" in out:
@@ -478,6 +484,7 @@ def micro_loss(out, batch, config, foresight_config=None):
 		(((ratio - 1).abs() > config.clip).float() * keep).sum() / batch["count_keep"],  # clip_fraction
 		(((drift.exp() - 1) - drift) * keep).sum() / batch["count_keep"],  # kl: k3, before this step
 		teacher_part.detach(),  # teacher_kl
+		advice_part.detach(),  # teacher_ce
 	]).float()
 	return loss, metrics, fs_parts, fs_share
 
@@ -512,6 +519,14 @@ def ppo_update(
 	convert = inputs_on_device if decode is None and device.type == "cuda" else None
 	decode = decode or ((lambda rows: decode_wire([decisions[r] for r in rows])) if convert else (lambda rows: decode_inputs([decisions[r] for r in rows])))
 	choice = {name: torch.from_numpy(value).to(device) for name, value in choices(decisions).items()}
+	# Nullkiller2's advice (config.nk2_advice), where a decision has it: its type, entry and tile; advised 1 there
+	advice_t = None
+	if any(d.advice is not None for d in decisions):
+		advice = np.array([d.advice if d.advice is not None else (0, 0, -1) for d in decisions], dtype=np.int64).reshape(-1, 3)
+		advice_t = {
+			"advice_action": torch.from_numpy(advice[:, 0]).to(device), "advice_index": torch.from_numpy(advice[:, 1]).to(device), "advice_cell": torch.from_numpy(advice[:, 2]).to(device),
+			"advised": torch.tensor([d.advice is not None for d in decisions], dtype=torch.float32, device=device),
+		}
 	if advantages is None:
 		baseline = choice["old_value"] @ torch.tensor(weights, dtype=torch.float32, device=device)
 		advantage = torch.from_numpy(np.asarray(returns, dtype=np.float32)).to(device) - baseline
@@ -661,6 +676,8 @@ def ppo_update(
 			# up to the whole minibatch's, at 1 / micro_batches of its peak memory (2026-10-28: the update's ~8 GB on
 			# Apple's GPU next to the battle learner's sent the machine into swap)
 			counts = {"credit": (whole * credited[index].float()).sum().clamp(min=1), "keep": whole.sum().clamp(min=1), "share": share_valid[index].sum(dim=0)}
+			if advice_t is not None:
+				counts["advised"] = (whole * advice_t["advised"][index]).sum().clamp(min=1)
 			if growth is not None:
 				counts["growth"] = growth_valid[index].sum(dim=0)
 			if end is not None:
@@ -682,6 +699,8 @@ def ppo_update(
 					batch.update(growth=growth_t[sub], growth_valid=growth_valid[sub], count_growth=counts["growth"])
 				if end is not None:
 					batch.update(end=end_t[sub], end_valid=end_valid[sub], count_end=counts["end"])
+				if advice_t is not None:  # Nullkiller2's advice, at the teacher's weight
+					batch.update({name: value[sub] for name, value in advice_t.items()}, count_advised=counts["advised"], teacher_weight=teacher_weight_t)
 				if foresight_t is not None:
 					batch.update({"fs:" + name: value[sub] for name, value in foresight_t.items()})
 				if teacher is not None:  # the teacher's distributions on the same inputs

@@ -72,12 +72,14 @@ struct Record
 	Choice choice;
 	std::array<float, MapSchema::N_VALUE_OFFSETS> value{};
 	uint32_t flags = 0; // RECORD_NO_EFFECT: the action was carried out and changed nothing
+	std::optional<Choice> advice; // Nullkiller2's choice in the same state (RECORD_ADVICE: Advice.cpp)
 	std::string inputs; // wire encoded
 	uint64_t serial = 0; // this player's count of records so far (not sent)
 };
 
 constexpr uint32_t RECORD_NO_EFFECT = 1;
 constexpr uint32_t RECORD_TEACHER = 2; // Nullkiller2's decision (Teacher.cpp): its choice is the teacher's, no model's probability
+constexpr uint32_t RECORD_ADVICE = 4; // our decision with Nullkiller2's choice in the same state beside it (Advice.cpp)
 
 /// Adventure-map AI: every decision is the campaign model's (campaign_model/), asked of the inference server; battles
 /// are played by the configured battle AI. Built on Nullkiller2's patterns for threads and queries (AIGateway).
@@ -156,6 +158,22 @@ class AlphaMapAI : public CAdventureAI
 	int teacherApproximate = 0;
 	std::map<std::string, int> teacherUnmatched;
 	std::map<QueryID, Decision> teacherQuestions; // (asked, not yet answered: under recordsMutex)
+
+	// Nullkiller2's advice (Advice.cpp; ALPHA_MAP_NK2_ADVICE: the chance a turn decision gets it, 0 off): a Nullkiller2
+	// of this player's, its requests going to a client that sends none; asked before a sampled decision of ours what
+	// it would do there, its first request stops it and is matched to our legal entry (matchRequest)
+	struct Advisor;
+	std::shared_ptr<Advisor> advisor;
+	double adviceProbability = 0;
+	int advised = 0;
+	int adviceMatched = 0;
+	double adviceSeconds = 0;
+	std::map<std::string, int> adviceUnmatched;
+	void initAdvice();
+	std::optional<Choice> advise(const Decision & decision);
+	std::string adviceJson() const;
+	// A request of Nullkiller2's as our turn decision's legal entry doing the same; false (unmatched: why) when none
+	bool matchRequest(const Decision & decision, const CPackForServer * pack, Choice & choice, bool & exact, std::string & unmatched) const;
 	std::string teacherJson() const;
 
 public:
@@ -211,7 +229,7 @@ private:
 	void exchange(ObjectInstanceID first, ObjectInstanceID second, QueryID queryID);
 
 	// The model (AlphaMapAI.cpp)
-	Choice decide(Decision & decision);
+	Choice decide(Decision & decision, const std::optional<Choice> & advice = std::nullopt);
 	void noEffect(const Choice & choice);
 	Choice sample(const Decision & decision, const Outputs & outputs);
 	void record(const Decision & decision, const Choice & choice, const Outputs & outputs, uint32_t version);

@@ -446,6 +446,8 @@ class Runner:
 		for i, color in enumerate(COLORS):
 			settings[f"ALPHA_BATTLE_RECORD_KEY_{color}"] = f"{key}:{color}"
 			settings[f"ALPHA_BATTLE_SEED_{color}"] = str(seed * 101 + i)
+		if self.config.campaign.nk2_advice > 0:  # (a training game: Nullkiller2's advice on some of our decisions)
+			settings["ALPHA_MAP_NK2_ADVICE"] = str(self.config.campaign.nk2_advice)
 		return tuple(settings.items())
 
 	def campaign(self, spec, stop=None):

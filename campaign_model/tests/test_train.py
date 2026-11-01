@@ -268,3 +268,23 @@ def test_an_update_with_the_schedule_credit_weighs_the_share_by_the_day():
 	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, np.zeros(8, dtype=np.float32), config, decode=decode, growth_real=growth_real)
 	assert metrics["schedule_share_weight"] == pytest.approx(0.12)
 	assert metrics["steps"] >= 1 and np.isfinite(metrics["kl"])
+
+
+def test_an_update_with_nk2s_advice_moves_toward_its_choices():
+	"""Decisions advised by Nullkiller2 (Decision.advice): the update's teacher cross-entropy raises their probability."""
+	import dataclasses
+
+	torch.manual_seed(6)
+	model = CampaignModel(dim=32, cell_dim=16, layers=1)
+	x = random_inputs(16, seed=12)
+	sampled = decisions_for(model.eval(), x)
+	decisions = [dataclasses.replace(d, advice=(d.action_type, d.index, d.cell)) if i % 2 == 0 else d for i, d in enumerate(sampled)]
+	tensors = {k: torch.from_numpy(v) for k, v in x.items()}
+	advised = [i for i in range(16) if i % 2 == 0]
+	measure = lambda: float(chosen_logp(model.eval()(tensors), choice_tensors([decisions[i] for i in range(16)]))[0][advised].mean().detach())  # noqa: E731
+	before = measure()
+	config = CampaignConfig(batch_size=8, passes=4, teacher_kl=5.0, target_kl=0.0)
+	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
+	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-3), decisions, np.full((16, c.N_VALUE_OFFSETS), 0.5, dtype=np.float32), np.full(16, 0.5, dtype=np.float32), config, decode=decode)
+	assert metrics["teacher_ce"] > 0
+	assert measure() > before

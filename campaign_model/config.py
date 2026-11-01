@@ -135,6 +135,12 @@ class CampaignConfig:
 	# leave it. 0: off
 	teacher_checkpoint: str = ""
 	teacher_kl: float = 0.0
+	# Nullkiller2's advice (agents/AlphaMapAI/Advice.cpp; the user, 2026-10-31: "a real teacher"): the chance a training
+	# game's turn decision is also asked of a Nullkiller2 in the same state; the update adds the cross-entropy of the
+	# model's probabilities toward its choice on those decisions, at the teacher's weight (teacher_mix "score": dominant
+	# while it is much better, small once we are; teacher_kl before the first evaluation). 0: off (the default). Each
+	# advice is ~15-30 ms of a game's CPU
+	nk2_advice: float = 0.0
 	# The KL a decision is kept near (0: teacher_kl stays the weight): after each update the weight is x1.5 when the
 	# update's teacher KL was over 1.5 x this, /1.5 when under 1/1.5 of it (the PPO KL control's rule), within 0.01..10.
 	# PPO moves the policy ~target_kl an update, in a random direction where the credit is noise: unanchored, the clone

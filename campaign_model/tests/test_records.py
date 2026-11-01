@@ -85,3 +85,21 @@ def test_inputs_decoded_on_a_device_are_the_inputs():
 	for name in want:
 		assert got[name].shape == want[name].shape and str(got[name].dtype).replace("torch.", "") == {"bool": "bool", "int64": "int64", "float32": "float32"}[str(want[name].dtype)]
 		np.testing.assert_array_equal(got[name].cpu().numpy(), want[name])
+
+
+def test_a_record_with_nk2s_advice_reads_back_with_it():
+	"""AMZ2 with RECORD_ADVICE: the advice's three integers right after the header (AlphaMapAI::sendRecords)."""
+	import struct
+	import zlib
+
+	from campaign_model import constants as c
+	from campaign_model.records import ADVICE, ADVICE_FIELDS, HEADER, IN_BYTES, parse_records
+
+	raw = bytes(IN_BYTES)
+	packed = zlib.compress(raw, 1)
+	values = [0.5] * c.N_VALUE_OFFSETS
+	plain = HEADER.pack(3, c.DecisionKind.TURN, 0, 7, c.ActionType.MOVE, 12, -1, -0.5, *values, 0, IN_BYTES) + struct.pack("<I", len(packed)) + packed
+	advised = HEADER.pack(3, c.DecisionKind.TURN, 1, 7, c.ActionType.MOVE, 12, -1, -0.5, *values, ADVICE, IN_BYTES) + ADVICE_FIELDS.pack(c.ActionType.BUILD, 40, -1) + struct.pack("<I", len(packed)) + packed
+	decisions = parse_records("RED", b"AMZ2" + struct.pack("<I", 2) + plain + advised)
+	assert decisions[0].advice is None and decisions[1].advice == (c.ActionType.BUILD, 40, -1)
+	assert decisions[1].index == 12 and zlib.decompress(decisions[1].inputs) == raw
