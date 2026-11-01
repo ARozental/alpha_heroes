@@ -110,7 +110,8 @@ class StepGraph:
 
 	fn(out, batch) -> (loss, *outputs): tensors only, nothing read to the host. A graph is recorded per shape of the
 	inputs and the batch, and checked the first time against the eager step on the same micro-batch (its gradient and
-	outputs); one that differs, or that could not be recorded, is dropped for good and the caller steps eagerly."""
+	outputs); one that differs, that could not be recorded or whose check found no memory, is dropped for good and the
+	caller steps eagerly."""
 
 	TOLERANCE = 1e-3  # the largest gradient difference, relative to the largest gradient (TF32 matmuls: ~1e-3 each)
 
@@ -173,9 +174,17 @@ class StepGraph:
 	def _first(self, entry, key, inputs, batch):
 		"""The first replay, checked against the eager step on the same micro-batch; the gradient added either way."""
 		params = self._params()
-		loss, *eager_outputs = self.fn(self.model(inputs), batch)
-		eager = torch.autograd.grad(loss, params, allow_unused=True)
-		del loss
+		try:
+			loss, *eager_outputs = self.fn(self.model(inputs), batch)
+			eager = torch.autograd.grad(loss, params, allow_unused=True)
+			del loss
+		except torch.OutOfMemoryError as error:
+			# The eager step beside the recorded one's pool did not fit (2026-11-01: joint7's first update, under the 27 GB
+			# cap, a run's end): the graph is dropped, its pool freed once the caller lets go of it, and the caller steps
+			# eagerly (nothing was added to .grad)
+			self.entries[key] = None
+			print(f"campaign step graph: no memory for its check ({str(error)[:160]}): dropped, eager steps", flush=True)
+			return None
 		before = [p.grad.clone() for p in params]
 		entry["graph"].replay()
 		recorded = [p.grad - b for p, b in zip(params, before)]

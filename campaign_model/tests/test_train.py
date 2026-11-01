@@ -308,3 +308,17 @@ def test_an_update_with_nk2s_advice_moves_toward_its_choices():
 	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-3), decisions, np.full((16, c.N_VALUE_OFFSETS), 0.5, dtype=np.float32), np.full(16, 0.5, dtype=np.float32), config, decode=decode)
 	assert metrics["teacher_ce"] > 0
 	assert measure() > before
+
+
+def test_a_step_graph_whose_check_finds_no_memory_is_dropped_and_the_step_goes_eager():
+	from campaign_model.graphs import StepGraph
+
+	def no_memory(out, batch):
+		raise torch.OutOfMemoryError("CUDA out of memory (a test)")
+
+	model = CampaignModel(dim=32, cell_dim=16, layers=1)
+	graph = StepGraph(model, no_memory)
+	graph.entries["key"] = {"checked": False}
+	inputs = {k: torch.from_numpy(v) for k, v in random_inputs(2, seed=1).items()}
+	assert graph._first(graph.entries["key"], "key", inputs, {}) is None and graph.entries["key"] is None
+	assert all(p.grad is None for p in model.parameters())  # (nothing added: the caller's eager step adds it)
