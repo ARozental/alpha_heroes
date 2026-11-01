@@ -79,12 +79,19 @@ class TeacherPlay(torch.utils.data.IterableDataset):
 		for n in itertools.count():
 			seed = (self.seed * 100 + worker) * 100000 + n
 			players, size, days = rng.choice(config.players), rng.choice(config.sizes), draw_days(rng, config)
-			map_name = make_map(seed, players, size, config.levels, config.water)[0]
+			try:
+				map_name = make_map(seed, players, size, config.levels, config.water)[0]
+			except Exception as error:  # (VCMI's generator hangs on some seeds: make_map's timeout; the next seed)
+				print(f"imitate: worker {worker}: no map for seed {seed} ({type(error).__name__}): the next one", flush=True)
+				continue
 			run = GameRun(battle_play.SOCKET_DIR / "teacher-none.sock", map_name, days, seed, max_seconds=self.game_seconds, battle_ai="BattleAI", game_key=f"s{seed}", teacher=True)
 			try:
 				while not run.poll():
 					time.sleep(0.5)
 				game, _ = run.result()
+			except Exception as error:  # (a game that failed: the next one; an exception here ended the worker, 2026-10-31)
+				print(f"imitate: worker {worker}: game {seed} failed ({type(error).__name__}: {str(error)[:200]}): the next one", flush=True)
+				continue
 			finally:
 				run.terminate()
 				(battle_play.USER_DIR / (map_name + ".vmap")).unlink(missing_ok=True)
@@ -110,7 +117,15 @@ class StreamPool:
 		threading.Thread(target=self._fill, args=(loader,), daemon=True).start()
 
 	def _fill(self, loader):
-		for stream in loader:
+		streams = iter(loader)
+		while True:
+			try:
+				stream = next(streams)
+			except StopIteration:
+				return
+			except Exception as error:  # (a worker's error: it ended this thread, and training waited forever, 2026-10-31)
+				print(f"imitate: FAILURE: a worker raised ({type(error).__name__}: {str(error)[:300]}): the others go on", flush=True)
+				continue
 			with self.lock:
 				while len(self.items) >= self.size and not self.closed:
 					self.lock.wait()
