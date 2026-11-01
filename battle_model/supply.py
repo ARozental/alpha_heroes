@@ -49,7 +49,7 @@ from .constants import MAX_UNITS, N_HEXES, ActionType
 from .data import SPARSE_INPUTS, Sparse, battle_examples, check_record, collate, compact_record, version_of
 from .losses import normalize_advantages
 
-MEMORY_FLOOR_GB = 6.0  # no new game here under this much available memory (Linux; elsewhere unknown: no limit). Games grow after they start (a VCMI client, the worker's arrays), and runtime/memwatch.sh stops a run under 1.5 GB: it did, 2026-10-30 23:27. 6, not 4.5 (2026-11-01 12:21 CST): joint7 sat at the floor from 11:30, and a campaign update's growth (~3.5 GB at 104k decisions) with an eval beside it took the rest
+MEMORY_FLOOR_GB = 6.0  # no new game here under this much available memory (Linux; elsewhere unknown: no limit). Games grow after they start (a VCMI client, the worker's arrays), and runtime/memwatch.sh stops a run under 1.5 GB: it did, 2026-10-30 23:27. The trainer's own swing is kept free besides (memory_allows); the floor is for the games' growth after they start (6, not 4.5, since 2026-11-01 13:20 CST), and what still runs past it the guard sheds a game at a time (runtime/memwatch.sh)
 SLOT_HELLO_SECONDS = 30
 NEUTRAL_AI = "BattleAI"  # the wandering monsters' battle AI in generated battles, as in a campaign game
 TRACE_EVERY = 20  # worker 0 keeps the compact record of one battle in this many, for the run's traces
@@ -89,9 +89,40 @@ def inference_ready(address, family):
 		socket.setdefaulttimeout(before)
 
 
-def memory_allows():
+def process_gb(pid, field):
+	"""A process's VmRSS or VmHWM (its peak resident memory) in GB on Linux, else None."""
+	try:
+		with open(f"/proc/{pid}/status") as status:
+			return next(int(line.split()[1]) for line in status if line.startswith(field + ":")) / 2**20
+	except (OSError, StopIteration):
+		return None
+
+
+SHARED = None  # the trainer's Shared (Supply sets it): memory_allows() in the trainer's process (the campaign eval)
+
+
+def memory_allows(shared=None):
+	"""Whether a game may start here: the memory available, less the trainer's way back to its peak, over the floor.
+	The trainer's memory swings ~5 GB each campaign update (it frees the update's buffers after it, takes them back in
+	the next); games let in at its low point took what the next update needed, and the guard stopped joint7 at 1.06 GB
+	(2026-11-01 12:21 CST: the trainer 9.6 -> 13.2 GB in update 49, the unit 18.9 -> 25.1 GB in 4.5 minutes). Its
+	peak: its own (VmHWM), or the one recorded in the run's directory by an earlier process of the run, the higher."""
 	free = available_gb()
-	return free is None or free >= MEMORY_FLOOR_GB
+	if free is None:
+		return True
+	shared = shared or SHARED
+	if shared is None:
+		return free >= MEMORY_FLOOR_GB
+	rss, peak = process_gb(shared.trainer, "VmRSS"), process_gb(shared.trainer, "VmHWM")
+	if rss is None or peak is None:
+		return free >= MEMORY_FLOOR_GB
+	if peak > shared.peak.value + 0.1:  # a new peak, for the run's next process
+		shared.peak.value = peak
+		try:
+			Path(shared.peak_file).write_text(f"{peak:.2f}\n")
+		except OSError:
+			pass
+	return free - max(0.0, max(peak, shared.peak.value) - rss) >= MEMORY_FLOOR_GB
 
 
 def peer_closed(conn):
@@ -189,8 +220,15 @@ def assemble(items, advantage_config):
 class Shared:
 	"""Counters the workers and the trainer share (the loader's context: inherited by the workers)."""
 
-	def __init__(self, ctx, ceilings):
+	def __init__(self, ctx, ceilings, peak_file):
 		self.lock = ctx.Lock()
+		self.trainer = os.getpid()  # (memory_allows: its peak is kept free)
+		self.peak_file = str(peak_file)
+		try:
+			peak = float(Path(peak_file).read_text())
+		except (OSError, ValueError):
+			peak = 0.0
+		self.peak = ctx.Value("d", peak, lock=False)  # the trainer's highest memory in this run (GB), any of its processes
 		self.ceilings = dict(ceilings)  # kind -> games of it at once on this machine
 		self.local = {kind: ctx.Value("i", 0, lock=False) for kind in ceilings}  # playing here now
 		self.remote = {kind: ctx.Value("i", 0, lock=False) for kind in ceilings}  # playing on remote slots now
@@ -219,10 +257,11 @@ class Games(IterableDataset):
 		"""("here", None), ("remote", connection) or None (nothing free now): local first, then a remote slot."""
 		shared, kind = self.shared, self.kind
 		with shared.lock:
-			if shared.local[kind].value < shared.ceilings[kind] and memory_allows():
+			if shared.local[kind].value < shared.ceilings[kind] and memory_allows(shared):
 				shared.local[kind].value += 1
 				return "here", None
-		if self.listener is not None:
+		# A remote slot's game takes memory here too (its worker holds what it played), so it waits for the floor as well
+		if self.listener is not None and memory_allows(shared):
 			conn = self._accept_slot()
 			if conn is not None:
 				with shared.lock:
@@ -553,8 +592,10 @@ class Supply:
 		if hasattr(self.ctx, "set_forkserver_preload"):
 			self.ctx.set_forkserver_preload(["battle_model.supply"])  # (torch and the models' code imported once, inherited)
 		ceilings = {"battle": config.generated_actors, **({"campaign": config.campaign.games} if campaign else {})}
-		self.shared = Shared(self.ctx, ceilings)
+		self.shared = Shared(self.ctx, ceilings, self.out / "memory-peak-gb")
 		self.shared.version.value = pool.version
+		global SHARED
+		SHARED = self.shared
 		self.token = remote.token(config)
 		self.listener = socket.create_server(("0.0.0.0", config.remote_port + remote.SLOT_PORT), backlog=64) if config.remote_port and config.remote_slots else None
 		battle_sockets = list(pool.server.socket_paths)

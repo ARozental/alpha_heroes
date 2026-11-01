@@ -115,9 +115,7 @@ def evaluate(config, server, battle, version, epoch, stop=None, model="current")
 	def work(i):
 		seed, players, color = games[i]
 		with slots:
-			# Under the memory floor as the training's games are: 4 eval games of 3-4 VCMI clients each, started at once
-			# beside a 104k-decision update, took the PC from 4.7 to 1.06 GB available and the guard stopped joint7
-			# (2026-11-01 12:21 CST)
+			# Under the memory floor as the training's games are (supply.memory_allows: the trainer's peak kept free)
 			while not memory_allows() and not (stop is not None and stop.is_set()):
 				time.sleep(5)
 			play_one(i, seed, players, color)
