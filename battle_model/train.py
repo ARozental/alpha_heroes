@@ -475,13 +475,14 @@ class EvalStopped(Exception):
 	"""An eval round left unfinished: the run is stopping (play_eval's stop)."""
 
 
-def play_eval(games, model_path, config, label, stop=None):
+def play_eval(games, model_path, config, label, stop=None, reduce=None):
 	"""The records of the eval battles, played on config.eval_workers persistent battle processes (play.BattleProcess:
 	a VCMI start-up per 50 battles, not one per battle as play_in_groups), new ones each eval. Game i goes to worker
 	i % eval_workers, so every eval plays the same battles in the same processes in the same order. A battle that
 	fails or stalls is retried once in a new process, then left out (an eval stopped the run when
 	one battle stalled every time). Returns (the games played, their records). stop (threading.Event): once set, no
-	new battle starts and EvalStopped is raised."""
+	new battle starts and EvalStopped is raised. reduce(i, records): what is kept of game i's records, as each is
+	played (eval_round: its summary and failure counts; the full records of an eval round were ~5-6 GB in the trainer)."""
 	model_path = Path(model_path).resolve()  # VCMI runs in build/bin: paths must be absolute
 	n = min(config.eval_workers, len(games))
 	results, errors = [None] * len(games), []
@@ -495,6 +496,8 @@ def play_eval(games, model_path, config, label, stop=None):
 				for attempt in range(1, min(config.attempts, 2) + 1):  # greedy: a battle that stalls once mostly stalls again
 					try:
 						results[i] = process.play(games[i], model_path)
+						if reduce is not None:
+							results[i] = reduce(i, results[i])
 						break
 					except RuntimeError as error:
 						print(f"{label}: battle {i}, attempt {attempt} failed: {str(error)[:300]}", flush=True)
@@ -740,10 +743,15 @@ def eval_round(model, epoch, out, battle_map, config, baseline, name="", stop=No
 	export(cpu, model_path)
 	verify(cpu, model_path, seeds=(epoch,), batch_sizes=(2,))  # the eval plays this file, training the torch model: the same?
 	games = [g for g in eval_games(config, battle_map) if (g.our_side, g.game_seed) in baseline]  # (one the baseline failed has none)
-	played, records = play_eval(games, model_path, config, f"eval {epoch}", stop)
+	# Each battle's record reduced as it is played to its summary and failure counts (the full ones of a round, ~200
+	# battles, were held to the end: the trainer 5 -> 11.8 GB in eval 7925, 2026-11-01 20:39 CST), full only for the
+	# first few of each side (the traces: the first one played)
+	keep = {i for side in (0, 1) for i in [k for k, g in enumerate(games) if g.our_side == side][:3]}
+	played, reduced = play_eval(games, model_path, config, f"eval {epoch}", stop, reduce=lambda i, records: [(summarize(r.events), failure_counts([r]), r if i in keep else None) for r in records])
 	failed, games = len(games) - len(played), played
-	summaries = [summarize(r.events) for r in records]
-	write_traces(out, epoch, f"vs_{config.eval_opponent}_greedy{name}", [next(r for g, r in zip(games, records) if g.our_side == side) for side in (0, 1)])  # the first seed's
+	summaries = [summary for summary, _, _ in reduced]
+	traces = [next((r for g, (_, _, r) in zip(games, reduced) if g.our_side == side and r is not None), None) for side in (0, 1)]
+	write_traces(out, epoch, f"vs_{config.eval_opponent}_greedy{name}", [r for r in traces if r is not None])  # the first seed's
 	row = {"epoch": epoch}
 	rewards, baselines = [], []
 	for side, name in ((0, "attack"), (1, "defence")):
@@ -784,7 +792,10 @@ def eval_round(model, epoch, out, battle_map, config, baseline, name="", stop=No
 	row["hard_kinds"] = {k: round(sum(v) / len(v), 4) for k, v in sorted(kinds.items())}
 	row["score_worst"] = round(min(sets), 4) if sets else float("nan")
 	row["mean_vs_baseline"] = round((sum(rewards) - sum(baselines)) / len(rewards), 4)
-	row.update(failure_modes(records))
+	counts = failure_counts([])  # (every name, as over no record)
+	for _, part, _ in reduced:
+		add_failure_counts(counts, part)
+	row.update(failure_modes(counts=counts))
 	row["failed_battles"] = failed
 	row["seconds"] = round(time.time() - started, 1)
 	row["rewards"] = {(g.our_side, g.game_seed, eval_set(g)): s.reward for g, s in zip(games, summaries)}  # (not a column: for paired comparisons)
