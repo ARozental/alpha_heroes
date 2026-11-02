@@ -50,19 +50,16 @@ from .constants import (
 	EFFECT_VOCAB,
 	GATE_STATE_VOCAB,
 	HERO_TYPE_VOCAB,
-	MASKED_LOGIT,
 	N_ACTION_TYPES,
 	N_HEXES,
 	N_SECONDARY_SKILLS,
 	N_SIDES,
 	N_SPELLS,
-	N_VALUE_HORIZONS,
 	OBSTACLE_ID_VOCAB,
 	OBSTACLE_TYPE_VOCAB,
 	SECOND_TARGET_KIND,
 	WALL_STATE_VOCAB,
 	ActionType,
-	TargetKind,
 )
 from .layers import ActionScore, Block, ValueHeads, best_of, masked_log_softmax, small_embedding, vocab_index
 

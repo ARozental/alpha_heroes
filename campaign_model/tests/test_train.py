@@ -183,7 +183,7 @@ def test_heads_that_know_only_the_player_count_explain_nothing():
 	assert np.allclose([d.value for d in decisions], prior[:, None], atol=1e-6)
 	labels = np.repeat((prior + np.random.default_rng(0).normal(0, 0.02, 8)).astype(np.float32)[:, None], c.N_VALUE_OFFSETS, axis=1)
 	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
-	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, labels, np.zeros(8, dtype=np.float32), CampaignConfig(batch_size=4, passes=1), decode=decode)
+	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, labels, np.zeros(8, dtype=np.float32), CampaignConfig(batch_size=4, passes=1, credit="horizon", share_target="share"), decode=decode)  # (share heads: no longer the default)
 	assert all(abs(metrics[f"value_ev_d{k}"]) < 1e-5 for k in c.VALUE_OFFSETS)  # (plain EV here: ~0.97)
 
 

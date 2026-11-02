@@ -89,6 +89,28 @@ a battle decision, compressed); what it made (training arrays, finished games) g
    7700-7760`). Check from a worker with the run started: `nc -vz <master's address> 7700`. Home network only: the token
    is the only lock.
 
+### The PC's long run (a service that loses nothing at a stop)
+
+The RTX 5090 PC runs the joint run as a user service in WSL (systemd), its settings in `runtime/advice_run.sh` (its
+header: why each one, and the memory budget the number of games comes from):
+
+```sh
+systemd-run --user --unit=alpha-joint7 -p KillSignal=SIGINT -p TimeoutStopSec=900 -p KillMode=mixed \
+  -p LimitNOFILE=65536 ~/projects/alpha_heroes/runtime/advice_run.sh        # resumes by itself when its run exists
+systemd-run --user --unit=alpha-joint7-keeper ~/projects/alpha_heroes/runtime/keeper.sh alpha-joint7 runtime/advice_run.sh
+```
+
+- `runtime/memwatch.sh` (started by the run script): samples the run's memory every 10 s into
+  `runtime/memwatch-<unit>.csv` and stops the run only with WSL's RAM full and its swap nearly; what held the memory then
+  goes to `runtime/memwatch-<unit>-events.log`. The trainer logs what it holds every 2 minutes (`trainer memory:`).
+- `runtime/keeper.sh`: starts the run again a minute after that guard stopped it (never after a stop by hand; at most 3
+  times in 6 hours).
+- What a stop keeps: each finished campaign game is on disk (`<run>/campaign/finished/`) until the checkpoint of the
+  update that trained on it, the battles not trained on yet are saved at the stop, and a resume takes both back. The
+  games still playing are lost.
+- Deploying code: `DEPLOY="<the copy command>" runtime/drain_restart.sh` (run on the Mac): no new game starts
+  (`<run>/drain`), the playing ones finish (up to 45 minutes), DEPLOY runs, the run restarts: nothing is lost.
+
 ### On a second machine (an independent run beside this one)
 
 Two machines do not share one run: the second runs its own (its own seed, or other settings) and the evals, which

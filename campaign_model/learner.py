@@ -186,7 +186,8 @@ class CampaignLearner:
 			raise SystemExit(f"campaign.share_target 'change' with credit '{config.credit}': that credit reads the heads as shares (use 'attributed')")
 		self.label_futures = {}  # id(game) -> its Future (precomputed takes it)
 		if config.learner == "process":
-			self.worker = UpdateProcess(config, self.kwargs, self.model, self.optimizer, self.lr_scale, latest)
+			# (UpdateProcess alone is tested; with the games supply.py hands this process since 2026-10-30 it never ran)
+			raise SystemExit("campaign.learner 'process' has not run since the supply's rebuild (2026-10-30): use 'turns' (or 'thread')")
 		battle_play.SOCKET_DIR.mkdir(parents=True, exist_ok=True)
 		from battle_model.actors import inference_device
 

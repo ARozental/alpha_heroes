@@ -35,7 +35,6 @@ import socket
 import sys
 import threading
 import time
-import traceback
 from collections import Counter, deque
 from dataclasses import replace
 from pathlib import Path

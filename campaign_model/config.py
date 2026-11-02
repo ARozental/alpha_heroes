@@ -83,7 +83,7 @@ class CampaignConfig:
 	# over 7 days less V7's forecast) + (1 - w) x the growth's (our value's real log growth less G7's), w = min(1,
 	# share_weight_start + share_weight_per_day x day): early on growth counts most (the share moves with rivals we cannot
 	# see yet), late the share (destroying them); the end credit stays in at attributed_end_weight
-	credit: str = "horizon"
+	credit: str = "schedule"  # (the default since 2026-11-01: what runs; it needs share_target "change")
 	share_weight_start: float = 0.1
 	share_weight_per_day: float = 0.02
 	attributed_end_weight: float = 0.2
@@ -112,11 +112,12 @@ class CampaignConfig:
 	device: str = "auto"  # "auto": CUDA or Apple's GPU when there is one (process), the battle learner's (turns)
 	torch_threads: int = 8  # the campaign learner's CPU threads (torch's pool is shared by the process: 0 leaves it)
 	# "v1": model.CampaignModel; "v2": model_v2.CampaignModelV2 (docs/campaign_model_v2_draft.md: typed encoders, owners,
-	# the whole map's tiles, foresight heads, every logit a match; cell_dim 16 for it)
-	model_architecture: str = "v1"
+	# the whole map's tiles, foresight heads, every logit a match; cell_dim 16 for it). v2 the default since 2026-11-01,
+	# at its sizes (dim 128, cell_dim 16): what runs
+	model_architecture: str = "v2"
 	foresight_weight: float = 0.2  # v2: each foresight head's loss weight (foresight.py; its gradient share is logged)
-	model_dim: int = 64
-	model_cell_dim: int = 32
+	model_dim: int = 128
+	model_cell_dim: int = 16
 	model_heads: int = 4
 	model_layers: int = 2
 	seed: int = 0
@@ -127,7 +128,7 @@ class CampaignConfig:
 	#             2026-10-31: our log growth less the others', so their value hidden from us cancels), from no change.
 	#             The ladder grades them on real outcomes only, and the horizon and mix credits refuse it (they read
 	#             the heads as shares); the attributed credit reads the growth heads
-	share_target: str = "share"
+	share_target: str = "change"  # (the default since 2026-11-01: what runs)
 	# The teacher's KL (AlphaStar's KL to its supervised policy, 2026-10-31: 1,020 -> 1,400 Elo in its ablation): each
 	# decision's KL(teacher || model) over the action type and each type's table (train.teacher_kl), at this weight in
 	# the loss, the teacher a frozen imitation of Nullkiller2 (imitate.py's bc_latest.pt: teacher_checkpoint). It keeps

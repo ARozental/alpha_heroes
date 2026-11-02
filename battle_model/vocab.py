@@ -53,14 +53,3 @@ def artifact_price(id_):
 	return tables()["artifacts"][id_]["price"]
 
 
-def describe_units(inputs, b=0):
-	"""Readable unit list from a model input dict (numpy arrays with a batch dimension)."""
-	lines = []
-	for u in range(inputs["u_present"].shape[1]):
-		if not inputs["u_present"][b, u]:
-			continue
-		count, creature_id = int(inputs["u_count"][b, u]), int(inputs["u_creature"][b, u])
-		side = "attacker" if inputs["u_side"][b, u] == 0 else "defender"
-		state = "" if inputs["u_alive"][b, u] else " (dead)"
-		lines.append(f"slot {u:2d}: {count} x {name('creatures', creature_id)} [{side}] at hex {int(inputs['u_hex'][b, u])}{state}")
-	return "\n".join(lines)

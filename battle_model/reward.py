@@ -66,10 +66,6 @@ class RewardConfig:
 	level_steps: int = game_values.LEVEL_STEPS
 
 
-def stack_value(unit_cost, count):
-	return resources_value(unit_cost) * count
-
-
 def mana_value(mana, power, config=RewardConfig()):
 	return config.mana_value * max(power, 0) * max(mana, 0)
 

@@ -71,7 +71,6 @@ from .constants import (
 	GATE_STATE_VOCAB,
 	HEX_TYPES,
 	N_ACTION_TYPES,
-	N_EVENTS,
 	N_HEXES,
 	N_SECONDARY_SKILLS,
 	N_SIDES,

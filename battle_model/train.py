@@ -101,7 +101,6 @@ class TrainConfig:
 	remote_slots: int = 0
 	real_games: int = 0  # (real_games.py, unused since 2026-10-30: training against the game's AI is out)
 	real_share: float = 0.5
-	real_game_seconds: int = 900
 	game_share: float = 0.125  # at most this share of an update from any one game
 	max_record_age: int = 3  # model versions: older records are dropped
 	buffer_decisions: int = 16000  # at most this many decisions wait in the buffer (the oldest go first)
@@ -140,7 +139,6 @@ class TrainConfig:
 	# (a worker's --local --serve: its servers get this run's weights from the hub, remote.py). Every game here asks them;
 	# no GPU process but the trainer's (inference.ModelStore). Empty: a server process here
 	inference_endpoints: str = ""
-	persistent_battles: bool = True  # each generated actor plays its battles in one VCMI process (play.BattleProcess)
 	# Workers on other machines (remote.py, worker.py): they connect to this port (0: none), play with this machine's
 	# inference servers over the network and send their records here; remote_token: their shared secret (empty: the
 	# file runtime/remote-token, made here on the first run)

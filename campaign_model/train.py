@@ -39,7 +39,7 @@ from . import constants as c
 from .config import CampaignConfig
 from .empire import EmpireConfig, empire_value
 from .labels import COLORS, GROWTH_CAP, PHI_FLOOR, SHARE_CHANGE_CAP, LabelConfig, blend_credit, end_advantages, end_labels, end_steps, explained_variance, growth_labels, label, residual_variances
-from .model import CampaignModel, build_model
+from .model import build_model
 from .play import make_map, play
 from .graphs import Graphs, StepGraph
 from .records import NO_EFFECT, decode_inputs, decode_wire, inputs_on_device

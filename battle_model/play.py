@@ -95,10 +95,6 @@ def record_dirs(game, record_dir):
 	return [record_dir / f"side_{side}" for side in game.recorded_sides] if game.opponent == SELF_PLAY else [record_dir]
 
 
-def load_scenario(path):
-	return json.loads(Path(path).read_text())
-
-
 def map_name(scenario_path, variant=""):
 	return "Maps/alpha/" + Path(scenario_path).stem + (f"-{variant}" if variant else "")
 

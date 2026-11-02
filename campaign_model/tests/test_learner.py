@@ -158,7 +158,7 @@ def test_an_update_runs_with_the_horizon_credit_and_learns_how_far_to_trust_the_
 	torch.manual_seed(5)
 	kwargs = {"dim": 32, "cell_dim": 16, "layers": 1}
 	model = CampaignModel(**kwargs).eval()
-	config = CampaignConfig(decisions_per_update=8, min_games_per_update=2, batch_size=4, passes=1, learner="thread", device="cpu")
+	config = CampaignConfig(decisions_per_update=8, min_games_per_update=2, batch_size=4, passes=1, learner="thread", device="cpu", credit="horizon", share_target="share")  # (the horizon credit on share heads: no longer the defaults)
 	games = []
 	for g in range(2):
 		x = random_inputs(8, seed=20 + g)
