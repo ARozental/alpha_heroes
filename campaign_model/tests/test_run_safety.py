@@ -25,3 +25,19 @@ def test_an_eval_cut_by_the_runs_stop_writes_no_row(monkeypatch):
 	monkeypatch.setattr(evaluate, "eval_map", lambda seed, players, config: (_ for _ in ()).throw(RuntimeError("stopped")))
 	config = CampaignConfig(eval_games=4, eval_parallel=2)
 	assert evaluate.evaluate(config, server=None, battle=None, version=1, epoch=1, stop=stop) is None
+
+
+def test_no_eval_begins_while_the_run_drains(tmp_path):
+	"""learner.eval_due: an eval due does not begin while runtime/drain_restart.sh drains the run (it would be cut by the
+	restart); it begins once the drain file is gone."""
+	from types import SimpleNamespace
+
+	from campaign_model.learner import CampaignLearner
+
+	(tmp_path / "campaign").mkdir()
+	learner = SimpleNamespace(config=CampaignConfig(eval_minutes=60.0, eval_games=4), evaluating=lambda: False, last_eval=None, out=tmp_path / "campaign")
+	assert CampaignLearner.eval_due(learner)
+	(tmp_path / "drain").touch()
+	assert not CampaignLearner.eval_due(learner)
+	(tmp_path / "drain").unlink()
+	assert CampaignLearner.eval_due(learner)

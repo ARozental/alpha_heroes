@@ -778,6 +778,8 @@ class CampaignLearner:
 	def eval_due(self):
 		if not self.config.eval_minutes or not self.config.eval_games or self.evaluating():
 			return False
+		if (self.out.parent / "drain").exists():  # (runtime/drain_restart.sh: the run restarts once its games end, an eval
+			return False  # begun now would be cut there; the resumed run evaluates first, eval.csv's time past due)
 		return self.last_eval is None or time.monotonic() - self.last_eval >= self.config.eval_minutes * 60
 
 	def evaluating(self):
