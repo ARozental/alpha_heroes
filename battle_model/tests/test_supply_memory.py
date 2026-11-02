@@ -85,3 +85,15 @@ def test_the_memory_census_counts_what_the_trainer_holds():
 	s.pool = SimpleNamespace(lock=threading.Lock(), buffer=[{"decisions": 7, "data": {"x": np.zeros(2**18, np.float32)}}])
 	line = s.memory_census(5.0, by_type=True)
 	assert "campaign waiting 1 games, 3 decisions, inputs 3 MB" in line and "battle buffer 1 battles, 7 decisions, 1 MB" in line and "objects " in line
+
+
+def test_a_remote_slot_waits_only_for_the_last_game_level(tmp_path, monkeypatch):
+	# the trainer's peak kept free puts the floor out of reach (6 GB available, 4 owed): a game here waits, the Mac's
+	# (its worker here exists already) plays; under LAST_GAME_GB it waits too
+	shared = shared_at(monkeypatch, available=6.0, rss=9.0, peak=13.0)
+	shared.local["campaign"].value = 3
+	games = supply.Games("campaign", None, tmp_path, [], [], shared, token=None, listener=object())
+	monkeypatch.setattr(games, "_accept_slot", lambda: "conn")
+	assert games.place() == ("remote", "conn")
+	monkeypatch.setattr(supply, "available_gb", lambda: 3.0)
+	assert games.place() is None

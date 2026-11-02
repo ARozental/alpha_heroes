@@ -313,8 +313,11 @@ class Games(IterableDataset):
 			if shared.local[kind].value < shared.ceilings[kind] and (shared.eval_waiting.value == 0 or playing == 0) and memory_allows(shared, playing):
 				shared.local[kind].value += 1
 				return "here", None
-		# A remote slot's game takes memory here too (its worker holds what it played), so it waits for the floor as well
-		if self.listener is not None and memory_allows(shared):
+		# A remote slot's game takes little memory here (its worker exists already and holds only what it played, 20-130
+		# MB), so it waits only for LAST_GAME_GB, not the floor with the trainer's peak kept free: under that the Mac's 4
+		# slots played ~6 games in 15 minutes while 11 permits were open (2026-11-02 03:10-03:26 CST)
+		free = available_gb()
+		if self.listener is not None and (free is None or free >= LAST_GAME_GB):
 			conn = self._accept_slot()
 			if conn is not None:
 				with shared.lock:
