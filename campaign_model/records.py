@@ -34,6 +34,8 @@ PLAN = 8  # Nullkiller2's plan in the same state beside it (Decision.plan: Advic
 # -1: no task in the plan, -2: a task without a tile of the hero's)
 PLAN_FIELDS = struct.Struct("<" + "hhhhf" * c.OWN_HEROES)
 PLAN_ENTRY = 5
+ACCEPT = 16  # more of our entries that follow Nullkiller2 in the same state (Decision.accept: Advice.cpp; advice.py)
+ACCEPT_COUNT, ACCEPT_ENTRY = struct.Struct("<H"), struct.Struct("<hi")  # (after the plan, when flags has ACCEPT: their count, then each one's type and entry)
 # The questions the teacher's recorder records Nullkiller2's answers to (Teacher.cpp): the others are the model's own
 TEACHER_QUESTIONS = (c.DecisionKind.YES_NO, c.DecisionKind.SELECT, c.DecisionKind.LEVEL_UP)
 
@@ -59,6 +61,7 @@ class Decision:
 	inputs: bytes  # zlib-compressed wire encoding (decode_inputs)
 	advice: tuple = None  # (action type, index, cell) of Nullkiller2's choice in this state (flags ADVICE), else None
 	plan: tuple = None  # Nullkiller2's plan in this state (flags PLAN): PLAN_ENTRY values a hero slot (PLAN_FIELDS), else None
+	accept: tuple = None  # (flags ACCEPT) more of our entries that follow Nullkiller2 here: type, entry, type, entry, ...
 
 
 @dataclass
@@ -76,6 +79,15 @@ class Game:
 	days: int = 0  # the day cap it was played to (0: none known): reaching it is the game's end (labels.end_labels)
 
 
+def read_accept(buffer, offset, flags):
+	"""(Decision.accept or None, the offset past it) of a record whose fields reach offset."""
+	if not flags & ACCEPT:
+		return None, offset
+	(k,) = ACCEPT_COUNT.unpack_from(buffer, offset)
+	offset += ACCEPT_COUNT.size
+	return struct.unpack_from("<" + "hi" * k, buffer, offset), offset + ACCEPT_ENTRY.size * k
+
+
 def parse_records(color, payload):
 	if payload[:4] == b"AMZ2":
 		(count,) = struct.unpack_from("<I", payload, 4)
@@ -91,13 +103,14 @@ def parse_records(color, payload):
 			if flags & PLAN:
 				plan = PLAN_FIELDS.unpack_from(payload, offset)
 				offset += PLAN_FIELDS.size
+			accept, offset = read_accept(payload, offset, flags)
 			(m,) = struct.unpack_from("<I", payload, offset)
 			offset += 4
 			if n != IN_BYTES:
 				raise ValueError(f"a decision has {n} input bytes, the contract {IN_BYTES}")
 			if offset + m > len(payload):
 				raise ValueError("a damaged records message")
-			out.append(Decision(color, day, kind, today, version, action_type, index, cell, logp, value, flags, bytes(payload[offset : offset + m]), advice, plan))
+			out.append(Decision(color, day, kind, today, version, action_type, index, cell, logp, value, flags, bytes(payload[offset : offset + m]), advice, plan, accept))
 			offset += m
 		return out
 	if payload[:4] != b"AMZ1":
@@ -119,9 +132,10 @@ def parse_records(color, payload):
 		if flags & PLAN:
 			plan = PLAN_FIELDS.unpack_from(raw, offset)
 			offset += PLAN_FIELDS.size
+		accept, offset = read_accept(raw, offset, flags)
 		if n != IN_BYTES:
 			raise ValueError(f"a decision has {n} input bytes, the contract {IN_BYTES}")
-		out.append(Decision(color, day, kind, today, version, action_type, index, cell, logp, value, flags, zlib.compress(raw[offset : offset + n], 1), advice, plan))
+		out.append(Decision(color, day, kind, today, version, action_type, index, cell, logp, value, flags, zlib.compress(raw[offset : offset + n], 1), advice, plan, accept))
 		offset += n
 	return out
 

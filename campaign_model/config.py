@@ -156,6 +156,11 @@ class CampaignConfig:
 	# small, not 0): after each evaluation against Nullkiller2 the teacher's share of the loss is lambda = clip(1.2 - score,
 	# 0.05, 0.95), its weight lambda / (1 - lambda) (PPO's 1); teacher_kl is the weight until the first evaluation
 	teacher_mix: str = ""
+	# The loss shares (learner.LOSS_TERMS; the user, 2026-11-02: each loss a sane share of the gradient, the teacher's by how
+	# good we are, policy and value never under 10% each): each term's weight set from its running gradient norm on the
+	# shared layers (GradNorm's balance in closed form) so the terms get their shares (learner.loss_shares); off: the
+	# teacher at its weight (teacher_mix), the others at 1
+	loss_shares: bool = False
 	label_weights: tuple = (1 / 3, 1 / 3, 1 / 3)  # of the shares at VALUE_OFFSETS (labels.py)
 	decision_price: float = 1e-4  # share points per turn decision
 	# Evaluation against Nullkiller2 (evaluate.py): our models in one seat, Nullkiller2 in the others

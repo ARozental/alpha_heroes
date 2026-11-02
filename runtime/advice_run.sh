@@ -18,6 +18,10 @@
 # over 20 updates); the battle learner on ~10% of the battles at a fixed mix, campaign 60%, generated self-play 20%, past
 # versions 20% (real_keep 0.12 of the campaign's battles, fixed_mix, league 0.5/0.5), the same batch and learning rate,
 # its evals every 3 hours (eval_minutes 180): the GPU's and the CPU's time to the campaign, which improves
+# Since 2026-11-02 midday (the user): Nullkiller2's advice at every decision (nk2_advice 1.0, ~5% of a game's time more)
+# as the teacher over the turn (advice.py: any of its plan's steps or of the town actions it named that turn), and each
+# loss a share of the gradient (campaign.loss_shares: the teacher's by our eval score, at most 60%; policy and value
+# never under 15%)
 # 10 games, not 13 (13 at 16:43-16:55 CST on 2026-11-01: the memory guard stopped the run at 1.13 GB, its games in flight
 # lost). The budget: ~26.6 GB available with nothing running, less the inference servers (4.0), the trainer at its peak
 # (9.3 GB before its first update after a start, 11.75 seen at 15:46) and the guard's 3 GB, leaves ~10 GB for slots
@@ -45,6 +49,6 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 	--set remote_port=7700 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.02 campaign.entropy_floor_weight=0 \
-		campaign.nk2_advice=0.5 campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=10 remote_slots=4 campaign.inference_device=cpu inference_processes=6 \
+		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=10 remote_slots=4 campaign.inference_device=cpu inference_processes=6 \
 		campaign.head_scale=true fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null

@@ -242,9 +242,10 @@ void AlphaMapAI::makeTurn()
 			auto decision = encode(DecisionKind::TURN);
 			std::optional<Choice> advice; // (Nullkiller2's, at this decision's chance: before ours, in the same state)
 			std::optional<PlanTargets> plan; // (and its plan there: labels both, never inputs)
+			std::vector<std::pair<int, int>> accept; // (and our other entries that follow it)
 			if(adviceDrawn())
-				advice = advise(decision, plan);
-			const auto choice = decide(decision, advice, plan);
+				advice = advise(decision, plan, accept);
+			const auto choice = decide(decision, advice, plan, accept);
 			if(choice.type <= static_cast<int>(ActionType::END))
 				break;
 			const bool changed = execute(decision, choice);
@@ -520,7 +521,7 @@ void AlphaMapAI::connectInference(bool waiting)
 	}
 }
 
-Choice AlphaMapAI::decide(Decision & decision, const std::optional<Choice> & advice, const std::optional<PlanTargets> & plan)
+Choice AlphaMapAI::decide(Decision & decision, const std::optional<Choice> & advice, const std::optional<PlanTargets> & plan, const std::vector<std::pair<int, int>> & accept)
 {
 	Choice choice;
 	try
@@ -585,6 +586,11 @@ Choice AlphaMapAI::decide(Decision & decision, const std::optional<Choice> & adv
 		{
 			entry.plan = plan;
 			entry.flags |= RECORD_PLAN;
+		}
+		if(!accept.empty())
+		{
+			entry.accept = accept;
+			entry.flags |= RECORD_ACCEPT;
 		}
 		for(int k = 0; k < N_VALUE_OFFSETS; ++k)
 			entry.value[k] = outputs[Out::value][k];
@@ -766,6 +772,15 @@ void AlphaMapAI::sendRecords(bool final)
 						put<int16_t>(out, target.turns);
 						put<float>(out, target.priority);
 					}
+				if(r.flags & RECORD_ACCEPT) // (more entries that follow Nullkiller2: their count, then each one's type and entry)
+				{
+					put<uint16_t>(out, static_cast<uint16_t>(r.accept.size()));
+					for(const auto & [type, index] : r.accept)
+					{
+						put<int16_t>(out, static_cast<int16_t>(type));
+						put<int32_t>(out, index);
+					}
+				}
 			};
 			auto deflate = [](const std::string & raw)
 			{
@@ -1044,9 +1059,10 @@ void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, Query
 		if(!decision.inputs.any(In::army_mask))
 			break;
 		std::optional<Choice> advice;
+		std::vector<std::pair<int, int>> accept;
 		if(adviceDrawn())
-			advice = adviseExchange(decision, first, second);
-		const auto choice = decide(decision, advice);
+			advice = adviseExchange(decision, first, second, accept);
+		const auto choice = decide(decision, advice, std::nullopt, accept);
 		if(choice.type != static_cast<int>(ActionType::ARMY))
 			break;
 		if(!execute(decision, choice))

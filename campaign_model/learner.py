@@ -53,6 +53,7 @@ from .labels import (
 	COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, attributed_labels, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
 	label, ladder_targets, pooled_ev, residual_variances, share_change_labels,
 )
+from .advice import teacher_sets
 from .foresight import labels_of
 from .labeler import Labeler
 from .model import build_model
@@ -61,9 +62,19 @@ from .train import HEAD_SCALE_RAMP, _prefetched, load_optimizer, make_optimizer,
 
 TYPES = [a.name.lower() for a in c.ActionType]
 FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answer") for part in ("battle", "score", "parts")) + ("foresight_hero_alive", "foresight_hero_army", "foresight_turn", "foresight_plan")
-# The shared layers' gradient norm from each term of the loss (foresight.gradient_check; grad_shared_foresight is the
-# foresight's with its plan, these the plan's alone and the rest's)
-GRADIENT_COLUMNS = tuple(f"grad_shared_{term}" for term in ("policy", "value", "entropy", "teacher", "plan"))
+# The shared layers' gradient norm from each term of the loss as it enters it (foresight.gradient_check at weight 1,
+# times the term's weight; grad_shared_foresight is the foresight's with its plan, these the plan's alone and the rest's),
+# and the loss shares' weights (config.loss_shares)
+GRADIENT_COLUMNS = tuple(f"grad_shared_{term}" for term in ("policy", "value", "entropy", "teacher", "plan")) + ("loss_weight_value", "loss_weight_teacher", "loss_weight_foresight", "teacher_share", "teacher_set_agree")
+# The loss shares (config.loss_shares; the user, 2026-11-02): each term of the loss gets a share of the shared layers'
+# gradient, its weight set from its gradient's running norm (GradNorm's balance, Chen et al. 2018, in closed form: the
+# weight that gives a term its share against the policy's, whose weight stays 1), each weight moving at most
+# LOSS_SCALE_STEP times an update. The teacher's share is how good we are (teacher_share_for), the rest policy : value :
+# foresight 4 : 3 : 1: policy and value never under 15% each
+LOSS_TERMS = ("policy", "value", "teacher", "foresight")
+TEACHER_SHARE_MAX = 0.6
+LOSS_SCALE_STEP = 1.25
+LOSS_SCALE_MEMORY = 0.9  # (each term's log gradient norm, averaged over ~10 updates)
 COLUMNS = [
 	"version", "epoch", "games", "decisions", "dropped_old", "unsound", "credited", "days", "players", "phi_end", "heroes", "label_mean", "price_mean",
 	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_weighted", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "teacher_kl", "teacher_weight", "advised", "teacher_agree", "teacher_ce", "clip_fraction", "grad_norm", "steps", "learning_rate",
@@ -137,6 +148,7 @@ class CampaignLearner:
 		self.head_ev = {}  # each head's explained variance at the day starts, smoothed: how far it grades the next (grade_trust)
 		self.value_pool, self.head_pool = None, {}  # their parts (labels.pooled_ev): the residual variance and the variance, smoothed apart
 		self.head_var, self.head_scale_updates = None, 0  # (config.head_scale) the heads' running target variances, the updates since it began
+		self.loss_scale, self.teacher_share = None, None  # (config.loss_shares) {"log_norm", "weight"} of the terms; the teacher's share
 		latest = self.out / "checkpoint_latest.pt"
 		if resume and latest.exists():
 			state = torch.load(latest, map_location=device)
@@ -158,6 +170,7 @@ class CampaignLearner:
 			self.head_ev = state.get("head_ev", {})
 			self.value_pool, self.head_pool = state.get("value_pool"), state.get("head_pool", {})
 			self.head_var, self.head_scale_updates = state.get("head_var"), state.get("head_scale_updates", 0)
+			self.loss_scale, self.teacher_share = state.get("loss_scale"), state.get("teacher_share")
 			print(f"campaign: resuming at version {self.version}", flush=True)
 		elif config.init_from:
 			state = torch.load(config.init_from, map_location=device)
@@ -242,8 +255,8 @@ class CampaignLearner:
 				rows = list(csv.DictReader(f))
 			score = float(rows[-1].get("score") or "nan") if rows else float("nan")
 			if np.isfinite(score):
-				self.teacher_weight = teacher_weight_for(score)
-				print(f"campaign: the teacher's weight {self.teacher_weight:.2f} from the last eval's score {score:.3f}", flush=True)
+				self.teacher_weight, self.teacher_share = teacher_weight_for(score), teacher_share_for(score)
+				print(f"campaign: the teacher's weight {self.teacher_weight:.2f} (its gradient share {self.teacher_share:.2f} with config.loss_shares) from the last eval's score {score:.3f}", flush=True)
 		# Each finished game is on disk from its arrival until the checkpoint of the update that trained on it is saved,
 		# and a resumed run takes them back: a stop (a crash, the memory guard, a restart) loses no finished game (until
 		# 2026-11-01 each restart lost the ~20-40 finished games waiting for their update)
@@ -451,6 +464,7 @@ class CampaignLearner:
 		starts, trust, (weight, outcome) = day_starts(self.model, played, self.model_lock), self.grade_trust(), self.end_credit()
 		memory.append(("starts", rss_gb()))
 		foresight = [] if self.kwargs.get("architecture") == "v2" else None  # (v2's foresight labels, each game's)
+		sets = [] if getattr(self.config, "nk2_advice", 0) > 0 else None  # (the teacher's entries beyond the advice's: advice.teacher_sets)
 		decisions, targets, labels, growth, returns, advantages, errors, players, forecasts, row = [], [], [], [], [], [], [], [], [], Counter()
 		growth_real, attributed = [], {"share_now": [], "taken": []}
 		end = {"targets": [], "real": [], "step": [], "week": [], "price": []}
@@ -487,6 +501,13 @@ class CampaignLearner:
 			if foresight is not None:
 				rows = pre["foresight"] if pre is not None and "foresight" in pre else labels_of(game, self.features_cpu)
 				foresight.append({name: value[fresh] for name, value in rows.items()})
+			if sets is not None:  # (over all the game's decisions: what we did counts, usable or not)
+				full = getattr(game, "all_decisions", game.decisions)
+				kept = {id(d) for d in game.decisions}
+				used = np.array([id(d) in kept for d in full], dtype=bool)
+				sets.append(tuple(part[used][fresh] for part in teacher_sets(full)))
+				row["set_agree"] += set_agreement([d for d, keep in zip(game.decisions, fresh) if keep], *sets[-1])
+				row["set_advised"] += sum(1 for d, keep in zip(game.decisions, fresh) if keep and d.advice is not None)
 			targets.append(graded[fresh])
 			labels.append(t[fresh])
 			growth.append(grown[fresh])
@@ -520,6 +541,8 @@ class CampaignLearner:
 		end = {name: np.concatenate(parts) for name, parts in end.items()}
 		if foresight is not None:
 			foresight = {name: np.concatenate([rows[name] for rows in foresight]) for name in foresight[0]}
+		if sets is not None:
+			sets = tuple(np.concatenate([game_sets[k] for game_sets in sets]) for k in range(3))
 		row["trust"] = self.trust()
 		end["outcome"], end["weight"] = outcome, weight if self.config.credit == "horizon" else (self.config.attributed_end_weight if weight > 0 else 0.0) if self.config.credit in ("attributed", "schedule") else 0.0
 		attributed = {name: np.concatenate(parts) for name, parts in attributed.items()} if self.config.credit == "attributed" else None
@@ -543,7 +566,7 @@ class CampaignLearner:
 			out_of_memory = None
 			with self.model_lock:
 				try:
-					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.teacher_weight, share_trust=self.trust(), head_scale={"var": getattr(self, "head_var", None), "ramp": min(1.0, getattr(self, "head_scale_updates", 0) / HEAD_SCALE_RAMP)} if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
+					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale={"var": getattr(self, "head_var", None), "ramp": min(1.0, getattr(self, "head_scale_updates", 0) / HEAD_SCALE_RAMP)} if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
 				except torch.OutOfMemoryError as error:  # (handled below, once the error's frames, and their tensors, are gone)
 					out_of_memory = str(error)[:200]
 			if out_of_memory is not None:
@@ -563,6 +586,7 @@ class CampaignLearner:
 				self._refresh_features()
 				self._note_value_ev(metrics)
 				self.teacher_weight = adapted_teacher_weight(self.teacher_weight, metrics.get("teacher_kl"), self.config.teacher_kl_target)
+				self._note_gradients(metrics)
 				if metrics.get("head_var") is not None:  # (config.head_scale: for the next update; the ramp goes on)
 					self.head_var, self.head_scale_updates = metrics["head_var"], getattr(self, "head_scale_updates", 0) + 1
 					weights = metrics.get("head_weights") or {}
@@ -695,7 +719,7 @@ class CampaignLearner:
 			"below_floor": metrics.get("below_floor", float("nan")),
 			"kl": metrics.get("kl", float("nan")),
 			"teacher_kl": metrics.get("teacher_kl", float("nan")),  # (KL(teacher || model) a decision; 0 without a teacher)
-			"teacher_weight": self.teacher_weight,
+			"teacher_weight": metrics.get("loss_weight_teacher", self.teacher_weight),  # (the update's: the loss shares' when on)
 			# Nullkiller2's advice (config.nk2_advice): the share of turn and exchange decisions it advised, how often our
 			# choice was its, and the cross-entropy toward it
 			"advised": sum(d.advice is not None for d in decisions) / max(1, sum(d.kind in (c.DecisionKind.TURN, c.DecisionKind.EXCHANGE) for d in decisions)),
@@ -724,7 +748,8 @@ class CampaignLearner:
 			**{f"failure_{k}": v for k, v in failure_modes(decisions).items()},  # dumb decisions (failures.py)
 			"kinds": " ".join(f"{k}:{n}" for k, n in sorted(Counter(c.DecisionKind(d.kind).name for d in decisions).items())),
 			"no_effect_types": " ".join(f"{t}:{n}" for t, n in sorted(Counter(c.ActionType(d.action_type).name for d in decisions if d.flags & NO_EFFECT).items())),
-			**{name: metrics.get(name, float("nan")) for name in (*FORESIGHT_COLUMNS, "grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share", *GRADIENT_COLUMNS)},
+			**{name: metrics.get(name, float("nan")) for name in (*FORESIGHT_COLUMNS, "grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share", *GRADIENT_COLUMNS) if name != "teacher_set_agree"},
+			"teacher_set_agree": sums["set_agree"] / sums["set_advised"] if sums.get("set_advised") else float("nan"),  # (ours one of the teacher's entries: its advice's or a set's)
 		}
 		with self.progress.open("a", newline="") as f:
 			csv.writer(f).writerow([round(row[k], 6) if isinstance(row[k], float) else row[k] for k in COLUMNS])
@@ -775,7 +800,56 @@ class CampaignLearner:
 	def _save(self, path):
 		state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
 		optimizer = {} if self.worker else {"optimizer": self.optimizer.state_dict()}  # (the process's is in checkpoint_latest.pt)
-		torch.save({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "model_kwargs": self.kwargs}, path)
+		torch.save({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "model_kwargs": self.kwargs}, path)
+
+	# ---- the loss shares (config.loss_shares) ----
+
+	def loss_shares(self):
+		"""Each term's share of the shared layers' gradient: the teacher's by how good we are (teacher_share), the rest
+		policy : value : foresight 4 : 3 : 1."""
+		teacher = getattr(self, "teacher_share", None) if getattr(self, "teacher_share", None) is not None else min(TEACHER_SHARE_MAX, self.teacher_weight / (1.0 + self.teacher_weight))
+		rest = 1.0 - teacher
+		return {"policy": rest * 4 / 8, "value": rest * 3 / 8, "teacher": teacher, "foresight": rest / 8}
+
+	def loss_weights(self):
+		"""The terms' weights for the next update (ppo_update's loss_weights and teacher_weight): the loss shares' (their
+		start: as without them, the teacher at its weight), else the teacher's weight alone; kl_teacher the teacher's share
+		against the policy's (the KL target's)."""
+		if not getattr(self.config, "loss_shares", False):
+			return {"value": 1.0, "foresight": 1.0, "teacher": self.teacher_weight}
+		if getattr(self, "loss_scale", None) is None:
+			self.loss_scale = {"log_norm": {}, "weight": {"value": 1.0, "teacher": self.teacher_weight, "foresight": 1.0}}
+		shares = self.loss_shares()
+		return {**self.loss_scale["weight"], "kl_teacher": shares["teacher"] / shares["policy"]}
+
+	def _note_gradients(self, metrics):
+		"""After an update: each term's gradient on the shared layers as it entered the loss (grad_shared_*: its norm at
+		weight 1, grad_raw_*, times its weight) into metrics; with the loss shares, each term's log norm into its running
+		mean and each weight a step toward the one that gives its term its share against the policy's (GradNorm's balance:
+		weight = share / share_policy x norm_policy / norm over the running means), at most LOSS_SCALE_STEP times."""
+		weights = self.loss_weights()
+		scale = {"policy": 1.0, "entropy": 1.0, "value": weights["value"], "teacher": weights["teacher"], "foresight": weights["foresight"], "plan": weights["foresight"]}
+		for term, weight in scale.items():
+			metrics[f"grad_shared_{term}"] = metrics.get(f"grad_raw_{term}", float("nan")) * weight
+		metrics.update({f"loss_weight_{term}": weights[term] for term in ("value", "teacher", "foresight")}, teacher_share=self.loss_shares()["teacher"])
+		if not getattr(self.config, "loss_shares", False):
+			return
+		state = self.loss_scale
+		for term in LOSS_TERMS:
+			norm = metrics.get(f"grad_raw_{term}", float("nan"))
+			if np.isfinite(norm) and norm > 0:
+				old = state["log_norm"].get(term)
+				state["log_norm"][term] = math.log(norm) if old is None else LOSS_SCALE_MEMORY * old + (1 - LOSS_SCALE_MEMORY) * math.log(norm)
+		shares, norms = self.loss_shares(), state["log_norm"]
+		if "policy" in norms:
+			for term in ("value", "teacher", "foresight"):
+				if term in norms:
+					target = shares[term] / shares["policy"] * math.exp(norms["policy"] - norms[term])
+					weight = state["weight"][term]
+					state["weight"][term] = float(np.clip(np.clip(target, weight / LOSS_SCALE_STEP, weight * LOSS_SCALE_STEP), 1e-4, 1e6))
+		now = {term: metrics[f"grad_shared_{term}"] for term in LOSS_TERMS}
+		total = sum(v for v in now.values() if np.isfinite(v))
+		print("campaign loss shares (target / this update's): " + "  ".join(f"{term} {shares[term]:.2f}/{now[term] / total if total > 0 and np.isfinite(now[term]) else float('nan'):.2f}" for term in LOSS_TERMS) + "  weights next: " + "  ".join(f"{term} {state['weight'][term]:.3g}" for term in ("value", "teacher", "foresight")), flush=True)
 
 	# ---- evaluation ----
 
@@ -805,6 +879,7 @@ class CampaignLearner:
 		evaluate.log(row, self.out / "eval.csv", self.writer)
 		if self.config.teacher_mix == "score" and (self.teacher is not None or self.config.nk2_advice > 0) and np.isfinite(row.get("score", np.nan)):
 			self.teacher_weight = teacher_weight_for(row["score"])  # (config.teacher_mix: the teacher's share by our strength)
+			self.teacher_share = teacher_share_for(row["score"])  # (config.loss_shares: its share of the gradient)
 			print(f"campaign: the teacher's weight {self.teacher_weight:.2f} (its share of the loss {self.teacher_weight / (1 + self.teacher_weight):.2f}) for an eval score of {row['score']:.3f}", flush=True)
 		self.save(self.out / f"checkpoint_{version:05d}.pt")
 		return row
@@ -983,6 +1058,23 @@ def agrees(decision):
 	(an end is only its type: ours has no index, -1, the advice's 0)."""
 	action, index = decision.advice[:2]
 	return decision.action_type == action and (action <= c.ActionType.END or decision.index == index)
+
+
+def teacher_share_for(score):
+	"""The teacher's share of the shared layers' gradient for an evaluation score (config.loss_shares): teacher_weight_for's
+	share of the loss, at most TEACHER_SHARE_MAX: 0.6 up to a score of 0.6, 0.2 at 1 (as good as the teacher)."""
+	return float(min(TEACHER_SHARE_MAX, np.clip(1.2 - score, 0.05, 0.95)))
+
+
+def set_agreement(decisions, types, indices, valid):
+	"""How many of the decisions with an advice chose one of the teacher's entries: the advice's own or one of its set."""
+	count = 0
+	for i, d in enumerate(decisions):
+		if d.advice is None:
+			continue
+		ours = (d.action_type, d.index)
+		count += ours == tuple(d.advice[:2]) or any(valid[i] & (types[i] == d.action_type) & (indices[i] == d.index))
+	return count
 
 
 def teacher_weight_for(score):

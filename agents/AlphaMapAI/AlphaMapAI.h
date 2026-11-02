@@ -86,6 +86,7 @@ struct Record
 	uint32_t flags = 0; // RECORD_NO_EFFECT: the action was carried out and changed nothing
 	std::optional<Choice> advice; // Nullkiller2's choice in the same state (RECORD_ADVICE: Advice.cpp)
 	std::optional<PlanTargets> plan; // Nullkiller2's plan in the same state (RECORD_PLAN: Advice.cpp)
+	std::vector<std::pair<int, int>> accept; // (type, entry) more of ours that follow Nullkiller2 there (RECORD_ACCEPT)
 	std::string inputs; // wire encoded
 	uint64_t serial = 0; // this player's count of records so far (not sent)
 };
@@ -94,6 +95,9 @@ constexpr uint32_t RECORD_NO_EFFECT = 1;
 constexpr uint32_t RECORD_TEACHER = 2; // Nullkiller2's decision (Teacher.cpp): its choice is the teacher's, no model's probability
 constexpr uint32_t RECORD_ADVICE = 4; // our decision with Nullkiller2's choice in the same state beside it (Advice.cpp)
 constexpr uint32_t RECORD_PLAN = 8; // Nullkiller2's plan in the same state beside it (Advice.cpp: each hero slot's PlanTarget)
+// More of our legal entries that follow Nullkiller2 there, beside the advice's own (Advice.cpp: a step along its plan's
+// path for each hero, an exchange's moves toward the army it wants): the teacher's targets, never inputs
+constexpr uint32_t RECORD_ACCEPT = 16;
 
 /// Adventure-map AI: every decision is the campaign model's (campaign_model/), asked of the inference server; battles
 /// are played by the configured battle AI. Built on Nullkiller2's patterns for threads and queries (AIGateway).
@@ -189,8 +193,9 @@ class AlphaMapAI : public CAdventureAI
 	void initAdvice();
 	bool adviceDrawn(); // this decision gets the advice (at adviceProbability)
 	// plan: Nullkiller2's plan there, its targets in our hero slots (with a Nullkiller2 that keeps it: NK2_KEEPS_PLAN)
-	std::optional<Choice> advise(const Decision & decision, std::optional<PlanTargets> & plan);
-	std::optional<Choice> adviseExchange(const Decision & decision, ObjectInstanceID first, ObjectInstanceID second);
+	std::optional<Choice> advise(const Decision & decision, std::optional<PlanTargets> & plan, std::vector<std::pair<int, int>> & accept);
+	// accept: our other moves toward the army Nullkiller2 wants (RECORD_ACCEPT)
+	std::optional<Choice> adviseExchange(const Decision & decision, ObjectInstanceID first, ObjectInstanceID second, std::vector<std::pair<int, int>> & accept);
 	std::string adviceJson() const;
 	// A request of Nullkiller2's as our turn decision's legal entry doing the same; false (unmatched: why) when none.
 	// intended: a move's destination when the caller knows it (its plan's tile), else the request's own tile is taken
@@ -259,7 +264,7 @@ private:
 	void exchange(ObjectInstanceID first, ObjectInstanceID second, QueryID queryID);
 
 	// The model (AlphaMapAI.cpp)
-	Choice decide(Decision & decision, const std::optional<Choice> & advice = std::nullopt, const std::optional<PlanTargets> & plan = std::nullopt);
+	Choice decide(Decision & decision, const std::optional<Choice> & advice = std::nullopt, const std::optional<PlanTargets> & plan = std::nullopt, const std::vector<std::pair<int, int>> & accept = {});
 	void noEffect(const Choice & choice);
 	Choice sample(const Decision & decision, const Outputs & outputs);
 	void record(const Decision & decision, const Choice & choice, const Outputs & outputs, uint32_t version);

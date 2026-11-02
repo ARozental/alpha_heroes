@@ -19,6 +19,7 @@
 #endif
 
 #include <chrono>
+#include <set>
 
 using namespace MapSchema;
 
@@ -117,6 +118,46 @@ PlanTargets planTargets(const Decision & decision, const NK2AI::Goals::TTaskVec 
 	}
 	return out;
 }
+
+/// Our MOVE and TRAVEL entries that walk Nullkiller2's plan (more entries that follow it beside its first request:
+/// RECORD_ACCEPT, the teacher's targets): each hero's MOVE to any tile of its own part of a planned hero chain (a short
+/// step along the path or a long one alike), its TRAVEL to an area the path reaches in a day or more
+void planEntries(const Decision & decision, const NK2AI::Goals::TTaskVec & plan, const int3 & size, std::set<std::pair<int, int>> & out)
+{
+	const int area = 2 * std::max(1, (std::max(size.x, size.y) + MAP_GRID - 1) / MAP_GRID); // (Encoder's TRAVEL areas)
+	const auto & travels = decision.entries[static_cast<int>(ActionType::TRAVEL)];
+	const auto chain = [&](const NK2AI::Goals::ExecuteHeroChain & goal)
+	{
+		for(const auto & node : goal.getPath().nodes)
+			for(int i = 0; i < OWN_HEROES; ++i)
+			{
+				if(!node.targetHero || decision.heroes[i] != node.targetHero->id)
+					continue;
+				const auto & center = decision.centers[i];
+				const int row = node.coord.y - center.y + WINDOW_RADIUS;
+				const int column = node.coord.x - center.x + WINDOW_RADIUS;
+				if(node.coord != center && node.coord.z == center.z && row >= 0 && row < WINDOW && column >= 0 && column < WINDOW && decision.inputs.get(In::move_mask, i, row, column) != 0)
+					out.insert({static_cast<int>(ActionType::MOVE), (i * WINDOW + row) * WINDOW + column});
+				if(node.turns >= 1 && node.coord.z >= 0 && node.coord.z < MAP_LEVELS)
+				{
+					const int index = ((i * MAP_LEVELS + node.coord.z) * TRAVEL_GRID + std::min(node.coord.y / area, TRAVEL_GRID - 1)) * TRAVEL_GRID + std::min(node.coord.x / area, TRAVEL_GRID - 1);
+					if(travels.count(index))
+						out.insert({static_cast<int>(ActionType::TRAVEL), index});
+				}
+				break;
+			}
+	};
+	for(const auto & task : plan)
+	{
+		if(const auto * goal = dynamic_cast<const NK2AI::Goals::ExecuteHeroChain *>(task.get()))
+			chain(*goal);
+		else if(const auto * composition = dynamic_cast<const NK2AI::Goals::Composition *>(task.get()))
+			for(const auto & step : composition->getSubtasks())
+				for(const auto & sub : step)
+					if(const auto * goal = dynamic_cast<const NK2AI::Goals::ExecuteHeroChain *>(sub.get()))
+						chain(*goal);
+	}
+}
 #endif
 #endif
 }
@@ -167,7 +208,7 @@ bool AlphaMapAI::adviceDrawn()
 	return uniform(rng) < adviceProbability;
 }
 
-std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optional<PlanTargets> & plan)
+std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optional<PlanTargets> & plan, std::vector<std::pair<int, int>> & accept)
 {
 #ifdef ALPHA_MAP_NK2_ADVICE
 	if(!advisor)
@@ -213,9 +254,17 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optiona
 	}
 	advisor->client.taken = nullptr;
 #ifdef NK2_KEEPS_PLAN
-	// Its plan, made before any request of this turn of its (keepPlan): our hero slots' targets
+	// Its plan, made before any request of this turn of its (keepPlan): our hero slots' targets, and our entries that
+	// walk it (each hero's, whichever hero it would move first: the teacher's targets beside the advice's own)
 	if(advisor->nk2->nullkiller->lastPlanValid)
+	{
 		plan = planTargets(decision, advisor->nk2->nullkiller->lastPlan);
+		std::set<std::pair<int, int>> entries;
+		planEntries(decision, advisor->nk2->nullkiller->lastPlan, cb->getMapSize(), entries);
+		if(advice)
+			entries.erase({advice->type, advice->index});
+		accept.assign(entries.begin(), entries.end());
+	}
 #endif
 	adviceSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 	++advised;
@@ -229,7 +278,7 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optiona
 #endif
 }
 
-std::optional<Choice> AlphaMapAI::adviseExchange(const Decision & decision, ObjectInstanceID first, ObjectInstanceID second)
+std::optional<Choice> AlphaMapAI::adviseExchange(const Decision & decision, ObjectInstanceID first, ObjectInstanceID second, std::vector<std::pair<int, int>> & accept)
 {
 #ifdef ALPHA_MAP_NK2_ADVICE
 	const auto * one = cb->getHero(first);
@@ -304,6 +353,21 @@ std::optional<Choice> AlphaMapAI::adviseExchange(const Decision & decision, Obje
 			if(move >= 0)
 				break;
 		}
+	// Every other move of ours toward its army (the teacher's targets beside the advice's own: any order of the moves
+	// reaches it): troops of a creature it wants more of from the source, no more than are missing; troops it would
+	// not keep back to the source, no more than the excess
+	for(const auto & [index, e] : moves)
+	{
+		if(index == move || (e.first != source->id && e.first != destination->id) || (e.second != source->id && e.second != destination->id) || e.first == e.second)
+			continue;
+		const auto * from = e.first == source->id ? source : destination;
+		if(from->getCreature(SlotID(e.a)) == nullptr)
+			continue;
+		const auto creature = from->getCreature(SlotID(e.a))->getId();
+		const int missing = wanted[creature] - has[creature];
+		if((from == source && missing > 0 && e.c <= missing) || (from == destination && missing < 0 && e.c <= -missing))
+			accept.emplace_back(static_cast<int>(ActionType::ARMY), index);
+	}
 	std::optional<Choice> advice;
 	if(move >= 0)
 	{

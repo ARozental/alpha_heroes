@@ -178,7 +178,7 @@ def test_an_update_runs_with_the_horizon_credit_and_learns_how_far_to_trust_the_
 		server=SimpleNamespace(set_model=lambda *args: None), teacher=None, teacher_weight=0.0, games_used=0, out=tmp_path, kwargs=kwargs, value_ev=None, credit_evidence={}, credit_check=1.0, head_ev={"Vend": 0.2}, value_pool=None, head_pool={}, progress=tmp_path / "progress.csv", writer=Writer(),
 		features_cpu=model.features,
 	)
-	for name in ("_take", "trust", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting"):
+	for name in ("_take", "trust", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting", "loss_shares", "loss_weights", "_note_gradients"):
 		setattr(learner, name, getattr(CampaignLearner, name).__get__(learner))
 	learner.progress.write_text(",".join(COLUMNS) + "\n")
 	assert learner.trust() == 0.0  # nothing known yet: the credit leans on the real outcome
@@ -316,7 +316,7 @@ def test_an_update_runs_with_the_attributed_credit(tmp_path):
 		server=SimpleNamespace(set_model=lambda *args: None), teacher=None, teacher_weight=0.0, games_used=0, out=tmp_path, kwargs=kwargs, value_ev=None, credit_evidence={}, credit_check=1.0, head_ev={"Vend": 0.2}, value_pool=None, head_pool={}, progress=tmp_path / "progress.csv", writer=Writer(),
 		features_cpu=model.features,
 	)
-	for name in ("_take", "trust", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting"):
+	for name in ("_take", "trust", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting", "loss_shares", "loss_weights", "_note_gradients"):
 		setattr(learner, name, getattr(CampaignLearner, name).__get__(learner))
 	learner.progress.write_text(",".join(COLUMNS) + "\n")
 	assert CampaignLearner.step(learner, epoch=1)

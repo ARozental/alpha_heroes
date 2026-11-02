@@ -150,7 +150,7 @@ def test_an_update_with_foresight_labels_runs_and_reports_them():
 	# The plan's cross-entropy (its outputs start at 0: uniform over the areas and none) and each term's gradient norm on
 	# the shared layers: the plan's 0 at the check (an update's first micro-batch) until its outputs move
 	assert model.plan_outputs and abs(metrics["foresight_plan"] - math.log(AREAS + 1)) < 0.05
-	assert all(metrics[f"grad_shared_{term}"] >= 0 for term in ("policy", "value", "entropy")) and metrics["grad_shared_plan"] == 0
+	assert all(metrics[f"grad_raw_{term}"] >= 0 for term in ("policy", "value", "entropy", "foresight")) and metrics["grad_raw_plan"] == 0  # (at weight 1: the learner weighs them, grad_shared_*)
 
 
 def battle(won=True, side=0, casualties=((0, 5), (1, 20)), result=0):

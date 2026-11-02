@@ -210,10 +210,10 @@ def labels_of(game, features, chunk=512):
 	return labels
 
 
-def gradient_check(model, main, foresight, terms=None):
+def gradient_check(model, main, foresight, terms=None, prefix="grad_shared_"):
 	"""The shared layers' gradient norm from the policy's and the values' losses (main) and from the foresight's, their
 	cosine, and the share of the parameters neither reaches (a path cut off), without touching .grad; terms ({name: a
-	term of the loss}, train.micro_loss's split): each one's norm there too (grad_shared_<name>), on the same scale."""
+	term of the loss}, train.micro_loss's split): each one's norm there too (<prefix><name>), on the same scale."""
 	shared = [p for name, p in model.named_parameters() if p.requires_grad and name.startswith(("encode_", "blocks.", "unet.", "read_tiles.", "sides.", "tile_sides.", "join_", "stamp_"))]
 	params = [p for p in model.parameters() if p.requires_grad]
 	g_main = torch.autograd.grad(main, params, retain_graph=True, allow_unused=True)
@@ -225,7 +225,7 @@ def gradient_check(model, main, foresight, terms=None):
 	norms = {}
 	for name, term in (terms or {}).items():
 		if term.requires_grad:
-			norms[f"grad_shared_{name}"] = float(flat(torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)).norm())
+			norms[f"{prefix}{name}"] = float(flat(torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)).norm())
 	return {
 		"grad_shared_main": float(a.norm()), "grad_shared_foresight": float(b.norm()),
 		"grad_shared_cosine": float(F.cosine_similarity(a, b, dim=0)), "grad_dead_share": dead / max(len(params), 1), **norms,

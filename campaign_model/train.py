@@ -129,6 +129,18 @@ def chosen_logp(out, choice):
 	return logp, entropy
 
 
+def entries_logp(out, types, indices, valid):
+	"""[N, K] log-probabilities of K turn entries a row (types: ActionType [N, K]; indices: in their tables [N, K]), -1e4
+	where not valid or not legal: their probability 0, every gradient finite (an all-illegal row's log-sum-exp is not
+	-inf, whose gradient would be NaN)."""
+	logp = out["type_logp"].gather(1, types.clamp(0, c.N_ACTION_TYPES - 1))
+	zero = torch.zeros((), device=types.device, dtype=logp.dtype)
+	for a, (output, _) in HEADS.items():
+		table = out[output].reshape(types.shape[0], -1)
+		logp = logp + torch.where(types == a, table.gather(1, indices.clamp(0, table.shape[1] - 1)), zero)
+	return logp.clamp(min=-1e4).masked_fill(~valid, -1e4)
+
+
 DECODE_THREADS = 3  # batches decoded at once: one thread's ~0.3 s a 128-decision micro-batch (110 MB of zlib and dtype copies, which release the interpreter lock) held the GPU's 146 ms step to it (2026-10-30, the PC)
 
 
@@ -502,7 +514,8 @@ def micro_loss(out, batch, config, foresight_config=None, split=False):
 	value, own = value / heads, own / heads
 	bonus = (entropy * keep).sum() / batch["count_keep"]
 	floor = (torch.relu(config.entropy_floor - entropy) * keep).sum() / batch["count_keep"]  # only decisions below it
-	loss = policy + config.value_weight * value - config.entropy_weight * bonus + config.entropy_floor_weight * floor
+	# (the value's and the foresight's weights from the learner's loss shares, "lw:value" "lw:foresight"; 1 without)
+	loss = policy + config.value_weight * value * batch.get("lw:value", 1.0) - config.entropy_weight * bonus + config.entropy_floor_weight * floor
 	teacher_part = torch.zeros((), device=keep.device)
 	if "t:type_logp" in batch:  # the teacher's KL (ppo_update's teacher), at its weight (a tensor: a recorded step reads it)
 		teacher_part = (teacher_kl(out, batch) * keep).sum() / batch["count_keep"]
@@ -511,6 +524,10 @@ def micro_loss(out, batch, config, foresight_config=None, split=False):
 	if "advice_action" in batch:  # Nullkiller2's advice (config.nk2_advice): its choice's cross-entropy, at the teacher's weight
 		advised = batch["advised"] * keep
 		advice_logp, _ = chosen_logp(out, {"kind": batch["kind"], "action": batch["advice_action"], "index": batch["advice_index"], "cell": batch["advice_cell"]})
+		if "accept_types" in batch:  # (and every other entry that follows it there, advice.teacher_sets: their summed probability)
+			advised_own = torch.where(batch["advice_has"], advice_logp.clamp(min=-1e4), torch.full_like(advice_logp, -1e4)).unsqueeze(1)
+			advice_logp = torch.logsumexp(torch.cat([advised_own, entries_logp(out, batch["accept_types"], batch["accept_index"], batch["accept_valid"])], dim=1), dim=1)
+			advised = advised * (advice_logp > -1e3).float()  # (a row none of whose entries is legal any more: none)
 		advice_part = -(torch.where(advised > 0, advice_logp, torch.zeros_like(advice_logp)) * advised).sum() / batch["count_advised"]
 		loss = loss + batch["teacher_weight"] * advice_part
 	fs_parts = fs_share = None
@@ -518,7 +535,7 @@ def micro_loss(out, batch, config, foresight_config=None, split=False):
 	if labels and "fs_turn" in out:
 		fs_config = foresight_config or ForesightConfig()
 		fs_loss, parts = foresight_loss(out, labels, fs_config)
-		fs_share = batch["share"] * fs_loss
+		fs_share = batch["share"] * fs_loss * batch.get("lw:foresight", 1.0)
 		loss = loss + fs_share
 		fs_parts = torch.stack([parts[name].detach().float() for name in PART_NAMES])
 	drift = logp.detach() - batch["anchor"]
@@ -533,15 +550,13 @@ def micro_loss(out, batch, config, foresight_config=None, split=False):
 		advice_part.detach(),  # teacher_ce
 		value.detach(),  # value_weighted
 	]).float()
-	if split:  # (each term as it enters the loss: the foresight's without its plan part, the plan's apart)
+	if split:  # (each term at weight 1 against the learner's loss shares, the loss_weights it sets: the plan's apart too)
 		terms = {
 			"policy": policy, "value": config.value_weight * value,
-			"entropy": config.entropy_floor_weight * floor - config.entropy_weight * bonus,
-			"teacher": batch["teacher_weight"] * (teacher_part + advice_part) if "teacher_weight" in batch else teacher_part + advice_part,
+			"entropy": config.entropy_floor_weight * floor - config.entropy_weight * bonus, "teacher": teacher_part + advice_part,
 		}
 		if fs_share is not None:
-			plan_share = batch["share"] * fs_config.weight * parts["plan"]
-			terms["foresight"], terms["plan"] = fs_share - plan_share, plan_share
+			terms["foresight"], terms["plan"] = batch["share"] * fs_loss, batch["share"] * fs_config.weight * parts["plan"]
 		return loss, metrics, fs_parts, fs_share, terms
 	return loss, metrics, fs_parts, fs_share
 
@@ -560,7 +575,7 @@ def share_baseline(real_change, predicted, trust):
 def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
 	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None, teacher=None, teacher_weight=None,
-	share_trust=1.0, head_scale=None,
+	share_trust=1.0, head_scale=None, teacher_sets=None, loss_weights=None,
 ):
 	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
 	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
@@ -593,12 +608,18 @@ def ppo_update(
 	choice = {name: torch.from_numpy(value).to(device) for name, value in choices(decisions).items()}
 	# Nullkiller2's advice (config.nk2_advice), where a decision has it: its type, entry and tile; advised 1 there
 	advice_t = None
-	if any(d.advice is not None for d in decisions):
+	# (teacher_sets: advice.teacher_sets' (types, indices, valid) of the decisions, every other entry that follows it)
+	has = np.array([d.advice is not None for d in decisions], dtype=bool)
+	if has.any() or (teacher_sets is not None and teacher_sets[2].any()):
 		advice = np.array([d.advice if d.advice is not None else (0, 0, -1) for d in decisions], dtype=np.int64).reshape(-1, 3)
+		advised = has | teacher_sets[2].any(axis=1) if teacher_sets is not None else has
 		advice_t = {
 			"advice_action": torch.from_numpy(advice[:, 0]).to(device), "advice_index": torch.from_numpy(advice[:, 1]).to(device), "advice_cell": torch.from_numpy(advice[:, 2]).to(device),
-			"advised": torch.tensor([d.advice is not None for d in decisions], dtype=torch.float32, device=device),
+			"advised": torch.from_numpy(advised.astype(np.float32)).to(device),
 		}
+		if teacher_sets is not None:
+			types, indices, valid = teacher_sets
+			advice_t.update(advice_has=torch.from_numpy(has).to(device), accept_types=torch.from_numpy(types).to(device), accept_index=torch.from_numpy(indices).to(device), accept_valid=torch.from_numpy(valid).to(device))
 	if advantages is None:
 		baseline = choice["old_value"] @ torch.tensor(weights, dtype=torch.float32, device=device)
 		advantage = torch.from_numpy(np.asarray(returns, dtype=np.float32)).to(device) - baseline
@@ -634,7 +655,11 @@ def ppo_update(
 	# an update; a teacher's pull (its advice, its KL) is supervised, not noise. At teacher_weight against PPO's 1 the
 	# update may move (1 + teacher_weight) x as far: at the teacher's 95% of the loss, PPO's target alone stopped every
 	# joint7 update after 2-6 of its ~56 steps and cut the rate 1.5x each time (1e-5 to 3e-6 in 3 updates, 2026-11-01)
-	kl_target = config.target_kl * (1.0 + float(teacher_weight_t)) if advice_t is not None or teacher is not None else config.target_kl
+	# (loss_weights, the learner's loss shares: the value's and the foresight's weights, and kl_teacher, the teacher's share
+	# against the policy's: the KL its pull makes, as teacher_weight was against PPO's 1 before them)
+	kl_teacher = float(loss_weights["kl_teacher"]) if loss_weights is not None else float(teacher_weight_t)
+	kl_target = config.target_kl * (1.0 + kl_teacher) if advice_t is not None or teacher is not None else config.target_kl
+	weights_t = {f"lw:{name}": torch.full((), float(loss_weights[name]), device=device) for name in ("value", "foresight")} if loss_weights is not None else {}
 	steps_graph = None
 	if graphs is not None and config.step_graphs:
 		steps_graph = model.__dict__.setdefault("_step_graph", StepGraph(model, lambda out, batch: micro_loss(out, batch, config, foresight_config)[:3]))
@@ -800,6 +825,7 @@ def ppo_update(
 					batch.update(end=end_t[sub], end_valid=end_valid[sub], count_end=counts["end"])
 				if head_w is not None:  # (config.head_scale: each value head's weight, the update's)
 					batch.update(head_w)
+				batch.update(weights_t)
 				if advice_t is not None:  # Nullkiller2's advice, at the teacher's weight
 					batch.update({name: value[sub] for name, value in advice_t.items()}, count_advised=counts["advised"], teacher_weight=teacher_weight_t)
 				if foresight_t is not None:
@@ -815,7 +841,7 @@ def ppo_update(
 					# reference to the default stream (stream 0) from warmup", 2026-10-30)
 					check = micro_loss(model(inputs), batch, config, foresight_config, split=True)
 					if check[3] is not None:
-						checked = gradient_check(model, check[0] - check[3], check[3], check[4])
+						checked = gradient_check(model, check[0] - check[3], check[3], check[4], prefix="grad_raw_")
 					del check
 				mark = time.perf_counter()
 				recorded = steps_graph.run(inputs, batch) if steps_graph is not None else None
