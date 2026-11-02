@@ -29,6 +29,11 @@ NO_EFFECT = 1  # the action was carried out and changed nothing
 TEACHER = 2  # Nullkiller2's decision (AlphaTeacherAI: agents/AlphaMapAI/Teacher.cpp): its choice, no model's logp
 ADVICE = 4  # our decision with Nullkiller2's choice in the same state beside it (Decision.advice: Advice.cpp)
 ADVICE_FIELDS = struct.Struct("<iii")  # (after the header, when flags has ADVICE: its action type, entry, tile)
+PLAN = 8  # Nullkiller2's plan in the same state beside it (Decision.plan: Advice.cpp; a label of the foresight's)
+# (after the advice, when flags has PLAN: each of our hero slots' target tile x, y, z, its days, its task's priority; x
+# -1: no task in the plan, -2: a task without a tile of the hero's)
+PLAN_FIELDS = struct.Struct("<" + "hhhhf" * c.OWN_HEROES)
+PLAN_ENTRY = 5
 # The questions the teacher's recorder records Nullkiller2's answers to (Teacher.cpp): the others are the model's own
 TEACHER_QUESTIONS = (c.DecisionKind.YES_NO, c.DecisionKind.SELECT, c.DecisionKind.LEVEL_UP)
 
@@ -53,6 +58,7 @@ class Decision:
 	flags: int
 	inputs: bytes  # zlib-compressed wire encoding (decode_inputs)
 	advice: tuple = None  # (action type, index, cell) of Nullkiller2's choice in this state (flags ADVICE), else None
+	plan: tuple = None  # Nullkiller2's plan in this state (flags PLAN): PLAN_ENTRY values a hero slot (PLAN_FIELDS), else None
 
 
 @dataclass
@@ -78,17 +84,20 @@ def parse_records(color, payload):
 			day, kind, today, version, action_type, index, cell, logp, *rest = HEADER.unpack_from(payload, offset)
 			value, flags, n = tuple(rest[: c.N_VALUE_OFFSETS]), rest[-2], rest[-1]
 			offset += HEADER.size
-			advice = None
+			advice = plan = None
 			if flags & ADVICE:
 				advice = ADVICE_FIELDS.unpack_from(payload, offset)
 				offset += ADVICE_FIELDS.size
+			if flags & PLAN:
+				plan = PLAN_FIELDS.unpack_from(payload, offset)
+				offset += PLAN_FIELDS.size
 			(m,) = struct.unpack_from("<I", payload, offset)
 			offset += 4
 			if n != IN_BYTES:
 				raise ValueError(f"a decision has {n} input bytes, the contract {IN_BYTES}")
 			if offset + m > len(payload):
 				raise ValueError("a damaged records message")
-			out.append(Decision(color, day, kind, today, version, action_type, index, cell, logp, value, flags, bytes(payload[offset : offset + m]), advice))
+			out.append(Decision(color, day, kind, today, version, action_type, index, cell, logp, value, flags, bytes(payload[offset : offset + m]), advice, plan))
 			offset += m
 		return out
 	if payload[:4] != b"AMZ1":
@@ -103,13 +112,16 @@ def parse_records(color, payload):
 		day, kind, today, version, action_type, index, cell, logp, *rest = HEADER.unpack_from(raw, offset)
 		value, flags, n = tuple(rest[: c.N_VALUE_OFFSETS]), rest[-2], rest[-1]
 		offset += HEADER.size
-		advice = None
+		advice = plan = None
 		if flags & ADVICE:
 			advice = ADVICE_FIELDS.unpack_from(raw, offset)
 			offset += ADVICE_FIELDS.size
+		if flags & PLAN:
+			plan = PLAN_FIELDS.unpack_from(raw, offset)
+			offset += PLAN_FIELDS.size
 		if n != IN_BYTES:
 			raise ValueError(f"a decision has {n} input bytes, the contract {IN_BYTES}")
-		out.append(Decision(color, day, kind, today, version, action_type, index, cell, logp, value, flags, zlib.compress(raw[offset : offset + n], 1), advice))
+		out.append(Decision(color, day, kind, today, version, action_type, index, cell, logp, value, flags, zlib.compress(raw[offset : offset + n], 1), advice, plan))
 		offset += n
 	return out
 

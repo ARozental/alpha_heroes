@@ -60,15 +60,18 @@ from .records import NO_EFFECT, TEACHER, decode_fields, decode_inputs
 from .train import HEAD_SCALE_RAMP, _prefetched, load_optimizer, make_optimizer, migrate_subtypes, model_kwargs, ppo_update, usable
 
 TYPES = [a.name.lower() for a in c.ActionType]
-FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answer") for part in ("battle", "score", "parts")) + ("foresight_hero_alive", "foresight_hero_army", "foresight_turn")
+FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answer") for part in ("battle", "score", "parts")) + ("foresight_hero_alive", "foresight_hero_army", "foresight_turn", "foresight_plan")
+# The shared layers' gradient norm from each term of the loss (foresight.gradient_check; grad_shared_foresight is the
+# foresight's with its plan, these the plan's alone and the rest's)
+GRADIENT_COLUMNS = tuple(f"grad_shared_{term}" for term in ("policy", "value", "entropy", "teacher", "plan"))
 COLUMNS = [
 	"version", "epoch", "games", "decisions", "dropped_old", "unsound", "credited", "days", "players", "phi_end", "heroes", "label_mean", "price_mean",
-	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "teacher_kl", "teacher_weight", "advised", "teacher_agree", "teacher_ce", "clip_fraction", "grad_norm", "steps", "learning_rate",
+	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_weighted", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "teacher_kl", "teacher_weight", "advised", "teacher_agree", "teacher_ce", "clip_fraction", "grad_norm", "steps", "learning_rate",
 	*(f"value_ev_d{k}" for k in c.VALUE_OFFSETS), *(f"head_ev_{kind}{k}" for kind in "vg" for k in c.VALUE_OFFSETS), "head_ev_vend", "no_effect", "ai_errors", "failed_actions", "game_failures", "game_maps", "dropped_games",
 	"game_seconds", "record_mb", "seconds", "gpu_mb", "label_staleness", *(f"share_{t}" for t in TYPES), *(f"failure_{k}" for k in FAILURES), "no_effect_types", "kinds",
 	# v2's foresight losses (foresight.py) and the gradient check: the shared layers' gradient from the PPO losses and the
 	# foresight's, their cosine, the share of parameters no loss reaches
-	*FORESIGHT_COLUMNS, "grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share",
+	*FORESIGHT_COLUMNS, "grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share", *GRADIENT_COLUMNS,
 ]
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
 DROP_BEYOND = 4  # updates' worth of finished games beyond which the oldest are dropped (_take)
@@ -686,6 +689,7 @@ class CampaignLearner:
 			"price_mean": sums["price_sum"] / max(n, 1),
 			"policy_loss": metrics.get("policy", float("nan")),
 			"value_loss": metrics.get("value", float("nan")),
+			"value_loss_weighted": metrics.get("value_weighted", float("nan")),  # (config.head_scale's weights: what the update takes)
 			"value_loss_fresh": metrics.get("value_fresh", float("nan")),  # train.ppo_update: before the update, above the targets' entropy
 			"entropy": metrics.get("entropy", float("nan")),
 			"below_floor": metrics.get("below_floor", float("nan")),
@@ -720,7 +724,7 @@ class CampaignLearner:
 			**{f"failure_{k}": v for k, v in failure_modes(decisions).items()},  # dumb decisions (failures.py)
 			"kinds": " ".join(f"{k}:{n}" for k, n in sorted(Counter(c.DecisionKind(d.kind).name for d in decisions).items())),
 			"no_effect_types": " ".join(f"{t}:{n}" for t, n in sorted(Counter(c.ActionType(d.action_type).name for d in decisions if d.flags & NO_EFFECT).items())),
-			**{name: metrics.get(name, float("nan")) for name in (*FORESIGHT_COLUMNS, "grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share")},
+			**{name: metrics.get(name, float("nan")) for name in (*FORESIGHT_COLUMNS, "grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share", *GRADIENT_COLUMNS)},
 		}
 		with self.progress.open("a", newline="") as f:
 			csv.writer(f).writerow([round(row[k], 6) if isinstance(row[k], float) else row[k] for k in COLUMNS])

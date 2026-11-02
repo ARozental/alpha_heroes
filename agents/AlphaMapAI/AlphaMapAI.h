@@ -62,6 +62,18 @@ struct Choice
 	uint64_t record = 0; // the serial of its Record (0: none), so a no-op flags this decision, not a later dialog's
 };
 
+/// Nullkiller2's plan for one of our hero slots (RECORD_PLAN: Advice.cpp, a label of the foresight's, never an input):
+/// where it sends the hero; x -1 no task of its plan, -2 a task with no tile of its own
+struct PlanTarget
+{
+	int16_t x = -1;
+	int16_t y = -1;
+	int16_t z = -1;
+	int16_t turns = 0; // the days to that tile
+	float priority = 0; // its task's
+};
+using PlanTargets = std::array<PlanTarget, MapSchema::OWN_HEROES>;
+
 /// A decision as sent to the trainer (campaign_model/records.py)
 struct Record
 {
@@ -73,6 +85,7 @@ struct Record
 	std::array<float, MapSchema::N_VALUE_OFFSETS> value{};
 	uint32_t flags = 0; // RECORD_NO_EFFECT: the action was carried out and changed nothing
 	std::optional<Choice> advice; // Nullkiller2's choice in the same state (RECORD_ADVICE: Advice.cpp)
+	std::optional<PlanTargets> plan; // Nullkiller2's plan in the same state (RECORD_PLAN: Advice.cpp)
 	std::string inputs; // wire encoded
 	uint64_t serial = 0; // this player's count of records so far (not sent)
 };
@@ -80,6 +93,7 @@ struct Record
 constexpr uint32_t RECORD_NO_EFFECT = 1;
 constexpr uint32_t RECORD_TEACHER = 2; // Nullkiller2's decision (Teacher.cpp): its choice is the teacher's, no model's probability
 constexpr uint32_t RECORD_ADVICE = 4; // our decision with Nullkiller2's choice in the same state beside it (Advice.cpp)
+constexpr uint32_t RECORD_PLAN = 8; // Nullkiller2's plan in the same state beside it (Advice.cpp: each hero slot's PlanTarget)
 
 /// Adventure-map AI: every decision is the campaign model's (campaign_model/), asked of the inference server; battles
 /// are played by the configured battle AI. Built on Nullkiller2's patterns for threads and queries (AIGateway).
@@ -174,7 +188,8 @@ class AlphaMapAI : public CAdventureAI
 	std::map<std::string, int> adviceUnmatched;
 	void initAdvice();
 	bool adviceDrawn(); // this decision gets the advice (at adviceProbability)
-	std::optional<Choice> advise(const Decision & decision);
+	// plan: Nullkiller2's plan there, its targets in our hero slots (with a Nullkiller2 that keeps it: NK2_KEEPS_PLAN)
+	std::optional<Choice> advise(const Decision & decision, std::optional<PlanTargets> & plan);
 	std::optional<Choice> adviseExchange(const Decision & decision, ObjectInstanceID first, ObjectInstanceID second);
 	std::string adviceJson() const;
 	// A request of Nullkiller2's as our turn decision's legal entry doing the same; false (unmatched: why) when none.
@@ -244,7 +259,7 @@ private:
 	void exchange(ObjectInstanceID first, ObjectInstanceID second, QueryID queryID);
 
 	// The model (AlphaMapAI.cpp)
-	Choice decide(Decision & decision, const std::optional<Choice> & advice = std::nullopt);
+	Choice decide(Decision & decision, const std::optional<Choice> & advice = std::nullopt, const std::optional<PlanTargets> & plan = std::nullopt);
 	void noEffect(const Choice & choice);
 	Choice sample(const Decision & decision, const Outputs & outputs);
 	void record(const Decision & decision, const Choice & choice, const Outputs & outputs, uint32_t version);

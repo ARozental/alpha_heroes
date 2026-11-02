@@ -14,6 +14,9 @@ window of the MOVE that led there). END has none (what follows is the other play
 	        against now (log ratio, -3..1; Huber, where it is still ours)
 	turn    Φ at the player's last turn decision that day against now (log ratio, -2..2), each resource at its first
 	        decision the next day against now (log((r' + k) / (r + k)), -3..3); Huber
+	plan    at a decision with Nullkiller2's advice, its plan in the same state (Decision.plan: Advice.cpp, our fork's
+	        Nullkiller2): each of our heroes' TRAVEL area it sends the hero to, or none (no task for it); cross-entropy.
+	        A label only, never an input: the AI plays without Nullkiller2
 """
 from dataclasses import dataclass
 
@@ -27,7 +30,8 @@ from battle_model import reward
 
 from . import constants as c
 from . import features as ft
-from .model_v2 import ACTION_TARGETS, HERO_TARGETS, TURN_TARGETS
+from .model_v2 import ACTION_TARGETS, AREAS, HERO_TARGETS, TURN_TARGETS
+from .records import PLAN_ENTRY
 
 W, HO = c.WINDOW, c.OWN_HEROES
 PARTS = len(ft.PHI_PARTS)
@@ -91,7 +95,9 @@ def game_labels(game, x, phi_parts, hero_gold):
 		"option": np.zeros(n, np.int64),
 		"hero": np.zeros((n, HO, HERO_TARGETS), np.float32), "hero_mask": np.zeros((n, HO), bool), "hero_alive": np.zeros((n, HO), bool),
 		"turn": np.zeros((n, TURN_TARGETS), np.float32), "turn_mask": np.zeros((n, TURN_TARGETS), bool),
+		"plan": np.zeros((n, HO), np.int64), "plan_mask": np.zeros((n, HO), bool),
 	}
+	plan_labels(game, x, labels)
 	by_color = {}
 	for i, d in enumerate(game.decisions):
 		by_color.setdefault(d.color, []).append(i)
@@ -150,6 +156,26 @@ def game_labels(game, x, phi_parts, hero_gold):
 	return labels
 
 
+def plan_labels(game, x, labels):
+	"""Nullkiller2's plan at each decision that has it (Decision.plan), into labels["plan"] (each hero slot's TRAVEL area,
+	AREAS: none) and labels["plan_mask"] (one of our heroes, its target an area or none; a task without a tile of the
+	hero's, -2, is no label). The areas are features.area_index's (TRAVEL's: blocks of 2 x the map encoder's a side)."""
+	rows = np.array([i for i, d in enumerate(game.decisions) if getattr(d, "plan", None) is not None], dtype=np.int64)
+	if len(rows) == 0:
+		return
+	plan = np.asarray([game.decisions[i].plan for i in rows], dtype=np.float64).reshape(len(rows), HO, PLAN_ENTRY)
+	tx, ty, tz = (plan[..., k].astype(np.int64) for k in range(3))
+	size = np.maximum(x["g_map"][rows].astype(np.int64), 1)
+	side = (2 * np.maximum((np.maximum(size[:, 0], size[:, 1]) + c.MAP_GRID - 1) // c.MAP_GRID, 1))[:, None]
+	tg = c.TRAVEL_GRID
+	area = (np.clip(tz, 0, c.MAP_LEVELS - 1) * tg + np.minimum(np.maximum(ty, 0) // side, tg - 1)) * tg + np.minimum(np.maximum(tx, 0) // side, tg - 1)
+	none = tx == -1
+	placed = (tx >= 0) & (ty >= 0) & (tz >= 0) & (tz < c.MAP_LEVELS)
+	ours = x["h_present"][rows, :HO].astype(bool) & (x["h_owner"][rows, :HO] == c.OWNER_SELF)
+	labels["plan"][rows] = np.where(none, AREAS, area)
+	labels["plan_mask"][rows] = ours & (none | placed)
+
+
 # The inputs the labels need: Φ's (features.empire_value), the heroes' armies and types, the resources
 LABEL_INPUTS = (
 	"g_resources", "g_object_income", "g_owned_creature", "g_owned_count", "g_dwelling_creature", "g_dwelling_count", "g_explored", "g_players", "g_day", "g_map",
@@ -184,9 +210,10 @@ def labels_of(game, features, chunk=512):
 	return labels
 
 
-def gradient_check(model, main, foresight):
+def gradient_check(model, main, foresight, terms=None):
 	"""The shared layers' gradient norm from the policy's and the values' losses (main) and from the foresight's, their
-	cosine, and the share of the parameters neither reaches (a path cut off), without touching .grad."""
+	cosine, and the share of the parameters neither reaches (a path cut off), without touching .grad; terms ({name: a
+	term of the loss}, train.micro_loss's split): each one's norm there too (grad_shared_<name>), on the same scale."""
 	shared = [p for name, p in model.named_parameters() if p.requires_grad and name.startswith(("encode_", "blocks.", "unet.", "read_tiles.", "sides.", "tile_sides.", "join_", "stamp_"))]
 	params = [p for p in model.parameters() if p.requires_grad]
 	g_main = torch.autograd.grad(main, params, retain_graph=True, allow_unused=True)
@@ -195,9 +222,13 @@ def gradient_check(model, main, foresight):
 	flat = lambda grads: torch.cat([(grads[index[id(p)]] if grads[index[id(p)]] is not None else torch.zeros_like(p)).flatten() for p in shared])  # noqa: E731
 	a, b = flat(g_main), flat(g_fore)
 	dead = sum(1 for x, y in zip(g_main, g_fore) if (x is None or not bool(x.any())) and (y is None or not bool(y.any())))
+	norms = {}
+	for name, term in (terms or {}).items():
+		if term.requires_grad:
+			norms[f"grad_shared_{name}"] = float(flat(torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)).norm())
 	return {
 		"grad_shared_main": float(a.norm()), "grad_shared_foresight": float(b.norm()),
-		"grad_shared_cosine": float(F.cosine_similarity(a, b, dim=0)), "grad_dead_share": dead / max(len(params), 1),
+		"grad_shared_cosine": float(F.cosine_similarity(a, b, dim=0)), "grad_dead_share": dead / max(len(params), 1), **norms,
 	}
 
 
@@ -218,7 +249,7 @@ def action_loss(predicted, target, battle, config, rows=None):
 	return fought, score, parts
 
 
-PART_NAMES = ("move_battle", "move_score", "move_parts", "answer_battle", "answer_score", "answer_parts", "hero_alive", "hero_army", "turn")  # foresight_loss's parts, in this order
+PART_NAMES = ("move_battle", "move_score", "move_parts", "answer_battle", "answer_score", "answer_parts", "hero_alive", "hero_army", "turn", "plan")  # foresight_loss's parts, in this order
 
 
 def foresight_loss(out, labels, config=ForesightConfig()):
@@ -238,5 +269,10 @@ def foresight_loss(out, labels, config=ForesightConfig()):
 	parts["hero_alive"] = masked_mean(F.binary_cross_entropy_with_logits(predicted[..., 0], labels["hero"][..., 0], reduction="none"), labels["hero_mask"])
 	parts["hero_army"] = masked_mean(F.huber_loss(predicted[..., 1], labels["hero"][..., 1], reduction="none", delta=config.huber), labels["hero_alive"])
 	parts["turn"] = masked_mean(F.huber_loss(out["fs_turn"], labels["turn"], reduction="none", delta=config.huber), labels["turn_mask"])
+	parts["plan"] = zero
+	if "fs_plan" in out and "plan" in labels:  # (model_v2.plan_of: the trainer's model only)
+		logits = out["fs_plan"].float()
+		crossed = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels["plan"].reshape(-1), reduction="none").reshape(labels["plan"].shape)
+		parts["plan"] = masked_mean(crossed, labels["plan_mask"])
 	total = sum(parts.values(), zero)
-	return config.weight * total, {k: v.detach() for k, v in parts.items()}
+	return config.weight * total, parts

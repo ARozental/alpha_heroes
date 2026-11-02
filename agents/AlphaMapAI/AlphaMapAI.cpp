@@ -241,9 +241,10 @@ void AlphaMapAI::makeTurn()
 				return;
 			auto decision = encode(DecisionKind::TURN);
 			std::optional<Choice> advice; // (Nullkiller2's, at this decision's chance: before ours, in the same state)
+			std::optional<PlanTargets> plan; // (and its plan there: labels both, never inputs)
 			if(adviceDrawn())
-				advice = advise(decision);
-			const auto choice = decide(decision, advice);
+				advice = advise(decision, plan);
+			const auto choice = decide(decision, advice, plan);
 			if(choice.type <= static_cast<int>(ActionType::END))
 				break;
 			const bool changed = execute(decision, choice);
@@ -519,7 +520,7 @@ void AlphaMapAI::connectInference(bool waiting)
 	}
 }
 
-Choice AlphaMapAI::decide(Decision & decision, const std::optional<Choice> & advice)
+Choice AlphaMapAI::decide(Decision & decision, const std::optional<Choice> & advice, const std::optional<PlanTargets> & plan)
 {
 	Choice choice;
 	try
@@ -579,6 +580,11 @@ Choice AlphaMapAI::decide(Decision & decision, const std::optional<Choice> & adv
 		{
 			entry.advice = advice;
 			entry.flags |= RECORD_ADVICE;
+		}
+		if(plan)
+		{
+			entry.plan = plan;
+			entry.flags |= RECORD_PLAN;
 		}
 		for(int k = 0; k < N_VALUE_OFFSETS; ++k)
 			entry.value[k] = outputs[Out::value][k];
@@ -751,6 +757,15 @@ void AlphaMapAI::sendRecords(bool final)
 					put<int32_t>(out, r.advice->index);
 					put<int32_t>(out, r.advice->cell);
 				}
+				if(r.flags & RECORD_PLAN) // (Nullkiller2's plan there: each hero slot's target tile, its days, its task's priority)
+					for(const auto & target : *r.plan)
+					{
+						put<int16_t>(out, target.x);
+						put<int16_t>(out, target.y);
+						put<int16_t>(out, target.z);
+						put<int16_t>(out, target.turns);
+						put<float>(out, target.priority);
+					}
 			};
 			auto deflate = [](const std::string & raw)
 			{

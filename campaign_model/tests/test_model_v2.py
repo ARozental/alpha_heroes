@@ -1,5 +1,7 @@
 """The campaign model v2 (model_v2.py) and its foresight (foresight.py): the contract, the export, every part learning,
 the labels of a game, an update with them."""
+import math
+
 import numpy as np
 import pytest
 import torch
@@ -8,7 +10,7 @@ from campaign_model import constants as c
 from campaign_model.config import CampaignConfig
 from campaign_model.foresight import battle_score, game_labels
 from campaign_model.model import CORRECTION_STEP, CampaignModel, build_model
-from campaign_model.model_v2 import ACTION_TARGETS, CampaignModelV2, Sides
+from campaign_model.model_v2 import ACTION_TARGETS, AREAS, CampaignModelV2, Sides
 from campaign_model.records import Decision, Game
 from campaign_model.schema import HEADS, OUTPUTS, random_inputs
 from campaign_model.tests.test_train import decisions_for
@@ -94,6 +96,7 @@ def test_every_part_learns_after_its_zero_starts_move():
 	policy's, the values' and the foresight's outputs: no path cut off."""
 	torch.manual_seed(3)
 	model = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	model.plan_outputs = True  # (as the trainer's: train.ppo_update)
 	x = tensors(rich_inputs(8, seed=4))
 	optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
@@ -101,8 +104,9 @@ def test_every_part_learns_after_its_zero_starts_move():
 
 	def loss():  # (each table's log-probabilities weighted at random: the mean of a uniform table's has no gradient)
 		out = model(x)
-		tables = sum((v.clamp(min=-30) * weights.setdefault(k, torch.randn(v.shape, generator=torch.Generator().manual_seed(len(k))))).mean() for k, v in out.items() if k.endswith("_logp"))
-		return tables + out["value"].mean() + out["growth_logit"].mean() + out["end_logit"].mean() + sum(v.pow(2).mean() for k, v in out.items() if k.startswith("fs_"))
+		# (fs_plan too: its outputs start at 0, where a square has no gradient)
+		tables = sum((v.clamp(min=-30) * weights.setdefault(k, torch.randn(v.shape, generator=torch.Generator().manual_seed(len(k))))).mean() for k, v in out.items() if k.endswith("_logp") or k == "fs_plan")
+		return tables + out["value"].mean() + out["growth_logit"].mean() + out["end_logit"].mean() + sum(v.pow(2).mean() for k, v in out.items() if k.startswith("fs_") and k != "fs_plan")
 
 	for _ in range(3):
 		optimizer.zero_grad()
@@ -135,6 +139,7 @@ def test_an_update_with_foresight_labels_runs_and_reports_them():
 		"option": np.array([max(d.index, 0) if d.action_type < 0 else 0 for d in decisions], np.int64),
 		"hero": np.zeros((n, c.OWN_HEROES, 2), np.float32), "hero_mask": x["h_present"][:, : c.OWN_HEROES].copy(), "hero_alive": x["h_present"][:, : c.OWN_HEROES].copy(),
 		"turn": np.zeros((n, 1 + c.N_RESOURCES), np.float32), "turn_mask": np.ones((n, 1 + c.N_RESOURCES), bool),
+		"plan": np.random.default_rng(1).integers(0, AREAS + 1, (n, c.OWN_HEROES)), "plan_mask": x["h_present"][:, : c.OWN_HEROES].copy(),
 	}
 	targets = np.full((n, c.N_VALUE_OFFSETS), 0.5, np.float32)
 	before = [p.detach().clone() for p in model.parameters()]
@@ -142,6 +147,10 @@ def test_an_update_with_foresight_labels_runs_and_reports_them():
 	assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters()))
 	assert metrics["foresight_turn"] >= 0 and metrics["foresight_hero_alive"] > 0
 	assert metrics["grad_shared_foresight"] > 0 and -1 <= metrics["grad_shared_cosine"] <= 1
+	# The plan's cross-entropy (its outputs start at 0: uniform over the areas and none) and each term's gradient norm on
+	# the shared layers: the plan's 0 at the check (an update's first micro-batch) until its outputs move
+	assert model.plan_outputs and abs(metrics["foresight_plan"] - math.log(AREAS + 1)) < 0.05
+	assert all(metrics[f"grad_shared_{term}"] >= 0 for term in ("policy", "value", "entropy")) and metrics["grad_shared_plan"] == 0
 
 
 def battle(won=True, side=0, casualties=((0, 5), (1, 20)), result=0):
@@ -296,3 +305,65 @@ def test_adams_moments_carry_over_to_a_model_that_gained_a_parameter():
 		else:
 			assert torch.equal(state["exp_avg"], optimizer.state[trained[name]]["exp_avg"]), name
 			assert torch.equal(state["exp_avg_sq"], optimizer.state[trained[name]]["exp_avg_sq"]), name
+
+
+def test_the_plan_head_changes_nothing_the_ai_reads(model):
+	"""model_v2.plan_of (the trainer's model: plan_outputs): fs_plan [B, HO, AREAS + 1] beside outputs that are
+	bit-identical to a server's (plan_outputs off): the AI reads none of it."""
+	x = tensors(rich_inputs(6, seed=7))
+	with torch.no_grad():
+		served = model(x)
+		model.plan_outputs = True
+		trained = model(x)
+		del model.plan_outputs
+	assert "fs_plan" not in served and trained["fs_plan"].shape == (6, c.OWN_HEROES, AREAS + 1)
+	assert all(torch.equal(served[k], trained[k]) for k in served if torch.is_tensor(served[k]))
+
+
+def test_a_checkpoint_without_the_plan_head_loads_it_as_a_new_model_starts_it():
+	"""model.ADDED_HEADS: a checkpoint from before foresight.plan* loads (strict) with the loading model's own fresh
+	weights there (not 0: a SwiGLU at 0 never gets a gradient), everything else the checkpoint's."""
+	torch.manual_seed(0)
+	saved = CampaignModelV2(dim=32, cell_dim=8, layers=1).state_dict()
+	old = {k: v for k, v in saved.items() if not k.startswith("foresight.plan")}
+	assert len(old) < len(saved)
+	torch.manual_seed(1)
+	fresh = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	own = {k: v.clone() for k, v in fresh.state_dict().items()}
+	fresh.load_state_dict(old)
+	for k, v in fresh.state_dict().items():
+		assert torch.equal(v, own[k] if k.startswith("foresight.plan") else saved[k]), k
+	assert float(fresh.foresight.plan.up.weight.abs().sum()) > 0  # (its SwiGLU at its fresh weights; its outputs start at 0)
+
+
+def test_the_plan_labels_are_its_targets_travel_areas():
+	"""foresight.plan_labels: each of our hero slots' target as its TRAVEL area (features.area_index's), none (-1) as
+	AREAS; a task without a tile (-2), a slot not ours and a decision without a plan are no label."""
+	from types import SimpleNamespace
+
+	from campaign_model import features as ft
+	from campaign_model.foresight import plan_labels
+	from campaign_model.records import PLAN_ENTRY
+
+	n, ho = 3, c.OWN_HEROES
+	x = {
+		"g_map": np.array([[36, 36, 2], [72, 72, 2], [36, 36, 2]], np.int64),
+		"h_present": np.zeros((n, c.N_HEROES), bool), "h_owner": np.full((n, c.N_HEROES), c.OWNER_SELF, np.int64),
+	}
+	x["h_present"][:, :4] = True
+	x["h_owner"][:, 3] = c.OWNER_SELF + 1  # (a slot that is not ours)
+	plan = np.zeros((ho, PLAN_ENTRY))
+	plan[:, 0] = -1
+	plan[0, :3], plan[1, :3], plan[2, 0], plan[3, :3] = (5, 7, 0), (35, 30, 1), -2, (1, 1, 0)
+	decisions = [SimpleNamespace(plan=tuple(plan.ravel())), SimpleNamespace(plan=tuple(plan.ravel())), SimpleNamespace(plan=None)]
+	labels = {"plan": np.zeros((n, ho), np.int64), "plan_mask": np.zeros((n, ho), bool)}
+	plan_labels(SimpleNamespace(decisions=decisions), x, labels)
+	pos = torch.tensor(np.stack([plan[:, :3]] * n), dtype=torch.long)
+	areas = ft.area_index({"g_map": torch.from_numpy(x["g_map"])}, pos).numpy()
+	for i in (0, 1):
+		assert labels["plan"][i, 0] == areas[i, 0] and labels["plan"][i, 1] == areas[i, 1] and labels["plan_mask"][i, :2].all()
+		assert not labels["plan_mask"][i, 2] and not labels["plan_mask"][i, 3]  # (no tile; not ours)
+		assert labels["plan"][i, 4] == AREAS and not labels["plan_mask"][i, 4]  # (none, but no hero in the slot)
+	assert labels["plan"][0, 0] == (0 * c.TRAVEL_GRID + 7 // 2) * c.TRAVEL_GRID + 5 // 2  # (36 x 36: areas 2 tiles a side)
+	assert labels["plan"][1, 0] == (0 * c.TRAVEL_GRID + 7 // 4) * c.TRAVEL_GRID + 5 // 4  # (72 x 72: 4)
+	assert not labels["plan_mask"][2].any()

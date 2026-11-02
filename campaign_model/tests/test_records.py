@@ -103,3 +103,25 @@ def test_a_record_with_nk2s_advice_reads_back_with_it():
 	decisions = parse_records("RED", b"AMZ2" + struct.pack("<I", 2) + plain + advised)
 	assert decisions[0].advice is None and decisions[1].advice == (c.ActionType.BUILD, 40, -1)
 	assert decisions[1].index == 12 and zlib.decompress(decisions[1].inputs) == raw
+
+
+def test_a_record_with_nk2s_plan_reads_back_with_it():
+	"""AMZ2 with RECORD_PLAN: each hero slot's target (x, y, z, days as int16, priority as float) after the advice's
+	fields, or right after the header without them (a plan beside an advice ours could not match)."""
+	import struct
+	import zlib
+
+	from campaign_model import constants as c
+	from campaign_model.records import ADVICE, ADVICE_FIELDS, HEADER, IN_BYTES, PLAN, PLAN_FIELDS, parse_records
+
+	packed = zlib.compress(bytes(IN_BYTES), 1)
+	values = [0.5] * c.N_VALUE_OFFSETS
+	plan = []
+	for h in range(c.OWN_HEROES):
+		plan += [h, 2 * h, h % 2, 1, 0.5 * h] if h < 3 else [-1, -1, -1, 0, 0.0]
+	both = HEADER.pack(3, c.DecisionKind.TURN, 0, 7, c.ActionType.MOVE, 12, -1, -0.5, *values, ADVICE | PLAN, IN_BYTES) + ADVICE_FIELDS.pack(c.ActionType.BUILD, 40, -1) + PLAN_FIELDS.pack(*plan) + struct.pack("<I", len(packed)) + packed
+	alone = HEADER.pack(3, c.DecisionKind.TURN, 1, 7, c.ActionType.END, 0, -1, -0.5, *values, PLAN, IN_BYTES) + PLAN_FIELDS.pack(*plan) + struct.pack("<I", len(packed)) + packed
+	decisions = parse_records("RED", b"AMZ2" + struct.pack("<I", 2) + both + alone)
+	assert decisions[0].advice == (c.ActionType.BUILD, 40, -1) and decisions[1].advice is None
+	assert decisions[0].plan == decisions[1].plan == tuple(plan) and len(plan) == PLAN_FIELDS.size // 12 * 5
+	assert decisions[1].action_type == c.ActionType.END and zlib.decompress(decisions[1].inputs) == bytes(IN_BYTES)

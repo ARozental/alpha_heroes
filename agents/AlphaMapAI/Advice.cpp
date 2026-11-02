@@ -12,6 +12,10 @@
 #include "lib/mapObjects/CGHeroInstance.h"
 #include "lib/mapping/TerrainTile.h"
 #include "lib/networkPacks/PacksForServer.h"
+#ifdef NK2_KEEPS_PLAN // (our fork's Nullkiller2: Nullkiller.h)
+#include "Goals/Composition.h"
+#include "Goals/ExecuteHeroChain.h"
+#endif
 #endif
 
 #include <chrono>
@@ -59,6 +63,61 @@ public:
 		throw AdviceTaken();
 	}
 };
+
+#ifdef NK2_KEEPS_PLAN
+/// Nullkiller2's plan (Nullkiller::lastPlan: its tasks, the best first) as our hero slots' targets (labels of the
+/// foresight's, never inputs): in a hero chain each hero's last tile in it (the path's nodes run from the target back
+/// to the start: a hero's first node there is the target for the hero that ends the chain, the meeting for one that
+/// brings it an army; a Composition's chain alike); a hero whose task has no chain gets x -2, one in no task keeps -1.
+/// A hero in two tasks keeps the better one's
+PlanTargets planTargets(const Decision & decision, const NK2AI::Goals::TTaskVec & plan)
+{
+	PlanTargets out{};
+	std::array<bool, OWN_HEROES> set{};
+	const auto slot = [&decision](const CGHeroInstance * hero)
+	{
+		for(int i = 0; hero && i < OWN_HEROES; ++i)
+			if(decision.heroes[i] == hero->id)
+				return i;
+		return -1;
+	};
+	const auto chain = [&](const NK2AI::Goals::ExecuteHeroChain & goal, float priority)
+	{
+		for(const auto & node : goal.getPath().nodes)
+		{
+			const int i = slot(node.targetHero);
+			if(i < 0 || set[i])
+				continue;
+			set[i] = true;
+			out[i] = {static_cast<int16_t>(node.coord.x), static_cast<int16_t>(node.coord.y), static_cast<int16_t>(node.coord.z), static_cast<int16_t>(node.turns), priority};
+		}
+	};
+	for(const auto & task : plan)
+	{
+		bool chained = false;
+		if(const auto * goal = dynamic_cast<const NK2AI::Goals::ExecuteHeroChain *>(task.get()))
+		{
+			chain(*goal, task->priority);
+			chained = true;
+		}
+		else if(const auto * composition = dynamic_cast<const NK2AI::Goals::Composition *>(task.get()))
+			for(const auto & step : composition->getSubtasks())
+				for(const auto & sub : step)
+					if(const auto * goal = dynamic_cast<const NK2AI::Goals::ExecuteHeroChain *>(sub.get()))
+					{
+						chain(*goal, task->priority);
+						chained = true;
+					}
+		if(const int i = slot(task->getHero()); !chained && i >= 0 && !set[i])
+		{
+			set[i] = true;
+			out[i].x = -2;
+			out[i].priority = task->priority;
+		}
+	}
+	return out;
+}
+#endif
 #endif
 }
 
@@ -87,6 +146,9 @@ void AlphaMapAI::initAdvice()
 	a->callback = std::make_shared<CCallback>(std::shared_ptr<CGameState>(const_cast<CGameState *>(&state), [](CGameState *) {}), playerID, &a->client);
 	a->nk2 = std::make_shared<NK2AI::AIGateway>();
 	a->nk2->initGameInterface(env, a->callback);
+#ifdef NK2_KEEPS_PLAN
+	a->nk2->nullkiller->keepPlan = true; // (its plan, made before its turn's first request: advise's labels)
+#endif
 	advisor = a;
 	logAi->info("AlphaMapAI %s: Nullkiller2's advice at a chance of %.3f a turn decision", playerID.toString(), adviceProbability);
 #else
@@ -105,7 +167,7 @@ bool AlphaMapAI::adviceDrawn()
 	return uniform(rng) < adviceProbability;
 }
 
-std::optional<Choice> AlphaMapAI::advise(const Decision & decision)
+std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optional<PlanTargets> & plan)
 {
 #ifdef ALPHA_MAP_NK2_ADVICE
 	if(!advisor)
@@ -150,6 +212,11 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision)
 		unmatched = std::string("an error: ") + e.what();
 	}
 	advisor->client.taken = nullptr;
+#ifdef NK2_KEEPS_PLAN
+	// Its plan, made before any request of this turn of its (keepPlan): our hero slots' targets
+	if(advisor->nk2->nullkiller->lastPlanValid)
+		plan = planTargets(decision, advisor->nk2->nullkiller->lastPlan);
+#endif
 	adviceSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 	++advised;
 	if(advice)

@@ -180,6 +180,12 @@ class Foresight(nn.Module):
 		self.answer_out = nn.Linear(FORESIGHT_HIDDEN, ACTION_TARGETS)
 		self.hero_out = nn.Linear(FORESIGHT_HIDDEN, HERO_TARGETS)
 		self.turn_out = nn.Linear(FORESIGHT_HIDDEN, TURN_TARGETS)
+		# Nullkiller2's plan (CampaignModelV2.plan_of): per (hero, TRAVEL area), and each hero's "no task". Its outputs start
+		# at 0: uniform, its loss ln(AREAS + 1), no gradient to the shared layers until it predicts (at random weights on
+		# a trained model's pairs it started at 14.5 nats, its shared gradient twice the policy's, 2026-11-02)
+		self.plan = SwiGLU(pair_dim, pair_dim, FORESIGHT_HIDDEN)
+		self.plan_out = zero_output(nn.Linear(FORESIGHT_HIDDEN, 1))
+		self.plan_none = zero_output(nn.Linear(dim, 1))
 
 
 class Memory(nn.Module):
@@ -228,6 +234,7 @@ class Memory(nn.Module):
 
 class CampaignModelV2(nn.Module):
 	ARCHITECTURE = "v2"
+	plan_outputs = False  # fs_plan too (plan_of): the trainer's model sets it (train.ppo_update); a server's does not
 
 	def load_state_dict(self, state_dict, strict=True, assign=False):
 		"""A checkpoint from before a parameter was added (model.ADDED) loads with it at 0: the model as it was."""
@@ -335,7 +342,18 @@ class CampaignModelV2(nn.Module):
 		state = self.think(state)
 		foresight = self.foresee(state, known)
 		state = self.think_again(state, foresight, known)
-		return {**self.decide(state, known), **foresight["outputs"], "memory": state.memory_out}
+		out = {**self.decide(state, known), **foresight["outputs"], "memory": state.memory_out}
+		if self.plan_outputs:
+			out["fs_plan"] = self.plan_of(state)
+		return out
+
+	def plan_of(self, state):
+		"""Nullkiller2's plan as the foresight predicts it [B, HO, AREAS + 1] (foresight.py "plan"): each of our heroes'
+		logits over the TRAVEL areas it is sent to (from its TRAVEL pairs: the hero, the area, the days there, the area's
+		prior) and over none (no task for it). For the loss only: the AI reads none of it, nothing else depends on it."""
+		f = self.foresight
+		areas = f.plan_out(f.plan(state.travel_pairs)).squeeze(-1)
+		return torch.cat([areas, f.plan_none(state.heroes[:, :HO])], dim=-1)
 
 	# ---- domain_knowledge ----
 

@@ -762,12 +762,17 @@ class PairBias(nn.Module):
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
 ADDED = ("features.move_discount",)
+# Heads added since that nothing the AI reads depends on (their losses only), by prefix: a checkpoint without them loads
+# them as a new model starts them (2026-11-02: foresight.plan*, model_v2.plan_of)
+ADDED_HEADS = ("foresight.plan",)
 
 
 def with_added(state_dict, own):
-	"""state_dict (a checkpoint's) with the ADDED parameters it lacks at 0; own: the loading model's state_dict."""
-	missing = [key for key in ADDED if key in own and key not in state_dict]
-	return {**state_dict, **{key: torch.zeros_like(own[key]) for key in missing}} if missing else state_dict
+	"""state_dict (a checkpoint's) with the ADDED parameters it lacks at 0 and the ADDED_HEADS' it lacks as the loading
+	model has them; own: the loading model's state_dict."""
+	missing = {key: torch.zeros_like(own[key]) for key in ADDED if key in own and key not in state_dict}
+	missing.update({key: value.clone() for key, value in own.items() if key.startswith(ADDED_HEADS) and key not in state_dict})
+	return {**state_dict, **missing} if missing else state_dict
 
 
 class CampaignModel(nn.Module):
