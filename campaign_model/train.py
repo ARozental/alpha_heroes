@@ -303,6 +303,39 @@ def head_loss(logits, targets, valid, count=None):
 	return loss.sum(dim=0) / (valid.sum(dim=0) if count is None else count).clamp(min=1)
 
 
+HEAD_SCALE_EPS = 1e-4  # (config.head_scale) a head's target variance floor, on its 0..1 scale (a spread of 0.01)
+HEAD_SCALE_RAMP = 20  # updates over which the heads' weights go from 1 (and growth_weight) to head_weights' (Adam's second moments adapt over ~1,000 steps)
+HEAD_SCALE_MEMORY = 0.8  # the running variance's share of the old estimate at each update
+
+
+def head_weights(variances, ramp, growth_weight, eps=HEAD_SCALE_EPS):
+	"""(config.head_scale) Each value head's weight in the value loss, {"share": [V2, V5, V7], "growth": [G2, G5, G7],
+	"end": [Vend]}: inversely to its targets' variance (each head's loss, a constant prediction's, equally large), scaled
+	so the heads' losses at a constant prediction add up to what they did at the old weights (1, growth_weight, 1): the
+	value loss keeps its size against the policy's and the teacher's, only its split between the heads changes; and ramp
+	(0..1) of the way from the old weights. variances: the same layout (a missing head keeps its old weight).
+	2026-11-02: V_end's targets spread 0.097 on the 0..1 scale and the share-change heads' 0.010-0.017, V_end's loss at
+	a constant prediction 35-100x theirs: the share-change heads were near-constant after a day."""
+	old = {"share": [1.0] * c.N_VALUE_OFFSETS, "growth": [growth_weight] * c.N_VALUE_OFFSETS, "end": [1.0]}
+	pairs = [(name, k) for name in old for k in range(len(old[name])) if variances.get(name) is not None and k < len(variances[name])]
+	if not pairs:
+		return old
+	baseline = sum(old[name][k] * variances[name][k] for name, k in pairs)
+	raw = {(name, k): old[name][k] / (variances[name][k] + eps) for name, k in pairs}
+	scale = baseline / max(sum(raw[p] * variances[p[0]][p[1]] for p in pairs), 1e-12)
+	out = {name: list(values) for name, values in old.items()}
+	for name, k in pairs:
+		out[name][k] = (1 - ramp) * old[name][k] + ramp * scale * raw[(name, k)]
+	return out
+
+
+def masked_variance(t, valid):
+	"""[heads] each column's variance over its valid rows (0 with fewer than 2)."""
+	n = valid.sum(dim=0)
+	mean = (t * valid).sum(dim=0) / n.clamp(min=1)
+	return torch.where(n > 1, (((t - mean) ** 2) * valid).sum(dim=0) / n.clamp(min=1), torch.zeros_like(n))
+
+
 def excess_loss(logits, targets):
 	"""Each head's cross-entropy against its soft targets above the targets' own entropy (its floor): 0 when the head
 	predicts its target exactly."""
@@ -446,14 +479,19 @@ def micro_loss(out, batch, config, foresight_config=None):
 	ratio = (logp - batch["old_logp"]).exp()
 	a, credit = batch["advantage"], keep * batch["credited"]
 	policy = -(torch.minimum(ratio * a, ratio.clamp(1 - config.clip, 1 + config.clip) * a) * credit).sum() / batch["count_credit"]
-	value, heads = head_loss(out["value_logit"], batch["targets"], batch["share_valid"], batch["count_share"]).sum(), float(c.N_VALUE_OFFSETS)
+	# (config.head_scale: each head at its weight, "w:share" "w:growth" "w:end", train.head_weights; the denominator stays the
+	# old weights' sum, the weights keeping the heads' total)
+	value, heads = head_loss(out["value_logit"], batch["targets"], batch["share_valid"], batch["count_share"]), float(c.N_VALUE_OFFSETS)
+	value = (value * batch["w:share"]).sum() if "w:share" in batch else value.sum()
 	if "growth" in batch:  # our value's log growth from the decision, on the heads' 0..1 scale
 		now = out["phi"].detach().clamp(min=PHI_FLOOR).log().unsqueeze(-1)
 		scaled = ((batch["growth"] - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
-		value = value + config.growth_weight * head_loss(out["growth_logit"], scaled, batch["growth_valid"], batch["count_growth"]).sum()
+		grown = head_loss(out["growth_logit"], scaled, batch["growth_valid"], batch["count_growth"])
+		value = value + ((grown * batch["w:growth"]).sum() if "w:growth" in batch else config.growth_weight * grown.sum())
 		heads += config.growth_weight * c.N_VALUE_OFFSETS
 	if "end" in batch:  # V_end, at a share head's weight
-		value = value + head_loss(out["end_logit"].unsqueeze(-1), batch["end"].unsqueeze(-1), batch["end_valid"].unsqueeze(-1), batch["count_end"].unsqueeze(-1)).sum()
+		ended = head_loss(out["end_logit"].unsqueeze(-1), batch["end"].unsqueeze(-1), batch["end_valid"].unsqueeze(-1), batch["count_end"].unsqueeze(-1))
+		value = value + ((ended * batch["w:end"]).sum() if "w:end" in batch else ended.sum())
 		heads += 1.0
 	value = value / heads
 	bonus = (entropy * keep).sum() / batch["count_keep"]
@@ -504,7 +542,7 @@ def share_baseline(real_change, predicted, trust):
 def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
 	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None, teacher=None, teacher_weight=None,
-	share_trust=1.0,
+	share_trust=1.0, head_scale=None,
 ):
 	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
 	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
@@ -621,6 +659,20 @@ def ppo_update(
 		value_fresh, heads = value_fresh + masked(fresh["end"], end_valid.unsqueeze(-1)), heads + 1.0
 	value_fresh = float(value_fresh) / heads
 	del fresh
+	# config.head_scale: the heads' target variances this update (the growth heads' on their 0..1 scale, over the value
+	# now), into the running ones (head_scale["var"]), and the heads' weights from them (head_weights)
+	head_w, head_var = None, None
+	if head_scale is not None:
+		measured = {"share": masked_variance(targets_t, share_valid).tolist()}
+		if growth is not None:
+			scaled_growth = ((growth_t - log_phi.unsqueeze(-1)).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
+			measured["growth"] = masked_variance(scaled_growth, growth_valid).tolist()
+		if end is not None:
+			measured["end"] = masked_variance(end_t.unsqueeze(-1), end_valid.unsqueeze(-1)).tolist()
+		old = head_scale.get("var") or {}
+		head_var = {name: [HEAD_SCALE_MEMORY * o + (1 - HEAD_SCALE_MEMORY) * m for o, m in zip(old[name], values)] if name in old and len(old[name]) == len(values) else values for name, values in measured.items()}
+		weights = head_weights(head_var, float(head_scale.get("ramp", 1.0)), config.growth_weight)
+		head_w = {f"w:{name}": torch.tensor(values, dtype=torch.float32, device=device) for name, values in weights.items() if name in measured}
 	gpu_mb = 0.0
 	end_step_error = None
 	attributed_stats = {}
@@ -726,6 +778,8 @@ def ppo_update(
 					batch.update(growth=growth_t[sub], growth_valid=growth_valid[sub], count_growth=counts["growth"])
 				if end is not None:
 					batch.update(end=end_t[sub], end_valid=end_valid[sub], count_end=counts["end"])
+				if head_w is not None:  # (config.head_scale: each value head's weight, the update's)
+					batch.update(head_w)
 				if advice_t is not None:  # Nullkiller2's advice, at the teacher's weight
 					batch.update({name: value[sub] for name, value in advice_t.items()}, count_advised=counts["advised"], teacher_weight=teacher_weight_t)
 				if foresight_t is not None:
@@ -823,6 +877,8 @@ def ppo_update(
 		**{f"value_ev_d{k}": explained_variance(predicted[:, i], actual[:, i]) for i, k in enumerate(c.VALUE_OFFSETS)},
 		**{f"value_parts_d{k}": residual_variances(predicted[:, i], actual[:, i]) for i, k in enumerate(c.VALUE_OFFSETS)},
 		**value_fit(predicted[:, -1], actual[:, -1]),
+		head_var=head_var,  # (config.head_scale: the running target variances, for the next update)
+		head_weights={name[2:]: tensor.tolist() for name, tensor in head_w.items()} if head_w is not None else None,
 	)
 	return metrics, lr_scale
 

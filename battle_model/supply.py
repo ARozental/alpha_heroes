@@ -592,6 +592,10 @@ class Runner:
 
 		for record_key, records in self.records.drain().items():
 			for data in records:
+				# config.real_keep: the battle learner gets this share of the campaign's battles, chosen at random before
+				# anything is done with them (2026-11-02, the user: 90% fewer battles, the campaign's share of them fixed)
+				if self.config.real_keep < 1.0 and random.random() >= self.config.real_keep:
+					continue
 				try:
 					record = parse_record(data)
 				except Exception as error:

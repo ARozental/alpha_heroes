@@ -129,6 +129,10 @@ class CampaignConfig:
 	#             The ladder grades them on real outcomes only, and the horizon and mix credits refuse it (they read
 	#             the heads as shares); the attributed credit reads the growth heads
 	share_target: str = "change"  # (the default since 2026-11-01: what runs)
+	# Each value head's loss weighted inversely to its targets' running variance (train.head_weights: the heads' total
+	# kept, ramped in over HEAD_SCALE_RAMP updates): V_end's loss at a constant prediction was 35-100x a share-change
+	# head's (2026-11-02)
+	head_scale: bool = False
 	# The teacher's KL (AlphaStar's KL to its supervised policy, 2026-10-31: 1,020 -> 1,400 Elo in its ablation): each
 	# decision's KL(teacher || model) over the action type and each type's table (train.teacher_kl), at this weight in
 	# the loss, the teacher a frozen imitation of Nullkiller2 (imitate.py's bc_latest.pt: teacher_checkpoint). It keeps

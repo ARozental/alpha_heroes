@@ -101,6 +101,11 @@ class TrainConfig:
 	remote_slots: int = 0
 	real_games: int = 0  # (real_games.py, unused since 2026-10-30: training against the game's AI is out)
 	real_share: float = 0.5
+	# fixed_mix: each update's share of campaign battles is real_share, the rest generated (league: self-play, past
+	# versions), and neither fills the other's share until it has been short FILL_AFTER (actors.py); the generated
+	# actors play only their share. Off: the generated fill what the campaign leaves short (the learner never waits)
+	fixed_mix: bool = False
+	real_keep: float = 1.0  # the share of the campaign games' battles the battle learner gets (the rest skipped in supply._battles, before prepare)
 	game_share: float = 0.125  # at most this share of an update from any one game
 	max_record_age: int = 3  # model versions: older records are dropped
 	buffer_decisions: int = 16000  # at most this many decisions wait in the buffer (the oldest go first)

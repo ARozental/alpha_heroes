@@ -29,6 +29,7 @@ from .inference import InferenceServer
 
 KEEP_VERSIONS = 6  # the newest model versions kept for the actors (older ones are deleted unless a league snapshot)
 LEAGUE_EVERY = 50  # every this many versions one is kept for good, as a past opponent
+FILL_AFTER = 1800  # s (config.fixed_mix): how long an update waits at its mix before one source fills the other's share
 
 
 class ActorPool:
@@ -63,6 +64,7 @@ class ActorPool:
 				version = int(path.stem.split("_")[1])
 				self.server.set_model(f"v{version}", version, torch.load(path, map_location="cpu"))
 		self.buffer = []  # supply.prepare items: data, source, game, version, decisions, summary, ...
+		self.short_since = None  # (config.fixed_mix) when the next update first could not be filled at its mix
 		self.lock = threading.Condition()
 		self.stats = {"failures": 0, "dropped_stale": 0, "dropped_overflow": 0, "battles": {"generated": 0, "real": 0}, "last_failure": ""}
 
@@ -168,11 +170,20 @@ class ActorPool:
 		the generated actors held at their 60% the learner waited 13-50 s an update for the campaign's battles)."""
 		config = self.config
 		real = sum(b["decisions"] for b in self.buffer if b["source"] == "real" and b["version"] >= self.version - config.max_record_age)
-		room = config.ahead * max((1 - config.real_share) * config.decisions_per_update, config.decisions_per_update - real / config.ahead)
+		if getattr(config, "fixed_mix", False) and not self.filling():  # (only their own share: the campaign's battles are not filled in for)
+			room = config.ahead * (1 - config.real_share) * config.decisions_per_update
+		else:
+			room = config.ahead * max((1 - config.real_share) * config.decisions_per_update, config.decisions_per_update - real / config.ahead)
 		# No more than the buffer keeps: take() drops whatever is over buffer_decisions, oldest first, so a room past it
 		# had battles played to be dropped (2026-10-31 review: the PC's 3 x 6,400 against a buffer of 8,000)
 		waiting_real = sum(b["decisions"] for b in self.buffer if b["source"] == "real")
 		return min(room, max(0, config.buffer_decisions - waiting_real))
+
+	def filling(self):
+		"""(config.fixed_mix) Whether the next update has been short of a source past FILL_AFTER: the other then fills it,
+		and the generated actors may play for it (else a campaign that stopped sending battles left the update unfillable
+		and take() raised at its timeout)."""
+		return self.short_since is not None and time.time() - self.short_since > FILL_AFTER
 
 	def generated_waiting(self):
 		"""Decisions of generated battles in the buffer, young enough to be used (call with self.lock held)."""
@@ -201,9 +212,12 @@ class ActorPool:
 		with self.lock:
 			while True:
 				self._drop_stale()
-				chosen, per_game, taken = self._select(decisions)
+				chosen, per_game, taken = self._select(decisions, fill=not getattr(config, "fixed_mix", False) or self.filling())
 				if sum(taken.values()) >= decisions:
+					self.short_since = None
 					break
+				if self.short_since is None:
+					self.short_since = time.time()
 				if time.time() > deadline:
 					raise RuntimeError(f"actors: an update could not be filled in {timeout}s ({sum(taken.values())} decisions; {self.stats})")
 				if stop is not None and stop():
@@ -229,7 +243,7 @@ class ActorPool:
 			}
 		return chosen, stats
 
-	def _select(self, decisions):
+	def _select(self, decisions, fill=True):
 		"""(battles, decisions per game, decisions per source) for an update, oldest first (within max_record_age: newest
 		first left the long battles, which start under an older version, to age out): real_share from real games,
 		the rest generated, the other source filling when one is short; no real game over game_share of the update
@@ -253,8 +267,9 @@ class ActorPool:
 		real_goal = config.real_share * decisions if config.campaign.games else 0.0
 		pick("real", real_goal)
 		pick("generated", decisions - real_goal)
-		pick("real", decisions)  # one source short: the other fills the update
-		pick("generated", decisions)
+		if fill:  # one source short: the other fills the update (config.fixed_mix: only once it has been short FILL_AFTER)
+			pick("real", decisions)
+			pick("generated", decisions)
 		return chosen, per_game, taken
 
 

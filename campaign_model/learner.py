@@ -57,7 +57,7 @@ from .foresight import labels_of
 from .labeler import Labeler
 from .model import build_model
 from .records import NO_EFFECT, TEACHER, decode_fields, decode_inputs
-from .train import _prefetched, load_optimizer, make_optimizer, migrate_subtypes, model_kwargs, ppo_update, usable
+from .train import HEAD_SCALE_RAMP, _prefetched, load_optimizer, make_optimizer, migrate_subtypes, model_kwargs, ppo_update, usable
 
 TYPES = [a.name.lower() for a in c.ActionType]
 FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answer") for part in ("battle", "score", "parts")) + ("foresight_hero_alive", "foresight_hero_army", "foresight_turn")
@@ -133,6 +133,7 @@ class CampaignLearner:
 		self.end_check = 1.0  # and its verdict (end_credit: config.end_credit_check)
 		self.head_ev = {}  # each head's explained variance at the day starts, smoothed: how far it grades the next (grade_trust)
 		self.value_pool, self.head_pool = None, {}  # their parts (labels.pooled_ev): the residual variance and the variance, smoothed apart
+		self.head_var, self.head_scale_updates = None, 0  # (config.head_scale) the heads' running target variances, the updates since it began
 		latest = self.out / "checkpoint_latest.pt"
 		if resume and latest.exists():
 			state = torch.load(latest, map_location=device)
@@ -153,6 +154,7 @@ class CampaignLearner:
 			self.end_check = credit_trust(credit_gaps(self.end_evidence))
 			self.head_ev = state.get("head_ev", {})
 			self.value_pool, self.head_pool = state.get("value_pool"), state.get("head_pool", {})
+			self.head_var, self.head_scale_updates = state.get("head_var"), state.get("head_scale_updates", 0)
 			print(f"campaign: resuming at version {self.version}", flush=True)
 		elif config.init_from:
 			state = torch.load(config.init_from, map_location=device)
@@ -538,7 +540,7 @@ class CampaignLearner:
 			out_of_memory = None
 			with self.model_lock:
 				try:
-					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.teacher_weight, share_trust=self.trust(), measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
+					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.teacher_weight, share_trust=self.trust(), head_scale={"var": getattr(self, "head_var", None), "ramp": min(1.0, getattr(self, "head_scale_updates", 0) / HEAD_SCALE_RAMP)} if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
 				except torch.OutOfMemoryError as error:  # (handled below, once the error's frames, and their tensors, are gone)
 					out_of_memory = str(error)[:200]
 			if out_of_memory is not None:
@@ -558,6 +560,10 @@ class CampaignLearner:
 				self._refresh_features()
 				self._note_value_ev(metrics)
 				self.teacher_weight = adapted_teacher_weight(self.teacher_weight, metrics.get("teacher_kl"), self.config.teacher_kl_target)
+				if metrics.get("head_var") is not None:  # (config.head_scale: for the next update; the ramp goes on)
+					self.head_var, self.head_scale_updates = metrics["head_var"], getattr(self, "head_scale_updates", 0) + 1
+					weights = metrics.get("head_weights") or {}
+					print("campaign value heads' weights (ramp %.2f): " % min(1.0, self.head_scale_updates / HEAD_SCALE_RAMP) + "  ".join(f"{name} " + "/".join(f"{w:.2f}" for w in values) for name, values in weights.items()) + "  target std " + "  ".join(f"{name} " + "/".join(f"{v ** 0.5:.3f}" for v in values) for name, values in self.head_var.items()), flush=True)
 				self._save(self.out / "checkpoint_latest.pt")
 		unspool(game for game, _ in games)  # (in the checkpoint now: this process's, or the update process's)
 		if self.worker:  # (the process saved its checkpoint with the trust before this update: one update behind)
@@ -765,7 +771,7 @@ class CampaignLearner:
 	def _save(self, path):
 		state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
 		optimizer = {} if self.worker else {"optimizer": self.optimizer.state_dict()}  # (the process's is in checkpoint_latest.pt)
-		torch.save({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "model_kwargs": self.kwargs}, path)
+		torch.save({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "model_kwargs": self.kwargs}, path)
 
 	# ---- evaluation ----
 
