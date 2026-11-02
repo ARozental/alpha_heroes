@@ -1297,7 +1297,7 @@ def train(config, resume=False):
 			if pool:  # the workers prepared each battle's arrays (supply.prepare): joined, the advantages normalised over the update
 				from .supply import assemble
 
-				batch_all, summaries = assemble(items, advantage_config)
+				batch_all, summaries = assemble(items, advantage_config, device=device if device.type == "cuda" else None)  # (the sparse inputs dense on the GPU: supply.dense_on)
 				n_examples = int(batch_all["advantage"].shape[0]) if batch_all is not None else 0
 			else:
 				loader, summaries, _ = make_dataloader(records, config.batch_size, True, reward_config, advantage_config)

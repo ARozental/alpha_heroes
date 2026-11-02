@@ -213,13 +213,37 @@ def _numpy(value):
 def _tensors(value):
 	if isinstance(value, dict):
 		return {k: _tensors(v) for k, v in value.items()}
+	if isinstance(value, torch.Tensor):  # (dense_on's, already on its device)
+		return value
 	return torch.from_numpy(np.ascontiguousarray(value))
 
 
-def assemble(items, advantage_config):
+def dense_on(values, device):
+	"""The items' arrays of one input (Sparse or not) joined along their rows, built on device: a Sparse one's nonzero
+	entries go there and are placed in the zeros there, so the dense batch never exists on the CPU (2026-11-01: an
+	update's 6,400 battle decisions made densely on the CPU were a ~3-4 GB swing of the trainer every epoch, 0.3 GB sparse)."""
+	first = values[0]
+	rest = tuple(first.shape[1:])
+	rows = [v.shape[0] for v in values]
+	dtype = torch.from_numpy(np.zeros(0, first.dtype)).dtype
+	out = torch.zeros((sum(rows),) + rest, dtype=dtype, device=device)
+	flat, per_row, offset = out.view(-1), int(np.prod(rest)) if rest else 1, 0
+	for v, n in zip(values, rows):
+		if isinstance(v, Sparse):
+			if len(v.index):
+				where = torch.from_numpy(v.index.astype(np.int64)).to(device) + offset * per_row
+				flat[where] = True if v.values is None else torch.from_numpy(np.ascontiguousarray(v.values)).to(device)
+		else:
+			out[offset : offset + n] = torch.from_numpy(np.ascontiguousarray(v)).to(device)
+		offset += n
+	return out
+
+
+def assemble(items, advantage_config, device=None):
 	"""One update's batch (as data.collate(widen=False) gives it, the int64 inputs int32) from the battle items taken, the
 	advantages normalised per side and source over the update (data.make_dataloader: the campaign games' battles got 50%
-	larger advantages than the generated ones' when normalised together); and the items' summaries, in order."""
+	larger advantages than the generated ones' when normalised together); and the items' summaries, in order. device:
+	the sparse inputs made dense there (dense_on), not on the CPU; the rest as before (moved by the caller)."""
 	parts = [item["data"] for item in items if item["data"]]
 	if not parts:
 		return None, [item["summary"] for item in items]
@@ -227,6 +251,8 @@ def assemble(items, advantage_config):
 	def join(values):
 		if isinstance(values[0], dict):
 			return {k: join([v[k] for v in values]) for k in values[0]}
+		if device is not None and any(isinstance(v, Sparse) for v in values):
+			return dense_on(values, device)
 		return np.concatenate([v.dense() if isinstance(v, Sparse) else v for v in values])
 
 	batch = _tensors(join(parts))
