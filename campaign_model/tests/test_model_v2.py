@@ -7,12 +7,12 @@ import torch
 from campaign_model import constants as c
 from campaign_model.config import CampaignConfig
 from campaign_model.foresight import battle_score, game_labels
-from campaign_model.model import build_model
+from campaign_model.model import CORRECTION_STEP, CampaignModel, build_model
 from campaign_model.model_v2 import ACTION_TARGETS, CampaignModelV2, Sides
 from campaign_model.records import Decision, Game
 from campaign_model.schema import HEADS, OUTPUTS, random_inputs
 from campaign_model.tests.test_train import decisions_for
-from campaign_model.train import chosen_logp, choices, ppo_update
+from campaign_model.train import chosen_logp, choices, load_optimizer, make_optimizer, ppo_update
 
 
 def tensors(x):
@@ -237,3 +237,62 @@ def test_the_change_heads_start_at_no_change_whatever_the_players():
 	with torch.no_grad():
 		out = model(x)
 	assert torch.allclose(out["value"], torch.full_like(out["value"], 0.5))  # (a share's would be 1/2, 1/3, 1/4, 1/8)
+
+
+def test_the_move_discount_starts_as_the_old_score_and_moves_only_the_move_scores(model):
+	"""features.move_discount (CustomFeatures.move_discount_power): a checkpoint without it loads (v2 and v1) with it at
+	0, the model as it was; its gradient there is not 0; away from 0 it changes the MOVE options' scores and the action
+	type's (it reads them), nothing else."""
+	x = tensors(rich_inputs(6, seed=3))
+	old = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	old.load_state_dict({k: v for k, v in model.state_dict().items() if k != "features.move_discount"})
+	assert float(old.features.move_discount.detach()) == 0 and float(old.features.move_discount_power().detach()) == 0
+	v1 = CampaignModel(dim=32, cell_dim=16, layers=1)
+	v1.load_state_dict({k: v for k, v in v1.state_dict().items() if k != "features.move_discount"})
+	with torch.no_grad():
+		before = old(x)
+		old.features.move_discount.fill_(1 / CORRECTION_STEP)  # (its power 1.5 tanh 1: ~1.14)
+		after = old(x)
+	changed = {k for k in before if torch.is_tensor(before[k]) and not torch.equal(before[k], after[k])}
+	assert "move_logp" in changed and changed <= {"move_logp", "type_logp"}, changed
+	with torch.no_grad():
+		old.features.move_discount.zero_()
+	logp = old(x)["move_logp"].flatten(1)
+	rows = torch.isfinite(logp).any(dim=1)
+	assert rows.any()
+	logp[rows].max(dim=1).values.sum().backward()
+	grad = old.features.move_discount.grad
+	assert grad is not None and torch.isfinite(grad).all() and float(grad.abs()) > 0
+
+
+def test_adams_moments_carry_over_to_a_model_that_gained_a_parameter():
+	"""train.load_optimizer: a checkpoint's optimizer from before features.move_discount keeps every other parameter's
+	moments, matched by name (the new one sits among them, not at the end), and the new one starts fresh."""
+	config = CampaignConfig(learning_rate=1e-3)
+	torch.manual_seed(0)
+	model = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	optimizer = make_optimizer(model, config)
+	for p in model.parameters():
+		p.grad = torch.randn_like(p)
+	optimizer.step()
+	names = {id(p): n for n, p in model.named_parameters()}
+	order = [names[id(p)] for group in optimizer.param_groups for p in group["params"]]
+	gone = order.index("features.move_discount")
+	assert gone < len(order) - 1
+	saved = optimizer.state_dict()
+	place = {i: i - (i > gone) for i in range(len(order)) if i != gone}  # each parameter's place in the old model's
+	old = {
+		"state": {place[i]: s for i, s in saved["state"].items() if i != gone},
+		"param_groups": [{**g, "params": [place[i] for i in g["params"] if i != gone]} for g in saved["param_groups"]],
+	}
+	fresh = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	fresh_optimizer = make_optimizer(fresh, config)
+	load_optimizer(fresh_optimizer, fresh, old, [k for k in model.state_dict() if k != "features.move_discount"])
+	trained = dict(model.named_parameters())
+	for name, p in fresh.named_parameters():
+		state = fresh_optimizer.state.get(p, {})
+		if name == "features.move_discount":
+			assert not state
+		else:
+			assert torch.equal(state["exp_avg"], optimizer.state[trained[name]]["exp_avg"]), name
+			assert torch.equal(state["exp_avg_sq"], optimizer.state[trained[name]]["exp_avg_sq"]), name

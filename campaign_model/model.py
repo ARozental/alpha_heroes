@@ -237,6 +237,7 @@ class CustomFeatures(nn.Module):
 		self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight = zeros(), zeros(), zeros(), zeros()
 		self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight = (zeros() for _ in range(6))
 		self.travel_exponent, self.end_coupling, self.travel_coupling = zeros(), zeros(), zeros()
+		self.move_discount = zeros()  # (not a prior correction: its 0 is the old score, not a prior; move_discount_power)
 		self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
@@ -244,6 +245,11 @@ class CustomFeatures(nn.Module):
 		self.register_buffer("pairs", ft.pair_table(), persistent=False)
 		for table in (self.object_type_gain, self.object_type_delta, self.object_subtype_delta):
 			nn.init.zeros_(table.weight)
+
+	def move_discount_power(self):
+		"""The power of Nullkiller2's movement discount on a MOVE tile's gain (tile_features): exactly 0 at the start (the
+		score as before), within -1.5..1.5, moving about as fast as a prior correction (CORRECTION_STEP)."""
+		return 1.5 * torch.tanh(CORRECTION_STEP * self.move_discount)
 
 	def corrections(self):
 		return [
@@ -526,6 +532,20 @@ class CustomFeatures(nn.Module):
 		explore = ft.unexplored_around(flags)
 		# The object is ours only if we win the fight in front of it (a bank's guards, a monster's zone, a town's garrison)
 		value = object_gold * torch.where(fights, win, torch.ones_like(win)) + fight + explore * self.explore_gold()
+		# That gain discounted by the time to reach the tile as Nullkiller2 discounts its targets (PriorityEvaluator::
+		# evaluateMovement, as travel_prior does TRAVEL's areas): by the part of a day's movement it costs, raised to
+		# move_discount_power, 0 at the start (the score as before) and 1 its full discount. Nullkiller2 scores every
+		# target, near or far, as value by cost, so a pickup on the way outranks a far goal (the user, 2026-11-02: value
+		# per movement cost as an op on what the model has, the old score while it is unused). The danger below stays
+		# where the move ends, undiscounted
+		left_now = pick("w_move_left")
+		days = torch.where(
+			left_now >= 0,
+			(ours(x["h_move"]).float()[:, None, None] - left_now.float()).clamp(min=0) / ours(x["h_move_max"]).float().clamp(min=1)[:, None, None],
+			pick("w_turns").clamp(min=1).float(),
+		)
+		discount = ft.movement_discount(days, ft.bounded(self.travel_exponent, 0.7, 2.0, 1.3, CORRECTION_STEP))
+		value = value * discount ** self.move_discount_power()
 		# Danger: the enemy heroes we see, their reach to the tile x P(they beat this hero); what ending the move there
 		# instead of where the hero stands changes in the expected loss (army, hero, its replacement: hero); our towns'
 		# danger on them
@@ -739,6 +759,17 @@ class PairBias(nn.Module):
 		return self.net(features).permute(0, 3, 1, 2)
 
 
+# Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
+# loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
+ADDED = ("features.move_discount",)
+
+
+def with_added(state_dict, own):
+	"""state_dict (a checkpoint's) with the ADDED parameters it lacks at 0; own: the loading model's state_dict."""
+	missing = [key for key in ADDED if key in own and key not in state_dict]
+	return {**state_dict, **{key: torch.zeros_like(own[key]) for key in missing}} if missing else state_dict
+
+
 class CampaignModel(nn.Module):
 	def __init__(self, dim=64, cell_dim=32, heads=4, layers=2):
 		super().__init__()
@@ -831,8 +862,9 @@ class CampaignModel(nn.Module):
 		at 0 (its prior: what a hire does to Φ), and the type head's learned part goes back to its priors. It was learned
 		in games whose towns had neither a tavern nor a dwelling (vcmi 47c9d57eb: random maps lost their towns' default
 		buildings), where building had to come first, and had drifted to BUILD +4.3 and HIRE -2.3 logits over 290 updates:
-		left so, it would hold every hire back however much the hire brought."""
+		left so, it would hold every hire back however much the hire brought. A parameter added since (ADDED) starts at 0."""
 		own = self.state_dict()
+		state_dict = with_added(state_dict, own)
 		missing = [key for key in own if key.startswith("hire_worth.") and key not in state_dict]
 		if missing:
 			state_dict = dict(state_dict)

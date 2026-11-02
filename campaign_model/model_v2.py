@@ -35,7 +35,7 @@ from . import constants as c
 from . import encoders as E
 from . import features as ft
 from . import priors
-from .model import MOVE_FEATURES, CustomFeatures, PairBias, dense, flat_log_softmax
+from .model import MOVE_FEATURES, CustomFeatures, PairBias, dense, flat_log_softmax, with_added
 from .schema import HEADS
 
 HO, TO, A, W, HD = c.OWN_HEROES, c.OWN_TOWNS, c.ARMY_SLOTS, c.WINDOW, c.N_HOLDERS
@@ -228,6 +228,10 @@ class Memory(nn.Module):
 
 class CampaignModelV2(nn.Module):
 	ARCHITECTURE = "v2"
+
+	def load_state_dict(self, state_dict, strict=True, assign=False):
+		"""A checkpoint from before a parameter was added (model.ADDED) loads with it at 0: the model as it was."""
+		return super().load_state_dict(with_added(state_dict, self.state_dict()), strict=strict, assign=assign)
 
 	def __init__(self, dim=64, cell_dim=16, heads=4, layers=2, share_target="share"):
 		"""cell_dim: the map tiles' width (the U-Net's at full resolution; twice and four times it at half and a quarter):
