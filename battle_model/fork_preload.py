@@ -4,12 +4,16 @@ worker that imported the campaign's modules after its fork and ran gc.collect() 
 own; one forked from this, 5 MB; 20 workers). CUDA is not initialized by these imports (a forked CUDA context is
 unusable)."""
 import gc
+import os
 
-import battle_model.supply  # noqa: F401
-import battle_model.train  # noqa: F401
-import campaign_model.learner  # noqa: F401
-import campaign_model.maps  # noqa: F401
-import campaign_model.play  # noqa: F401
+# (numpy's OpenBLAS starts a thread a core at its import, 24 on the PC, idle in every worker forked from here; one)
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+import battle_model.supply  # noqa: E402, F401
+import battle_model.train  # noqa: E402, F401
+import campaign_model.learner  # noqa: E402, F401
+import campaign_model.maps  # noqa: E402, F401
+import campaign_model.play  # noqa: E402, F401
 
 gc.collect()
 gc.freeze()

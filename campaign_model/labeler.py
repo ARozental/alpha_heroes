@@ -14,10 +14,10 @@ What needs the model as it is at the update (day_starts, the ladder's grades, th
 """
 import concurrent.futures
 import copy
-import multiprocessing
-import sys
 
 import torch
+
+from battle_model import forkserver
 
 from .empire import EmpireConfig
 from .labels import LabelConfig, end_labels, end_steps, growth_labels, label, share_change_labels
@@ -69,8 +69,8 @@ def precompute(game, features_state, labels=LabelConfig(), empire=EmpireConfig()
 class Labeler:
 	def __init__(self, labels=LabelConfig(), empire=EmpireConfig(), foresight=True, workers=LABEL_WORKERS, share_target="share"):
 		self.labels, self.empire, self.foresight, self.share_target = labels, empire, foresight, share_target
-		context = multiprocessing.get_context("forkserver" if sys.platform != "win32" else "spawn")
-		self.pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=context)
+		# (the run's forkserver, its preload set: this pool may be what starts it, at a resume's labels of the spooled games)
+		self.pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=forkserver.context())
 
 	def submit(self, game, features):
 		"""A Future of precompute(game) (a records.Game, or its spool file's path) with the features module's weights as

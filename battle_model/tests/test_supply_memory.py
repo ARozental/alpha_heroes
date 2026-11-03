@@ -97,3 +97,26 @@ def test_a_remote_slot_waits_only_for_the_last_game_level(tmp_path, monkeypatch)
 	assert games.place() == ("remote", "conn")
 	monkeypatch.setattr(supply, "available_gb", lambda: 3.0)
 	assert games.place() is None
+
+
+def test_the_runs_forkserver_preloads_what_a_worker_imports(tmp_path):
+	"""(2026-11-03) battle_model.forkserver.context: the first pool to start a process starts the forkserver (the
+	labeler's at a resume, before the loaders), and its processes come with fork_preload's modules imported, torch
+	among them (the PC's forkserver preloaded nothing: the labeler's pool started it before Supply set the preload)."""
+	import subprocess
+	import sys
+	from pathlib import Path
+
+	script = tmp_path / "pool.py"
+	script.write_text(
+		"import concurrent.futures, os, sys\n"
+		"from battle_model import forkserver\n"
+		"def loaded():\n"
+		"    return 'battle_model.fork_preload' in sys.modules and 'torch' in sys.modules, os.environ.get('OPENBLAS_NUM_THREADS')\n"
+		"if __name__ == '__main__':\n"
+		"    with concurrent.futures.ProcessPoolExecutor(1, mp_context=forkserver.context()) as pool:\n"
+		"        print(pool.submit(loaded).result())\n"
+	)
+	root = Path(__file__).resolve().parents[2]
+	result = subprocess.run([sys.executable, str(script)], cwd=root, env={**__import__("os").environ, "PYTHONPATH": str(root)}, capture_output=True, text=True, timeout=300)
+	assert result.stdout.strip().splitlines()[-1] == "(True, '1')", result.stdout + result.stderr[-2000:]

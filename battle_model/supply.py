@@ -43,7 +43,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from . import generator, play, remote
+from . import forkserver, generator, play, remote
 from .constants import MAX_UNITS, N_HEXES, ActionType
 from .data import SPARSE_INPUTS, Sparse, battle_examples, check_record, collate, compact_record, version_of
 from .losses import normalize_advantages
@@ -648,9 +648,7 @@ class Supply:
 
 	def __init__(self, config, out, pool, campaign=None):
 		self.config, self.out, self.pool, self.campaign = config, Path(out), pool, campaign
-		self.ctx = multiprocessing.get_context("forkserver" if sys.platform != "win32" else "spawn")
-		if hasattr(self.ctx, "set_forkserver_preload"):
-			self.ctx.set_forkserver_preload(["battle_model.fork_preload"])  # (every module a worker imports, once, frozen: inherited)
+		self.ctx = forkserver.context()  # (fork_preload: every module a worker imports, once, frozen: inherited)
 		ceilings = {"battle": config.generated_actors, **({"campaign": config.campaign.games} if campaign else {})}
 		self.shared = Shared(self.ctx, ceilings)
 		self.shared.version.value = pool.version
