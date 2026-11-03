@@ -19,6 +19,10 @@ MAX_MB="${3:-200}"
 STALL_SECONDS="${4:-30}"
 SHARED="$ROOT/runtime/vcmi-user"
 export ALPHA_BATTLE_MODEL="${ALPHA_BATTLE_MODEL:-$ROOT/battle_model/artifacts/battle_model.onnx}"
+# The game's TBB thread pool (vcmi/lib/AsyncRunner.h): one worker a hardware thread by default, 23 on the PC, of which
+# ~13 spun between Nullkiller2's parallel loops at every AI request, ~60% of a game's CPU (2026-11-02). Four is the pool's
+# minimum (AsyncRunner's requiredWorkersCount): a turn's blocking AI task and the one that unblocks it both get a thread
+export VCMI_MAX_WORKERS="${VCMI_MAX_WORKERS:-4}"
 
 RUN_DIR="$ROOT/runtime/runs/$(date +%Y%m%d-%H%M%S)-$$-$(basename "$MAP" | tr -c 'A-Za-z0-9\n' '_')"
 mkdir -p "$RUN_DIR/config"
