@@ -462,7 +462,7 @@ def loss_noise(model, decisions, decode, convert, device, t, config, rows=128, s
 		for _ in range(samples):
 			chunk = np.sort(rng.choice(pool, rows, replace=False))
 			raw = decode(chunk)
-			inputs = {name: torch.from_numpy(value).to(device) for name, value in raw.items()} if isinstance(raw, dict) else convert(torch.from_numpy(raw).to(device))
+			inputs = {name: torch.from_numpy(value).to(device) for name, value in raw.items()} if isinstance(raw, dict) else convert(torch.as_tensor(raw).to(device))  # (as_tensor: decode's wire is wire_for's tensor, or an array)
 			sub = torch.from_numpy(chunk).to(device)
 			keep = (~t["unsound"][sub]).float()
 			out = model(inputs)
