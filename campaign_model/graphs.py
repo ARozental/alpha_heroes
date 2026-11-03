@@ -8,9 +8,27 @@ each replay is a launch or two. The optimizer updates the weights in place, so t
 	Graphs(model).eval(inputs)    the outputs without gradients (the update's first pass)
 
 A batch of another size than the first one recorded, or a model without fixed windows, runs eagerly as before.
+
+A graph may compute fewer windows than every hero slot (window_budget: model_v2.windows_of's budget), the caller having
+counted the batch's heroes; its own graph, checked as a step's (StepGraph: against the eager step over every slot)
+before the update's first pass uses it (StepGraph.budget_ok).
 """
+import contextlib
+
 import torch
 from torch import nn
+
+
+@contextlib.contextmanager
+def window_budget(model, budget):
+	"""The model's fixed windows (model_v2.windows_of), `budget` of them a batch (None: every hero slot), while a graph
+	is recorded or a step runs eagerly: never left set (an eager forward elsewhere, on a batch with more of our heroes,
+	would lose some of their windows)."""
+	model.fixed_windows, model.window_budget = True, budget
+	try:
+		yield
+	finally:
+		model.window_budget = None
 
 
 class _Flat(nn.Module):
@@ -66,31 +84,35 @@ class Graphs:
 			return self.model(inputs)
 		return dict(zip(self.outputs, graphed(*args)))
 
-	def eval(self, inputs):
-		"""The model's outputs for inputs without gradients (copies: the next replay overwrites the graph's)."""
+	def eval(self, inputs, budget=None):
+		"""The model's outputs for inputs without gradients (copies: the next replay overwrites the graph's). budget: the
+		windows a batch (window_budget), a graph of its own; every slot's if that one could not be recorded."""
 		self.model.fixed_windows = True
 		args = self._order(inputs)
-		rows = args[0].shape[0]
-		if rows not in self.evaluated:
+		key = (args[0].shape[0], budget)
+		if key not in self.evaluated:
 			try:
 				static = tuple(a.detach().clone() for a in args)
 				flat = _Flat(self.model, self.names, self.outputs)
-				side = torch.cuda.Stream()
-				side.wait_stream(torch.cuda.current_stream())
-				with torch.cuda.stream(side), torch.no_grad():
-					for _ in range(2):
-						flat(*static)
-				torch.cuda.current_stream().wait_stream(side)
-				graph = torch.cuda.CUDAGraph()
-				with torch.no_grad(), torch.cuda.graph(graph, pool=self.pool):
-					out = flat(*static)
+				with window_budget(self.model, budget):
+					side = torch.cuda.Stream()
+					side.wait_stream(torch.cuda.current_stream())
+					with torch.cuda.stream(side), torch.no_grad():
+						for _ in range(2):
+							flat(*static)
+					torch.cuda.current_stream().wait_stream(side)
+					graph = torch.cuda.CUDAGraph()
+					with torch.no_grad(), torch.cuda.graph(graph, pool=self.pool):
+						out = flat(*static)
 				self.pool = graph.pool()
-				self.evaluated[rows] = (static, out, graph)
+				self.evaluated[key] = (static, out, graph)
 			except Exception as error:
-				self.evaluated[rows] = None
-				print(f"campaign graphs: no first-pass graph at {rows} rows ({type(error).__name__}: {str(error)[:200]}): eager", flush=True)
-		entry = self.evaluated[rows]
+				self.evaluated[key] = None
+				print(f"campaign graphs: no first-pass graph at {key[0]} rows, {budget or 'all'} windows ({type(error).__name__}: {str(error)[:200]}): {'every slot' if budget else 'eager'}", flush=True)
+		entry = self.evaluated[key]
 		if entry is None:
+			if budget is not None:
+				return self.eval(inputs)
 			with torch.no_grad():
 				return self.model(inputs)
 		static, out, graph = entry
@@ -117,62 +139,75 @@ class StepGraph:
 
 	def __init__(self, model, fn):
 		self.model, self.fn = model, fn
-		self.entries = {}  # shape signature -> {"inputs", "batch", "outputs", "graph", "checked"} or None
+		self.entries = {}  # (shape signature, window budget) -> {"inputs", "batch", "outputs", "graph", "checked"} or None
+		# A budget graph's check (against the eager step over every slot): None before the first, then whether it held;
+		# the update uses budgets while not False, and in its first pass (no check there) once True
+		self.budget_ok = None
 
 	@staticmethod
 	def signature(*dicts):
 		return tuple(tuple(sorted((name, tuple(value.shape), value.dtype) for name, value in d.items())) for d in dicts)
 
-	def run(self, inputs, batch):
+	def run(self, inputs, batch, budget=None):
+		"""budget: the windows of the step (window_budget), a graph of its own; every slot's (the graph without a budget)
+		once one with a budget failed its check or could not be recorded."""
 		self.model.fixed_windows = True
-		key = self.signature(inputs, batch)
+		if self.budget_ok is False:
+			budget = None
+		key = self.signature(inputs, batch) + (budget,)
 		if key not in self.entries:
-			self.entries[key] = self._record(inputs, batch)
+			self.entries[key] = self._record(inputs, batch, budget)
 		entry = self.entries[key]
 		if entry is None:
-			return None
+			return None if budget is None else self.run(inputs, batch)
 		for name, value in inputs.items():
 			entry["inputs"][name].copy_(value)
 		for name, value in batch.items():
 			entry["batch"][name].copy_(value)
 		if not entry["checked"]:
-			return self._first(entry, key, inputs, batch)
+			return self._first(entry, key, inputs, batch, budget)
 		entry["graph"].replay()
 		return tuple(None if o is None else o.clone() for o in entry["outputs"])
 
 	def _params(self):
 		return [p for p in self.model.parameters() if p.requires_grad]
 
-	def _record(self, inputs, batch):
-		params = self._params()
+	def _record(self, inputs, batch, budget=None):
+		params, before = self._params(), None
 		try:
 			for p in params:
 				if p.grad is None:
 					p.grad = torch.zeros_like(p)
 			before = [p.grad.clone() for p in params]  # (the minibatch's gradient so far: the warm-up adds to it)
-			static_inputs = {name: value.detach().clone() for name, value in inputs.items()}
-			static_batch = {name: value.detach().clone() for name, value in batch.items()}
-			side = torch.cuda.Stream()
-			side.wait_stream(torch.cuda.current_stream())
-			with torch.cuda.stream(side):
-				for _ in range(2):  # (the allocator and the libraries' choices settle before the recording)
-					loss, *_ = self.fn(self.model(static_inputs), static_batch)
+			with window_budget(self.model, budget):
+				static_inputs = {name: value.detach().clone() for name, value in inputs.items()}
+				static_batch = {name: value.detach().clone() for name, value in batch.items()}
+				side = torch.cuda.Stream()
+				side.wait_stream(torch.cuda.current_stream())
+				with torch.cuda.stream(side):
+					for _ in range(2):  # (the allocator and the libraries' choices settle before the recording)
+						loss, *_ = self.fn(self.model(static_inputs), static_batch)
+						loss.backward()
+						del loss
+				torch.cuda.current_stream().wait_stream(side)
+				for p, g in zip(params, before):
+					p.grad.copy_(g)
+				graph = torch.cuda.CUDAGraph()
+				with torch.cuda.graph(graph):
+					loss, *outputs = self.fn(self.model(static_inputs), static_batch)
 					loss.backward()
-					del loss
-			torch.cuda.current_stream().wait_stream(side)
-			for p, g in zip(params, before):
-				p.grad.copy_(g)
-			graph = torch.cuda.CUDAGraph()
-			with torch.cuda.graph(graph):
-				loss, *outputs = self.fn(self.model(static_inputs), static_batch)
-				loss.backward()
 			return {"inputs": static_inputs, "batch": static_batch, "outputs": tuple(None if o is None else o.detach() for o in outputs), "graph": graph, "checked": False}
 		except Exception as error:
-			print(f"campaign step graph: not recorded ({type(error).__name__}: {str(error)[:300]}): eager steps", flush=True)
+			if before is not None:  # (a warm-up cut short left its part added, maybe still running on its stream)
+				torch.cuda.synchronize()
+				for p, g in zip(params, before):
+					p.grad.copy_(g)
+			print(f"campaign step graph: not recorded{f' at {budget} windows' if budget else ''} ({type(error).__name__}: {str(error)[:300]}): {'every slot' if budget else 'eager steps'}", flush=True)
 			return None
 
-	def _first(self, entry, key, inputs, batch):
-		"""The first replay, checked against the eager step on the same micro-batch; the gradient added either way."""
+	def _first(self, entry, key, inputs, batch, budget=None):
+		"""The first replay, checked against the eager step on the same micro-batch (over every hero slot: a budget is
+		set only while recording); the gradient added either way."""
 		params = self._params()
 		try:
 			loss, *eager_outputs = self.fn(self.model(inputs), batch)
@@ -192,12 +227,17 @@ class StepGraph:
 		worst = max(float(((r - (g if g is not None else torch.zeros_like(r))).abs().max())) for r, g in zip(recorded, eager)) / scale
 		outputs = tuple(None if o is None else o.clone() for o in entry["outputs"])
 		output_diff = max((float((o - e.detach()).abs().max()) for o, e in zip(outputs, eager_outputs) if o is not None and e is not None), default=0.0)
+		windows = f" at {budget} windows" if budget else ""
 		if worst > self.TOLERANCE or output_diff > self.TOLERANCE or not all(torch.isfinite(r).all() for r in recorded):
 			for p, b, g in zip(params, before, eager):  # (this micro-batch's gradient: the eager one)
 				p.grad.copy_(b if g is None else b + g)
 			self.entries[key] = None
-			print(f"campaign step graph: differs from the eager step (gradient {worst:.1e}, outputs {output_diff:.1e} of the largest): eager steps", flush=True)
+			if budget:
+				self.budget_ok = False
+			print(f"campaign step graph{windows}: differs from the eager step (gradient {worst:.1e}, outputs {output_diff:.1e} of the largest): {'every slot from now on' if budget else 'eager steps'}", flush=True)
 			return tuple(None if e is None else e.detach() for e in eager_outputs)
 		entry["checked"] = True
-		print(f"campaign step graph: recorded and checked (gradient within {worst:.1e} of the eager step's, outputs {output_diff:.1e})", flush=True)
+		if budget:
+			self.budget_ok = True
+		print(f"campaign step graph{windows}: recorded and checked (gradient within {worst:.1e} of the eager step's, outputs {output_diff:.1e})", flush=True)
 		return outputs

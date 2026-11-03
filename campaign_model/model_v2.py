@@ -250,6 +250,10 @@ class CampaignModelV2(nn.Module):
 		# Every hero slot's window, absent heroes' masked out (windows_of): fixed shapes and no sync with the host, for a
 		# CUDA graph (inference.py sets it on CUDA); the same outputs, more windows computed
 		self.fixed_windows = False
+		# With fixed windows, this many a batch instead of every slot (windows_of): our heroes' first. Set only around a
+		# graph's recording and the eager step it is checked against (graphs.window_budget), by a caller that counted the
+		# batch's heroes: a batch with more of them would lose some of its heroes' windows
+		self.window_budget = None
 		dp = d // 2  # (hero, tile) and (hero, area) pairs
 		self.pair_dim = dp
 		# domain_knowledge
@@ -360,7 +364,7 @@ class CampaignModelV2(nn.Module):
 	def domain_knowledge(self, x):
 		"""model.CustomFeatures' facts (Φ, armies, fights, each window tile's value and prior, TRAVEL's prior, the action
 		priors), for the windows of our heroes there, and the references sizes are relative to."""
-		windows, n, real = windows_of(x, fixed=self.fixed_windows)
+		windows, n, real = windows_of(x, fixed=self.fixed_windows, budget=self.window_budget)
 		known = self.features(x, windows)
 		known.windows, known.n, known.real = windows, n, real
 		known.window_tiles = window_tile_index(x, windows)  # [K, W, W] each window tile's map tile (-1 off the grid)
@@ -790,11 +794,18 @@ def window_tile_index(x, windows):
 	return torch.where(inside, (tz * S + ty) * S + tx, torch.full_like(tx, -1))
 
 
-def windows_of(x, fixed=False):
+def windows_of(x, fixed=False, budget=None):
 	"""(flat indices of the windows computed (decision x OWN_HEROES + hero), how many of them dense() places, [K] which
 	are our heroes'). Our heroes' alone, as model.CampaignModel's, padded on Apple's GPU with copies of the first (the
-	padding not real); fixed: every slot's, absent heroes' not real (CUDA graphs: one shape a batch size, no sync)."""
+	padding not real); fixed: every slot's, absent heroes' not real (CUDA graphs: one shape a batch size, no sync).
+	fixed with a budget: that many slots, ours first (each in its decision's order) and then absent ones, not real:
+	distinct slots, so dense() places them all and the absent ones' are zeroed as every slot's are. The same outputs
+	when the batch has at most `budget` of our heroes (the caller counts them: more would be left out); the PC's games,
+	2026-11-03: 2.8 a decision, never more than 4, of 8 slots."""
 	present = x["h_present"][:, :HO].reshape(-1)
+	if fixed and budget is not None and budget < present.shape[0]:
+		windows = torch.argsort((~present).to(torch.int8), stable=True)[:budget]
+		return windows, budget, present.index_select(0, windows)
 	if fixed:
 		return torch.arange(present.shape[0], device=present.device), present.shape[0], present
 	windows = torch.nonzero(present).squeeze(-1)

@@ -42,7 +42,7 @@ from .labels import COLORS, GROWTH_CAP, PHI_FLOOR, SHARE_CHANGE_CAP, LabelConfig
 from .model import build_model
 from .play import make_map, play
 from .graphs import Graphs, StepGraph
-from .records import NO_EFFECT, decode_inputs, decode_wire, inputs_on_device
+from .records import NO_EFFECT, decode_inputs, decode_wire, heroes_in, inputs_on_device
 from .schema import HEADS
 
 RUNS = battle_play.ROOT / "runtime" / "campaign"
@@ -144,12 +144,13 @@ def entries_logp(out, types, indices, valid):
 DECODE_THREADS = 3  # batches decoded at once: one thread's ~0.3 s a 128-decision micro-batch (110 MB of zlib and dtype copies, which release the interpreter lock) held the GPU's 146 ms step to it (2026-10-30, the PC)
 
 
-def _prefetched(batches, decode, device, convert=None, threads=DECODE_THREADS):
+def _prefetched(batches, decode, device, convert=None, threads=DECODE_THREADS, measure=None):
 	"""(rows, inputs on device) of each batch of rows, decoded ahead in `threads` threads (zlib and numpy let the
 	training step go on meanwhile) and yielded in order. convert: applied on the device to what decode gave (the wire
-	bytes cut and converted there: records.inputs_on_device), else decode gives the inputs themselves. A consumer that
-	stops early (the KL control) ends the threads: they were left blocked on the full queue with their batches, every
-	such update (2026-10-30)."""
+	bytes cut and converted there: records.inputs_on_device), else decode gives the inputs themselves. measure: a
+	function of what decode gave, on the host in the batch's thread, its result yielded third ((rows, inputs, it)). A
+	consumer that stops early (the KL control) ends the threads: they were left blocked on the full queue with their
+	batches, every such update (2026-10-30)."""
 	import concurrent.futures
 
 	stop = threading.Event()
@@ -159,8 +160,9 @@ def _prefetched(batches, decode, device, convert=None, threads=DECODE_THREADS):
 		if stop.is_set():
 			return None
 		decoded = decode(rows)
+		measured = () if measure is None else (measure(decoded),)
 		inputs = {name: torch.from_numpy(value) for name, value in decoded.items()} if isinstance(decoded, dict) else {"wire": torch.from_numpy(decoded)}
-		return rows, ({name: value.pin_memory() for name, value in inputs.items()} if pinned else inputs)
+		return rows, ({name: value.pin_memory() for name, value in inputs.items()} if pinned else inputs), measured
 
 	pool = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
 	pending = collections.deque()
@@ -174,12 +176,24 @@ def _prefetched(batches, decode, device, convert=None, threads=DECODE_THREADS):
 				pending.append(pool.submit(work, rows))
 			if item is None:
 				break
-			rows, inputs = item
+			rows, inputs, measured = item
 			inputs = {name: value.to(device, non_blocking=pinned) for name, value in inputs.items()}
-			yield rows, (convert(inputs["wire"]) if convert is not None and "wire" in inputs else inputs)
+			yield (rows, convert(inputs["wire"]) if convert is not None and "wire" in inputs else inputs, *measured)
 	finally:
 		stop.set()
 		pool.shutdown(wait=False, cancel_futures=True)
+
+
+def batch_heroes(decoded):
+	"""Our heroes in a decoded batch (decode_inputs' or decode_wire's), on the host."""
+	return int(heroes_in(decoded).sum())
+
+
+def windows_for(rows, heroes, config):
+	"""The hero windows a step's graph computes for a batch of `rows` decisions holding `heroes` of ours
+	(model_v2.windows_of's budget): config.window_budget a decision, or None (every slot) when the batch has more."""
+	budget = int(round(rows * config.window_budget))
+	return budget if 0 < budget < rows * c.OWN_HEROES and heroes <= budget else None
 
 
 def make_optimizer(model, config=CampaignConfig()):
@@ -675,9 +689,11 @@ def ppo_update(
 		chunk = config.prepass_batch or max(1, size // max(1, config.micro_batches))  # (no gradients, but at a whole minibatch it was the update's peak: 5.2 GB)
 		chunks = [np.arange(i, i + chunk).clip(max=n - 1) for i in range(0, n, chunk)]  # the last one padded: fixed shapes
 		prepass_started = time.perf_counter()
-		for rows, inputs in _prefetched(chunks, decode, device, convert, config.decode_threads):
+		for rows, inputs, heroes in _prefetched(chunks, decode, device, convert, config.decode_threads, measure=batch_heroes):
 			index = torch.arange(int(rows[0]), int(rows[0]) + len(rows), device=device).clamp(max=n - 1)  # (made there: a copy from pageable memory waited for the GPU)
-			out = graphs.eval(inputs) if graphs else model(inputs)
+			# (fewer windows once a step's graph with them was checked: graphs.StepGraph.budget_ok, none here)
+			budget = windows_for(len(rows), heroes, config) if steps_graph is not None and steps_graph.budget_ok else None
+			out = graphs.eval(inputs, budget) if graphs else model(inputs)
 			logp, _ = chosen_logp(out, {k: choice[k][index] for k in ("kind", "action", "index", "cell")})
 			anchor[index] = logp
 			end_now[index] = torch.sigmoid(out["end_logit"].float())
@@ -777,6 +793,7 @@ def ppo_update(
 		if device.type == "cuda":
 			torch.cuda.empty_cache()
 	totals, steps, stopped, update_kl, recent = Counter(), 0, False, 0.0, deque(maxlen=KL_WINDOW)
+	full_windows = 0  # micro-batches stepped over every hero slot (more of our heroes than config.window_budget allows)
 	stopped_pass = 0  # the pass the KL control ended (0: none; b1, 2026-10-31: with passes=2, a second pass mostly cut short adds nothing)
 	model.train()
 	for pass_number in range(1, config.passes + 1):
@@ -789,7 +806,7 @@ def ppo_update(
 		# decision several MB: the PC's learner at 9.5 GB, 2026-10-30); the minibatch's gradient as before
 		minibatches = [order[i : i + size] for i in range(0, len(order), size)]
 		splits = [np.array_split(np.arange(len(rows)), max(1, min(config.micro_batches, len(rows)))) for rows in minibatches]
-		decoded = _prefetched([rows[part] for rows, parts in zip(minibatches, splits) for part in parts], decode, device, convert, config.decode_threads)
+		decoded = _prefetched([rows[part] for rows, parts in zip(minibatches, splits) for part in parts], decode, device, convert, config.decode_threads, measure=batch_heroes)
 		# The pass's order on the device once: a minibatch's and each micro-batch's rows as slices of it (each copy of a
 		# small index array from pageable memory waited for the GPU: five a minibatch, 2026-10-31)
 		order_t = torch.from_numpy(order).to(device)
@@ -811,8 +828,10 @@ def ppo_update(
 			for part in parts_of_rows:
 				sub, keep = index[part[0] : part[-1] + 1], whole[part[0] : part[-1] + 1]  # (array_split's parts: consecutive)
 				waited = time.perf_counter()
-				_, inputs = next(decoded)
+				_, inputs, heroes = next(decoded)
 				clock["wait"] += time.perf_counter() - waited
+				budget = windows_for(len(part), heroes, config) if steps_graph is not None else None
+				full_windows += steps_graph is not None and config.window_budget > 0 and budget is None
 				share = len(part) / len(rows)
 				batch = {
 					**{k: choice[k][sub] for k in ("kind", "action", "index", "cell", "old_logp")},
@@ -844,7 +863,7 @@ def ppo_update(
 						checked = gradient_check(model, check[0] - check[3], check[3], check[4], prefix="grad_raw_")
 					del check
 				mark = time.perf_counter()
-				recorded = steps_graph.run(inputs, batch) if steps_graph is not None else None
+				recorded = steps_graph.run(inputs, batch, budget) if steps_graph is not None else None
 				if recorded is not None:  # forward, loss and backward in one replay, its gradient added to .grad
 					metrics, fs_parts = recorded
 					clock["forward"] += time.perf_counter() - mark
@@ -918,6 +937,8 @@ def ppo_update(
 		backward_seconds=clock["backward"],
 		optimizer_seconds=clock["optimizer"],
 		cpu_share=(time.thread_time() - clock["cpu"]) / max(time.time() - started, 1e-9),  # of the update's time this thread ran on the CPU
+		full_windows=full_windows,
+		window_budget_ok=steps_graph.budget_ok if steps_graph is not None else None,
 		**({f"foresight_{name}": value / max(foresight_sums["steps_seen"], 1e-9) for name, value in zip(PART_NAMES, foresight_sum.tolist())} if foresight_sum is not None else {}),
 		**checked,
 		**{f"value_ev_d{k}": explained_variance(predicted[:, i], actual[:, i]) for i, k in enumerate(c.VALUE_OFFSETS)},

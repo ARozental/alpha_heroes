@@ -87,6 +87,27 @@ def test_inputs_decoded_on_a_device_are_the_inputs():
 		np.testing.assert_array_equal(got[name].cpu().numpy(), want[name])
 
 
+def test_the_heroes_counted_from_the_wire_are_the_inputs_ones():
+	"""(2026-11-03) A batch's heroes, counted on the host for the window budget (train.batch_heroes), from the bytes as
+	sent the same as from the decoded inputs."""
+	import numpy as np
+
+	from campaign_model import constants as c
+	from campaign_model.model import CampaignModel
+	from campaign_model.records import decode_inputs, decode_wire, heroes_in
+	from campaign_model.schema import random_inputs
+	from campaign_model.tests.test_model import encoded
+	from campaign_model.tests.test_train import decisions_for
+
+	model = CampaignModel(dim=32, cell_dim=16, layers=1).eval()
+	x = random_inputs(5, seed=4)
+	x["h_present"][:, : c.OWN_HEROES] = np.arange(c.OWN_HEROES)[None, :] < np.array([0, 1, 3, 8, 2])[:, None]
+	x["h_present"][:, c.OWN_HEROES :] = True  # (others' heroes: not counted)
+	decisions = [d.__class__(**{**d.__dict__, "inputs": encoded(x, b)}) for b, d in enumerate(decisions_for(model, x))]
+	assert heroes_in(decode_inputs(decisions)).tolist() == [0, 1, 3, 8, 2]
+	assert heroes_in(decode_wire(decisions)).tolist() == [0, 1, 3, 8, 2]
+
+
 def test_a_record_with_nk2s_advice_reads_back_with_it():
 	"""AMZ2 with RECORD_ADVICE: the advice's three integers right after the header (AlphaMapAI::sendRecords)."""
 	import struct

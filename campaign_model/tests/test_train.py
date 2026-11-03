@@ -7,7 +7,7 @@ from campaign_model.model import CampaignModel
 from campaign_model.records import Decision
 from campaign_model.schema import HEADS, random_inputs
 from campaign_model.config import CampaignConfig
-from campaign_model.train import choices, chosen_logp, head_entropy, ppo_update
+from campaign_model.train import _prefetched, choices, chosen_logp, head_entropy, ppo_update, windows_for
 
 
 def sample(out, x, b, rng):
@@ -322,3 +322,22 @@ def test_a_step_graph_whose_check_finds_no_memory_is_dropped_and_the_step_goes_e
 	inputs = {k: torch.from_numpy(v) for k, v in random_inputs(2, seed=1).items()}
 	assert graph._first(graph.entries["key"], "key", inputs, {}) is None and graph.entries["key"] is None
 	assert all(p.grad is None for p in model.parameters())  # (nothing added: the caller's eager step adds it)
+
+
+def test_the_window_budget_is_a_share_of_the_slots_unless_the_batch_has_more_heroes():
+	"""(2026-11-03) train.windows_for: config.window_budget windows a decision, every slot (None) for a batch with more
+	of our heroes, when off, or when the budget is every slot anyway."""
+	assert windows_for(64, 200, CampaignConfig(window_budget=4.0)) == 256
+	assert windows_for(64, 256, CampaignConfig(window_budget=4.0)) == 256
+	assert windows_for(64, 257, CampaignConfig(window_budget=4.0)) is None
+	assert windows_for(64, 10, CampaignConfig(window_budget=0.0)) is None
+	assert windows_for(64, 10, CampaignConfig(window_budget=c.OWN_HEROES)) is None
+
+
+def test_prefetched_yields_what_measure_found_on_the_host():
+	batches = [np.arange(3), np.arange(3, 5)]
+	decode = lambda rows: {"a": np.asarray(rows, dtype=np.float32)}  # noqa: E731
+	got = list(_prefetched(batches, decode, torch.device("cpu"), measure=lambda decoded: float(decoded["a"].sum())))
+	assert [measured for _, _, measured in got] == [3.0, 7.0]
+	assert [inputs["a"].tolist() for _, inputs, _ in got] == [[0, 1, 2], [3, 4]]
+	assert [len(item) for item in _prefetched(batches, decode, torch.device("cpu"))] == [2, 2]  # (without: as before)

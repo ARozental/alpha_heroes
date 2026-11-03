@@ -10,6 +10,7 @@ is kept compressed (1-4 KB) as it came until a minibatch decodes it (play.py ask
 Without it (and before 2026-10-29): "AMZ1", u32 size, zlib("AMR1", u32 count, count x decision with u32 n, n bytes of
 inputs), the whole message compressed at once, each decision compressed again here.
 """
+import itertools
 import json
 import struct
 import zlib
@@ -217,6 +218,20 @@ def decode_inputs(decisions):
 
 
 _TORCH_DTYPES = None
+
+
+def heroes_in(decoded):
+	"""Our heroes in each decision, [N] on the host (h_present's first OWN_HEROES slots), from decode_inputs' inputs or
+	decode_wire's bytes: how many windows a batch needs (model_v2.windows_of's budget)."""
+	if isinstance(decoded, dict):
+		present = decoded["h_present"]
+	else:
+		offset, (_, shape, wire_dtype, _, nbytes) = _WIRE_AT["h_present"]
+		present = np.ascontiguousarray(decoded[:, offset : offset + nbytes]).view(wire_dtype).reshape((len(decoded),) + shape)
+	return np.count_nonzero(present[:, : c.OWN_HEROES], axis=1)
+
+
+_WIRE_AT = {entry[0]: (offset, entry) for entry, offset in zip(IN_LAYOUT, itertools.accumulate((entry[-1] for entry in IN_LAYOUT), initial=0))}
 
 
 def inputs_on_device(wire):

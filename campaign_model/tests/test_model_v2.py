@@ -10,7 +10,8 @@ from campaign_model import constants as c
 from campaign_model.config import CampaignConfig
 from campaign_model.foresight import battle_score, game_labels
 from campaign_model.model import CORRECTION_STEP, CampaignModel, build_model
-from campaign_model.model_v2 import ACTION_TARGETS, AREAS, CampaignModelV2, Sides
+from campaign_model.graphs import window_budget
+from campaign_model.model_v2 import ACTION_TARGETS, AREAS, CampaignModelV2, Sides, windows_of
 from campaign_model.records import Decision, Game
 from campaign_model.schema import HEADS, OUTPUTS, random_inputs
 from campaign_model.tests.test_train import decisions_for
@@ -367,3 +368,62 @@ def test_the_plan_labels_are_its_targets_travel_areas():
 	assert labels["plan"][0, 0] == (0 * c.TRAVEL_GRID + 7 // 2) * c.TRAVEL_GRID + 5 // 2  # (36 x 36: areas 2 tiles a side)
 	assert labels["plan"][1, 0] == (0 * c.TRAVEL_GRID + 7 // 4) * c.TRAVEL_GRID + 5 // 4  # (72 x 72: 4)
 	assert not labels["plan_mask"][2].any()
+
+
+def test_a_window_budget_takes_our_heroes_first_then_distinct_absent_slots():
+	"""(2026-11-03) windows_of's budget, the CUDA graphs' windows: every slot of ours first, in order, then absent ones
+	(not real), all distinct (dense() places them all); every slot without a budget or with one past the slots."""
+	present = torch.zeros(2, c.N_HEROES, dtype=torch.bool)
+	present[0, [1, 3]] = True
+	present[1, 0] = True
+	present[1, c.OWN_HEROES :] = True  # (others' heroes: no windows)
+	windows, n, real = windows_of({"h_present": present}, fixed=True, budget=5)
+	assert windows.tolist()[:3] == [1, 3, c.OWN_HEROES] and n == 5 and real.tolist() == [True] * 3 + [False] * 2
+	assert len(set(windows.tolist())) == 5
+	for budget in (None, 2 * c.OWN_HEROES):
+		windows, n, real = windows_of({"h_present": present}, fixed=True, budget=budget)
+		assert windows.tolist() == list(range(2 * c.OWN_HEROES)) and n == 2 * c.OWN_HEROES
+	windows, n, real = windows_of({"h_present": present}, budget=5)  # (no budget without fixed windows: ours alone)
+	assert windows.tolist() == [1, 3, c.OWN_HEROES] and n == 3
+
+
+def test_a_window_budget_gives_the_exact_windows_outputs_and_gradients():
+	"""(2026-11-03) The budget's windows (ours and absent slots to spare, or exactly ours) against our heroes' alone:
+	the same outputs and gradients (the PC's update computes them so, train.windows_for)."""
+	torch.manual_seed(0)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).train()
+	m.plan_outputs = True
+	x = tensors(rich_inputs(6, 5))
+	heroes = int(x["h_present"][:, : c.OWN_HEROES].sum())
+	assert 0 < heroes <= 6 * c.OWN_HEROES - 4
+
+	def run(fixed, budget):
+		m.zero_grad(set_to_none=True)
+		with window_budget(m, budget):
+			m.fixed_windows = fixed
+			out = m(x)
+		sum(v.float().clamp(-1e4, 1e4).sum() for v in out.values() if torch.is_tensor(v) and v.requires_grad).backward()
+		return {k: v.detach() for k, v in out.items() if torch.is_tensor(v)}, {k: p.grad.clone() for k, p in m.named_parameters() if p.grad is not None}
+
+	exact, exact_grads = run(False, None)
+	for budget in (heroes, heroes + 4):
+		out, grads = run(True, budget)
+		assert m.window_budget is None  # (never left set)
+		assert set(out) == set(exact) and set(grads) == set(exact_grads)
+		for name in exact:
+			torch.testing.assert_close(out[name], exact[name], rtol=1e-5, atol=1e-5, equal_nan=True)
+		# (relative to the largest gradient, as graphs.StepGraph's check: the sums' order differs; a softmax's bias has
+		# none but that rounding)
+		scale = max(float(g.abs().max()) for g in exact_grads.values())
+		worst = max(float((grads[name] - exact_grads[name]).abs().max()) for name in exact_grads)
+		assert worst <= 1e-6 * scale, (worst, scale)
+	m.fixed_windows = False
+
+
+def test_the_window_budget_is_never_left_set():
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	with pytest.raises(RuntimeError):
+		with window_budget(m, 7):
+			assert m.window_budget == 7 and m.fixed_windows
+			raise RuntimeError
+	assert m.window_budget is None
