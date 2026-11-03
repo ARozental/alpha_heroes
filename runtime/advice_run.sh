@@ -23,6 +23,11 @@
 # as the teacher over the turn (advice.py: any of its plan's steps or of the town actions it named that turn), and each
 # loss a share of the gradient (campaign.loss_shares: the teacher's by our eval score, at most 60%; policy and value
 # never under 15%)
+# ahead 2 since 2026-11-03 ~09:45 (1.5 in the machine config): the permits held the games finished and in flight to
+# 30 games' worth (1.5 updates of 20), so during each update the slots emptied (the supply's snapshots: permits 0 in 5
+# of 8, 9-15 of the 17 campaign slots playing, the Mac's 1-4 of 6) while the learner waited ~45% of its time for games.
+# 1.5 was for memory (2026-11-01: 60 waiting long games, ~140 MB each); the waiting games' inputs are on disk since
+# (strip_inputs) and games are ~2,900 decisions. Labels two versions old are redone (learner._relabel_waiting)
 # 6 remote slots since 2026-11-03 ~08:15 (4 before; the user: "allocate more cpus from here", the Mac): the Mac's 2
 # campaign inference processes were saturated (97-99% each) at 4 slots, so it runs 6 slots with 4 (SLOTS=6
 # runtime/mac_slots.sh alpha-joint7 campaign.inference_processes=4). Each remote slot costs this machine a loader worker
@@ -62,6 +67,6 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 	--set remote_port=7700 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.02 campaign.entropy_floor_weight=0 \
-		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=11 remote_slots=6 campaign.inference_device=cpu inference_processes=10 \
+		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=11 remote_slots=6 campaign.inference_device=cpu inference_processes=10 ahead=2 \
 		campaign.head_scale=true fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
