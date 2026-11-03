@@ -11,7 +11,8 @@
 # still needs to work"): every model's inference here (the campaign's on the GPU, the battles' on the CPU); a Mac adds
 # game slots when it is up (remote_slots=4: runtime/mac_slots.sh with SLOTS=4, its own servers mirroring these models),
 # never anything the run waits on. 10 games here: the campaign's server here and the 4 slots' idle workers take ~2.5 GB.
-# Both models' inference on the PC's CPU (one server, 6 processes), the GPU the learner's alone: the campaign's on the
+# Both models' inference on the PC's CPU (one server, 8 processes since 2026-11-02 evening: the games wait on it, each
+# ~460 MB PSS; 6 before, the cores the games' spinning TBB threads freed going to it), the GPU the learner's alone: the campaign's on the
 # GPU (09:27-09:45) time-sliced the learner, ~2x its time a decision (v34: 72k decisions in 499 s, against ~114k in
 # ~400 s), and the permits then held games back (4 of 14 slots playing) while the CPU idled
 # Since 2026-11-02 (the user): the value heads' losses weighted by their targets' variance (campaign.head_scale, ramped
@@ -49,6 +50,6 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 	--set remote_port=7700 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.02 campaign.entropy_floor_weight=0 \
-		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=10 remote_slots=4 campaign.inference_device=cpu inference_processes=6 \
+		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=10 remote_slots=4 campaign.inference_device=cpu inference_processes=8 \
 		campaign.head_scale=true fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
