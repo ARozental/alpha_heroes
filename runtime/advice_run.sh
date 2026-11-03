@@ -23,6 +23,12 @@
 # as the teacher over the turn (advice.py: any of its plan's steps or of the town actions it named that turn), and each
 # loss a share of the gradient (campaign.loss_shares: the teacher's by our eval score, at most 60%; policy and value
 # never under 15%)
+# 8 games here, 9 remote slots, 8 inference processes since 2026-11-03 ~10:25 (11, 6, 10 before): with ahead 2 the
+# permits were plenty (22) but only 7 of the 11 local games played, the rest held by the memory floor (supply.py
+# MEMORY_FLOOR_GB 4.5; the least available 4.02 GB, median 4.85), while each loader worker holds ~0.41 GB played or not.
+# A game here costs this machine ~0.65 GB (its worker and VCMI client), one on the Mac ~0.5 (its worker and half a
+# battle worker): fewer local workers and servers, more Mac slots (SLOTS=9 runtime/mac_slots.sh alpha-joint7
+# campaign.inference_processes=6; ~17-19 games an hour a Mac slot against ~14 here), ~0.5 GB more free here
 # ahead 2 since 2026-11-03 ~09:45 (1.5 in the machine config): the permits held the games finished and in flight to
 # 30 games' worth (1.5 updates of 20), so during each update the slots emptied (the supply's snapshots: permits 0 in 5
 # of 8, 9-15 of the 17 campaign slots playing, the Mac's 1-4 of 6) while the learner waited ~45% of its time for games.
@@ -67,6 +73,6 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 	--set remote_port=7700 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.02 campaign.entropy_floor_weight=0 \
-		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=11 remote_slots=6 campaign.inference_device=cpu inference_processes=10 ahead=2 \
+		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=8 remote_slots=9 campaign.inference_device=cpu inference_processes=8 ahead=2 \
 		campaign.head_scale=true fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
