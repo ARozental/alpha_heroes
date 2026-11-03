@@ -97,13 +97,3 @@ def test_a_remote_slot_waits_only_for_the_last_game_level(tmp_path, monkeypatch)
 	assert games.place() == ("remote", "conn")
 	monkeypatch.setattr(supply, "available_gb", lambda: 3.0)
 	assert games.place() is None
-
-
-def test_a_loader_worker_keeps_large_allocations_apart_where_glibc_runs():
-	"""(2026-11-03) keep_large_allocations_apart, each loader worker's: glibc's mmap threshold fixed and 2 arenas on
-	Linux (where the workers held ~370 MB each of freed battle-record buffers), nothing elsewhere."""
-	import sys
-
-	from battle_model.supply import keep_large_allocations_apart
-
-	assert keep_large_allocations_apart() is sys.platform.startswith("linux")

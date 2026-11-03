@@ -618,26 +618,6 @@ def _worker_init(_index):
 	signal.signal(signal.SIGTERM, stop)
 	signal.signal(signal.SIGINT, signal.SIG_IGN)  # (the trainer's Ctrl-C is the trainer's to handle)
 	gc.freeze()
-	keep_large_allocations_apart()
-
-
-def keep_large_allocations_apart():
-	"""glibc's large allocations made apart and given back when freed (a loader worker's): its mmap threshold fixed at
-	1 MB (glibc raises it after each large free, up to 32 MB, and the next battle records' buffers, tens of MB grown by
-	doubling in RecordServer's threads, then come from the heap and the threads' arenas and stay there freed, beyond
-	malloc_trim's reach), and 2 arenas. 2026-11-03 on the PC: the loader workers held ~370 MB each of their own (21 of
-	them, 8.7 GB); RecordServer's pattern alone held 180 MB after 6 games and growing by default, ~50 MB so. Whether it
-	applied (glibc only)."""
-	if not sys.platform.startswith("linux"):
-		return False
-	import ctypes
-
-	try:
-		libc = ctypes.CDLL("libc.so.6")
-	except OSError:
-		return False
-	M_MMAP_THRESHOLD, M_ARENA_MAX = -3, -8  # (malloc.h)
-	return bool(libc.mallopt(M_MMAP_THRESHOLD, 1 << 20)) and bool(libc.mallopt(M_ARENA_MAX, 2))
 
 
 def trim_memory():
