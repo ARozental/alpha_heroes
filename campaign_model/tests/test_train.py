@@ -442,3 +442,69 @@ def test_the_update_with_the_conversion_in_its_graphs_learns_what_it_learned_wit
 	assert any(not torch.equal(weights[True][k], start.state_dict()[k]) for k in weights[True])  # (it learned)
 	for k in weights[True]:
 		torch.testing.assert_close(weights[True][k], weights[False][k], rtol=0, atol=0, msg=k)
+
+
+def test_a_step_over_the_window_budget_is_stepped_eagerly_not_recorded(monkeypatch):
+	"""(2026-11-03) A micro-batch with more of our heroes than config.window_budget allows, while budgets work: stepped
+	eagerly, not given to the step graph (whose graph over every slot would hold its pool for the run). The same
+	weights as with no step graph at all."""
+	from campaign_model import train
+	from campaign_model.tests.test_model import encoded
+
+	runs = []
+
+	class Counting(_EagerStep):
+		budget_ok = True
+
+		def run(self, inputs, batch, budget=None, prepare=None):
+			runs.append(budget)
+			return super().run(inputs, batch, budget, prepare)
+
+	monkeypatch.setattr(train, "converts_on_device", lambda device: True)
+	monkeypatch.setattr(train, "Graphs", _EagerGraphs)
+	monkeypatch.setattr(train, "StepGraph", Counting)
+	x = random_inputs(12, seed=4)
+	torch.manual_seed(1)
+	start = CampaignModel(dim=32, cell_dim=16, layers=1)
+	decisions = [d.__class__(**{**d.__dict__, "inputs": encoded(x, b)}) for b, d in enumerate(decisions_for(start.eval(), x))]
+	n = len(decisions)
+	assert x["h_present"][:, : c.OWN_HEROES].sum() > 0.1 * n  # (every micro-batch over a budget of 0.1 a decision)
+	weights = {}
+	for steps in (True, False):
+		model = CampaignModel(dim=32, cell_dim=16, layers=1)
+		model.load_state_dict(start.state_dict())
+		model.fixed_windows = False
+		torch.manual_seed(2)
+		config = CampaignConfig(batch_size=4, micro_batches=2, passes=1, cuda_graphs=True, step_graphs=steps, window_budget=0.1, decode_threads=1)
+		ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-3), decisions, np.full((n, c.N_VALUE_OFFSETS), 0.5, np.float32), np.linspace(-1, 1, n).astype(np.float32), config)
+		weights[steps] = {k: v.detach().clone() for k, v in model.state_dict().items()}
+	assert runs == []  # (no step went to the step graph)
+	for k in weights[True]:
+		torch.testing.assert_close(weights[True][k], weights[False][k], rtol=0, atol=0, msg=k)
+
+
+def test_steps_over_budget_take_the_step_graph_once_budgets_are_refused(monkeypatch):
+	"""(2026-11-03) With the budget refused (StepGraph.budget_ok False: every step over every slot), the steps go to
+	the step graph as before, never eagerly."""
+	from campaign_model import train
+	from campaign_model.tests.test_model import encoded
+
+	runs = []
+
+	class Refused(_EagerStep):
+		budget_ok = False
+
+		def run(self, inputs, batch, budget=None, prepare=None):
+			runs.append(budget)
+			return super().run(inputs, batch, budget, prepare)
+
+	monkeypatch.setattr(train, "converts_on_device", lambda device: True)
+	monkeypatch.setattr(train, "Graphs", _EagerGraphs)
+	monkeypatch.setattr(train, "StepGraph", Refused)
+	x = random_inputs(8, seed=4)
+	model = CampaignModel(dim=32, cell_dim=16, layers=1)
+	decisions = [d.__class__(**{**d.__dict__, "inputs": encoded(x, b)}) for b, d in enumerate(decisions_for(model.eval(), x))]
+	model.fixed_windows = False
+	config = CampaignConfig(batch_size=4, micro_batches=2, passes=1, cuda_graphs=True, step_graphs=True, window_budget=0.1, decode_threads=1)
+	ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-3), decisions, np.full((8, c.N_VALUE_OFFSETS), 0.5, np.float32), np.zeros(8, np.float32), config)
+	assert runs and all(budget is None for budget in runs)

@@ -858,7 +858,12 @@ def ppo_update(
 				_, raw, heroes = next(decoded)
 				clock["wait"] += time.perf_counter() - waited
 				budget = windows_for(len(part), heroes, config) if steps_graph is not None else None
-				full_windows += steps_graph is not None and config.window_budget > 0 and budget is None
+				over = steps_graph is not None and config.window_budget > 0 and budget is None  # (more of our heroes than the budget)
+				full_windows += over
+				# A step over budget while budgets work is stepped eagerly, never recorded: a graph over every slot holds its
+				# pool for the rest of the run (~6 GB of the GPU, 2026-11-03: recorded for one such step in hours, the card
+				# then 7.6 GB from full and the loss noise out of memory)
+				eager = over and steps_graph.budget_ok is not False
 				share = len(part) / len(rows)
 				batch = {
 					**{k: choice[k][sub] for k in ("kind", "action", "index", "cell", "old_logp")},
@@ -890,13 +895,13 @@ def ppo_update(
 						checked = gradient_check(model, check[0] - check[3], check[3], check[4], prefix="grad_raw_")
 					del check
 				mark = time.perf_counter()
-				recorded = steps_graph.run(raw, batch, budget, prepare) if steps_graph is not None else None
+				recorded = steps_graph.run(raw, batch, budget, prepare) if steps_graph is not None and not eager else None
 				if recorded is not None:  # forward, loss and backward in one replay, its gradient added to .grad
 					metrics, fs_parts = recorded
 					clock["forward"] += time.perf_counter() - mark
 				else:
 					inputs = model_inputs(raw)
-					out = graphs.train(inputs) if graphs else model(inputs)
+					out = model(inputs) if eager else graphs.train(inputs) if graphs else model(inputs)
 					clock["forward"] += time.perf_counter() - mark
 					mark = time.perf_counter()
 					loss, metrics, fs_parts, _ = micro_loss(out, batch, config, foresight_config)
