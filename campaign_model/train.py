@@ -26,6 +26,7 @@ import queue
 import random
 import threading
 import time
+import traceback
 from collections import Counter, deque
 
 import numpy as np
@@ -801,6 +802,10 @@ def ppo_update(
 		except torch.OutOfMemoryError as error:
 			noise = {}
 			print(f"campaign: the loss noise not measured (out of GPU memory: {str(error)[:120]})", flush=True)
+		except Exception:  # (a diagnostic never ends the run: 2026-11-03 07:25, a TypeError here stopped joint7, its games in flight lost; the traceback logged, which the watcher sees)
+			noise = {}
+			traceback.print_exc()
+			print("campaign: the loss noise not measured (the error above)", flush=True)
 		if device.type == "cuda":
 			torch.cuda.empty_cache()
 	totals, steps, stopped, update_kl, recent = Counter(), 0, False, 0.0, deque(maxlen=KL_WINDOW)

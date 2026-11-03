@@ -7,7 +7,7 @@ from campaign_model.model import CampaignModel
 from campaign_model.records import Decision
 from campaign_model.schema import HEADS, random_inputs
 from campaign_model.config import CampaignConfig
-from campaign_model.train import _prefetched, choices, chosen_logp, head_entropy, ppo_update, windows_for, wire_for
+from campaign_model.train import _prefetched, choices, chosen_logp, head_entropy, loss_noise, ppo_update, windows_for, wire_for
 
 
 def sample(out, x, b, rng):
@@ -357,3 +357,26 @@ def test_the_wire_filled_in_a_tensor_reaches_the_update_as_it_is():
 	np.testing.assert_array_equal(wire.numpy(), decode_wire(decisions))
 	(rows, inputs, heroes), = list(_prefetched([np.arange(3)], lambda rows: wire_for([decisions[r] for r in rows], torch.device("cpu")), torch.device("cpu"), measure=lambda decoded: int(np.asarray(decoded).sum() > 0)))
 	assert torch.equal(inputs["wire"], wire) and heroes == 1
+
+
+def test_the_loss_noise_takes_the_wire_as_the_pcs_update_decodes_it():
+	"""(2026-11-03) joint7 stopped at 07:25 CST: loss_noise decoded with the update's decode, which gives wire_for's
+	tensor on CUDA (decode_wire into pinned memory, then inputs_on_device), and torch.from_numpy refused it. The same
+	noise from that wire as from the decoded inputs."""
+	from campaign_model.records import decode_inputs, inputs_on_device
+	from campaign_model.tests.test_model import encoded
+
+	torch.manual_seed(0)
+	model = CampaignModel(dim=32, cell_dim=16, layers=1).eval()
+	x = random_inputs(8, seed=3)
+	decisions = [d.__class__(**{**d.__dict__, "inputs": encoded(x, b)}) for b, d in enumerate(decisions_for(model, x))]
+	n, k = len(decisions), c.N_VALUE_OFFSETS
+	t = {"choice": {name: torch.from_numpy(value) for name, value in choices(decisions).items()}, "advantage": torch.linspace(-1, 1, n), "credited": torch.ones(n),
+		"unsound": torch.zeros(n, dtype=torch.bool), "targets": torch.full((n, k), 0.5), "share_valid": torch.ones(n, k), "labels": torch.full((n, k), 0.4), "growth_real": torch.zeros(n, k)}
+	cpu = torch.device("cpu")
+	model.train()
+	wire = loss_noise(model, decisions, lambda rows: wire_for([decisions[r] for r in rows], cpu), inputs_on_device, cpu, t, CampaignConfig(), rows=2, samples=3)
+	arrays = loss_noise(model, decisions, lambda rows: decode_inputs([decisions[r] for r in rows]), None, cpu, t, CampaignConfig(), rows=2, samples=3)
+	assert wire and wire.keys() == arrays.keys()
+	for name in wire:
+		assert wire[name] == arrays[name] or (np.isnan(wire[name]) and np.isnan(arrays[name])) or abs(wire[name] - arrays[name]) <= 1e-4 * abs(arrays[name]), name
