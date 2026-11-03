@@ -606,9 +606,10 @@ class Runner:
 
 
 def _worker_init(_index):
-	"""Each loader worker: on SIGTERM (the loader shutting it down) end the games it runs, so no VCMI outlives a run; the
-	objects inherited from the forkserver frozen, so the collector never writes to their pages (which would copy them:
-	40 workers' torch imports stay shared, 2026-10-30)."""
+	"""Each loader worker: on SIGTERM (the loader shutting it down) end the games it runs, so no VCMI outlives a run.
+	What it inherits from the forkserver is already frozen there (fork_preload): no collection here first, which would
+	walk every inherited object and copy its page (49 MB a worker on the PC, 2026-11-02); what the fork itself made is
+	frozen too."""
 	import gc
 
 	def stop(signum, frame):
@@ -616,7 +617,6 @@ def _worker_init(_index):
 
 	signal.signal(signal.SIGTERM, stop)
 	signal.signal(signal.SIGINT, signal.SIG_IGN)  # (the trainer's Ctrl-C is the trainer's to handle)
-	gc.collect()
 	gc.freeze()
 
 
@@ -650,7 +650,7 @@ class Supply:
 		self.config, self.out, self.pool, self.campaign = config, Path(out), pool, campaign
 		self.ctx = multiprocessing.get_context("forkserver" if sys.platform != "win32" else "spawn")
 		if hasattr(self.ctx, "set_forkserver_preload"):
-			self.ctx.set_forkserver_preload(["battle_model.supply"])  # (torch and the models' code imported once, inherited)
+			self.ctx.set_forkserver_preload(["battle_model.fork_preload"])  # (every module a worker imports, once, frozen: inherited)
 		ceilings = {"battle": config.generated_actors, **({"campaign": config.campaign.games} if campaign else {})}
 		self.shared = Shared(self.ctx, ceilings)
 		self.shared.version.value = pool.version
