@@ -108,6 +108,42 @@ def test_the_heroes_counted_from_the_wire_are_the_inputs_ones():
 	assert heroes_in(decode_wire(decisions)).tolist() == [0, 1, 3, 8, 2]
 
 
+def test_the_wire_inflated_into_its_rows_is_what_zlib_and_a_join_gave(monkeypatch):
+	"""(2026-11-03) decode_wire inflates each record straight into its row (libz through ctypes, or zlib.decompress
+	where libz does not load), into a buffer of the caller's or its own: the bytes the join of zlib.decompress gave,
+	a schema 9 record (no memory) given zeros there; a record of another size refused."""
+	import zlib
+
+	import numpy as np
+	import pytest
+
+	from campaign_model import records
+	from types import SimpleNamespace  # (what decode_wire reads of a Decision: its inputs)
+
+	from campaign_model.records import IN_BYTES, MEM_BYTES, decode_wire, padded
+	from campaign_model.schema import random_inputs
+	from campaign_model.tests.test_model import encoded
+
+	x = random_inputs(4, seed=7)
+	blobs = [encoded(x, b) for b in range(4)]
+	blobs[2] = zlib.compress(zlib.decompress(blobs[2])[: IN_BYTES - MEM_BYTES])  # (schema 9: before the memory)
+	decisions = [SimpleNamespace(inputs=blob) for blob in blobs]
+	want = np.frombuffer(b"".join(padded(zlib.decompress(blob)) for blob in blobs), dtype=np.uint8).reshape(4, IN_BYTES)
+	for inflate in (records._inflater(), None):
+		if inflate is None:  # (the fallback, where libz does not load)
+			monkeypatch.setattr(records.ctypes, "CDLL", lambda *_: (_ for _ in ()).throw(OSError("no libz")))
+			monkeypatch.setattr(records, "_INFLATE", None)
+		out = np.full((4, IN_BYTES), 255, dtype=np.uint8)
+		assert decode_wire(decisions, out=out) is out
+		np.testing.assert_array_equal(out, want)
+		np.testing.assert_array_equal(decode_wire(decisions), want)
+		with pytest.raises((ValueError, zlib.error)):
+			decode_wire([SimpleNamespace(inputs=zlib.compress(bytes(100)))])
+		with pytest.raises((ValueError, zlib.error)):
+			decode_wire([SimpleNamespace(inputs=zlib.compress(bytes(IN_BYTES + 1)))])
+	assert records._INFLATE is not None
+
+
 def test_a_record_with_nk2s_advice_reads_back_with_it():
 	"""AMZ2 with RECORD_ADVICE: the advice's three integers right after the header (AlphaMapAI::sendRecords)."""
 	import struct

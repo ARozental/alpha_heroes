@@ -7,7 +7,7 @@ from campaign_model.model import CampaignModel
 from campaign_model.records import Decision
 from campaign_model.schema import HEADS, random_inputs
 from campaign_model.config import CampaignConfig
-from campaign_model.train import _prefetched, choices, chosen_logp, head_entropy, ppo_update, windows_for
+from campaign_model.train import _prefetched, choices, chosen_logp, head_entropy, ppo_update, windows_for, wire_for
 
 
 def sample(out, x, b, rng):
@@ -341,3 +341,19 @@ def test_prefetched_yields_what_measure_found_on_the_host():
 	assert [measured for _, _, measured in got] == [3.0, 7.0]
 	assert [inputs["a"].tolist() for _, inputs, _ in got] == [[0, 1, 2], [3, 4]]
 	assert [len(item) for item in _prefetched(batches, decode, torch.device("cpu"))] == [2, 2]  # (without: as before)
+
+
+def test_the_wire_filled_in_a_tensor_reaches_the_update_as_it_is():
+	"""(2026-11-03) wire_for: decode_wire straight into a tensor (pinned on CUDA), which _prefetched passes on whole."""
+	from types import SimpleNamespace  # (what decode_wire reads of a Decision: its inputs)
+
+	from campaign_model.records import decode_wire
+	from campaign_model.tests.test_model import encoded
+
+	x = random_inputs(3, seed=2)
+	decisions = [SimpleNamespace(inputs=encoded(x, b)) for b in range(3)]
+	wire = wire_for(decisions, torch.device("cpu"))
+	assert torch.is_tensor(wire) and wire.dtype == torch.uint8
+	np.testing.assert_array_equal(wire.numpy(), decode_wire(decisions))
+	(rows, inputs, heroes), = list(_prefetched([np.arange(3)], lambda rows: wire_for([decisions[r] for r in rows], torch.device("cpu")), torch.device("cpu"), measure=lambda decoded: int(np.asarray(decoded).sum() > 0)))
+	assert torch.equal(inputs["wire"], wire) and heroes == 1

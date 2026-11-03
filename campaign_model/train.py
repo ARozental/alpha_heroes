@@ -42,7 +42,7 @@ from .labels import COLORS, GROWTH_CAP, PHI_FLOOR, SHARE_CHANGE_CAP, LabelConfig
 from .model import build_model
 from .play import make_map, play
 from .graphs import Graphs, StepGraph
-from .records import NO_EFFECT, decode_inputs, decode_wire, heroes_in, inputs_on_device
+from .records import IN_BYTES, NO_EFFECT, decode_inputs, decode_wire, heroes_in, inputs_on_device
 from .schema import HEADS
 
 RUNS = battle_play.ROOT / "runtime" / "campaign"
@@ -161,7 +161,10 @@ def _prefetched(batches, decode, device, convert=None, threads=DECODE_THREADS, m
 			return None
 		decoded = decode(rows)
 		measured = () if measure is None else (measure(decoded),)
-		inputs = {name: torch.from_numpy(value) for name, value in decoded.items()} if isinstance(decoded, dict) else {"wire": torch.from_numpy(decoded)}
+		if torch.is_tensor(decoded):  # (decode filled a tensor of its own: wire_for's, pinned already, pin_memory() then itself)
+			inputs = {"wire": decoded}
+		else:
+			inputs = {name: torch.from_numpy(value) for name, value in decoded.items()} if isinstance(decoded, dict) else {"wire": torch.from_numpy(decoded)}
 		return rows, ({name: value.pin_memory() for name, value in inputs.items()} if pinned else inputs), measured
 
 	pool = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
@@ -182,6 +185,14 @@ def _prefetched(batches, decode, device, convert=None, threads=DECODE_THREADS, m
 	finally:
 		stop.set()
 		pool.shutdown(wait=False, cancel_futures=True)
+
+
+def wire_for(decisions, device):
+	"""decode_wire into memory the copy to `device` reads directly: pinned on CUDA (no staging copy; the caching host
+	allocator's buffers, resident and reused, which let the decoding threads scale: records.decode_wire)."""
+	out = torch.empty((len(decisions), IN_BYTES), dtype=torch.uint8, pin_memory=device.type == "cuda")
+	decode_wire(decisions, out=out.numpy())
+	return out
 
 
 def batch_heroes(decoded):
@@ -618,7 +629,7 @@ def ppo_update(
 	foresight_sums, foresight_sum, checked = Counter(), None, {}  # (foresight_sum: its parts, PART_NAMES' order, on the device)
 	# On CUDA the bytes as sent go to the device and are cut and converted there (half the copy, none of the CPU's dtype copies)
 	convert = inputs_on_device if decode is None and device.type == "cuda" else None
-	decode = decode or ((lambda rows: decode_wire([decisions[r] for r in rows])) if convert else (lambda rows: decode_inputs([decisions[r] for r in rows])))
+	decode = decode or ((lambda rows: wire_for([decisions[r] for r in rows], device)) if convert else (lambda rows: decode_inputs([decisions[r] for r in rows])))
 	choice = {name: torch.from_numpy(value).to(device) for name, value in choices(decisions).items()}
 	# Nullkiller2's advice (config.nk2_advice), where a decision has it: its type, entry and tile; advised 1 there
 	advice_t = None

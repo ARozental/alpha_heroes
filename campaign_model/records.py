@@ -10,6 +10,8 @@ is kept compressed (1-4 KB) as it came until a minibatch decodes it (play.py ask
 Without it (and before 2026-10-29): "AMZ1", u32 size, zlib("AMR1", u32 count, count x decision with u32 n, n bytes of
 inputs), the whole message compressed at once, each decision compressed again here.
 """
+import ctypes
+import ctypes.util
 import itertools
 import json
 import struct
@@ -192,10 +194,65 @@ def decode_fields(decisions, names):
 	return {name: np.frombuffer(b"".join(parts[name]), dtype=wire).astype(dtype).reshape((len(decisions),) + shape) for name, shape, wire, dtype, _, _ in fields}
 
 
-def decode_wire(decisions):
+def decode_wire(decisions, out=None):
 	"""The decisions' inputs as sent, [N, IN_BYTES] uint8 (zlib only): for inputs_on_device, which cuts and converts
-	them on the GPU (half the bytes to copy there, and no dtype copies on the CPU: 2026-10-30, the trainer's thread)."""
-	return np.frombuffer(b"".join(padded(zlib.decompress(d.inputs)) for d in decisions), dtype=np.uint8).reshape(len(decisions), IN_BYTES)
+	them on the GPU (half the bytes to copy there, and no dtype copies on the CPU: 2026-10-30, the trainer's thread).
+	Each record inflated straight into its row (_inflater), of `out` when given (C-contiguous): the trainer's pinned
+	buffers, resident and reused. 2026-11-03 on the PC, 64 decisions a batch over 3 threads: 38.8 ms a batch through
+	zlib.decompress and a join (a new 876 KB object a record, its page faults serializing the threads), 8.1 ms into a
+	reused buffer."""
+	out = np.empty((len(decisions), IN_BYTES), dtype=np.uint8) if out is None else out
+	assert out.shape == (len(decisions), IN_BYTES) and out.dtype == np.uint8 and out.flags.c_contiguous
+	inflate, address = _inflater(), out.ctypes.data
+	for i, d in enumerate(decisions):
+		n = inflate(d.inputs, out[i], address + i * IN_BYTES)
+		if n != IN_BYTES:
+			if not (MEM_BYTES and n == IN_BYTES - MEM_BYTES):
+				raise ValueError(f"a decision's inputs are {n} bytes, not {IN_BYTES}")
+			out[i, n:] = 0  # (padded: a record of schema 9)
+	return out
+
+
+_INFLATE = None
+
+
+def _inflater():
+	"""inflate(compressed, row, its address) -> the bytes written: libz's uncompress straight into the row (no object
+	made, no copy, the interpreter lock released by ctypes), or zlib.decompress and a copy where libz does not load."""
+	global _INFLATE
+	if _INFLATE is None:
+		lib = _libz()
+		if lib is None:
+
+			def inflate(data, row, address):
+				raw = zlib.decompress(data)
+				row[: len(raw)] = np.frombuffer(raw, dtype=np.uint8)
+				return len(raw)
+		else:
+			uncompress = lib.uncompress
+			uncompress.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.c_char_p, ctypes.c_ulong)
+			uncompress.restype = ctypes.c_int
+
+			def inflate(data, row, address):
+				size = ctypes.c_ulong(row.nbytes)
+				status = uncompress(address, ctypes.byref(size), data, len(data))
+				if status != 0:  # (Z_BUF_ERROR -5: more than the row; Z_DATA_ERROR -3: damaged)
+					raise zlib.error(f"libz uncompress: error {status}")
+				return size.value
+
+		_INFLATE = inflate
+	return _INFLATE
+
+
+def _libz():
+	for name in ("libz.so.1", None):  # (Linux's by name; elsewhere where find_library says)
+		try:
+			path = name or ctypes.util.find_library("z")
+			if path:
+				return ctypes.CDLL(path)
+		except OSError:
+			pass
+	return None
 
 
 MEM_BYTES = IN_LAYOUT[-1][-1] if IN_LAYOUT[-1][0] == "mem" else 0
@@ -227,6 +284,7 @@ def heroes_in(decoded):
 		present = decoded["h_present"]
 	else:
 		offset, (_, shape, wire_dtype, _, nbytes) = _WIRE_AT["h_present"]
+		decoded = np.asarray(decoded)  # (a tensor: train.wire_for's pinned one)
 		present = np.ascontiguousarray(decoded[:, offset : offset + nbytes]).view(wire_dtype).reshape((len(decoded),) + shape)
 	return np.count_nonzero(present[:, : c.OWN_HEROES], axis=1)
 
