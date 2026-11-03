@@ -23,6 +23,10 @@
 # as the teacher over the turn (advice.py: any of its plan's steps or of the town actions it named that turn), and each
 # loss a share of the gradient (campaign.loss_shares: the teacher's by our eval score, at most 60%; policy and value
 # never under 15%)
+# 10 inference processes since 2026-11-03 ~08:15 (8 before): after the trainer's window budget and decoding fixes the
+# learner waits ~40% of the time for its 20 games; the PC's CPU was ~65% idle, the 8 servers at ~0.7 cores each, and
+# the games (11 campaign, the battles' and the evals', spread round-robin: socket_for) queue on shared servers. ~0.46 GB
+# each; back to 8 if the least available memory falls under 3 GB or the games finished an hour do not rise
 # 11 games since 2026-11-02 23:30: with 10, after the games' TBB cap and the loaders' preload, at least 5.3 GB stayed
 # available through an hour of updates (a game ~0.65 GB: its loader worker and its VCMI client); back to 10 if the
 # least available falls under 4 GB
@@ -53,6 +57,6 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 	--set remote_port=7700 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.02 campaign.entropy_floor_weight=0 \
-		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=11 remote_slots=4 campaign.inference_device=cpu inference_processes=8 \
+		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=11 remote_slots=4 campaign.inference_device=cpu inference_processes=10 \
 		campaign.head_scale=true fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
