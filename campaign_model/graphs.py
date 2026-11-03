@@ -32,68 +32,93 @@ def window_budget(model, budget):
 
 
 class _Flat(nn.Module):
-	"""The model with its inputs and outputs as tuples in a fixed order (what a graph's static buffers need)."""
+	"""The model with its inputs and outputs as tuples in a fixed order (what a graph's static buffers need). prepare:
+	what turns them into the model's inputs first, recorded with it (the update's wire bytes: records.inputs_on_device)."""
 
-	def __init__(self, model, names, outputs):
+	def __init__(self, model, names, outputs, prepare=None):
 		super().__init__()
-		self.model, self.names, self.outputs = model, names, outputs
+		self.model, self.names, self.outputs, self.prepare = model, names, outputs, prepare
 
 	def forward(self, *tensors):
-		out = self.model(dict(zip(self.names, tensors)))
+		inputs = dict(zip(self.names, tensors))
+		out = self.model(self.prepare(inputs) if self.prepare is not None else inputs)
 		return tuple(out[name] for name in self.outputs)
 
 
+def _difference(a, b):
+	"""The largest difference of two outputs relative to b's largest magnitude (at least 1); inf where their shapes or
+	their non-finite entries (a masked table's -inf) differ."""
+	a, b = a.detach().float(), b.detach().float()
+	if a.shape != b.shape:
+		return float("inf")
+	if a.numel() == 0:
+		return 0.0
+	finite = torch.isfinite(b)
+	if not torch.equal(torch.isfinite(a), finite) or not torch.equal(torch.where(finite, 0.0, a).nan_to_num(nan=0.0), torch.where(finite, 0.0, b).nan_to_num(nan=0.0)):
+		return float("inf")
+	return float(torch.where(finite, (a - b).abs(), 0.0).max()) / max(1.0, float(torch.where(finite, b.abs(), 0.0).max()))
+
+
 class Graphs:
+	TOLERANCE = 1e-3  # a first-pass graph that converts its inputs, its outputs against the eager forward's (_difference)
+
 	def __init__(self, model):
 		self.model = model
-		self.names = self.outputs = None
-		self.trained = {}  # rows -> the graphed module (forward and backward), or None: its recording failed
-		self.evaluated = {}  # rows -> (static inputs, static outputs, graph), or None
+		self.outputs = None
+		self.trained = {}  # (rows, input names) -> the graphed module (forward and backward), or None: its recording failed
+		self.evaluated = {}  # (rows, budget, input names) -> [static inputs, static outputs, graph, checked], or None
 		self.pool = None
+		self.prepare_ok = True  # (False once a graph converting its inputs failed: converted outside from then on)
 
 	@staticmethod
 	def usable(model, device):
 		return device.type == "cuda" and hasattr(model, "fixed_windows")
 
-	def _order(self, inputs):
-		if self.names is None:
-			self.names = tuple(sorted(inputs))
+	def _order(self, inputs, prepare=None):
+		"""The inputs' names (sorted) and tensors in that order; the model's output names once (its first call)."""
+		if self.outputs is None:
 			was = self.model.training
 			self.model.eval()
 			with torch.no_grad():
-				self.outputs = tuple(self.model(inputs))  # (the model's output names, in its order)
+				self.outputs = tuple(self.model(prepare(inputs) if prepare is not None else inputs))  # (the model's output names, in its order)
 			self.model.train(was)
-		return tuple(inputs[name] for name in self.names)
+		names = tuple(sorted(inputs))
+		return names, tuple(inputs[name] for name in names)
 
 	def train(self, inputs):
 		"""The model's outputs for inputs (a dict on the GPU), its backward through the recorded graph."""
 		self.model.fixed_windows = True
-		args = self._order(inputs)
-		rows = args[0].shape[0]
-		if rows not in self.trained:
+		names, args = self._order(inputs)
+		key = (args[0].shape[0], names)
+		if key not in self.trained:
 			try:
-				flat = _Flat(self.model, self.names, self.outputs)
+				flat = _Flat(self.model, names, self.outputs)
 				# (allow_unused_input: parameters no output reaches, e.g. a head's the loss leaves out, failed the capture: "the
 				# differentiated Tensor ... appears to not have been used", 2026-10-30)
-				self.trained[rows] = torch.cuda.make_graphed_callables(flat, tuple(a.detach().clone() for a in args), num_warmup_iters=3, allow_unused_input=True)
+				self.trained[key] = torch.cuda.make_graphed_callables(flat, tuple(a.detach().clone() for a in args), num_warmup_iters=3, allow_unused_input=True)
 			except Exception as error:  # (eager from then on, at this size)
-				self.trained[rows] = None
-				print(f"campaign graphs: no training graph at {rows} rows ({type(error).__name__}: {str(error)[:200]}): eager", flush=True)
-		graphed = self.trained[rows]
+				self.trained[key] = None
+				print(f"campaign graphs: no training graph at {key[0]} rows ({type(error).__name__}: {str(error)[:200]}): eager", flush=True)
+		graphed = self.trained[key]
 		if graphed is None:
 			return self.model(inputs)
 		return dict(zip(self.outputs, graphed(*args)))
 
-	def eval(self, inputs, budget=None):
+	def eval(self, inputs, budget=None, prepare=None):
 		"""The model's outputs for inputs without gradients (copies: the next replay overwrites the graph's). budget: the
-		windows a batch (window_budget), a graph of its own; every slot's if that one could not be recorded."""
+		windows a batch (window_budget), a graph of its own; every slot's if that one could not be recorded. prepare:
+		what turns inputs into the model's, recorded in the graph and its first replay checked against the eager forward
+		(the same windows); done here, outside, from then on if that failed."""
+		if prepare is not None and not self.prepare_ok:
+			inputs, prepare = prepare(inputs), None
 		self.model.fixed_windows = True
-		args = self._order(inputs)
-		key = (args[0].shape[0], budget)
+		names, args = self._order(inputs, prepare)
+		key = (args[0].shape[0], budget, names)
+		what = f"first-pass graph at {key[0]} rows, {budget or 'all'} windows" + (", converting its inputs" if prepare is not None else "")
 		if key not in self.evaluated:
 			try:
 				static = tuple(a.detach().clone() for a in args)
-				flat = _Flat(self.model, self.names, self.outputs)
+				flat = _Flat(self.model, names, self.outputs, prepare)
 				with window_budget(self.model, budget):
 					side = torch.cuda.Stream()
 					side.wait_stream(torch.cuda.current_stream())
@@ -105,21 +130,35 @@ class Graphs:
 					with torch.no_grad(), torch.cuda.graph(graph, pool=self.pool):
 						out = flat(*static)
 				self.pool = graph.pool()
-				self.evaluated[key] = (static, out, graph)
+				self.evaluated[key] = [static, out, graph, prepare is None]
 			except Exception as error:
 				self.evaluated[key] = None
-				print(f"campaign graphs: no first-pass graph at {key[0]} rows, {budget or 'all'} windows ({type(error).__name__}: {str(error)[:200]}): {'every slot' if budget else 'eager'}", flush=True)
+				print(f"campaign graphs: no {what} ({type(error).__name__}: {str(error)[:200]}): {'converted outside' if prepare is not None else 'every slot' if budget else 'eager'}", flush=True)
 		entry = self.evaluated[key]
 		if entry is None:
+			if prepare is not None:
+				self.prepare_ok = False
+				return self.eval(prepare(inputs), budget)
 			if budget is not None:
 				return self.eval(inputs)
 			with torch.no_grad():
 				return self.model(inputs)
-		static, out, graph = entry
+		static, out, graph, checked = entry
 		for buffer, value in zip(static, args):
 			buffer.copy_(value)
 		graph.replay()
-		return {name: value.clone() for name, value in zip(self.outputs, out)}
+		result = {name: value.clone() for name, value in zip(self.outputs, out)}
+		if not checked:
+			with torch.no_grad(), window_budget(self.model, budget):
+				eager = self.model(prepare(inputs))
+			worst = max((_difference(result[name], eager[name]) for name in self.outputs), default=0.0)
+			if not worst <= self.TOLERANCE:  # (nan: differs)
+				self.evaluated[key], self.prepare_ok = None, False
+				print(f"campaign graphs: the {what} differs from the eager forward ({worst:.1e} of the largest): converted outside from now on", flush=True)
+				return {name: eager[name] for name in self.outputs}
+			entry[3] = True
+			print(f"campaign graphs: {what}: recorded and checked (outputs within {worst:.1e} of the eager forward's)", flush=True)
+		return result
 
 
 class StepGraph:
@@ -143,36 +182,44 @@ class StepGraph:
 		# A budget graph's check (against the eager step over every slot): None before the first, then whether it held;
 		# the update uses budgets while not False, and in its first pass (no check there) once True
 		self.budget_ok = None
+		self.prepare_ok = True  # (False once a graph converting its inputs failed: converted outside from then on)
 
 	@staticmethod
 	def signature(*dicts):
 		return tuple(tuple(sorted((name, tuple(value.shape), value.dtype) for name, value in d.items())) for d in dicts)
 
-	def run(self, inputs, batch, budget=None):
+	def run(self, inputs, batch, budget=None, prepare=None):
 		"""budget: the windows of the step (window_budget), a graph of its own; every slot's (the graph without a budget)
-		once one with a budget failed its check or could not be recorded."""
+		once one with a budget failed its check or could not be recorded. prepare: what turns inputs into the model's
+		(the update's wire bytes: records.inputs_on_device), recorded in the graph; done here, outside, once a graph with
+		it failed its check or could not be recorded."""
 		self.model.fixed_windows = True
+		if prepare is not None and not self.prepare_ok:
+			inputs, prepare = prepare(inputs), None
 		if self.budget_ok is False:
 			budget = None
 		key = self.signature(inputs, batch) + (budget,)
 		if key not in self.entries:
-			self.entries[key] = self._record(inputs, batch, budget)
+			self.entries[key] = self._record(inputs, batch, budget, prepare)
 		entry = self.entries[key]
 		if entry is None:
+			if prepare is not None:
+				self.prepare_ok = False
+				return self.run(prepare(inputs), batch, budget)
 			return None if budget is None else self.run(inputs, batch)
 		for name, value in inputs.items():
 			entry["inputs"][name].copy_(value)
 		for name, value in batch.items():
 			entry["batch"][name].copy_(value)
 		if not entry["checked"]:
-			return self._first(entry, key, inputs, batch, budget)
+			return self._first(entry, key, inputs, batch, budget, prepare)
 		entry["graph"].replay()
 		return tuple(None if o is None else o.clone() for o in entry["outputs"])
 
 	def _params(self):
 		return [p for p in self.model.parameters() if p.requires_grad]
 
-	def _record(self, inputs, batch, budget=None):
+	def _record(self, inputs, batch, budget=None, prepare=None):
 		params, before = self._params(), None
 		try:
 			for p in params:
@@ -186,7 +233,7 @@ class StepGraph:
 				side.wait_stream(torch.cuda.current_stream())
 				with torch.cuda.stream(side):
 					for _ in range(2):  # (the allocator and the libraries' choices settle before the recording)
-						loss, *_ = self.fn(self.model(static_inputs), static_batch)
+						loss, *_ = self.fn(self.model(prepare(static_inputs) if prepare is not None else static_inputs), static_batch)
 						loss.backward()
 						del loss
 				torch.cuda.current_stream().wait_stream(side)
@@ -194,7 +241,7 @@ class StepGraph:
 					p.grad.copy_(g)
 				graph = torch.cuda.CUDAGraph()
 				with torch.cuda.graph(graph):
-					loss, *outputs = self.fn(self.model(static_inputs), static_batch)
+					loss, *outputs = self.fn(self.model(prepare(static_inputs) if prepare is not None else static_inputs), static_batch)
 					loss.backward()
 			return {"inputs": static_inputs, "batch": static_batch, "outputs": tuple(None if o is None else o.detach() for o in outputs), "graph": graph, "checked": False}
 		except Exception as error:
@@ -202,15 +249,15 @@ class StepGraph:
 				torch.cuda.synchronize()
 				for p, g in zip(params, before):
 					p.grad.copy_(g)
-			print(f"campaign step graph: not recorded{f' at {budget} windows' if budget else ''} ({type(error).__name__}: {str(error)[:300]}): {'every slot' if budget else 'eager steps'}", flush=True)
+			print(f"campaign step graph: not recorded{f' at {budget} windows' if budget else ''}{', converting its inputs' if prepare is not None else ''} ({type(error).__name__}: {str(error)[:300]}): {'converted outside' if prepare is not None else 'every slot' if budget else 'eager steps'}", flush=True)
 			return None
 
-	def _first(self, entry, key, inputs, batch, budget=None):
+	def _first(self, entry, key, inputs, batch, budget=None, prepare=None):
 		"""The first replay, checked against the eager step on the same micro-batch (over every hero slot: a budget is
-		set only while recording); the gradient added either way."""
+		set only while recording; its inputs converted outside); the gradient added either way."""
 		params = self._params()
 		try:
-			loss, *eager_outputs = self.fn(self.model(inputs), batch)
+			loss, *eager_outputs = self.fn(self.model(prepare(inputs) if prepare is not None else inputs), batch)
 			eager = torch.autograd.grad(loss, params, allow_unused=True)
 			del loss
 		except torch.OutOfMemoryError as error:
@@ -227,14 +274,16 @@ class StepGraph:
 		worst = max(float(((r - (g if g is not None else torch.zeros_like(r))).abs().max())) for r, g in zip(recorded, eager)) / scale
 		outputs = tuple(None if o is None else o.clone() for o in entry["outputs"])
 		output_diff = max((float((o - e.detach()).abs().max()) for o, e in zip(outputs, eager_outputs) if o is not None and e is not None), default=0.0)
-		windows = f" at {budget} windows" if budget else ""
+		windows = (f" at {budget} windows" if budget else "") + (", converting its inputs," if prepare is not None else "")
 		if worst > self.TOLERANCE or output_diff > self.TOLERANCE or not all(torch.isfinite(r).all() for r in recorded):
 			for p, b, g in zip(params, before, eager):  # (this micro-batch's gradient: the eager one)
 				p.grad.copy_(b if g is None else b + g)
 			self.entries[key] = None
-			if budget:
+			if prepare is not None:  # (the conversion first: the steps go on as they were, converted outside)
+				self.prepare_ok = False
+			elif budget:
 				self.budget_ok = False
-			print(f"campaign step graph{windows}: differs from the eager step (gradient {worst:.1e}, outputs {output_diff:.1e} of the largest): {'every slot from now on' if budget else 'eager steps'}", flush=True)
+			print(f"campaign step graph{windows}: differs from the eager step (gradient {worst:.1e}, outputs {output_diff:.1e} of the largest): {'converted outside from now on' if prepare is not None else 'every slot from now on' if budget else 'eager steps'}", flush=True)
 			return tuple(None if e is None else e.detach() for e in eager_outputs)
 		entry["checked"] = True
 		if budget:

@@ -182,3 +182,22 @@ def test_a_record_with_nk2s_plan_reads_back_with_it():
 	assert decisions[0].advice == (c.ActionType.BUILD, 40, -1) and decisions[1].advice is None
 	assert decisions[0].plan == decisions[1].plan == tuple(plan) and len(plan) == PLAN_FIELDS.size // 12 * 5
 	assert decisions[1].action_type == c.ActionType.END and zlib.decompress(decisions[1].inputs) == bytes(IN_BYTES)
+
+
+def test_one_input_on_a_device_is_that_input_of_them_all():
+	"""(2026-11-03) records.input_on_device (the update's g_players beside graphs converting the rest): what
+	inputs_on_device gives for that name, for every name."""
+	import torch
+
+	from campaign_model.model import CampaignModel
+	from campaign_model.records import IN_LAYOUT, decode_wire, input_on_device, inputs_on_device
+	from campaign_model.schema import random_inputs
+	from campaign_model.tests.test_model import encoded
+	from campaign_model.tests.test_train import decisions_for
+
+	x = random_inputs(3, seed=8)
+	decisions = [d.__class__(**{**d.__dict__, "inputs": encoded(x, b)}) for b, d in enumerate(decisions_for(CampaignModel(dim=32, cell_dim=16, layers=1).eval(), x))]
+	wire = torch.from_numpy(decode_wire(decisions))
+	every = inputs_on_device(wire)
+	for name, *_ in IN_LAYOUT:
+		assert torch.equal(input_on_device(wire, name), every[name]), name

@@ -295,15 +295,22 @@ _WIRE_AT = {entry[0]: (offset, entry) for entry, offset in zip(IN_LAYOUT, iterto
 def inputs_on_device(wire):
 	"""{input name: tensor [N, ...]} in the model's dtypes from decode_wire's bytes as a tensor [N, IN_BYTES] on the
 	device (battle_model/inference.py's decode_on_device, for training)."""
+	return {name: _column(wire, offset, entry) for name, (offset, entry) in _WIRE_AT.items()}
+
+
+def input_on_device(wire, name):
+	"""One of inputs_on_device's inputs alone (the update's g_players beside a graph that converts the rest itself)."""
+	offset, entry = _WIRE_AT[name]
+	return _column(wire, offset, entry)
+
+
+def _column(wire, offset, entry):
 	import torch
 
 	global _TORCH_DTYPES
 	if _TORCH_DTYPES is None:
 		_TORCH_DTYPES = {np.dtype(t): getattr(torch, name) for t, name in ((np.uint8, "uint8"), (np.int32, "int32"), (np.float32, "float32"), (np.bool_, "bool"), (np.int64, "int64"))}
-	inputs, offset, n = {}, 0, wire.shape[0]
-	for name, shape, wire_dtype, dtype, nbytes in IN_LAYOUT:
-		# (a copy always: one row's slice counts as contiguous and kept its odd stride, which the view refused)
-		column = wire[:, offset : offset + nbytes].clone(memory_format=torch.contiguous_format).view(_TORCH_DTYPES[np.dtype(wire_dtype)])
-		inputs[name] = column.to(_TORCH_DTYPES[np.dtype(dtype)]).reshape((n,) + shape)
-		offset += nbytes
-	return inputs
+	_, shape, wire_dtype, dtype, nbytes = entry
+	# (a copy always: one row's slice counts as contiguous and kept its odd stride, which the view refused)
+	column = wire[:, offset : offset + nbytes].clone(memory_format=torch.contiguous_format).view(_TORCH_DTYPES[np.dtype(wire_dtype)])
+	return column.to(_TORCH_DTYPES[np.dtype(dtype)]).reshape((wire.shape[0],) + tuple(shape))

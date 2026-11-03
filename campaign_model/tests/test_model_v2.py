@@ -427,3 +427,59 @@ def test_the_window_budget_is_never_left_set():
 			assert m.window_budget == 7 and m.fixed_windows
 			raise RuntimeError
 	assert m.window_budget is None
+
+
+def test_the_update_converting_in_its_graphs_falls_back_and_checks_its_gradient_as_without(monkeypatch):
+	"""(2026-11-03) config.convert_in_graphs on the PC's path (the bytes as sent): the gradient check (v2's foresight)
+	and the eager step a graph could not take convert the batch themselves. Eager stand-ins of the graphs whose step
+	declines (the fallback), with the conversion in them and outside: the same weights after."""
+	from campaign_model import train
+	from campaign_model.tests.test_model import encoded
+	from campaign_model.tests.test_train import _EagerGraphs, _EagerStep
+
+	class Declining(_EagerStep):
+		def run(self, inputs, batch, budget=None, prepare=None):
+			return None
+
+	monkeypatch.setattr(train, "converts_on_device", lambda device: True)
+	monkeypatch.setattr(train, "Graphs", _EagerGraphs)
+	monkeypatch.setattr(train, "StepGraph", Declining)
+	torch.manual_seed(5)
+	start = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	x = rich_inputs(8, seed=6)
+	decisions = [d.__class__(**{**d.__dict__, "inputs": encoded(x, b)}) for b, d in enumerate(decisions_for(start.eval(), x))]
+	n = len(decisions)
+	foresight = {
+		"move": np.random.default_rng(0).normal(size=(n, ACTION_TARGETS)).astype(np.float32), "move_mask": np.array([d.action_type == c.ActionType.MOVE for d in decisions]),
+		"move_battle": np.ones(n, bool), "move_at": np.array([(d.index // (c.WINDOW * c.WINDOW), (d.index // c.WINDOW) % c.WINDOW, d.index % c.WINDOW) if d.action_type == c.ActionType.MOVE else (0, 0, 0) for d in decisions], np.int64),
+		"answer": np.zeros((n, ACTION_TARGETS), np.float32), "answer_mask": np.array([d.action_type < 0 for d in decisions]), "answer_battle": np.zeros(n, bool),
+		"option": np.array([max(d.index, 0) if d.action_type < 0 else 0 for d in decisions], np.int64),
+		"hero": np.zeros((n, c.OWN_HEROES, 2), np.float32), "hero_mask": x["h_present"][:, : c.OWN_HEROES].copy(), "hero_alive": x["h_present"][:, : c.OWN_HEROES].copy(),
+		"turn": np.zeros((n, 1 + c.N_RESOURCES), np.float32), "turn_mask": np.ones((n, 1 + c.N_RESOURCES), bool),
+		"plan": np.random.default_rng(1).integers(0, AREAS + 1, (n, c.OWN_HEROES)), "plan_mask": x["h_present"][:, : c.OWN_HEROES].copy(),
+	}
+	weights, metrics = {}, {}
+	for inside in (True, False):
+		model = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+		model.load_state_dict(start.state_dict())
+		torch.manual_seed(7)
+		config = CampaignConfig(batch_size=4, micro_batches=2, passes=1, model_architecture="v2", cuda_graphs=True, step_graphs=True, convert_in_graphs=inside, decode_threads=1)
+		metrics[inside], _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, np.full((n, c.N_VALUE_OFFSETS), 0.5, np.float32), np.zeros(n, np.float32), config, foresight=foresight)
+		weights[inside] = {k: v.detach().clone() for k, v in model.state_dict().items()}
+	assert metrics[True]["grad_shared_foresight"] > 0 and metrics[True]["grad_shared_foresight"] == metrics[False]["grad_shared_foresight"]
+	assert any(not torch.equal(weights[True][k], start.state_dict()[k]) for k in weights[True])
+	for k in weights[True]:
+		torch.testing.assert_close(weights[True][k], weights[False][k], rtol=0, atol=0, msg=k)
+
+
+def test_a_graphs_outputs_are_compared_relative_to_their_scale_and_masks():
+	"""(2026-11-03) graphs._difference, a first-pass graph's check: relative to the output's largest magnitude (at least
+	1); a masked (-inf) entry where the other has a number, or another shape, is a difference without bound."""
+	from campaign_model.graphs import _difference
+
+	a = torch.tensor([[0.5, -float("inf"), 100.0]])
+	assert _difference(a, a.clone()) == 0.0
+	assert abs(_difference(a + torch.tensor([[0.0, 0.0, 0.05]]), a) - 0.05 / 100.0) < 1e-6  # (float32)
+	assert abs(_difference(torch.tensor([0.2]), torch.tensor([0.1])) - 0.1) < 1e-6  # (scale at least 1)
+	assert _difference(torch.tensor([[0.5, 0.0, 100.0]]), a) == float("inf")
+	assert _difference(a, a.reshape(3, 1)) == float("inf")

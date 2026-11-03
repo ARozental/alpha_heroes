@@ -45,6 +45,7 @@ class CampaignConfig:
 	prepass_batch: int = 0  # the update's first pass (no gradients: the KL anchor, the old values) in batches of this many; 0: a micro-batch's
 	cuda_graphs: bool = True  # on CUDA: the update's forward and backward replayed from recorded graphs (graphs.py: launches cost under WSL)
 	step_graphs: bool = True  # with cuda_graphs: a micro-batch's forward, loss and backward as one recorded graph (graphs.StepGraph)
+	convert_in_graphs: bool = True  # with cuda_graphs, on CUDA: the wire's conversion (records.inputs_on_device, ~250 small kernels a micro-batch, ~20 ms of the main thread's ~58 under WSL, 2026-11-03) recorded in the update's graphs, which take the bytes as sent; each such graph checked at its first replay, the conversion done outside again if one fails
 	window_budget: float = 4.0  # with cuda_graphs: hero windows computed a decision (model_v2.windows_of), of OWN_HEROES slots: the same outputs for a batch with no more of our heroes (it computes every slot otherwise); the PC's games, 2026-11-03: 2.8 a decision, never more than 4. 0: every slot
 	# The update's inputs decoded ahead in this many threads (train._prefetched: zlib, ~430 decisions/s a thread on the PC). With
 	# the step recorded whole the PC's update waited ~15 s for 3 of them, the CPU half idle (2026-10-31): each decision is

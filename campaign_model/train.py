@@ -43,7 +43,7 @@ from .labels import COLORS, GROWTH_CAP, PHI_FLOOR, SHARE_CHANGE_CAP, LabelConfig
 from .model import build_model
 from .play import make_map, play
 from .graphs import Graphs, StepGraph
-from .records import IN_BYTES, NO_EFFECT, decode_inputs, decode_wire, heroes_in, inputs_on_device
+from .records import IN_BYTES, NO_EFFECT, decode_inputs, decode_wire, heroes_in, input_on_device, inputs_on_device
 from .schema import HEADS
 
 RUNS = battle_play.ROOT / "runtime" / "campaign"
@@ -186,6 +186,11 @@ def _prefetched(batches, decode, device, convert=None, threads=DECODE_THREADS, m
 	finally:
 		stop.set()
 		pool.shutdown(wait=False, cancel_futures=True)
+
+
+def converts_on_device(device):
+	"""Whether the update sends the decisions' bytes as recorded to the device and converts them there (CUDA)."""
+	return device.type == "cuda"
 
 
 def wire_for(decisions, device):
@@ -629,7 +634,7 @@ def ppo_update(
 	foresight_config = ForesightConfig(weight=getattr(config, "foresight_weight", ForesightConfig.weight))
 	foresight_sums, foresight_sum, checked = Counter(), None, {}  # (foresight_sum: its parts, PART_NAMES' order, on the device)
 	# On CUDA the bytes as sent go to the device and are cut and converted there (half the copy, none of the CPU's dtype copies)
-	convert = inputs_on_device if decode is None and device.type == "cuda" else None
+	convert = inputs_on_device if decode is None and converts_on_device(device) else None
 	decode = decode or ((lambda rows: wire_for([decisions[r] for r in rows], device)) if convert else (lambda rows: decode_inputs([decisions[r] for r in rows])))
 	choice = {name: torch.from_numpy(value).to(device) for name, value in choices(decisions).items()}
 	# Nullkiller2's advice (config.nk2_advice), where a decision has it: its type, entry and tile; advised 1 there
@@ -689,6 +694,11 @@ def ppo_update(
 	steps_graph = None
 	if graphs is not None and config.step_graphs:
 		steps_graph = model.__dict__.setdefault("_step_graph", StepGraph(model, lambda out, batch: micro_loss(out, batch, config, foresight_config)[:3]))
+	# The wire's conversion recorded in the graphs (config.convert_in_graphs): they take the decoded batches as sent
+	# ({"wire": [N, IN_BYTES]}) and prepare them inside; everything else here converts them itself (model_inputs)
+	prepare = (lambda raw: convert(raw["wire"])) if convert is not None and graphs is not None and config.convert_in_graphs else None
+	model_inputs = prepare or (lambda raw: raw)
+	fed = None if prepare is not None else convert  # (_prefetched's conversion: on the main thread, outside the graphs)
 	model.eval()
 	anchor, end_now, prior = torch.empty(n, device=device), torch.empty(n, device=device), torch.empty(n, device=device)
 	growth_now, log_phi = torch.zeros(n, device=device), torch.zeros(n, device=device)  # (G7's logit, our log value: the attributed credit's)
@@ -701,11 +711,11 @@ def ppo_update(
 		chunk = config.prepass_batch or max(1, size // max(1, config.micro_batches))  # (no gradients, but at a whole minibatch it was the update's peak: 5.2 GB)
 		chunks = [np.arange(i, i + chunk).clip(max=n - 1) for i in range(0, n, chunk)]  # the last one padded: fixed shapes
 		prepass_started = time.perf_counter()
-		for rows, inputs, heroes in _prefetched(chunks, decode, device, convert, config.decode_threads, measure=batch_heroes):
+		for rows, raw, heroes in _prefetched(chunks, decode, device, fed, config.decode_threads, measure=batch_heroes):
 			index = torch.arange(int(rows[0]), int(rows[0]) + len(rows), device=device).clamp(max=n - 1)  # (made there: a copy from pageable memory waited for the GPU)
 			# (fewer windows once a step's graph with them was checked: graphs.StepGraph.budget_ok, none here)
 			budget = windows_for(len(rows), heroes, config) if steps_graph is not None and steps_graph.budget_ok else None
-			out = graphs.eval(inputs, budget) if graphs else model(inputs)
+			out = graphs.eval(raw, budget, prepare) if graphs else model(model_inputs(raw))
 			logp, _ = chosen_logp(out, {k: choice[k][index] for k in ("kind", "action", "index", "cell")})
 			anchor[index] = logp
 			end_now[index] = torch.sigmoid(out["end_logit"].float())
@@ -713,7 +723,8 @@ def ppo_update(
 				growth_now[index] = out["growth_logit"][:, -1].float()
 				value_now[index] = out["value_logit"][:, -1].float()
 				log_phi[index] = out["phi"].float().clamp(min=PHI_FLOOR).log()
-			prior[index] = 1.0 / inputs["g_players"].float().clamp(min=2) if config.share_target == "share" else 0.5  # the share heads' start: 1 / players (no change: 1/2)
+			players = input_on_device(raw["wire"], "g_players") if prepare is not None else raw["g_players"]
+			prior[index] = 1.0 / players.float().clamp(min=2) if config.share_target == "share" else 0.5  # the share heads' start: 1 / players (no change: 1/2)
 			fresh["share"][index] = excess_loss(out["value_logit"].float(), targets_t[index])
 			if growth is not None:
 				now = out["phi"].float().clamp(min=PHI_FLOOR).log().unsqueeze(-1)
@@ -822,7 +833,7 @@ def ppo_update(
 		# decision several MB: the PC's learner at 9.5 GB, 2026-10-30); the minibatch's gradient as before
 		minibatches = [order[i : i + size] for i in range(0, len(order), size)]
 		splits = [np.array_split(np.arange(len(rows)), max(1, min(config.micro_batches, len(rows)))) for rows in minibatches]
-		decoded = _prefetched([rows[part] for rows, parts in zip(minibatches, splits) for part in parts], decode, device, convert, config.decode_threads, measure=batch_heroes)
+		decoded = _prefetched([rows[part] for rows, parts in zip(minibatches, splits) for part in parts], decode, device, fed, config.decode_threads, measure=batch_heroes)
 		# The pass's order on the device once: a minibatch's and each micro-batch's rows as slices of it (each copy of a
 		# small index array from pageable memory waited for the GPU: five a minibatch, 2026-10-31)
 		order_t = torch.from_numpy(order).to(device)
@@ -844,7 +855,7 @@ def ppo_update(
 			for part in parts_of_rows:
 				sub, keep = index[part[0] : part[-1] + 1], whole[part[0] : part[-1] + 1]  # (array_split's parts: consecutive)
 				waited = time.perf_counter()
-				_, inputs, heroes = next(decoded)
+				_, raw, heroes = next(decoded)
 				clock["wait"] += time.perf_counter() - waited
 				budget = windows_for(len(part), heroes, config) if steps_graph is not None else None
 				full_windows += steps_graph is not None and config.window_budget > 0 and budget is None
@@ -867,23 +878,24 @@ def ppo_update(
 					batch.update({"fs:" + name: value[sub] for name, value in foresight_t.items()})
 				if teacher is not None:  # the teacher's distributions on the same inputs
 					with torch.no_grad():
-						t_out = teacher_graphs.eval(inputs) if teacher_graphs is not None else teacher(inputs)
+						t_out = teacher_graphs.eval(raw, prepare=prepare) if teacher_graphs is not None else teacher(model_inputs(raw))
 					batch.update({"t:" + name: t_out[name] for name in TEACHER_OUTPUTS}, teacher_weight=teacher_weight_t)
 				if foresight_t is not None and not checked:
 					# The gradient check, once an update, on an eager forward of its own, through torch.autograd.grad; every tensor
 					# of that forward is dropped before the graphed step: its autograd graph alive (one tensor of it kept) made
 					# the parameters' AccumulateGrad nodes reference the default stream, and the capture refused them ("a stale
 					# reference to the default stream (stream 0) from warmup", 2026-10-30)
-					check = micro_loss(model(inputs), batch, config, foresight_config, split=True)
+					check = micro_loss(model(model_inputs(raw)), batch, config, foresight_config, split=True)
 					if check[3] is not None:
 						checked = gradient_check(model, check[0] - check[3], check[3], check[4], prefix="grad_raw_")
 					del check
 				mark = time.perf_counter()
-				recorded = steps_graph.run(inputs, batch, budget) if steps_graph is not None else None
+				recorded = steps_graph.run(raw, batch, budget, prepare) if steps_graph is not None else None
 				if recorded is not None:  # forward, loss and backward in one replay, its gradient added to .grad
 					metrics, fs_parts = recorded
 					clock["forward"] += time.perf_counter() - mark
 				else:
+					inputs = model_inputs(raw)
 					out = graphs.train(inputs) if graphs else model(inputs)
 					clock["forward"] += time.perf_counter() - mark
 					mark = time.perf_counter()

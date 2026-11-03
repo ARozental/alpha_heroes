@@ -380,3 +380,65 @@ def test_the_loss_noise_takes_the_wire_as_the_pcs_update_decodes_it():
 	assert wire and wire.keys() == arrays.keys()
 	for name in wire:
 		assert wire[name] == arrays[name] or (np.isnan(wire[name]) and np.isnan(arrays[name])) or abs(wire[name] - arrays[name]) <= 1e-4 * abs(arrays[name]), name
+
+
+class _EagerGraphs:
+	"""graphs.Graphs' interface, eager on the CPU (each call its own forward): the update's wiring checked without CUDA."""
+
+	def __init__(self, model):
+		self.model = model
+
+	@staticmethod
+	def usable(model, device):
+		return True
+
+	def eval(self, inputs, budget=None, prepare=None):
+		with torch.no_grad():
+			return self.model(prepare(inputs) if prepare is not None else inputs)
+
+	def train(self, inputs):
+		return self.model(inputs)
+
+
+class _EagerStep:
+	"""graphs.StepGraph's interface, eager: the step's loss and backward, its outputs past the loss."""
+
+	budget_ok = None
+
+	def __init__(self, model, fn):
+		self.model, self.fn = model, fn
+
+	def run(self, inputs, batch, budget=None, prepare=None):
+		loss, *outputs = self.fn(self.model(prepare(inputs) if prepare is not None else inputs), batch)
+		loss.backward()
+		return tuple(None if o is None else o.detach() for o in outputs)
+
+
+def test_the_update_with_the_conversion_in_its_graphs_learns_what_it_learned_without(monkeypatch):
+	"""(2026-11-03) config.convert_in_graphs: the graphs take the bytes as sent and convert them inside (records.
+	inputs_on_device); the update's other uses of a batch (the first pass's g_players, the gradient check, the eager
+	fallback) convert it themselves. The PC's path (wire_for + the conversion on the device) run on the CPU through
+	eager stand-ins of the graphs, with the conversion in them and outside: the same weights after."""
+	from campaign_model import train
+	from campaign_model.tests.test_model import encoded
+
+	monkeypatch.setattr(train, "converts_on_device", lambda device: True)
+	monkeypatch.setattr(train, "Graphs", _EagerGraphs)
+	monkeypatch.setattr(train, "StepGraph", _EagerStep)
+	x = random_inputs(12, seed=4)
+	torch.manual_seed(1)
+	start = CampaignModel(dim=32, cell_dim=16, layers=1)
+	decisions = [d.__class__(**{**d.__dict__, "inputs": encoded(x, b)}) for b, d in enumerate(decisions_for(start.eval(), x))]
+	n = len(decisions)
+	weights = {}
+	for inside in (True, False):
+		model = CampaignModel(dim=32, cell_dim=16, layers=1)
+		model.load_state_dict(start.state_dict())
+		model.fixed_windows = False  # (graphs.Graphs.usable's mark: the stand-ins take it)
+		torch.manual_seed(2)
+		config = CampaignConfig(batch_size=4, micro_batches=2, passes=1, cuda_graphs=True, step_graphs=True, convert_in_graphs=inside, decode_threads=1)
+		ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-3), decisions, np.full((n, c.N_VALUE_OFFSETS), 0.5, np.float32), np.linspace(-1, 1, n).astype(np.float32), config)
+		weights[inside] = {k: v.detach().clone() for k, v in model.state_dict().items()}
+	assert any(not torch.equal(weights[True][k], start.state_dict()[k]) for k in weights[True])  # (it learned)
+	for k in weights[True]:
+		torch.testing.assert_close(weights[True][k], weights[False][k], rtol=0, atol=0, msg=k)
