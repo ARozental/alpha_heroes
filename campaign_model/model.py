@@ -675,6 +675,7 @@ class CustomFeatures(nn.Module):
 		)  # CELL_FEATURES
 		return {
 			"tile_value": value, "tile_prior": prior, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight, "tile_fight_ratio": fight_ratio, "tile_fights": fights.float(),
+			"tile_stacks": (monster | guarded).float(),  # (a wandering monster or its zone: model_v2's battle head)
 			"move_strength": torch.cat([this_hero, main_army], dim=-1).clamp(-2.0, 2.0), "move_relative": relative,  # (model_v2: MOVE_STRENGTH, MOVE_RELATIVE)
 		}
 

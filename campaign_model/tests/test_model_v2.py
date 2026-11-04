@@ -139,6 +139,7 @@ def test_an_update_with_foresight_labels_runs_and_reports_them():
 		"move": np.random.default_rng(0).normal(size=(n, ACTION_TARGETS)).astype(np.float32), "move_mask": np.array([d.action_type == c.ActionType.MOVE for d in decisions]),
 		"move_battle": np.ones(n, bool), "move_at": np.array([(d.index // (c.WINDOW * c.WINDOW), (d.index // c.WINDOW) % c.WINDOW, d.index % c.WINDOW) if d.action_type == c.ActionType.MOVE else (0, 0, 0) for d in decisions], np.int64),
 		"move_win": np.random.default_rng(2).integers(0, 2, n).astype(np.float32), "move_stake": np.random.default_rng(3).random(n).astype(np.float32),
+		"move_offer": np.random.default_rng(4).integers(0, 2, n).astype(bool),
 		"answer": np.zeros((n, ACTION_TARGETS), np.float32), "answer_mask": np.array([d.action_type < 0 for d in decisions]), "answer_battle": np.zeros(n, bool),
 		"option": np.array([max(d.index, 0) if d.action_type < 0 else 0 for d in decisions], np.int64),
 		"hero": np.zeros((n, c.OWN_HEROES, 2), np.float32), "hero_mask": x["h_present"][:, : c.OWN_HEROES].copy(), "hero_alive": x["h_present"][:, : c.OWN_HEROES].copy(),
@@ -456,6 +457,7 @@ def test_the_update_converting_in_its_graphs_falls_back_and_checks_its_gradient_
 		"move": np.random.default_rng(0).normal(size=(n, ACTION_TARGETS)).astype(np.float32), "move_mask": np.array([d.action_type == c.ActionType.MOVE for d in decisions]),
 		"move_battle": np.ones(n, bool), "move_at": np.array([(d.index // (c.WINDOW * c.WINDOW), (d.index // c.WINDOW) % c.WINDOW, d.index % c.WINDOW) if d.action_type == c.ActionType.MOVE else (0, 0, 0) for d in decisions], np.int64),
 		"move_win": np.random.default_rng(2).integers(0, 2, n).astype(np.float32), "move_stake": np.random.default_rng(3).random(n).astype(np.float32),
+		"move_offer": np.random.default_rng(4).integers(0, 2, n).astype(bool),
 		"answer": np.zeros((n, ACTION_TARGETS), np.float32), "answer_mask": np.array([d.action_type < 0 for d in decisions]), "answer_battle": np.zeros(n, bool),
 		"option": np.array([max(d.index, 0) if d.action_type < 0 else 0 for d in decisions], np.int64),
 		"hero": np.zeros((n, c.OWN_HEROES, 2), np.float32), "hero_mask": x["h_present"][:, : c.OWN_HEROES].copy(), "hero_alive": x["h_present"][:, : c.OWN_HEROES].copy(),
@@ -727,36 +729,49 @@ def test_adams_moments_of_move_pair_move_with_its_columns():
 
 def test_the_battle_heads_labels_and_loss():
 	"""foresight: a MOVE a battle followed is labelled with its outcome (won, the stake's share lost: a loss takes it
-	all); the battle heads' loss is finite and lower for predictions that agree with the tiles' kinds."""
+	all) and with the engine's answer, never ours (the user, 2026-11-04): a wandering monster that asked us first (it
+	offered to join, or fled: a yes/no question about a monster) offered, whatever we answered; the battle heads' loss
+	pushes a plain tile toward 'no monster', a monster's toward 'attacks or offers', a chosen one toward what it did."""
 	from campaign_model.foresight import LABEL_NAMES, battle_heads_loss, stake_lost
 
 	assert stake_lost(battle()) == pytest.approx(5 * game_values_creature(0) / (20 * game_values_creature(0)))
 	assert stake_lost(battle(won=False, casualties=((0, 20), (1, 4)))) == 1.0
 	W = c.WINDOW
 	d = lambda day, kind, action, index: Decision("RED", day, kind, 0, 1, action, index, -1, 0.0, (0.5,) * 3, 0, b"")  # noqa: E731
-	moves = [d(1, c.DecisionKind.TURN, c.ActionType.MOVE, 1 * W * W + 3 * W + 4), d(1, c.DecisionKind.TURN, c.ActionType.END, -1), d(2, c.DecisionKind.TURN, c.ActionType.END, -1)]
+	step = 1 * W * W + 3 * W + 4
+	moves = [
+		d(1, c.DecisionKind.TURN, c.ActionType.MOVE, step),  # attacked at once (serial 1)
+		d(1, c.DecisionKind.TURN, c.ActionType.MOVE, step), d(1, c.DecisionKind.YES_NO, -1, 0),  # asked first: we fought (serial 3)
+		d(1, c.DecisionKind.TURN, c.ActionType.MOVE, step), d(1, c.DecisionKind.YES_NO, -1, 1),  # asked first: we let it go
+		d(1, c.DecisionKind.TURN, c.ActionType.END, -1), d(2, c.DecisionKind.TURN, c.ActionType.END, -1),
+	]
 	game = Game(decisions=moves)
-	game.battles = {"RED": [dict(battle(won=False, casualties=((0, 20), (1, 4))), serial=1)]}
+	game.battles = {"RED": [dict(battle(won=False, casualties=((0, 20), (1, 4))), serial=1), dict(battle(), serial=3)]}
 	n = len(moves)
-	x = {"h_present": np.zeros((n, c.N_HEROES), bool), "h_owner": np.zeros((n, c.N_HEROES), np.int64), "h_type": np.full((n, c.N_HEROES), -1), "g_resources": np.full((n, c.N_RESOURCES), 10)}
+	x = {"h_present": np.zeros((n, c.N_HEROES), bool), "h_owner": np.zeros((n, c.N_HEROES), np.int64), "h_type": np.full((n, c.N_HEROES), -1), "g_resources": np.full((n, c.N_RESOURCES), 10), "d_object": np.full(n, -1)}
+	x["d_object"][[2, 4]] = 54  # (the questions about a wandering monster)
 	labels = game_labels(game, x, np.zeros((n, 10)), np.full((n, c.N_HEROES), 500.0))
 	assert set(labels) == LABEL_NAMES
-	assert labels["move_battle"][0] and labels["move_win"][0] == 0.0 and labels["move_stake"][0] == 1.0
-	# the loss: 2 decisions; a fight tile at (0, 3, 3), the chosen tiles (0, 1, 1) (a battle followed) and (1, 2, 2)
-	b = 2
+	assert labels["move_battle"][0] and not labels["move_offer"][0] and labels["move_win"][0] == 0.0 and labels["move_stake"][0] == 1.0
+	assert labels["move_offer"][1] and labels["move_battle"][1] and labels["move_win"][1] == 1.0
+	assert labels["move_offer"][3] and not labels["move_battle"][3]  # (the engine's answer: offered, whatever ours)
+	# the loss: 3 decisions; a monster at (0, 3, 3) and (0, 1, 1); chosen: (0, 1, 1) attacked, (0, 1, 1) offered, (0, 2, 2) plain
+	b = 3
 	out = {"fs_tiles": torch.zeros(b, c.OWN_HEROES, W, W, 3, requires_grad=True), "fs_outcome": torch.zeros(b, c.OWN_HEROES, W, W, 2, requires_grad=True),
-		"fs_fight_tile": torch.zeros(b, c.OWN_HEROES, W, W), "fs_move_legal": torch.zeros(b, c.OWN_HEROES, W, W)}
+		"fs_stack_tile": torch.zeros(b, c.OWN_HEROES, W, W), "fs_move_legal": torch.zeros(b, c.OWN_HEROES, W, W)}
 	out["fs_move_legal"][:, 0, :5, :5] = 1.0
-	out["fs_fight_tile"][0, 0, 3, 3] = out["fs_fight_tile"][0, 0, 1, 1] = 1.0
-	t = {"move_mask": torch.tensor([True, True]), "move_battle": torch.tensor([True, False]), "move_win": torch.tensor([1.0, 0.0]), "move_stake": torch.tensor([0.2, 0.0])}
-	every, at = torch.arange(b), torch.tensor([[0, 1, 1], [0, 2, 2]])
+	out["fs_stack_tile"][:, 0, 3, 3] = out["fs_stack_tile"][:, 0, 1, 1] = 1.0
+	t = {"move_mask": torch.tensor([True, True, True]), "move_battle": torch.tensor([True, True, False]), "move_offer": torch.tensor([False, True, False]),
+		"move_win": torch.tensor([1.0, 0.0, 0.0]), "move_stake": torch.tensor([0.2, 1.0, 0.0])}
+	every, at = torch.arange(b), torch.tensor([[0, 1, 1], [0, 1, 1], [0, 2, 2]])
 	tiles, won, stake = battle_heads_loss(out, t, every, at)
 	assert all(bool(torch.isfinite(v)) for v in (tiles, won, stake))
 	(tiles + won + stake).backward()
 	g = out["fs_tiles"].grad
-	assert float(g[0, 0, 0, 0, 0]) < 0 and float(g[0, 0, 3, 3, 0]) > 0  # a plain tile toward 'no fight', a fight tile away from it
-	assert float(g[0, 0, 1, 1, 1]) < 0  # the chosen fight tile toward 'a battle followed'
-	assert float(out["fs_outcome"].grad[0, 0, 1, 1, 0]) < 0 and float(out["fs_outcome"].grad[1].abs().sum()) == 0.0  # (no battle: no outcome)
+	assert float(g[0, 0, 0, 0, 0]) < 0 and float(g[0, 0, 3, 3, 0]) > 0  # a plain tile toward 'no monster', a monster's away from it
+	assert float(g[0, 0, 1, 1, 1]) < 0 and float(g[1, 0, 1, 1, 2]) < 0  # the chosen: 'attacks' where it did, 'offers' where it asked
+	assert float(g[2, 0, 2, 2, 0]) < 0  # a chosen plain tile: 'no monster'
+	assert float(out["fs_outcome"].grad[0, 0, 1, 1, 0]) < 0 and float(out["fs_outcome"].grad[2].abs().sum()) == 0.0  # (no battle: no outcome)
 
 
 def game_values_creature(creature):

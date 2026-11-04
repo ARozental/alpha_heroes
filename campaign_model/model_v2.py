@@ -186,9 +186,10 @@ class Foresight(nn.Module):
 		self.plan = SwiGLU(pair_dim, pair_dim, FORESIGHT_HIDDEN)
 		self.plan_out = zero_output(nn.Linear(FORESIGHT_HIDDEN, 1))
 		self.plan_none = zero_output(nn.Linear(dim, 1))
-		# The battle a step starts, on every window tile (foresight.py "move_tiles"; the user, 2026-11-04): no fight can start
-		# there / a fight tile, a battle followed / a fight tile, none did (it fled, it joined); and on a battle, P(we win it)
-		# and the share of the hero's stake it took ("move_win", "move_stake"). At 0 to begin with; read by MOVE (detached)
+		# What a wandering monster does when a hero steps on it or into its zone, on every window tile (foresight.py
+		# "move_tiles"; the user, 2026-11-04: the engine's answer, never ours): no monster there / it attacks / it offers to
+		# join or flees; and on a battle, P(we win it) and the share of the hero's stake it took ("move_win", "move_stake").
+		# At 0 to begin with; read by MOVE (detached)
 		self.tiles = zero_output(nn.Linear(FORESIGHT_HIDDEN, 3))
 		self.outcome = zero_output(nn.Linear(FORESIGHT_HIDDEN, 2))
 
@@ -557,9 +558,9 @@ class CampaignModelV2(nn.Module):
 		outputs = {
 			"fs_turn": f.turn_out(hidden["turn"]), "fs_hero": f.hero_out(hidden["hero"]), "fs_answer": f.answer_out(hidden["answer"]),
 			"fs_move": torch.zeros(b, HO, W, W, ACTION_TARGETS, device=device),
-			# the battle head's (foresight.py "move_tiles"), its labels' tiles: the legal ones, those where a fight starts
+			# the battle head's (foresight.py "move_tiles"), its labels' tiles: the legal ones, a wandering monster's or its zone's
 			"fs_tiles": torch.zeros(b, HO, W, W, 3, device=device), "fs_outcome": torch.zeros(b, HO, W, W, 2, device=device),
-			"fs_fight_tile": torch.zeros(b, HO, W, W, device=device), "fs_move_legal": x["move_mask"].float(),
+			"fs_stack_tile": torch.zeros(b, HO, W, W, device=device), "fs_move_legal": x["move_mask"].float(),
 		}
 		foreseen = None
 		if known.n > 0:
@@ -569,8 +570,9 @@ class CampaignModelV2(nn.Module):
 			outputs["fs_move"] = dense(real_only(f.move_out(hidden["move"]), known), known.windows, known.n, b)
 			outputs["fs_tiles"] = dense(real_only(tiles, known), known.windows, known.n, b)
 			outputs["fs_outcome"] = dense(real_only(outcome, known), known.windows, known.n, b)
-			outputs["fs_fight_tile"] = dense(real_only(known.tile_fights, known), known.windows, known.n, b)
-			# What MOVE reads of them (MOVE_FORESEEN), detached: its loss shapes the predictions, never the policy's
+			outputs["fs_stack_tile"] = dense(real_only(known.tile_stacks, known), known.windows, known.n, b)
+			# What MOVE reads of them (MOVE_FORESEEN: P(a monster here attacks), P(win), the stake lost), detached: its loss shapes
+			# the predictions, never the policy's
 			foreseen = torch.stack([tiles.softmax(dim=-1)[..., 1], torch.sigmoid(outcome[..., 0]), torch.sigmoid(outcome[..., 1])], dim=-1).detach()
 		return {"hidden": hidden, "outputs": outputs, "foreseen": foreseen}
 
@@ -801,7 +803,7 @@ def tile_known(x, features, known):
 #             for our main army, within -2..2
 #   relative  its move_relative: hopeless, the object, the fight's stake and gain, our town's risk (shares of Φ) and what
 #             this hero can take into its army here
-#   foreseen  the foresight's P(a battle follows), P(we win it), the share of the stake it takes (detached)
+#   foreseen  the foresight's P(a monster here attacks), P(we win a battle here), the share of the stake it takes (detached)
 MOVE_KEPT = tuple(i for i, name in enumerate(MOVE_FEATURES) if name not in ("defend", "home", "under_threat", "to_main"))
 MOVE_STRENGTH, MOVE_RELATIVE, MOVE_FORESEEN = 8, 6, 3
 MOVE_KNOWN = len(MOVE_KEPT) + MOVE_STRENGTH + MOVE_RELATIVE + MOVE_FORESEEN

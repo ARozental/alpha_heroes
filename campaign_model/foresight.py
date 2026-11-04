@@ -97,7 +97,7 @@ def stake_lost(battle):
 # ---- the labels of a game ----
 
 LABEL_NAMES = frozenset((  # game_labels' arrays (learner.step computes a game's again when its precomputed ones lack one)
-	"move", "move_mask", "move_battle", "move_at", "move_win", "move_stake", "answer", "answer_mask", "answer_battle", "option",
+	"move", "move_mask", "move_battle", "move_at", "move_offer", "move_win", "move_stake", "answer", "answer_mask", "answer_battle", "option",
 	"hero", "hero_mask", "hero_alive", "turn", "turn_mask", "plan", "plan_mask",
 ))
 
@@ -108,7 +108,7 @@ def game_labels(game, x, phi_parts, hero_gold):
 	n = len(game.decisions)
 	labels = {
 		"move": np.zeros((n, ACTION_TARGETS), np.float32), "move_mask": np.zeros(n, bool), "move_battle": np.zeros(n, bool),
-		"move_at": np.zeros((n, 3), np.int64), "move_win": np.zeros(n, np.float32), "move_stake": np.zeros(n, np.float32),
+		"move_at": np.zeros((n, 3), np.int64), "move_offer": np.zeros(n, bool), "move_win": np.zeros(n, np.float32), "move_stake": np.zeros(n, np.float32),
 		"answer": np.zeros((n, ACTION_TARGETS), np.float32), "answer_mask": np.zeros(n, bool), "answer_battle": np.zeros(n, bool),
 		"option": np.zeros(n, np.int64),
 		"hero": np.zeros((n, HO, HERO_TARGETS), np.float32), "hero_mask": np.zeros((n, HO), bool), "hero_alive": np.zeros((n, HO), bool),
@@ -148,6 +148,10 @@ def game_labels(game, x, phi_parts, hero_gold):
 				if is_move:
 					hero, rest = divmod(d.index, W * W)
 					labels["move_at"][i] = (hero, rest // W, rest % W)
+					# The engine's answer to the step, never ours (the user, 2026-11-04): a wandering monster that offers to join or
+					# flees asks us first (VCMI's CGCreature: a yes/no question about it), one that fights does not
+					window = indices[position + 1 : indices.index(end)]
+					labels["move_offer"][i] = any(game.decisions[j].kind == c.DecisionKind.YES_NO and int(x["d_object"][j]) == ft.OBJ_MONSTER for j in window) if "d_object" in x else False
 					if fought:  # (the battle's outcome: the battle heads' "move_win" and "move_stake")
 						labels["move_win"][i] = float(fought[0]["winner"] == fought[0]["side"])
 						labels["move_stake"][i] = stake_lost(fought[0])
@@ -203,6 +207,7 @@ LABEL_INPUTS = (
 	"t_present", "t_owner", "t_faction", "t_built", "t_garrison_creature", "t_garrison_count", "t_available", "t_available_creature",
 	"h_present", "h_owner", "h_type", "h_detailed", "h_army_creature", "h_army_count", "h_artifacts", "h_backpack", "h_mana", "h_spell_cost",
 	"h_primary", "h_primary_base", "h_skills", "h_exp", "h_spells", "h_luck", "h_morale", "h_battle_luck", "h_battle_morale",
+	"d_object",  # (a question's object: a wandering monster's offer, the "move_offer" label)
 )
 
 
@@ -271,27 +276,32 @@ def action_loss(predicted, target, battle, config, rows=None):
 
 
 def battle_heads_loss(out, labels, every, at):
-	"""The battle heads' losses (model_v2.Foresight.tiles, .outcome; the user, 2026-11-04: heads that mean something):
-	  move_tiles  every legal window tile of a MOVE decision: one not chosen is known only to be a fight tile or not (our
-	              features', fs_fight_tile), its loss -log P(no fight) or -log P(a fight, followed by a battle or not),
-	              the two kinds weighted alike whatever their numbers (a fight tile was ~1 in 30 legal tiles); the chosen
-	              one by what followed: a battle, a fight tile without one (it fled, it joined), or neither
+	"""The battle heads' losses (model_v2.Foresight.tiles, .outcome; the user, 2026-11-04: heads that mean something, and
+	the engine's answer only, never our own):
+	  move_tiles  what a wandering monster does when a hero steps on it or into its zone, on every legal window tile of a
+	              MOVE decision: no monster here / it attacks / it offers to join or flees (VCMI asks us then: what we
+	              answer is ours, not the engine's). A tile not chosen is known only to have a monster or not
+	              (fs_stack_tile, our features'), its loss -log P(none) or -log P(attacks or offers), the two kinds weighted
+	              alike whatever their numbers; the chosen one by what the engine did (a step that met neither a question
+	              nor a battle, a move cut short, left out)
 	  move_win    on a MOVE a battle followed: P(we won it) (BCE)
 	  move_stake  and the share of the hero's stake it took (foresight.stake_lost; BCE against it)"""
 	logp = F.log_softmax(out["fs_tiles"].float(), dim=-1)  # [B, HO, W, W, 3]
-	legal, fight = out["fs_move_legal"] > 0, out["fs_fight_tile"] > 0
+	legal, stack = out["fs_move_legal"] > 0, out["fs_stack_tile"] > 0
 	move = labels["move_mask"]
 	chosen = torch.zeros_like(legal)
 	chosen[every, at[:, 0], at[:, 1], at[:, 2]] = move  # (a row with no MOVE: its at is 0s, nothing set)
 	rest = legal & ~chosen
-	plain = masked_mean(-logp[..., 0], rest & ~fight)
-	fighting = masked_mean(-torch.logsumexp(logp[..., 1:], dim=-1), rest & fight)
-	picked, fight_at = logp[every, at[:, 0], at[:, 1], at[:, 2]], fight[every, at[:, 0], at[:, 1], at[:, 2]]
+	plain = masked_mean(-logp[..., 0], rest & ~stack)
+	met = masked_mean(-torch.logsumexp(logp[..., 1:], dim=-1), rest & stack)
+	picked, stack_at = logp[every, at[:, 0], at[:, 1], at[:, 2]], stack[every, at[:, 0], at[:, 1], at[:, 2]]
 	zero = torch.zeros_like(at[:, 0])
-	kind = torch.where(labels["move_battle"], zero + 1, torch.where(fight_at, zero + 2, zero))
-	tiles = 0.5 * (plain + fighting) + masked_mean(-picked.gather(1, kind.unsqueeze(1)).squeeze(1), move)
+	offer, battle = labels["move_offer"], labels["move_battle"]
+	kind = torch.where(stack_at, torch.where(offer, zero + 2, zero + 1), zero)
+	known = move & (~stack_at | offer | battle)
+	tiles = 0.5 * (plain + met) + masked_mean(-picked.gather(1, kind.unsqueeze(1)).squeeze(1), known)
 	outcome = out["fs_outcome"][every, at[:, 0], at[:, 1], at[:, 2]].float()
-	fought = labels["move_battle"] & move
+	fought = battle & move
 	won = masked_mean(F.binary_cross_entropy_with_logits(outcome[:, 0], labels["move_win"], reduction="none"), fought)
 	stake = masked_mean(F.binary_cross_entropy_with_logits(outcome[:, 1], labels["move_stake"], reduction="none"), fought)
 	return tiles, won, stake
