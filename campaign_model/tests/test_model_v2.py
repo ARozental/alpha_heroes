@@ -502,8 +502,9 @@ def test_the_fight_features_tell_a_hopeless_fight_from_an_even_one():
 
 def test_the_fight_layer_moves_only_the_fight_tiles_move_logits():
 	"""model_v2.move_fight (0 to begin with): once its 'hopeless' weight is negative, MOVE's learned logit falls on the
-	tiles where a fight starts, by how hopeless, and nowhere else."""
+	tiles where a fight starts, by how hopeless (FIGHT_STEP x the weight), and nowhere else."""
 	from campaign_model.model import dense
+	from campaign_model.model_v2 import FIGHT_STEP
 
 	torch.manual_seed(3)
 	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
@@ -513,7 +514,7 @@ def test_the_fight_layer_moves_only_the_fight_tiles_move_logits():
 		fights = dense(known.tile_fights, known.windows, known.n, 4)
 		hopeless = dense(torch.relu(-known.tile_fight_ratio * known.tile_fights - 1.0).clamp(max=6.0) * known.tile_fights, known.windows, known.n, 4)
 		before = m(x)["move_logp"].clone()
-		m.move_fight.weight.data[0, 2] = -1.0
+		m.move_fight.weight.data[0, 2] = -1.0 / FIGHT_STEP
 		after = m(x)["move_logp"]
 	assert float(fights.sum()) > 0 and float(hopeless.sum()) > 0  # (the inputs have fights, some hopeless)
 	# (MOVE's table is one log-softmax a decision: each legal tile moves by the decision's constant, the fight tiles by
@@ -524,6 +525,32 @@ def test_the_fight_layer_moves_only_the_fight_tiles_move_logits():
 		if rest.numel():
 			assert torch.allclose(rest, rest[0].expand_as(rest), atol=1e-4), i
 	assert float((hopeless * legal).sum()) > 0  # (some legal tile was hopeless: the test saw the effect)
+
+
+def test_one_adam_step_moves_a_hopeless_tiles_logit_by_fight_step_times_the_rate():
+	"""model_v2.FIGHT_STEP (joint7, 2026-11-04: at the campaign's 1e-5 the 3 fight weights moved ~3e-4 in 26 updates): one
+	step of make_optimizer's AdamW at the PC's rate, its gradient pushing the hopeless tiles down, takes such a tile's
+	learned MOVE logit (move_fight's part) lower by FIGHT_STEP x lr x its features, not lr x them."""
+	from campaign_model.model_v2 import FIGHT_STEP, fight_features
+
+	torch.manual_seed(3)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	x = tensors(rich_inputs(4, 7))
+	lr = 1e-5
+	optimizer = make_optimizer(m, CampaignConfig(learning_rate=lr))
+	with torch.no_grad():
+		features = fight_features(m.domain_knowledge(x))
+	hopeless = features[..., 2] > 0
+	assert bool(hopeless.any())
+	part = lambda: m.move_fight(FIGHT_STEP * features).squeeze(-1)  # noqa: E731
+	before = part().detach()
+	part()[hopeless].sum().backward()  # (the loss's gradient: the hopeless tiles' logits up, so the step takes them down)
+	optimizer.step()
+	with torch.no_grad():
+		drop = before - part()
+	# (Adam's first step moves each weight by lr (its sign's), the bias too: the bias's lr unscaled)
+	expected = FIGHT_STEP * lr * features.abs().sum(dim=-1) + lr
+	torch.testing.assert_close(drop[hopeless], expected[hopeless], rtol=1e-3, atol=1e-7)
 
 
 def test_a_checkpoint_without_the_fight_layers_loads_them_at_0():

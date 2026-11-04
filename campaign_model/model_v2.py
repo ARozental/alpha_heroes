@@ -301,7 +301,7 @@ class CampaignModelV2(nn.Module):
 		self.move_pair = SwiGLU(dp + FORESIGHT_HIDDEN + MOVE_KNOWN, dp, dp)
 		# The fight's features straight onto MOVE's learned logit too, at 0 to begin with: a few weights a fight's outcome
 		# teaches directly (joint7's near-empty heroes walked into hopeless fights at ~1% a tile among ~110: the pairs'
-		# learned part told those tiles from the rest by less than a logit)
+		# learned part told those tiles from the rest by less than a logit); its inputs scaled up (FIGHT_STEP) to learn in hours
 		self.move_fight = zero_output(nn.Linear(FIGHT_FEATURES, 1))
 		self.travel_hero, self.travel_area = nn.Linear(d, dp), nn.Linear(d, dp)
 		self.travel_pair = SwiGLU(dp + 1, dp, dp)
@@ -578,7 +578,7 @@ class CampaignModelV2(nn.Module):
 		# MOVE and the targeted spell's tile: each window's pairs, + the hero's act-now score, + the tile's prior
 		move = cast_cell = move_prior = torch.full((b, HO, W, W), 0.0, device=state.glob.device)
 		if known.n > 0:
-			move = dense(real_only(self.move_out(state.move_pairs).squeeze(-1) + self.move_fight(fight_features(known)).squeeze(-1), known), known.windows, known.n, b)
+			move = dense(real_only(self.move_out(state.move_pairs).squeeze(-1) + self.move_fight(FIGHT_STEP * fight_features(known)).squeeze(-1), known), known.windows, known.n, b)
 			move_prior = dense(real_only(known.tile_prior, known), known.windows, known.n, b)
 			cast_cell = dense(real_only(self.cast_cell_out(state.move_pairs).squeeze(-1), known), known.windows, known.n, b)
 		learned[A_.MOVE], prior[A_.MOVE] = move + self.act_move(own_heroes).reshape(b, HO, 1, 1), move_prior
@@ -764,6 +764,13 @@ def tile_known(x, features, known):
 
 MOVE_KNOWN = len(MOVE_FEATURES) + 1  # model.MOVE_FEATURES and the tile's prior (tanh / 4)
 FIGHT_FEATURES = 3
+# move_fight's inputs times this (its bias not): Adam moves a weight ~lr a step whatever its gradient's size, and the
+# PC's campaign takes ~300 steps an hour (18 an update) at 1e-5, so each of its 3 weights could move 0.003 an hour if
+# every step agreed: 26 updates after they were added (joint7 v641-667) they were ~3e-4, a hopeless tile's logit ~1e-3
+# lower. At 100 a weight moves the logit as a prior correction was meant to (model.CORRECTION_STEP: ~1e-3 a step,
+# designed at 1e-4): a fight 54x our strength (hopeless 3) up to ~1.6 logits an hour under a steady gradient, under
+# noise a few hundredths; at most ~0.16 an update, the KL control's to bound
+FIGHT_STEP = 100.0
 
 
 def fight_features(known):
