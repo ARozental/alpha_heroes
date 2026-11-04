@@ -8,7 +8,7 @@
 namespace MapSchema
 {
 constexpr int SCHEMA_VERSION = 11;
-constexpr const char * CONTRACT_HASH = "0fdf125397e6e3c2";
+constexpr const char * CONTRACT_HASH = "3653f6c54ad2233b";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;

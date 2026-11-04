@@ -183,7 +183,7 @@ INPUTS = (
 	# "fight?" (YES starts the battle), a wandering monster's offer to join (YES takes them, for d_number gold if any; NO
 	# fights them) or its flight (YES pursues: the battle)
 	_m("o_battle", (O,), "this option starts a battle against the question's guards (d_guard_*)"),
-	_m("o_join", (O,), "this option takes the question's creatures (d_guard_*) into the hero's army, for d_number gold"),
+	_m("o_join", (O,), "this option takes the question's creatures (d_guard_*) into the hero's army, for its o_amount gold (0 free)"),
 	_i("d_guard_creature", (A,), "the question's guards or joining creatures: each stack's creature (0 with no count)"),
 	_i("d_guard_count", (A,), "their counts: exact when d_guard_detailed, else VCMI's quantity id; 0 none"),
 	_m("d_guard_detailed", (), "d_guard_count is exact (the dialog shows a bank's guards so)"),
