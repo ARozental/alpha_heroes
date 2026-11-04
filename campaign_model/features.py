@@ -163,11 +163,24 @@ def main_hero(values, present):
 	return (torch.arange(values.shape[-1], device=values.device) == best) & present
 
 
-def heroes_value(values, present, t):
-	"""empire.heroes_value [B]: HERO_BASE each, the strongest hero's skill_value (values [B, H]) in full, the others' at
-	SECONDARY_SHARE."""
+def armed_share(army_gold, t):
+	"""empire.hero_base_value's share of HERO_BASE [...] at a hero's army worth (gold at cost + u): armyless_share with
+	none, 1 from armed_army on."""
+	return t.armyless_share + (1 - t.armyless_share) * (army_gold.clamp(min=0) / t.armed_army).clamp(max=1.0)
+
+
+def heroes_value(values, present, armed, t):
+	"""empire.heroes_value [B]: each hero's HERO_BASE at its armed_share (armed [B, H]), the strongest hero's skill_value
+	(values [B, H]) in full, the others' at SECONDARY_SHARE."""
 	weight = torch.where(main_hero(values, present), torch.ones_like(values), torch.full_like(values, t.secondary_share))
-	return (t.hero_base + weight * values).mul(present.float()).sum(dim=-1)
+	return (t.hero_base * armed + weight * values).mul(present.float()).sum(dim=-1)
+
+
+def own_armed(x, t):
+	"""Our heroes' armed_share [B, HO] (their armies at cost + u, exact counts: ours)."""
+	creatures = x["h_army_creature"][:, :HO]
+	_, _, gold, _ = army(creatures, x["h_army_count"][:, :HO], torch.ones_like(creatures[..., 0], dtype=torch.bool), t)
+	return armed_share(gold, t)
 
 
 def own_skill_values(x, t):
@@ -216,7 +229,7 @@ def hero_worth(x, t):
 	weight = torch.where(main_hero(values, present), torch.ones_like(values), torch.full_like(values, t.secondary_share))
 	artifacts = torch.cat([x["h_artifacts"][:, :HO], x["h_backpack"][:, :HO]], dim=-1)
 	carried = (t.artifact_price[vocab_index(artifacts, c.ARTIFACT_VOCAB)] * (artifacts >= 0)).sum(dim=-1)
-	return (t.hero_base + weight * values + carried) * present
+	return (t.hero_base * own_armed(x, t) + weight * values + carried) * present
 
 
 def tavern_worth(x, t):
@@ -230,8 +243,9 @@ def tavern_worth(x, t):
 	carried = (t.artifact_price[vocab_index(worn, c.ARTIFACT_VOCAB)] * (worn >= 0)).sum(dim=-1)
 	theirs = skill_value(x["g_tavern_primary"], x["g_tavern_skills"], x["g_tavern_exp"], x["g_tavern_spells"], t)  # [B, N_TAVERN]
 	ours, mine = own_skill_values(x, t)
-	before = heroes_value(ours, mine, t).unsqueeze(-1)
-	after = torch.stack([heroes_value(torch.cat([ours, theirs[:, s : s + 1]], dim=1), torch.cat([mine, torch.ones_like(mine[:, :1])], dim=1), t) for s in range(theirs.shape[1])], dim=1)
+	armed, theirs_armed = own_armed(x, t), armed_share(army_gold, t)
+	before = heroes_value(ours, mine, armed, t).unsqueeze(-1)
+	after = torch.stack([heroes_value(torch.cat([ours, theirs[:, s : s + 1]], dim=1), torch.cat([mine, torch.ones_like(mine[:, :1])], dim=1), torch.cat([armed, theirs_armed[:, s : s + 1]], dim=1), t) for s in range(theirs.shape[1])], dim=1)
 	return (after - before + army_gold + carried) * present
 
 
@@ -274,7 +288,7 @@ def empire_value(x, t):
 			t.income_days * (x["g_object_income"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
 			(hero_army * own_heroes).sum(dim=-1) + (garrison * own_towns).sum(dim=-1) + owned,
 			((x["t_available"][:, : c.OWN_TOWNS].clamp(min=0).float() * t.creature_unit[vocab_index(available, c.CREATURE_VOCAB)] * (available >= 0)).sum(dim=-1) * own_towns).sum(dim=-1) + dwelling_hire,
-			heroes_value(*own_skill_values(x, t), t) + (boost_values(x, t) * own_heroes).sum(dim=-1),
+			heroes_value(*own_skill_values(x, t), armed_share(hero_army, t), t) + (boost_values(x, t) * own_heroes).sum(dim=-1),
 			((t.artifact_price[vocab_index(artifacts, c.ARTIFACT_VOCAB)] * (artifacts >= 0)).sum(dim=-1) * own_heroes).sum(dim=-1),
 			(2.0 * x["h_primary"][:, :HO, 2].clamp(min=0).float() * usable_mana * own_heroes).sum(dim=-1),  # game_values.capped_mana_value
 			-t.hero_penalty * own_heroes.sum(dim=-1) ** 2,

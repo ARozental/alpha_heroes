@@ -365,7 +365,12 @@ def test_a_bank_is_its_reward_plus_the_fight_with_its_guards(model):
 	army (10 x (60 + 15) gold) and the hero (a hire's 2,500); a mine next to the same hero is worth its gold."""
 	x, tile = window_with(25)  # Dragon Utopia
 	f = custom_features(model, x)
-	lost = 10 * (60 + 15) + 2500  # the army and the hero's replacement
+	from campaign_model.empire import EmpireConfig
+
+	config = EmpireConfig()
+	army = 10 * (60 + 15)
+	# the army and the hero's replacement: its HERO_BASE at that army (empire.hero_base_value) and the rest of the price
+	lost = army + config.hero_base * (config.armyless_share + (1 - config.armyless_share) * army / config.armed_army) + (2500 - config.hero_base)
 	assert float(f.tile_object_gold[0][tile]) > 80000 and float(f.tile_fight_gold[0][tile]) == pytest.approx(-lost, abs=1.0)
 	assert float(f.tile_value[0][tile]) < -3000 and float(f.tile_prior[0][tile]) < -3
 	x, tile = window_with(GOLD_MINE, subtype=6)

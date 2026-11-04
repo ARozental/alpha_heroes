@@ -213,7 +213,7 @@ class CustomFeatures(nn.Module):
 
 		empire = EmpireConfig()
 		self.income_days, self.hero_penalty, self.explored_tile = empire.income_days, empire.hero_penalty, empire.explored_tile
-		for name in ("hero_base", "skill_level", "fresh_skill_levels", "primary_point", "primary_base", "level_bonus", "secondary_share", "boost"):  # (empire.py's heroes)
+		for name in ("hero_base", "skill_level", "fresh_skill_levels", "primary_point", "primary_base", "level_bonus", "secondary_share", "boost", "armyless_share", "armed_army"):  # (empire.py's heroes)
 			setattr(self, name, getattr(empire, name))
 		scores, subtypes = priors.object_values()
 		# Tables of a fixed shape, [object, subtype] (the last column: any other subtype), looked up in one gather: a
@@ -525,6 +525,10 @@ class CustomFeatures(nn.Module):
 		fight = fight + self.block_share() * win * behind
 		# Stepping into a wandering monster's zone of control starts its fight: the worst guard's
 		guarded = ft.bit(flags, c.TILE_GUARDED) & ~has_enemy
+		# The fight's log strength ratio (ours over theirs) where one starts, the tile's own enemy's or the worst guard's
+		# next to a tile of a monster's zone (model_v2's pair features; joint7, 2026-11-03: heroes with less than 1,000
+		# gold of army stepped into fights 54x their strength, 97% lost)
+		fight_ratio = torch.where(guarded, ft.worst_guard(ratio, monster, guarded), ratio)
 		fight = fight + ft.worst_guard(fight, monster, guarded)
 		loss = torch.maximum(loss, -ft.worst_guard(-loss, monster, guarded))
 		win = torch.where(guarded, ft.worst_guard(win, monster, guarded), win * has_enemy)
@@ -600,7 +604,7 @@ class CustomFeatures(nn.Module):
 			],
 			dim=-1,
 		)  # CELL_FEATURES
-		return {"tile_value": value, "tile_prior": prior, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight}
+		return {"tile_value": value, "tile_prior": prior, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight, "tile_fight_ratio": fight_ratio, "tile_fights": fights.float()}
 
 
 class MapEncoder(nn.Module):
@@ -762,9 +766,10 @@ class PairBias(nn.Module):
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
 ADDED = ("features.move_discount",)
-# Heads added since that nothing the AI reads depends on (their losses only), by prefix: a checkpoint without them loads
-# them as a new model starts them (2026-11-02: foresight.plan*, model_v2.plan_of)
-ADDED_HEADS = ("foresight.plan",)
+# Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
+# reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
+# (2026-11-03: model_v2's pair_fight and move_fight, the fight features)
+ADDED_HEADS = ("foresight.plan", "pair_fight", "move_fight")  # (2026-11-03: the fight features, at 0)
 
 
 def with_added(state_dict, own):

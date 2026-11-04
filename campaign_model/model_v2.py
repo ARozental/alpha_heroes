@@ -287,8 +287,10 @@ class CampaignModelV2(nn.Module):
 		self.memory = Memory(d, heads)  # (read before the blocks, written after think_again)
 		self.blocks = nn.ModuleList(Block(d, heads) for _ in range(layers))
 		self.norm = RMSNorm(d)
-		# foresee: a (hero, tile) pair is its hero's, its tile's and its reach's projections summed
+		# foresee: a (hero, tile) pair is its hero's, its tile's and its reach's projections summed, and the fight stepping
+		# there starts (fight_features: its log strength ratio, the user's, 2026-11-03), at 0 to begin with
 		self.pair_hero, self.pair_tile, self.pair_reach = nn.Linear(d, dp), nn.Linear(dc, dp), nn.Linear(dc, dp)
+		self.pair_fight = zero_output(nn.Linear(FIGHT_FEATURES, dp))
 		self.foresight = Foresight(d, dp)
 		# think_again
 		self.again_global = E.Tokenizer(d + FORESIGHT_HIDDEN + ft_phi_features() + 3, d, embedded=False)
@@ -297,6 +299,10 @@ class CampaignModelV2(nn.Module):
 		self.again_block = Block(d, heads)
 		self.again_norm = RMSNorm(d)
 		self.move_pair = SwiGLU(dp + FORESIGHT_HIDDEN + MOVE_KNOWN, dp, dp)
+		# The fight's features straight onto MOVE's learned logit too, at 0 to begin with: a few weights a fight's outcome
+		# teaches directly (joint7's near-empty heroes walked into hopeless fights at ~1% a tile among ~110: the pairs'
+		# learned part told those tiles from the rest by less than a logit)
+		self.move_fight = zero_output(nn.Linear(FIGHT_FEATURES, 1))
 		self.travel_hero, self.travel_area = nn.Linear(d, dp), nn.Linear(d, dp)
 		self.travel_pair = SwiGLU(dp + 1, dp, dp)
 		# decide: each table's learned part; every type's bias from the priors
@@ -519,7 +525,7 @@ class CampaignModelV2(nn.Module):
 		decision = torch.div(known.windows, HO, rounding_mode="floor")
 		index = known.window_tiles
 		cells = torch.where((index >= 0).unsqueeze(-1), flat.index_select(0, (decision[:, None, None] * (L * S * S) + index.clamp(min=0)).reshape(-1)).reshape(k, W, W, -1), torch.zeros(k, W, W, self.cell_dim, device=flat.device, dtype=flat.dtype))
-		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach)
+		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach) + self.pair_fight(fight_features(known))
 
 	def foresee(self, state, known):
 		x = state.x
@@ -572,7 +578,7 @@ class CampaignModelV2(nn.Module):
 		# MOVE and the targeted spell's tile: each window's pairs, + the hero's act-now score, + the tile's prior
 		move = cast_cell = move_prior = torch.full((b, HO, W, W), 0.0, device=state.glob.device)
 		if known.n > 0:
-			move = dense(real_only(self.move_out(state.move_pairs).squeeze(-1), known), known.windows, known.n, b)
+			move = dense(real_only(self.move_out(state.move_pairs).squeeze(-1) + self.move_fight(fight_features(known)).squeeze(-1), known), known.windows, known.n, b)
 			move_prior = dense(real_only(known.tile_prior, known), known.windows, known.n, b)
 			cast_cell = dense(real_only(self.cast_cell_out(state.move_pairs).squeeze(-1), known), known.windows, known.n, b)
 		learned[A_.MOVE], prior[A_.MOVE] = move + self.act_move(own_heroes).reshape(b, HO, 1, 1), move_prior
@@ -757,6 +763,16 @@ def tile_known(x, features, known):
 
 
 MOVE_KNOWN = len(MOVE_FEATURES) + 1  # model.MOVE_FEATURES and the tile's prior (tanh / 4)
+FIGHT_FEATURES = 3
+
+
+def fight_features(known):
+	"""[K, W, W, FIGHT_FEATURES] the fight stepping on each window tile starts (model.tile_features: the tile's own enemy,
+	or the worst guard next to a tile of a monster's zone): whether one does, its log strength ratio ours over theirs
+	(/3, within -2..2) and how hopeless it is (beyond e^-1 of their strength: relu(-ratio - 1), within 0..6)."""
+	fights = known.tile_fights
+	ratio = known.tile_fight_ratio * fights
+	return torch.stack([fights, (ratio / 3).clamp(-2.0, 2.0), torch.relu(-ratio - 1.0).clamp(max=6.0) * fights], dim=-1)
 
 
 def reach_features(x, windows):

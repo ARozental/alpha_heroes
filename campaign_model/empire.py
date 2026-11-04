@@ -77,7 +77,13 @@ class EmpireConfig:
 	spell_level: float = 500.0  # each spell in a hero's spellbook: this x its level (1-5)
 	boost: float = 0.02  # each 1/24 of battle chance luck or morale gives until the next battle: this x the army it lifts
 	hero_penalty: float = 100.0  # gold x heroes^2
-	explored_tile: float = 1.0  # gold per tile ever revealed (the user, 2026-10-27: 10 was too much; a 72x72 two-level map is 10k)
+	explored_tile: float = 5.0  # gold per tile ever revealed (the user, 2026-11-03: 5, our 36x36 two-level maps 13k explored in full, ~3.4k at a game's usual 26%; 2026-10-27: 10 was too much)
+	# A hero's HERO_BASE by its army (the user, 2026-11-03: "a hero with nothing slightly negative, maybe -1k on average
+	# ... heroes with creatures should stay positive"): armyless_share of it with no army, all of it once the army is
+	# worth armed_army (gold at cost + u, as Φ's army part counts it). The hires of joint7's games (471): +1,943 in Φ at the
+	# median, -366 without their army; at 0.55 an empty hire comes to ~-1,040, one with its usual army (1,938) as before
+	armyless_share: float = 0.55
+	armed_army: float = 1000.0
 
 
 def _unit(creature_id, config):
@@ -139,14 +145,25 @@ def boost_value(hero, config=EmpireConfig()):
 	return config.boost * (gained_luck * lucky + gained_morale * living)
 
 
+def army_worth(stacks, config=EmpireConfig()):
+	"""An army's worth in Φ (gold): each creature at cost + u, as Φ's army part counts it."""
+	return sum(count * (vocab.creature_cost(creature) + _unit(creature, config)) for creature, count in stacks)
+
+
+def hero_base_value(army, config=EmpireConfig()):
+	"""A hero's HERO_BASE at its army's worth (gold): armyless_share of it with none, all of it from armed_army on."""
+	return config.hero_base * (config.armyless_share + (1 - config.armyless_share) * min(1.0, max(army, 0.0) / config.armed_army))
+
+
 def heroes_value(heroes, config=EmpireConfig()):
-	"""Φ's heroes part (gold): HERO_BASE each, the strongest hero's skill_value in full, the others' at SECONDARY_SHARE,
-	and every hero's luck and morale until the next battle (boost_value)."""
+	"""Φ's heroes part (gold): each hero's HERO_BASE by its army (hero_base_value), the strongest hero's skill_value in
+	full, the others' at SECONDARY_SHARE, and every hero's luck and morale until the next battle (boost_value)."""
 	if not heroes:
 		return 0.0
 	values = [skill_value(h, config) for h in heroes]
 	main = max(values)
-	return config.hero_base * len(heroes) + main + config.secondary_share * (sum(values) - main) + sum(boost_value(h, config) for h in heroes)
+	base = sum(hero_base_value(army_worth(h["army"], config), config) for h in heroes)
+	return base + main + config.secondary_share * (sum(values) - main) + sum(boost_value(h, config) for h in heroes)
 
 
 def empire_value(player, config=EmpireConfig()):

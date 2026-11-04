@@ -3,7 +3,7 @@ import copy
 import pytest
 
 from campaign_model import vocab
-from campaign_model.empire import EmpireConfig, boost_value, building_value, empire_value, heroes_value, shares, skill_value
+from campaign_model.empire import EmpireConfig, army_worth, boost_value, building_value, empire_value, hero_base_value, heroes_value, shares, skill_value
 from game_values import HERO_HIRE_COST, capped_mana_value, resources_value
 
 CASTLE = 0
@@ -67,15 +67,19 @@ def test_a_new_dwelling_with_its_first_batch_is_neutral_and_growth_is_a_gain():
 
 
 def test_recruiting_and_upgrading_are_neutral():
+	"""For a hero already armed (an army worth armed_army or more): below that, creatures also lift its HERO_BASE
+	(test_a_hero_with_nothing_is_worth_less_than_one_with_creatures)."""
 	before = player()
+	before["heroes"][0]["army"] = [[PIKEMAN, 30]]  # (30 x (60 + u): armed)
+	assert army_worth(before["heroes"][0]["army"]) >= EmpireConfig().armed_army
 	recruited = copy.deepcopy(before)
 	recruited["resources"][6] -= 5 * vocab.creature_cost(PIKEMAN)
 	recruited["towns"][0]["available"][0][1] -= 5
 	recruited["towns"][0]["garrison"] = [[PIKEMAN, 5]]
 	assert total(recruited) == pytest.approx(total(before))
 	upgraded = copy.deepcopy(before)
-	upgraded["resources"][6] -= 10 * (vocab.creature_cost(HALBERDIER) - vocab.creature_cost(PIKEMAN))
-	upgraded["heroes"][0]["army"] = [[HALBERDIER, 10]]
+	upgraded["resources"][6] -= 30 * (vocab.creature_cost(HALBERDIER) - vocab.creature_cost(PIKEMAN))
+	upgraded["heroes"][0]["army"] = [[HALBERDIER, 30]]
 	assert total(upgraded) == pytest.approx(total(before))
 
 
@@ -91,8 +95,31 @@ def test_a_hire_brings_a_hero_and_its_army_for_its_price_and_the_crowding():
 		return total(after) - total(before)
 
 	crowding = config.hero_penalty * (2**2 - 1**2)
-	assert hire(((PIKEMAN, 10),)) == pytest.approx(config.hero_base + 10 * vocab.creature_cost(PIKEMAN) * (1 + config.alpha) - HERO_HIRE_COST - crowding)
+	ten = army_worth(((PIKEMAN, 10),))
+	assert ten == pytest.approx(10 * vocab.creature_cost(PIKEMAN) * (1 + config.alpha))
+	assert hire(((PIKEMAN, 10),)) == pytest.approx(hero_base_value(ten) + ten - HERO_HIRE_COST - crowding)
 	assert hire(((PIKEMAN, 30), (HALBERDIER, 10))) > 0 and hire(((PIKEMAN, 1),)) < 0
+
+
+def test_a_hero_with_nothing_is_worth_less_than_one_with_creatures():
+	"""(the user, 2026-11-03) "a hero with nothing slightly negative, maybe -1k on average ... heroes with creatures
+	should stay positive": HERO_BASE at armyless_share with no army, rising with the army to all of it at armed_army."""
+	config, before = EmpireConfig(), player()
+
+	def hire(army):
+		after = copy.deepcopy(before)
+		after["resources"][6] -= HERO_HIRE_COST
+		after["heroes"].append(fresh_hero(1, army=army, mana=0, power=0))
+		return total(after) - total(before)
+
+	assert hero_base_value(0.0) == pytest.approx(config.armyless_share * config.hero_base)
+	assert hero_base_value(config.armed_army) == pytest.approx(config.hero_base) == hero_base_value(10 * config.armed_army)
+	assert hero_base_value(config.armed_army / 2) == pytest.approx(config.hero_base * (1 + config.armyless_share) / 2)
+	crowding = config.hero_penalty * (2**2 - 1**2)
+	# (a bare hero: no skills beyond a fresh one's, no artifacts; joint7's hires without their army came to ~-1,040)
+	assert hire(()) == pytest.approx(config.armyless_share * config.hero_base - HERO_HIRE_COST - crowding)
+	assert hire(()) < -1000
+	assert hire(((PIKEMAN, 30),)) > 0
 
 
 def test_a_level_is_worth_what_it_brings():
@@ -117,7 +144,8 @@ def test_only_the_strongest_heros_skills_count_in_full():
 	main = fresh_hero(0, exp=1000, primary=[2, 1, 1, 2], skills=[[0, 2], [1, 1]])
 	scout = fresh_hero(1, skills=[[0, 1], [1, 1], [2, 1]])  # one skill level beyond a fresh hero's
 	value = heroes_value([main, scout])
-	assert value == pytest.approx(2 * config.hero_base + skill_value(main) + config.secondary_share * skill_value(scout))
+	bases = hero_base_value(army_worth(main["army"])) + hero_base_value(army_worth(scout["army"]))
+	assert value == pytest.approx(bases + skill_value(main) + config.secondary_share * skill_value(scout))
 	assert heroes_value([scout, main]) == pytest.approx(value)  # whatever the order
 	assert heroes_value([]) == 0
 

@@ -483,3 +483,61 @@ def test_a_graphs_outputs_are_compared_relative_to_their_scale_and_masks():
 	assert abs(_difference(torch.tensor([0.2]), torch.tensor([0.1])) - 0.1) < 1e-6  # (scale at least 1)
 	assert _difference(torch.tensor([[0.5, 0.0, 100.0]]), a) == float("inf")
 	assert _difference(a, a.reshape(3, 1)) == float("inf")
+
+
+def test_the_fight_features_tell_a_hopeless_fight_from_an_even_one():
+	"""(2026-11-03, the user: the strength ratio as a feature of the (hero, tile) pair) model_v2.fight_features: no
+	fight 0; an even fight 1, ratio 0, not hopeless; one 54x our strength (joint7's near-empty heroes' median) hopeless."""
+	from types import SimpleNamespace
+
+	from campaign_model.model_v2 import fight_features
+
+	ratio = torch.tensor([[[0.0, 0.0, math.log(1 / 54)]]])
+	fights = torch.tensor([[[0.0, 1.0, 1.0]]])
+	f = fight_features(SimpleNamespace(tile_fights=fights, tile_fight_ratio=ratio))[0, 0]
+	assert f[0].tolist() == [0.0, 0.0, 0.0]
+	assert f[1].tolist() == [1.0, 0.0, 0.0]
+	assert f[2, 0] == 1 and f[2, 1] == pytest.approx(math.log(1 / 54) / 3) and f[2, 2] == pytest.approx(math.log(54) - 1)
+
+
+def test_the_fight_layer_moves_only_the_fight_tiles_move_logits():
+	"""model_v2.move_fight (0 to begin with): once its 'hopeless' weight is negative, MOVE's learned logit falls on the
+	tiles where a fight starts, by how hopeless, and nowhere else."""
+	from campaign_model.model import dense
+
+	torch.manual_seed(3)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = tensors(rich_inputs(4, 7))
+	with torch.no_grad():
+		known = m.domain_knowledge(x)
+		fights = dense(known.tile_fights, known.windows, known.n, 4)
+		hopeless = dense(torch.relu(-known.tile_fight_ratio * known.tile_fights - 1.0).clamp(max=6.0) * known.tile_fights, known.windows, known.n, 4)
+		before = m(x)["move_logp"].clone()
+		m.move_fight.weight.data[0, 2] = -1.0
+		after = m(x)["move_logp"]
+	assert float(fights.sum()) > 0 and float(hopeless.sum()) > 0  # (the inputs have fights, some hopeless)
+	# (MOVE's table is one log-softmax a decision: each legal tile moves by the decision's constant, the fight tiles by
+	# -hopeless besides)
+	legal = x["move_mask"] & torch.isfinite(before) & torch.isfinite(after)
+	for i in range(4):
+		rest = ((after - before) + hopeless)[i][legal[i]]
+		if rest.numel():
+			assert torch.allclose(rest, rest[0].expand_as(rest), atol=1e-4), i
+	assert float((hopeless * legal).sum()) > 0  # (some legal tile was hopeless: the test saw the effect)
+
+
+def test_a_checkpoint_without_the_fight_layers_loads_them_at_0():
+	"""model.ADDED_HEADS: a checkpoint from before pair_fight and move_fight loads (strict) with them as a new model starts
+	them, their outputs 0: the same outputs as the model that saved it."""
+	torch.manual_seed(0)
+	saving = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	old = {k: v for k, v in saving.state_dict().items() if not k.startswith(("pair_fight", "move_fight"))}
+	assert len(old) < len(saving.state_dict())
+	loading = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	loading.load_state_dict(old)
+	x = tensors(rich_inputs(3, 2))
+	with torch.no_grad():
+		a, b = saving(x), loading(x)
+	for name in a:
+		if torch.is_tensor(a[name]):
+			torch.testing.assert_close(a[name], b[name], equal_nan=True)
