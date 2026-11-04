@@ -728,6 +728,34 @@ def trade_needs(x, t):
 	return torch.stack([torch.log1p(lack * price / 1000), torch.log1p(spare * price / 1000)], dim=-1)
 
 
+def trade_options(x, t):
+	"""Each TRADE entry's (sell, buy, TRADE_FRACTIONS) [B, R, R, F, 2] (the user, 2026-11-04: every trade is dumb unless
+	it buys what could not be bought without it): what it costs Φ (log(1 + gold / 1000): the resources sold at their
+	prices less those bought; joint7's trades cost a median 900) and whether it unlocks a building (one of our towns'
+	buildings short of resources, build_short, short of the one bought alone, affordable after it). The amounts as the
+	agent's Encoder makes the entries: VCMI's market (IMarket::getOffer) at our marketplaces' rate, each fraction of the
+	trades our stock of the resource sold allows, rounded up, at least one."""
+	price = t.resource_price  # [R] (VCMI's resource prices)
+	efficiency = ((x["g_markets"].float() + 1.0) / 20.0).clamp(max=0.5)  # [B]
+	given = price[None, :, None]  # [1, R (sold), 1]
+	wanted = price[None, None, :] / efficiency[:, None, None]  # [B, 1, R (bought)]
+	dearer = given > wanted
+	give = torch.where(dearer, torch.ones_like(given * wanted), torch.floor(wanted / given + 0.5))  # [B, R, R]
+	get = torch.where(dearer, torch.ceil(given / wanted), torch.ones_like(given * wanted))
+	have = x["g_resources"].clamp(min=0).float()  # [B, R]
+	units = torch.floor(have[:, :, None] / give.clamp(min=1.0))
+	trades = torch.ceil(units.unsqueeze(-1) * constant(c.TRADE_FRACTIONS, price.device, torch.float32)).clamp(min=1.0)  # [B, R, R, F]
+	sold, bought = trades * give.unsqueeze(-1), trades * get.unsqueeze(-1)
+	cost = sold * price[None, :, None, None] - bought * price[None, None, :, None]
+	need = t.building_resources[vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)].permute(0, 3, 1, 2)  # [B, R, TO, NB]
+	short = (need > have[:, :, None, None]) & x["build_short"][:, None, : c.OWN_TOWNS]  # [B, R, TO, NB]
+	alone = short & (short.sum(dim=1, keepdim=True) == 1)  # short of this resource only
+	covers = have[:, None, :, None, None, None] + bought[..., None, None] >= need[:, None, :, None]  # [B, R, R, F, TO, NB]
+	keeps = have[:, :, None, None, None, None] - sold[..., None, None] >= need[:, :, None, None]
+	unlocks = (alone[:, None, :, None] & covers & keeps).flatten(4).any(dim=-1)  # [B, R, R, F]
+	return torch.stack([torch.log1p(cost.clamp(min=0.0) / 1000.0), unlocks.float()], dim=-1)
+
+
 def area_index(x, pos):
 	"""The TRAVEL area [..] (level, row, column of TRAVEL_GRID) of map positions pos [B, .., 3], -1 off the levels."""
 	side = (2 * block_side(x)).reshape((-1,) + (1,) * (pos.dim() - 2))

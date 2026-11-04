@@ -208,6 +208,8 @@ class CustomFeatures(nn.Module):
 	                  turns still ended and 3 of 8 TRAVELs left with a safe pile in reach (failures.py)
 	  safety          Nullkiller2 never starts a fight it cannot win: a hopeless fight's tile costs MOVE 6 logits a unit of
                   hopeless (0..12; safety_weight)
+  trades          a trade that unlocks a building gains 2 logits (0..4), each unit of its cost to Φ costs 0.5 (0..2;
+                  trade_weights, features.trade_options)
   garrisons       what leaving our troops in a garrison not a town's (a mine's) costs in logits (4, 0..8): Φ prices
 	                  them as if in the hero, so the labels never say it is dumb, which it almost always is; NK2 never
 	                  does it"""
@@ -247,6 +249,7 @@ class CustomFeatures(nn.Module):
 		self.travel_exponent, self.end_coupling, self.travel_coupling = zeros(), zeros(), zeros()
 		self.move_discount = zeros()  # (not a prior correction: its 0 is the old score, not a prior; move_discount_power)
 		self.safety = zeros()  # (2026-11-04: Nullkiller2 never starts a fight it cannot win; safety_weight)
+		self.trade_unlock, self.trade_cost = zeros(), zeros()  # (2026-11-04: TRADE's prior; trade_weights)
 		self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
@@ -264,7 +267,7 @@ class CustomFeatures(nn.Module):
 		return [
 			self.object_gain, self.object_type_gain.weight, self.object_type_delta.weight, self.object_subtype_delta.weight,
 			self.fight_sharpness, self.enemy_value, self.hero_value, self.danger_gain, self.explore_gain, self.class_gain, self.travel_exponent,
-			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety,
+			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
@@ -333,6 +336,14 @@ class CustomFeatures(nn.Module):
 		logits a unit: 6 at the start, 0..12 (2026-11-04: with the mixer's -3 alone, joint7's heroes with less than 1,000
 		gold of army still attacked 193 times in 30 games and lost 98%, the median such tile only -1.3 logits down)."""
 		return ft.bounded(self.safety, 0.0, 12.0, 6.0, CORRECTION_STEP)
+
+	def trade_weights(self):
+		"""TRADE's prior (the user, 2026-11-04: every trade is dumb unless it buys what could not be bought without it):
+		(what a trade that unlocks a building gains, 2 logits at the start, 0..4; what a unit of its cost loses, log(1 + Φ's
+		gold lost / 1000), 0.5, 0..2; features.trade_options). joint7 traded 135 times a game, 77% with no purchase that
+		day, ~900 of Φ a trade at the median: the old prior, 0.5 for a trade toward a building short of resources, 0 for
+		the rest, said nothing of what a trade costs."""
+		return ft.bounded(self.trade_unlock, 0.0, 4.0, 2.0, CORRECTION_STEP), ft.bounded(self.trade_cost, 0.0, 2.0, 0.5, CORRECTION_STEP)
 
 	def block_share(self):
 		"""How much of what a wandering monster blocks counts for its fight (x P(win)): 0.5 at the start, 0..1."""
@@ -404,6 +415,7 @@ class CustomFeatures(nn.Module):
 		f.tavern_worth = ft.tavern_worth(x, self)
 		f.hire_gain = ft.hire_gain(x, self, f.tavern_worth)
 		f.trade_needs = ft.trade_needs(x, self)
+		f.trade_options = ft.trade_options(x, self)
 		f.area_centres = ft.centres(x, TG)
 		f.travel_prior = self.travel_prior(x, f)
 		if windows.shape[0] > 0:
@@ -848,12 +860,12 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.move_discount", "features.safety")  # (2026-11-04: safety at 0, its start: Nullkiller2's rule, 6)
+ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
 # the mixer (move_mix*: its direct path as the fresh model has it, Nullkiller2's rule) and the foresight's battle heads)
-ADDED_HEADS = ("foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome")
+ADDED_HEADS = ("foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option")  # (+ trade_option: TRADE's options' cost and unlock, at 0)
 
 
 def with_added(state_dict, own):

@@ -799,3 +799,32 @@ def test_nk2s_safety_rule_lowers_a_hopeless_tiles_prior_by_its_weight():
 	loaded = CampaignModelV2(dim=32, cell_dim=8, layers=1)
 	loaded.load_state_dict(state)
 	assert float(loaded.features.safety_weight()) == pytest.approx(6.0)
+
+
+def test_a_trade_unlocks_a_building_only_if_it_buys_its_last_missing_resource_and_keeps_the_rest():
+	"""features.trade_options (the user, 2026-11-04: every trade is dumb unless it buys what could not be bought without
+	it): at one marketplace VCMI sells a crystal for 20 wood (IMarket::getOffer at efficiency (1 + 1) / 20), which costs
+	Φ 20 x 250 - 500; with 30 wood, a building short of one crystal alone (and needing 5 wood) is unlocked by it; one that
+	needs 26 wood too is not (the trade leaves 10); selling wood for gold (25 a wood) unlocks neither."""
+	from types import SimpleNamespace
+
+	from campaign_model import features as ft
+
+	R, F = c.N_RESOURCES, c.N_TRADE_AMOUNTS
+	WOOD, CRYSTAL, GOLD = 0, 4, 6
+	tables = torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, R)
+	tables[0, 5, WOOD], tables[0, 5, CRYSTAL] = 5, 1  # building 5: 5 wood, 1 crystal
+	tables[0, 6, WOOD], tables[0, 6, CRYSTAL] = 26, 1  # building 6: 26 wood, 1 crystal
+	t = SimpleNamespace(resource_price=torch.tensor([250.0, 500, 250, 500, 500, 500, 1]), building_resources=tables)
+	x = {"g_markets": torch.tensor([1]), "g_resources": torch.zeros(1, R, dtype=torch.long), "t_faction": torch.full((1, c.N_TOWNS), -1), "build_short": torch.zeros(1, c.OWN_TOWNS, c.N_BUILDINGS, dtype=torch.bool)}
+	x["g_resources"][0, WOOD] = 30
+	x["t_faction"][0, 0] = 0
+	x["build_short"][0, 0, 5] = True
+	options = ft.trade_options(x, t)[0]  # [R, R, F, 2]
+	assert options.shape == (R, R, F, 2)
+	torch.testing.assert_close(options[WOOD, CRYSTAL, :, 0], torch.full((F,), math.log1p(4.5)))
+	assert options[WOOD, CRYSTAL, :, 1].tolist() == [1.0] * F
+	assert float(options[WOOD, GOLD, :, 1].sum()) == 0.0
+	torch.testing.assert_close(options[WOOD, GOLD, 0, 0], torch.tensor(math.log1p((3 * 250 - 3 * 25) / 1000)))  # (10% of 30 trades: 3)
+	x["build_short"][0, 0, 5], x["build_short"][0, 0, 6] = False, True
+	assert float(ft.trade_options(x, t)[0, ..., 1].sum()) == 0.0
