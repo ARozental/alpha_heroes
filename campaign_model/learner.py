@@ -799,9 +799,11 @@ class CampaignLearner:
 			self._save(path)
 
 	def _save(self, path):
+		from battle_model.train import save_atomically  # (whole or not at all: the run resumes from it)
+
 		state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
 		optimizer = {} if self.worker else {"optimizer": self.optimizer.state_dict()}  # (the process's is in checkpoint_latest.pt)
-		torch.save({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "model_kwargs": self.kwargs}, path)
+		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "model_kwargs": self.kwargs}, path)
 
 	# ---- the loss shares (config.loss_shares) ----
 
@@ -1140,7 +1142,9 @@ def _update_worker(config, kwargs, device_name, state, requests, results, latest
 			if device.type == "mps":
 				torch.mps.empty_cache()  # (the battle learner's lesson: MPS keeps blocks of every size it saw)
 			cpu = {key: value.detach().cpu() for key, value in model.state_dict().items()}
-			torch.save({"model": cpu, "optimizer": optimizer.state_dict(), "lr_scale": lr_scale, "model_kwargs": kwargs, **about}, latest)
+			from battle_model.train import save_atomically
+
+			save_atomically({"model": cpu, "optimizer": optimizer.state_dict(), "lr_scale": lr_scale, "model_kwargs": kwargs, **about}, latest)
 			results.put(("ok", cpu, metrics, lr_scale))
 		except Exception:
 			results.put(("error", traceback.format_exc(), None, lr_scale))

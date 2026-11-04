@@ -971,12 +971,21 @@ def load_optimizer(optimizer, model, state):
 	print(f"optimizer: Adam's moments kept for {len(had)} parameters, fresh for {len(names) - len(had)} new: " + ", ".join(n for i, n in enumerate(names) if i not in set(had)), flush=True)
 
 
+def save_atomically(state, path):
+	"""torch.save to path whole or not at all: written beside it, then renamed over it, so a stop or a crash while it is
+	written leaves the file as it was, never a torn one (2026-11-04: a copy of the campaign's checkpoint_latest.pt taken
+	while it was written could not be read, and a run resumes from that file)."""
+	tmp = f"{path}.tmp"
+	torch.save(state, tmp)
+	os.replace(tmp, path)
+
+
 def save_checkpoint(path, model, optimizer, epoch, config, elapsed=0.0, lr_scale=1.0, value_ev=None, average=None):
 	"""elapsed: the training's seconds so far (run_hours counts them across resumes); lr_scale: the KL control's;
 	value_ev: the smoothed explained variance the window credit's outcome share follows; average: the WeightAverage
 	(saved as "average", the weights the evals played; "model" is the trained weights the optimizer goes on from)."""
 	extra = {"average": average.model.state_dict(), "average_updates": average.updates} if average else {}
-	torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "model_kwargs": model_kwargs(config), "elapsed": elapsed, "lr_scale": lr_scale, "value_ev": value_ev, **extra}, path)
+	save_atomically({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "model_kwargs": model_kwargs(config), "elapsed": elapsed, "lr_scale": lr_scale, "value_ev": value_ev, **extra}, path)
 
 
 def train(config, resume=False):
