@@ -610,9 +610,10 @@ def test_a_heros_spell_damage_is_its_best_spell_as_its_mana_allows():
 
 
 def test_the_strength_estimates_are_the_main_armys_for_our_strongest_hero_and_zero_without_a_fight():
-	"""model.tile_features' move_strength (four estimates x this hero, our main army): nothing where no fight starts; the
-	same for this hero and the main army in our strongest hero's window, the main army's no weaker in the others (army
-	estimate); hopeless only where a fight starts, from the kindest of this hero's estimates."""
+	"""model.tile_features' move_strength (four estimates x this hero, our main army, each's soft view): nothing where no
+	fight starts; the same for this hero and the main army in our strongest hero's window, the main army's no weaker in
+	the others (army estimate); hopeless (features.hopeless, smooth) only where a fight starts, from the kindest of this
+	hero's estimates."""
 	torch.manual_seed(0)
 	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
 	x = tensors(rich_inputs(4, 7))
@@ -634,10 +635,14 @@ def test_the_strength_estimates_are_the_main_armys_for_our_strongest_hero_and_ze
 			torch.testing.assert_close(this, main)
 		else:
 			assert bool((main[:, 0] >= this[:, 0] - 1e-5).all())
-	hopeless = (-s[..., :4].amax(dim=-1) - 1.0).clamp(0.0, 6.0) / 3 * fights
-	# (move_strength is clamped to +-2: hopeless reads the estimates before it, so compare where they are inside)
-	inside = (s[..., :4].abs() < 2.0).all(dim=-1)
-	torch.testing.assert_close(r[..., 0][inside], hopeless[inside])
+	# (move_strength is the estimates' soft view, features.strength_view: hopeless reads them before it, so compare where
+	# the view inverts well)
+	from campaign_model import features as ft
+
+	raw = 2.0 * torch.atanh((s[..., :4] / 2.0).clamp(-0.999, 0.999))
+	hopeless = ft.hopeless(raw.amax(dim=-1)) * fights
+	inside = (s[..., :4].abs() < 1.9).all(dim=-1)
+	torch.testing.assert_close(r[..., 0][inside], hopeless[inside], atol=1e-3, rtol=1e-3)
 
 
 def test_the_mixer_starts_as_nk2s_rule_on_hopeless_tiles_only():
@@ -836,3 +841,93 @@ def test_a_trade_unlocks_a_building_only_if_it_buys_its_last_missing_resource_an
 	x["t_available_creature"][0, 0, 6], x["t_available"][0, 0, 6] = 0, 2
 	options = ft.trade_options(x, t)[0]
 	assert options[WOOD, 5, :, 1].tolist() == [1.0] * F and float(options[..., 1].sum()) == F
+
+
+# ---- 2026-11-04: garrisons, a question's battle and join (schema 11) ----
+
+def _strongest_and_cheapest():
+	from campaign_model import vocab
+
+	rows = {k: r for k, r in vocab.creatures().items() if 0 <= k < c.CREATURE_VOCAB and r.get("fight_value", 0) > 0}
+	return max(rows, key=lambda k: rows[k]["fight_value"]), min(rows, key=lambda k: rows[k]["fight_value"])
+
+
+def test_a_garrison_on_a_tile_is_a_fight_there_by_its_army():
+	"""schema 11's a_*: a garrison not ours fights the hero that steps on it (VCMI's CGGarrison), so its tile is a fight
+	tile with its army in the strength estimates: 40 of the strongest creatures against random heroes are hopeless."""
+	strong, _ = _strongest_and_cheapest()
+	x = rich_inputs(2, 3)
+	b, hero = 0, 0
+	px, py, pz = (int(v) for v in x["h_pos"][b, hero])
+	x["a_present"][b, 0] = True
+	x["a_pos"][b, 0] = (px + 1, py, pz)
+	x["a_creature"][b, 0], x["a_count"][b, 0], x["a_detailed"][b, 0] = strong, 40, True
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	with torch.no_grad():
+		known = m.domain_knowledge(tensors(x))
+	k = [i for i, w in enumerate(known.windows.tolist()) if w == b * c.OWN_HEROES + hero and bool(known.real[i])][0]
+	R = c.WINDOW_RADIUS
+	assert float(known.tile_fights[k, R, R + 1]) == 1.0
+	assert float(known.move_strength[k, R, R + 1, :4].max()) < -1.5 and float(known.move_relative[k, R, R + 1, 0]) > 0.3
+	without = rich_inputs(2, 3)
+	with torch.no_grad():
+		plain = m.domain_knowledge(tensors(without))
+	assert float(plain.tile_fights[k, R, R + 1]) == float(without["w_creature"].reshape(-1, c.WINDOW, c.WINDOW)[b * c.OWN_HEROES + hero, R, R + 1] >= 0)
+
+
+def _question(x, b, creature, count, battle=None, join=None, d_object=16):
+	x["d_hero"][b] = 0
+	x["d_object"][b], x["d_subtype"][b] = d_object, 0
+	x["d_guard_creature"][b, 0], x["d_guard_count"][b, 0], x["d_guard_detailed"][b] = creature, count, True
+	x["option_mask"][b] = False
+	x["option_mask"][b, :2] = True
+	x["o_kind"][b, 0], x["o_kind"][b, 1] = int(c.OptionKind.YES), int(c.OptionKind.NO)
+	x["o_battle"][b] = False
+	x["o_join"][b] = False
+	if battle is not None:
+		x["o_battle"][b, battle] = True
+	if join is not None:
+		x["o_join"][b, join] = True
+
+
+def test_a_banks_strong_guards_make_yes_unlikely_and_a_free_join_likely():
+	"""model.CustomFeatures.question_features: a bank's 'fight the guards?' (o_battle on YES) against 200 of the strongest
+	creatures puts YES far below NO (the fight's value, NK2's safety rule); a wandering monster's free offer of 30 of
+	them to join (o_join on YES, NO the battle) puts YES far above NO. The priors land on those options only."""
+	strong, _ = _strongest_and_cheapest()
+	torch.manual_seed(1)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = rich_inputs(3, 5)
+	_question(x, 0, strong, 200, battle=0)
+	_question(x, 1, strong, 30, join=0, battle=1, d_object=54)
+	_question(x, 2, strong, 200)  # (the same guards, no option flagged: no prior)
+	with torch.no_grad():
+		known = m.domain_knowledge(tensors(x))
+		out = m(tensors(x))
+	q = known.question
+	assert float(q["battle_prior"][0]) < -5.0
+	assert float(q["join_prior"][1]) > 3.0
+	p = out["option_logp"].exp()
+	assert float(p[0, 0]) < 0.01 and float(p[1, 0]) > 0.99
+	assert abs(float(p[2, 0]) - 0.5) < 0.2  # (unflagged: no prior moves it)
+
+
+def test_records_from_before_schema_11_read_with_no_guards_battle_join_or_armed_object():
+	"""records: a record of schema 10 (before o_battle) and one of schema 9 (before mem) decode with zeros from where they
+	end: no memory, no question guards, no flags, no armed object."""
+	import zlib
+	from types import SimpleNamespace
+
+	from campaign_model.records import IN_BYTES, SHORT_RECORDS, decode_inputs
+	from campaign_model.tests.test_model import encoded
+
+	x = rich_inputs(2, 4)
+	x["o_battle"][:, 0] = True
+	x["a_present"][:, 0] = True
+	x["a_count"][:, 0, 0] = 5
+	full = zlib.decompress(encoded(x, 0))
+	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 2
+	for n in sorted(SHORT_RECORDS):
+		got = decode_inputs([SimpleNamespace(inputs=zlib.compress(full[:n]))])
+		for name in ("o_battle", "o_join", "d_guard_count", "a_present", "a_count"):
+			assert not got[name].any(), (n, name)

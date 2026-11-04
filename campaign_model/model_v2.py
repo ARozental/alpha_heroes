@@ -347,6 +347,11 @@ class CampaignModelV2(nn.Module):
 		self.buy_q = zero_output(nn.Linear(d, d))
 		self.dismiss_out = zero_output(nn.Linear(d, 1))
 		self.option_q = zero_output(nn.Linear(2 * d, d))
+		# A question's battle and join (2026-11-04; model.CustomFeatures.question_features): what each option does with
+		# its creatures into the option's token (o_battle, o_join) and their fight's and join's features onto the option's
+		# logit, beside their priors; at 0 to begin with
+		self.option_flags = zero_output(nn.Linear(2, d))
+		self.answer_fight, self.answer_join = zero_output(nn.Linear(6, 1)), zero_output(nn.Linear(3, 1))
 		self.end_out = zero_output(nn.Linear(d, 1))
 		self.type_bias = nn.Parameter(priors.action_types().clone())
 		self.value_hidden = nn.Sequential(nn.Linear(3 * d + ft_phi_features(), d), nn.GELU())
@@ -414,7 +419,7 @@ class CampaignModelV2(nn.Module):
 		state.towns, state.town_stacks, state.town_levels = self.encode_town(x)
 		state.tavern, _ = self.encode_hero(E.tavern_fields(x))
 		state.other_stacks, state.other = self.encode_other(x["x_creature"], x["x_count"], torch.ones_like(x["x_creature"][:, 0], dtype=torch.bool))
-		state.options = self.encode_options(x)
+		state.options = self.encode_options(x) + self.option_flags(torch.stack([x["o_battle"], x["o_join"]], dim=-1).float()) * x["option_mask"].unsqueeze(-1)
 		state.tiles = self.encode_tiles(x)  # [B, L, S, S, dc]
 		return state
 
@@ -677,7 +682,11 @@ class CampaignModelV2(nn.Module):
 		# A question's options: each against the global token and the hero it is about; Nullkiller2's skill scores
 		about = torch.gather(state.heroes, 1, x["d_hero"].clamp(min=0).reshape(b, 1, 1).expand(b, 1, d)).squeeze(1) * (x["d_hero"] >= 0).float().unsqueeze(-1)
 		query = self.option_q(torch.cat([state.glob, about], dim=-1))
-		out["option_logp"] = masked_log_softmax((state.options * query.unsqueeze(1)).sum(dim=-1) / math.sqrt(d) + skill_weight * known.skill_scores, x["option_mask"])
+		# (the option that starts a battle: its fight's prior, MOVE's fight's, and features; the one that takes the creatures
+		# in: what they are worth less their price; the rest: neither)
+		q = known.question
+		answers = x["o_battle"].float() * (q["battle_prior"] + self.answer_fight(q["fight"]).squeeze(-1)).unsqueeze(1) + x["o_join"].float() * (q["join_prior"] + self.answer_join(q["join"]).squeeze(-1)).unsqueeze(1)
+		out["option_logp"] = masked_log_softmax((state.options * query.unsqueeze(1)).sum(dim=-1) / math.sqrt(d) + skill_weight * known.skill_scores + answers, x["option_mask"])
 		# The action type: each table normalised within itself (the contract's: the AI samples a type, then an entry).
 		# A type is as good as its best option: its score is its bias (priors/action_types.csv), what its domain prior
 		# offers (offers: the best legal prior entry, as v1's; MOVE's and TRAVEL's the best tile's and area's value as a

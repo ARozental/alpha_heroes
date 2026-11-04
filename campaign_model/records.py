@@ -207,9 +207,9 @@ def decode_wire(decisions, out=None):
 	for i, d in enumerate(decisions):
 		n = inflate(d.inputs, out[i], address + i * IN_BYTES)
 		if n != IN_BYTES:
-			if not (MEM_BYTES and n == IN_BYTES - MEM_BYTES):
+			if n not in SHORT_RECORDS:
 				raise ValueError(f"a decision's inputs are {n} bytes, not {IN_BYTES}")
-			out[i, n:] = 0  # (padded: a record of schema 9)
+			out[i, n:] = 0  # (padded: a record of an older schema)
 	return out
 
 
@@ -255,12 +255,18 @@ def _libz():
 	return None
 
 
-MEM_BYTES = IN_LAYOUT[-1][-1] if IN_LAYOUT[-1][0] == "mem" else 0
+# Records made before inputs were added at the end (schema 10: mem; schema 11: the question's guards and armed objects,
+# from o_battle on) end where those start: decoded with zeros there, which each of them reads as none (no memory, no
+# guard, no battle, no armed object)
+TAIL_STARTS = ("mem", "o_battle")
+_STARTS = {entry[0]: sum(e[-1] for e in IN_LAYOUT[:i]) for i, entry in enumerate(IN_LAYOUT)}
+SHORT_RECORDS = frozenset(_STARTS[name] for name in TAIL_STARTS if name in _STARTS)  # the byte lengths of older records
+MEM_BYTES = IN_BYTES - _STARTS["mem"]  # what a record of schema 9 (before the memory) lacks
 
 
 def padded(row):
-	"""A decision's decompressed inputs, a record of schema 9 (before the memory, the last input) given zeros there."""
-	return row + bytes(MEM_BYTES) if MEM_BYTES and len(row) == IN_BYTES - MEM_BYTES else row
+	"""A decision's decompressed inputs, a record of an older schema (SHORT_RECORDS) given zeros where it ends."""
+	return row + bytes(IN_BYTES - len(row)) if len(row) in SHORT_RECORDS else row
 
 
 def decode_inputs(decisions):

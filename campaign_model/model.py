@@ -401,6 +401,11 @@ class CustomFeatures(nn.Module):
 		f.hero_attack, f.hero_defense = f.hero_attack + primary[..., 0], f.hero_defense + primary[..., 1]
 		f.hero_spells = ft.spell_damage(x, self)
 		f.town_damage, f.town_attack, f.town_defense = ft.army_battle(x["t_garrison_creature"], x["t_garrison_count"], x["t_detailed"], self)
+		# The armed objects that fight a hero stepping on them (schema 11's a_*: garrisons not ours), as a human sees them
+		# (a record from before: none, zeros)
+		armed = torch.where(x["a_present"].unsqueeze(-1) & (x["a_count"] > 0), x["a_creature"], torch.full_like(x["a_creature"], -1))
+		_, f.armed_power, f.armed_gold, f.armed_health = ft.army(armed, x["a_count"], x["a_detailed"], self)
+		f.armed_damage, f.armed_attack, f.armed_defense = ft.army_battle(armed, x["a_count"], x["a_detailed"], self)
 		f.town_value = self.town_value(x)
 		f.town_danger = ft.town_danger(x, f.hero_strength, f.town_strength)
 		f.map_worth, f.map_gate, f.map_monster_power = self.map_objects(x)
@@ -423,7 +428,50 @@ class CustomFeatures(nn.Module):
 		f.travel_prior = self.travel_prior(x, f)
 		if windows.shape[0] > 0:
 			f.update(self.tile_features(x, windows, f))
+		f.question = self.question_features(x, f)
 		return f
+
+	def question_features(self, x, f):
+		"""A question's battle and join (schema 11: d_guard_*, o_battle, o_join; the user, 2026-11-04: a battle decided as a
+		MOVE's fight is, an offer to join easy to take): the hero asked (d_hero) against the question's creatures by
+		tile_features' estimates (army, total, race, spells), their hopeless view and the fight's value (its experience
+		and a guarded object's worth, the bank's reward, as often as we win; its losses as fight_return counts them); and
+		what taking them is worth (at cost + u) less the join option's price. {"fight": [B, 6], "battle_prior": [B]
+		(value_logit of the fight's value less safety x hopeless, as MOVE's), "join": [B, 3], "join_prior": [B]}; the
+		options they are for are model_v2's to pick (o_battle, o_join)."""
+		hero = x["d_hero"].clamp(min=0, max=HO - 1)  # (our hero asked; with none, its options carry no battle or join)
+
+		def asked(values):  # [B] of a [B, H or HO] per-hero value
+			return values.gather(1, hero.unsqueeze(1)).squeeze(1)
+
+		guards = torch.where(x["d_guard_count"] > 0, x["d_guard_creature"], torch.full_like(x["d_guard_creature"], -1))
+		_, power, gold, health = ft.army(guards, x["d_guard_count"], x["d_guard_detailed"], self)
+		damage, attack, defense = ft.army_battle(guards, x["d_guard_count"], x["d_guard_detailed"], self)
+		theirs = torch.log1p(power)
+		ours = (asked(f.hero_health), asked(f.hero_damage), asked(f.hero_attack), asked(f.hero_defense))
+		ratios = torch.stack(
+			[
+				torch.log1p(asked(f.hero_power)) - theirs, asked(f.hero_strength) - theirs,
+				ft.race_strength(*ours, health, damage, attack, defense), ft.race_strength(*ours, health, damage, attack, defense, asked(f.hero_spells)),
+			],
+			dim=-1,
+		)  # [B, 4]
+		hopeless = ft.hopeless(ratios.amax(dim=-1))
+		win = ft.win_chance(ratios[:, 1], ft.bounded(self.fight_sharpness, 0.5, 8.0, 4.0, CORRECTION_STEP))
+		loss = ft.expected_loss(ratios[:, 1], torch.ones_like(win))
+		obj = x["d_object"]
+		reward = self.object_gold(obj, x["d_subtype"]) * ((obj >= 0) & (obj != ft.OBJ_MONSTER))  # (a bank's; a monster holds nothing)
+		gain = ft.experience_value(asked(x["h_exp"].clamp(min=0).float()), health, asked(f.level_gain), self)
+		at_stake = asked(f.hero_worth) + (HERO_HIRE_COST - self.hero_base) * self.gain(self.hero_value)
+		fight = ft.fight_return(win, loss, asked(f.hero_gold), at_stake, gain) + win * reward
+		price = (x["o_amount"].clamp(min=0).float() * x["o_join"]).sum(dim=-1)
+		joined = gold - price
+		return {
+			"fight": torch.cat([ft.strength_view(ratios), hopeless.unsqueeze(-1), torch.tanh(ft.value_logit(fight) / 4).unsqueeze(-1)], dim=-1),
+			"battle_prior": ft.value_logit(fight) - self.safety_weight() * hopeless,
+			"join": torch.stack([torch.log1p(gold / 1000.0), torch.log1p(price / 1000.0), torch.tanh(ft.value_logit(joined) / 4)], dim=-1),
+			"join_prior": ft.value_logit(joined),
+		}
 
 	def town_strength(self, x, power):
 		"""Each town's log strength [B, T]: its garrison's, plus its fort's while it is defended (FORT_STRENGTH x a gain)."""
@@ -524,6 +572,7 @@ class CustomFeatures(nn.Module):
 		# Who we would fight there: wandering monsters, an enemy hero, a town not ours, a creature bank's guards
 		heroes_here = on_tile(x["h_pos"], x["h_present"] & (x["h_owner"] != c.OWNER_SELF))
 		towns_here = on_tile(x["t_pos"], x["t_present"] & (x["t_owner"] != c.OWNER_SELF))
+		armed_here = on_tile(x["a_pos"], x["a_present"])  # (a garrison not ours: its battle starts there)
 		town_value = of(towns_here, f.town_value)
 		object_gold = self.object_gold(obj, subtype, town_value) * gate
 		creature = pick("w_creature")
@@ -533,10 +582,10 @@ class CustomFeatures(nn.Module):
 		bank_power, bank_health = self.bank_guards(obj, subtype)
 		bank = gate & (bank_power > 0)
 		on_hero, on_town = heroes_here.any(dim=-1), towns_here.any(dim=-1)
-		has_enemy = monster | on_hero | on_town | bank
+		has_enemy = monster | on_hero | on_town | bank | armed_here.any(dim=-1)
 		their_strength = torch.maximum(
 			torch.maximum(torch.log1p(count * self.fight_value[index]) * monster, torch.log1p(bank_power) * bank),
-			torch.maximum(of(heroes_here, f.hero_strength), of(towns_here, f.town_strength)),
+			torch.maximum(torch.maximum(of(heroes_here, f.hero_strength), of(towns_here, f.town_strength)), of(armed_here, torch.log1p(f.armed_power))),
 		)
 		our_strength = ours(f.hero_strength)
 		ratio = (our_strength[:, None, None] - their_strength) * has_enemy  # log of ours / theirs
@@ -546,7 +595,7 @@ class CustomFeatures(nn.Module):
 		their_gold = of(heroes_here, f.hero_gold) + of(towns_here, f.town_gold) + of(rival_towns, f.town_value)
 		their_health = (
 			count * self.creature_health[index] + bank_health * bank + of(heroes_here, f.hero_health) + of(towns_here, f.town_health)
-			+ ft.HERO_XP * on_hero + ft.TOWN_XP * on_town
+			+ of(armed_here, f.armed_health) + ft.HERO_XP * on_hero + ft.TOWN_XP * on_town
 		)
 		# The fight's expected return (gold): win it and gain its experience and the enemy's loss, minus what it costs
 		loss, win = ft.expected_loss(ratio, has_enemy), ft.win_chance(ratio, ft.bounded(self.fight_sharpness, 0.5, 8.0, 4.0, CORRECTION_STEP))
@@ -585,12 +634,16 @@ class CustomFeatures(nn.Module):
 		monster_health = count * self.creature_health[index]
 		their_army = torch.maximum(
 			torch.maximum(torch.log1p(count * self.fight_value[index]) * monster, torch.log1p(bank_power) * bank),
-			torch.maximum(of(heroes_here, torch.log1p(f.hero_power)), of(towns_here, torch.log1p(f.town_power))),
+			torch.maximum(torch.maximum(of(heroes_here, torch.log1p(f.hero_power)), of(towns_here, torch.log1p(f.town_power))), of(armed_here, torch.log1p(f.armed_power))),
 		)
-		their_hp = monster_health + of(heroes_here, f.hero_health) + of(towns_here, f.town_health)
-		their_damage = monster_damage + of(heroes_here, f.hero_damage) + of(towns_here, f.town_damage)
-		their_attack = (monster_damage * self.creature_attack[index] + of(heroes_here, f.hero_damage * f.hero_attack) + of(towns_here, f.town_damage * f.town_attack)) / their_damage.clamp(min=1e-6)
-		their_defense = (monster_health * self.creature_defense[index] + of(heroes_here, f.hero_health * f.hero_defense) + of(towns_here, f.town_health * f.town_defense)) / their_hp.clamp(min=1e-6)
+		their_hp = monster_health + of(heroes_here, f.hero_health) + of(towns_here, f.town_health) + of(armed_here, f.armed_health)
+		their_damage = monster_damage + of(heroes_here, f.hero_damage) + of(towns_here, f.town_damage) + of(armed_here, f.armed_damage)
+		their_attack = (
+			monster_damage * self.creature_attack[index] + of(heroes_here, f.hero_damage * f.hero_attack) + of(towns_here, f.town_damage * f.town_attack) + of(armed_here, f.armed_damage * f.armed_attack)
+		) / their_damage.clamp(min=1e-6)
+		their_defense = (
+			monster_health * self.creature_defense[index] + of(heroes_here, f.hero_health * f.hero_defense) + of(towns_here, f.town_health * f.town_defense) + of(armed_here, f.armed_health * f.armed_defense)
+		) / their_hp.clamp(min=1e-6)
 		own_slot = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
 		strongest = torch.where(own_slot, f.hero_strength[:, :HO], torch.full_like(f.hero_strength[:, :HO], -1e9)).argmax(dim=1)  # [B]
 
@@ -609,9 +662,9 @@ class CustomFeatures(nn.Module):
 			return torch.stack(out, dim=-1)
 
 		this_hero, main_army = estimates(ours), estimates(of_main)
-		# How hopeless the fight is by the kindest of this hero's estimates: beyond e^-1 of their strength, 0..6 / 3 (a
-		# guard 54x our strength: 1)
-		hopeless = (-this_hero.amax(dim=-1) - 1.0).clamp(0.0, 6.0) / 3 * fights
+		# How hopeless the fight is by the kindest of this hero's estimates (features.hopeless: smooth; a guard 54x our
+		# strength ~0.92)
+		hopeless = ft.hopeless(this_hero.amax(dim=-1)) * fights
 		explore = ft.unexplored_around(flags)
 		# The object is ours only if we win the fight in front of it (a bank's guards, a monster's zone, a town's garrison)
 		value = object_gold * torch.where(fights, win, torch.ones_like(win)) + fight + explore * self.explore_gold()
@@ -701,7 +754,7 @@ class CustomFeatures(nn.Module):
 		return {
 			"tile_value": value, "tile_prior": prior, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight, "tile_fight_ratio": fight_ratio, "tile_fights": fights.float(),
 			"tile_stacks": (monster | guarded).float(),  # (a wandering monster or its zone: model_v2's battle head)
-			"move_strength": torch.cat([this_hero, main_army], dim=-1).clamp(-2.0, 2.0), "move_relative": relative,  # (model_v2: MOVE_STRENGTH, MOVE_RELATIVE)
+			"move_strength": ft.strength_view(torch.cat([this_hero, main_army], dim=-1)), "move_relative": relative,  # (model_v2: MOVE_STRENGTH, MOVE_RELATIVE)
 		}
 
 
@@ -868,7 +921,9 @@ ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
 # the mixer (move_mix*: its direct path as the fresh model has it, Nullkiller2's rule) and the foresight's battle heads)
-ADDED_HEADS = ("foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option")  # (+ trade_option: TRADE's options' cost and unlock, at 0)
+ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; answer_fight, answer_join, option_flags: a question's battle and join, at 0)
+	"foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option", "answer_fight", "answer_join", "option_flags",
+)
 
 
 def with_added(state_dict, own):

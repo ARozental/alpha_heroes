@@ -27,6 +27,9 @@
 #include "lib/spells/CSpellHandler.h"
 #include "lib/spells/ISpellMechanics.h"
 #include "lib/spells/Problem.h"
+#include "lib/GameLibrary.h"
+#include "lib/networkPacks/Component.h"
+#include "lib/texts/CGeneralTextHandler.h"
 
 using namespace MapSchema;
 
@@ -69,6 +72,26 @@ const CGObjectInstance * topNonHero(const CCallback & cb, const int3 & pos)
 		if(obj->ID != Obj::HERO)
 			return obj;
 	return nullptr;
+}
+
+/// Whether a question's text is VCMI's template's (a CGCreature dialog: it fills the template's %s and %d): the
+/// template's longest fixed piece is in it
+bool fromTemplate(const std::string & text, const std::string & templ)
+{
+	std::string longest, piece;
+	for(size_t i = 0; i <= templ.size(); ++i)
+	{
+		if(i == templ.size() || (templ[i] == '%' && i + 1 < templ.size() && (templ[i + 1] == 's' || templ[i + 1] == 'd')))
+		{
+			if(piece.size() > longest.size())
+				longest = piece;
+			piece.clear();
+			++i;
+			continue;
+		}
+		piece += templ[i];
+	}
+	return longest.size() >= 8 && text.find(longest) != std::string::npos;
 }
 
 const CGObjectInstance * topObject(const CCallback & cb, const int3 & pos, const CGObjectInstance * except)
@@ -602,10 +625,30 @@ void AlphaMapAI::encodeMap(Decision & decision, const std::vector<int3> & ours)
 	std::vector<const CGHeroInstance *> heroes; // our hero tokens, for their visits and Visions
 	for(int h = 0; h < OWN_HEROES; ++h)
 		heroes.push_back(decision.heroes[h] == ObjectInstanceID() ? nullptr : cb->getHero(decision.heroes[h]));
+	int armed = 0; // garrisons not ours with an army (a_*), the nearest first
 	for(int i = 0; i < std::min<int>(objects.size(), MAP_OBJECTS); ++i)
 	{
 		const auto * obj = objects[i];
 		const auto pos = obj->visitablePos();
+		// A garrison fights a hero that steps on it (CGGarrison::onHeroVisit), its army as a human's right-click shows it
+		// (CInfoBoxPopup: VCMI's quantity ids): the model's fight on that tile (2026-11-04: 9 of 49 lost fights of joint7's
+		// near-empty heroes were garrisons it took for empty tiles)
+		if((obj->ID == Obj::GARRISON || obj->ID == Obj::GARRISON2) && armed < ARMED_OBJECTS && owner(obj->tempOwner) != OWNER_SELF)
+			if(const auto * army = dynamic_cast<const CArmedInstance *>(obj); army && army->stacksCount() > 0)
+			{
+				in.at(In::a_present, armed) = 1;
+				in.at(In::a_pos, armed, 0) = pos.x;
+				in.at(In::a_pos, armed, 1) = pos.y;
+				in.at(In::a_pos, armed, 2) = pos.z;
+				int s = 0;
+				for(const auto & [slot, stack] : army->Slots())
+					if(stack && s < ARMY_SLOTS)
+					{
+						in.at(In::a_creature, armed, s) = stack->getId().getNum();
+						in.at(In::a_count, armed, s++) = static_cast<int>(stack->getQuantityID());
+					}
+				++armed;
+			}
 		in.at(In::m_object, i) = obj->ID.getNum();
 		in.at(In::m_subtype, i) = obj->subID.getNum();
 		in.at(In::m_owner, i) = owner(obj->tempOwner);
@@ -1000,4 +1043,64 @@ void AlphaMapAI::encodeOptionContext(Decision & decision, ObjectInstanceID heroI
 				in.at(In::d_detailed) = exact ? 1 : 0;
 			}
 	}
+}
+
+void AlphaMapAI::encodeQuestionGuards(Decision & decision, const std::string & text, const std::vector<Component> & components)
+{
+	// What a yes/no question's options do with the creatures it is about (the model's fight and join features; the
+	// user, 2026-11-04): a wandering monster's offer to join (YES takes them, for the gold component's price if any; NO
+	// refuses, a battle as a rule), its flight (YES pursues: the battle; NO lets it go), a guarded object's "fight the
+	// guards?" (a bank's, a mine's, a dwelling's: YES starts the battle). Its creatures as the dialog or the map shows them
+	auto & in = decision.inputs;
+	const auto * hero = cb->getHero(activeHero);
+	const auto * obj = activeTarget.isValid() && cb->isInTheMap(activeTarget) ? topObject(*cb, activeTarget, hero) : nullptr;
+	const auto * army = dynamic_cast<const CArmedInstance *>(obj);
+	if(!army || army->stacksCount() == 0 || dynamic_cast<const CGHeroInstance *>(obj) || dynamic_cast<const CGTownInstance *>(obj))
+		return;
+	constexpr int YES = 0;
+	constexpr int NO = 1;
+	if(obj->ID == Obj::MONSTER)
+	{
+		const auto [count, exact] = seenCount(obj, hero);
+		if(const auto * stack = army->getStackPtr(SlotID(0)))
+		{
+			in.at(In::d_guard_creature, 0) = stack->getId().getNum();
+			in.at(In::d_guard_count, 0) = count;
+			in.at(In::d_guard_detailed) = exact ? 1 : 0;
+		}
+		int price = -1; // a join for gold's (its gold component), 0 a join for free's, -1 no join
+		for(const auto & component : components)
+			if(component.type == ComponentType::RESOURCE && component.subType == GameResID(GameResID::GOLD))
+				price = component.value.value_or(0);
+		if(price < 0 && fromTemplate(text, LIBRARY->generaltexth->advobtxt[86]))
+			price = 0;
+		if(price >= 0)
+		{
+			in.at(In::o_join, YES) = 1;
+			in.at(In::o_amount, YES) = price;
+			in.at(In::o_battle, NO) = 1;
+		}
+		else if(fromTemplate(text, LIBRARY->generaltexth->advobtxt[91]))
+			in.at(In::o_battle, YES) = 1;
+		return;
+	}
+	in.at(In::o_battle, YES) = 1;
+	int i = 0;
+	for(const auto & component : components) // (a bank's guards as its dialog shows them: exact)
+		if(component.type == ComponentType::CREATURE && i < ARMY_SLOTS)
+		{
+			in.at(In::d_guard_creature, i) = component.subType.getNum();
+			in.at(In::d_guard_count, i++) = component.value.value_or(0);
+		}
+	if(i > 0)
+	{
+		in.at(In::d_guard_detailed) = 1;
+		return;
+	}
+	for(const auto & [slot, stack] : army->Slots()) // (a mine's or a dwelling's: as a human sees a monster stack)
+		if(stack && i < ARMY_SLOTS)
+		{
+			in.at(In::d_guard_creature, i) = stack->getId().getNum();
+			in.at(In::d_guard_count, i++) = static_cast<int>(stack->getQuantityID());
+		}
 }

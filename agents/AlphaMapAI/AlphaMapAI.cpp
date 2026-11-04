@@ -884,6 +884,7 @@ Decision AlphaMapAI::blockingQuestion(const std::string & text, const std::vecto
 		in.at(In::o_kind, 1) = static_cast<int>(OptionKind::NO);
 		in.at(In::option_mask, 0) = in.at(In::option_mask, 1) = 1;
 		decision.answers = {1, 0};
+		encodeQuestionGuards(decision, text, components);
 	}
 	return decision;
 }

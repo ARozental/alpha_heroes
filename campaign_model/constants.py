@@ -8,7 +8,7 @@ Every decision is one of two families:
 """
 from enum import IntEnum
 
-SCHEMA_VERSION = 10  # 10: the model's memory (mem in, memory out: a player's decisions carry it forward); 9: the whole map tile by tile (tile_*, MAP_TILES a side), for the model's map CNN (docs/campaign_model_v2_draft.md); 8: heroes' luck and morale with their parts until the next battle (h_luck, h_morale, h_battle_*), the spells of heroes for hire (g_tavern_spells); 7: what a hero for hire brings (g_tavern_exp, g_tavern_army_*, g_tavern_artifacts); 6: build_short (buildable but for resources); 5: every object we see (MAP_OBJECTS 8192), no g_objects (torch counts them); 4: RECRUIT's destination, TRAVEL's days, our previous decision (g_last_*); 3: the whole map (m_* objects, g_tiles, g_objects), TRAVEL, g_object_income, h_spell_cost; 2: counts as a human sees them
+SCHEMA_VERSION = 11  # 11: a question's guards and what its options do with them (o_battle, o_join, d_guard_*), the armed objects that fight a hero stepping on them (a_*: garrisons), after mem (older records read with them at 0); 10: the model's memory (mem in, memory out: a player's decisions carry it forward); 9: the whole map tile by tile (tile_*, MAP_TILES a side), for the model's map CNN (docs/campaign_model_v2_draft.md); 8: heroes' luck and morale with their parts until the next battle (h_luck, h_morale, h_battle_*), the spells of heroes for hire (g_tavern_spells); 7: what a hero for hire brings (g_tavern_exp, g_tavern_army_*, g_tavern_artifacts); 6: build_short (buildable but for resources); 5: every object we see (MAP_OBJECTS 8192), no g_objects (torch counts them); 4: RECRUIT's destination, TRAVEL's days, our previous decision (g_last_*); 3: the whole map (m_* objects, g_tiles, g_objects), TRAVEL, g_object_income, h_spell_cost; 2: counts as a human sees them
 
 N_RESOURCES = 7  # wood, mercury, ore, sulfur, crystal, gems, gold (VCMI's order)
 
@@ -43,6 +43,7 @@ N_OPTIONS = 8  # answers to an engine question
 # The whole map, whatever its size (the windows see 16 tiles around each hero): the objects we see, and per-block counts
 # of the tiles (model.py's map encoder scatters the objects onto the blocks)
 MAP_OBJECTS = 8192  # every object on revealed tiles (VCMI's getAllVisitableObjs), nearest first: a 144 x 144 two-level map has 3,000-6,000
+ARMED_OBJECTS = 32  # armed objects that fight a hero stepping on them (garrisons not ours), the nearest first (schema a_*)
 MAP_GRID = 36  # blocks per side of each level; a block is ceil(max(width, height) / MAP_GRID) tiles on a side
 MAP_LEVELS = 2  # surface and underground
 MAP_TILES = 36  # the whole map's tiles (tile_*), this many a side: every map played so far (config.sizes); a bigger map needs this raised (the model's map encoder takes any size), its tiles past it are left out (an error, never silent)

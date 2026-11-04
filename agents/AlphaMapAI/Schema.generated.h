@@ -7,8 +7,8 @@
 
 namespace MapSchema
 {
-constexpr int SCHEMA_VERSION = 10;
-constexpr const char * CONTRACT_HASH = "7c198498b323a829";
+constexpr int SCHEMA_VERSION = 11;
+constexpr const char * CONTRACT_HASH = "0fdf125397e6e3c2";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;
@@ -58,6 +58,7 @@ constexpr int TILE_VISITED_BY_PLAYER = 64;
 constexpr int TILE_VISITED_BY_HERO = 128;
 constexpr int TILE_EXACT_COUNT = 256;
 constexpr int MAP_OBJECTS = 8192;
+constexpr int ARMED_OBJECTS = 32;
 constexpr int MAP_GRID = 36;
 constexpr int MAP_LEVELS = 2;
 constexpr int MAP_TILES = 36;
@@ -277,6 +278,16 @@ enum class In : int
 	travel_mask,
 	option_mask,
 	mem,
+	o_battle,
+	o_join,
+	d_guard_creature,
+	d_guard_count,
+	d_guard_detailed,
+	a_present,
+	a_pos,
+	a_creature,
+	a_count,
+	a_detailed,
 	COUNT
 };
 
@@ -408,6 +419,16 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"travel_mask", DType::BOOL, 4, {8, 2, 18, 18}, 0},
 	TensorSpec{"option_mask", DType::BOOL, 1, {8, 1, 1, 1}, 0},
 	TensorSpec{"mem", DType::INT64, 2, {8, 64, 1, 1}, 0},
+	TensorSpec{"o_battle", DType::BOOL, 1, {8, 1, 1, 1}, 0},
+	TensorSpec{"o_join", DType::BOOL, 1, {8, 1, 1, 1}, 0},
+	TensorSpec{"d_guard_creature", DType::INT64, 1, {7, 1, 1, 1}, 0},
+	TensorSpec{"d_guard_count", DType::INT64, 1, {7, 1, 1, 1}, 0},
+	TensorSpec{"d_guard_detailed", DType::BOOL, 0, {1, 1, 1, 1}, 0},
+	TensorSpec{"a_present", DType::BOOL, 1, {32, 1, 1, 1}, 0},
+	TensorSpec{"a_pos", DType::INT64, 2, {32, 3, 1, 1}, 0},
+	TensorSpec{"a_creature", DType::INT64, 2, {32, 7, 1, 1}, 0},
+	TensorSpec{"a_count", DType::INT64, 2, {32, 7, 1, 1}, 0},
+	TensorSpec{"a_detailed", DType::BOOL, 1, {32, 1, 1, 1}, 0},
 }};
 
 enum class Out : int

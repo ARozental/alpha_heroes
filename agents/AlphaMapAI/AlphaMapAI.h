@@ -281,6 +281,7 @@ private:
 	void dropFutile(Decision & decision);
 	void encodeTurnActions(Decision & decision, PathfinderCache & paths);
 	void encodeArmyMoves(Decision & decision, const std::vector<std::pair<int, int>> & pairs);
+	void encodeQuestionGuards(Decision & decision, const std::string & text, const std::vector<Component> & components);
 	void encodeOptionContext(Decision & decision, ObjectInstanceID hero, int3 target);
 	// The questions' decisions, as asked (the handlers decide them; the teacher's recorder keeps them for the answer)
 	Decision blockingQuestion(const std::string & text, const std::vector<Component> & components, int soundID, bool selection, bool cancel);

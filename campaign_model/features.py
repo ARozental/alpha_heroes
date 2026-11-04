@@ -180,6 +180,19 @@ def spell_damage(x, t):
 	return ((base + per_power * power) * casts * known).amax(dim=-1) / SPELL_ROUNDS
 
 
+def hopeless(ratio):
+	"""How hopeless a fight is by its log strength ratio (ours over theirs) [...]: ~0 while the enemy is at most ~e times as
+	strong, then a unit an e-fold more, /3 (a guard 54x our strength ~0.92), softly bounded at 2 (e^7). Smooth (the user,
+	2026-11-04: a softplus at a quarter's temperature for the ramp's kink, a tanh for its bound): ~0.06 at e times."""
+	ramp = 0.25 * F.softplus((-ratio - 1.0) / 0.25)
+	return 6.0 * torch.tanh(ramp / 6.0) / 3.0
+
+
+def strength_view(ratio):
+	"""A log strength ratio as a feature [...]: itself near even, softly bounded at +-2 (e^2 times either way)."""
+	return 2.0 * torch.tanh(ratio / 2.0)
+
+
 def race_strength(health, damage, attack, defense, their_health, their_damage, their_attack, their_defense, spells=0.0):
 	"""A fight's log strength ratio (ours over theirs) as a damage race: each side's hit points x the damage it deals a
 	round (its stacks' damage at its attack against the other's defense, damage_modifier; ours plus `spells` a round),

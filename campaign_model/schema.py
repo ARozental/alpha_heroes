@@ -177,6 +177,23 @@ INPUTS = (
 	_m("option_mask", (O,), "the options of a question"),
 	# (last: a record of before it, schema 9, is this one without it: records.decode_wire gives it zeros)
 	_i("mem", (c.MEMORY_SLOTS, c.MEMORY_WIDTH), "the model's memory as this player's previous decision left it (its memory output) x MEMORY_SCALE; 0 at the start of a game"),
+	# Added after mem (2026-11-04: a record from before carries none of them, records.decode_wire gives them zeros: no
+	# guards, no battle, no armed object). A question's guards and what each option does with them (the user: a battle
+	# decided as a MOVE's fight is; a monster's offer to join easy to take): a guarded bank's, dwelling's or mine's
+	# "fight?" (YES starts the battle), a wandering monster's offer to join (YES takes them, for d_number gold if any; NO
+	# fights them) or its flight (YES pursues: the battle)
+	_m("o_battle", (O,), "this option starts a battle against the question's guards (d_guard_*)"),
+	_m("o_join", (O,), "this option takes the question's creatures (d_guard_*) into the hero's army, for d_number gold"),
+	_i("d_guard_creature", (A,), "the question's guards or joining creatures: each stack's creature (0 with no count)"),
+	_i("d_guard_count", (A,), "their counts: exact when d_guard_detailed, else VCMI's quantity id; 0 none"),
+	_m("d_guard_detailed", (), "d_guard_count is exact (the dialog shows a bank's guards so)"),
+	# Armed objects we see that fight a hero the moment it steps on them, their armies as a human sees them (VCMI's
+	# right-click; CGGarrison::onHeroVisit starts the battle): garrisons not ours, the nearest first
+	_m("a_present", (c.ARMED_OBJECTS,), "an armed object in this slot"),
+	_i("a_pos", (c.ARMED_OBJECTS, 3), "x, y, level of its entrance"),
+	_i("a_creature", (c.ARMED_OBJECTS, A), "its army's creatures (0 with no count)"),
+	_i("a_count", (c.ARMED_OBJECTS, A), "their counts: VCMI's quantity id unless a_detailed, 0 none"),
+	_m("a_detailed", (c.ARMED_OBJECTS,), "a_count is exact"),
 )
 
 
