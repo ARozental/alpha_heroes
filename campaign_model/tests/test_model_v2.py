@@ -778,3 +778,24 @@ def game_values_creature(creature):
 	from game_values import creature_value
 
 	return creature_value(creature)
+
+
+def test_nk2s_safety_rule_lowers_a_hopeless_tiles_prior_by_its_weight():
+	"""model.CustomFeatures.safety_weight (6 at the start, 0..12): MOVE's prior on a tile whose fight is hopeless by every
+	estimate is lower by safety x hopeless, and nowhere else; a checkpoint from before it loads with it at its start."""
+	torch.manual_seed(3)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = tensors(rich_inputs(4, 7))
+	assert float(m.features.safety_weight()) == pytest.approx(6.0)
+	with torch.no_grad():
+		known = m.domain_knowledge(x)
+		with_rule = known.tile_prior.clone()
+		hopeless = known.move_relative[..., 0]
+		m.features.safety.fill_(-1e3)  # (its weight at 0)
+		without = m.domain_knowledge(x).tile_prior
+	assert float(hopeless.sum()) > 0
+	torch.testing.assert_close(with_rule - without, -6.0 * hopeless, atol=1e-4, rtol=1e-4)
+	state = {k: v for k, v in CampaignModelV2(dim=32, cell_dim=8, layers=1).state_dict().items() if k != "features.safety"}
+	loaded = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	loaded.load_state_dict(state)
+	assert float(loaded.features.safety_weight()) == pytest.approx(6.0)

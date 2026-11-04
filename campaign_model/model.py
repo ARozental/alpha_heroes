@@ -206,7 +206,9 @@ class CustomFeatures(nn.Module):
 	  type coupling   how much what MOVE and TRAVEL offer keeps a turn from ending (1.5, 0..4), and what MOVE offers keeps
 	                  TRAVEL from walking past it (2, 0..4): Nullkiller2 always takes its best task; at 1 each, 4 of 42
 	                  turns still ended and 3 of 8 TRAVELs left with a safe pile in reach (failures.py)
-	  garrisons       what leaving our troops in a garrison not a town's (a mine's) costs in logits (4, 0..8): Φ prices
+	  safety          Nullkiller2 never starts a fight it cannot win: a hopeless fight's tile costs MOVE 6 logits a unit of
+                  hopeless (0..12; safety_weight)
+  garrisons       what leaving our troops in a garrison not a town's (a mine's) costs in logits (4, 0..8): Φ prices
 	                  them as if in the hero, so the labels never say it is dumb, which it almost always is; NK2 never
 	                  does it"""
 
@@ -244,6 +246,7 @@ class CustomFeatures(nn.Module):
 		self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight = (zeros() for _ in range(6))
 		self.travel_exponent, self.end_coupling, self.travel_coupling = zeros(), zeros(), zeros()
 		self.move_discount = zeros()  # (not a prior correction: its 0 is the old score, not a prior; move_discount_power)
+		self.safety = zeros()  # (2026-11-04: Nullkiller2 never starts a fight it cannot win; safety_weight)
 		self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
@@ -261,7 +264,7 @@ class CustomFeatures(nn.Module):
 		return [
 			self.object_gain, self.object_type_gain.weight, self.object_type_delta.weight, self.object_subtype_delta.weight,
 			self.fight_sharpness, self.enemy_value, self.hero_value, self.danger_gain, self.explore_gain, self.class_gain, self.travel_exponent,
-			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain,
+			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
@@ -323,6 +326,13 @@ class CustomFeatures(nn.Module):
 		reinforce it, defend: to a town of ours under threat, ferry: a scout with troops to a main hero, hire, trade)."""
 		weak = lambda raw: ft.bounded(raw, 0.0, 2.0, 0.5, CORRECTION_STEP)  # noqa: E731
 		return weak(self.pull_home), weak(self.pull_defend), weak(self.pull_ferry), weak(self.hire_weight), weak(self.trade_weight)
+
+	def safety_weight(self):
+		"""Nullkiller2's rule as MOVE's prior: it never starts a fight it cannot win (its isSafeToVisit), so a tile whose
+		fight is hopeless by every estimate (tile_features' hopeless: 1 at a guard 54x the hero's strength) costs this many
+		logits a unit: 6 at the start, 0..12 (2026-11-04: with the mixer's -3 alone, joint7's heroes with less than 1,000
+		gold of army still attacked 193 times in 30 games and lost 98%, the median such tile only -1.3 logits down)."""
+		return ft.bounded(self.safety, 0.0, 12.0, 6.0, CORRECTION_STEP)
 
 	def block_share(self):
 		"""How much of what a wandering monster blocks counts for its fight (x P(win)): 0.5 at the start, 0..1."""
@@ -629,7 +639,7 @@ class CustomFeatures(nn.Module):
 			) / ft.PULL_SCALE
 		)  # [K, W, W, 3]
 		home_weight, defend_weight, ferry_weight, _, _ = self.pull_weights()
-		prior = ft.value_logit(value) + (torch.stack([home_weight, defend_weight, ferry_weight]) * pulls).sum(dim=-1)
+		prior = ft.value_logit(value) + (torch.stack([home_weight, defend_weight, ferry_weight]) * pulls).sum(dim=-1) - self.safety_weight() * hopeless
 		# model_v2's MOVE features beside MOVE_FEATURES, relative so they keep their meaning on any map and day (the user,
 		# 2026-11-04): hopeless (above); the object as a share of our Φ (log(1 + 100 x share) / 3: 1% 0.23, 10% 0.8); where
 		# a fight starts, what losing it takes (the army, the hero, its replacement) and what winning it takes (the enemy's
@@ -838,7 +848,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.move_discount",)
+ADDED = ("features.move_discount", "features.safety")  # (2026-11-04: safety at 0, its start: Nullkiller2's rule, 6)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
