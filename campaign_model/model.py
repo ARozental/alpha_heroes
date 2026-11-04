@@ -86,6 +86,7 @@ def game_tables():
 		"creature_attack": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_defense": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_damage": torch.zeros(c.CREATURE_VOCAB + 1),  # (its average damage a hit: min and max's mean)
+		"creature_resources": torch.zeros(c.CREATURE_VOCAB + 1, len(RESOURCE_PRICES)),  # (its recruit cost, each resource)
 		"resource_price": torch.tensor([float(v) for v in RESOURCE_PRICES.values()]),
 		"building_value": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS),
 		"artifact_price": torch.zeros(c.ARTIFACT_VOCAB + 1),
@@ -116,6 +117,8 @@ def game_tables():
 				tables["creature_attack"][creature_id] = float(row.get("attack", 0))
 				tables["creature_defense"][creature_id] = float(row.get("defense", 0))
 				tables["creature_damage"][creature_id] = 0.5 * float(row.get("damage_min", 0) + row.get("damage_max", 0))
+				for k, name in enumerate(RESOURCE_PRICES):
+					tables["creature_resources"][creature_id, k] = float(row.get("cost", {}).get(name, 0))
 				tables["creature_growth"][creature_id] = float(row.get("growth", 0))
 				tables["creature_luck"][creature_id] = float(feels(creature_id, NO_LUCK))
 				tables["creature_morale"][creature_id] = float(feels(creature_id, NO_MORALE))

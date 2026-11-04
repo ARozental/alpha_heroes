@@ -815,8 +815,11 @@ def test_a_trade_unlocks_a_building_only_if_it_buys_its_last_missing_resource_an
 	tables = torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, R)
 	tables[0, 5, WOOD], tables[0, 5, CRYSTAL] = 5, 1  # building 5: 5 wood, 1 crystal
 	tables[0, 6, WOOD], tables[0, 6, CRYSTAL] = 26, 1  # building 6: 26 wood, 1 crystal
-	t = SimpleNamespace(resource_price=torch.tensor([250.0, 500, 250, 500, 500, 500, 1]), building_resources=tables)
-	x = {"g_markets": torch.tensor([1]), "g_resources": torch.zeros(1, R, dtype=torch.long), "t_faction": torch.full((1, c.N_TOWNS), -1), "build_short": torch.zeros(1, c.OWN_TOWNS, c.N_BUILDINGS, dtype=torch.bool)}
+	creatures = torch.zeros(c.CREATURE_VOCAB + 1, R)
+	creatures[0, GOLD], creatures[0, 5] = 3000, 1  # an Angel: 3,000 gold and a gem
+	t = SimpleNamespace(resource_price=torch.tensor([250.0, 500, 250, 500, 500, 500, 1]), building_resources=tables, creature_resources=creatures)
+	x = {"g_markets": torch.tensor([1]), "g_resources": torch.zeros(1, R, dtype=torch.long), "t_faction": torch.full((1, c.N_TOWNS), -1), "build_short": torch.zeros(1, c.OWN_TOWNS, c.N_BUILDINGS, dtype=torch.bool),
+		"t_available_creature": torch.full((1, c.N_TOWNS, c.N_LEVELS), -1), "t_available": torch.zeros(1, c.N_TOWNS, c.N_LEVELS, dtype=torch.long)}
 	x["g_resources"][0, WOOD] = 30
 	x["t_faction"][0, 0] = 0
 	x["build_short"][0, 0, 5] = True
@@ -828,3 +831,8 @@ def test_a_trade_unlocks_a_building_only_if_it_buys_its_last_missing_resource_an
 	torch.testing.assert_close(options[WOOD, GOLD, 0, 0], torch.tensor(math.log1p((3 * 250 - 3 * 25) / 1000)))  # (10% of 30 trades: 3)
 	x["build_short"][0, 0, 5], x["build_short"][0, 0, 6] = False, True
 	assert float(ft.trade_options(x, t)[0, ..., 1].sum()) == 0.0
+	# a creature for hire we cannot afford one of (an Angel: no gem), with 3,000 gold: the wood for a gem unlocks it
+	x["g_resources"][0, GOLD] = 3000
+	x["t_available_creature"][0, 0, 6], x["t_available"][0, 0, 6] = 0, 2
+	options = ft.trade_options(x, t)[0]
+	assert options[WOOD, 5, :, 1].tolist() == [1.0] * F and float(options[..., 1].sum()) == F

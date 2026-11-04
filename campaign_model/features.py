@@ -731,10 +731,12 @@ def trade_needs(x, t):
 def trade_options(x, t):
 	"""Each TRADE entry's (sell, buy, TRADE_FRACTIONS) [B, R, R, F, 2] (the user, 2026-11-04: every trade is dumb unless
 	it buys what could not be bought without it): what it costs Φ (log(1 + gold / 1000): the resources sold at their
-	prices less those bought; joint7's trades cost a median 900) and whether it unlocks a building (one of our towns'
-	buildings short of resources, build_short, short of the one bought alone, affordable after it). The amounts as the
-	agent's Encoder makes the entries: VCMI's market (IMarket::getOffer) at our marketplaces' rate, each fraction of the
-	trades our stock of the resource sold allows, rounded up, at least one."""
+	prices less those bought; joint7's trades cost a median 900) and whether it unlocks a purchase: a building (one of
+	our towns' buildings short of resources, build_short) or a creature for hire in our towns we cannot afford one of,
+	either short of the one resource bought alone and affordable after it (Nullkiller2 mostly sells rare resources for
+	gold: 6% of its advised trades unlocked a building, joint7 2026-11-04). The amounts as the agent's Encoder makes the
+	entries: VCMI's market (IMarket::getOffer) at our marketplaces' rate, each fraction of the trades our stock of the
+	resource sold allows, rounded up, at least one."""
 	price = t.resource_price  # [R] (VCMI's resource prices)
 	efficiency = ((x["g_markets"].float() + 1.0) / 20.0).clamp(max=0.5)  # [B]
 	given = price[None, :, None]  # [1, R (sold), 1]
@@ -747,8 +749,12 @@ def trade_options(x, t):
 	trades = torch.ceil(units.unsqueeze(-1) * constant(c.TRADE_FRACTIONS, price.device, torch.float32)).clamp(min=1.0)  # [B, R, R, F]
 	sold, bought = trades * give.unsqueeze(-1), trades * get.unsqueeze(-1)
 	cost = sold * price[None, :, None, None] - bought * price[None, None, :, None]
-	need = t.building_resources[vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)].permute(0, 3, 1, 2)  # [B, R, TO, NB]
-	short = (need > have[:, :, None, None]) & x["build_short"][:, None, : c.OWN_TOWNS]  # [B, R, TO, NB]
+	building = t.building_resources[vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)]  # [B, TO, NB, R]
+	creature = x["t_available_creature"][:, : c.OWN_TOWNS]
+	recruit = t.creature_resources[vocab_index(creature, c.CREATURE_VOCAB)]  # [B, TO, LV, R]
+	need = torch.cat([building, recruit], dim=2).permute(0, 3, 1, 2)  # [B, R, TO, NB + LV]
+	wanted = torch.cat([x["build_short"][:, : c.OWN_TOWNS], (creature >= 0) & (x["t_available"][:, : c.OWN_TOWNS] > 0)], dim=2)
+	short = (need > have[:, :, None, None]) & wanted[:, None]  # [B, R, TO, NB + LV]
 	alone = short & (short.sum(dim=1, keepdim=True) == 1)  # short of this resource only
 	covers = have[:, None, :, None, None, None] + bought[..., None, None] >= need[:, None, :, None]  # [B, R, R, F, TO, NB]
 	keeps = have[:, :, None, None, None, None] - sold[..., None, None] >= need[:, :, None, None]
