@@ -106,8 +106,10 @@ def test_every_part_learns_after_its_zero_starts_move():
 	def loss():  # (each table's log-probabilities weighted at random: the mean of a uniform table's has no gradient)
 		out = model(x)
 		# (fs_plan too: its outputs start at 0, where a square has no gradient)
-		tables = sum((v.clamp(min=-30) * weights.setdefault(k, torch.randn(v.shape, generator=torch.Generator().manual_seed(len(k))))).mean() for k, v in out.items() if k.endswith("_logp") or k == "fs_plan")
-		return tables + out["value"].mean() + out["growth_logit"].mean() + out["end_logit"].mean() + sum(v.pow(2).mean() for k, v in out.items() if k.startswith("fs_") and k != "fs_plan")
+		# (and the battle heads', 2026-11-04, alike)
+		starts_at_0 = ("fs_plan", "fs_tiles", "fs_outcome")
+		tables = sum((v.clamp(min=-30) * weights.setdefault(k, torch.randn(v.shape, generator=torch.Generator().manual_seed(len(k))))).mean() for k, v in out.items() if k.endswith("_logp") or k in starts_at_0)
+		return tables + out["value"].mean() + out["growth_logit"].mean() + out["end_logit"].mean() + sum(v.pow(2).mean() for k, v in out.items() if k.startswith("fs_") and k not in starts_at_0 and v.requires_grad)
 
 	for _ in range(3):
 		optimizer.zero_grad()
@@ -118,7 +120,7 @@ def test_every_part_learns_after_its_zero_starts_move():
 	required = (
 		"encode_hero.", "encode_town.", "encode_tiles.", "encode_global.", "encode_options.", "encode_other.", "reach.", "travel_days.", "sides.", "tile_sides.",
 		"player.", "players.", "join_", "stamp_", "unet.", "read_tiles.", "area.", "blocks.", "norm.", "pair_", "foresight.", "again_", "move_pair.", "travel_",
-		"move_out.", "act_", "build_q.", "building.", "recruit_head.", "hire_", "army_src.", "army_dst.", "army_out.", "trade_head.", "cast_q.", "spell.",
+		"move_out.", "move_mix", "act_", "build_q.", "building.", "recruit_head.", "hire_", "army_src.", "army_dst.", "army_out.", "trade_head.", "cast_q.", "spell.",
 		"buy_q.", "buy_item.", "option_q.", "end_out.", "type_bias", "value_hidden.", "value_heads.", "growth_heads.", "end_head.",
 	)
 	dead = [name for name, p in model.named_parameters() if name.startswith(required) and (p.grad is None or float(p.grad.abs().sum()) == 0)]
@@ -136,6 +138,7 @@ def test_an_update_with_foresight_labels_runs_and_reports_them():
 	foresight = {
 		"move": np.random.default_rng(0).normal(size=(n, ACTION_TARGETS)).astype(np.float32), "move_mask": np.array([d.action_type == c.ActionType.MOVE for d in decisions]),
 		"move_battle": np.ones(n, bool), "move_at": np.array([(d.index // (c.WINDOW * c.WINDOW), (d.index // c.WINDOW) % c.WINDOW, d.index % c.WINDOW) if d.action_type == c.ActionType.MOVE else (0, 0, 0) for d in decisions], np.int64),
+		"move_win": np.random.default_rng(2).integers(0, 2, n).astype(np.float32), "move_stake": np.random.default_rng(3).random(n).astype(np.float32),
 		"answer": np.zeros((n, ACTION_TARGETS), np.float32), "answer_mask": np.array([d.action_type < 0 for d in decisions]), "answer_battle": np.zeros(n, bool),
 		"option": np.array([max(d.index, 0) if d.action_type < 0 else 0 for d in decisions], np.int64),
 		"hero": np.zeros((n, c.OWN_HEROES, 2), np.float32), "hero_mask": x["h_present"][:, : c.OWN_HEROES].copy(), "hero_alive": x["h_present"][:, : c.OWN_HEROES].copy(),
@@ -452,6 +455,7 @@ def test_the_update_converting_in_its_graphs_falls_back_and_checks_its_gradient_
 	foresight = {
 		"move": np.random.default_rng(0).normal(size=(n, ACTION_TARGETS)).astype(np.float32), "move_mask": np.array([d.action_type == c.ActionType.MOVE for d in decisions]),
 		"move_battle": np.ones(n, bool), "move_at": np.array([(d.index // (c.WINDOW * c.WINDOW), (d.index // c.WINDOW) % c.WINDOW, d.index % c.WINDOW) if d.action_type == c.ActionType.MOVE else (0, 0, 0) for d in decisions], np.int64),
+		"move_win": np.random.default_rng(2).integers(0, 2, n).astype(np.float32), "move_stake": np.random.default_rng(3).random(n).astype(np.float32),
 		"answer": np.zeros((n, ACTION_TARGETS), np.float32), "answer_mask": np.array([d.action_type < 0 for d in decisions]), "answer_battle": np.zeros(n, bool),
 		"option": np.array([max(d.index, 0) if d.action_type < 0 else 0 for d in decisions], np.int64),
 		"hero": np.zeros((n, c.OWN_HEROES, 2), np.float32), "hero_mask": x["h_present"][:, : c.OWN_HEROES].copy(), "hero_alive": x["h_present"][:, : c.OWN_HEROES].copy(),
@@ -541,3 +545,221 @@ def test_a_checkpoint_without_the_fight_layers_loads_them_at_0():
 	for name in a:
 		if torch.is_tensor(a[name]):
 			torch.testing.assert_close(a[name], b[name], equal_nan=True)
+
+
+# ---- 2026-11-04: the user's review of MOVE's features (strength estimates, relative features, the mixer, battle heads) ----
+
+def test_a_guard_is_credited_with_the_object_it_blocks_on_a_blocked_tile():
+	"""features.blocked_by_guards: VCMI marks every object's tile blocked (joint7: 3,302 of 3,302), so the region of passable
+	unreachable tiles never held a value and 'behind' was 0 on every tile; now an unreachable object's value enters the
+	region from its own tile and reaches the monster through its zone. A reachable object counts for no guard."""
+	from campaign_model import features as ft
+
+	W = c.WINDOW
+	value, region, zone, monster = (torch.zeros(1, W, W) for _ in range(4))
+	monster[0, 16, 16] = 1.0
+	zone[0, 15:18, 15:18] = 1.0
+	zone[0, 16, 16] = 0.0
+	region[0, 10:15, 13:20] = 1.0  # north of the zone, unreachable and passable
+	value[0, 11, 16] = 2000.0  # an object (on a blocked tile, not one of the region's) inside it
+	behind = ft.blocked_by_guards(value, region.bool(), zone, monster)
+	assert float(behind[0, 16, 16]) == pytest.approx(2000.0)
+	assert float(behind.sum()) == pytest.approx(2000.0)  # (on the monster's tile only)
+	assert float(ft.blocked_by_guards(torch.zeros(1, W, W), region.bool(), zone, monster).sum()) == 0.0  # (nothing behind it)
+
+
+def test_vcmis_damage_modifier_and_the_damage_race():
+	"""features.damage_modifier: +5% an attack point over the defense (at most +300%), -2.5% a point under (at most -70%);
+	race_strength in log1p(army strength)'s units: twice the army is ~log 2 stronger, an empty army hopeless."""
+	from campaign_model import features as ft
+
+	d = torch.tensor([0.0, 10.0, 60.0, 100.0, -10.0, -28.0, -50.0])
+	assert ft.damage_modifier(d).tolist() == pytest.approx([1.0, 1.5, 4.0, 4.0, 0.75, 0.3, 0.3])
+	one = lambda v: torch.tensor([float(v)])  # noqa: E731
+	even = ft.race_strength(one(1000), one(100), one(5), one(5), one(1000), one(100), one(5), one(5))
+	double = ft.race_strength(one(2000), one(200), one(5), one(5), one(1000), one(100), one(5), one(5))
+	empty = ft.race_strength(one(0), one(0), one(0), one(0), one(1000), one(100), one(5), one(5))
+	assert float(even) == pytest.approx(0.0, abs=1e-6)
+	assert float(double) == pytest.approx(math.log(2.0), abs=1e-3)
+	assert float(empty) < -5.0
+	# our attack 10 over their defense: our damage x1.5, our race up by log(1.5) / 2
+	stronger = ft.race_strength(one(1000), one(100), one(15), one(5), one(1000), one(100), one(5), one(5))
+	assert float(stronger) == pytest.approx(0.5 * math.log(1.5), abs=1e-3)
+
+
+def test_a_heros_spell_damage_is_its_best_spell_as_its_mana_allows():
+	"""features.spell_damage: the best of the damage spells it knows at its spell power, cast at most SPELL_ROUNDS times as
+	its mana allows, a round's share; 0 without a spell or the mana for one."""
+	from types import SimpleNamespace
+
+	from campaign_model import features as ft
+
+	x = {"h_spells": torch.zeros(1, 3, c.N_SPELLS), "h_primary": torch.zeros(1, 3, 4), "h_mana": torch.zeros(1, 3)}
+	x["h_spells"][0, 0, 17] = 1  # Lightning Bolt: 10 + 25 x power, 10 mana
+	x["h_primary"][0, 0, 2], x["h_mana"][0, 0] = 5, 30
+	x["h_spells"][0, 1, 15] = x["h_spells"][0, 1, 18] = 1  # Magic Arrow (10 + 10 x power, 5) and Implosion (100 + 75 x power, 30)
+	x["h_primary"][0, 1, 2], x["h_mana"][0, 1] = 2, 40
+	x["h_spells"][0, 2, 17] = 1  # Lightning Bolt without the mana for it
+	x["h_mana"][0, 2] = 9
+	damage = ft.spell_damage(x, SimpleNamespace())[0]
+	assert float(damage[0]) == pytest.approx(10 + 25 * 5)  # 3 casts over 3 rounds
+	assert float(damage[1]) == pytest.approx(max((100 + 75 * 2) * 1, (10 + 10 * 2) * 3) / 3)  # Implosion once beats 3 Arrows
+	assert float(damage[2]) == 0.0
+
+
+def test_the_strength_estimates_are_the_main_armys_for_our_strongest_hero_and_zero_without_a_fight():
+	"""model.tile_features' move_strength (four estimates x this hero, our main army): nothing where no fight starts; the
+	same for this hero and the main army in our strongest hero's window, the main army's no weaker in the others (army
+	estimate); hopeless only where a fight starts, from the kindest of this hero's estimates."""
+	torch.manual_seed(0)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = tensors(rich_inputs(4, 7))
+	with torch.no_grad():
+		known = m.domain_knowledge(x)
+	s, r = known.move_strength, known.move_relative
+	fights = known.tile_fights > 0
+	assert bool(fights.any()) and s.shape[-1] == 8 and r.shape[-1] == 6
+	assert float(s[~fights].abs().sum()) == 0.0 and float(r[..., 0][~fights].abs().sum()) == 0.0
+	strength = known.hero_strength[:, : c.OWN_HEROES]
+	own = x["h_present"][:, : c.OWN_HEROES] & (x["h_owner"][:, : c.OWN_HEROES] == c.OWNER_SELF)
+	strongest = torch.where(own, strength, torch.full_like(strength, -1e9)).argmax(dim=1)
+	for k, w in enumerate(known.windows.tolist()):
+		if not bool(known.real[k]) or not bool(fights[k].any()):
+			continue
+		b, slot = divmod(w, c.OWN_HEROES)
+		this, main = s[k][fights[k]][:, :4], s[k][fights[k]][:, 4:]
+		if slot == int(strongest[b]):
+			torch.testing.assert_close(this, main)
+		else:
+			assert bool((main[:, 0] >= this[:, 0] - 1e-5).all())
+	hopeless = (-s[..., :4].amax(dim=-1) - 1.0).clamp(0.0, 6.0) / 3 * fights
+	# (move_strength is clamped to +-2: hopeless reads the estimates before it, so compare where they are inside)
+	inside = (s[..., :4].abs() < 2.0).all(dim=-1)
+	torch.testing.assert_close(r[..., 0][inside], hopeless[inside])
+
+
+def test_the_mixer_starts_as_nk2s_rule_on_hopeless_tiles_only():
+	"""model_v2's mixer: its hidden layer's output starts at 0 and its direct path at HOPELESS_LOGIT x hopeless, so the
+	fresh model's MOVE logits differ from the same model without that weight by exactly that, on the hopeless tiles."""
+	from campaign_model.model import dense
+	from campaign_model.model_v2 import HOPELESS, HOPELESS_LOGIT
+
+	torch.manual_seed(3)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = tensors(rich_inputs(4, 7))
+	with torch.no_grad():
+		known = m.domain_knowledge(x)
+		hopeless = dense(known.move_relative[..., 0], known.windows, known.n, 4)
+		with_rule = m(x)["move_logp"].clone()
+		m.move_mix_direct.weight[0, HOPELESS] = 0.0
+		without = m(x)["move_logp"]
+	assert float(hopeless.sum()) > 0
+	legal = x["move_mask"] & torch.isfinite(with_rule) & torch.isfinite(without)
+	for i in range(4):
+		rest = ((with_rule - without) - HOPELESS_LOGIT * hopeless)[i][legal[i]]
+		if rest.numel():
+			assert torch.allclose(rest, rest[0].expand_as(rest), atol=1e-4), i
+
+
+def test_an_old_checkpoint_loads_into_the_new_move_inputs_with_the_same_outputs():
+	"""model_v2.migrate_move_inputs: a state dict from before 2026-11-04 (move_pair's inputs: the pairs, the foresight,
+	MOVE_FEATURES and the prior again) loads (strict) with move_pair's columns moved: from a model whose new columns are 0,
+	the dropped features' and behind's weights 0 and the prior's split over its two copies, the same outputs (the mixer's
+	rule aside)."""
+	from campaign_model import model_v2
+
+	torch.manual_seed(5)
+	source = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	base = source.pair_dim + model_v2.FORESIGHT_HIDDEN
+	with torch.no_grad():
+		source.move_pair.up.weight[:, base + len(model_v2.MOVE_KEPT):] = 0.0  # (new inputs, the mixer's: 0 in a migrated model)
+		source.move_pair.up.weight[:, base + model_v2.MOVE_KEPT.index(MOVE_FEATURES_INDEX("behind"))] = 0.0
+		source.move_mix_direct.weight.zero_()
+	new = source.move_pair.up.weight.detach()
+	old = torch.zeros(new.shape[0], base + model_v2.OLD_MOVE_KNOWN)
+	old[:, :base] = new[:, :base]
+	for to, frm in enumerate(model_v2.MOVE_KEPT):
+		old[:, base + frm] = new[:, base + to]
+	value = base + MOVE_FEATURES_INDEX("value")
+	old[:, value], old[:, base + model_v2.OLD_MOVE_KNOWN - 1] = 0.25 * new[:, base], 0.75 * new[:, base]  # (two copies of one input)
+	state = {k: v for k, v in source.state_dict().items() if not k.startswith(("pair_strength", "move_mix", "foresight.tiles", "foresight.outcome"))}
+	state["move_pair.up.weight"] = old
+	loaded = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	loaded.load_state_dict(state)
+	with torch.no_grad():
+		loaded.move_mix_direct.weight.zero_()  # (the rule aside)
+		x = tensors(rich_inputs(3, 2))
+		a, b = source(x), loaded(x)
+	for name in ("move_logp", "type_logp", "value", "fs_move"):
+		torch.testing.assert_close(a[name], b[name], equal_nan=True)
+
+
+def MOVE_FEATURES_INDEX(name):
+	from campaign_model.model import MOVE_FEATURES
+
+	return MOVE_FEATURES.index(name)
+
+
+def test_adams_moments_of_move_pair_move_with_its_columns():
+	"""train.fit_moments: moments loaded for move_pair's first layer from before 2026-11-04 (another shape: the first step
+	would fail) are moved as its weights are (no folding: the first copy's), any other misfit started fresh."""
+	from campaign_model import model_v2
+	from campaign_model.train import fit_moments
+
+	model = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	optimizer = make_optimizer(model, CampaignConfig())
+	p = model.move_pair.up.weight
+	base = model.pair_dim + model_v2.FORESIGHT_HIDDEN
+	old = torch.arange(p.shape[0] * (base + model_v2.OLD_MOVE_KNOWN), dtype=torch.float32).reshape(p.shape[0], -1)
+	optimizer.state[p] = {"step": torch.tensor(5.0), "exp_avg": old.clone(), "exp_avg_sq": old.clone() ** 2}
+	q = model.act_move.weight
+	optimizer.state[q] = {"step": torch.tensor(5.0), "exp_avg": torch.zeros(3), "exp_avg_sq": torch.zeros(3)}
+	fit_moments(optimizer, model)
+	state = optimizer.state[p]
+	assert state["exp_avg"].shape == p.shape and state["exp_avg_sq"].shape == p.shape
+	torch.testing.assert_close(state["exp_avg"][:, :base], old[:, :base])
+	for to, frm in enumerate(model_v2.MOVE_KEPT):
+		expected = 0.0 * old[:, base + frm] if frm == MOVE_FEATURES_INDEX("behind") else old[:, base + frm]
+		torch.testing.assert_close(state["exp_avg"][:, base + to], expected)
+	assert float(state["exp_avg"][:, base + len(model_v2.MOVE_KEPT):].abs().sum()) == 0.0
+	assert q not in optimizer.state  # (a misfit with no migration: fresh)
+
+
+def test_the_battle_heads_labels_and_loss():
+	"""foresight: a MOVE a battle followed is labelled with its outcome (won, the stake's share lost: a loss takes it
+	all); the battle heads' loss is finite and lower for predictions that agree with the tiles' kinds."""
+	from campaign_model.foresight import LABEL_NAMES, battle_heads_loss, stake_lost
+
+	assert stake_lost(battle()) == pytest.approx(5 * game_values_creature(0) / (20 * game_values_creature(0)))
+	assert stake_lost(battle(won=False, casualties=((0, 20), (1, 4)))) == 1.0
+	W = c.WINDOW
+	d = lambda day, kind, action, index: Decision("RED", day, kind, 0, 1, action, index, -1, 0.0, (0.5,) * 3, 0, b"")  # noqa: E731
+	moves = [d(1, c.DecisionKind.TURN, c.ActionType.MOVE, 1 * W * W + 3 * W + 4), d(1, c.DecisionKind.TURN, c.ActionType.END, -1), d(2, c.DecisionKind.TURN, c.ActionType.END, -1)]
+	game = Game(decisions=moves)
+	game.battles = {"RED": [dict(battle(won=False, casualties=((0, 20), (1, 4))), serial=1)]}
+	n = len(moves)
+	x = {"h_present": np.zeros((n, c.N_HEROES), bool), "h_owner": np.zeros((n, c.N_HEROES), np.int64), "h_type": np.full((n, c.N_HEROES), -1), "g_resources": np.full((n, c.N_RESOURCES), 10)}
+	labels = game_labels(game, x, np.zeros((n, 10)), np.full((n, c.N_HEROES), 500.0))
+	assert set(labels) == LABEL_NAMES
+	assert labels["move_battle"][0] and labels["move_win"][0] == 0.0 and labels["move_stake"][0] == 1.0
+	# the loss: 2 decisions; a fight tile at (0, 3, 3), the chosen tiles (0, 1, 1) (a battle followed) and (1, 2, 2)
+	b = 2
+	out = {"fs_tiles": torch.zeros(b, c.OWN_HEROES, W, W, 3, requires_grad=True), "fs_outcome": torch.zeros(b, c.OWN_HEROES, W, W, 2, requires_grad=True),
+		"fs_fight_tile": torch.zeros(b, c.OWN_HEROES, W, W), "fs_move_legal": torch.zeros(b, c.OWN_HEROES, W, W)}
+	out["fs_move_legal"][:, 0, :5, :5] = 1.0
+	out["fs_fight_tile"][0, 0, 3, 3] = out["fs_fight_tile"][0, 0, 1, 1] = 1.0
+	t = {"move_mask": torch.tensor([True, True]), "move_battle": torch.tensor([True, False]), "move_win": torch.tensor([1.0, 0.0]), "move_stake": torch.tensor([0.2, 0.0])}
+	every, at = torch.arange(b), torch.tensor([[0, 1, 1], [0, 2, 2]])
+	tiles, won, stake = battle_heads_loss(out, t, every, at)
+	assert all(bool(torch.isfinite(v)) for v in (tiles, won, stake))
+	(tiles + won + stake).backward()
+	g = out["fs_tiles"].grad
+	assert float(g[0, 0, 0, 0, 0]) < 0 and float(g[0, 0, 3, 3, 0]) > 0  # a plain tile toward 'no fight', a fight tile away from it
+	assert float(g[0, 0, 1, 1, 1]) < 0  # the chosen fight tile toward 'a battle followed'
+	assert float(out["fs_outcome"].grad[0, 0, 1, 1, 0]) < 0 and float(out["fs_outcome"].grad[1].abs().sum()) == 0.0  # (no battle: no outcome)
+
+
+def game_values_creature(creature):
+	from game_values import creature_value
+
+	return creature_value(creature)

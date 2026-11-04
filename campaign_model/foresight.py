@@ -82,7 +82,25 @@ def battle_score(battle):
 	return reward.terminal_reward(start[ours], end[ours], start[1 - ours], end[1 - ours])
 
 
+def stake_lost(battle):
+	"""The share of our side's stake a battle took, 0..1 (the user, 2026-11-04: battle_score divides by both sides' assets,
+	so a hero lost to a stack 50x its army scored ~-0.05): all of it when we did not win (the hero leaves the map with
+	everything it had), else its casualties over its army's value and its hero's asset at the start (battle_score's)."""
+	ours = battle["side"]
+	if battle["winner"] != ours:
+		return 1.0
+	army, hero, _, _ = side_assets(battle, ours)
+	lost = sum(count * game_values.creature_value(creature) for creature, count in battle["casualties"][ours])
+	return float(min(1.0, lost / max(army + hero, 1.0)))
+
+
 # ---- the labels of a game ----
+
+LABEL_NAMES = frozenset((  # game_labels' arrays (learner.step computes a game's again when its precomputed ones lack one)
+	"move", "move_mask", "move_battle", "move_at", "move_win", "move_stake", "answer", "answer_mask", "answer_battle", "option",
+	"hero", "hero_mask", "hero_alive", "turn", "turn_mask", "plan", "plan_mask",
+))
+
 
 def game_labels(game, x, phi_parts, hero_gold):
 	"""The foresight's labels for every decision of a game (records.Game, its decoded inputs x, Φ's parts [N, PARTS] and
@@ -90,7 +108,7 @@ def game_labels(game, x, phi_parts, hero_gold):
 	n = len(game.decisions)
 	labels = {
 		"move": np.zeros((n, ACTION_TARGETS), np.float32), "move_mask": np.zeros(n, bool), "move_battle": np.zeros(n, bool),
-		"move_at": np.zeros((n, 3), np.int64),
+		"move_at": np.zeros((n, 3), np.int64), "move_win": np.zeros(n, np.float32), "move_stake": np.zeros(n, np.float32),
 		"answer": np.zeros((n, ACTION_TARGETS), np.float32), "answer_mask": np.zeros(n, bool), "answer_battle": np.zeros(n, bool),
 		"option": np.zeros(n, np.int64),
 		"hero": np.zeros((n, HO, HERO_TARGETS), np.float32), "hero_mask": np.zeros((n, HO), bool), "hero_alive": np.zeros((n, HO), bool),
@@ -130,6 +148,9 @@ def game_labels(game, x, phi_parts, hero_gold):
 				if is_move:
 					hero, rest = divmod(d.index, W * W)
 					labels["move_at"][i] = (hero, rest // W, rest % W)
+					if fought:  # (the battle's outcome: the battle heads' "move_win" and "move_stake")
+						labels["move_win"][i] = float(fought[0]["winner"] == fought[0]["side"])
+						labels["move_stake"][i] = stake_lost(fought[0])
 				else:
 					labels["option"][i] = d.index
 			# Our heroes tomorrow, the turn's end, the resources tomorrow
@@ -249,7 +270,34 @@ def action_loss(predicted, target, battle, config, rows=None):
 	return fought, score, parts
 
 
-PART_NAMES = ("move_battle", "move_score", "move_parts", "answer_battle", "answer_score", "answer_parts", "hero_alive", "hero_army", "turn", "plan")  # foresight_loss's parts, in this order
+def battle_heads_loss(out, labels, every, at):
+	"""The battle heads' losses (model_v2.Foresight.tiles, .outcome; the user, 2026-11-04: heads that mean something):
+	  move_tiles  every legal window tile of a MOVE decision: one not chosen is known only to be a fight tile or not (our
+	              features', fs_fight_tile), its loss -log P(no fight) or -log P(a fight, followed by a battle or not),
+	              the two kinds weighted alike whatever their numbers (a fight tile was ~1 in 30 legal tiles); the chosen
+	              one by what followed: a battle, a fight tile without one (it fled, it joined), or neither
+	  move_win    on a MOVE a battle followed: P(we won it) (BCE)
+	  move_stake  and the share of the hero's stake it took (foresight.stake_lost; BCE against it)"""
+	logp = F.log_softmax(out["fs_tiles"].float(), dim=-1)  # [B, HO, W, W, 3]
+	legal, fight = out["fs_move_legal"] > 0, out["fs_fight_tile"] > 0
+	move = labels["move_mask"]
+	chosen = torch.zeros_like(legal)
+	chosen[every, at[:, 0], at[:, 1], at[:, 2]] = move  # (a row with no MOVE: its at is 0s, nothing set)
+	rest = legal & ~chosen
+	plain = masked_mean(-logp[..., 0], rest & ~fight)
+	fighting = masked_mean(-torch.logsumexp(logp[..., 1:], dim=-1), rest & fight)
+	picked, fight_at = logp[every, at[:, 0], at[:, 1], at[:, 2]], fight[every, at[:, 0], at[:, 1], at[:, 2]]
+	zero = torch.zeros_like(at[:, 0])
+	kind = torch.where(labels["move_battle"], zero + 1, torch.where(fight_at, zero + 2, zero))
+	tiles = 0.5 * (plain + fighting) + masked_mean(-picked.gather(1, kind.unsqueeze(1)).squeeze(1), move)
+	outcome = out["fs_outcome"][every, at[:, 0], at[:, 1], at[:, 2]].float()
+	fought = labels["move_battle"] & move
+	won = masked_mean(F.binary_cross_entropy_with_logits(outcome[:, 0], labels["move_win"], reduction="none"), fought)
+	stake = masked_mean(F.binary_cross_entropy_with_logits(outcome[:, 1], labels["move_stake"], reduction="none"), fought)
+	return tiles, won, stake
+
+
+PART_NAMES = ("move_battle", "move_score", "move_parts", "answer_battle", "answer_score", "answer_parts", "hero_alive", "hero_army", "turn", "plan", "move_tiles", "move_win", "move_stake")  # foresight_loss's parts, in this order
 
 
 def foresight_loss(out, labels, config=ForesightConfig()):
@@ -263,6 +311,7 @@ def foresight_loss(out, labels, config=ForesightConfig()):
 	at = labels["move_at"]
 	predicted = out["fs_move"][every, at[:, 0], at[:, 1], at[:, 2]]
 	parts["move_battle"], parts["move_score"], parts["move_parts"] = action_loss(predicted, labels["move"], labels["move_battle"], config, labels["move_mask"])
+	parts["move_tiles"], parts["move_win"], parts["move_stake"] = battle_heads_loss(out, labels, every, at)
 	predicted = out["fs_answer"][every, labels["option"]]
 	parts["answer_battle"], parts["answer_score"], parts["answer_parts"] = action_loss(predicted, labels["answer"], labels["answer_battle"], config, labels["answer_mask"])
 	predicted = out["fs_hero"][:, :HO]

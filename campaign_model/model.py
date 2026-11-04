@@ -83,6 +83,9 @@ def game_tables():
 		"creature_cost": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_unit": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_health": torch.zeros(c.CREATURE_VOCAB + 1),
+		"creature_attack": torch.zeros(c.CREATURE_VOCAB + 1),
+		"creature_defense": torch.zeros(c.CREATURE_VOCAB + 1),
+		"creature_damage": torch.zeros(c.CREATURE_VOCAB + 1),  # (its average damage a hit: min and max's mean)
 		"resource_price": torch.tensor([float(v) for v in RESOURCE_PRICES.values()]),
 		"building_value": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS),
 		"artifact_price": torch.zeros(c.ARTIFACT_VOCAB + 1),
@@ -110,6 +113,9 @@ def game_tables():
 				tables["creature_cost"][creature_id] = float(creature_cost(creature_id))
 				tables["creature_unit"][creature_id] = float(_unit(creature_id, EmpireConfig()))
 				tables["creature_health"][creature_id] = float(row.get("hit_points", 0))
+				tables["creature_attack"][creature_id] = float(row.get("attack", 0))
+				tables["creature_defense"][creature_id] = float(row.get("defense", 0))
+				tables["creature_damage"][creature_id] = 0.5 * float(row.get("damage_min", 0) + row.get("damage_max", 0))
 				tables["creature_growth"][creature_id] = float(row.get("growth", 0))
 				tables["creature_luck"][creature_id] = float(feels(creature_id, NO_LUCK))
 				tables["creature_morale"][creature_id] = float(feels(creature_id, NO_MORALE))
@@ -364,6 +370,13 @@ class CustomFeatures(nn.Module):
 		f.level_gain = ft.level_gains(x, self)
 		f.town_counts, f.town_power, f.town_gold, f.town_health = ft.army(x["t_garrison_creature"], x["t_garrison_count"], x["t_detailed"], self)
 		f.town_strength = self.town_strength(x, f.town_power)
+		# The armies' fighting numbers (features.army_battle; a hero's attack and defense add its primary skills'), and our
+		# heroes' spell damage a round (features.spell_damage): tile_features' damage-race estimates of a fight
+		f.hero_damage, f.hero_attack, f.hero_defense = ft.army_battle(x["h_army_creature"], x["h_army_count"], x["h_detailed"], self)
+		primary = x["h_primary"].clamp(min=0).float()
+		f.hero_attack, f.hero_defense = f.hero_attack + primary[..., 0], f.hero_defense + primary[..., 1]
+		f.hero_spells = ft.spell_damage(x, self)
+		f.town_damage, f.town_attack, f.town_defense = ft.army_battle(x["t_garrison_creature"], x["t_garrison_count"], x["t_detailed"], self)
 		f.town_value = self.town_value(x)
 		f.town_danger = ft.town_danger(x, f.hero_strength, f.town_strength)
 		f.map_worth, f.map_gate, f.map_monster_power = self.map_objects(x)
@@ -520,8 +533,9 @@ class CustomFeatures(nn.Module):
 		# Kill a guard, take what it blocks (Nullkiller2's ClusterBehavior): a wandering monster's fight counts part of the
 		# best object in a region we reach only through its zone (features.blocked_by_guards), as often as we win it
 		zone = ft.bit(flags, c.TILE_GUARDED)
-		region = ft.bit(flags, c.TILE_ON_MAP) & ft.bit(flags, c.TILE_REVEALED) & ~ft.bit(flags, c.TILE_BLOCKED) & (pick("w_turns") < 0) & ~zone
-		behind = ft.blocked_by_guards(object_gold, region, zone.float(), monster.float())
+		unreachable = pick("w_turns") < 0
+		region = ft.bit(flags, c.TILE_ON_MAP) & ft.bit(flags, c.TILE_REVEALED) & ~ft.bit(flags, c.TILE_BLOCKED) & unreachable & ~zone
+		behind = ft.blocked_by_guards(object_gold * unreachable, region, zone.float(), monster.float())
 		fight = fight + self.block_share() * win * behind
 		# Stepping into a wandering monster's zone of control starts its fight: the worst guard's
 		guarded = ft.bit(flags, c.TILE_GUARDED) & ~has_enemy
@@ -533,6 +547,46 @@ class CustomFeatures(nn.Module):
 		loss = torch.maximum(loss, -ft.worst_guard(-loss, monster, guarded))
 		win = torch.where(guarded, ft.worst_guard(win, monster, guarded), win * has_enemy)
 		fights = has_enemy | guarded
+		# The fight in four estimates of strength (the user, 2026-11-04: several that agree are easier to act on), each a
+		# log ratio ours over theirs, for this hero and for our main army (our strongest hero), where a fight starts (the
+		# tile's own enemy's, or the worst guard's next to a tile of a monster's zone):
+		#   army    count x fight value (Nullkiller2's getArmyStrength)
+		#   total   that and the hero's attack and defense (Nullkiller2's getTotalStrength): `ratio`'s
+		#   race    a damage race (features.race_strength): each side's hit points x its damage a round at its attack
+		#           against the other's defense
+		#   spells  the race with our best damage spell a round (features.spell_damage)
+		# A creature bank's guards are known only by strength and hit points: their race is the army estimate
+		monster_damage = count * self.creature_damage[index]
+		monster_health = count * self.creature_health[index]
+		their_army = torch.maximum(
+			torch.maximum(torch.log1p(count * self.fight_value[index]) * monster, torch.log1p(bank_power) * bank),
+			torch.maximum(of(heroes_here, torch.log1p(f.hero_power)), of(towns_here, torch.log1p(f.town_power))),
+		)
+		their_hp = monster_health + of(heroes_here, f.hero_health) + of(towns_here, f.town_health)
+		their_damage = monster_damage + of(heroes_here, f.hero_damage) + of(towns_here, f.town_damage)
+		their_attack = (monster_damage * self.creature_attack[index] + of(heroes_here, f.hero_damage * f.hero_attack) + of(towns_here, f.town_damage * f.town_attack)) / their_damage.clamp(min=1e-6)
+		their_defense = (monster_health * self.creature_defense[index] + of(heroes_here, f.hero_health * f.hero_defense) + of(towns_here, f.town_health * f.town_defense)) / their_hp.clamp(min=1e-6)
+		own_slot = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
+		strongest = torch.where(own_slot, f.hero_strength[:, :HO], torch.full_like(f.hero_strength[:, :HO], -1e9)).argmax(dim=1)  # [B]
+
+		def of_main(values):  # [K] of a [B, H] per-hero value: our strongest hero's, for each window's decision
+			return values[:, :HO].gather(1, strongest.unsqueeze(1)).squeeze(1).index_select(0, decision)
+
+		def estimates(pick_hero):  # pick_hero: ours or of_main -> [K, W, W, 4] (army, total, race, spells)
+			side = lambda values: pick_hero(values)[:, None, None]  # noqa: E731
+			army = side(torch.log1p(f.hero_power)) - their_army
+			race = ft.race_strength(side(f.hero_health), side(f.hero_damage), side(f.hero_attack), side(f.hero_defense), their_hp, their_damage, their_attack, their_defense)
+			spells = ft.race_strength(side(f.hero_health), side(f.hero_damage), side(f.hero_attack), side(f.hero_defense), their_hp, their_damage, their_attack, their_defense, side(f.hero_spells))
+			out = []
+			for r in (army, side(f.hero_strength) - their_strength, torch.where(bank, army, race), torch.where(bank, army, spells)):
+				r = r * has_enemy
+				out.append(torch.where(guarded, ft.worst_guard(r, monster, guarded), r))
+			return torch.stack(out, dim=-1)
+
+		this_hero, main_army = estimates(ours), estimates(of_main)
+		# How hopeless the fight is by the kindest of this hero's estimates: beyond e^-1 of their strength, 0..6 / 3 (a
+		# guard 54x our strength: 1)
+		hopeless = (-this_hero.amax(dim=-1) - 1.0).clamp(0.0, 6.0) / 3 * fights
 		explore = ft.unexplored_around(flags)
 		# The object is ours only if we win the fight in front of it (a bank's guards, a monster's zone, a town's garrison)
 		value = object_gold * torch.where(fights, win, torch.ones_like(win)) + fight + explore * self.explore_gold()
@@ -576,6 +630,21 @@ class CustomFeatures(nn.Module):
 		)  # [K, W, W, 3]
 		home_weight, defend_weight, ferry_weight, _, _ = self.pull_weights()
 		prior = ft.value_logit(value) + (torch.stack([home_weight, defend_weight, ferry_weight]) * pulls).sum(dim=-1)
+		# model_v2's MOVE features beside MOVE_FEATURES, relative so they keep their meaning on any map and day (the user,
+		# 2026-11-04): hopeless (above); the object as a share of our Φ (log(1 + 100 x share) / 3: 1% 0.23, 10% 0.8); where
+		# a fight starts, what losing it takes (the army, the hero, its replacement) and what winning it takes (the enemy's
+		# loss and the experience, the object there and what a guard blocks), each a share of Φ; our town here, its danger x
+		# its stakes as a share of Φ; and what this hero can take into its army here (a town's reinforcements over its own
+		# army; a scout's army over the main hero's it would join)
+		phi = f.phi_total.clamp(min=1000.0).index_select(0, decision)[:, None, None]
+		share = lambda gold: torch.log1p(100.0 * gold.clamp(min=0) / phi) / 3  # noqa: E731
+		stake = (ours(f.hero_gold) + hero)[:, None, None] * fights
+		taken = (torch.where(guarded, ft.worst_guard(gain, monster, guarded), gain * has_enemy) + object_gold + behind) * fights
+		reinforce = torch.log1p(of(ours_here, f.reinforcements) / (ours(f.hero_gold)[:, None, None] + 500.0)) / 3
+		ferry = torch.log1p(ours(f.hero_gold)[:, None, None] * (1 - main)[:, None, None] / (of(mains_here, f.hero_gold[:, :HO]) + 500.0)) / 3 * mains_here.any(dim=-1)
+		relative = torch.stack(
+			[hopeless, share(object_gold), share(stake), share(taken), share(of(ours_here, f.town_danger * f.town_stakes)), torch.maximum(reinforce, ferry)], dim=-1
+		)  # [K, W, W, MOVE_RELATIVE]
 		move = torch.cat(
 			[
 				torch.stack(
@@ -604,7 +673,10 @@ class CustomFeatures(nn.Module):
 			],
 			dim=-1,
 		)  # CELL_FEATURES
-		return {"tile_value": value, "tile_prior": prior, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight, "tile_fight_ratio": fight_ratio, "tile_fights": fights.float()}
+		return {
+			"tile_value": value, "tile_prior": prior, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight, "tile_fight_ratio": fight_ratio, "tile_fights": fights.float(),
+			"move_strength": torch.cat([this_hero, main_army], dim=-1).clamp(-2.0, 2.0), "move_relative": relative,  # (model_v2: MOVE_STRENGTH, MOVE_RELATIVE)
+		}
 
 
 class MapEncoder(nn.Module):
@@ -768,8 +840,9 @@ class PairBias(nn.Module):
 ADDED = ("features.move_discount",)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
-# (2026-11-03: model_v2's pair_fight and move_fight, the fight features)
-ADDED_HEADS = ("foresight.plan", "pair_fight", "move_fight")  # (2026-11-03: the fight features, at 0)
+# (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
+# the mixer (move_mix*: its direct path as the fresh model has it, Nullkiller2's rule) and the foresight's battle heads)
+ADDED_HEADS = ("foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome")
 
 
 def with_added(state_dict, own):

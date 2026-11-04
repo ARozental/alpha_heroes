@@ -54,14 +54,14 @@ from .labels import (
 	label, ladder_targets, pooled_ev, residual_variances, share_change_labels,
 )
 from .advice import teacher_sets
-from .foresight import labels_of
+from .foresight import LABEL_NAMES, labels_of
 from .labeler import Labeler
 from .model import build_model
 from .records import NO_EFFECT, TEACHER, decode_fields, decode_inputs
-from .train import HEAD_SCALE_RAMP, _prefetched, load_optimizer, make_optimizer, migrate_subtypes, model_kwargs, ppo_update, usable
+from .train import HEAD_SCALE_RAMP, _prefetched, fit_moments, load_optimizer, make_optimizer, migrate_subtypes, model_kwargs, ppo_update, usable
 
 TYPES = [a.name.lower() for a in c.ActionType]
-FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answer") for part in ("battle", "score", "parts")) + ("foresight_hero_alive", "foresight_hero_army", "foresight_turn", "foresight_plan")
+FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answer") for part in ("battle", "score", "parts")) + ("foresight_hero_alive", "foresight_hero_army", "foresight_turn", "foresight_plan", "foresight_move_tiles", "foresight_move_win", "foresight_move_stake")
 # The shared layers' gradient norm from each term of the loss as it enters it (foresight.gradient_check at weight 1,
 # times the term's weight; grad_shared_foresight is the foresight's with its plan, these the plan's alone and the rest's),
 # and the loss shares' weights (config.loss_shares)
@@ -499,7 +499,8 @@ class CampaignLearner:
 			end["price"].append(price[fresh])
 			decisions += [d for d, keep in zip(game.decisions, fresh) if keep]
 			if foresight is not None:
-				rows = pre["foresight"] if pre is not None and "foresight" in pre else labels_of(game, self.features_cpu)
+				# (labels precomputed before a label was added, a spooled game's at a resume: computed again here)
+				rows = pre["foresight"] if pre is not None and "foresight" in pre and LABEL_NAMES <= pre["foresight"].keys() else labels_of(game, self.features_cpu)
 				foresight.append({name: value[fresh] for name, value in rows.items()})
 			if sets is not None:  # (over all the game's decisions: what we did counts, usable or not)
 				full = getattr(game, "all_decisions", game.decisions)
@@ -1129,6 +1130,7 @@ def _update_worker(config, kwargs, device_name, state, requests, results, latest
 	model.load_state_dict(state["model"])
 	if state.get("optimizer"):
 		optimizer.load_state_dict(state["optimizer"])
+		fit_moments(optimizer, model)
 	use_fused(optimizer)
 	lr_scale = state["lr_scale"]
 	while (request := requests.get()) is not None:

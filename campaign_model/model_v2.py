@@ -186,6 +186,11 @@ class Foresight(nn.Module):
 		self.plan = SwiGLU(pair_dim, pair_dim, FORESIGHT_HIDDEN)
 		self.plan_out = zero_output(nn.Linear(FORESIGHT_HIDDEN, 1))
 		self.plan_none = zero_output(nn.Linear(dim, 1))
+		# The battle a step starts, on every window tile (foresight.py "move_tiles"; the user, 2026-11-04): no fight can start
+		# there / a fight tile, a battle followed / a fight tile, none did (it fled, it joined); and on a battle, P(we win it)
+		# and the share of the hero's stake it took ("move_win", "move_stake"). At 0 to begin with; read by MOVE (detached)
+		self.tiles = zero_output(nn.Linear(FORESIGHT_HIDDEN, 3))
+		self.outcome = zero_output(nn.Linear(FORESIGHT_HIDDEN, 2))
 
 
 class Memory(nn.Module):
@@ -237,8 +242,9 @@ class CampaignModelV2(nn.Module):
 	plan_outputs = False  # fs_plan too (plan_of): the trainer's model sets it (train.ppo_update); a server's does not
 
 	def load_state_dict(self, state_dict, strict=True, assign=False):
-		"""A checkpoint from before a parameter was added (model.ADDED) loads with it at 0: the model as it was."""
-		return super().load_state_dict(with_added(state_dict, self.state_dict()), strict=strict, assign=assign)
+		"""A checkpoint from before a parameter was added (model.ADDED) loads with it at 0: the model as it was; one from
+		before 2026-11-04's MOVE features with move_pair's first layer moved to its inputs now (migrate_move_inputs)."""
+		return super().load_state_dict(with_added(migrate_move_inputs(state_dict), self.state_dict()), strict=strict, assign=assign)
 
 	def __init__(self, dim=64, cell_dim=16, heads=4, layers=2, share_target="share"):
 		"""cell_dim: the map tiles' width (the U-Net's at full resolution; twice and four times it at half and a quarter):
@@ -291,6 +297,7 @@ class CampaignModelV2(nn.Module):
 		# there starts (fight_features: its log strength ratio, the user's, 2026-11-03), at 0 to begin with
 		self.pair_hero, self.pair_tile, self.pair_reach = nn.Linear(d, dp), nn.Linear(dc, dp), nn.Linear(dc, dp)
 		self.pair_fight = zero_output(nn.Linear(FIGHT_FEATURES, dp))
+		self.pair_strength = zero_output(nn.Linear(MOVE_STRENGTH + 1, dp))  # (2026-11-04: the four estimates x two sides, hopeless)
 		self.foresight = Foresight(d, dp)
 		# think_again
 		self.again_global = E.Tokenizer(d + FORESIGHT_HIDDEN + ft_phi_features() + 3, d, embedded=False)
@@ -298,7 +305,18 @@ class CampaignModelV2(nn.Module):
 		self.again_option = E.Tokenizer(d + FORESIGHT_HIDDEN, d, embedded=False)
 		self.again_block = Block(d, heads)
 		self.again_norm = RMSNorm(d)
-		self.move_pair = SwiGLU(dp + FORESIGHT_HIDDEN + MOVE_KNOWN, dp, dp)
+		self.move_pair = SwiGLU(dp + FORESIGHT_HIDDEN + MOVE_KNOWN + MIX_HIDDEN, dp, dp)
+		# The user's mixer (2026-11-04): MOVE's known features' second-order effects, a small hidden layer onto the logit and
+		# into move_pair, beside a direct linear path. Its hidden layer's output starts at 0, the direct path as Nullkiller2's
+		# rule (it never starts a fight it cannot win: HOPELESS_LOGIT x hopeless), both learning at the run's rate
+		self.move_mix = nn.Linear(MOVE_KNOWN, MIX_HIDDEN)
+		self.move_mix_out = zero_output(nn.Linear(MIX_HIDDEN, 1))
+		self.move_mix_direct = nn.Linear(MOVE_KNOWN, 1)
+		with torch.no_grad():
+			self.move_mix_direct.weight.zero_()
+			self.move_mix_direct.weight[0, HOPELESS] = HOPELESS_LOGIT
+			self.move_mix_direct.bias.zero_()
+		self.register_buffer("move_kept", torch.tensor(MOVE_KEPT), persistent=False)
 		# The fight's features straight onto MOVE's learned logit too, at 0 to begin with: a few weights a fight's outcome
 		# teaches directly (joint7's near-empty heroes walked into hopeless fights at ~1% a tile among ~110: the pairs'
 		# learned part told those tiles from the rest by less than a logit)
@@ -525,7 +543,8 @@ class CampaignModelV2(nn.Module):
 		decision = torch.div(known.windows, HO, rounding_mode="floor")
 		index = known.window_tiles
 		cells = torch.where((index >= 0).unsqueeze(-1), flat.index_select(0, (decision[:, None, None] * (L * S * S) + index.clamp(min=0)).reshape(-1)).reshape(k, W, W, -1), torch.zeros(k, W, W, self.cell_dim, device=flat.device, dtype=flat.dtype))
-		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach) + self.pair_fight(fight_features(known))
+		strength = torch.cat([known.move_strength, known.move_relative[..., :1]], dim=-1)  # (the estimates and hopeless)
+		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach) + self.pair_fight(fight_features(known)) + self.pair_strength(strength)
 
 	def foresee(self, state, known):
 		x = state.x
@@ -534,15 +553,26 @@ class CampaignModelV2(nn.Module):
 		hidden = {"turn": f.turn(state.glob), "hero": f.hero(state.heroes)}
 		about = torch.gather(state.heroes, 1, x["d_hero"].clamp(min=0).reshape(b, 1, 1).expand(b, 1, self.dim)) * (x["d_hero"] >= 0).reshape(b, 1, 1).float()
 		hidden["answer"] = f.answer(torch.cat([state.options, about.expand(-1, c.N_OPTIONS, -1)], dim=-1))
+		device = state.glob.device
 		outputs = {
 			"fs_turn": f.turn_out(hidden["turn"]), "fs_hero": f.hero_out(hidden["hero"]), "fs_answer": f.answer_out(hidden["answer"]),
-			"fs_move": torch.zeros(b, HO, W, W, ACTION_TARGETS, device=state.glob.device),
+			"fs_move": torch.zeros(b, HO, W, W, ACTION_TARGETS, device=device),
+			# the battle head's (foresight.py "move_tiles"), its labels' tiles: the legal ones, those where a fight starts
+			"fs_tiles": torch.zeros(b, HO, W, W, 3, device=device), "fs_outcome": torch.zeros(b, HO, W, W, 2, device=device),
+			"fs_fight_tile": torch.zeros(b, HO, W, W, device=device), "fs_move_legal": x["move_mask"].float(),
 		}
+		foreseen = None
 		if known.n > 0:
 			state.pairs = self.pairs(state, known)
 			hidden["move"] = f.move(state.pairs)
+			tiles, outcome = f.tiles(hidden["move"]), f.outcome(hidden["move"])
 			outputs["fs_move"] = dense(real_only(f.move_out(hidden["move"]), known), known.windows, known.n, b)
-		return {"hidden": hidden, "outputs": outputs}
+			outputs["fs_tiles"] = dense(real_only(tiles, known), known.windows, known.n, b)
+			outputs["fs_outcome"] = dense(real_only(outcome, known), known.windows, known.n, b)
+			outputs["fs_fight_tile"] = dense(real_only(known.tile_fights, known), known.windows, known.n, b)
+			# What MOVE reads of them (MOVE_FORESEEN), detached: its loss shapes the predictions, never the policy's
+			foreseen = torch.stack([tiles.softmax(dim=-1)[..., 1], torch.sigmoid(outcome[..., 0]), torch.sigmoid(outcome[..., 1])], dim=-1).detach()
+		return {"hidden": hidden, "outputs": outputs, "foreseen": foreseen}
 
 	# ---- think_again ----
 
@@ -558,8 +588,10 @@ class CampaignModelV2(nn.Module):
 		state.memory_out = self.memory.write(tokens, valid, state.mem)
 		if known.n > 0:
 			pairs = self.pairs(state, known)  # (with the heroes as they are now)
-			move_known = torch.cat([known.move_features, torch.tanh(known.tile_prior / 4).unsqueeze(-1)], dim=-1)
-			state.move_pairs = self.move_pair(torch.cat([pairs, hidden["move"], move_known], dim=-1))
+			move_known = torch.cat([known.move_features.index_select(-1, self.move_kept), known.move_strength, known.move_relative, foresight["foreseen"]], dim=-1)  # [K, W, W, MOVE_KNOWN]
+			mixed = F.silu(self.move_mix(move_known))
+			state.move_mix = self.move_mix_out(mixed) + self.move_mix_direct(move_known)
+			state.move_pairs = self.move_pair(torch.cat([pairs, hidden["move"], move_known, mixed], dim=-1))
 		b = x["g_day"].shape[0]
 		days = x["travel_days"][:, :HO].reshape(b, HO, AREAS)
 		travel_in = torch.cat([E.amount(days.clamp(min=0).float() / 100, "days"), (days >= 0).float().unsqueeze(-1)], dim=-1)
@@ -578,7 +610,7 @@ class CampaignModelV2(nn.Module):
 		# MOVE and the targeted spell's tile: each window's pairs, + the hero's act-now score, + the tile's prior
 		move = cast_cell = move_prior = torch.full((b, HO, W, W), 0.0, device=state.glob.device)
 		if known.n > 0:
-			move = dense(real_only(self.move_out(state.move_pairs).squeeze(-1) + self.move_fight(fight_features(known)).squeeze(-1), known), known.windows, known.n, b)
+			move = dense(real_only(self.move_out(state.move_pairs).squeeze(-1) + self.move_fight(fight_features(known)).squeeze(-1) + state.move_mix.squeeze(-1), known), known.windows, known.n, b)
 			move_prior = dense(real_only(known.tile_prior, known), known.windows, known.n, b)
 			cast_cell = dense(real_only(self.cast_cell_out(state.move_pairs).squeeze(-1), known), known.windows, known.n, b)
 		learned[A_.MOVE], prior[A_.MOVE] = move + self.act_move(own_heroes).reshape(b, HO, 1, 1), move_prior
@@ -762,8 +794,50 @@ def tile_known(x, features, known):
 	)
 
 
-MOVE_KNOWN = len(MOVE_FEATURES) + 1  # model.MOVE_FEATURES and the tile's prior (tanh / 4)
+# MOVE's known features (2026-11-04, the user's review of them: dead ones out, relative ones in, several strengths):
+#   kept      model.MOVE_FEATURES but defend, home, under_threat and to_main, 0 on ~all of joint7's tiles (99-100%; the
+#             duplicate prior went too: "value" is the same)
+#   strength  model.tile_features' move_strength: four estimates of the fight's log strength ratio, for this hero and
+#             for our main army, within -2..2
+#   relative  its move_relative: hopeless, the object, the fight's stake and gain, our town's risk (shares of Φ) and what
+#             this hero can take into its army here
+#   foreseen  the foresight's P(a battle follows), P(we win it), the share of the stake it takes (detached)
+MOVE_KEPT = tuple(i for i, name in enumerate(MOVE_FEATURES) if name not in ("defend", "home", "under_threat", "to_main"))
+MOVE_STRENGTH, MOVE_RELATIVE, MOVE_FORESEEN = 8, 6, 3
+MOVE_KNOWN = len(MOVE_KEPT) + MOVE_STRENGTH + MOVE_RELATIVE + MOVE_FORESEEN
+OLD_MOVE_KNOWN = len(MOVE_FEATURES) + 1  # move_pair's known inputs before 2026-11-04 (MOVE_FEATURES, the prior again)
+MIX_HIDDEN = 16  # the mixer's hidden layer (the user: more than 6)
+HOPELESS = len(MOVE_KEPT) + MOVE_STRENGTH  # hopeless's place among MOVE's known features
+HOPELESS_LOGIT = -3.0  # the mixer's direct weight on it to begin with: a guard 54x this hero's strength 3 logits down
 FIGHT_FEATURES = 3
+
+
+def move_pair_columns(old, fold=True):
+	"""move_pair's first layer's weights [rows, dp + FORESIGHT_HIDDEN + OLD_MOVE_KNOWN] from before 2026-11-04 (or Adam's
+	moments of them: fold False) -> [rows, dp + FORESIGHT_HIDDEN + MOVE_KNOWN + MIX_HIDDEN]: the pairs' and the foresight's
+	columns as they were, each kept MOVE_FEATURES column at its new place (the prior's second copy added onto the first's,
+	the same input; the moments keep the first's), behind's at 0 (it was 0 on every tile until 2026-11-04: its column never
+	learned and would add noise now), every new input's at 0: the same outputs."""
+	dp = old.shape[0] // 2
+	base = dp + FORESIGHT_HIDDEN
+	new = old.new_zeros(old.shape[0], base + MOVE_KNOWN + MIX_HIDDEN)
+	new[:, :base] = old[:, :base]
+	for to, frm in enumerate(MOVE_KEPT):
+		new[:, base + to] = old[:, base + frm]
+	if fold:
+		new[:, base + MOVE_KEPT.index(MOVE_FEATURES.index("value"))] += old[:, base + OLD_MOVE_KNOWN - 1]
+	new[:, base + MOVE_KEPT.index(MOVE_FEATURES.index("behind"))] = 0.0
+	return new
+
+
+def migrate_move_inputs(state_dict):
+	"""A state dict with move_pair's first layer from before 2026-11-04 moved to its inputs now (move_pair_columns); as
+	it is otherwise."""
+	key = "move_pair.up.weight"
+	old = state_dict.get(key)
+	if old is None or old.shape[1] != old.shape[0] // 2 + FORESIGHT_HIDDEN + OLD_MOVE_KNOWN:
+		return state_dict
+	return {**state_dict, key: move_pair_columns(old)}
 
 
 def fight_features(known):

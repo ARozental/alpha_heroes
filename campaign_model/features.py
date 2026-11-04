@@ -128,6 +128,67 @@ def hero_strength(primary, power):
 	return torch.log1p(power) + 0.5 * torch.log((1 + 0.05 * p[..., 0]) * (1 + 0.05 * p[..., 1]))
 
 
+# ---- a fight's strength, several ways (the user, 2026-11-04: estimates that agree are easier to act on) ----
+
+# VCMI's damage spells at no school (the classic table; SpellID order 15..23): (spell id, damage at 0 power, damage a
+# point of spell power, mana a cast). Death Ripple, Destroy Undead and Armageddon are left out (they need undead, or hit
+# our own army too)
+DAMAGE_SPELLS = (
+	(15, 10.0, 10.0, 5.0),  # Magic Arrow
+	(16, 10.0, 20.0, 8.0),  # Ice Bolt
+	(17, 10.0, 25.0, 10.0),  # Lightning Bolt
+	(18, 100.0, 75.0, 30.0),  # Implosion
+	(19, 25.0, 40.0, 24.0),  # Chain Lightning (its first target)
+	(20, 15.0, 10.0, 12.0),  # Frost Ring
+	(21, 15.0, 10.0, 12.0),  # Fireball
+	(22, 20.0, 10.0, 16.0),  # Inferno
+	(23, 25.0, 25.0, 16.0),  # Meteor Shower
+)
+SPELL_ROUNDS = 3.0  # the rounds a fight against a wandering monster takes, about: the casts a spell's damage is spread over
+
+
+def army_battle(creatures, counts, detailed, t):
+	"""An army's fighting numbers as seen [..., A] -> [...] each: (its damage a round, every stack's average damage x
+	count; its attack, damage-weighted; its defense, hit-point-weighted), from the creatures' own stats (vocab)."""
+	present = creatures >= 0
+	index = vocab_index(creatures, c.CREATURE_VOCAB)
+	count = typical_counts(counts, detailed.unsqueeze(-1).expand_as(counts), t) * present
+	damage = count * t.creature_damage[index]
+	health = count * t.creature_health[index]
+	total = damage.sum(dim=-1)
+	attack = (damage * t.creature_attack[index]).sum(dim=-1) / total.clamp(min=1e-6)
+	defense = (health * t.creature_defense[index]).sum(dim=-1) / health.sum(dim=-1).clamp(min=1e-6)
+	return total, attack, defense
+
+
+def damage_modifier(difference):
+	"""VCMI's damage factor for an attack of `difference` points over the defender's defense: +5% a point (at most
+	+300%), -2.5% a point under it (at most -70%)."""
+	return 1.0 + 0.05 * difference.clamp(0.0, 60.0) - 0.025 * (-difference).clamp(0.0, 28.0)
+
+
+def spell_damage(x, t):
+	"""Each hero's spell damage a round [B, H]: its best damage spell (DAMAGE_SPELLS, at its spell power) cast as often
+	as its mana allows, at most SPELL_ROUNDS times, spread over SPELL_ROUNDS rounds. 0 without one (or what we cannot see:
+	the other players' heroes' spells)."""
+	device = x["h_spells"].device
+	ids = constant([s[0] for s in DAMAGE_SPELLS], device, torch.long)  # (made once per device: no copy inside a CUDA graph)
+	base, per_power, cost = (constant([s[k] for s in DAMAGE_SPELLS], device, torch.float32) for k in (1, 2, 3))
+	known = x["h_spells"].index_select(-1, ids) > 0  # [B, H, S]
+	power = x["h_primary"][..., 2].clamp(min=0).float().unsqueeze(-1)
+	casts = torch.minimum(torch.floor(x["h_mana"].clamp(min=0).float().unsqueeze(-1) / cost), torch.full_like(cost, SPELL_ROUNDS))
+	return ((base + per_power * power) * casts * known).amax(dim=-1) / SPELL_ROUNDS
+
+
+def race_strength(health, damage, attack, defense, their_health, their_damage, their_attack, their_defense, spells=0.0):
+	"""A fight's log strength ratio (ours over theirs) as a damage race: each side's hit points x the damage it deals a
+	round (its stacks' damage at its attack against the other's defense, damage_modifier; ours plus `spells` a round),
+	the square root of each (the units of log1p(army strength): an army twice as big is log 2 stronger)."""
+	ours = damage * damage_modifier(attack - their_defense) + spells
+	theirs = their_damage * damage_modifier(their_attack - defense)
+	return 0.5 * (torch.log1p(health * ours) - torch.log1p(their_health * theirs))
+
+
 def fractional_level(experience, table):
 	"""A hero's level with the way to the next (game_values.fractional_level): 1500 experience -> 2.5."""
 	top = table.shape[0]
@@ -677,11 +738,13 @@ def area_index(x, pos):
 
 def blocked_by_guards(value, region, zone, monster, steps=c.WINDOW_RADIUS):
 	"""Kill a guard, take what it blocks (Nullkiller2's ClusterBehavior) [K, W, W]: on each wandering monster's tile, the
-	best object value in a region we reach only through its zone. value: each tile's object value (gold); region:
-	passable tiles we cannot reach, outside every zone; zone: the monsters' zones; monster: their tiles. The best value
-	spreads through the region (steps hops), then onto the zone tiles next to it and the monsters they surround."""
+	best object value in a region we reach only through its zone. value: the object value (gold) of each tile we cannot
+	reach (an object's tile is blocked: never one of the region's); region: passable tiles we cannot reach, outside every
+	zone; zone: the monsters' zones; monster: their tiles. The best value spreads from the objects through the region
+	(steps hops), then onto the zone tiles next to it and the monsters they surround. (Until 2026-11-04 the values were
+	taken from the region's tiles only, where no object stands: it was 0 on every tile of joint7's games.)"""
 	pool = lambda v: F.max_pool2d(v.unsqueeze(1), 3, stride=1, padding=1).squeeze(1)  # noqa: E731
-	best = torch.where(region, value.clamp(min=0), torch.zeros_like(value))
+	best = torch.where(region | (value > 0), value.clamp(min=0), torch.zeros_like(value))
 	for _ in range(steps):
 		best = torch.where(region, torch.maximum(best, pool(best)), best)
 	return pool(pool(best) * zone) * monster

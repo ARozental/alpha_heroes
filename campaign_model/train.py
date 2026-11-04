@@ -290,6 +290,7 @@ def load_optimizer(optimizer, model, saved, saved_keys):
 	groups = [[names[id(p)] for p in group["params"]] for group in optimizer.param_groups]
 	if all(len(g) == len(s["params"]) for g, s in zip(groups, saved["param_groups"])):
 		optimizer.load_state_dict(saved)
+		fit_moments(optimizer, model)
 		return
 	saved_keys = set(saved_keys)
 	state, param_groups, index = {}, [], 0
@@ -306,8 +307,31 @@ def load_optimizer(optimizer, model, saved, saved_keys):
 			index += 1
 		param_groups.append({**saved_group, "params": ids})
 	optimizer.load_state_dict({"state": state, "param_groups": param_groups})
+	fit_moments(optimizer, model)
 	fresh = [name for group in groups for name in group if name not in saved_keys]
 	print(f"campaign optimizer: Adam's moments kept, fresh for the new parameters: {', '.join(fresh)}", flush=True)
+
+
+def fit_moments(optimizer, model):
+	"""Adam's moments loaded for a parameter whose shape has changed since (optimizer.load_state_dict does not check, and
+	the first step would fail): move_pair's first layer from before 2026-11-04's MOVE features moved with its weights
+	(model_v2.move_pair_columns), any other started fresh (logged)."""
+	from .model_v2 import move_pair_columns
+
+	names = {id(p): name for name, p in model.named_parameters()}
+	for group in optimizer.param_groups:
+		for p in group["params"]:
+			state = optimizer.state.get(p)
+			if not state or "exp_avg" not in state or state["exp_avg"].shape == p.shape:
+				continue
+			name = names.get(id(p), "?")
+			if name == "move_pair.up.weight" and move_pair_columns(state["exp_avg"], fold=False).shape == p.shape:
+				for key in ("exp_avg", "exp_avg_sq"):
+					state[key] = move_pair_columns(state[key], fold=False)
+				print(f"campaign optimizer: {name}'s moments moved to its inputs now (model_v2.move_pair_columns)", flush=True)
+			else:
+				del optimizer.state[p]
+				print(f"campaign optimizer: {name}'s moments did not fit its shape {tuple(p.shape)}: fresh", flush=True)
 
 
 def value_fit(predicted, actual):
