@@ -88,6 +88,7 @@ class CampaignConfig:
 	credit: str = "schedule"  # (the default since 2026-11-01: what runs; it needs share_target "change")
 	share_weight_start: float = 0.1
 	share_weight_per_day: float = 0.02
+	share_weight_side: float = 36.0  # the map side share_weight_per_day is for: a map of side S ramps at that x share_weight_side / S (the user, 2026-11-03: faster, and slower on bigger maps, where rivals are met later); 0: the same on every map
 	attributed_end_weight: float = 0.2
 	outcome_share_min: float = 0.25
 	myopic_weight: float = 0.5

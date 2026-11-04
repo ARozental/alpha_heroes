@@ -201,6 +201,13 @@ def wire_for(decisions, device):
 	return out
 
 
+def share_weight(day, side, config):
+	"""The schedule credit's share weight [N] at each decision's day: share_weight_start + share_weight_per_day x day,
+	the rate scaled by the map's side (share_weight_side / side: a map twice as wide ramps half as fast), within 0..1."""
+	rate = config.share_weight_per_day * (config.share_weight_side / side.clamp(min=1.0) if config.share_weight_side > 0 else 1.0)
+	return (config.share_weight_start + rate * day).clamp(0.0, 1.0)
+
+
 def batch_heroes(decoded):
 	"""Our heroes in a decoded batch (decode_inputs' or decode_wire's), on the host."""
 	return int(heroes_in(decoded).sum())
@@ -702,6 +709,7 @@ def ppo_update(
 	model.eval()
 	anchor, end_now, prior = torch.empty(n, device=device), torch.empty(n, device=device), torch.empty(n, device=device)
 	growth_now, log_phi = torch.zeros(n, device=device), torch.zeros(n, device=device)  # (G7's logit, our log value: the attributed credit's)
+	side = torch.full((n,), 36.0, device=device)  # (each decision's map side: the schedule credit's share weight)
 	value_now = torch.zeros(n, device=device)  # (V7's logit: the schedule credit's share forecast)
 	# The same pass measures the value loss on these decisions before the update learns from them (the user, 2026-10-29:
 	# it should go down over time): every value head weighted as the loss below weighs it, above its targets' entropy
@@ -724,6 +732,7 @@ def ppo_update(
 				value_now[index] = out["value_logit"][:, -1].float()
 				log_phi[index] = out["phi"].float().clamp(min=PHI_FLOOR).log()
 			players = input_on_device(raw["wire"], "g_players") if prepare is not None else raw["g_players"]
+			side[index] = (input_on_device(raw["wire"], "g_map") if prepare is not None else raw["g_map"])[:, :2].amax(dim=1).float()
 			prior[index] = 1.0 / players.float().clamp(min=2) if config.share_target == "share" else 0.5  # the share heads' start: 1 / players (no change: 1/2)
 			fresh["share"][index] = excess_loss(out["value_logit"].float(), targets_t[index])
 			if growth is not None:
@@ -775,7 +784,7 @@ def ppo_update(
 		real_change = torch.from_numpy(np.asarray(targets, dtype=np.float32)[:, -1]).to(device) * 2 * SHARE_CHANGE_CAP - SHARE_CHANGE_CAP
 		change = real_change - share_baseline(real_change, torch.sigmoid(value_now) * 2 * SHARE_CHANGE_CAP - SHARE_CHANGE_CAP, share_trust)
 		day = torch.tensor([d.day for d in decisions], dtype=torch.float32, device=device)
-		w = (config.share_weight_start + config.share_weight_per_day * day).clamp(0.0, 1.0)
+		w = share_weight(day, side, config)
 		advantage = w * change + (1 - w) * grow  # (nan where a label is unknown: no credit)
 		known = torch.isfinite(advantage)
 		if int(known.sum()) > 1:

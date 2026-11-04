@@ -7,7 +7,7 @@ from campaign_model.model import CampaignModel
 from campaign_model.records import Decision
 from campaign_model.schema import HEADS, random_inputs
 from campaign_model.config import CampaignConfig
-from campaign_model.train import _prefetched, choices, chosen_logp, head_entropy, loss_noise, ppo_update, windows_for, wire_for
+from campaign_model.train import _prefetched, choices, chosen_logp, head_entropy, loss_noise, ppo_update, share_weight, windows_for, wire_for
 
 
 def sample(out, x, b, rng):
@@ -508,3 +508,14 @@ def test_steps_over_budget_take_the_step_graph_once_budgets_are_refused(monkeypa
 	config = CampaignConfig(batch_size=4, micro_batches=2, passes=1, cuda_graphs=True, step_graphs=True, window_budget=0.1, decode_threads=1)
 	ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-3), decisions, np.full((8, c.N_VALUE_OFFSETS), 0.5, np.float32), np.zeros(8, np.float32), config)
 	assert runs and all(budget is None for budget in runs)
+
+
+def test_the_share_weight_ramps_by_the_day_slower_on_bigger_maps():
+	"""(2026-11-03, the user) The schedule credit's share weight: start + per day x day on a map of share_weight_side,
+	half the rate on a map twice as wide, within 0..1; the same everywhere with share_weight_side 0."""
+	config = CampaignConfig(share_weight_start=0.1, share_weight_per_day=0.03, share_weight_side=36.0)
+	day = torch.tensor([0.0, 10.0, 30.0, 60.0])
+	torch.testing.assert_close(share_weight(day, torch.full((4,), 36.0), config), torch.tensor([0.1, 0.4, 1.0, 1.0]))
+	torch.testing.assert_close(share_weight(day, torch.full((4,), 72.0), config), torch.tensor([0.1, 0.25, 0.55, 1.0]))
+	unscaled = CampaignConfig(share_weight_start=0.1, share_weight_per_day=0.03, share_weight_side=0.0)
+	torch.testing.assert_close(share_weight(day, torch.full((4,), 144.0), unscaled), torch.tensor([0.1, 0.4, 1.0, 1.0]))

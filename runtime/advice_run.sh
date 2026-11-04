@@ -23,6 +23,9 @@
 # as the teacher over the turn (advice.py: any of its plan's steps or of the town actions it named that turn), and each
 # loss a share of the gradient (campaign.loss_shares: the teacher's by our eval score, at most 60%; policy and value
 # never under 15%)
+# The schedule credit's share weight since 2026-11-03 evening (the user: "increasing slightly faster and with map size"):
+# 0.1 + 0.03 a day on a 36-wide map, the rate x 36 / the map's width elsewhere (train.share_weight): all share by day 30
+# here (day 45 before), by 60 on a 72-wide map, 120 on a 144-wide one
 # 14 games here and 12 inference processes since 2026-11-03 ~12:10 (8 and 8 before): the forkserver's preload now
 # applies (78d55e4), and the 25 loader workers hold 2.9 GB in play, not 9.5 (the least available 12.2 GB since, against
 # ~4). The learner takes ~500 games an hour; the 17 slots made ~300 (~17-18 an hour a slot): 6 more games here (~0.35
@@ -77,7 +80,7 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 	--battle-from runtime/saved/battle_joint5_07295.pt \
 	--set remote_port=7700 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
-		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.02 campaign.entropy_floor_weight=0 \
+		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
 		campaign.head_scale=true fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
