@@ -912,6 +912,63 @@ def test_a_banks_strong_guards_make_yes_unlikely_and_a_free_join_likely():
 	assert abs(float(p[2, 0]) - 0.5) < 0.2  # (unflagged: no prior moves it)
 
 
+def test_a_monsters_question_counts_no_reward_wherever_it_is_asked():
+	"""question_features: a fleeing monster's offer (o_battle on YES) values the same whether d_object is the monster
+	(an attack), our hero itself (a step into its zone: topObject's blocking fallback), or a town; a join counts none
+	either; a bank's question still counts its reward (its object_gold, as often as we win)."""
+	from battle_model.layers import vocab_index
+	from campaign_model import features as ft
+
+	_, weak = _strongest_and_cheapest()
+	torch.manual_seed(1)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	with torch.no_grad():
+		m.features.object_type_delta.weight[vocab_index(torch.tensor(ft.OBJ_HERO), c.OBJECT_VOCAB)] = -3000.0  # (a hero's object_gold well below 0)
+	x = {k: np.repeat(v, 6, axis=0) for k, v in rich_inputs(1, 5).items()}  # (one state: the rows differ in the question only)
+	for b, d_object in enumerate((ft.OBJ_MONSTER, ft.OBJ_HERO, ft.OBJ_TOWN)):
+		_question(x, b, weak, 2, battle=0, d_object=d_object)
+	_question(x, 3, weak, 2, join=0, battle=1, d_object=ft.OBJ_MONSTER)
+	_question(x, 4, weak, 2, join=0, battle=1, d_object=ft.OBJ_HERO)
+	_question(x, 5, weak, 2, battle=0, d_object=84)  # (a Crypt's guards)
+	with torch.no_grad():
+		q = m.domain_knowledge(tensors(x)).question
+		gold = float(m.features.object_gold(torch.tensor([84]), torch.tensor([0]))[0])
+		hero_gold = float(m.features.object_gold(torch.tensor([ft.OBJ_HERO]), torch.tensor([0]))[0])
+	assert hero_gold < -1000
+	prior = q["battle_prior"]
+	assert torch.allclose(prior[:3], prior[0].expand(3)) and torch.allclose(prior[3], prior[4])
+	assert gold > 0 and float(prior[5]) > float(prior[0])  # (the same fight with a bank's reward on top)
+
+
+def test_a_dwellings_recruit_question_leans_yes_and_nothing_else_does():
+	"""model_v2's answers: a dwelling's "Would you like to recruit?" (d_object 17, 20 or 78, no option flagged) gets
+	recruit_yes_weight (4 at the start) on YES, as Nullkiller2 answers it; an unflagged question at another object and a
+	guarded dwelling's "fight the guards?" (o_battle on YES) get nothing from it."""
+	strong, _ = _strongest_and_cheapest()
+	torch.manual_seed(1)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = {k: np.repeat(v, 4, axis=0) for k, v in rich_inputs(1, 5).items()}
+	_question(x, 0, 0, 0, d_object=17)  # (a dwelling's: no guards, no flags)
+	_question(x, 1, 0, 0, d_object=47)  # (a School of Magic's)
+	_question(x, 2, 0, 0, d_object=78)  # (a Refugee Camp's)
+	_question(x, 3, strong, 5, battle=0, d_object=17)  # (a guarded dwelling's guards)
+
+	def yes_over_no():
+		with torch.no_grad():
+			logp = m(tensors(x))["option_logp"]
+		return logp[:, 0] - logp[:, 1]
+
+	with torch.no_grad():
+		assert m.domain_knowledge(tensors(x)).question["recruit"].tolist() == [True, False, True, False]
+		start = float(m.features.recruit_yes_weight())
+	with_prior = yes_over_no()
+	with torch.no_grad():
+		m.features.recruit_yes.fill_(-1e4)  # (the weight at its floor, 0)
+	without = yes_over_no()
+	assert abs(start - 4.0) < 1e-4
+	assert torch.allclose(with_prior - without, torch.tensor([4.0, 0.0, 4.0, 0.0]), atol=1e-3)
+
+
 def test_records_from_before_schema_11_read_with_no_guards_battle_join_or_armed_object():
 	"""records: a record of schema 10 (before o_battle) and one of schema 9 (before mem) decode with zeros from where they
 	end: no memory, no question guards, no flags, no armed object."""
