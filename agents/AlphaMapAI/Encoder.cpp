@@ -1054,6 +1054,23 @@ void AlphaMapAI::encodeQuestionGuards(Decision & decision, const std::string & t
 	auto & in = decision.inputs;
 	const auto * hero = cb->getHero(activeHero);
 	const auto * obj = activeTarget.isValid() && cb->isInTheMap(activeTarget) ? topObject(*cb, activeTarget, hero) : nullptr;
+	// A monster's questions by their texts (CGCreature: 86 joins for free, 90 for its gold component's price, 91 flees)
+	const auto & texts = LIBRARY->generaltexth->advobtxt;
+	int price = -1; // a join's price (0 a join for free's), -1 no join
+	if(fromTemplate(text, texts[90]))
+		for(const auto & component : components)
+			if(component.type == ComponentType::RESOURCE && component.subType == GameResID(GameResID::GOLD))
+				price = component.value.value_or(0);
+	if(price < 0 && fromTemplate(text, texts[86]))
+		price = 0;
+	const bool flees = price < 0 && fromTemplate(text, texts[91]);
+	// The monster asking: the move's destination (an attack on it), else the guard of the tile the hero stepped onto
+	// (its zone, an object there too: the engine's guard of that tile, CGameHandler::moveHero), the case of most of them
+	if((price >= 0 || flees) && hero && (!obj || obj->ID != Obj::MONSTER))
+	{
+		const int3 guard = cb->guardingCreaturePosition(hero->visitablePos());
+		obj = guard.isValid() ? topObject(*cb, guard, hero) : nullptr;
+	}
 	const auto * army = dynamic_cast<const CArmedInstance *>(obj);
 	if(!army || army->stacksCount() == 0 || dynamic_cast<const CGHeroInstance *>(obj) || dynamic_cast<const CGTownInstance *>(obj))
 		return;
@@ -1068,22 +1085,18 @@ void AlphaMapAI::encodeQuestionGuards(Decision & decision, const std::string & t
 			in.at(In::d_guard_count, 0) = count;
 			in.at(In::d_guard_detailed) = exact ? 1 : 0;
 		}
-		int price = -1; // a join for gold's (its gold component), 0 a join for free's, -1 no join
-		for(const auto & component : components)
-			if(component.type == ComponentType::RESOURCE && component.subType == GameResID(GameResID::GOLD))
-				price = component.value.value_or(0);
-		if(price < 0 && fromTemplate(text, LIBRARY->generaltexth->advobtxt[86]))
-			price = 0;
 		if(price >= 0)
 		{
 			in.at(In::o_join, YES) = 1;
 			in.at(In::o_amount, YES) = price;
 			in.at(In::o_battle, NO) = 1;
 		}
-		else if(fromTemplate(text, LIBRARY->generaltexth->advobtxt[91]))
+		else if(flees)
 			in.at(In::o_battle, YES) = 1;
 		return;
 	}
+	if(price >= 0 || flees)
+		return; // (a monster's question whose monster is not found: nothing known of what its options do)
 	in.at(In::o_battle, YES) = 1;
 	int i = 0;
 	for(const auto & component : components) // (a bank's guards as its dialog shows them: exact)
