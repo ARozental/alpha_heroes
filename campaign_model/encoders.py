@@ -318,12 +318,6 @@ class OptionTables(NamedTuple):
 	pairs: torch.Tensor
 
 
-# VCMI's ComponentType (lib/networkPacks/Component.h): a COMPONENT option's o_type
-PRIM_SKILL, SEC_SKILL, RESOURCE, RESOURCE_PER_DAY, CREATURE, ARTIFACT, SPELL_SCROLL = range(7)
-SPELL = 10
-COMPONENT_TYPES = 16
-
-
 class OptionEncoder(nn.Module):
 	"""A question's options -> (their tokens [B, O, d], their identities [B, O, d]: the sum the token is made of, its numbers
 	projected in, a choice's key; the token, through its MLP, starts as its bias: every option's alike), each its own
@@ -339,7 +333,7 @@ class OptionEncoder(nn.Module):
 	def __init__(self, dim):
 		super().__init__()
 		self.kind = small_embedding(len(c.OptionKind) + 1, dim)
-		self.component = small_embedding(COMPONENT_TYPES + 1, dim)
+		self.component = small_embedding(len(c.ComponentType) + 1, dim)
 		self.primary = small_embedding(c.N_PRIMARY + 1, dim)
 		self.resource = small_embedding(c.N_RESOURCES + 1, dim)
 		self.token = Tokenizer(AMOUNT_FEATURES + 8 + 1, dim)
@@ -375,14 +369,15 @@ class OptionEncoder(nn.Module):
 		"""A component's identity [..., d] (kind: VCMI's ComponentType, sub: its subtype): its type's row and what it names
 		(a primary skill, a resource, a secondary skill at basic, a creature, an artifact, a spell); the rest (mana,
 		experience, a level, morale, luck, ...) only by its type, their amounts in the option's numbers."""
+		T = c.ComponentType
 		is_ = lambda *types: functools.reduce(torch.logical_or, [kind == t for t in types]).unsqueeze(-1).float()  # noqa: E731
 		spell = tables.spells.weight.t()[sub.clamp(0, c.N_SPELLS - 1)] * ((sub >= 0) & (sub < c.N_SPELLS)).unsqueeze(-1)
 		return (
-			self.component(vocab_index(kind, COMPONENT_TYPES))
-			+ self.primary(vocab_index(sub, c.N_PRIMARY)) * is_(PRIM_SKILL)
-			+ self.resource(vocab_index(sub, c.N_RESOURCES)) * is_(RESOURCE, RESOURCE_PER_DAY)
-			+ tables.skill(sub.clamp(0, c.N_SECONDARY_SKILLS - 1) * 4 + 1) * is_(SEC_SKILL)
-			+ tables.army.creature(vocab_index(sub, c.CREATURE_VOCAB)) * is_(CREATURE)
-			+ tables.artifact(vocab_index(sub, c.ARTIFACT_VOCAB)) * is_(ARTIFACT)
-			+ spell * is_(SPELL_SCROLL, SPELL)
+			self.component(vocab_index(kind, len(T)))
+			+ self.primary(vocab_index(sub, c.N_PRIMARY)) * is_(T.PRIM_SKILL)
+			+ self.resource(vocab_index(sub, c.N_RESOURCES)) * is_(T.RESOURCE, T.RESOURCE_PER_DAY)
+			+ tables.skill(sub.clamp(0, c.N_SECONDARY_SKILLS - 1) * 4 + 1) * is_(T.SEC_SKILL)
+			+ tables.army.creature(vocab_index(sub, c.CREATURE_VOCAB)) * is_(T.CREATURE)
+			+ tables.artifact(vocab_index(sub, c.ARTIFACT_VOCAB)) * is_(T.ARTIFACT)
+			+ spell * is_(T.SPELL_SCROLL, T.SPELL)
 		)

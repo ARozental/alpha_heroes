@@ -126,6 +126,28 @@ class OptionKind(IntEnum):
 	AMOUNT = 6  # o_type: the creature, o_amount: how many
 
 
+
+class ComponentType(IntEnum):
+	"""VCMI's ComponentType (lib/networkPacks/Component.h): a COMPONENT option's o_type (not part of the contract)."""
+
+	PRIM_SKILL = 0
+	SEC_SKILL = 1
+	RESOURCE = 2
+	RESOURCE_PER_DAY = 3
+	CREATURE = 4
+	ARTIFACT = 5
+	SPELL_SCROLL = 6
+	MANA = 7
+	EXPERIENCE = 8
+	LEVEL = 9
+	SPELL = 10
+	MORALE = 11
+	LUCK = 12
+	BUILDING = 13
+	HERO_PORTRAIT = 14
+	FLAG = 15
+
+
 # w_flags bits of a window tile
 TILE_ON_MAP = 1
 TILE_REVEALED = 2

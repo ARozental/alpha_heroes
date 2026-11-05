@@ -257,6 +257,7 @@ class CustomFeatures(nn.Module):
 		self.trade_unlock, self.trade_cost = zeros(), zeros()  # (2026-11-04: TRADE's prior; trade_weights)
 		self.recruit_yes = zeros()  # (2026-11-04: a dwelling's "recruit?" answered YES, as Nullkiller2 does; recruit_yes_weight)
 		self.visit_yes = zeros()  # (2026-11-04: a guard's "pass?", a quest's "complete it?" answered YES, as Nullkiller2 does)
+		self.select_pick = zeros()  # (2026-11-04: Nullkiller2's pick among a selection's components; select_weight)
 		self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
@@ -274,7 +275,7 @@ class CustomFeatures(nn.Module):
 		return [
 			self.object_gain, self.object_type_gain.weight, self.object_type_delta.weight, self.object_subtype_delta.weight,
 			self.fight_sharpness, self.enemy_value, self.hero_value, self.danger_gain, self.explore_gain, self.class_gain, self.travel_exponent,
-			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes,
+			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
@@ -366,6 +367,10 @@ class CustomFeatures(nn.Module):
 		(AIGateway::showBlockingDialog: border and quest guards always). joint7 answered NO to all of the first 150
 		(2026-11-04: one hero asked 53 times in 15 days at the same Quest Guard)."""
 		return ft.bounded(self.visit_yes, 0.0, 8.0, 4.0, CORRECTION_STEP)
+
+	def select_weight(self):
+		"""What Nullkiller2's pick among a selection's components gains, in logits (3 at the start, 0..8; nk2_select)."""
+		return ft.bounded(self.select_pick, 0.0, 8.0, 3.0, CORRECTION_STEP)
 
 	def block_share(self):
 		"""How much of what a wandering monster blocks counts for its fight (x P(win)): 0.5 at the start, 0..1."""
@@ -503,16 +508,42 @@ class CustomFeatures(nn.Module):
 		of = lambda objects: (functools.reduce(torch.logical_or, [obj == o for o in objects]) & plain).float()  # noqa: E731
 		return of(ft.DWELLING_OBJECTS) * self.recruit_yes_weight() + of(ft.VISIT_OBJECTS) * self.visit_yes_weight()
 
+	def nk2_select(self, x, f):
+		"""Nullkiller2's pick among a selection's components [B, O], x select_weight (AIGateway::showBlockingDialog): the
+		last one, but a Treasure Chest's gold (two components, the first a resource) for a hero not its main one or under
+		gold pressure (as smooth as the pressure); 0 where no option is a component."""
+		component = x["option_mask"] & (x["o_kind"] == int(c.OptionKind.COMPONENT))
+		index = torch.arange(component.shape[1], device=component.device)
+		count = component.sum(dim=-1, keepdim=True)
+		last, first = (component & (index == count - 1)).float(), (component & (index == 0)).float()  # (AlphaMapAI lists the components first, then a NO)
+		hero = x["d_hero"].clamp(0, HO - 1)
+		main = (f.main.gather(1, hero.unsqueeze(1)).squeeze(1) & (x["d_hero"] >= 0)).float()
+		chest = ((count.squeeze(-1) == 2) & (x["o_type"][:, 0] == int(c.ComponentType.RESOURCE))).float()
+		gold = (chest * torch.maximum(1 - main, torch.sigmoid(10 * (f.gold_pressure - ft.MAX_GOLD_PRESSURE)))).unsqueeze(-1)
+		return self.select_weight() * (gold * first + (1 - gold) * last)
+
+	def nk2_amount(self, x):
+		"""Nullkiller2 buys all it can at a dwelling (AIGateway::recruitCreatures): its largest amount option [B, O], x the
+		town's recruit_all weight (the same habit there: recruit_prior)."""
+		amounts = x["option_mask"] & (x["o_kind"] == int(c.OptionKind.AMOUNT))
+		value = torch.where(amounts, x["o_amount"], torch.full_like(x["o_amount"], -1))
+		most = amounts & (value == value.amax(dim=-1, keepdim=True)) & (value > 0)
+		return most.float() * ft.bounded(self.recruit_all, 0.0, 4.0, 2.0, CORRECTION_STEP)
+
 	def option_knowledge(self, x, f):
 		"""What is known of each option of a question (the user, 2026-11-04: every expert rule its own function, gathered
 		here): (its prior [B, O]: the known AI's values with their corrections, the guards' fight on the option that fights
-		them and their join on the one that takes them (question_guards), Nullkiller2's YES (nk2_yes) and its skill scores
-		x their weight; its features [B, O, QUESTION_FEATURES] for the model's zero-init weights: the fight's 6 and the join's
-		3 on those options, then those two flags)."""
+		them and their join on the one that takes them (question_guards), Nullkiller2's YES (nk2_yes), its pick among a
+		selection's components (nk2_select), its dwelling purchase (nk2_amount) and its skill scores x their weight; its
+		features [B, O, QUESTION_FEATURES] for the model's zero-init weights: the fight's 6 and the join's 3 on those
+		options, then those two flags)."""
 		fight, battle_prior, join, join_prior = self.question_guards(x, f)
 		battle, takes = x["o_battle"].float(), x["o_join"].float()
 		yes = (x["o_kind"] == int(c.OptionKind.YES)).float()
-		prior = battle * battle_prior.unsqueeze(1) + takes * join_prior.unsqueeze(1) + yes * self.nk2_yes(x).unsqueeze(1) + self.nk2_weights()[0] * f.skill_scores
+		prior = (
+			battle * battle_prior.unsqueeze(1) + takes * join_prior.unsqueeze(1) + yes * self.nk2_yes(x).unsqueeze(1)
+			+ self.nk2_select(x, f) + self.nk2_amount(x) + self.nk2_weights()[0] * f.skill_scores
+		)
 		features = torch.cat([battle.unsqueeze(-1) * fight.unsqueeze(1), takes.unsqueeze(-1) * join.unsqueeze(1), battle.unsqueeze(-1), takes.unsqueeze(-1)], dim=-1)
 		return prior, features
 
@@ -959,7 +990,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4)
+ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,

@@ -994,6 +994,37 @@ def test_a_yes_names_what_it_does_and_a_no_does_not():
 	assert not torch.allclose(keys[1, 0], keys[2, 0], atol=1e-3)
 
 
+def test_nullkiller2s_selection_and_purchase_priors_lean_where_it_goes():
+	"""option_knowledge's Nullkiller2 rules (AIGateway::showBlockingDialog, recruitCreatures): a selection leans to its last
+	component, not its NO; a Treasure Chest (gold, experience) to its gold under gold pressure and to its experience for
+	the main hero with gold to spare; a dwelling's purchase to its largest amount."""
+	T = c.ComponentType
+	torch.manual_seed(1)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = {k: np.repeat(v, 4, axis=0) for k, v in rich_inputs(1, 5).items()}
+	with torch.no_grad():
+		assert bool(m.domain_knowledge(tensors(x)).main[0, 0])  # (our one hero: the main one)
+	x["d_hero"][:] = 0
+	x["g_resources"][:, 6], x["g_income"][:, 6] = 200_000, 0  # (gold to spare)
+	x["g_resources"][1, 6] = 0  # (row 1: none, under pressure)
+	x["option_mask"][:], x["o_battle"][:], x["o_join"][:] = False, False, False
+	rows = [  # each row's options: kind, type, subtype, amount
+		[(c.OptionKind.COMPONENT, T.PRIM_SKILL, 0, 1), (c.OptionKind.COMPONENT, T.PRIM_SKILL, 1, 1), (c.OptionKind.NO, 0, 0, 0)],
+		[(c.OptionKind.COMPONENT, T.RESOURCE, 6, 1500), (c.OptionKind.COMPONENT, T.EXPERIENCE, 0, 1000)],
+		[(c.OptionKind.COMPONENT, T.RESOURCE, 6, 1500), (c.OptionKind.COMPONENT, T.EXPERIENCE, 0, 1000)],
+		[(c.OptionKind.AMOUNT, 12, 0, n) for n in (0, 5, 10, 20)],
+	]
+	for b, options in enumerate(rows):
+		for o, (kind, what, sub, n) in enumerate(options):
+			x["option_mask"][b, o] = True
+			x["o_kind"][b, o], x["o_type"][b, o], x["o_subtype"][b, o], x["o_amount"][b, o] = int(kind), int(what), sub, n
+	with torch.no_grad():
+		prior = m.domain_knowledge(tensors(x)).option_prior
+	picks = [int(prior[b, : len(options)].argmax()) for b, options in enumerate(rows)]
+	assert picks == [1, 0, 1, 3], picks
+	assert float(prior[0, 1]) == pytest.approx(3.0, abs=1e-3) and float(prior[3, 3]) == pytest.approx(2.0, abs=1e-3)
+
+
 def test_options_that_differ_never_share_an_identity():
 	"""encoders.OptionEncoder has no hashed rows (features.bucket put 546 of 954 options on a shared row, 2026-11-04: NO with
 	a scroll of spell 57, a skill with a creature's amount): those pairs differ, and so do two resources and two primary
