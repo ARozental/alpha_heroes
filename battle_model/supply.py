@@ -46,6 +46,8 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from . import forkserver, generator, play, remote
 from .constants import MAX_UNITS, N_HEXES, ActionType
 from .data import SPARSE_INPUTS, Sparse, battle_examples, check_record, collate, compact_record, version_of
+
+KEPT_RUNS = deque(maxlen=9)  # (the VCMI logs of clean games with actions that changed nothing: the newest 8 a process)
 from .losses import normalize_advantages
 
 MEMORY_FLOOR_GB = 4.5  # no new game here under this much available memory (Linux; elsewhere unknown: no limit). Games grow after they start (a VCMI client, the worker's arrays), and runtime/memwatch.sh stops a run under 1.5 GB: it did, 2026-10-30 23:27. The trainer's own swing is kept free besides (memory_allows); what still runs past the floor the guard sheds a game at a time (runtime/memwatch.sh). (6 GB on 2026-11-01 13:38-15:00 CST deadlocked joint7: the trainer at its peak, 5.6 GB left, no game could start, and it waited for games)
@@ -580,7 +582,14 @@ class Runner:
 				(battle_play.USER_DIR / (map_name + ".vmap")).unlink(missing_ok=True)
 		game.days = spec["days"]
 		ok = info.status.startswith("stopped") or "exit code 0" in info.status  # (at the cap, or training is over)
-		if ok:
+		if ok and any(done.get("failed_actions", 0) or done.get("errors", 0) for done in game.done.values()):
+			# A clean game whose AI made an action that changed nothing (or logged an error): its VCMI logs kept, the
+			# server's reason in them (2026-11-05: CAST changed nothing 2,110 times in joint7, BUILD 569, reasons lost
+			# with the logs), the newest KEPT_RUNS of this process's
+			KEPT_RUNS.append(info.run_dir)
+			while len(KEPT_RUNS) > KEPT_RUNS.maxlen - 1:
+				shutil.rmtree(KEPT_RUNS.popleft(), ignore_errors=True)
+		elif ok:
 			shutil.rmtree(info.run_dir, ignore_errors=True)
 		else:  # its records up to then are still used: the labels take the last day it reached as its end
 			yield {"kind": "failed", "what": "campaign", "message": f"game {key} ({map_name}, {players} players): {info.status} (run {info.run_dir})", "run_dir": info.run_dir}
