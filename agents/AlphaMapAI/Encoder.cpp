@@ -1051,6 +1051,12 @@ void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)
 		// for the model to set), still build_short: the model's prior prices the trades
 		for(int b = 0; b < N_BUILDINGS; ++b)
 		{
+			// (BUILD's SHIP is a boat, below, by the boat's own rules: VCMI's building 20, "ship" (buildingsLibrary.json),
+			// is a hidden building of no cost that canBuildStructure allows whenever the shipyard stands, and its entry
+			// here made a boat legal we could not pay for or put anywhere: 569 BUILDs changed nothing in joint7, the 12
+			// looked at all boats, with 0-6 of the 10 wood a boat costs)
+			if(b == BuildingID::SHIP)
+				continue;
 			const auto found = town->getTown()->buildings.find(BuildingID(b));
 			if(found == town->getTown()->buildings.end())
 				continue;
