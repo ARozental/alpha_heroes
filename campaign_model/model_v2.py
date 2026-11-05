@@ -702,7 +702,7 @@ class CampaignModelV2(nn.Module):
 		# build_trade, recruit_trade: the gold of worth they lose), priced as every change of Φ is (value_logit), in the
 		# entry and in its type's offer: the least any legal entry pays, 0 while one needs no trade (within the table
 		# alone a charge every entry pays cancels: a BUILD with nothing affordable traded for whatever it chose)
-		_, trade_cost = self.features.trade_weights()
+		trade_cost = self.features.trade_cost_weight()
 		build_charge = trade_cost * ft.value_logit(known.build_trade)
 		learned[A_.BUILD] = self.build_scores(own_towns, x) + self.build_bias
 		prior[A_.BUILD] = self.nk2_build(known.build_rewards).squeeze(-1) - build_charge
@@ -724,7 +724,7 @@ class CampaignModelV2(nn.Module):
 		recruit_charge = (trade_cost * ft.value_logit(known.recruit_trade))[..., None, None].expand_as(learned[A_.RECRUIT])
 		prior[A_.RECRUIT] = self.features.recruit_prior(known.town_danger).expand_as(learned[A_.RECRUIT]) - recruit_charge
 		_, upgrade_weight, book_weight, pause_weight = self.features.nk2_weights()  # (a skill's: model.CustomFeatures.option_knowledge)
-		home_weight, defend_weight, ferry_weight, hire_weight, _ = self.features.pull_weights()  # (TRADE: trade_weights since 2026-11-04)
+		home_weight, defend_weight, ferry_weight, hire_weight, _ = self.features.pull_weights()  # (TRADE: trade_cost_weight since 2026-11-04)
 		offers[A_.RECRUIT] = -pause_weight * known.recruit_pause + best_legal(-recruit_charge, x["recruit_mask"])  # (no army bought while saving for a hall: Nullkiller2's habit)
 		# HIRE: the town's query against each hero for hire (the same hero space as ours) + what the hire does to Φ
 		worth = torch.cat([scales(known.tavern_worth.clamp(min=0), (1000, 3000, 10000)), torch.tanh(known.hire_gain / 2000).unsqueeze(-1)], dim=-1)
@@ -749,8 +749,7 @@ class CampaignModelV2(nn.Module):
 		options = known.trade_options  # [B, R, R, F, 2]: the gold of worth lost, unlocks
 		read = torch.stack([torch.log1p(options[..., 0] / 1000.0), options[..., 1]], dim=-1)  # (the learned part's reading: log(1 + cost / 1000))
 		learned[A_.TRADE] = self.trade_head(state.glob).reshape(b, R, R, c.N_TRADE_AMOUNTS) + self.nk2_trade(needs) + self.trade_option(read).squeeze(-1)
-		unlock_weight, cost_weight = self.features.trade_weights()
-		prior[A_.TRADE] = unlock_weight * options[..., 1] - cost_weight * ft.value_logit(options[..., 0])
+		prior[A_.TRADE] = -trade_cost * ft.value_logit(options[..., 0])  # (the charge a purchase trading for itself pays: no route cheaper)
 		offers[A_.TRADE] = best_legal(prior[A_.TRADE], x["trade_mask"])
 		learned[A_.CAST] = self.cast_q(own_heroes) @ self.spell.weight.t() / math.sqrt(d)
 		prior[A_.CAST] = torch.zeros_like(learned[A_.CAST])

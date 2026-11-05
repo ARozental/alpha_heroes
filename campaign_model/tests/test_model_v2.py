@@ -1164,7 +1164,7 @@ def test_a_build_with_nothing_affordable_pays_its_least_trade_in_its_types_score
 		free = m(tensors(x))["type_logp"]
 	B, END = int(c.ActionType.BUILD), int(c.ActionType.END)
 	drop = (free[:, B] - free[:, END]) - (charged[:, B] - charged[:, END])
-	_, weight = m.features.trade_weights()
+	weight = m.features.trade_cost_weight()
 	assert lost > 1000 and float(drop[0]) == pytest.approx(float(weight * ft.value_logit(torch.tensor(lost))), rel=1e-4)
 	assert abs(float(drop[1])) < 1e-5
 

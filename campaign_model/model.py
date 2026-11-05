@@ -233,8 +233,9 @@ class CustomFeatures(nn.Module):
 	                  turns still ended and 3 of 8 TRAVELs left with a safe pile in reach (failures.py)
 	  safety          Nullkiller2 never starts a fight it cannot win: a hopeless fight's tile costs MOVE 6 logits a unit of
                   hopeless (0..12; safety_weight)
-  trades          a trade that unlocks a building gains 2 logits (0..4), each unit of its cost to Φ costs 0.5 (0..2;
-                  trade_weights, features.trade_options)
+  trades          what a trade loses (its gold of worth at value_logit's price, the price of every change of Φ) times 1
+                  (0..2; trade_cost_weight): TRADE's prior, and a purchase trading for itself in its entry and its type's
+                  offer (features.trade_options, purchase_trades)
   garrisons       what leaving our troops in a garrison not a town's (a mine's) costs in logits (4, 0..8): Φ prices
 	                  them as if in the hero, so the labels never say it is dumb, which it almost always is; NK2 never
 	                  does it"""
@@ -274,7 +275,7 @@ class CustomFeatures(nn.Module):
 		self.travel_exponent, self.end_coupling, self.travel_coupling = zeros(), zeros(), zeros()
 		self.move_discount = zeros()  # (not a prior correction: its 0 is the old score, not a prior; move_discount_power)
 		self.safety = zeros()  # (2026-11-04: Nullkiller2 never starts a fight it cannot win; safety_weight)
-		self.trade_unlock, self.trade_cost = zeros(), zeros()  # (2026-11-04: TRADE's prior; trade_weights)
+		self.trade_unlock, self.trade_cost = zeros(), zeros()  # (2026-11-04: TRADE's prior; trade_cost_weight. trade_unlock unused since 2026-11-05, kept: checkpoints hold it)
 		self.recruit_yes = zeros()  # (2026-11-04: a dwelling's "recruit?" answered YES, as Nullkiller2 does; recruit_yes_weight)
 		self.visit_yes = zeros()  # (2026-11-04: a guard's "pass?", a quest's "complete it?" answered YES, as Nullkiller2 does)
 		self.select_pick = zeros()  # (2026-11-04: Nullkiller2's pick among a selection's components; select_weight)
@@ -366,16 +367,17 @@ class CustomFeatures(nn.Module):
 		gold of army still attacked 193 times in 30 games and lost 98%, the median such tile only -1.3 logits down)."""
 		return ft.bounded(self.safety, 0.0, 12.0, 6.0, CORRECTION_STEP)
 
-	def trade_weights(self):
-		"""TRADE's prior (the user, 2026-11-04: every trade is dumb unless it buys what could not be bought without it):
-		(what a trade that unlocks a building gains, 2 logits at the start, 0..4; the weight of what a trade loses, its
-		gold of worth as value_logit prices every change of Φ, 1 at the start, 0..2; features.trade_options), the same
-		weight on the trades a purchase short of resources makes (features.purchase_trades). joint7 traded 135 times a
-		game, 77% with no purchase that day, ~900 of Φ a trade at the median: the old prior, 0.5 for a trade toward a
-		building short of resources, 0 for the rest, said nothing of what a trade costs. 2026-11-05: at 0.5 x log(1 +
-		lost / 1000), a 4,000 loss 0.8 logits against value_logit's 3.3 for a 4,000 gain, a fifth of the purchases
-		traded for themselves, ~5,200 of worth each, ~150,000 a game (joint7 v1024's games)."""
-		return ft.bounded(self.trade_unlock, 0.0, 4.0, 2.0, CORRECTION_STEP), ft.bounded(self.trade_cost, 0.0, 2.0, 1.0, CORRECTION_STEP)
+	def trade_cost_weight(self):
+		"""The weight of what a trade loses, its gold of worth as value_logit prices every change of Φ (1 at the start,
+		0..2): TRADE's prior (features.trade_options; the user, 2026-11-04: every trade is dumb unless it buys what could
+		not be bought without it) and the trades a purchase short of resources makes (features.purchase_trades). joint7
+		traded 135 times a game, 77% with no purchase that day, ~900 of Φ a trade at the median. 2026-11-05: at 0.5 x
+		log(1 + lost / 1000), a 4,000 loss 0.8 logits against value_logit's 3.3 for a 4,000 gain, a fifth of the
+		purchases traded for themselves, ~5,200 of worth each, ~150,000 a game (joint7 v1024's games). TRADE's bonus for
+		a trade that unlocks a purchase (2 logits) went then too: with the purchase trading for itself at the full
+		charge, TRADE and then BUILD came 2 logits cheaper than BUILD alone, and TRADE rose from 4 to 23 a game, 61% of
+		them with nothing bought that day."""
+		return ft.bounded(self.trade_cost, 0.0, 2.0, 1.0, CORRECTION_STEP)
 
 	def recruit_yes_weight(self):
 		"""What YES to a dwelling's "Would you like to recruit?" gains, in logits (4 at the start, 0..8): Nullkiller2 answers
