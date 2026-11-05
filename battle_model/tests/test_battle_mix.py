@@ -84,3 +84,18 @@ def test_the_workers_prepare_battles_with_the_trainers_credit(tmp_path):
 	advantage = runner.advantage_config().advantage
 	assert shared.version.value == 7 and advantage.outcome_share == 0.3 and advantage.policy_heads == (0.1, 0.0, 0.0, 1.0)
 	assert advantage.window_rounds == config.advantage.window_rounds and runner.config is config
+
+
+def test_a_game_takes_the_least_loaded_inference_process():
+	"""Games.take_server: each local game on the process with the fewest games now; a finished game's is free again
+	(release_server)."""
+	import multiprocessing
+
+	games = supply.Games.__new__(supply.Games)
+	games.shared = SimpleNamespace(lock=multiprocessing.Lock(), server_games=multiprocessing.Array("i", 3, lock=False))
+	assert [games.take_server() for _ in range(4)] == [0, 1, 2, 0]
+	games.release_server(1)
+	assert games.take_server() == 1
+	games.release_server(0)
+	games.release_server(0)
+	assert games.take_server() == 0 and list(games.shared.server_games) == [1, 1, 1]

@@ -272,7 +272,7 @@ def assemble(items, advantage_config, device=None):
 class Shared:
 	"""Counters the workers and the trainer share (the loader's context: inherited by the workers)."""
 
-	def __init__(self, ctx, ceilings):
+	def __init__(self, ctx, ceilings, servers=1):
 		self.lock = ctx.Lock()
 		self.trainer = os.getpid()  # (memory_allows: its recent peak is kept free)
 		self.peak = ctx.Value("d", 0.0, lock=False)  # the trainer's highest memory in the last PEAK_WINDOW (GB)
@@ -288,6 +288,7 @@ class Shared:
 		# The credit the trainer set last (Supply.publish): the window credit's outcome share, then the policy heads' weights,
 		# both following the value head's quality (train.py); unset (< 0) before its first update: the config's own
 		self.credit = ctx.Array("d", [-1.0] * (2 + N_VALUE_HORIZONS), lock=False)
+		self.server_games = ctx.Array("i", max(servers, 1), lock=False)  # this machine's games on each inference process now (Games.take_server)
 		self.stop = ctx.Event()
 
 
@@ -419,6 +420,11 @@ class Games(IterableDataset):
 					continue
 				n += 1
 				spec = runner.sample_battle(rng, index, n) if self.kind == "battle" else runner.sample_campaign(rng, index, n)
+				slot = self.take_server() if where == "here" else None
+				if slot is not None:  # (both models' processes are the same: a game's battles go where its decisions do)
+					runner.battle_socket = self.battle_sockets[slot % len(self.battle_sockets)]
+					if self.campaign_sockets:
+						runner.campaign_socket = self.campaign_sockets[slot % len(self.campaign_sockets)]
 				try:
 					if where == "here":
 						yield from (runner.battle(spec, keep_record=index == 0 and n % TRACE_EVERY == 0) if self.kind == "battle" else runner.campaign(spec, stop))
@@ -428,10 +434,26 @@ class Games(IterableDataset):
 					# (a campaign game lost to an error yields no game item: "lost" lets the trainer count it as over)
 					yield {"kind": "failed", "what": self.kind, "message": f"{spec.get('key', '?')}: {str(error)[:400]}", "lost": self.kind == "campaign"}
 				finally:
+					if slot is not None:
+						self.release_server(slot)
 					self.release(where, conn)
 					trim_memory()
 		finally:
 			runner.close()
+
+	def take_server(self):
+		"""The inference process with the fewest of this machine's games now (Shared.server_games), counted one more
+		until release_server. By the worker's own index (index % processes) two games often shared a process while others
+		idled: 2026-11-05, 14 games and 12 processes, 9 busy 76-100% and 3 idle, the games waiting on them."""
+		with self.shared.lock:
+			games = self.shared.server_games
+			slot = min(range(len(games)), key=games.__getitem__)
+			games[slot] += 1
+		return slot
+
+	def release_server(self, slot):
+		with self.shared.lock:
+			self.shared.server_games[slot] -= 1
 
 	def permits_left(self):
 		with self.shared.lock:
@@ -671,7 +693,7 @@ class Supply:
 		self.config, self.out, self.pool, self.campaign = config, Path(out), pool, campaign
 		self.ctx = forkserver.context()  # (fork_preload: every module a worker imports, once, frozen: inherited)
 		ceilings = {"battle": config.generated_actors, **({"campaign": config.campaign.games} if campaign else {})}
-		self.shared = Shared(self.ctx, ceilings)
+		self.shared = Shared(self.ctx, ceilings, servers=len(pool.server.socket_paths))
 		self.shared.version.value = pool.version
 		global SHARED
 		SHARED = self.shared
