@@ -217,6 +217,7 @@ class AlphaMapAI : public CAdventureAI
 	int exchangeAdvised = 0;
 	int exchangeAdviceMatched = 0;
 	int exchangeAdviceEnds = 0;
+	int exchangeAdviceArtifacts = 0; // (exchanges advised a GIVE into a free slot of the hero with the army)
 	std::array<int, 3> visitAdvised{}; // (turn decisions advised a town visit's upgrade, gathering, spellbook: adviseVisit)
 	double adviceSeconds = 0;
 	std::map<std::string, int> adviceUnmatched;

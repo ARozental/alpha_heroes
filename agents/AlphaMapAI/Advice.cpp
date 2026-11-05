@@ -310,6 +310,27 @@ std::optional<Choice> AlphaMapAI::adviseExchange(const Decision & decision, Obje
 	std::optional<Choice> advice = adviseToward(decision, destination, source, needed, accept);
 	if(!advice && !needed)
 	{
+		// Its artifacts (pickBestArtifacts, after the army): the hero that got the army gets each of the other's artifacts
+		// that fits a free slot of its (and swaps in better ones by its score, not exported: left out). Ours: a GIVE from
+		// the other hero landing in a worn slot (getArtAnyPosition's: the slot is free), the first one advised, the rest
+		// accepted; END only once none is left (the END it advised before taught our model to keep its artifacts apart)
+		for(const auto & [index, e] : decision.entries[static_cast<int>(ActionType::ARTIFACT)])
+			if(e.first == source->id && e.second == destination->id && e.c >= 0 && e.c < N_WORN_SLOTS)
+			{
+				if(advice)
+					accept.emplace_back(static_cast<int>(ActionType::ARTIFACT), index);
+				else
+				{
+					Choice choice;
+					choice.type = static_cast<int>(ActionType::ARTIFACT);
+					choice.index = index;
+					advice = choice;
+					++exchangeAdviceArtifacts;
+				}
+			}
+	}
+	if(!advice && !needed)
+	{
 		Choice choice;
 		choice.type = static_cast<int>(ActionType::END);
 		choice.index = 0; // (as the end of a turn's advice: matchRequest)
@@ -497,7 +518,7 @@ std::string AlphaMapAI::adviceJson() const
 	std::string unmatched;
 	for(const auto & [kind, count] : adviceUnmatched)
 		unmatched += (unmatched.empty() ? "\"" : ", \"") + kind + "\": " + std::to_string(count);
-	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + "}, \"visit\": {\"upgrade\": " + std::to_string(visitAdvised[0]) + ", \"gather\": " + std::to_string(visitAdvised[1]) + ", \"book\": " + std::to_string(visitAdvised[2]) + "}, \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
+	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + ", \"artifacts\": " + std::to_string(exchangeAdviceArtifacts) + "}, \"visit\": {\"upgrade\": " + std::to_string(visitAdvised[0]) + ", \"gather\": " + std::to_string(visitAdvised[1]) + ", \"book\": " + std::to_string(visitAdvised[2]) + "}, \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
 }
 
 // The events of a seated Nullkiller2's memory (AlphaMapAI.h), passed on to the advising one; none of our own uses them
