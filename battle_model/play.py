@@ -8,6 +8,7 @@ data.py turns into training examples.
 
 Each game runs through scripts/headless.sh, so it has a time limit, a disk limit and stall detection.
 """
+import collections
 import functools
 import itertools
 import json
@@ -382,6 +383,13 @@ BATTLE_NICENESS = 10  # BattleProcess's (the actors' generated battles; real gam
 IDLE_SECONDS = 40
 
 
+# The runner folders of stalled battle clients (VCMI's logs, and the stall sample: what each thread waited in) this process
+# keeps, the newest STALLED_KEPT. 2026-11-05: 205 of joint7's generated battles and 17 of eval 8347's had stalled with
+# nothing kept, the folders deleted with the client
+STALLED_KEPT = 4
+_stalled_runs = collections.deque()
+
+
 class BattleProcess:
 	"""One VCMI client that plays battle after battle (the client's test queue, vcmi client/TestQueue.h): its start-up
 	(~0.6 s of CPU, more than the rest of a short battle) once every max_battles, not once a battle. play() is play()
@@ -495,7 +503,12 @@ class BattleProcess:
 			output = self.process.communicate()[0] if self.process.stdout and not self.process.stdout.closed else ""
 			run = next((line.split(":", 1)[1].strip() for line in (output or "").splitlines() if line.startswith("run:")), "")
 			status = next((line.split(":", 1)[1].strip() for line in (output or "").splitlines() if line.startswith("status:")), "")
-			if run:
+			if run and status.startswith("killed: no log output"):
+				_stalled_runs.append(run)
+				while len(_stalled_runs) > STALLED_KEPT:
+					shutil.rmtree(_stalled_runs.popleft(), ignore_errors=True)
+				status += f" (kept: {run})"
+			elif run:
 				shutil.rmtree(run, ignore_errors=True)
 		self.process = None
 		return status

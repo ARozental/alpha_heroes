@@ -50,6 +50,7 @@ def test_the_battle_learner_gets_real_keep_of_the_campaigns_battles(monkeypatch)
 	monkeypatch.setattr(supply, "prepare", lambda record, source, game, config: ({"kind": "battle", "record": record}, None))
 	runner = supply.Runner.__new__(supply.Runner)
 	runner.records = SimpleNamespace(drain=lambda: {"g1:RED": list(range(4000))})
+	runner.credit = None  # (no trainer: the config's own credit)
 	random.seed(1)
 	for keep, low, high in ((1.0, 4000, 4000), (0.0, 0, 0), (0.12, 380, 580)):
 		runner.config = SimpleNamespace(real_keep=keep)
@@ -65,3 +66,21 @@ def test_once_filling_the_generated_actors_play_for_the_shortfall(monkeypatch):
 	monkeypatch.setattr(actors, "FILL_AFTER", 0.0)
 	p.short_since = 1.0
 	assert ActorPool.generated_room(p) == 1000
+
+
+def test_the_workers_prepare_battles_with_the_trainers_credit(tmp_path):
+	"""Supply.publish's credit (Shared.credit) reaches Runner.advantage_config: the outcome share and policy heads of
+	the trainer's last update; unset, the config's own."""
+	import multiprocessing
+
+	from battle_model.losses import AdvantageConfig
+	from battle_model.train import TrainConfig
+
+	config = TrainConfig()
+	shared = SimpleNamespace(version=multiprocessing.Value("i", 0, lock=False), credit=multiprocessing.Array("d", [-1.0] * 5, lock=False))
+	runner = supply.Runner(config, tmp_path, None, None, None, "w0", shared.version, shared.credit)
+	assert runner.advantage_config() is config
+	supply.Supply.publish(SimpleNamespace(shared=shared), 7, AdvantageConfig(outcome_share=0.3, policy_heads=(0.1, 0, 0, 1)))
+	advantage = runner.advantage_config().advantage
+	assert shared.version.value == 7 and advantage.outcome_share == 0.3 and advantage.policy_heads == (0.1, 0.0, 0.0, 1.0)
+	assert advantage.window_rounds == config.advantage.window_rounds and runner.config is config

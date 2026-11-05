@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from .constants import N_ACTION_TYPES, N_SPELLS
+from .constants import N_ACTION_TYPES, N_SPELLS, ActionType
 
 PRIORS_DIR = Path(__file__).resolve().parent / "priors"
 MASTERY_BIAS = (0.0, 0.25, 0.5, 0.75)
@@ -58,3 +58,26 @@ def spells():
 def mastery():
 	"""[N_SPELLS, 4]: MASTERY_BIAS for every spell."""
 	return torch.tensor(MASTERY_BIAS).expand(N_SPELLS, -1).clone()
+
+
+# A unit that can shoot at full damage shoots: BattleAI's rule, as the type rules' prior (the user's learnable penalty for
+# idle shooters, 2026-11-05). DEFEND starts this much lower there (features.SHOT_TYPE_FEATURES' full_shot); every other
+# type rule starts at 0. In joint2 the 5% of shooter states where an idle type beat SHOOT were behind by up to ~1 logit
+IDLE_SHOT_BIAS = -2.0
+
+
+def type_rules(names):
+	"""[N_ACTION_TYPES, len(names)]: the type rules' start (model.ActionHeads.type_rules); names: features.TYPE_FEATURES."""
+	weight = torch.zeros(N_ACTION_TYPES, len(names))
+	weight[ActionType.DEFEND, names.index("full_shot")] = IDLE_SHOT_BIAS
+	return weight
+
+
+def widen_type_rules(state_dict, key, names):
+	"""A checkpoint (or a league snapshot) from before features.SHOT_TYPE_FEATURES: its type rules' columns kept, the
+	new ones at their start (type_rules)."""
+	saved = state_dict.get(key)
+	if saved is not None and saved.shape[-1] < len(names):
+		widened = type_rules(names).to(device=saved.device, dtype=saved.dtype)
+		widened[:, : saved.shape[-1]] = saved
+		state_dict[key] = widened

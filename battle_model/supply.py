@@ -44,7 +44,7 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from . import forkserver, generator, play, remote
-from .constants import MAX_UNITS, N_HEXES, ActionType
+from .constants import MAX_UNITS, N_HEXES, N_VALUE_HORIZONS, ActionType
 from .data import SPARSE_INPUTS, Sparse, battle_examples, check_record, collate, compact_record, version_of
 
 KEPT_RUNS = deque(maxlen=9)  # (the VCMI logs of clean games with actions that changed nothing: the newest 8 a process)
@@ -285,6 +285,9 @@ class Shared:
 		self.permits = ctx.Value("i", 0, lock=False)  # campaign games the trainer lets start (Supply.allow)
 		self.started = ctx.Value("i", 0, lock=False)  # campaign games started (in flight = this - what the trainer got)
 		self.version = ctx.Value("i", 0, lock=False)  # the battle model's version (the league's draw: no snapshot of it)
+		# The credit the trainer set last (Supply.publish): the window credit's outcome share, then the policy heads' weights,
+		# both following the value head's quality (train.py); unset (< 0) before its first update: the config's own
+		self.credit = ctx.Array("d", [-1.0] * (2 + N_VALUE_HORIZONS), lock=False)
 		self.stop = ctx.Event()
 
 
@@ -390,7 +393,7 @@ class Games(IterableDataset):
 		info = get_worker_info()
 		index = info.id if info else 0
 		rng = random.Random(1_000_003 * (self.config.seed + 1) + 7919 * index + (104_729 * self.config.campaign.seed if self.kind == "campaign" else 0))
-		runner = Runner(self.config, self.run_dir, self.battle_sockets[index % len(self.battle_sockets)], self.campaign_sockets[index % len(self.campaign_sockets)] if self.campaign_sockets else None, self.link, f"w{index}", self.shared.version)
+		runner = Runner(self.config, self.run_dir, self.battle_sockets[index % len(self.battle_sockets)], self.campaign_sockets[index % len(self.campaign_sockets)] if self.campaign_sockets else None, self.link, f"w{index}", self.shared.version, self.shared.credit)
 		stop = self.shared.stop
 		n = 0
 		unreachable = 0.0  # (when this worker last said its campaign inference was unreachable)
@@ -452,13 +455,22 @@ class Runner:
 	"""Plays games on this machine (a worker's, or a remote slot's: worker.py) and yields their items: one battle
 	process for the generated battles (play.BattleProcess), one record server for the campaign games' battles."""
 
-	def __init__(self, config, run_dir, battle_socket, campaign_socket, link, name, version=None):
+	def __init__(self, config, run_dir, battle_socket, campaign_socket, link, name, version=None, credit=None):
 		self.config, self.run_dir, self.name = config, Path(run_dir), name
 		self.battle_socket, self.campaign_socket, self.link = battle_socket, campaign_socket, link
 		self.version = version  # a shared Value (the battle model's), or None
+		self.credit = credit  # Shared.credit, or None (a remote slot: the config's own)
 		self.process = None  # play.BattleProcess, made on the first battle
 		self.records = None  # play.RecordServer for the campaign games' battles
 		self.game = None  # the campaign game running (play.GameRun), for close()
+
+	def advantage_config(self):
+		"""The config with the credit the trainer uses now (Shared.credit). Until 2026-11-05 the workers kept the config's
+		own: the outcome share the trainer logged as following the value head stayed at its floor here."""
+		credit = list(self.credit) if self.credit is not None else [-1.0]
+		if credit[0] < 0:
+			return self.config
+		return replace(self.config, advantage=replace(self.config.advantage, outcome_share=credit[0], policy_heads=tuple(credit[1:])))
 
 	def close(self):
 		if self.game is not None:
@@ -510,7 +522,7 @@ class Runner:
 		"""Plays one generated battle here; yields its items (one a recorded side)."""
 		from .train import generated_games
 
-		config = self.config
+		config = self.advantage_config()
 		if self.process is None:
 			self.process = play.BattleProcess()
 		scenario, opponent, our_side = spec["scenario"], spec["opponent"], spec["our_side"]
@@ -610,7 +622,7 @@ class Runner:
 				except Exception as error:
 					yield {"kind": "failed", "what": "battle", "message": f"FAILURE: unreadable record from {record_key}: {error}"}
 					continue
-				item, problem = prepare(record, "real", record_key.split(":", 1)[0], self.config)
+				item, problem = prepare(record, "real", record_key.split(":", 1)[0], self.advantage_config())
 				yield item if item else {"kind": "failed", "what": "battle", "message": problem}
 
 
@@ -763,9 +775,12 @@ class Supply:
 			if iterator is not None:
 				iterator._shutdown_workers()
 
-	def publish(self, version):
-		"""The battle model's new version (the league's draw leaves its snapshot out)."""
+	def publish(self, version, advantage=None):
+		"""The battle model's new version (the league's draw leaves its snapshot out), and the credit its update used
+		(advantage: an AdvantageConfig; the workers prepare the next battles with it)."""
 		self.shared.version.value = int(version)
+		if advantage is not None:
+			self.shared.credit[:] = [float(advantage.outcome_share), *(float(w) for w in advantage.policy_heads)]
 
 	def _pull(self, kind, loader):
 		iterator = iter(loader)

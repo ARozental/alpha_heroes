@@ -64,6 +64,7 @@ class BattleSummary:
 	army_killed: float = 0.0  # {round: round_score at its end} while the battle went on
 	decisions: int = 0
 	advantage_std: float = 0.0  # std of the raw (not normalised) advantages, -1..1 scale: how much there is to learn
+	advantage_scale: float = 1.0  # what its advantages were multiplied by (lopsided_scale), after advantage_std
 	value_error: float = 0.0  # mean |V - final reward| over the decisions, -1..1 scale, V from the model that played
 	values: list = field(default_factory=list)  # V at every decision (-1..1), for the value head's explained variance
 	# Per decision but the last: (our army value lost, enemy army value killed, change of V) until the next decision,
@@ -367,6 +368,7 @@ def read_decisions(record):
 
 
 MIN_WEIGHT, FULL_WEIGHT_SHARE = 0.05, 0.1
+LOPSIDED_MIN_SHARE = 0.02  # lopsided_scale: a battle more lopsided than this is scaled as if its weaker side had this share
 
 
 def unit_health(inputs):
@@ -421,6 +423,19 @@ def example_weight(summary):
 	return min(1.0, max(MIN_WEIGHT, share / FULL_WEIGHT_SHARE))
 
 
+def lopsided_scale(summary):
+	"""What a battle's advantages are multiplied by (AdvantageConfig.lopsided_scale): both sides' start assets over twice
+	their harmonic mean, 1 / (4 p (1 - p)) for the weaker side's share p. The reward is a share of both sides' assets,
+	while what the decisions can change is about the weaker side's worth (the big army's losses, the small one's damage);
+	the harmonic mean is the weaker side smoothed (the user, 2026-11-05: scale lopsided battles by the weaker army). 1 for
+	an even fight, x3 at 10:1, at most x12.8 (its value at LOPSIDED_MIN_SHARE, ~50:1): the value head's errors are
+	multiplied as well, and how precise it is where the reward moves by ~0.01 is not known. example_weight still damps
+	the most lopsided by their share."""
+	own, enemy = max(summary.own_start_value, 0.0), max(summary.enemy_start_value, 0.0)
+	share = max(min(own, enemy) / max(own + enemy, 1.0), LOPSIDED_MIN_SHARE)
+	return 1.0 / (4.0 * share * (1.0 - share))
+
+
 def battle_examples(record, reward_config=RewardConfig(), advantage_config=AdvantageConfig()):
 	"""(examples, summary) for one recorded battle (a Record, or a record folder). Each example is a dict as described at the top."""
 	record = as_record(record)
@@ -443,6 +458,8 @@ def battle_examples(record, reward_config=RewardConfig(), advantage_config=Advan
 	labels = value_targets(rounds, summary.round_scores, summary.reward)
 	advantages = policy_advantages(final_advantages, labels, outputs["value"], advantage_config)
 	summary.advantage_std = float(advantages.std()) if len(advantages) > 1 else 0.0
+	summary.advantage_scale = lopsided_scale(summary) if advantage_config.lopsided_scale else 1.0
+	advantages = advantages * summary.advantage_scale
 	summary.value_error = float((values - rewards[-1]).abs().mean())
 	summary.values = values.tolist()
 	own = army_values(record.tensors, summary.our_side) / max(summary.own_start_value, 1.0)

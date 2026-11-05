@@ -207,3 +207,23 @@ def test_distance_maps_match_the_engines_search(seed):
 	engine, _ = rules.reachability(t, b.me, b.me["flying"][:, 0])
 	engine = torch.where(engine <= F.REACH_STEPS, engine, rules.INFINITE_DISTANCE)
 	assert torch.equal(ours[walkers], engine[walkers])
+
+
+def test_a_shooter_sees_whether_it_has_a_full_damage_shot():
+	"""features.shot_types (the type rules' full_shot, half_shot_only): a legal target within 10 hexes is a full shot,
+	only farther ones half damage; a unit with no distance penalty shoots at full damage from anywhere; no legal target
+	(blocked), neither."""
+	def shot(units, legal=(1,)):
+		x = battle(units)
+		for slot in legal:
+			x["m_shoot_target"][0, slot] = True
+		finalize_masks(x, 0)
+		t = {k: torch.from_numpy(v) for k, v in x.items()}
+		return F.shot_types(F.read_battle(t, BattleModel().tables()))[0].tolist()
+
+	archer, near, far = ("Archer", 10, 0, 86, 6, 3), ("Pikeman", 10, 1, 90, 4, 5), ("Pikeman", 10, 1, 101, 4, 5)  # 4 and 15 hexes
+	assert shot([archer, near]) == [1.0, 0.0]
+	assert shot([archer, far]) == [0.0, 1.0]
+	assert shot([archer, far, near], legal=(1, 2)) == [1.0, 0.0]  # one near target is enough
+	assert shot([("Sharpshooter", 10, 0, 86, 12, 10), far]) == [1.0, 0.0]
+	assert shot([archer, near], legal=()) == [0.0, 0.0]

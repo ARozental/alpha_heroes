@@ -92,11 +92,25 @@ while kill -0 "$PID" 2>/dev/null; do
 		LAST_LOG_CHANGE=$SECONDS
 		CPU_AT_CHANGE=$(cpu_seconds)
 	elif (( SECONDS - LAST_LOG_CHANGE >= STALL_SECONDS )); then
-		# sample itself can hang on a stuck client (it did, for hours, blocking an eval and two real-game actors)
-		sample "$PID" 3 -file "$RUN_DIR/stall_sample.txt" > /dev/null 2>&1 &
-		SAMPLER=$!
-		for _ in {1..20}; do kill -0 "$SAMPLER" 2>/dev/null || break; sleep 1; done
-		kill -KILL "$SAMPLER" 2>/dev/null
+		if command -v sample > /dev/null; then
+			# sample itself can hang on a stuck client (it did, for hours, blocking an eval and two real-game actors)
+			sample "$PID" 3 -file "$RUN_DIR/stall_sample.txt" > /dev/null 2>&1 &
+			SAMPLER=$!
+			for _ in {1..20}; do kill -0 "$SAMPLER" 2>/dev/null || break; sleep 1; done
+			kill -KILL "$SAMPLER" 2>/dev/null
+		else
+			# Linux (the PC's WSL: no sample, no debugger, ptrace_scope 1): each thread's state and the kernel function it
+			# waits in, and the client's descriptors. Every thread in futex_wait is a deadlock; one in a socket read waits
+			# on the inference or the server; R is a busy loop. Readable without ptrace
+			for P in "$PID" $(pgrep -P "$PID"); do  # (and a server process of its own, if any)
+				echo "pid $P: $(tr '\0' ' ' < "/proc/$P/cmdline" 2>/dev/null)"
+				for TASK in /proc/"$P"/task/*; do
+					echo "$(basename "$TASK") $(cat "$TASK/comm" 2>/dev/null) state $(sed 's/.*) //' "$TASK/stat" 2>/dev/null | cut -d' ' -f1) wchan $(cat "$TASK/wchan" 2>/dev/null)"
+				done
+				ls -l /proc/"$P"/fd 2>/dev/null
+				echo
+			done > "$RUN_DIR/stall_sample.txt" 2>&1
+		fi
 		STATUS="killed: no log output for ${STALL_SECONDS}s, stack sample in stall_sample.txt"
 		break
 	fi

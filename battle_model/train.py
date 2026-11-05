@@ -295,7 +295,7 @@ ACTION_KINDS = ("WAIT", "DEFEND", "MOVE", "MELEE", "SHOOT", "HERO_SPELL", "CREAT
 COLUMNS = [
 	"epoch", "attack_reward", "attack_outcome", "defence_reward", "defence_outcome", "mean_reward", "attack_raw_reward", "defence_raw_reward", "attack_win_rate", "defence_win_rate",
 	"decisions", "rounds", "policy_loss", "value_loss", "value_loss_fresh", "value_loss_fresh_real", "value_loss_fresh_generated", "entropy", "below_floor", "approx_kl", "clip_fraction", "signal_ratio", "weight_change",
-	"attack_advantage_std", "defence_advantage_std", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds", "data_seconds", "prepass_seconds", "steps_seconds", "publish_seconds",
+	"attack_advantage_std", "defence_advantage_std", "attack_advantage_scale", "defence_advantage_scale", "attack_value_error", "defence_value_error", "seconds", "wait_seconds", "train_seconds", "data_seconds", "prepass_seconds", "steps_seconds", "publish_seconds",
 ] + [f"{side}_share_{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS] + [
 	f"{side}_{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")
 ] + ["real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow", "battles_here", "battles_remote", "games_here", "games_remote", "game_permits", "games_in_flight", "learning_rate", "ppo_steps", "update_kl", "outcome_share", "round_head_weight"] + [
@@ -332,7 +332,7 @@ TENSORBOARD_TAGS = {
 	"attack_win_rate": "won/attack", "defence_win_rate": "won/defence",
 	"policy_loss": "loss/policy", "value_loss": "loss/value", "value_loss_fresh": VALUE_LOSS_TAB, "value_loss_fresh_real": VALUE_LOSS_TAB + "_real", "value_loss_fresh_generated": VALUE_LOSS_TAB + "_generated", "entropy": "loss/entropy", "below_floor": "loss/entropy_below_floor",
 	"signal_ratio": "stability/signal_ratio", "weight_change": "stability/weight_change", "approx_kl": "stability/approx_kl", "clip_fraction": "stability/clip_fraction",
-	"attack_advantage_std": "advantage_std/attack", "defence_advantage_std": "advantage_std/defence",
+	"attack_advantage_std": "advantage_std/attack", "defence_advantage_std": "advantage_std/defence", "attack_advantage_scale": "advantage_scale/attack", "defence_advantage_scale": "advantage_scale/defence",
 	"attack_value_error": "value_error/attack", "defence_value_error": "value_error/defence",
 	"decisions": "battle/decisions", "rounds": "battle/rounds", "seconds": "time/epoch_seconds",
 	"wait_seconds": "time/waiting_for_battles_seconds", "train_seconds": "time/training_seconds",
@@ -952,17 +952,18 @@ def trunk_gradients(model, main, foresight):
 
 def load_optimizer(optimizer, model, state):
 	"""The checkpoint's optimizer state. A checkpoint from before parameters were added (2026-10-29: the value priors,
-	model.VALUE_PRIOR_KINDS) keeps Adam's moments for the parameters it had, matched by name in the model's order; the
-	new ones start fresh."""
+	model.VALUE_PRIOR_KINDS) or reshaped (2026-11-05: the type rules' shot features) keeps Adam's moments for the
+	parameters it had at their shapes, matched by name in the model's order; the others start fresh."""
 	saved = state["optimizer"]
 	names = [name for name, _ in model.named_parameters()]
-	if len(saved["param_groups"][0]["params"]) == len(names):
+	shapes = [p.shape for _, p in model.named_parameters()]
+	# (the same parameters, none reshaped: 2026-11-05's type rules widened in place, model.ActionHeads._load_from_state_dict)
+	if len(saved["param_groups"][0]["params"]) == len(names) and all(s["exp_avg"].shape == shapes[i] for i, s in saved["state"].items() if "exp_avg" in s):
 		optimizer.load_state_dict(saved)
 		return
 	had = [i for i, name in enumerate(names) if name in state["model"]]  # the checkpoint's parameters, in its order
 	if len(had) != len(saved["param_groups"][0]["params"]):
 		raise ValueError(f"the checkpoint's optimizer has {len(saved['param_groups'][0]['params'])} parameters, its model {len(had)}")
-	shapes = [p.shape for _, p in model.named_parameters()]
 	moments = {new: saved["state"][old] for old, new in enumerate(had) if old in saved["state"] and saved["state"][old]["exp_avg"].shape == shapes[new]}
 	reshaped = [names[new] for old, new in enumerate(had) if old in saved["state"] and new not in moments]
 	if reshaped:
@@ -1455,7 +1456,7 @@ def train(config, resume=False):
 				torch.mps.empty_cache()
 			if pool:
 				pool.publish(model)
-				supply.publish(pool.version)
+				supply.publish(pool.version, advantage_config)
 			else:
 				current = 1 - current
 				export(cpu_copy(model), model_files[current])
@@ -1521,6 +1522,7 @@ def train(config, resume=False):
 				row[f"{name}_win_rate"] = round(mean_of([float(s.outcome == Outcome.WIN) for s in side_summaries]), 4)
 				row[f"{name}_outcome"] = outcome_text(side_summaries)
 				row[f"{name}_advantage_std"] = round(mean_of([s.advantage_std for s in side_summaries]), 4)
+				row[f"{name}_advantage_scale"] = round(mean_of([s.advantage_scale for s in side_summaries]), 3)
 				row[f"{name}_value_error"] = round(mean_of([s.value_error for s in side_summaries]), 4)
 				ev, own_lost, killed = credit_check(side_summaries)
 				row[f"{name}_value_ev"], row[f"{name}_credit_own_lost"], row[f"{name}_credit_killed"] = round(ev, 3), round(own_lost, 3), round(killed, 3)

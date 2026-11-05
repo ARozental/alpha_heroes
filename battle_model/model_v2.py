@@ -202,10 +202,10 @@ class ActionHeads(nn.Module):
 			second[spell] = int(kind)
 		self.register_buffer("second_target", second, persistent=False)
 		self.register_buffer("type_one_hot", torch.eye(N_ACTION_TYPES), persistent=False)
-		with torch.no_grad():  # untrained: the biases (priors.py), no type rules, zero pointer scores
+		with torch.no_grad():  # untrained: the biases (priors.py), the type rules at their prior, zero pointer scores
 			self.type_head.weight.zero_()
 			self.type_head.bias.copy_(priors.action_types())
-			self.type_rules.weight.zero_()
+			self.type_rules.weight.copy_(priors.type_rules(F.TYPE_FEATURES))
 			# every pointer score starts at 0: the queries, and the per-unit offsets added to them, start at 0
 			for layer in (*self.queries.values(), self.keys["melee_from_unit"], self.keys["spell2_from_unit"]):
 				layer.weight.zero_()
@@ -214,6 +214,11 @@ class ActionHeads(nn.Module):
 			self.spell_head.bias.copy_(priors.spells())
 			self.spell_query.weight.zero_()
 			self.creature_spell_query.weight.zero_()
+
+	def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+		"""A checkpoint from before the shot type features: they start at their prior."""
+		priors.widen_type_rules(state_dict, prefix + "type_rules.weight", F.TYPE_FEATURES)
+		super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
 	def mastery_bias(self, x):
 		"""[B, N_SPELLS]: each spell's bias for our hero's mastery of its school (the best of its schools: none, basic,

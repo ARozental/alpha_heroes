@@ -203,3 +203,50 @@ def test_npy_view_reads_what_np_load_reads():
 		np.save(buffer, array)
 		view = npy_view(memoryview(buffer.getvalue()))
 		assert view.dtype == array.dtype and view.shape == array.shape and np.array_equal(view, array)
+
+
+def test_lopsided_battles_are_scaled_to_their_weaker_side():
+	"""data.lopsided_scale: 1 for an even fight, 1 / (4 p (1 - p)) for the weaker side's share p (either side), at most
+	its value at LOPSIDED_MIN_SHARE."""
+	from types import SimpleNamespace
+
+	from battle_model.data import LOPSIDED_MIN_SHARE, lopsided_scale
+
+	scale = lambda own, enemy: lopsided_scale(SimpleNamespace(own_start_value=own, enemy_start_value=enemy))  # noqa: E731
+	assert scale(5000, 5000) == pytest.approx(1.0)
+	assert scale(10000, 1000) == pytest.approx(121 / 40) and scale(1000, 10000) == scale(10000, 1000)
+	cap = 1 / (4 * LOPSIDED_MIN_SHARE * (1 - LOPSIDED_MIN_SHARE))
+	assert scale(100000, 1000) == pytest.approx(cap) and scale(0, 0) == pytest.approx(cap)
+
+
+def test_a_battles_advantages_are_multiplied_by_its_scale(tmp_path):
+	"""battle_examples multiplies every advantage by lopsided_scale (AdvantageConfig.lopsided_scale); advantage_std
+	stays in the reward's unit."""
+	import numpy as np
+	import torch
+
+	from battle_model.data import battle_examples, lopsided_scale
+	from battle_model.distributions import sample
+	from battle_model.losses import AdvantageConfig
+	from battle_model.model import BattleModel
+	from battle_model.schema import random_inputs
+
+	torch.manual_seed(0)
+	model = BattleModel(dim=32, layers=1).eval()
+	decisions = []
+	for i in range(5):
+		x = random_inputs(batch=1, seed=i)
+		with torch.no_grad():
+			out = model({k: torch.from_numpy(v) for k, v in x.items()})
+		outputs = {k: v.numpy() for k, v in out.items() if k != "value_logit"}
+		decisions.append(({**x, **outputs}, sample(outputs, 0, np.random.default_rng(i))))
+	write_record(tmp_path / "game_0", decisions, events(0, {"round": 3, "winner": 0, "result": RESULT_NORMAL, "casualties": [[], THEIRS], "alive": [[], []]}))
+
+	scaled, summary = battle_examples(tmp_path / "game_0")
+	plain, unscaled = battle_examples(tmp_path / "game_0", advantage_config=AdvantageConfig(lopsided_scale=False))
+	factor = lopsided_scale(summary)
+	assert 1.2 < factor < 2.0  # (10 pikemen and an angel against 20 imps)
+	assert summary.advantage_scale == factor and unscaled.advantage_scale == 1.0 and summary.advantage_std == unscaled.advantage_std
+	assert any(float(e["advantage"]) != 0.0 for e in plain)
+	for a, b in zip(scaled, plain):
+		assert float(a["advantage"]) == pytest.approx(factor * float(b["advantage"]), rel=1e-5, abs=1e-7)

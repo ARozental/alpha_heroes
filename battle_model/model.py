@@ -574,10 +574,10 @@ class ActionHeads(nn.Module):
 		self.register_buffer("second_target", second, persistent=False)
 		self.register_buffer("type_one_hot", torch.eye(N_ACTION_TYPES), persistent=False)
 		self.value_gains = nn.Parameter(torch.zeros(len(VALUE_PRIOR_KINDS)))  # each kind's value prior: log-gain, 0 = x1
-		with torch.no_grad():  # untrained: the biases (priors.py), no type rules, zero pointer scores
+		with torch.no_grad():  # untrained: the biases (priors.py), the type rules at their prior, zero pointer scores
 			self.type_head.weight.zero_()
 			self.type_head.bias.copy_(priors.action_types())
-			self.type_rules.weight.zero_()
+			self.type_rules.weight.copy_(priors.type_rules(F.TYPE_FEATURES))
 			self.type_strength.weight.zero_()
 			for layer in (*self.queries.values(), self.keys["melee_from_unit"], self.keys["spell2_from_unit"]):
 				layer.weight.zero_()
@@ -588,9 +588,11 @@ class ActionHeads(nn.Module):
 			self.creature_spell_query.weight.zero_()
 
 	def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-		"""A checkpoint (or a league snapshot) from before the value priors: they start at their prior."""
+		"""A checkpoint (or a league snapshot) from before the value priors or the shot type features: they start at their
+		prior."""
 		if prefix + "value_gains" not in state_dict:
 			state_dict[prefix + "value_gains"] = torch.zeros_like(self.value_gains)
+		priors.widen_type_rules(state_dict, prefix + "type_rules.weight", F.TYPE_FEATURES)
 		super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
 	def value_prior(self, value, kind):

@@ -32,9 +32,12 @@ buffer_decisions = 8000
 generated_actors = 4
 # The battle model's steps (the user, 2026-10-31): its eval flat at ~+0.09 for ~1,100 updates of 256-decision steps,
 # signal_ratio ~0.12 (mostly noise). 3,072-decision steps at 1e-5, 3 an update: it hardly moved (300 updates: weight
-# change 7e-3 an update against 8e-2, KL 2e-5 against 3e-3; signal 0.22). Now (the user: larger still, 3e-5, not the
-# cap): updates of 6,400 decisions, steps of 6,144 (24 minibatches accumulated), 4 passes (4 steps an update), Adam's
-# second moment over ~100 steps (adam_beta2): aims an update KL of ~1e-4-1e-3 and a signal ratio of 0.3+
+# change 7e-3 an update against 8e-2, KL 2e-5 against 3e-3; signal 0.22). Then (the user: larger still, 3e-5, not the
+# cap): updates of 6,400 decisions, steps of 6,144 (24 minibatches accumulated), 4 passes, Adam's second moment over
+# ~100 steps (adam_beta2), aiming at an update KL of ~1e-4-1e-3 and a signal ratio of 0.3+. It froze instead: joint7's
+# 1,090 updates had a median update KL of 5e-5, signal 0.25, eval +0.088..+0.097. Since 2026-11-05 512-decision steps
+# (accumulate 2), ~48 an update, at the same rate: Adam's step is ~lr whatever the batch, so ~3.5x the movement at the
+# same signal-to-noise (a step's noise falls with sqrt(batch)); the aim as before. beta2 0.99 is now ~2 updates
 learning_rate = 1e-5  # (the user, 2026-10-31: at most 3e-5, 1e-5 recommended; it was 3e-5, the battle eval flat at ~+0.09)
 adam_beta2 = 0.99
 decisions_per_update = 6400
@@ -43,7 +46,7 @@ tf32 = true
 # 85% of the 32 GB card (~27 GB) for the trainer, the rest for the CUDA context and the driver: past the card Windows
 # spills to RAM and the GPU crawls (2026-11-01, campaign v8: 31.2 GB + 7.9 GB spilled; the update's live peak was 16 GB)
 cuda_memory_fraction = 0.85
-accumulate = 24
+accumulate = 2
 ppo_passes = 4
 # The battle evals' sets three times as large (2026-10-31: a set's standard error was ~0.03, the total's ~0.013, more than
 # the changes to see; with the generator, eval_seeds plays no part): ~600 battles an opponent, ~3x the eval's time on the

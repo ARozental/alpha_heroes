@@ -748,7 +748,22 @@ def hero_assets(x, config):
 MOVE_FEATURES = ("threat_change", "melee_threat_change", "danger_change", "blocked_change", "new_targets", "allies_next_to_change", "enemies_next_to_change", "progress", "shooter_progress", "shooter_next_to_enemy")
 FROM_FEATURES = (*MOVE_FEATURES[:7], "hex_value", *HIT_FEATURES)
 SHOT_FEATURES = tuple(f for f in ATTACK_FEATURES if f not in ("retaliation", "value_lost"))
-TYPE_FEATURES = ("danger_here", "threat_here", "strength")
+# The type rules' features (model.ActionHeads.type_rules): the battle's three, then the acting unit's shot (shot_types).
+# The shot pair since 2026-11-05: shooters idled at 1.4-3.1% of their full-damage chances in greedy evals
+# (train.failure_counts), and the user asked for a learnable penalty
+BATTLE_TYPE_FEATURES = ("danger_here", "threat_here", "strength")
+SHOT_TYPE_FEATURES = ("full_shot", "half_shot_only")
+TYPE_FEATURES = (*BATTLE_TYPE_FEATURES, *SHOT_TYPE_FEATURES)
+
+
+def shot_types(b):
+	"""[B, SHOT_TYPE_FEATURES]: the acting unit can shoot something at full damage (a legal target within
+	rules.SHOOTING_PENALTY_DISTANCE hexes, either of its hexes, or the unit has no distance penalty: train.full_shot's
+	rule, walls not counted); it can shoot, but only at half damage."""
+	near = (rules.hex_distance(b.me["hex"], b.units["hex"]) <= rules.SHOOTING_PENALTY_DISTANCE) | ((b.units["rear"] >= 0) & (rules.hex_distance(b.me["hex"], b.units["rear"]) <= rules.SHOOTING_PENALTY_DISTANCE))
+	legal = b.x["m_shoot_target"] != 0  # [B, U]
+	full = (legal & (near | b.me["no_distance_penalty"])).any(dim=1)
+	return torch.stack([full, legal.any(dim=1) & ~full], dim=-1).float()
 
 
 def action_features(b, melee, shot, maps, can_attack, battle):
@@ -791,7 +806,7 @@ def action_features(b, melee, shot, maps, can_attack, battle):
 		"melee_from": melee_from,
 		"shoot_target": pick(SHOT_FEATURES, shot, ATTACK_FEATURES),
 		"move": hexes,
-		"type": pick(TYPE_FEATURES, battle, BATTLE_FEATURES),
+		"type": torch.cat([pick(BATTLE_TYPE_FEATURES, battle, BATTLE_FEATURES), shot_types(b)], dim=-1),
 	}
 
 

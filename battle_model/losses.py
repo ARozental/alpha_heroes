@@ -99,11 +99,13 @@ class AdvantageConfig:
 	#   "gae"     GAE(lam): exponentially decaying shares of every later step (lam below)
 	credit: str = "window"
 	window_rounds: int = 2
-	outcome_share: float = 0.15
+	# The user, 2026-11-05: half the credit the outcome's, fixed (it was 0.15 at a value EV >= 0.4, all of joint7's 1,090
+	# updates: 85% of a decision's credit was the value head's view two rounds on, its blind spots the policy's)
+	outcome_share: float = 0.5
 	# "window": the outcome's share follows how good the value head is (train.py, by its explained variance EV):
 	# outcome_share_max at EV <= 0, falling linearly to outcome_share at EV >= outcome_share_full_ev. A weak value head is
 	# not trusted with most of the credit: v15-window's first two hours (EV < 0) went flat and half unlearned casting,
-	# and it was well again once EV was ~0.2-0.4. outcome_share_max = outcome_share: off.
+	# and it was well again once EV was ~0.2-0.4. outcome_share_max = outcome_share (the default since 2026-11-05): off.
 	outcome_share_max: float = 0.5
 	outcome_share_full_ev: float = 0.4
 	# GAE lambda (step 5), read by credit "gae" only: the "window" default has no decay of any kind. 1 = judge each
@@ -112,6 +114,11 @@ class AdvantageConfig:
 	# comparison is pending. At 0.8 a decision 12 steps from the end gets 7% of its credit from the outcome (0.95: 54%)
 	lam: float = 0.8
 	normalize_min_decisions: int = 8  # step 5: rescale a group's advantages only if it has at least this many decisions
+	# Step 5a: each battle's advantages in the unit of its weaker side (data.lopsided_scale), before the normalisation. The
+	# reward is a share of both sides' assets, so what a lopsided battle's decisions could change was ~1/100 of an even
+	# fight's, and 60% of joint7's battle updates were lopsided campaign battles (attack won 84%): near-silent (2026-11-05).
+	# The reward, the value heads and the evals keep their unit
+	lopsided_scale: bool = True
 	# How much of each value head (V0, V1, V2, V) the policy maximizes (policy_advantages): weights. The policy
 	# maximizes the final outcome V alone (the user, 2026-10-28: the longest horizon, as the campaign's day 7); the
 	# window credit reaches it through V two rounds on, and the outcome's share covers V's blind spots while V is weak.

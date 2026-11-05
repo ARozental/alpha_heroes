@@ -179,6 +179,7 @@ def test_untrained_model_picks_types_with_the_prior_odds(monkeypatch):
 	with torch.no_grad():  # the spells' biases lift HERO_SPELL by the best castable spell's: zero them here
 		m.actions.spell_head.bias.zero_()
 		m.actions.spell_mastery.zero_()
+		m.actions.type_rules.weight.zero_()  # (the idle-shot prior: test_defend_starts_lower_where_a_full_damage_shot_is)
 	x = random_inputs(batch=1, seed=4)
 	out = run(m, x)
 	legal = np.flatnonzero(x["m_type"][0])
@@ -325,3 +326,57 @@ def test_the_trunks_folded_relation_bias_is_the_bias():
 	h = x + block.proj((att @ v).transpose(1, 2).reshape(b, n, 64))
 	expected = h + block.mlp(block.norm2(h))
 	assert torch.allclose(block(x, valid, team), expected, atol=1e-5)
+
+
+def test_defend_starts_lower_where_a_full_damage_shot_is():
+	"""priors.IDLE_SHOT_BIAS: in the untrained model DEFEND is that many logits under WAIT where the acting unit can
+	shoot at full damage, and level with it where its shot would do half."""
+	from battle_model import priors
+	from battle_model.schema import finalize_masks
+	from battle_model.tests.test_rules import battle
+
+	def defend_over_wait(target_hex):
+		x = battle([("Archer", 10, 0, 86, 6, 3), ("Pikeman", 10, 1, target_hex, 4, 5)])
+		x["m_shoot_target"][0, 1] = True
+		finalize_masks(x, 0)
+		with torch.no_grad():
+			out = BattleModel().eval()({k: torch.from_numpy(v) for k, v in x.items()})
+		return float(out["logp_type"][0, ActionType.DEFEND] - out["logp_type"][0, ActionType.WAIT])
+
+	assert defend_over_wait(90) == pytest.approx(priors.IDLE_SHOT_BIAS, abs=1e-5)
+	assert defend_over_wait(101) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_a_checkpoint_from_before_the_shot_type_features_loads_with_their_prior():
+	"""Its type rules' columns kept, the new ones at priors.type_rules; Adam's moments of the reshaped weight start
+	fresh, every other parameter's kept (train.load_optimizer)."""
+	from battle_model import features as F
+	from battle_model import priors
+	from battle_model.train import load_optimizer
+
+	torch.manual_seed(0)
+	model = BattleModel(dim=32, layers=1)
+	optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+	x = {k: torch.from_numpy(v) for k, v in random_inputs(batch=2, seed=1).items()}
+	out = model(x)
+	(out["value"].sum() + out["logp_type"].exp().mul(torch.arange(out["logp_type"].shape[-1])).sum()).backward()
+	optimizer.step()
+	# as a run from before saved it: the type rules three features wide, in the model and in Adam's moments
+	key, old = "actions.type_rules.weight", len(F.BATTLE_TYPE_FEATURES)
+	names = [name for name, _ in model.named_parameters()]
+	state = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
+	state["model"][key] = torch.randn(state["model"][key].shape[0], old)
+	for moment in ("exp_avg", "exp_avg_sq"):
+		state["optimizer"]["state"][names.index(key)][moment] = state["optimizer"]["state"][names.index(key)][moment][:, :old].clone()
+
+	new = BattleModel(dim=32, layers=1)
+	new.load_state_dict(state["model"])
+	weight = new.actions.type_rules.weight.detach()
+	assert torch.equal(weight[:, :old], state["model"][key])
+	assert torch.equal(weight[:, old:], priors.type_rules(F.TYPE_FEATURES)[:, old:])
+	fresh = torch.optim.Adam(new.parameters(), lr=1e-3)
+	load_optimizer(fresh, new, state)
+	kept = {names[i] for i in fresh.state_dict()["state"]}
+	assert key not in kept and "actions.type_head.weight" in kept and len(kept) == len(state["optimizer"]["state"]) - 1
+	new(x)["value"].sum().backward()
+	fresh.step()  # (moments of the old shape would fail here)
