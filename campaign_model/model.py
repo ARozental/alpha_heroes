@@ -275,6 +275,7 @@ class CustomFeatures(nn.Module):
 		self.danger_gain, self.garrison_penalty, self.fort_gain = zeros(), zeros(), zeros()
 		self.meeting_gain = zeros()  # (2026-11-05: what meeting a hero of ours or entering a town of ours gains, tile_features)
 		self.multi_weight = zeros()  # (2026-11-05: how far a multi-action's gain to Φ biases it: multi_prior)
+		self.give_all_cost = zeros()  # (2026-11-05: what a GIVE_ALL must gain to be worth making; give_all_cost_weight)
 		self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight = zeros(), zeros(), zeros(), zeros()
 		self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight = (zeros() for _ in range(6))
 		self.travel_exponent, self.end_coupling, self.travel_coupling = zeros(), zeros(), zeros()
@@ -302,7 +303,7 @@ class CustomFeatures(nn.Module):
 		return [
 			self.object_gain, self.object_type_gain.weight, self.object_type_delta.weight, self.object_subtype_delta.weight,
 			self.fight_sharpness, self.enemy_value, self.hero_value, self.danger_gain, self.meeting_gain, self.explore_gain, self.class_gain, self.travel_exponent,
-			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost, self.multi_weight,
+			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost, self.multi_weight, self.give_all_cost,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
@@ -613,10 +614,34 @@ class CustomFeatures(nn.Module):
 		"""How far a multi-action's gain to Φ (multi_gain, as value_logit prices it) biases MULTI's entries: 1 at the start, 0..2."""
 		return ft.bounded(self.multi_weight, 0.0, 2.0, 1.0, CORRECTION_STEP)
 
+	def give_all_cost_weight(self):
+		"""What a GIVE_ALL to the weaker of the exchange's two heroes (stronger_receiver) loses before what it gains, in
+		logits (3 at the start, 0..8). The first schema-14 games, Φ's gain alone deciding the receiver, gave armies back
+		and forth: 300 give-alls a game, their median gain 3 gold (two heroes' factors 0.022 apart at the median), 40%
+		toward the hero making less of the army, a third sending it back the same day, and Nullkiller2's labels at the next
+		exchange moving it back (its exchange labels ARMY 85%, from 52%). A cost on both ways instead (a give-all must gain
+		to be made) left the army to troop moves: in a test game 82 of 265 exchanges made 8, the most allowed."""
+		return ft.bounded(self.give_all_cost, 0.0, 8.0, 3.0, CORRECTION_STEP)
+
+	def stronger_receiver(self, x, f):
+		"""Which of GIVE_ALL's rows [B, 2] (its receiver: x_heroes' first or second) is the stronger hero, 1 or 0: the
+		higher level, else the one making more of an army (Φ's factor, f.hero_multiplier), else the bigger army. The user's
+		give-all is "to the strongest hero"; the level first as Nullkiller2's exchange (adviseExchange's destination: the
+		higher level, else the stronger army), which names the same hero at 93% of the schema-14 games' exchanges and Φ's
+		factor first at 71%."""
+		pair = (x["x_heroes"] - 1).clamp(min=0)  # [B, 2]
+		level = x["h_level"][:, :HO].gather(1, pair).float()
+		factor, army = f.hero_multiplier.gather(1, pair), f.hero_gold[:, :HO].gather(1, pair)
+		first = (level[:, 0] > level[:, 1]) | ((level[:, 0] == level[:, 1]) & ((factor[:, 0] > factor[:, 1]) | ((factor[:, 0] == factor[:, 1]) & (army[:, 0] >= army[:, 1]))))
+		return torch.stack([first, ~first], dim=1).float()
+
 	def multi_prior(self, x, f):
 		"""MULTI's prior logits [B, TO, N_MULTI]: what each multi-action does to Φ (multi_gain) as value_logit prices it, at
-		multi_weight_value."""
-		return self.multi_weight_value() * ft.value_logit(self.multi_gain(x, f))
+		multi_weight_value; a GIVE_ALL to the weaker hero less give_all_cost_weight."""
+		prior = self.multi_weight_value() * ft.value_logit(self.multi_gain(x, f))
+		weaker = torch.zeros_like(prior)
+		weaker[:, :2, c.MultiKind.GIVE_ALL] = 1.0 - self.stronger_receiver(x, f)
+		return prior - weaker * self.give_all_cost_weight()
 
 	def artifact_prior(self, x, f):
 		"""What each ARTIFACT entry does to Φ, as a prior logit [B, HO, N_ARTIFACT_POSITIONS, N_ARTIFACT_TARGETS]
@@ -1183,7 +1208,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,

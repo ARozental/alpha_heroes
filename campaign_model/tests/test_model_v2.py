@@ -1506,6 +1506,7 @@ def test_a_multi_actions_prior_is_what_it_does_to_phi():
 	level first, at (unled_share - 1) of its worth (a little below 0); RECRUIT_ALL_HERO into a visiting starting hero
 	(attack and defense 0, spell power 3, knowledge 2, a spellbook) 0; GATHER the garrison x (the visitor's factor -
 	unled_share); GIVE_ALL, each way, the giver's army x the factors' difference."""
+	from campaign_model import features as ft
 	from game_values import REFERENCE_KNOWLEDGE, REFERENCE_POWER
 
 	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
@@ -1523,10 +1524,13 @@ def test_a_multi_actions_prior_is_what_it_does_to_phi():
 	t.creature_resources[12] = torch.tensor([0.0, 0, 0, 0, 0, 0, 100.0])
 	x["g_resources"][0] = torch.tensor([0, 0, 0, 0, 0, 0, 650])  # (6 of the 10 affordable)
 	x["x_heroes"][0] = torch.tensor([1, 2])  # (an exchange of heroes 0 and 1)
+	x["h_army_creature"][0, :2], x["h_army_count"][0, :2] = -1, 0
+	x["h_army_creature"][0, :2, 0], x["h_army_count"][0, :2, 0] = 12, torch.tensor([20, 30])  # (each leads troops)
 	with torch.no_grad():
 		known = m.domain_knowledge(x)
 		gains = t.multi_gain(x, known)[0]
 	K, U = c.MultiKind, t.unled_share
+	assert float(known.hero_gold[0, 0]) > 0 and float(known.hero_gold[0, 1]) > 0
 	worth = 6 * float(t.creature_cost[12] + t.creature_unit[12])
 	assert float(gains[0, K.RECRUIT_ALL]) == pytest.approx(worth * (U - 1), rel=1e-4) and float(gains[0, K.RECRUIT_ALL]) < 0
 	assert float(gains[0, K.RECRUIT_ALL_HERO]) == pytest.approx(0.0, abs=1e-2)  # (the starting hero: neutral)
@@ -1535,3 +1539,22 @@ def test_a_multi_actions_prior_is_what_it_does_to_phi():
 	assert strong == pytest.approx(U * math.sqrt(1.5 / 0.75), rel=1e-5) and start == pytest.approx(1.0, rel=1e-5)
 	assert float(gains[1, K.GIVE_ALL]) == pytest.approx(float(known.hero_gold[0, 0]) * (strong - start), rel=1e-4)  # (to hero 1, the stronger)
 	assert float(gains[0, K.GIVE_ALL]) == pytest.approx(float(known.hero_gold[0, 1]) * (start - strong), rel=1e-4)
+	# The prior: the gain as value_logit prices it; a GIVE_ALL to the weaker hero less its cost (3 at the start). The
+	# stronger: the higher level, else the bigger factor, else the bigger army
+	cost = float(t.give_all_cost_weight())
+	assert cost == pytest.approx(3.0, abs=1e-5)
+	logit = lambda row: float(ft.value_logit(gains[row, K.GIVE_ALL]))  # noqa: E731
+	for levels, stronger in (((4, 4), 1), ((5, 4), 0), ((3, 4), 1)):  # (one level: hero 1's factor; else the level)
+		x["h_level"][0, :2] = torch.tensor(levels)
+		with torch.no_grad():
+			prior = t.multi_prior(x, m.domain_knowledge(x))[0]
+		for kind in (K.RECRUIT_ALL, K.RECRUIT_ALL_HERO, K.GATHER):
+			assert float(prior[0, kind]) == pytest.approx(float(ft.value_logit(gains[0, kind])), abs=1e-5)
+		assert float(prior[stronger, K.GIVE_ALL]) == pytest.approx(logit(stronger), abs=1e-5), levels
+		assert float(prior[1 - stronger, K.GIVE_ALL]) == pytest.approx(logit(1 - stronger) - cost, abs=1e-5), levels
+	# One level and one factor: the bigger army (hero 1's 30 against hero 0's 20)
+	x["h_level"][0, :2], x["h_primary"][0, 1], x["h_artifacts"][0, 1, 0] = 4, x["h_primary"][0, 0], 0
+	with torch.no_grad():
+		known = m.domain_knowledge(x)
+	assert float(known.hero_multiplier[0, 0]) == float(known.hero_multiplier[0, 1])
+	assert t.stronger_receiver(x, known)[0].tolist() == [0.0, 1.0]
