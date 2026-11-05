@@ -149,7 +149,7 @@ def _teacher_span():
 	span = torch.zeros(2, c.N_ACTION_TYPES, c.N_ACTION_TYPES, dtype=torch.bool)
 	for label in A:
 		family = hero | town if label == A.END or label in town else hero if label in hero or label == A.CAST else set()
-		span[0, label, sorted(family | {label, A.END, A.TRADE})] = True  # (TRADE pushed down at every turn label, as before)
+		span[0, label, sorted(family | {label, A.END, A.TRADE, A.MULTI})] = True  # (TRADE and MULTI pushed down at every turn label, as before)
 		span[1, label, sorted({A.ARMY, A.END, label})] = True
 	return span
 
@@ -165,7 +165,10 @@ def _teacher_span():
 # Nullkiller2 buys first for that), and with the moves out of a town label's span our heroes left towns before buying
 # (3 updates of 0d54e0f: RECRUIT 0.119 -> 0.078 and BUILD 0.060 -> 0.042 at decisions in a town of ours, MOVE and TRAVEL
 # up). An exchange's against ARMY and END; every accepted entry against itself too. What lies outside gets no gradient
-# from the teacher (teacher_outside: its share).
+# from the teacher (teacher_outside: its share). MULTI stays in every turn decision's (as TRADE below): out of it, the
+# turn's DROP and GATHER, which the teacher had held down, doubled within 15 updates (v1219-v1236: DROP 6 -> 14 a game,
+# its disbands destroying ~12k gold of army a game; GATHER 4.8 -> 8.6, the morning's emptied towns); at an exchange
+# TAKE_BEST and GIVE_ALL stay outside (52% of exchanges took one, as long as before, no loops).
 # TRADE stays in every turn decision's: its labels are not taught (taught: Nullkiller2's trades), and the push at every
 # other label is part of what ended 135 trades a game (2026-11-04); left to the family it would be pushed at a town's only
 TEACHER_SPAN = _teacher_span()

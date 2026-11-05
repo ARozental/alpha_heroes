@@ -1640,6 +1640,14 @@ def test_a_take_best_and_a_drop_are_priced_on_the_armies_they_make():
 	assert kept == pytest.approx(angels - both + t.unled_share * dwarves, rel=1e-4) and kept > 0  # (faster, +1 morale)
 	assert disbanded == pytest.approx(angels - both, rel=1e-4) and disbanded < kept
 	assert take == pytest.approx(0.0, abs=1e-2)  # (the armies as they were)
+	# Its prior: a DROP that disbands pays disband_cost_weight (3) beside its gain; one a garrison takes does not
+	with torch.no_grad():
+		lost = float(t.multi_prior(x, known)[0, 0, K.DROP_SLOW])
+		x["h_drop_kept"][0, 0, 0] = True
+		parked = float(t.multi_prior(x, known)[0, 0, K.DROP_SLOW])
+	assert float(t.disband_cost_weight()) == pytest.approx(3.0, abs=1e-5)
+	assert lost == pytest.approx(float(t.multi_weight_value() * ft.value_logit(torch.tensor(disbanded))) - 3.0, abs=1e-4)
+	assert parked == pytest.approx(float(t.multi_weight_value() * ft.value_logit(torch.tensor(kept))), abs=1e-4)
 
 
 def test_a_gather_counts_what_it_leaves_its_town_to():

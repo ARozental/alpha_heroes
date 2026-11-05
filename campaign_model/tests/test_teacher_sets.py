@@ -189,9 +189,9 @@ def test_the_teachers_label_is_weighed_against_its_family_and_end_only():
 
 	hero, town = {A.MOVE, A.TRAVEL, A.ARMY}, {A.BUILD, A.RECRUIT, A.HIRE, A.UPGRADE, A.TRADE, A.BUY}
 	spans = lambda exchange, label: {A(t) for t in range(c.N_ACTION_TYPES) if TEACHER_SPAN[exchange, label, t]}  # noqa: E731
-	assert spans(0, A.MOVE) == hero | {A.END, A.TRADE} and spans(0, A.BUILD) == hero | town | {A.END}  # (TRADE at every turn label)
-	assert spans(0, A.END) == hero | town | {A.END} and spans(0, A.CAST) == hero | {A.CAST, A.END, A.TRADE}
-	assert spans(1, A.ARMY) == {A.ARMY, A.END} and spans(1, A.END) == {A.ARMY, A.END}
+	assert spans(0, A.MOVE) == hero | {A.END, A.TRADE, A.MULTI} and spans(0, A.BUILD) == hero | town | {A.END, A.MULTI}  # (TRADE, MULTI at every turn label)
+	assert spans(0, A.END) == hero | town | {A.END, A.MULTI} and spans(0, A.CAST) == hero | {A.CAST, A.END, A.TRADE, A.MULTI}
+	assert spans(1, A.ARMY) == {A.ARMY, A.END} and spans(1, A.END) == {A.ARMY, A.END}  # (an exchange's MULTI outside)
 
 	torch.manual_seed(0)
 	logits = torch.randn(4, c.N_ACTION_TYPES, requires_grad=True)
@@ -205,16 +205,17 @@ def test_the_teachers_label_is_weighed_against_its_family_and_end_only():
 	span = teacher_span_logp(out, kind, label, accepted, accept_types)
 	p = out["type_logp"].exp()
 	expected = [
-		torch.log(sum(p[0, t] for t in hero | {A.END, A.TRADE}) + p[0, A.RECRUIT] * math.exp(-1.0)),
-		torch.log(sum(p[1, t] for t in hero | town | {A.END})),
-		torch.log(sum(p[2, t] for t in hero | town | {A.END})),
+		torch.log(sum(p[0, t] for t in hero | {A.END, A.TRADE, A.MULTI}) + p[0, A.RECRUIT] * math.exp(-1.0)),
+		torch.log(sum(p[1, t] for t in hero | town | {A.END, A.MULTI})),
+		torch.log(sum(p[2, t] for t in hero | town | {A.END, A.MULTI})),
 		torch.log(p[3, A.ARMY] + p[3, A.END]),
 	]
 	assert torch.allclose(span, torch.stack(expected), atol=1e-5)
 	loss = -(out["type_logp"].gather(1, label.unsqueeze(1)).squeeze(1) - span).sum()
 	loss.backward()
-	never = [A.ARTIFACT, A.DISMISS, A.MULTI, A.CAST]
+	never = [A.ARTIFACT, A.DISMISS, A.CAST]
 	assert all(float(logits.grad[r, t]) == pytest.approx(0.0, abs=1e-6) for r in range(4) for t in never)
+	assert float(logits.grad[3, A.MULTI]) == pytest.approx(0.0, abs=1e-6) and float(logits.grad[0, A.MULTI]) > 0  # (an exchange's free, a turn's pushed down)
 	assert all(float(logits.grad[0, t]) == pytest.approx(0.0, abs=1e-6) for t in town - {A.RECRUIT, A.TRADE})  # (a hero move's: the town's untouched)
 	assert all(float(logits.grad[1, t]) > 0 for t in hero)  # (a town action's: the heroes' pushed down, its visitor stays to buy)
 	assert float(logits.grad[0, A.MOVE]) < 0 and float(logits.grad[0, A.END]) > 0  # (the label up, END down)
