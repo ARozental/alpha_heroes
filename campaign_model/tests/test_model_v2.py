@@ -1521,7 +1521,15 @@ def test_a_gather_counts_what_it_leaves_its_town_to():
 		calm_gain = float(t.multi_gain(x, calm)[0, 0, c.MultiKind.GATHER])
 	assert float(calm.emptied_danger[0, 0]) == 0.0 and float(calm.town_danger[0, 0]) == 0.0
 	assert float(calm.hero_multiplier[0, 0]) > t.unled_share
-	assert calm_gain == pytest.approx(float(calm.town_gold[0, 0]) * (float(calm.hero_multiplier[0, 0]) - t.unled_share), rel=1e-4)
+
+	def joined_gain(known):  # (Φ v5: the visitor leading its army and the garrison, less both apart; features.led_values)
+		army_c, army_n = x["h_army_creature"][0, 0], x["h_army_count"][0, 0].float()
+		rest = x["h_morale"][0, 0].float() - ft.make_up_morales(army_c, army_n, t)
+		alone = ft.led_values(army_c, army_n, known.hero_multiplier[0, 0], rest, t)
+		both = ft.led_values(torch.cat([army_c, x["t_garrison_creature"][0, 0]]), torch.cat([army_n, x["t_garrison_count"][0, 0].float()]), known.hero_multiplier[0, 0], rest, t)
+		return float(both - alone - t.unled_share * known.town_gold[0, 0])
+
+	assert calm_gain == pytest.approx(joined_gain(calm), rel=1e-4)
 	e = c.OWN_HEROES  # (an enemy hero on the town's tile, 20 of the same creature)
 	x["h_present"][0, e], x["h_owner"][0, e], x["h_pos"][0, e] = True, c.OWNER_SELF + 1, x["t_pos"][0, 0]
 	x["h_army_creature"][0, e], x["h_army_count"][0, e], x["h_detailed"][0, e] = -1, 0, True
@@ -1533,7 +1541,7 @@ def test_a_gather_counts_what_it_leaves_its_town_to():
 	stakes, gold = float(known.town_stakes[0, 0]), float(known.town_gold[0, 0])
 	assert empty > 0.9 and now < 0.1 and stakes > gold > 0
 	assert float(t.gather_risk_weight()) == pytest.approx(1.0, abs=1e-5)
-	assert gain == pytest.approx(gold * (float(known.hero_multiplier[0, 0]) - t.unled_share) - (empty * (stakes - gold) - now * stakes), rel=1e-4)
+	assert gain == pytest.approx(joined_gain(known) - (empty * (stakes - gold) - now * stakes), rel=1e-4)
 	assert gain < calm_gain - 0.8 * (stakes - gold)
 	# Its prior: the gain as value_logit prices it while the visitor is our main hero (the only one: main); a stronger
 	# hero of ours elsewhere makes it a scout (one town, one main hero), whose GATHER pays gather_cost_weight (3)
@@ -1576,6 +1584,7 @@ def test_a_multi_actions_prior_is_what_it_does_to_phi():
 	x["x_heroes"][0] = torch.tensor([1, 2])  # (an exchange of heroes 0 and 1)
 	x["h_army_creature"][0, :2], x["h_army_count"][0, :2] = -1, 0
 	x["h_army_creature"][0, :2, 0], x["h_army_count"][0, :2, 0] = 12, torch.tensor([20, 30])  # (each leads troops)
+	x["h_morale"][0, :2] = 1  # (VCMI's for an army of one faction: its make-up's +1)
 	with torch.no_grad():
 		known = m.domain_knowledge(x)
 		gains = t.multi_gain(x, known)[0]
@@ -1583,12 +1592,22 @@ def test_a_multi_actions_prior_is_what_it_does_to_phi():
 	assert float(known.hero_gold[0, 0]) > 0 and float(known.hero_gold[0, 1]) > 0
 	worth = 6 * float(t.creature_cost[12] + t.creature_unit[12])
 	assert float(gains[0, K.RECRUIT_ALL]) == pytest.approx(worth * (U - 1), rel=1e-4) and float(gains[0, K.RECRUIT_ALL]) < 0
-	assert float(gains[0, K.RECRUIT_ALL_HERO]) == pytest.approx(0.0, abs=1e-2)  # (the starting hero: neutral)
-	assert float(gains[0, K.GATHER]) == pytest.approx(float(known.town_gold[0, 0]) * (1.0 - U), rel=1e-4)
+	# Φ v5: each hero's army as features.led_values prices it (its worth x the hero's multiplier x its movement, and its
+	# make-up's morale over the rest of the hero's: h_morale holds the make-up's, these all-Angel armies' +1)
+	army_c, army_n = x["h_army_creature"][0, :2], x["h_army_count"][0, :2].float()
+	rest = x["h_morale"][0, :2].float() - ft.make_up_morales(army_c, army_n, t)
+	led = lambda creatures, counts, h: float(ft.led_values(creatures, counts, known.hero_multiplier[0, h], rest[h], t))  # noqa: E731
+	alone = [led(army_c[h], army_n[h], h) for h in (0, 1)]
+	recruits_c, recruits_n = x["t_available_creature"][0, 0], torch.tensor([6.0] + [0.0] * (c.N_LEVELS - 1))
+	assert float(gains[0, K.RECRUIT_ALL_HERO]) == pytest.approx(led(torch.cat([army_c[0], recruits_c]), torch.cat([army_n[0], recruits_n]), 0) - alone[0] - worth, rel=1e-4, abs=1e-2)
+	garrison = led(torch.cat([army_c[0], x["t_garrison_creature"][0, 0]]), torch.cat([army_n[0], x["t_garrison_count"][0, 0].float()]), 0)
+	assert float(gains[0, K.GATHER]) == pytest.approx(garrison - alone[0] - U * float(known.town_gold[0, 0]), rel=1e-4, abs=1e-2)
 	strong, start = float(known.hero_multiplier[0, 1]), float(known.hero_multiplier[0, 0])
 	assert strong == pytest.approx(U * math.sqrt(1.5 / 0.75), rel=1e-5) and start == pytest.approx(1.0, rel=1e-5)
-	assert float(gains[1, K.GIVE_ALL]) == pytest.approx(float(known.hero_gold[0, 0]) * (strong - start), rel=1e-4)  # (to hero 1, the stronger)
-	assert float(gains[0, K.GIVE_ALL]) == pytest.approx(float(known.hero_gold[0, 1]) * (start - strong), rel=1e-4)
+	both = (torch.cat([army_c[0], army_c[1]]), torch.cat([army_n[0], army_n[1]]))
+	assert float(gains[1, K.GIVE_ALL]) == pytest.approx(led(*both, 1) - sum(alone), rel=1e-4)  # (to hero 1, the stronger)
+	assert float(gains[0, K.GIVE_ALL]) == pytest.approx(led(*both, 0) - sum(alone), rel=1e-4)
+	assert float(gains[1, K.GIVE_ALL]) > 0 > float(gains[0, K.GIVE_ALL])  # (one kind of creature: the multipliers decide)
 	# The prior: the gain as value_logit prices it; a GIVE_ALL to the weaker hero less its cost (3 at the start). The
 	# stronger: the higher level, else the bigger factor, else the bigger army
 	cost = float(t.give_all_cost_weight())

@@ -34,8 +34,12 @@ def player(**changes):
 	return p
 
 
-def total(p):
-	return empire_value(p)["total"]
+# Φ without the army's movement and make-up (2026-11-05, v5): the tests of the other rules, each its own
+ISOLATED = EmpireConfig(speed_power=0.0, army_morale=0.0)
+
+
+def total(p, config=ISOLATED):
+	return empire_value(p, config)["total"]
 
 
 def test_the_halls_are_worth_their_cost_and_the_village_hall_five_days_of_income():
@@ -172,10 +176,10 @@ def test_only_the_strongest_heros_skills_count_in_full():
 	config = EmpireConfig()
 	main = fresh_hero(0, exp=1000, primary=[2, 1, 1, 2], skills=[[0, 2], [1, 1]])
 	scout = fresh_hero(1, skills=[[0, 1], [1, 1], [2, 1]])  # one skill level beyond a fresh hero's
-	value = heroes_value([main, scout])
+	value = heroes_value([main, scout], ISOLATED)
 	bases = hero_base_value(army_worth(main["army"])) + hero_base_value(army_worth(scout["army"]))
 	assert value == pytest.approx(bases + skill_value(main) + config.secondary_share * skill_value(scout))
-	assert heroes_value([scout, main]) == pytest.approx(value)  # whatever the order
+	assert heroes_value([scout, main], ISOLATED) == pytest.approx(value)  # whatever the order
 	assert heroes_value([]) == 0
 
 
@@ -207,7 +211,7 @@ def test_luck_and_morale_until_the_next_battle_are_worth_the_battle_chance_they_
 	skeletons = 10 * (vocab.creature_cost(SKELETON) + config.alpha * vocab.creature_cost(vocab.base_forms()[SKELETON]))
 	assert boost_value(undead) == pytest.approx(config.boost * skeletons)  # the luck only
 	assert boost_value(fresh_hero(0, morale=2)) == 0  # nothing until the next battle: nothing to price
-	assert heroes_value([temple]) - heroes_value([fresh_hero(0, morale=0)]) == pytest.approx(boost_value(temple))  # in Φ, every hero's own
+	assert heroes_value([temple], ISOLATED) - heroes_value([fresh_hero(0, morale=0)], ISOLATED) == pytest.approx(boost_value(temple))  # in Φ, every hero's own
 
 
 def test_mana_counts_only_what_a_short_battle_can_spend():
@@ -236,9 +240,43 @@ def test_a_heros_war_machines_are_half_their_price_and_the_catapult_nothing():
 	base = player()
 	kit = player()
 	kit["heroes"] = [dict(h, artifacts=[3]) for h in base["heroes"]]
-	assert empire_value(kit)["total"] == empire_value(base)["total"]
+	assert total(kit) == total(base)
 	kit["heroes"] = [dict(h, artifacts=[3, 4, 5, 6]) for h in base["heroes"]]
-	assert empire_value(kit)["total"] == pytest.approx(empire_value(base)["total"] + len(base["heroes"]) * (1250 + 500 + 375))
+	assert total(kit) == pytest.approx(total(base) + len(base["heroes"]) * (1250 + 500 + 375))
 	kit["heroes"] = [dict(h, artifacts=[0]) for h in base["heroes"]]  # (2026-10-29) a spellbook at its price, and (2026-11-05) its spell factor on the army
 	factor = sum(army_worth(h["army"]) * (hero_multiplier(dict(h, artifacts=[0])) - hero_multiplier(h)) for h in base["heroes"])
-	assert factor > 0 and empire_value(kit)["total"] == pytest.approx(empire_value(base)["total"] + len(base["heroes"]) * 500 + factor)
+	assert factor > 0 and total(kit) == pytest.approx(total(base) + len(base["heroes"]) * 500 + factor)
+
+
+def _creature(key):
+	return next(i for i, row in vocab.creatures().items() if row["key"] == key)
+
+
+def test_a_slow_or_foreign_creature_costs_the_army_its_movement_and_morale():
+	"""Φ v5 (the user, 2026-11-05): a hero's army counts at its movement, game_values.movement_factor ((the movement of its
+	slowest creature's speed / 2000) ^ 0.25), and its make-up's morale (one faction +1, two 0, any undead -1 more; 2% of
+	the living army a 24th of battle chance, -4% a point below 0). Five Angels are worth more alone than with two Dwarves
+	(speed 3: 1500 a day, x0.931; two factions: +1 lost) or a Zombie (speed 4, undead: morale -1), whichever garrison
+	keeps them; ten Crusaders (speed 6, Castle's too) still add more than they slow. The evaluation's Φ (EVAL_EMPIRE)
+	sees none of it."""
+	from campaign_model.empire import EVAL_EMPIRE, army_make_up, make_up_value, speed_factor
+
+	angel, dwarf, zombie, crusader = _creature("core:angel"), _creature("core:dwarf"), _creature("core:zombieLord"), _creature("core:crusader")
+	assert speed_factor([[angel, 5]]) == 1.0 and speed_factor([[angel, 5], [dwarf, 2]]) == pytest.approx((1500 / 2000) ** 0.25)
+	assert (army_make_up([[angel, 5]]), army_make_up([[angel, 5], [dwarf, 2]]), army_make_up([[angel, 5], [zombie, 1]])) == (1, 0, -1)
+
+	def with_hero(army, garrison):
+		p = player()
+		p["heroes"] = [fresh_hero(0, army=army, morale=army_make_up(army))]  # (a hero's morale holds its army's make-up's)
+		p["towns"][0]["garrison"] = [list(g) for g in garrison]
+		return p
+
+	angels = with_hero(((angel, 5),), ((dwarf, 2), (zombie, 1)))
+	for kept, left in ((((angel, 5), (dwarf, 2)), ((zombie, 1),)), (((angel, 5), (zombie, 1)), ((dwarf, 2),))):
+		slowed = with_hero(kept, left)
+		assert total(angels, EmpireConfig()) > total(slowed, EmpireConfig())
+		moved = army_worth(kept) - army_worth([[angel, 5]])  # (under the evaluation's rules a move changes only what the hero makes of it)
+		assert total(slowed, EVAL_EMPIRE) - total(angels, EVAL_EMPIRE) == pytest.approx(moved * (hero_multiplier(slowed["heroes"][0], EVAL_EMPIRE) - 1.0), rel=1e-6)
+	assert make_up_value(angels["heroes"][0]) == pytest.approx(0.02 * army_worth([[angel, 5]]))  # (+1: 1/24 more turns)
+	crusaders = with_hero(((angel, 5), (crusader, 10)), ())
+	assert total(crusaders, EmpireConfig()) > total(with_hero(((angel, 5),), ()), EmpireConfig()) + 0.9 * army_worth([[crusader, 10]]) - 0.05 * army_worth([[angel, 5], [crusader, 10]])

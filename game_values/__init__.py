@@ -66,6 +66,35 @@ SPELL_STEP = 0.02
 REFERENCE_POWER, REFERENCE_KNOWLEDGE = 3, 2
 
 
+# A hero's movement a day on land, by the speed of its army's slowest creature (VCMI config/gameConfig.json "heroes"
+# "movementPointsLand", speed 0, 1, ... 11 and over): five Angels move 2000 a day, with two Dwarves (speed 3) 1500
+MOVEMENT_POINTS_LAND = (1500, 1500, 1500, 1500, 1560, 1630, 1700, 1760, 1830, 1900, 1960, 2000)
+# What a hero's movement makes of the army it leads (the user, 2026-11-05: the hero's value times its movement to a power
+# under 1): x (its movement / the fastest's) ^ SPEED_POWER, a slow creature slowing the whole army. At 0.25 two Dwarves
+# cost five Angels 7%, speed-6 Crusaders 4% (0.5 cost a usual army of mid-level troops 6-8%, and the tempo is paid
+# already through the objects it reaches)
+SPEED_POWER = 0.25
+# The battle chance an army's make-up gives or takes (VCMI's CArmedInstance::updateMoraleBonusFromArmy), priced as a
+# hero's luck and morale until the next battle are (empire.py's BOOST): this x a 24th of the living army it lifts, +2% a
+# point of morale, -4% a point below 0 (the user, 2026-11-05: splitting off a zombie that costs a large army its morale)
+ARMY_MORALE = 0.02
+
+
+def movement_factor(slowest_speed, power=SPEED_POWER):
+	"""What a hero's movement makes of the army it leads: (MOVEMENT_POINTS_LAND at its slowest creature's speed / the
+	fastest's) ^ power; 1 for an army as fast as any."""
+	points = MOVEMENT_POINTS_LAND[min(max(int(slowest_speed), 0), len(MOVEMENT_POINTS_LAND) - 1)]
+	return (points / MOVEMENT_POINTS_LAND[-1]) ** power
+
+
+def make_up_morale(factions, undead):
+	"""An army's morale from its make-up (VCMI's updateMoraleBonusFromArmy): one faction +1, n of them 2 - n, none 0 (an
+	empty army); -1 more when any of it is undead. factions: how many distinct ones (neutral creatures are one)."""
+	if factions == 0:
+		return 0
+	return (1 if factions == 1 else 2 - factions) - (1 if undead else 0)
+
+
 def spell_factor(power, knowledge, spellbook, step=SPELL_STEP):
 	"""What a hero's spellbook adds to what it makes of its army: 1 + step x sqrt(power x knowledge), 1 without one."""
 	return 1.0 + step * math.sqrt(max(power, 0) * max(knowledge, 0)) if spellbook else 1.0

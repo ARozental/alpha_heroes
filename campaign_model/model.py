@@ -109,6 +109,7 @@ def game_tables():
 		"artifact_slot": torch.full((c.ARTIFACT_VOCAB + 1,), -1, dtype=torch.long),  # (the first worn slot it fits)
 		"artifact_combination": torch.full((c.ARTIFACT_VOCAB + 1,), -1, dtype=torch.long),  # (the combination it is a part of)
 		"creature_undead": torch.zeros(c.CREATURE_VOCAB + 1),
+		"creature_speed": torch.zeros(c.CREATURE_VOCAB + 1),  # (its speed: the army's slowest sets its hero's movement)
 	}
 	try:
 		from .empire import EmpireConfig, _unit, building_value
@@ -134,6 +135,7 @@ def game_tables():
 				tables["creature_morale"][creature_id] = float(feels(creature_id, NO_MORALE))
 				tables["creature_faction"][creature_id] = faction_ids.get(row.get("faction"), -1)
 				tables["creature_undead"][creature_id] = float("UNDEAD" in row.get("abilities", []))
+				tables["creature_speed"][creature_id] = float(row.get("speed", 0))
 		for spell, level in spell_levels().items():
 			if 0 <= spell < c.N_SPELLS:
 				tables["spell_value"][spell] = EmpireConfig().spell_level * level
@@ -252,6 +254,7 @@ class CustomFeatures(nn.Module):
 		from game_values import unled_share
 
 		self.spell_step, self.unled_share = empire.spell_step, unled_share(empire.spell_step)  # (a hero's spellbook; armies no hero leads: game_values)
+		self.speed_power, self.army_morale = empire.speed_power, empire.army_morale  # (a hero's army at its movement and its make-up's morale)
 		for name in ("hero_base", "skill_level", "fresh_skill_levels", "primary_point", "primary_base", "level_bonus", "secondary_share", "boost", "armyless_share", "armed_army"):  # (empire.py's heroes)
 			setattr(self, name, getattr(empire, name))
 		scores, subtypes = priors.object_values()
@@ -583,35 +586,50 @@ class CustomFeatures(nn.Module):
 		"""What each MULTI entry does to Φ [B, TO, N_MULTI] (gold; c.MultiKind; the user, 2026-11-05: multi-actions biased
 		by what they gain): RECRUIT_ALL every creature the town has for hire we can pay for, the highest level first (each
 		town's from all of our resources), at its worth (cost + u) x unled_share for its cost and the u it was worth for
-		hire: its worth x (unled_share - 1), a little below 0; RECRUIT_ALL_HERO the same into the visiting hero: x (its
-		factor - 1); GATHER the garrison x (the visiting hero's factor - unled_share), less what it adds to the town's
-		expected loss (gather_loss); GIVE_ALL (rows 0 and 1: the exchange's receiving hero, x_heroes' first and second) the
-		other's army x (the receiver's factor - the giver's). The factors are Φ's (f.hero_multiplier:
-		features.hero_multipliers)."""
+		hire: its worth x (unled_share - 1), a little below 0. The others as Φ prices a hero's army (features.led_values:
+		its worth x the hero's multiplier x its movement, and its make-up's morale), the armies joined: RECRUIT_ALL_HERO the
+		visiting hero's army with the creatures bought, less their worth; GATHER its army with the garrison, less the
+		garrison at unled_share and what it adds to the town's expected loss (gather_loss); GIVE_ALL (rows 0 and 1: the
+		exchange's receiving hero, x_heroes' first and second) the receiver's army with the other's, less both apart. The
+		multipliers are Φ's (f.hero_multiplier: features.hero_multipliers)."""
 		b = x["g_day"].shape[0]
 		have = x["g_resources"][:, None, :].clamp(min=0).float().expand(b, TO, -1)  # [B, TO, R]
 		creatures = x["t_available_creature"][:, :TO]  # [B, TO, LV]
 		index = vocab_index(creatures, c.CREATURE_VOCAB)
 		counts = x["t_available"][:, :TO].clamp(min=0).float() * (creatures >= 0)
 		worth = torch.zeros(b, TO, device=have.device)
+		bought = []
 		for level in reversed(range(c.N_LEVELS)):
 			cost = self.creature_resources[index[:, :, level]]  # [B, TO, R]
 			afford = torch.where(cost > 0, torch.floor(have / cost.clamp(min=1e-6)), torch.full_like(cost, 1e9)).amin(dim=-1)
 			amount = torch.minimum(counts[:, :, level], afford)
 			have = have - amount.unsqueeze(-1) * cost
 			worth = worth + amount * (self.creature_cost[index[:, :, level]] + self.creature_unit[index[:, :, level]])
+			bought.append(amount)
+		bought = torch.stack(bought[::-1], dim=-1)  # [B, TO, LV]: each level's creatures bought
+		# Our heroes' armies as Φ prices them, and the hero visiting each town (at most one)
+		army_c, army_n = x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO].float()
+		rest = x["h_morale"][:, :HO].float() - ft.make_up_morales(army_c, army_n, self)  # (each hero's morale without its army's make-up's)
+		led = ft.led_values(army_c, army_n, f.hero_multiplier, rest, self)  # [B, HO]
 		ours = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF) & ~x["h_garrisoned"][:, :HO]
 		at = (x["h_town"][:, :HO].unsqueeze(-1) == torch.arange(TO, device=have.device)) & ours.unsqueeze(-1)  # [B, HO, TO]
-		visitor = (at.float() * f.hero_multiplier.unsqueeze(-1)).amax(dim=1)  # [B, TO]: the visiting hero's factor (0 none)
+		has, who = at.any(dim=1).float(), at.float().argmax(dim=1)  # [B, TO]
+		slots = lambda v: v.gather(1, who.unsqueeze(-1).expand(-1, -1, A))  # noqa: E731 ([B, HO, A] -> the visitor's [B, TO, A])
+		visitor_c, visitor_n = slots(army_c), slots(army_n)
+		visitor_m, visitor_r, visitor_led = f.hero_multiplier.gather(1, who), rest.gather(1, who), led.gather(1, who)
+		with_recruits = ft.led_values(torch.cat([visitor_c, creatures], dim=-1), torch.cat([visitor_n, bought], dim=-1), visitor_m, visitor_r, self)
+		garrison_c, garrison_n = x["t_garrison_creature"][:, :TO], x["t_garrison_count"][:, :TO].float()
+		with_garrison = ft.led_values(torch.cat([visitor_c, garrison_c], dim=-1), torch.cat([visitor_n, garrison_n], dim=-1), visitor_m, visitor_r, self)
 		gains = torch.zeros(b, TO, c.N_MULTI, device=have.device)
 		gains[..., c.MultiKind.RECRUIT_ALL] = worth * (self.unled_share - 1.0)
-		gains[..., c.MultiKind.RECRUIT_ALL_HERO] = worth * (visitor - 1.0)
-		gains[..., c.MultiKind.GATHER] = f.town_gold[:, :TO] * (visitor - self.unled_share) - self.gather_loss(f)
+		gains[..., c.MultiKind.RECRUIT_ALL_HERO] = (with_recruits - visitor_led - worth) * has
+		gains[..., c.MultiKind.GATHER] = (with_garrison - visitor_led - self.unled_share * f.town_gold[:, :TO]) * has - self.gather_loss(f)
 		pair = x["x_heroes"] - 1  # [B, 2]: the exchange's heroes (tokens + 1; -1 none)
-		factor, army = f.hero_multiplier.gather(1, pair.clamp(min=0)), f.hero_gold[:, :HO].gather(1, pair.clamp(min=0))  # [B, 2]
-		both = (pair >= 0).all(dim=1).float()
-		gains[:, 0, c.MultiKind.GIVE_ALL] = army[:, 1] * (factor[:, 0] - factor[:, 1]) * both  # (to the first hero)
-		gains[:, 1, c.MultiKind.GIVE_ALL] = army[:, 0] * (factor[:, 1] - factor[:, 0]) * both
+		p = pair.clamp(min=0)
+		pair_c, pair_n = army_c.gather(1, p.unsqueeze(-1).expand(-1, -1, A)), army_n.gather(1, p.unsqueeze(-1).expand(-1, -1, A))  # [B, 2, A]
+		joined = ft.led_values(torch.cat([pair_c, pair_c.flip(1)], dim=-1), torch.cat([pair_n, pair_n.flip(1)], dim=-1), f.hero_multiplier.gather(1, p), rest.gather(1, p), self)  # [B, 2]: row r's receiver leading both
+		both = (pair >= 0).all(dim=1).float().unsqueeze(-1)
+		gains[:, :2, c.MultiKind.GIVE_ALL] = (joined - led.gather(1, p).sum(dim=1, keepdim=True)) * both
 		return gains
 
 	def gather_risk_weight(self):

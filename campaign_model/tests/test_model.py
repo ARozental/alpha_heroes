@@ -107,7 +107,7 @@ def test_a_hire_in_the_graph_adds_what_empire_value_adds(model):
 		x["g_tavern_artifacts"][0, 0, 13] = 4  # a ballista
 		x["g_tavern_spells"][0, 0, 15] = True  # Magic Arrow
 		before = {"color": 0, "status": 0, "resources": [0] * 7, "income": [0] * 7, "explored": 0, "towns": [], "heroes": [hero], "dwellings": [], "armies": []}
-		hired = {"type": 5, "level": 1, "exp": tavern_exp, "mana": 0, "power": 1, "spell_cost": 0, "primary": [1, 2, 1, 1], "skills": tavern_skills, "army": [[PIKEMAN, 12], [HALBERDIER, 4]], "artifacts": [4], "spells": [15]}
+		hired = {"type": 5, "level": 1, "exp": tavern_exp, "mana": 0, "power": 1, "spell_cost": 0, "primary": [1, 2, 1, 1], "skills": tavern_skills, "army": [[PIKEMAN, 12], [HALBERDIER, 4]], "artifacts": [4], "spells": [15], "morale": 1}  # (its morale: its army's make-up's, one faction)
 		after = dict(before, heroes=[hero, hired])
 		with torch.no_grad():
 			worth = ft.tavern_worth(tensors(x), model.features)

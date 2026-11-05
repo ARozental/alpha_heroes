@@ -16,7 +16,7 @@ from torch.nn import functional as F
 from battle_model.device import constant, moved
 from battle_model.features import scales, signed_scales
 from battle_model.layers import vocab_index
-from game_values import ATTACK_POINTS, ATTACK_STEP, DAMAGE_SPELLS, DEFENSE_POINTS, DEFENSE_STEP, SPELL_ROUNDS
+from game_values import ATTACK_POINTS, ATTACK_STEP, DAMAGE_SPELLS, DEFENSE_POINTS, DEFENSE_STEP, MOVEMENT_POINTS_LAND, SPELL_ROUNDS
 from game_values import HERO_HIRE_COST as HERO_GOLD_COST
 
 from . import constants as c
@@ -275,6 +275,55 @@ def battle_chance(table, value):
 	return constant(table, value.device)[(value.clamp(-3, 3) + 3).long()]
 
 
+def speed_factors(creatures, counts, t):
+	"""empire.speed_factor of armies [..., A] -> [...]: what a hero's movement makes of the army it leads,
+	(MOVEMENT_POINTS_LAND at its slowest creature's speed / the fastest's) ^ speed_power; 1 for an empty army."""
+	present = (creatures >= 0) & (counts > 0)
+	speed = t.creature_speed[vocab_index(creatures, c.CREATURE_VOCAB)]
+	slowest = torch.where(present, speed, torch.full_like(speed, len(MOVEMENT_POINTS_LAND))).amin(dim=-1)
+	points = constant(MOVEMENT_POINTS_LAND, slowest.device)[slowest.clamp(0, len(MOVEMENT_POINTS_LAND) - 1).long()]
+	return (points / MOVEMENT_POINTS_LAND[-1]) ** t.speed_power
+
+
+def make_up_morales(creatures, counts, t):
+	"""game_values.make_up_morale of armies [..., A] -> [...]: one faction +1, n of them 2 - n, none 0; any undead -1."""
+	present = (creatures >= 0) & (counts > 0)
+	index = vocab_index(creatures, c.CREATURE_VOCAB)
+	ids = torch.arange(-1, c.FACTION_VOCAB + 1, device=creatures.device)  # (-1: a creature of no faction)
+	factions = ((t.creature_faction[index].unsqueeze(-1) == ids) & present.unsqueeze(-1)).any(dim=-2).sum(dim=-1).float()
+	undead = ((t.creature_undead[index] > 0) & present).any(dim=-1).float()
+	return torch.where(factions == 1, 1.0, 2.0 - factions) * (factions > 0).float() - undead
+
+
+def make_up_values(creatures, counts, rest, t):
+	"""empire.make_up_value of armies [..., A] -> [...] (gold): the battle chance their make-up's morale (make_up_morales)
+	adds over the rest of their hero's morale (rest [...]: its morale without the make-up's), within the caps,
+	army_morale a 24th of the living army at cost + u."""
+	from .empire import MORALE_CHANCE
+
+	make_up = make_up_morales(creatures, counts, t)
+	gained = battle_chance(MORALE_CHANCE, rest + make_up) - battle_chance(MORALE_CHANCE, rest)
+	index = vocab_index(creatures, c.CREATURE_VOCAB)
+	worth = counts.clamp(min=0).float() * (t.creature_cost[index] + t.creature_unit[index]) * (creatures >= 0)
+	return t.army_morale * gained * (worth * t.creature_morale[index]).sum(dim=-1)
+
+
+def led_values(creatures, counts, multiplier, rest, t):
+	"""What armies [..., A] count in Φ led by a hero (gold, [...]): their worth x the hero's multiplier (hero_multipliers)
+	x its movement (speed_factors), and their make-up's morale (make_up_values, over rest: the hero's morale without its
+	make-up's). An exchange's or a gather's armies joined: their slots concatenated."""
+	index = vocab_index(creatures, c.CREATURE_VOCAB)
+	worth = (counts.clamp(min=0).float() * (t.creature_cost[index] + t.creature_unit[index]) * (creatures >= 0)).sum(dim=-1)
+	return worth * multiplier * speed_factors(creatures, counts, t) + make_up_values(creatures, counts, rest, t)
+
+
+def own_make_up_values(x, t):
+	"""empire.make_up_value of our heroes [B, HO]: their army's make-up's morale over the rest of their morale (h_morale
+	holds the make-up's: VCMI's bonus of source ARMY)."""
+	creatures, counts = x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO]
+	return make_up_values(creatures, counts, x["h_morale"][:, :HO].float() - make_up_morales(creatures, counts, t), t)
+
+
 def boost_values(x, t):
 	"""empire.boost_value of our heroes [B, HO]: what their luck and morale until the next battle add (the battle
 	chance over the rest of their luck and morale, within the caps), BOOST a 24th of the army each lifts at cost + u."""
@@ -316,9 +365,9 @@ def hero_worth(x, t):
 def tavern_worth(x, t):
 	"""What hiring each hero for hire would add to Φ [B, N_TAVERN] (gold), before its price and the crowding: the
 	heroes part's change (empire.heroes_value: HERO_BASE, its skills in full if they beat our strongest hero's, else at
-	SECONDARY_SHARE, and ours re-weighed), the army it comes with at cost + u by what it makes of it (army_multiplier at
-	its primary skills) and its worn artifacts (a spellbook, war machines), as empire_value counts a hero of ours (its
-	mana left out); 0 for an empty slot."""
+	SECONDARY_SHARE, and ours re-weighed), the army it comes with as Φ prices a hero's (led_values: at cost + u by what it
+	makes of it, army_multiplier at its primary skills, its movement and its make-up's morale) and its worn artifacts (a
+	spellbook, war machines), as empire_value counts a hero of ours (its mana left out); 0 for an empty slot."""
 	present = (x["g_tavern"] >= 0).float()
 	_, _, army_gold, _ = army(x["g_tavern_army_creature"], x["g_tavern_army_count"], torch.ones_like(x["g_tavern_army_creature"][..., 0], dtype=torch.bool), t)
 	worn = x["g_tavern_artifacts"]
@@ -328,7 +377,8 @@ def tavern_worth(x, t):
 	armed, theirs_armed = own_armed(x, t), armed_share(army_gold, t)
 	before = heroes_value(ours, mine, armed, t).unsqueeze(-1)
 	after = torch.stack([heroes_value(torch.cat([ours, theirs[:, s : s + 1]], dim=1), torch.cat([mine, torch.ones_like(mine[:, :1])], dim=1), torch.cat([armed, theirs_armed[:, s : s + 1]], dim=1), t) for s in range(theirs.shape[1])], dim=1)
-	led = army_gold * hero_multipliers(x["g_tavern_primary"], x["g_tavern_artifacts"], t)
+	creatures, counts = x["g_tavern_army_creature"], x["g_tavern_army_count"].float()
+	led = led_values(creatures, counts, hero_multipliers(x["g_tavern_primary"], x["g_tavern_artifacts"], t), torch.zeros_like(army_gold), t)  # (its morale: its army's make-up's alone)
 	return (after - before + led + carried) * present
 
 
@@ -369,10 +419,10 @@ def empire_value(x, t):
 			(x["g_resources"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
 			((x["t_built"][:, : c.OWN_TOWNS].float() * t.building_value[faction]).sum(dim=-1) * own_towns).sum(dim=-1),
 			t.income_days * (x["g_object_income"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
-			(hero_army * hero_multipliers(x["h_primary"][:, :HO], x["h_artifacts"][:, :HO], t) * own_heroes).sum(dim=-1)
+			(hero_army * hero_multipliers(x["h_primary"][:, :HO], x["h_artifacts"][:, :HO], t) * speed_factors(x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO], t) * own_heroes).sum(dim=-1)
 			+ t.unled_share * ((garrison * own_towns).sum(dim=-1) + owned),  # (armies no hero leads: game_values.unled_share)
 			((x["t_available"][:, : c.OWN_TOWNS].clamp(min=0).float() * t.creature_unit[vocab_index(available, c.CREATURE_VOCAB)] * (available >= 0)).sum(dim=-1) * own_towns).sum(dim=-1) + dwelling_hire,
-			heroes_value(*own_skill_values(x, t), armed_share(hero_army, t), t) + (boost_values(x, t) * own_heroes).sum(dim=-1),
+			heroes_value(*own_skill_values(x, t), armed_share(hero_army, t), t) + ((boost_values(x, t) + own_make_up_values(x, t)) * own_heroes).sum(dim=-1),
 			((t.artifact_price[vocab_index(artifacts, c.ARTIFACT_VOCAB)] * (artifacts >= 0)).sum(dim=-1) * own_heroes).sum(dim=-1),
 			(2.0 * x["h_primary"][:, :HO, 2].clamp(min=0).float() * usable_mana * own_heroes).sum(dim=-1),  # game_values.capped_mana_value
 			-t.hero_penalty * own_heroes.sum(dim=-1) ** 2,
