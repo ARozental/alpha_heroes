@@ -36,6 +36,16 @@ def town_item(action, index):
 	return None
 
 
+def taught(entry):
+	"""Whether an accepted entry (type, index) is the teacher's: all but a MULTI GATHER. Advice.cpp accepts a town's army
+	into its visitor at every decision where it can be made, as Nullkiller2 takes it on every visit
+	(AIGateway::moveCreaturesToHero); the set's loss raises each of its entries by its own probability, so it is taught,
+	and in 25 updates (2026-11-05, v1133-v1157) our model came to take its garrisons and leave its towns empty: in 24
+	games against Nullkiller2 on the same code, 59% of our towns stood empty with those weights, 24% with v1125's (eval-
+	like games, the score 0.274 against 0.390). Nullkiller2 defends its towns apart (DefenceBehavior); ours does not."""
+	return not (entry[0] == A.MULTI and entry[1] % c.N_MULTI == c.MultiKind.GATHER)
+
+
 def teacher_sets(decisions, size=SET_SIZE):
 	"""Each decision's teacher entries beyond its advice's own: (types [N, size], indices [N, size], valid [N, size]).
 	decisions: a game's, in each player's order, all of them (what we did counts, usable or not)."""
@@ -57,7 +67,7 @@ def teacher_sets(decisions, size=SET_SIZE):
 		own = (int(d.advice[0]), int(d.advice[1])) if d.advice is not None else None
 		seen, k = set(), 0
 		for entry in extra:
-			if entry == own or entry in seen:
+			if entry == own or entry in seen or not taught(entry):
 				continue
 			if k == size:
 				break

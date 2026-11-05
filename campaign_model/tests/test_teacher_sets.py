@@ -47,6 +47,20 @@ def test_a_town_action_advised_stays_the_teachers_until_done_never_before():
 	assert entries(types, indices, valid, 4) == set() and entries(types, indices, valid, 5) == set()
 
 
+def test_a_gather_accepted_is_not_the_teachers_the_other_multi_actions_are():
+	"""advice.taught: Advice.cpp accepts GATHER wherever it can be made (Nullkiller2 takes every garrison on a visit);
+	the teacher drops it (it taught our model to leave its towns empty), keeps RECRUIT_ALL and GIVE_ALL."""
+	gather, recruit_all = 2 * c.N_MULTI + c.MultiKind.GATHER, 2 * c.N_MULTI + c.MultiKind.RECRUIT_ALL
+	give_all = 1 * c.N_MULTI + c.MultiKind.GIVE_ALL
+	decisions = [
+		turn(A.MOVE, 10, accept=(int(A.MULTI), gather, int(A.MULTI), recruit_all, int(A.MOVE), 11)),
+		turn(A.ARMY, 3, accept=(int(A.MULTI), give_all), kind=c.DecisionKind.EXCHANGE),
+	]
+	types, indices, valid = teacher_sets(decisions)
+	assert entries(types, indices, valid, 0) == {(int(A.MULTI), recruit_all), (int(A.MOVE), 11)}
+	assert entries(types, indices, valid, 1) == {(int(A.MULTI), give_all)}
+
+
 def test_a_recruit_is_the_same_item_at_any_amount_and_another_players_turn_is_apart():
 	index = int(np.ravel_multi_index((1, 2, 0, 0), _RECRUIT))
 	identity, all_amounts = town_item(A.RECRUIT, index)
