@@ -148,7 +148,7 @@ def _teacher_span():
 	hero, town = {A.MOVE, A.TRAVEL, A.ARMY}, {A.BUILD, A.RECRUIT, A.HIRE, A.UPGRADE, A.TRADE, A.BUY}
 	span = torch.zeros(2, c.N_ACTION_TYPES, c.N_ACTION_TYPES, dtype=torch.bool)
 	for label in A:
-		family = hero | town if label == A.END else hero if label in hero or label == A.CAST else town if label in town else set()
+		family = hero | town if label == A.END or label in town else hero if label in hero or label == A.CAST else set()
 		span[0, label, sorted(family | {label, A.END, A.TRADE})] = True  # (TRADE pushed down at every turn label, as before)
 		span[1, label, sorted({A.ARMY, A.END, label})] = True
 	return span
@@ -158,11 +158,14 @@ def _teacher_span():
 # (2026-11-05). Match.cpp maps none of Nullkiller2's requests to ARTIFACT, DISMISS or a MULTI (only the accept set's), and
 # it casts a few spells only, so every advised decision pushed those toward 0: ARTIFACT 0.020 of the decisions at schema 13
 # (v1025) to 0.00002 by v1200, CAST ~0 since v475, though nothing of the teacher's said they were wrong. And its label is
-# the first request of its turn: a town action it would make later was pushed down at a hero move's decision, and the
-# moves at a town action's (the turn's order should not matter: the user, 2026-11-02). So a turn decision's label is
-# weighed against its own family (a hero's MOVE, TRAVEL, ARMY; a town's BUILD, RECRUIT, HIRE, UPGRADE, TRADE, BUY) and
-# END, a CAST against the hero's and END, an END against both families; an exchange's against ARMY and END; and every
-# accepted entry against itself too. What lies outside gets no gradient from the teacher (teacher_outside: its share).
+# the first request of its turn: a town action it would make later was pushed down at a hero move's decision (the
+# turn's order should not matter: the user, 2026-11-02). So a hero's label (MOVE, TRAVEL, ARMY; a CAST) is weighed
+# against the hero's actions and END only, a town action's label (BUILD, RECRUIT, HIRE, UPGRADE, TRADE, BUY) and an END
+# against both: a town's actions before its visitor leaves are worth teaching (the troops go with the hero, and
+# Nullkiller2 buys first for that), and with the moves out of a town label's span our heroes left towns before buying
+# (3 updates of 0d54e0f: RECRUIT 0.119 -> 0.078 and BUILD 0.060 -> 0.042 at decisions in a town of ours, MOVE and TRAVEL
+# up). An exchange's against ARMY and END; every accepted entry against itself too. What lies outside gets no gradient
+# from the teacher (teacher_outside: its share).
 # TRADE stays in every turn decision's: its labels are not taught (taught: Nullkiller2's trades), and the push at every
 # other label is part of what ended 135 trades a game (2026-11-04); left to the family it would be pushed at a town's only
 TEACHER_SPAN = _teacher_span()
