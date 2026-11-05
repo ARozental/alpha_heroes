@@ -101,6 +101,7 @@ def test_every_part_learns_after_its_zero_starts_move():
 	model = CampaignModelV2(dim=32, cell_dim=8, layers=1)
 	model.plan_outputs = True  # (as the trainer's: train.ppo_update)
 	x = tensors(rich_inputs(8, seed=4))
+	x["h_backpack"][:, :2, 0] = 9  # (a carried artifact: encode_hero.carried reads the backpack's)
 	optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
 	weights = {}
@@ -1433,3 +1434,28 @@ def test_an_update_over_sequences_trains_the_memorys_writer_and_one_without_leav
 		assert metrics["memory_steps"] == steps and metrics["steps"] > 0
 		moved[steps] = float((m.memory.candidate.weight - before).abs().max())
 	assert moved[1] == 0 and moved[2] > 0
+
+
+def test_a_worn_artifact_and_a_carried_one_read_alike_until_the_carried_map_learns():
+	"""encoders.HeroEncoder (2026-11-05): the backpack's artifacts pass through `carried` too (at 0): a sword worn and the
+	same sword carried give the same hero vector at first, different ones once it moves; a checkpoint from before loads
+	it at 0 (model.ADDED_HEADS)."""
+	from campaign_model.encoders import hero_fields
+
+	torch.manual_seed(4)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = {k: np.repeat(v, 2, axis=0) for k, v in rich_inputs(1, 5).items()}
+	x["h_artifacts"][:, 0], x["h_backpack"][:, 0] = -1, -1
+	x["h_artifacts"][0, 0, 3] = 7  # (row 0: worn)
+	x["h_backpack"][1, 0, 0] = 7  # (row 1: carried)
+	fields = hero_fields(tensors(x))
+	with torch.no_grad():
+		worn_first, _ = m.encode_hero(fields)
+		assert torch.allclose(worn_first[0, 0], worn_first[1, 0], atol=1e-6)
+		nn.init.normal_(m.encode_hero.carried.weight, std=0.1)
+		learned, _ = m.encode_hero(fields)
+		assert not torch.allclose(learned[0, 0], learned[1, 0], atol=1e-4)
+	old = {k: v for k, v in m.state_dict().items() if not k.startswith("encode_hero.carried")}
+	fresh = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	fresh.load_state_dict(old)
+	assert float(fresh.encode_hero.carried.weight.abs().max()) == 0

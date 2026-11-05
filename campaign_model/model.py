@@ -1115,7 +1115,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	# model_v2.migrate_option_head)
 	"foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option", "option_flags",
 	"decision", "option_context", "option_weights", "encode_options.component", "encode_options.primary", "encode_options.resource",
-	"encode_options.numbers", "build_identity", "artifact_q", "artifact_target",
+	"encode_options.numbers", "build_identity", "artifact_q", "artifact_target", "encode_hero.carried",
 )
 
 

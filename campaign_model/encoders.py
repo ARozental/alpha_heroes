@@ -118,6 +118,10 @@ class HeroEncoder(nn.Module):
 		self.hero_type = small_embedding(c.HERO_TYPE_VOCAB + 1, dim)
 		self.klass = small_embedding(c.HERO_CLASS_VOCAB + 1, dim)
 		self.artifact = small_embedding(c.ARTIFACT_VOCAB + 1, dim)
+		# What the artifacts carried in the backpack (not worn: no bonus) add apart from their rows, from the sum of those
+		# rows, at 0: worn and carried read alike before (2026-11-05, model_cannot_do 2b)
+		self.carried = nn.Linear(dim, dim, bias=False)
+		nn.init.zeros_(self.carried.weight)
 		self.skill = small_embedding(c.N_SECONDARY_SKILLS * 4, dim)  # (skill, level 0..3): level 0's rows unused
 		self.spells = nn.Linear(c.N_SPELLS, dim, bias=False)
 		self.army = ArmyEncoder(dim)
@@ -126,12 +130,13 @@ class HeroEncoder(nn.Module):
 	def forward(self, f):
 		"""f: the hero's fields (hero_fields / tavern_fields) -> (vectors [..., d], army stacks [..., A, d])."""
 		stacks, army = self.army(f["army_creature"], f["army_count"], f["exact"])
-		artifacts = f["artifacts"]
+		artifacts = f["artifacts"]  # (the worn slots, then the backpack)
+		rows = self.artifact(vocab_index(artifacts, c.ARTIFACT_VOCAB)) * (artifacts >= 0).unsqueeze(-1)
 		skills = f["skills"].clamp(0, 3)
 		skill_rows = torch.arange(c.N_SECONDARY_SKILLS, device=skills.device) * 4 + skills
 		embedded = (
 			self.hero_type(vocab_index(f["type"], c.HERO_TYPE_VOCAB)) + self.klass(vocab_index(f["class"], c.HERO_CLASS_VOCAB)) + army
-			+ (self.artifact(vocab_index(artifacts, c.ARTIFACT_VOCAB)) * (artifacts >= 0).unsqueeze(-1)).sum(dim=-2)
+			+ rows.sum(dim=-2) + self.carried(rows[..., c.N_WORN_SLOTS :, :].sum(dim=-2))
 			+ (self.skill(skill_rows) * (skills > 0).unsqueeze(-1)).sum(dim=-2) + self.spells(f["spells"].float())
 		)
 		numbers = torch.cat(
