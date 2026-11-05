@@ -940,18 +940,21 @@ def test_a_monsters_question_counts_no_reward_wherever_it_is_asked():
 	assert gold > 0 and float(prior[5]) > float(prior[0])  # (the same fight with a bank's reward on top)
 
 
-def test_a_dwellings_recruit_question_leans_yes_and_nothing_else_does():
-	"""model_v2's answers: a dwelling's "Would you like to recruit?" (d_object 17, 20 or 78, no option flagged) gets
-	recruit_yes_weight (4 at the start) on YES, as Nullkiller2 answers it; an unflagged question at another object and a
-	guarded dwelling's "fight the guards?" (o_battle on YES) get nothing from it."""
+def test_the_questions_nullkiller2_answers_yes_lean_yes_and_nothing_else_does():
+	"""model_v2's answers: a dwelling's "Would you like to recruit?" (d_object 17, 20, 78 or 106, no option flagged) gets
+	recruit_yes_weight on YES, a Quest Guard's "complete the quest?" and a border guard's "pass?" (215, 9) visit_yes_weight,
+	4 each at the start, as Nullkiller2 answers them; an unflagged question at another object and a guarded dwelling's
+	"fight the guards?" (o_battle on YES) get nothing from them."""
 	strong, _ = _strongest_and_cheapest()
 	torch.manual_seed(1)
 	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
-	x = {k: np.repeat(v, 4, axis=0) for k, v in rich_inputs(1, 5).items()}
+	x = {k: np.repeat(v, 6, axis=0) for k, v in rich_inputs(1, 5).items()}
 	_question(x, 0, 0, 0, d_object=17)  # (a dwelling's: no guards, no flags)
 	_question(x, 1, 0, 0, d_object=47)  # (a School of Magic's)
 	_question(x, 2, 0, 0, d_object=78)  # (a Refugee Camp's)
 	_question(x, 3, strong, 5, battle=0, d_object=17)  # (a guarded dwelling's guards)
+	_question(x, 4, 0, 0, d_object=215)  # (a Quest Guard's)
+	_question(x, 5, 0, 0, d_object=9)  # (a border guard's)
 
 	def yes_over_no():
 		with torch.no_grad():
@@ -959,14 +962,17 @@ def test_a_dwellings_recruit_question_leans_yes_and_nothing_else_does():
 		return logp[:, 0] - logp[:, 1]
 
 	with torch.no_grad():
-		assert m.domain_knowledge(tensors(x)).question["recruit"].tolist() == [True, False, True, False]
-		start = float(m.features.recruit_yes_weight())
-	with_prior = yes_over_no()
+		q = m.domain_knowledge(tensors(x)).question
+		assert q["recruit"].tolist() == [True, False, True, False, False, False]
+		assert q["visit"].tolist() == [False, False, False, False, True, True]
+		starts = float(m.features.recruit_yes_weight()), float(m.features.visit_yes_weight())
+	with_priors = yes_over_no()
 	with torch.no_grad():
-		m.features.recruit_yes.fill_(-1e4)  # (the weight at its floor, 0)
+		m.features.recruit_yes.fill_(-1e4)  # (the weights at their floor, 0)
+		m.features.visit_yes.fill_(-1e4)
 	without = yes_over_no()
-	assert abs(start - 4.0) < 1e-4
-	assert torch.allclose(with_prior - without, torch.tensor([4.0, 0.0, 4.0, 0.0]), atol=1e-3)
+	assert max(abs(w - 4.0) for w in starts) < 1e-4
+	assert torch.allclose(with_priors - without, torch.tensor([4.0, 0.0, 4.0, 0.0, 4.0, 4.0]), atol=1e-3)
 
 
 def test_records_from_before_schema_11_read_with_no_guards_battle_join_or_armed_object():

@@ -683,10 +683,12 @@ class CampaignModelV2(nn.Module):
 		about = torch.gather(state.heroes, 1, x["d_hero"].clamp(min=0).reshape(b, 1, 1).expand(b, 1, d)).squeeze(1) * (x["d_hero"] >= 0).float().unsqueeze(-1)
 		query = self.option_q(torch.cat([state.glob, about], dim=-1))
 		# (the option that starts a battle: its fight's prior, MOVE's fight's, and features; the one that takes the creatures
-		# in: what they are worth less their price; a dwelling's "recruit?": YES, as Nullkiller2 answers; the rest: neither)
+		# in: what they are worth less their price; a dwelling's "recruit?", a guard's "pass?", a quest's
+		# "complete it?": YES, as Nullkiller2 answers them; the rest: neither)
 		q = known.question
 		answers = x["o_battle"].float() * (q["battle_prior"] + self.answer_fight(q["fight"]).squeeze(-1)).unsqueeze(1) + x["o_join"].float() * (q["join_prior"] + self.answer_join(q["join"]).squeeze(-1)).unsqueeze(1)
-		answers = answers + (q["recruit"].float() * self.features.recruit_yes_weight()).unsqueeze(1) * (x["o_kind"] == int(c.OptionKind.YES)).float()
+		nk2_yes = q["recruit"].float() * self.features.recruit_yes_weight() + q["visit"].float() * self.features.visit_yes_weight()
+		answers = answers + nk2_yes.unsqueeze(1) * (x["o_kind"] == int(c.OptionKind.YES)).float()
 		out["option_logp"] = masked_log_softmax((state.options * query.unsqueeze(1)).sum(dim=-1) / math.sqrt(d) + skill_weight * known.skill_scores + answers, x["option_mask"])
 		# The action type: each table normalised within itself (the contract's: the AI samples a type, then an entry).
 		# A type is as good as its best option: its score is its bias (priors/action_types.csv), what its domain prior

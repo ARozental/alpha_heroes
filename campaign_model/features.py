@@ -26,7 +26,8 @@ HO, W, G, L, TG = c.OWN_HEROES, c.WINDOW, c.MAP_GRID, c.MAP_LEVELS, c.TRAVEL_GRI
 # pack 10-19, lots 20-49, horde 50-99, throng 100-249, swarm 250-499, zounds 500-999, legion 1000+)
 QUANTITY_COUNTS = (15, 3, 7, 15, 35, 75, 175, 375, 750, 1500)
 OBJ_HERO, OBJ_TOWN, OBJ_MONSTER = 34, 98, 54  # Obj ids
-DWELLING_OBJECTS = (17, 20, 78)  # CREATURE_GENERATOR1, CREATURE_GENERATOR4, REFUGEE_CAMP: their "Would you like to recruit?"
+DWELLING_OBJECTS = (17, 20, 78, 106)  # CREATURE_GENERATOR1, 4, REFUGEE_CAMP, WAR_MACHINE_FACTORY: "Would you like to recruit?"
+VISIT_OBJECTS = (9, 83, 102, 215)  # BORDER_GUARD (pass: it goes), SEER_HUT, QUEST_GUARD (the quest completed), TREE_OF_KNOWLEDGE
 DANGER_RANGE = 15.0  # tiles: an enemy hero this far reaches a tile with even odds (about a day's walk)
 SIGHT_RADIUS = 5  # tiles a hero reveals around it (VCMI's scouting radius without the Scouting skill)
 HERO_XP = TOWN_XP = 500.0  # experience for beating a hero, for taking a town (VCMI)

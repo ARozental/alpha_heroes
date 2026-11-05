@@ -255,6 +255,7 @@ class CustomFeatures(nn.Module):
 		self.safety = zeros()  # (2026-11-04: Nullkiller2 never starts a fight it cannot win; safety_weight)
 		self.trade_unlock, self.trade_cost = zeros(), zeros()  # (2026-11-04: TRADE's prior; trade_weights)
 		self.recruit_yes = zeros()  # (2026-11-04: a dwelling's "recruit?" answered YES, as Nullkiller2 does; recruit_yes_weight)
+		self.visit_yes = zeros()  # (2026-11-04: a guard's "pass?", a quest's "complete it?" answered YES, as Nullkiller2 does)
 		self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
@@ -272,7 +273,7 @@ class CustomFeatures(nn.Module):
 		return [
 			self.object_gain, self.object_type_gain.weight, self.object_type_delta.weight, self.object_subtype_delta.weight,
 			self.fight_sharpness, self.enemy_value, self.hero_value, self.danger_gain, self.explore_gain, self.class_gain, self.travel_exponent,
-			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes,
+			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
@@ -356,6 +357,14 @@ class CustomFeatures(nn.Module):
 		0 too: AlphaMapAI::showRecruitmentDialog). joint7 had answered NO to 467 of 481 of them with creatures for hire and
 		the gold for one (2026-11-04: one player refused the same 14 Troglodytes on six days, with 1,100 to 4,100 gold)."""
 		return ft.bounded(self.recruit_yes, 0.0, 8.0, 4.0, CORRECTION_STEP)
+
+	def visit_yes_weight(self):
+		"""What YES gains, in logits (4 at the start, 0..8), at a border guard ("pass?": YES removes it, we hold its key), a
+		Seer's Hut's or a Quest Guard's "complete the quest?" (asked only when we can: CGSeerHut::onHeroVisit; a Quest
+		Guard then lets us through) and a Tree of Knowledge's level for its price: Nullkiller2 answers them YES
+		(AIGateway::showBlockingDialog: border and quest guards always). joint7 answered NO to all of the first 150
+		(2026-11-04: one hero asked 53 times in 15 days at the same Quest Guard)."""
+		return ft.bounded(self.visit_yes, 0.0, 8.0, 4.0, CORRECTION_STEP)
 
 	def block_share(self):
 		"""How much of what a wandering monster blocks counts for its fight (x P(win)): 0.5 at the start, 0..1."""
@@ -447,7 +456,8 @@ class CustomFeatures(nn.Module):
 		and a guarded object's worth, the bank's reward, as often as we win; its losses as fight_return counts them); and
 		what taking them is worth (at cost + u) less the join option's price. {"fight": [B, 6], "battle_prior": [B]
 		(value_logit of the fight's value less safety x hopeless, as MOVE's), "join": [B, 3], "join_prior": [B], "recruit": [B]
-		a dwelling's "recruit?" (its YES: recruit_yes_weight)}; the options they are for are model_v2's to pick (o_battle,
+		a dwelling's "recruit?" (its YES: recruit_yes_weight), "visit": [B] a guard's "pass?", a quest's "complete it?", a
+		Tree of Knowledge's level (visit_yes_weight)}; the options they are for are model_v2's to pick (o_battle,
 		o_join, o_kind YES)."""
 		hero = x["d_hero"].clamp(min=0, max=HO - 1)  # (our hero asked; with none, its options carry no battle or join)
 
@@ -485,6 +495,7 @@ class CustomFeatures(nn.Module):
 			"join": torch.stack([torch.log1p(gold / 1000.0), torch.log1p(price / 1000.0), torch.tanh(ft.value_logit(joined) / 4)], dim=-1),
 			"join_prior": ft.value_logit(joined),
 			"recruit": functools.reduce(torch.logical_or, [obj == o for o in ft.DWELLING_OBJECTS]) & ~(x["o_battle"] | x["o_join"]).any(dim=-1),
+			"visit": functools.reduce(torch.logical_or, [obj == o for o in ft.VISIT_OBJECTS]) & ~(x["o_battle"] | x["o_join"]).any(dim=-1),
 		}
 
 	def town_strength(self, x, power):
@@ -930,7 +941,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; a dwelling's YES 4)
+ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
