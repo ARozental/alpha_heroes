@@ -178,3 +178,43 @@ def test_an_update_with_the_teachers_sets_and_the_loss_shares_runs():
 	assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters()))
 	assert all(math.isfinite(float(p.detach().sum())) for p in model.parameters())
 	assert metrics["kl_target"] == pytest.approx(CampaignConfig().target_kl * 2.5) and math.isfinite(metrics["teacher_ce"])
+
+
+def test_the_teachers_label_is_weighed_against_its_family_and_end_only():
+	"""train.TEACHER_SPAN / teacher_span_logp (2026-11-05): a turn decision's label among its family (a hero's MOVE, TRAVEL,
+	ARMY; a town's BUILD, RECRUIT, HIRE, UPGRADE, TRADE, BUY) and END, an END among both, a CAST among the hero's; an
+	exchange's among ARMY and END; an accepted entry of another type with them. What lies outside gets no gradient: the
+	teacher never asks for ARTIFACT, DISMISS or a MULTI, and a town action at a hero move's decision is not its to judge."""
+	from campaign_model.train import TEACHER_SPAN, teacher_span_logp
+
+	hero, town = {A.MOVE, A.TRAVEL, A.ARMY}, {A.BUILD, A.RECRUIT, A.HIRE, A.UPGRADE, A.TRADE, A.BUY}
+	spans = lambda exchange, label: {A(t) for t in range(c.N_ACTION_TYPES) if TEACHER_SPAN[exchange, label, t]}  # noqa: E731
+	assert spans(0, A.MOVE) == hero | {A.END, A.TRADE} and spans(0, A.BUILD) == town | {A.END}  # (TRADE at every turn label)
+	assert spans(0, A.END) == hero | town | {A.END} and spans(0, A.CAST) == hero | {A.CAST, A.END, A.TRADE}
+	assert spans(1, A.ARMY) == {A.ARMY, A.END} and spans(1, A.END) == {A.ARMY, A.END}
+
+	torch.manual_seed(0)
+	logits = torch.randn(4, c.N_ACTION_TYPES, requires_grad=True)
+	out = {"type_logp": torch.log_softmax(logits, dim=1)}
+	kind = torch.tensor([c.DecisionKind.TURN, c.DecisionKind.TURN, c.DecisionKind.TURN, c.DecisionKind.EXCHANGE])
+	label = torch.tensor([A.MOVE, A.BUILD, A.END, A.ARMY])
+	# row 0 has an accepted entry of the other family (a pending recruit: counted beside the hero's family)
+	accepted = torch.full((4, 2), -1e4)
+	accepted[0, 0] = out["type_logp"][0, A.RECRUIT] - 1.0
+	accept_types = torch.tensor([[A.RECRUIT, 0], [0, 0], [0, 0], [0, 0]])
+	span = teacher_span_logp(out, kind, label, accepted, accept_types)
+	p = out["type_logp"].exp()
+	expected = [
+		torch.log(sum(p[0, t] for t in hero | {A.END, A.TRADE}) + p[0, A.RECRUIT] * math.exp(-1.0)),
+		torch.log(sum(p[1, t] for t in town | {A.END})),
+		torch.log(sum(p[2, t] for t in hero | town | {A.END})),
+		torch.log(p[3, A.ARMY] + p[3, A.END]),
+	]
+	assert torch.allclose(span, torch.stack(expected), atol=1e-5)
+	loss = -(out["type_logp"].gather(1, label.unsqueeze(1)).squeeze(1) - span).sum()
+	loss.backward()
+	never = [A.ARTIFACT, A.DISMISS, A.MULTI, A.CAST]
+	assert all(float(logits.grad[r, t]) == pytest.approx(0.0, abs=1e-6) for r in range(4) for t in never)
+	assert all(float(logits.grad[0, t]) == pytest.approx(0.0, abs=1e-6) for t in town - {A.RECRUIT, A.TRADE})  # (a hero move's: the town's untouched)
+	assert all(float(logits.grad[1, t]) == pytest.approx(0.0, abs=1e-6) for t in hero)  # (a town action's: the heroes' untouched)
+	assert float(logits.grad[0, A.MOVE]) < 0 and float(logits.grad[0, A.END]) > 0  # (the label up, END down)

@@ -1770,3 +1770,41 @@ def test_a_multi_actions_prior_is_what_it_does_to_phi():
 		known = m.domain_knowledge(x)
 	assert float(known.hero_multiplier[0, 0]) == float(known.hero_multiplier[0, 1])
 	assert t.stronger_receiver(x, known)[0].tolist() == [0.0, 1.0]
+
+
+def test_a_gather_takes_the_garrison_heros_army_when_one_is_there():
+	"""A town with a hero of ours in its garrison: VCMI's GATHER and RECRUIT_ALL act on its upper army, the hero's (the
+	town's own stacks then empty), so multi_gain prices the hero's army; and the town it leaves is empty, the hero with
+	one creature (emptied_danger: as with no hero there). Until 2026-11-05 both read the town's own stacks."""
+	from campaign_model import features as ft
+
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	t = m.features
+	x = tensors(rich_inputs(1, 5))
+	x["h_present"][:] = False
+	x["h_present"][0, 0], x["h_owner"][0, 0], x["h_garrisoned"][0, 0], x["h_town"][0, 0] = True, c.OWNER_SELF, False, 0  # (our visitor in town 0)
+	x["h_present"][0, 1], x["h_owner"][0, 1], x["h_garrisoned"][0, 1], x["h_town"][0, 1] = True, c.OWNER_SELF, True, 0  # (our hero in its garrison)
+	x["h_army_creature"][0, 1], x["h_army_count"][0, 1], x["h_detailed"][0, 1] = -1, 0, True
+	x["h_army_creature"][0, 1, 0], x["h_army_count"][0, 1, 0] = 12, 40  # (its angels)
+	x["t_present"][0, 0], x["t_owner"][0, 0], x["t_garrison_hero"][0, 0], x["t_visiting"][0, 0] = True, c.OWNER_SELF, 1, 0
+	x["t_garrison_creature"][0, 0], x["t_garrison_count"][0, 0], x["t_detailed"][0, 0] = -1, 0, True  # (the town's own: none)
+	with torch.no_grad():
+		known = m.domain_knowledge(x)
+		gain = float(t.multi_gain(x, known)[0, 0, c.MultiKind.GATHER])
+	army_c, army_n = x["h_army_creature"][0, 0], x["h_army_count"][0, 0].float()
+	rest = x["h_morale"][0, 0].float() - ft.make_up_morales(army_c, army_n, t)
+	alone = ft.led_values(army_c, army_n, known.hero_multiplier[0, 0], rest, t)
+	upper_c, upper_n = x["h_army_creature"][0, 1], x["h_army_count"][0, 1].float()
+	gathered = ft.bulk_moves(army_c, upper_c)
+	both = ft.led_values(torch.cat([army_c, torch.where(gathered, upper_c, torch.full_like(upper_c, -1))]), torch.cat([army_n, upper_n * gathered]), known.hero_multiplier[0, 0], rest, t)
+	worth = float((upper_n * gathered * (t.creature_cost[12] + t.creature_unit[12]) * (upper_c >= 0)).sum())
+	assert worth > 0 and gain == pytest.approx(float(both - alone) - t.unled_share * worth - float(t.gather_loss(known)[0, 0]), rel=1e-4)
+	e = c.OWN_HEROES  # (an enemy beside it: the town left empty, as with no hero in the garrison)
+	x["h_present"][0, e], x["h_owner"][0, e], x["h_pos"][0, e] = True, c.OWNER_SELF + 1, x["t_pos"][0, 0]
+	x["h_army_creature"][0, e], x["h_army_count"][0, e], x["h_detailed"][0, e] = -1, 0, True
+	x["h_army_creature"][0, e, 0], x["h_army_count"][0, e, 0] = 12, 20
+	with torch.no_grad():
+		with_hero = float(m.domain_knowledge(x).emptied_danger[0, 0])
+		x["t_garrison_hero"][0, 0] = -1
+		without = float(m.domain_knowledge(x).emptied_danger[0, 0])
+	assert with_hero == pytest.approx(without) and with_hero > 0.9

@@ -623,11 +623,17 @@ class CustomFeatures(nn.Module):
 		slots = lambda v: v.gather(1, who.unsqueeze(-1).expand(-1, -1, A))  # noqa: E731 ([B, HO, A] -> the visitor's [B, TO, A])
 		visitor_c, visitor_n = slots(army_c), slots(army_n)
 		visitor_m, visitor_r, visitor_led = f.hero_multiplier.gather(1, who), rest.gather(1, who), led.gather(1, who)
-		worth, _ = recruited(x["t_garrison_creature"][:, :TO])  # (RECRUIT_ALL's: into the garrison)
+		# The town's upper army, which RECRUIT_ALL and GATHER act on (VCMI's getUpperArmy: Encoder.cpp): its garrison hero's
+		# when one is there (the town's own stacks are then empty), else the town's (until 2026-11-05 always the town's)
+		garrisoned = x["t_garrison_hero"][:, :TO]  # [B, TO]: hero token, -1 none
+		upper = garrisoned.clamp(min=0).unsqueeze(-1).expand(-1, -1, A)
+		in_hero = (garrisoned >= 0).unsqueeze(-1)
+		garrison_c = torch.where(in_hero, x["h_army_creature"].gather(1, upper), x["t_garrison_creature"][:, :TO])
+		garrison_n = torch.where(in_hero, x["h_army_count"].gather(1, upper), x["t_garrison_count"][:, :TO]).float()
+		worth, _ = recruited(garrison_c)  # (RECRUIT_ALL's: into the upper army)
 		hero_worth, bought = recruited(visitor_c)  # (RECRUIT_ALL_HERO's: into the visitor)
 		with_recruits = ft.led_values(torch.cat([visitor_c, creatures], dim=-1), torch.cat([visitor_n, bought], dim=-1), visitor_m, visitor_r, self)
-		garrison_c, garrison_n = x["t_garrison_creature"][:, :TO], x["t_garrison_count"][:, :TO].float()
-		gathered = ft.bulk_moves(visitor_c, garrison_c)  # [B, TO, A]: what of the garrison fits into the visitor
+		gathered = ft.bulk_moves(visitor_c, garrison_c)  # [B, TO, A]: what of the garrison fits into the visitor (a garrison hero keeps one creature: not counted)
 		with_garrison = ft.led_values(torch.cat([visitor_c, torch.where(gathered, garrison_c, torch.full_like(garrison_c, -1))], dim=-1), torch.cat([visitor_n, garrison_n * gathered], dim=-1), visitor_m, visitor_r, self)
 		index = vocab_index(garrison_c, c.CREATURE_VOCAB)
 		gathered_worth = (garrison_n * gathered * (self.creature_cost[index] + self.creature_unit[index]) * (garrison_c >= 0)).sum(dim=-1)  # [B, TO]

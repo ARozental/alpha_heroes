@@ -77,7 +77,7 @@ LOSS_SCALE_STEP = 1.25
 LOSS_SCALE_MEMORY = 0.9  # (each term's log gradient norm, averaged over ~10 updates)
 COLUMNS = [
 	"version", "epoch", "games", "decisions", "dropped_old", "unsound", "credited", "days", "players", "phi_end", "heroes", "label_mean", "price_mean",
-	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_weighted", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "teacher_kl", "teacher_weight", "advised", "teacher_agree", "teacher_ce", "clip_fraction", "grad_norm", "steps", "learning_rate",
+	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_weighted", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "teacher_kl", "teacher_weight", "advised", "teacher_agree", "teacher_ce", "teacher_outside", "clip_fraction", "grad_norm", "steps", "learning_rate",
 	*(f"value_ev_d{k}" for k in c.VALUE_OFFSETS), *(f"head_ev_{kind}{k}" for kind in "vg" for k in c.VALUE_OFFSETS), "head_ev_vend", "no_effect", "ai_errors", "failed_actions", "game_failures", "game_maps", "dropped_games",
 	"game_seconds", "record_mb", "seconds", "gpu_mb", "label_staleness", *(f"share_{t}" for t in TYPES), *(f"failure_{k}" for k in FAILURES), "no_effect_types", "kinds",
 	# v2's foresight losses (foresight.py) and the gradient check: the shared layers' gradient from the PPO losses and the
@@ -732,6 +732,7 @@ class CampaignLearner:
 			"advised": sum(d.advice is not None for d in decisions) / max(1, sum(d.kind in (c.DecisionKind.TURN, c.DecisionKind.EXCHANGE) for d in decisions)),
 			"teacher_agree": float(np.mean([agrees(d) for d in decisions if d.advice is not None])) if any(d.advice is not None for d in decisions) else float("nan"),
 			"teacher_ce": metrics.get("teacher_ce", float("nan")),
+			"teacher_outside": metrics.get("teacher_outside", float("nan")),
 			"last_kl": metrics["last_kl"],
 			"clip_fraction": metrics.get("clip_fraction", float("nan")),
 			"grad_norm": metrics.get("grad_norm", float("nan")),

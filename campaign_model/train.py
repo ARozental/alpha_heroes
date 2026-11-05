@@ -142,6 +142,47 @@ def entries_logp(out, types, indices, valid):
 	return logp.clamp(min=-1e4).masked_fill(~valid, -1e4)
 
 
+def _teacher_span():
+	"""TEACHER_SPAN [2 (turn, exchange), label type, type]: the types Nullkiller2's label is weighed against."""
+	A = c.ActionType
+	hero, town = {A.MOVE, A.TRAVEL, A.ARMY}, {A.BUILD, A.RECRUIT, A.HIRE, A.UPGRADE, A.TRADE, A.BUY}
+	span = torch.zeros(2, c.N_ACTION_TYPES, c.N_ACTION_TYPES, dtype=torch.bool)
+	for label in A:
+		family = hero | town if label == A.END else hero if label in hero or label == A.CAST else town if label in town else set()
+		span[0, label, sorted(family | {label, A.END, A.TRADE})] = True  # (TRADE pushed down at every turn label, as before)
+		span[1, label, sorted({A.ARMY, A.END, label})] = True
+	return span
+
+
+# The teacher's cross-entropy is of its entries among what it could have asked for there, not among everything we can do
+# (2026-11-05). Match.cpp maps none of Nullkiller2's requests to ARTIFACT, DISMISS or a MULTI (only the accept set's), and
+# it casts a few spells only, so every advised decision pushed those toward 0: ARTIFACT 0.020 of the decisions at schema 13
+# (v1025) to 0.00002 by v1200, CAST ~0 since v475, though nothing of the teacher's said they were wrong. And its label is
+# the first request of its turn: a town action it would make later was pushed down at a hero move's decision, and the
+# moves at a town action's (the turn's order should not matter: the user, 2026-11-02). So a turn decision's label is
+# weighed against its own family (a hero's MOVE, TRAVEL, ARMY; a town's BUILD, RECRUIT, HIRE, UPGRADE, TRADE, BUY) and
+# END, a CAST against the hero's and END, an END against both families; an exchange's against ARMY and END; and every
+# accepted entry against itself too. What lies outside gets no gradient from the teacher (teacher_outside: its share).
+# TRADE stays in every turn decision's: its labels are not taught (taught: Nullkiller2's trades), and the push at every
+# other label is part of what ended 135 trades a game (2026-11-04); left to the family it would be pushed at a town's only
+TEACHER_SPAN = _teacher_span()
+
+
+def teacher_span_logp(out, kind, label, accepted=None, accept_types=None):
+	"""[N] the log-probability (now) of what each decision's teacher label is weighed against (TEACHER_SPAN), its accepted
+	entries of other types included (accepted [N, K] entries_logp, accept_types [N, K]); 0 (all of it) at a question."""
+	from battle_model.device import moved
+
+	span = moved(TEACHER_SPAN, kind.device)[(kind == c.DecisionKind.EXCHANGE).long(), label.clamp(0, c.N_ACTION_TYPES - 1)]  # [N, types]
+	parts = [torch.logsumexp(out["type_logp"].clamp(min=-1e4).masked_fill(~span, -1e4), dim=1, keepdim=True)]
+	if accepted is not None:
+		inside = span.gather(1, accept_types.clamp(0, c.N_ACTION_TYPES - 1))  # (counted with their type already)
+		parts.append(accepted.masked_fill(inside, -1e4))
+	logp = torch.logsumexp(torch.cat(parts, dim=1), dim=1)
+	turn = (kind == c.DecisionKind.TURN) | (kind == c.DecisionKind.EXCHANGE)
+	return torch.where(turn, logp, torch.zeros_like(logp))
+
+
 DECODE_THREADS = 3  # batches decoded at once: one thread's ~0.3 s a 128-decision micro-batch (110 MB of zlib and dtype copies, which release the interpreter lock) held the GPU's 146 ms step to it (2026-10-30, the PC)
 
 
@@ -449,7 +490,7 @@ def excess_loss(logits, targets):
 
 # A step's metrics, in ppo_update's order: value the heads' loss at their own weights (comparable whatever head_scale
 # does), value_weighted at head_scale's (what the update takes)
-STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl", "teacher_kl", "teacher_ce", "value_weighted")
+STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl", "teacher_kl", "teacher_ce", "value_weighted", "teacher_outside")
 # The teacher's outputs its KL reads (teacher_kl), put in each micro-batch as "t:<name>"
 TEACHER_OUTPUTS = ("type_logp", "option_logp") + tuple(output for output, _ in HEADS.values())
 
@@ -613,14 +654,21 @@ def micro_loss(out, batch, config, foresight_config=None, split=False):
 		teacher_part = (teacher_kl(out, batch) * keep).sum() / batch["count_keep"]
 		loss = loss + batch["teacher_weight"] * teacher_part
 	advice_part = torch.zeros((), device=keep.device)
+	outside_part = torch.zeros((), device=keep.device)
 	if "advice_action" in batch:  # Nullkiller2's advice (config.nk2_advice): its choice's cross-entropy, at the teacher's weight
 		advised = batch["advised"] * keep
 		advice_logp, _ = chosen_logp(out, {"kind": batch["kind"], "action": batch["advice_action"], "index": batch["advice_index"], "cell": batch["advice_cell"]})
+		accepted = None
 		if "accept_types" in batch:  # (and every other entry that follows it there, advice.teacher_sets: their summed probability)
 			advised_own = torch.where(batch["advice_has"], advice_logp.clamp(min=-1e4), torch.full_like(advice_logp, -1e4)).unsqueeze(1)
-			advice_logp = torch.logsumexp(torch.cat([advised_own, entries_logp(out, batch["accept_types"], batch["accept_index"], batch["accept_valid"])], dim=1), dim=1)
+			accepted = entries_logp(out, batch["accept_types"], batch["accept_index"], batch["accept_valid"])
+			advice_logp = torch.logsumexp(torch.cat([advised_own, accepted], dim=1), dim=1)
 			advised = advised * (advice_logp > -1e3).float()  # (a row none of whose entries is legal any more: none)
+		# among what it could have asked for there (TEACHER_SPAN), not among everything we can do
+		span_logp = teacher_span_logp(out, batch["kind"], batch["advice_action"], accepted, batch.get("accept_types"))
+		advice_logp = advice_logp - span_logp
 		advice_part = -(torch.where(advised > 0, advice_logp, torch.zeros_like(advice_logp)) * advised).sum() / batch["count_advised"]
+		outside_part = ((1.0 - span_logp.detach().exp()) * advised).sum() / batch["count_advised"]
 		loss = loss + batch["teacher_weight"] * advice_part
 	fs_parts = fs_share = None
 	labels = {name[3:]: value for name, value in batch.items() if name.startswith("fs:")}
@@ -641,6 +689,7 @@ def micro_loss(out, batch, config, foresight_config=None, split=False):
 		teacher_part.detach(),  # teacher_kl
 		advice_part.detach(),  # teacher_ce
 		value.detach(),  # value_weighted
+		outside_part,  # teacher_outside: our probability outside what the teacher's label is weighed against
 	]).float()
 	if split:  # (each term at weight 1 against the learner's loss shares, the loss_weights it sets: the plan's apart too)
 		terms = {
@@ -712,7 +761,9 @@ def ppo_update(
 	has = np.array([d.advice is not None for d in decisions], dtype=bool)
 	if has.any() or (teacher_sets is not None and teacher_sets[2].any()):
 		advice = np.array([d.advice if d.advice is not None else (0, 0, -1) for d in decisions], dtype=np.int64).reshape(-1, 3)
-		advised = taught(advice[:, 0], has | teacher_sets[2].any(axis=1) if teacher_sets is not None else has, config)
+		# Only where its request was matched (has): a decision where Nullkiller2 asked for what we cannot do (an artifact
+		# swap, a hero dismissed) has no label to weigh its plan's steps against (TEACHER_SPAN), 2026-11-05
+		advised = taught(advice[:, 0], has, config)
 		advice_t = {
 			"advice_action": torch.from_numpy(advice[:, 0]).to(device), "advice_index": torch.from_numpy(advice[:, 1]).to(device), "advice_cell": torch.from_numpy(advice[:, 2]).to(device),
 			"advised": torch.from_numpy(advised.astype(np.float32)).to(device),
