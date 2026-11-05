@@ -1489,40 +1489,69 @@ def test_a_worn_artifact_and_a_carried_one_read_alike_until_the_carried_map_lear
 
 
 def test_stepping_on_a_hero_or_a_town_of_ours_is_worth_what_the_army_gains_where_it_counts_most():
-	"""model.CustomFeatures.meeting_value (2026-11-05): a hero of ours on a window tile is worth the army of whichever of
-	the two makes less of its army times the multipliers' difference; a town of ours its garrison times the hero's
-	multiplier over unled_share; nothing elsewhere (the window's own hero's tile included)."""
+	"""model.CustomFeatures.meeting_value (2026-11-05): a hero of ours on a window tile is worth the best exchange there
+	(features.led_values: the two armies joined under the stronger, or joined less their slowest creatures, which the
+	other keeps) over the two apart, at least 0; a town of ours, for a main hero, its army joined with the garrison less
+	the garrison at unled_share and what taking it adds to the town's expected loss; nothing elsewhere (the window's own
+	hero's tile included). A hero holding only creatures that would slow ours is no meeting worth making: schema 15's
+	first games met 308 times a game, a pair up to 6 times a day, on Φ v4's factors."""
+	from campaign_model import features as ft
+	from campaign_model import vocab
+
+	key = {row["key"]: i for i, row in vocab.creatures().items()}
+	angel, dwarf, crusader = key["core:angel"], key["core:dwarf"], key["core:crusader"]
 	torch.manual_seed(9)
 	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
 	t = m.features
 	x = tensors({k: np.repeat(v, 1, axis=0) for k, v in rich_inputs(1, 5).items()})
 	x["h_present"][:] = False
-	x["h_present"][0, :2], x["h_owner"][0, :2] = True, c.OWNER_SELF
+	x["h_present"][0, :2], x["h_owner"][0, :2], x["h_garrisoned"][0, :2] = True, c.OWNER_SELF, False
 	x["h_pos"][0, 0] = torch.tensor([10, 10, 0])
 	x["h_pos"][0, 1] = torch.tensor([12, 10, 0])  # (two tiles east of hero 0)
+	x["h_level"][0, :2] = torch.tensor([6, 2])  # (hero 0 the stronger)
+	x["h_primary"][0, 0], x["h_primary"][0, 1], x["h_artifacts"][0, :2] = torch.tensor([5, 5, 1, 1]), torch.tensor([0, 0, 1, 1]), -1  # (hero 0 makes more of an army)
+	x["h_army_creature"][0, :2], x["h_army_count"][0, :2], x["h_detailed"][0, :2] = -1, 0, True
+	x["h_army_creature"][0, 0, 0], x["h_army_count"][0, 0, 0] = angel, 5
+	x["h_morale"][0, :2] = 1  # (one faction each: +1)
 	x["t_present"][:] = False
-	x["t_present"][0, 0], x["t_owner"][0, 0] = True, c.OWNER_SELF
+	x["t_present"][0, 0], x["t_owner"][0, 0], x["t_visiting"][0, 0], x["t_garrison_hero"][0, 0] = True, c.OWNER_SELF, -1, -1
 	x["t_pos"][0, 0] = torch.tensor([10, 13, 0])  # (three tiles south)
+	x["t_garrison_creature"][0, 0], x["t_garrison_count"][0, 0], x["t_detailed"][0, 0] = -1, 0, True
+	x["t_garrison_creature"][0, 0, 0], x["t_garrison_count"][0, 0, 0] = angel, 4  # (as fast: gathered, nothing slows)
 	windows = torch.tensor([0])  # (decision 0, hero 0)
-	f = t.make_custom_features(x, windows) if hasattr(t, "make_custom_features") else t(x, windows)
-	f.hero_multiplier = torch.tensor([[1.30, 1.05] + [1.0] * (c.OWN_HEROES - 2)])
-	f.hero_gold = torch.zeros(1, x["h_present"].shape[1])
-	f.hero_gold[0, :2] = torch.tensor([20_000.0, 8_000.0])
-	f.town_gold = torch.zeros(1, x["t_present"].shape[1])
-	f.town_gold[0, 0] = 50_000.0
 	offsets = torch.arange(c.WINDOW) - c.WINDOW_RADIUS
 	dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
 	tile_x, tile_y = 10 + dx, 10 + dy
+	r = c.WINDOW_RADIUS
 
 	def on_tile(pos, present):
 		return (pos[:, None, None, :, 0] == tile_x[None, ..., None]) & (pos[:, None, None, :, 1] == tile_y[None, ..., None]) & (pos[:, None, None, :, 2] == 0) & present[:, None, None, :]
 
-	with torch.no_grad():
-		value = t.meeting_value(x, f, torch.tensor([0]), windows, on_tile)[0]
-	r = c.WINDOW_RADIUS
-	assert float(value[r, r + 2]) == pytest.approx(8_000 * (1.30 - 1.05), rel=1e-4)  # (hero 1's army: it makes less of it)
-	assert float(value[r + 3, r]) == pytest.approx(50_000 * (1.30 - t.unled_share), rel=1e-4)
-	assert float(value[r, r]) == 0.0 and float(value.sum()) == pytest.approx(8_000 * 0.25 + 50_000 * (1.30 - t.unled_share), rel=1e-4)
+	def values(partner, count):
+		x["h_army_creature"][0, 1, 0], x["h_army_count"][0, 1, 0] = partner, count
+		with torch.no_grad():
+			f = m.domain_knowledge(x)
+			return t.meeting_value(x, f, torch.tensor([0]), windows, on_tile)[0], f
+
+	def led(creatures, counts, h, f):
+		rest = x["h_morale"][0, h].float() - ft.make_up_morales(x["h_army_creature"][0, h], x["h_army_count"][0, h].float(), t)
+		return float(ft.led_values(torch.tensor(creatures), torch.tensor(counts, dtype=torch.float32), f.hero_multiplier[0, h], rest, t))
+
+	pad = lambda ids, n: (list(ids) + [-1] * (n - len(ids)), None)  # noqa: E731
+	value, f = values(angel, 3)  # (fast Angels of the same faction: joined under hero 0)
+	alone = [led(pad([angel], 7)[0], [5.0] + [0.0] * 6, 0, f), led(pad([angel], 7)[0], [3.0] + [0.0] * 6, 1, f)]
+	joined = led(pad([angel, angel], 14)[0], [5.0, 3.0] + [0.0] * 12, 0, f)
+	gain = joined - sum(alone)
+	assert gain > 0 and float(value[r, r + 2]) == pytest.approx(gain * float(t.gain(t.meeting_gain)), rel=1e-4)
+	assert bool(f.main[0, 0])
+	gathered = led(pad([angel, angel], 14)[0], [5.0, 4.0] + [0.0] * 12, 0, f) - alone[0] - t.unled_share * float(f.town_gold[0, 0]) - float(t.gather_loss(f)[0, 0])
+	assert gathered > 0 and float(value[r + 3, r]) == pytest.approx(gathered * float(t.gain(t.meeting_gain)), rel=1e-4)
+	assert float(value[r, r]) == 0.0 and float((value > 0).sum()) == 2
+	slow, f = values(dwarf, 2)  # (Dwarves alone: joined they slow the Angels, kept apart nothing changes)
+	assert float(slow[r, r + 2]) == pytest.approx(0.0, abs=1e-3)
+	x["t_garrison_creature"][0, 0, 0], x["t_garrison_count"][0, 0, 0] = crusader, 10  # (speed 6: they would slow the Angels more than leading them adds)
+	slowed, f = values(angel, 3)
+	assert float(slowed[r + 3, r]) == pytest.approx(0.0, abs=1e-3)
 
 
 def test_a_take_best_and_a_drop_are_priced_on_the_armies_they_make():

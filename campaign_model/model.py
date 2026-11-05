@@ -879,21 +879,55 @@ class CustomFeatures(nn.Module):
 		)
 
 	def meeting_value(self, x, f, decision, windows, on_tile):
-		"""What stepping on a hero of ours (an exchange) or into a town of ours (its garrison) gains [K, W, W] (gold): Φ's
-		gain once the army is where it counts the most (the user, 2026-11-05: a meeting's expected gain, as a pickup's and a
-		fight's): of the two heroes, the army of the one making less of it (f.hero_multiplier) times the difference; a
-		town's garrison times what the hero makes of it over what Φ counts a garrison at (unled_share). Its weight learned
-		(meeting_gain, 1 at the start); what the exchange then does is ARMY's, and the artifacts' are ARTIFACT's."""
+		"""What stepping on a hero of ours (an exchange) or into a town of ours (its garrison) gains [K, W, W] (gold): the
+		best the exchange or the gather there would make to Φ (the user, 2026-11-05: a meeting's expected gain, as a
+		pickup's and a fight's), at least 0, priced as the actions are (features.led_values: each army at its hero's
+		multiplier, movement and make-up's morale):
+		  - a hero: the two armies joined under the stronger (stronger_hero: the higher level, else the multiplier, else
+		    the army), or joined less their slowest creatures, which the other keeps (TAKE_BEST_FAST's way), over the two
+		    apart. Before (Φ v4's factors alone, 2026-11-05 morning) a hero that had handed its slow creatures over was
+		    still a meeting worth making: schema 15's first games met 308 times a game, a pair up to 6 times a day;
+		  - a town, for a main hero (f.main; a scout's GATHER pays gather_cost_weight): its army joined with the garrison,
+		    less the garrison at unled_share and what taking it adds to the town's expected loss (gather_loss).
+		Its weight learned (meeting_gain, 1 at the start)."""
 		mine = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
 		hero = torch.remainder(windows, HO)  # [K]: the window's hero
 		others = on_tile(x["h_pos"][:, :HO], mine) & (torch.arange(HO, device=hero.device) != hero[:, None, None, None])  # [K, W, W, HO]
-		lead = f.hero_multiplier.reshape(-1).index_select(0, windows)[:, None]  # [K, 1]
-		army = f.hero_gold[:, :HO].reshape(-1).index_select(0, windows)[:, None]
-		their_lead, their_army = f.hero_multiplier.index_select(0, decision), f.hero_gold[:, :HO].index_select(0, decision)  # [K, HO]
-		gain = torch.where(lead >= their_lead, their_army * (lead - their_lead), army * (their_lead - lead))  # [K, HO]
+		army_c, army_n = x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO].float()  # [B, HO, A]
+		rest = x["h_morale"][:, :HO].float() - ft.make_up_morales(army_c, army_n, self)  # (each hero's morale without its army's make-up's)
+		led = ft.led_values(army_c, army_n, f.hero_multiplier, rest, self)  # [B, HO]
+		k = windows.shape[0]
+		flat = lambda v: v.reshape((-1,) + tuple(v.shape[2:])).index_select(0, windows)  # noqa: E731 ([B, HO, ...] -> the window's hero's [K, ...])
+		mover_c, mover_n, mover_m, mover_r, mover_v = flat(army_c), flat(army_n), flat(f.hero_multiplier), flat(rest), flat(led)  # [K, A] / [K]
+		other_c, other_n = army_c.index_select(0, decision), army_n.index_select(0, decision)  # [K, HO, A]
+		other_m, other_r, other_v = f.hero_multiplier.index_select(0, decision), rest.index_select(0, decision), led.index_select(0, decision)  # [K, HO]
+		joined_c = torch.cat([mover_c.unsqueeze(1).expand(-1, HO, -1), other_c], dim=-1)  # [K, HO, 2A]
+		joined_n = torch.cat([mover_n.unsqueeze(1).expand(-1, HO, -1), other_n], dim=-1)
+		level = x["h_level"][:, :HO].float()
+		mover_l, other_l = flat(level), level.index_select(0, decision)
+		mover_a, other_a = flat(f.hero_gold[:, :HO]), f.hero_gold[:, :HO].index_select(0, decision)
+		mover_first = (mover_l[:, None] > other_l) | ((mover_l[:, None] == other_l) & ((mover_m[:, None] > other_m) | ((mover_m[:, None] == other_m) & (mover_a[:, None] >= other_a))))  # [K, HO]
+		receiver_m = torch.where(mover_first, mover_m[:, None].expand(-1, HO), other_m)
+		receiver_r = torch.where(mover_first, mover_r[:, None].expand(-1, HO), other_r)
+		giver_m = torch.where(mover_first, other_m, mover_m[:, None].expand(-1, HO))
+		giver_r = torch.where(mover_first, other_r, mover_r[:, None].expand(-1, HO))
+		all_in = ft.led_values(joined_c, joined_n, receiver_m, receiver_r, self)
+		speed = self.creature_speed[vocab_index(joined_c, c.CREATURE_VOCAB)]
+		present = (joined_c >= 0) & (joined_n > 0)
+		slowest = torch.where(present, speed, torch.full_like(speed, 1e9)).amin(dim=-1, keepdim=True)
+		slow = present & (speed == slowest) & (speed < torch.where(present, speed, torch.full_like(speed, -1.0)).amax(dim=-1, keepdim=True))  # (none when all are as slow)
+		fast = ft.led_values(torch.where(slow, torch.full_like(joined_c, -1), joined_c), joined_n * ~slow, receiver_m, receiver_r, self) + ft.led_values(
+			torch.where(slow, joined_c, torch.full_like(joined_c, -1)), joined_n * slow, giver_m, giver_r, self
+		)
+		gain = (torch.maximum(all_in, fast) - mover_v[:, None] - other_v).clamp(min=0.0)  # [K, HO]
 		met = (others.float() * gain[:, None, None, :]).amax(dim=-1)
 		own = x["t_present"][:, :TO] & (x["t_owner"][:, :TO] == c.OWNER_SELF)
-		garrison = f.town_gold[:, :TO].index_select(0, decision) * (lead - self.unled_share).clamp(min=0.0)  # [K, TO]
+		garrison_c, garrison_n = x["t_garrison_creature"][:, :TO].index_select(0, decision), x["t_garrison_count"][:, :TO].float().index_select(0, decision)  # [K, TO, A]
+		with_garrison = ft.led_values(
+			torch.cat([mover_c.unsqueeze(1).expand(-1, TO, -1), garrison_c], dim=-1), torch.cat([mover_n.unsqueeze(1).expand(-1, TO, -1), garrison_n], dim=-1), mover_m[:, None], mover_r[:, None], self
+		)  # [K, TO]
+		gathered = with_garrison - mover_v[:, None] - self.unled_share * f.town_gold[:, :TO].index_select(0, decision) - self.gather_loss(f).index_select(0, decision)
+		garrison = gathered.clamp(min=0.0) * flat(f.main.float())[:, None]
 		entered = (on_tile(x["t_pos"][:, :TO], own).float() * garrison[:, None, None, :]).amax(dim=-1)
 		return (met + entered) * self.gain(self.meeting_gain)
 

@@ -243,6 +243,7 @@ class AlphaMapAI : public CAdventureAI
 	void payByTrades(const TResources & cost, const Decision & decision);
 	// The stacks of one creature in an army of ours merged into one (the user, 2026-11-04: "whenever possible, unify")
 	void unifyStacks();
+	bool mergeDuplicates(const CArmedInstance * army); // (a creature's stacks in one army into one; whether any merged)
 	// A University's skill as a yes/no: YES buys it (the option a SKILL: the skill, basic, its price)
 	Decision universityQuestion(const CGHeroInstance * hero, SecondarySkill skill, int price);
 

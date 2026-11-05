@@ -325,6 +325,11 @@ void AlphaMapAI::arrange(const CArmedInstance * giver, const CArmedInstance * re
 		return n;
 	};
 	const bool keepsOne = dynamic_cast<const CGHeroInstance *>(giver) != nullptr;
+	// A creature in two slots of one army takes a slot the receiver may need (an exchange's own troop moves and swaps
+	// make them; unifyStacks merges them only before a turn decision): 2 of the first 5,100 schema-15 TAKE_BESTs left a
+	// creature behind for want of a slot
+	mergeDuplicates(receiver);
+	mergeDuplicates(giver);
 	for(const auto & [creature, count] : target)
 		for(int guard = 0; guard < 2 * ARMY_SLOTS; ++guard) // (a request a stack at most)
 		{
@@ -361,6 +366,8 @@ void AlphaMapAI::arrange(const CArmedInstance * giver, const CArmedInstance * re
 			const SlotID to = receiver->getSlotFor(creature);
 			if(!to.validSlot())
 			{
+				if(mergeDuplicates(receiver)) // (a swap of ours may have made one)
+					continue;
 				if(!out.validSlot() || move < there)
 					break;
 				cb->swapCreatures(giver, receiver, from, out);
@@ -413,17 +420,25 @@ void AlphaMapAI::unifyStacks()
 	for(const auto * town : cb->getTownsInfo(true))
 		armies.push_back(town);
 	for(const auto * army : armies)
-		for(int first = 0; first < ARMY_SLOTS; ++first)
-			for(int second = first + 1; second < ARMY_SLOTS; ++second)
+		mergeDuplicates(army);
+}
+
+bool AlphaMapAI::mergeDuplicates(const CArmedInstance * army)
+{
+	bool merged = false;
+	for(int first = 0; first < ARMY_SLOTS; ++first)
+		for(int second = first + 1; second < ARMY_SLOTS; ++second)
+		{
+			const auto * one = army->getStackPtr(SlotID(first));
+			const auto * other = army->getStackPtr(SlotID(second));
+			if(one && other && one->getId() == other->getId())
 			{
-				const auto * one = army->getStackPtr(SlotID(first));
-				const auto * other = army->getStackPtr(SlotID(second));
-				if(one && other && one->getId() == other->getId())
-				{
-					cb->mergeStacks(army, army, SlotID(second), SlotID(first)); // (the later slot into the earlier)
-					++stacksMerged;
-				}
+				cb->mergeStacks(army, army, SlotID(second), SlotID(first)); // (the later slot into the earlier)
+				++stacksMerged;
+				merged = true;
 			}
+		}
+	return merged;
 }
 
 bool AlphaMapAI::moveHero(ObjectInstanceID heroID, int3 destination)
