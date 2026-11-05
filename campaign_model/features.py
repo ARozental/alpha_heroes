@@ -16,7 +16,7 @@ from torch.nn import functional as F
 from battle_model.device import constant, moved
 from battle_model.features import scales, signed_scales
 from battle_model.layers import vocab_index
-from game_values import ATTACK_POINTS, ATTACK_STEP, DEFENSE_POINTS, DEFENSE_STEP
+from game_values import ATTACK_POINTS, ATTACK_STEP, DAMAGE_SPELLS, DEFENSE_POINTS, DEFENSE_STEP, SPELL_ROUNDS
 from game_values import HERO_HIRE_COST as HERO_GOLD_COST
 
 from . import constants as c
@@ -133,21 +133,6 @@ def hero_strength(primary, power):
 
 # ---- a fight's strength, several ways (the user, 2026-11-04: estimates that agree are easier to act on) ----
 
-# VCMI's damage spells at no school (the classic table; SpellID order 15..23): (spell id, damage at 0 power, damage a
-# point of spell power, mana a cast). Death Ripple, Destroy Undead and Armageddon are left out (they need undead, or hit
-# our own army too)
-DAMAGE_SPELLS = (
-	(15, 10.0, 10.0, 5.0),  # Magic Arrow
-	(16, 10.0, 20.0, 8.0),  # Ice Bolt
-	(17, 10.0, 25.0, 10.0),  # Lightning Bolt
-	(18, 100.0, 75.0, 30.0),  # Implosion
-	(19, 25.0, 40.0, 24.0),  # Chain Lightning (its first target)
-	(20, 15.0, 10.0, 12.0),  # Frost Ring
-	(21, 15.0, 10.0, 12.0),  # Fireball
-	(22, 20.0, 10.0, 16.0),  # Inferno
-	(23, 25.0, 25.0, 16.0),  # Meteor Shower
-)
-SPELL_ROUNDS = 3.0  # the rounds a fight against a wandering monster takes, about: the casts a spell's damage is spread over
 
 
 def army_battle(creatures, counts, detailed, t):
@@ -170,11 +155,15 @@ def damage_modifier(difference):
 	return 1.0 + ATTACK_STEP * difference.clamp(0.0, ATTACK_POINTS) - DEFENSE_STEP * (-difference).clamp(0.0, DEFENSE_POINTS)
 
 
-def army_multiplier(attack, defense):
-	"""game_values.army_multiplier of tensors: what each hero's battle attack and defense make of the army it leads."""
+def army_multiplier(attack, defense, power=None, knowledge=None, spellbook=None, step=0.0):
+	"""game_values.army_multiplier of tensors: what each hero's battle attack and defense make of the army it leads, and
+	its spellbook (with power, knowledge: game_values.spell_factor at step)."""
 	dealt = 1.0 + ATTACK_STEP * attack.float().clamp(0.0, ATTACK_POINTS)
+	spells = 1.0
+	if spellbook is not None:
+		spells = 1.0 + step * torch.sqrt(power.float().clamp(min=0.0) * knowledge.float().clamp(min=0.0)) * spellbook.float()
 	taken = 1.0 - DEFENSE_STEP * defense.float().clamp(0.0, DEFENSE_POINTS)
-	return torch.sqrt(dealt / taken)
+	return torch.sqrt(dealt / taken) * spells
 
 
 def spell_damage(x, t):
@@ -188,6 +177,14 @@ def spell_damage(x, t):
 	power = x["h_primary"][..., 2].clamp(min=0).float().unsqueeze(-1)
 	casts = torch.minimum(torch.floor(x["h_mana"].clamp(min=0).float().unsqueeze(-1) / cost), torch.full_like(cost, SPELL_ROUNDS))
 	return ((base + per_power * power) * casts * known).amax(dim=-1) / SPELL_ROUNDS
+
+
+def hero_multipliers(primary, artifacts, t):
+	"""What each hero makes of the army it leads in Φ [..] (primary [.., 4], its items' included; artifacts [.., worn]):
+	unled_share x army_multiplier at its attack, defense, spell power and knowledge, its spellbook (artifact SPELLBOOK
+	worn), empire.hero_multiplier's."""
+	spellbook = (artifacts == SPELLBOOK).any(dim=-1)
+	return t.unled_share * army_multiplier(primary[..., 0], primary[..., 1], primary[..., 2], primary[..., 3], spellbook, t.spell_step)
 
 
 def hopeless(ratio):
@@ -331,7 +328,7 @@ def tavern_worth(x, t):
 	armed, theirs_armed = own_armed(x, t), armed_share(army_gold, t)
 	before = heroes_value(ours, mine, armed, t).unsqueeze(-1)
 	after = torch.stack([heroes_value(torch.cat([ours, theirs[:, s : s + 1]], dim=1), torch.cat([mine, torch.ones_like(mine[:, :1])], dim=1), torch.cat([armed, theirs_armed[:, s : s + 1]], dim=1), t) for s in range(theirs.shape[1])], dim=1)
-	led = army_gold * army_multiplier(x["g_tavern_primary"][..., 0], x["g_tavern_primary"][..., 1])
+	led = army_gold * hero_multipliers(x["g_tavern_primary"], x["g_tavern_artifacts"], t)
 	return (after - before + led + carried) * present
 
 
@@ -372,7 +369,8 @@ def empire_value(x, t):
 			(x["g_resources"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
 			((x["t_built"][:, : c.OWN_TOWNS].float() * t.building_value[faction]).sum(dim=-1) * own_towns).sum(dim=-1),
 			t.income_days * (x["g_object_income"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
-			(hero_army * army_multiplier(x["h_primary"][:, :HO, 0], x["h_primary"][:, :HO, 1]) * own_heroes).sum(dim=-1) + (garrison * own_towns).sum(dim=-1) + owned,
+			(hero_army * hero_multipliers(x["h_primary"][:, :HO], x["h_artifacts"][:, :HO], t) * own_heroes).sum(dim=-1)
+			+ t.unled_share * ((garrison * own_towns).sum(dim=-1) + owned),  # (armies no hero leads: game_values.unled_share)
 			((x["t_available"][:, : c.OWN_TOWNS].clamp(min=0).float() * t.creature_unit[vocab_index(available, c.CREATURE_VOCAB)] * (available >= 0)).sum(dim=-1) * own_towns).sum(dim=-1) + dwelling_hire,
 			heroes_value(*own_skill_values(x, t), armed_share(hero_army, t), t) + (boost_values(x, t) * own_heroes).sum(dim=-1),
 			((t.artifact_price[vocab_index(artifacts, c.ARTIFACT_VOCAB)] * (artifacts >= 0)).sum(dim=-1) * own_heroes).sum(dim=-1),

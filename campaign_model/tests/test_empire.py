@@ -5,6 +5,7 @@ import pytest
 
 from campaign_model import vocab
 from campaign_model.empire import EmpireConfig, army_worth, boost_value, building_value, empire_value, hero_base_value, hero_multiplier, heroes_value, shares, skill_value
+from game_values import REFERENCE_KNOWLEDGE, REFERENCE_POWER, unled_share
 from game_values import HERO_HIRE_COST, capped_mana_value, resources_value
 
 CASTLE = 0
@@ -67,18 +68,28 @@ def test_a_new_dwelling_with_its_first_batch_is_neutral_and_growth_is_a_gain():
 	assert total(monday) > total(after)
 
 
-def test_recruiting_into_a_town_is_neutral_and_an_upgrade_gains_what_its_hero_makes_of_it():
+def test_recruiting_into_a_town_is_slightly_negative_into_a_starting_hero_neutral_and_an_upgrade_gains_what_its_hero_makes_of_it():
 	"""For a hero already armed (an army worth armed_army or more): below that, creatures also lift its HERO_BASE
-	(test_a_hero_with_nothing_is_worth_less_than_one_with_creatures). A garrison's creatures count at their worth; a
-	hero's at its army_multiplier, so upgrading them adds that much more of the upgrade's worth (2026-11-04)."""
+	(test_a_hero_with_nothing_is_worth_less_than_one_with_creatures). A garrison's creatures count at unled_share of their
+	worth (the user, 2026-11-05: buying an army slightly negative, ~4.7% at 0.953), a starting hero with only spell power 3
+	and knowledge 2 and its spellbook makes it neutral; a hero's at its multiplier, so upgrading them adds that much more
+	of the upgrade's worth (2026-11-04)."""
 	before = player()
 	before["heroes"][0]["army"] = [[PIKEMAN, 30]]  # (30 x (60 + u): armed)
+	before["heroes"][0].update(attack=2, defense=2)  # (a starting might hero's: above the unit hero, x1.026)
 	assert army_worth(before["heroes"][0]["army"]) >= EmpireConfig().armed_army
 	recruited = copy.deepcopy(before)
 	recruited["resources"][6] -= 5 * vocab.creature_cost(PIKEMAN)
 	recruited["towns"][0]["available"][0][1] -= 5
 	recruited["towns"][0]["garrison"] = [[PIKEMAN, 5]]
-	assert total(recruited) == pytest.approx(total(before))
+	assert 0.95 < unled_share() < 1 and total(recruited) == pytest.approx(total(before) - (1 - unled_share()) * army_worth([[PIKEMAN, 5]]))
+	starting = copy.deepcopy(before)  # (a starting hero: attack and defense 0, spell power 3, knowledge 2, its spellbook)
+	starting["heroes"][0].update(attack=0, defense=0, power=REFERENCE_POWER, knowledge=REFERENCE_KNOWLEDGE, spellbook=True)
+	into_hero = copy.deepcopy(starting)
+	into_hero["resources"][6] -= 5 * vocab.creature_cost(PIKEMAN)
+	into_hero["towns"][0]["available"][0][1] -= 5
+	into_hero["heroes"][0]["army"] = [[PIKEMAN, 35]]
+	assert hero_multiplier(starting["heroes"][0]) == pytest.approx(1.0) and total(into_hero) == pytest.approx(total(starting))
 	upgraded = copy.deepcopy(before)
 	upgraded["resources"][6] -= 30 * (vocab.creature_cost(HALBERDIER) - vocab.creature_cost(PIKEMAN))
 	upgraded["heroes"][0]["army"] = [[HALBERDIER, 30]]
@@ -97,7 +108,7 @@ def test_an_army_is_worth_more_with_the_stronger_hero():
 	after = copy.deepcopy(before)
 	after["heroes"][0]["army"], after["heroes"][1]["army"] = [[PIKEMAN, 1]], [[PIKEMAN, 30]]
 	moved = army_worth(((PIKEMAN, 29),))
-	assert hero_multiplier(strong) == pytest.approx(math.sqrt(1.5 / 0.75))
+	assert hero_multiplier(strong) == pytest.approx(unled_share() * math.sqrt(1.5 / 0.75))  # (no spellbook: its attack and defense alone)
 	assert total(after) - total(before) == pytest.approx(moved * (hero_multiplier(strong) - hero_multiplier(weak)))
 
 
@@ -228,5 +239,6 @@ def test_a_heros_war_machines_are_half_their_price_and_the_catapult_nothing():
 	assert empire_value(kit)["total"] == empire_value(base)["total"]
 	kit["heroes"] = [dict(h, artifacts=[3, 4, 5, 6]) for h in base["heroes"]]
 	assert empire_value(kit)["total"] == pytest.approx(empire_value(base)["total"] + len(base["heroes"]) * (1250 + 500 + 375))
-	kit["heroes"] = [dict(h, artifacts=[0]) for h in base["heroes"]]  # (2026-10-29) a spellbook at its price
-	assert empire_value(kit)["total"] == pytest.approx(empire_value(base)["total"] + len(base["heroes"]) * 500)
+	kit["heroes"] = [dict(h, artifacts=[0]) for h in base["heroes"]]  # (2026-10-29) a spellbook at its price, and (2026-11-05) its spell factor on the army
+	factor = sum(army_worth(h["army"]) * (hero_multiplier(dict(h, artifacts=[0])) - hero_multiplier(h)) for h in base["heroes"])
+	assert factor > 0 and empire_value(kit)["total"] == pytest.approx(empire_value(base)["total"] + len(base["heroes"]) * 500 + factor)

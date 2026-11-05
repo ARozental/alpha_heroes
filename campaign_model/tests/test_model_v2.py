@@ -1459,3 +1459,40 @@ def test_a_worn_artifact_and_a_carried_one_read_alike_until_the_carried_map_lear
 	fresh = CampaignModelV2(dim=32, cell_dim=8, layers=1)
 	fresh.load_state_dict(old)
 	assert float(fresh.encode_hero.carried.weight.abs().max()) == 0
+
+
+def test_stepping_on_a_hero_or_a_town_of_ours_is_worth_what_the_army_gains_where_it_counts_most():
+	"""model.CustomFeatures.meeting_value (2026-11-05): a hero of ours on a window tile is worth the army of whichever of
+	the two makes less of its army times the multipliers' difference; a town of ours its garrison times the hero's
+	multiplier over unled_share; nothing elsewhere (the window's own hero's tile included)."""
+	torch.manual_seed(9)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	t = m.features
+	x = tensors({k: np.repeat(v, 1, axis=0) for k, v in rich_inputs(1, 5).items()})
+	x["h_present"][:] = False
+	x["h_present"][0, :2], x["h_owner"][0, :2] = True, c.OWNER_SELF
+	x["h_pos"][0, 0] = torch.tensor([10, 10, 0])
+	x["h_pos"][0, 1] = torch.tensor([12, 10, 0])  # (two tiles east of hero 0)
+	x["t_present"][:] = False
+	x["t_present"][0, 0], x["t_owner"][0, 0] = True, c.OWNER_SELF
+	x["t_pos"][0, 0] = torch.tensor([10, 13, 0])  # (three tiles south)
+	windows = torch.tensor([0])  # (decision 0, hero 0)
+	f = t.make_custom_features(x, windows) if hasattr(t, "make_custom_features") else t(x, windows)
+	f.hero_multiplier = torch.tensor([[1.30, 1.05] + [1.0] * (c.OWN_HEROES - 2)])
+	f.hero_gold = torch.zeros(1, x["h_present"].shape[1])
+	f.hero_gold[0, :2] = torch.tensor([20_000.0, 8_000.0])
+	f.town_gold = torch.zeros(1, x["t_present"].shape[1])
+	f.town_gold[0, 0] = 50_000.0
+	offsets = torch.arange(c.WINDOW) - c.WINDOW_RADIUS
+	dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
+	tile_x, tile_y = 10 + dx, 10 + dy
+
+	def on_tile(pos, present):
+		return (pos[:, None, None, :, 0] == tile_x[None, ..., None]) & (pos[:, None, None, :, 1] == tile_y[None, ..., None]) & (pos[:, None, None, :, 2] == 0) & present[:, None, None, :]
+
+	with torch.no_grad():
+		value = t.meeting_value(x, f, torch.tensor([0]), windows, on_tile)[0]
+	r = c.WINDOW_RADIUS
+	assert float(value[r, r + 2]) == pytest.approx(8_000 * (1.30 - 1.05), rel=1e-4)  # (hero 1's army: it makes less of it)
+	assert float(value[r + 3, r]) == pytest.approx(50_000 * (1.30 - t.unled_share), rel=1e-4)
+	assert float(value[r, r]) == 0.0 and float(value.sum()) == pytest.approx(8_000 * 0.25 + 50_000 * (1.30 - t.unled_share), rel=1e-4)

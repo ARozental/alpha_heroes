@@ -46,7 +46,7 @@ from dataclasses import dataclass
 
 import math
 
-from game_values import army_multiplier, capped_mana_value, fractional_level, resources_value
+from game_values import SPELL_STEP, army_multiplier, capped_mana_value, fractional_level, resources_value, unled_share
 
 from . import vocab
 from .vocab import DWELLING_FIRST, DWELLING_LAST
@@ -55,7 +55,10 @@ STATUS_INGAME, STATUS_LOST = 0, 1  # EPlayerStatus::INGAME, LOSER (WINNER is 2)
 # Bumped when Φ's rules change (the evals' scores are shares of it: evaluate.py compares only evals of one version).
 # 2 (2026-10-29): heroes by their skills (skill_value), the strongest in full; a fresh hero HERO_BASE; the spellbook.
 # 3 (2026-10-30): heroes' spells (SPELL_LEVEL a level), their luck and morale until the next battle (boost_value)
-EMPIRE_VERSION = 3
+# 4 (2026-11-05): armies no hero leads at EmpireConfig.unled_share, a hero's spells in what it makes of its army. Training's;
+# the evaluation keeps 3's rules (EVAL_EMPIRE, below EmpireConfig) and its version
+EMPIRE_VERSION = 4
+EVAL_EMPIRE_VERSION = 3
 # A battle's luck and morale (VCMI config/gameConfig.json "combat": goodLuckChance [1, 2, 3], badLuckChance [],
 # goodMoraleChance [1, 2, 3], badMoraleChance [2, 4, 6], all out of 24): at each value -3..+3 the chance in 24 that a
 # stack's attack is lucky (double damage), or that its turn brings an extra one (+) or is lost (-)
@@ -84,6 +87,15 @@ class EmpireConfig:
 	# median, -366 without their army; at 0.55 an empty hire comes to ~-1,040, one with its usual army (1,938) as before
 	armyless_share: float = 0.55
 	armed_army: float = 1000.0
+	# A hero's spellbook in what it makes of its army (game_values.spell_factor), and so Φ's unit: an army no hero leads
+	# at game_values.unled_share (0.953 at 0.02), a hero's at that x its multiplier (the user, 2026-11-05: buying an army
+	# slightly negative, neutral once even a starting hero with spell power 3 and knowledge 2 leads it)
+	spell_step: float = SPELL_STEP
+
+
+# The evaluation's Φ (its scores, evaluate.score): as of 2026-11-04's army multiplier, before the spellbook's factor and
+# the unled share, so its scores stay comparable across the change
+EVAL_EMPIRE = EmpireConfig(spell_step=0.0)
 
 
 def _unit(creature_id, config):
@@ -150,10 +162,16 @@ def army_worth(stacks, config=EmpireConfig()):
 	return sum(count * (vocab.creature_cost(creature) + _unit(creature, config)) for creature, count in stacks)
 
 
-def hero_multiplier(hero):
-	"""What a hero makes of the army it leads (game_values.army_multiplier) at its battle attack and defense, items
-	included (the ledger's "attack" and "defense"; its base primary skills in a ledger from before them)."""
-	return army_multiplier(hero.get("attack", hero["primary"][0]), hero.get("defense", hero["primary"][1]))
+def hero_multiplier(hero, config=EmpireConfig()):
+	"""What a hero's army counts at in Φ: game_values.unled_share x army_multiplier at its battle attack, defense, spell
+	power and knowledge, items included (the ledger's "attack", "defense", "power", "knowledge"; its base primary skills
+	in a ledger from before them), and its spellbook (the ledger's "spellbook", else artifact 0 among its "artifacts")."""
+	primary = hero["primary"]
+	spellbook = hero.get("spellbook", 0 in hero.get("artifacts", []))
+	multiplier = army_multiplier(
+		hero.get("attack", primary[0]), hero.get("defense", primary[1]), hero.get("power", primary[2]), hero.get("knowledge", primary[3]), spellbook, config.spell_step
+	)
+	return unled_share(config.spell_step) * multiplier
 
 
 def hero_base_value(army, config=EmpireConfig()):
@@ -185,7 +203,7 @@ def empire_value(player, config=EmpireConfig()):
 		parts["for_hire"] += sum(count * _unit(creature, config) for creature, count in town["available"] if creature >= 0)
 	for dwelling in player.get("dwellings", []):
 		parts["for_hire"] += sum(count * _unit(creature, config) for creature, count in dwelling["available"] if creature >= 0)
-	parts["army"] = army_worth(stacks, config) + sum(army_worth(hero["army"], config) * hero_multiplier(hero) for hero in player["heroes"])
+	parts["army"] = unled_share(config.spell_step) * army_worth(stacks, config) + sum(army_worth(hero["army"], config) * hero_multiplier(hero, config) for hero in player["heroes"])
 	parts["income"] = config.income_days * resources_value(player.get("income", [0] * 7))
 	prices = vocab.artifact_prices()
 	parts["heroes"] = heroes_value(player["heroes"], config)

@@ -62,9 +62,12 @@ def own_town(x):
 	return x
 
 
-def test_recruiting_at_list_price_is_worth_nothing(model):
-	"""Gold into creatures (each for hire at u, hired at cost + u) leaves Φ where it was: buying creates no value."""
+def test_recruiting_at_list_price_into_a_garrison_costs_its_unled_share(model):
+	"""Gold into creatures (each for hire at u, hired at cost + u): into a garrison they count at unled_share of their
+	worth (the user, 2026-11-05: buying an army slightly negative unless a hero leads it), empire.py's."""
+	from campaign_model.empire import army_worth
 	from campaign_model.vocab import creature_cost
+	from game_values import unled_share
 
 	x = own_town(empty_inputs(1))
 	x["t_available"][0, 0, 0], x["t_available_creature"][0, 0, 0] = 14, PIKEMAN
@@ -72,7 +75,7 @@ def test_recruiting_at_list_price_is_worth_nothing(model):
 	x["t_available"][0, 0, 0] -= 10
 	x["t_garrison_creature"][0, 0, 0], x["t_garrison_count"][0, 0, 0] = PIKEMAN, 10
 	x["g_resources"][0, 6] -= 10 * creature_cost(PIKEMAN)
-	assert empire(model, x) == pytest.approx(before, abs=1.0)
+	assert empire(model, x) == pytest.approx(before - (1 - unled_share()) * army_worth([[PIKEMAN, 10]]), abs=1.0)
 
 
 def test_building_at_list_price_is_worth_nothing(model):

@@ -29,7 +29,7 @@ from battle_model import play as battle_play
 from battle_model import supply
 from battle_model.supply import memory_allows
 
-from .empire import EMPIRE_VERSION, STATUS_INGAME, STATUS_LOST, EmpireConfig, empire_value
+from .empire import EVAL_EMPIRE, EVAL_EMPIRE_VERSION, STATUS_INGAME, STATUS_LOST, empire_value
 from .failures import NAMES as FAILURES, failure_counts, failure_modes
 from .labels import COLORS, share_at, share_table
 from .play import make_map, play
@@ -78,7 +78,7 @@ def eval_map(seed, players, config):
 STALLED = "killed: no log output"  # (scripts/headless.sh's status for a game silent past its stall limit)
 
 
-def score(game, color, players, days, empire=EmpireConfig()):
+def score(game, color, players, days, empire=EVAL_EMPIRE):
 	"""One game's results for our player (color), from the snapshot at the end of `days` or the game's last (a
 	knock-out ends the game for us: the end-of-game snapshot, after the day's)."""
 	table, last = share_table(game, empire)
@@ -161,7 +161,7 @@ def evaluate(config, server, battle, version, epoch, stop=None, model="current")
 				print(f"campaign eval: game {i} {info.status[:60]}" + (": played again" if not attempt else ": left out"), flush=True)
 			if info.status.startswith(STALLED):
 				raise RuntimeError(f"stalled twice ({info.status[:100]})")
-			results[i] = {**score(game, color, players, config.eval_days), "setup": i, "seed": seed, "map": name, "color": color, "temperature": config.eval_temperature, "empire": EMPIRE_VERSION, "seconds_limit": config.eval_seconds, "status": info.status, "seconds": round(info.seconds, 1), "failures": failure_counts(game.decisions)}
+			results[i] = {**score(game, color, players, config.eval_days), "setup": i, "seed": seed, "map": name, "color": color, "temperature": config.eval_temperature, "empire": EVAL_EMPIRE_VERSION, "seconds_limit": config.eval_seconds, "status": info.status, "seconds": round(info.seconds, 1), "failures": failure_counts(game.decisions)}
 			if info.status.startswith("stopped at day") or "exit code 0" in info.status:
 				shutil.rmtree(info.run_dir, ignore_errors=True)  # (a failed game's logs are kept)
 		except Exception as error:  # left out of the score, counted

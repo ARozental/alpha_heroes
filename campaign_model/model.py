@@ -249,6 +249,9 @@ class CustomFeatures(nn.Module):
 
 		empire = EmpireConfig()
 		self.income_days, self.hero_penalty, self.explored_tile = empire.income_days, empire.hero_penalty, empire.explored_tile
+		from game_values import unled_share
+
+		self.spell_step, self.unled_share = empire.spell_step, unled_share(empire.spell_step)  # (a hero's spellbook; armies no hero leads: game_values)
 		for name in ("hero_base", "skill_level", "fresh_skill_levels", "primary_point", "primary_base", "level_bonus", "secondary_share", "boost", "armyless_share", "armed_army"):  # (empire.py's heroes)
 			setattr(self, name, getattr(empire, name))
 		scores, subtypes = priors.object_values()
@@ -270,6 +273,7 @@ class CustomFeatures(nn.Module):
 		zeros = lambda *shape: nn.Parameter(torch.zeros(shape))  # noqa: E731 (every correction starts at its prior)
 		self.object_gain, self.fight_sharpness, self.enemy_value, self.explore_gain, self.hero_value = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.danger_gain, self.garrison_penalty, self.fort_gain = zeros(), zeros(), zeros()
+		self.meeting_gain = zeros()  # (2026-11-05: what meeting a hero of ours or entering a town of ours gains, tile_features)
 		self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight = zeros(), zeros(), zeros(), zeros()
 		self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight = (zeros() for _ in range(6))
 		self.travel_exponent, self.end_coupling, self.travel_coupling = zeros(), zeros(), zeros()
@@ -296,7 +300,7 @@ class CustomFeatures(nn.Module):
 	def corrections(self):
 		return [
 			self.object_gain, self.object_type_gain.weight, self.object_type_delta.weight, self.object_subtype_delta.weight,
-			self.fight_sharpness, self.enemy_value, self.hero_value, self.danger_gain, self.explore_gain, self.class_gain, self.travel_exponent,
+			self.fight_sharpness, self.enemy_value, self.hero_value, self.danger_gain, self.meeting_gain, self.explore_gain, self.class_gain, self.travel_exponent,
 			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
@@ -449,6 +453,8 @@ class CustomFeatures(nn.Module):
 		f.phi = ft.phi_features(f.phi_parts, f.phi_total)
 		f.hero_counts, f.hero_power, f.hero_gold, f.hero_health = ft.army(x["h_army_creature"], x["h_army_count"], x["h_detailed"], self)
 		f.hero_strength = ft.hero_strength(x["h_primary"], f.hero_power)
+		# What each hero of ours makes of the army it leads (Φ's: its attack, defense and spells; features.army_multiplier)
+		f.hero_multiplier = ft.hero_multipliers(x["h_primary"][:, :HO], x["h_artifacts"][:, :HO], self)
 		f.hero_worth = ft.hero_worth(x, self)
 		f.level_gain = ft.level_gains(x, self)
 		f.town_counts, f.town_power, f.town_gold, f.town_health = ft.army(x["t_garrison_creature"], x["t_garrison_count"], x["t_detailed"], self)
@@ -569,8 +575,9 @@ class CustomFeatures(nn.Module):
 
 	def artifact_prior(self, x, f):
 		"""What each ARTIFACT entry does to Φ, as a prior logit [B, HO, N_ARTIFACT_POSITIONS, N_ARTIFACT_TARGETS]
-		(value_logit; the user, 2026-11-04: move them to the strongest hero): an artifact's attack and defense change what
-		each hero makes of the army it leads (army_multiplier); GIVE takes a worn one's off its hero and puts it on the
+		(value_logit; the user, 2026-11-04: move them to the strongest hero): an artifact's primary skills change what
+		each hero makes of the army it leads (features.hero_multipliers: attack, defense, and with a spellbook spell power
+		and knowledge); GIVE takes a worn one's off its hero and puts it on the
 		other of the exchange (x_heroes); EQUIP wears one from the backpack in place of its slot's; ASSEMBLE turns the
 		worn parts into their combination (its price over theirs, its bonuses in place of theirs). An artifact's price
 		stays ours wherever it is: Φ's artifacts part moves only with an assembly."""
@@ -579,12 +586,17 @@ class CustomFeatures(nn.Module):
 		present = ids >= 0
 		worn = (torch.arange(ids.shape[-1], device=ids.device) < c.N_WORN_SLOTS) & present  # (a backpack artifact gives its hero nothing)
 		bonus = self.artifact_primary[index] * present.unsqueeze(-1).float()  # [B, HO, P, N_PRIMARY]
-		attack, defense = (x["h_primary"][:, :HO, k].clamp(min=0).float() for k in (0, 1))  # [B, HO]
+		primary = x["h_primary"][:, :HO].clamp(min=0).float()  # [B, HO, N_PRIMARY]
+		spellbook = (x["h_artifacts"][:, :HO] == ft.SPELLBOOK).any(dim=-1)  # [B, HO]
 		army = f.hero_gold[:, :HO]
-		lead = ft.army_multiplier(attack, defense)
 
-		def change(gained_attack, gained_defense):  # [B, HO, P]: what the hero's army gains in Φ
-			return army.unsqueeze(-1) * (ft.army_multiplier(attack.unsqueeze(-1) + gained_attack, defense.unsqueeze(-1) + gained_defense) - lead.unsqueeze(-1))
+		def lead_of(skills, book):  # what an army counts at in Φ with a hero of these primary skills [.., 4] (features.hero_multipliers')
+			return self.unled_share * ft.army_multiplier(skills[..., 0], skills[..., 1], skills[..., 2], skills[..., 3], book, self.spell_step)
+
+		lead = lead_of(primary, spellbook)  # [B, HO]
+
+		def change(gained):  # [B, HO, P]: what the hero's army gains in Φ with primary skills gained [B, HO, P, N_PRIMARY]
+			return army.unsqueeze(-1) * (lead_of(primary.unsqueeze(2) + gained, spellbook.unsqueeze(-1)) - lead.unsqueeze(-1))
 
 		on = lambda values, condition: values * condition.float()  # noqa: E731
 		first, second = x["x_heroes"][:, 0:1] - 1, x["x_heroes"][:, 1:2] - 1  # (tokens + 1; 0, none: -1)
@@ -596,20 +608,20 @@ class CustomFeatures(nn.Module):
 		# backpack sword counted as worn either way made giving it back a gain too, 1,049 moves in a game)
 		free = x["h_artifacts"][:, :HO].gather(1, other.unsqueeze(-1).expand(-1, -1, c.N_WORN_SLOTS)).gather(2, slot.clamp(min=0)) < 0
 		wears = (free & (slot >= 0)).float()
+		their_skills = primary.gather(1, other.unsqueeze(-1).expand(-1, -1, primary.shape[-1]))  # [B, HO, N_PRIMARY]: the other hero's
 		gained = army.gather(1, other).unsqueeze(-1) * (
-			ft.army_multiplier(attack.gather(1, other).unsqueeze(-1) + bonus[..., 0] * wears, defense.gather(1, other).unsqueeze(-1) + bonus[..., 1] * wears)
-			- lead.gather(1, other).unsqueeze(-1)
+			lead_of(their_skills.unsqueeze(2) + bonus * wears.unsqueeze(-1), spellbook.gather(1, other).unsqueeze(-1)) - lead.gather(1, other).unsqueeze(-1)
 		)
-		give = (change(-on(bonus[..., 0], worn), -on(bonus[..., 1], worn)) + gained) * (partner >= 0).unsqueeze(-1).float()
+		give = (change(-bonus * worn.unsqueeze(-1).float()) + gained) * (partner >= 0).unsqueeze(-1).float()
 		there = x["h_artifacts"][:, :HO].gather(2, slot.clamp(min=0)) * (slot >= 0) + -1 * (slot < 0)
 		replaced = self.artifact_primary[vocab_index(there, c.ARTIFACT_VOCAB)] * (there >= 0).unsqueeze(-1).float()
-		equip = on(change(bonus[..., 0] - replaced[..., 0], bonus[..., 1] - replaced[..., 1]), present & ~worn)
+		equip = on(change(bonus - replaced), present & ~worn)
 		combination = self.artifact_combination[index]  # [B, HO, P]
 		parts = (combination.unsqueeze(-1) == combination.unsqueeze(-2)) & (combination >= 0).unsqueeze(-1) & worn.unsqueeze(-2)  # [B, HO, P, P (the parts worn)]
 		parts_price = (parts.float() * self.artifact_price[index].unsqueeze(-2)).sum(dim=-1)
 		parts_bonus = (parts.float().unsqueeze(-1) * bonus.unsqueeze(-3)).sum(dim=-2)  # [B, HO, P, N_PRIMARY]
 		whole = self.artifact_primary[vocab_index(combination, c.ARTIFACT_VOCAB)]
-		assemble = on(self.artifact_price[vocab_index(combination, c.ARTIFACT_VOCAB)] - parts_price + change(whole[..., 0] - parts_bonus[..., 0], whole[..., 1] - parts_bonus[..., 1]), combination >= 0)
+		assemble = on(self.artifact_price[vocab_index(combination, c.ARTIFACT_VOCAB)] - parts_price + change(whole - parts_bonus), combination >= 0)
 		return ft.value_logit(torch.stack([give, equip, assemble], dim=-1)) - self.artifact_cost_weight()  # (a move must gain to be made)
 
 	def resource_worth(self, x):
@@ -722,6 +734,25 @@ class CustomFeatures(nn.Module):
 			],
 			dim=-1,
 		)
+
+	def meeting_value(self, x, f, decision, windows, on_tile):
+		"""What stepping on a hero of ours (an exchange) or into a town of ours (its garrison) gains [K, W, W] (gold): Φ's
+		gain once the army is where it counts the most (the user, 2026-11-05: a meeting's expected gain, as a pickup's and a
+		fight's): of the two heroes, the army of the one making less of it (f.hero_multiplier) times the difference; a
+		town's garrison times what the hero makes of it over what Φ counts a garrison at (unled_share). Its weight learned
+		(meeting_gain, 1 at the start); what the exchange then does is ARMY's, and the artifacts' are ARTIFACT's."""
+		mine = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
+		hero = torch.remainder(windows, HO)  # [K]: the window's hero
+		others = on_tile(x["h_pos"][:, :HO], mine) & (torch.arange(HO, device=hero.device) != hero[:, None, None, None])  # [K, W, W, HO]
+		lead = f.hero_multiplier.reshape(-1).index_select(0, windows)[:, None]  # [K, 1]
+		army = f.hero_gold[:, :HO].reshape(-1).index_select(0, windows)[:, None]
+		their_lead, their_army = f.hero_multiplier.index_select(0, decision), f.hero_gold[:, :HO].index_select(0, decision)  # [K, HO]
+		gain = torch.where(lead >= their_lead, their_army * (lead - their_lead), army * (their_lead - lead))  # [K, HO]
+		met = (others.float() * gain[:, None, None, :]).amax(dim=-1)
+		own = x["t_present"][:, :TO] & (x["t_owner"][:, :TO] == c.OWNER_SELF)
+		garrison = f.town_gold[:, :TO].index_select(0, decision) * (lead - self.unled_share).clamp(min=0.0)  # [K, TO]
+		entered = (on_tile(x["t_pos"][:, :TO], own).float() * garrison[:, None, None, :]).amax(dim=-1)
+		return (met + entered) * self.gain(self.meeting_gain)
 
 	def tile_features(self, x, windows, f):
 		"""Each window tile's features [K, W, W, ...] (K windows): its value in gold (the object we may take there + the
@@ -858,7 +889,7 @@ class CustomFeatures(nn.Module):
 		hopeless = ft.hopeless(this_hero.amax(dim=-1)) * fights
 		explore = ft.unexplored_around(flags)
 		# The object is ours only if we win the fight in front of it (a bank's guards, a monster's zone, a town's garrison)
-		value = object_gold * torch.where(fights, win, torch.ones_like(win)) + fight + explore * self.explore_gold()
+		value = object_gold * torch.where(fights, win, torch.ones_like(win)) + fight + explore * self.explore_gold() + self.meeting_value(x, f, decision, windows, on_tile)
 		# That gain discounted by the time to reach the tile as Nullkiller2 discounts its targets (PriorityEvaluator::
 		# evaluateMovement, as travel_prior does TRAVEL's areas): by the part of a day's movement it costs, raised to
 		# move_discount_power, 0 at the start (the score as before) and 1 its full discount. Nullkiller2 scores every
@@ -1107,7 +1138,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,

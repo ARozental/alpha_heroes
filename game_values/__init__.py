@@ -11,7 +11,8 @@ does, so it is expected to make most of the later changes here; every change mov
 	mana           battle: MANA_VALUE x spell power x mana;
 	               campaign: the same, but only of the mana a hero can spend in a short battle (capped_mana_value)
 	an army        campaign: its worth x what the hero leading it makes of it (army_multiplier: VCMI's damage
-	               modifiers at the hero's battle attack and defense), 1 for no hero (a garrison's)
+	               modifiers at the hero's battle attack and defense, its spellbook's spell_factor) x unled_share;
+	               an army no hero leads (a garrison's) at unled_share of its worth
 
 The tables are the engine's (battle_model/artifacts/vocab.json, scripts/export_vocab.sh); nothing here is trained.
 """
@@ -41,13 +42,50 @@ ATTACK_STEP, ATTACK_POINTS = 0.05, 60
 DEFENSE_STEP, DEFENSE_POINTS = 0.025, 28
 
 
-def army_multiplier(attack, defense):
+# VCMI's damage spells at no school (the classic table; SpellID order 15..23): (spell id, damage at 0 power, damage a
+# point of spell power, mana a cast). Death Ripple, Destroy Undead and Armageddon are left out (they need undead, or hit
+# our own army too)
+DAMAGE_SPELLS = (
+	(15, 10.0, 10.0, 5.0),  # Magic Arrow
+	(16, 10.0, 20.0, 8.0),  # Ice Bolt
+	(17, 10.0, 25.0, 10.0),  # Lightning Bolt
+	(18, 100.0, 75.0, 30.0),  # Implosion
+	(19, 25.0, 40.0, 24.0),  # Chain Lightning (its first target)
+	(20, 15.0, 10.0, 12.0),  # Frost Ring
+	(21, 15.0, 10.0, 12.0),  # Fireball
+	(22, 20.0, 10.0, 16.0),  # Inferno
+	(23, 25.0, 25.0, 16.0),  # Meteor Shower
+)
+SPELL_ROUNDS = 3.0  # the rounds a fight against a wandering monster takes, about: the casts a spell's damage is spread over
+# A hero's spellbook in what it makes of the army it leads (army_multiplier): x (1 + SPELL_STEP x sqrt(spell power x
+# knowledge)), the spells' strength and the mana to cast them, both needed (the user, 2026-11-05: a small multiplicative
+# bonus; a starting hero's 3 and 2: +4.9%)
+SPELL_STEP = 0.02
+# Φ's unit hero (the user, 2026-11-05: buying an army slightly negative, neutral once even a starting hero with only spell
+# power 3 and knowledge 2 leads it): its multiplier counts as 1 (unled_share), an army no hero leads at 1 / it
+REFERENCE_POWER, REFERENCE_KNOWLEDGE = 3, 2
+
+
+def spell_factor(power, knowledge, spellbook, step=SPELL_STEP):
+	"""What a hero's spellbook adds to what it makes of its army: 1 + step x sqrt(power x knowledge), 1 without one."""
+	return 1.0 + step * math.sqrt(max(power, 0) * max(knowledge, 0)) if spellbook else 1.0
+
+
+def army_multiplier(attack, defense, power=0, knowledge=0, spellbook=False, step=SPELL_STEP):
 	"""What a hero's battle attack and defense (its items' included) make of the army it leads (the user, 2026-11-04:
 	keeping the army with the strongest hero must be worth more), against an enemy of none: the root of the damage it
-	deals over the damage it takes, by VCMI's modifiers; 1 for attack and defense 0 (a garrison's)."""
+	deals over the damage it takes, by VCMI's modifiers; 1 for attack and defense 0; times its spellbook's spell_factor."""
 	dealt = 1.0 + ATTACK_STEP * min(max(attack, 0), ATTACK_POINTS)
 	taken = 1.0 - DEFENSE_STEP * min(max(defense, 0), DEFENSE_POINTS)
-	return math.sqrt(dealt / taken)
+	return math.sqrt(dealt / taken) * spell_factor(power, knowledge, spellbook, step)
+
+
+def unled_share(step=SPELL_STEP):
+	"""What an army counts at in Φ with no hero leading it (a garrison's, a mine's), a hero's at this x its army_multiplier:
+	1 over the reference hero's multiplier (REFERENCE_POWER, REFERENCE_KNOWLEDGE, a spellbook, attack and defense 0), so
+	recruiting at list price loses (1 - this) of the army's worth into a garrison and nothing into that hero (step 0: 1,
+	the multiplier alone)."""
+	return 1.0 / spell_factor(REFERENCE_POWER, REFERENCE_KNOWLEDGE, True, step)
 
 
 def resources_value(resources):
