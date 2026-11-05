@@ -1160,11 +1160,12 @@ def test_an_artifacts_move_is_priced_by_what_it_does_to_the_armies_the_heroes_le
 	x["x_heroes"][:] = [1, 2]  # (an exchange of heroes 0 and 1)
 	with torch.no_grad():
 		prior = m.domain_knowledge(tensors(x)).artifact_prior  # [B, HO, P, T]
-	assert float(prior[0, 0, 3, T.GIVE]) > 0.5  # (to the hero leading the army)
-	assert float(prior[1, 1, 3, T.GIVE]) < -0.5  # (away from it)
-	assert abs(float(prior[1, 1, c.N_WORN_SLOTS, T.EQUIP])) < 1e-4  # (its slot holds the same sword: no change)
+	cost = float(t.artifact_cost_weight())  # (a move must gain more than it: 2 at the start)
+	assert float(prior[0, 0, 3, T.GIVE]) > 0.5 - cost  # (to the hero leading the army)
+	assert float(prior[1, 1, 3, T.GIVE]) < -0.5 - cost  # (away from it)
+	assert float(prior[1, 1, c.N_WORN_SLOTS, T.EQUIP]) == pytest.approx(-cost, abs=1e-4)  # (its slot holds the same sword: nothing gained)
 	gained = float(prior[0, 1, 5, T.ASSEMBLE])
-	assert gained == pytest.approx(float(ft.value_logit(torch.tensor(9000.0 - 2000.0))), rel=1e-4)
+	assert gained == pytest.approx(float(ft.value_logit(torch.tensor(9000.0 - 2000.0))) - cost, rel=1e-4)
 
 
 def test_options_that_differ_never_share_an_identity():

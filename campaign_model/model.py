@@ -278,6 +278,7 @@ class CustomFeatures(nn.Module):
 		self.recruit_yes = zeros()  # (2026-11-04: a dwelling's "recruit?" answered YES, as Nullkiller2 does; recruit_yes_weight)
 		self.visit_yes = zeros()  # (2026-11-04: a guard's "pass?", a quest's "complete it?" answered YES, as Nullkiller2 does)
 		self.select_pick = zeros()  # (2026-11-04: Nullkiller2's pick among a selection's components; select_weight)
+		self.artifact_cost = zeros()  # (2026-11-04: what an artifact's move must gain to be worth making; artifact_cost_weight)
 		self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
@@ -295,7 +296,7 @@ class CustomFeatures(nn.Module):
 		return [
 			self.object_gain, self.object_type_gain.weight, self.object_type_delta.weight, self.object_subtype_delta.weight,
 			self.fight_sharpness, self.enemy_value, self.hero_value, self.danger_gain, self.explore_gain, self.class_gain, self.travel_exponent,
-			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick,
+			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
@@ -387,6 +388,14 @@ class CustomFeatures(nn.Module):
 		(AIGateway::showBlockingDialog: border and quest guards always). joint7 answered NO to all of the first 150
 		(2026-11-04: one hero asked 53 times in 15 days at the same Quest Guard)."""
 		return ft.bounded(self.visit_yes, 0.0, 8.0, 4.0, CORRECTION_STEP)
+
+	def artifact_cost_weight(self):
+		"""What an ARTIFACT move loses before what it gains, in logits (5 at the start, 0..12): a move that changes nothing
+		of Φ is worse than none. The first schema-13 games handed artifacts back and forth, 460-1,417 moves a game: END's
+		learned logit in an exchange sits near -3 (the model ends exchanges rarely, the 8 steps filled with what is legal),
+		so a move must score under it; at 5 a move that changes nothing loses to END ~9 in 10 and a +2 sword for a main
+		hero leading 20k (~900 gold of Φ) still wins ~6 in 10."""
+		return ft.bounded(self.artifact_cost, 0.0, 12.0, 5.0, CORRECTION_STEP)
 
 	def select_weight(self):
 		"""What Nullkiller2's pick among a selection's components gains, in logits (3 at the start, 0..8; nk2_select)."""
@@ -577,12 +586,16 @@ class CustomFeatures(nn.Module):
 		heroes = torch.arange(HO, device=ids.device).unsqueeze(0)
 		partner = torch.where(heroes == first, second, torch.where(heroes == second, first, torch.full_like(heroes.expand_as(first.expand(-1, HO)), -1)))
 		other = partner.clamp(min=0)
+		slot = self.artifact_slot[index]  # (where it is worn)
+		# (the other wears it only if its slot there is free, else it lands in that hero's backpack, adding nothing: a
+		# backpack sword counted as worn either way made giving it back a gain too, 1,049 moves in a game)
+		free = x["h_artifacts"][:, :HO].gather(1, other.unsqueeze(-1).expand(-1, -1, c.N_WORN_SLOTS)).gather(2, slot.clamp(min=0)) < 0
+		wears = (free & (slot >= 0)).float()
 		gained = army.gather(1, other).unsqueeze(-1) * (
-			ft.army_multiplier(attack.gather(1, other).unsqueeze(-1) + bonus[..., 0], defense.gather(1, other).unsqueeze(-1) + bonus[..., 1])
+			ft.army_multiplier(attack.gather(1, other).unsqueeze(-1) + bonus[..., 0] * wears, defense.gather(1, other).unsqueeze(-1) + bonus[..., 1] * wears)
 			- lead.gather(1, other).unsqueeze(-1)
 		)
 		give = (change(-on(bonus[..., 0], worn), -on(bonus[..., 1], worn)) + gained) * (partner >= 0).unsqueeze(-1).float()
-		slot = self.artifact_slot[index]  # (where it is worn)
 		there = x["h_artifacts"][:, :HO].gather(2, slot.clamp(min=0)) * (slot >= 0) + -1 * (slot < 0)
 		replaced = self.artifact_primary[vocab_index(there, c.ARTIFACT_VOCAB)] * (there >= 0).unsqueeze(-1).float()
 		equip = on(change(bonus[..., 0] - replaced[..., 0], bonus[..., 1] - replaced[..., 1]), present & ~worn)
@@ -592,7 +605,7 @@ class CustomFeatures(nn.Module):
 		parts_bonus = (parts.float().unsqueeze(-1) * bonus.unsqueeze(-3)).sum(dim=-2)  # [B, HO, P, N_PRIMARY]
 		whole = self.artifact_primary[vocab_index(combination, c.ARTIFACT_VOCAB)]
 		assemble = on(self.artifact_price[vocab_index(combination, c.ARTIFACT_VOCAB)] - parts_price + change(whole[..., 0] - parts_bonus[..., 0], whole[..., 1] - parts_bonus[..., 1]), combination >= 0)
-		return ft.value_logit(torch.stack([give, equip, assemble], dim=-1))
+		return ft.value_logit(torch.stack([give, equip, assemble], dim=-1)) - self.artifact_cost_weight()  # (a move must gain to be made)
 
 	def resource_worth(self, x):
 		"""What one unit of each resource is worth to us [B, R] (schema 12's resource_worth: a purchase short of resources
@@ -1089,7 +1102,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
