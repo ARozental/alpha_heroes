@@ -1160,12 +1160,40 @@ def test_an_artifacts_move_is_priced_by_what_it_does_to_the_armies_the_heroes_le
 	x["x_heroes"][:] = [1, 2]  # (an exchange of heroes 0 and 1)
 	with torch.no_grad():
 		prior = m.domain_knowledge(tensors(x)).artifact_prior  # [B, HO, P, T]
-	cost = float(t.artifact_cost_weight())  # (a move must gain more than it: 2 at the start)
+	cost = float(t.artifact_cost_weight())  # (a move must gain more than it: 5 at the start)
 	assert float(prior[0, 0, 3, T.GIVE]) > 0.5 - cost  # (to the hero leading the army)
 	assert float(prior[1, 1, 3, T.GIVE]) < -0.5 - cost  # (away from it)
 	assert float(prior[1, 1, c.N_WORN_SLOTS, T.EQUIP]) == pytest.approx(-cost, abs=1e-4)  # (its slot holds the same sword: nothing gained)
 	gained = float(prior[0, 1, 5, T.ASSEMBLE])
 	assert gained == pytest.approx(float(ft.value_logit(torch.tensor(9000.0 - 2000.0))) - cost, rel=1e-4)
+
+
+def test_an_artifact_move_trains_its_query_and_its_cost():
+	"""train.chosen_logp of an exchange's ARTIFACT decision reaches the head's learned part (artifact_q at 0: its gradient
+	is the hero's state against the artifact's row) and the prior's cost (features.artifact_cost, through ARTIFACT's offer
+	to the type head); a decision that ends the exchange reaches both too (the type's score holds its best legal learned
+	entry), the cost the other way."""
+	torch.manual_seed(2)
+	T = c.ArtifactTarget
+	x = {k: np.repeat(v, 2, axis=0) for k, v in rich_inputs(1, 6).items()}
+	x["h_present"][:, :2], x["h_owner"][:, :2] = True, c.OWNER_SELF
+	x["artifact_mask"][:] = False
+	x["artifact_mask"][:, 0, 0, T.GIVE] = True
+	x["artifact_mask"][:, 1, c.N_WORN_SLOTS, T.EQUIP] = True
+	x["x_heroes"][:] = [1, 2]
+	ARTIFACT, END = int(c.ActionType.ARTIFACT), int(c.ActionType.END)
+	grads = []
+	for action in (ARTIFACT, END):
+		torch.manual_seed(2)
+		m = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+		out = m(tensors(x))
+		choice = {"kind": torch.full((2,), int(c.DecisionKind.EXCHANGE)), "action": torch.full((2,), action), "index": torch.zeros(2, dtype=torch.long), "cell": torch.full((2,), -1)}
+		logp, _ = chosen_logp(out, choice)
+		(-logp.sum()).backward()
+		grads.append((m.artifact_q.weight.grad.abs().max(), m.features.artifact_cost.grad))
+	(q_taken, cost_taken), (q_ended, cost_ended) = grads
+	assert float(q_taken) > 0 and float(q_ended) > 0
+	assert float(cost_taken) > 0 > float(cost_ended)  # (descending: a move taken lowers the cost, one passed raises it)
 
 
 def test_options_that_differ_never_share_an_identity():
