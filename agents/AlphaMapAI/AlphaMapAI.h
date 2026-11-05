@@ -176,6 +176,7 @@ class AlphaMapAI : public CAdventureAI
 	// resources paid by trades, boats built, skills bought at a University, stacks of one creature merged
 	int tradedPurchases = 0;
 	int boatsBuilt = 0;
+	int multiActions = 0; // (MULTI's made: executeMulti)
 	int skillsBought = 0;
 	int stacksMerged = 0;
 	// The objects whose guards a question has shown us (encodeQuestionGuards): their armies in a_* from then on, as they
@@ -225,6 +226,8 @@ class AlphaMapAI : public CAdventureAI
 	std::optional<Choice> advise(const Decision & decision, std::optional<PlanTargets> & plan, std::vector<std::pair<int, int>> & accept);
 	// accept: our other moves toward the army Nullkiller2 wants (RECORD_ACCEPT)
 	std::optional<Choice> adviseExchange(const Decision & decision, ObjectInstanceID first, ObjectInstanceID second, std::vector<std::pair<int, int>> & accept);
+	// MULTI's entries doing what Nullkiller2's next requests would (its advice recruiting in a town, a hero visiting a town), accepted beside its label
+	void acceptMulti(const Decision & decision, const std::optional<Choice> & advice, std::vector<std::pair<int, int>> & accept) const;
 	std::string adviceJson() const;
 	// A request of Nullkiller2's as our turn decision's legal entry doing the same; false (unmatched: why) when none.
 	// intended: a move's destination when the caller knows it (its plan's tile), else the request's own tile is taken
@@ -324,6 +327,8 @@ private:
 	// ARTIFACT's entries: GIVE between an exchange's two heroes of ours (first, second: their hero tokens), EQUIP and
 	// ASSEMBLE in a turn (first < 0)
 	void encodeArtifacts(Decision & decision, int first, int second);
+	void encodeMulti(Decision & decision, int first, int second); // (MULTI: a turn's towns' with first -1, else an exchange of heroes first and second's)
+	void executeMulti(const Entry & e); // (MULTI's requests: Actions.cpp)
 	void encodeQuestionGuards(Decision & decision, const std::string & text, const std::vector<Component> & components);
 	void encodeOptionContext(Decision & decision, ObjectInstanceID hero, int3 target);
 	// The questions' decisions, as asked (the handlers decide them; the teacher's recorder keeps them for the answer)

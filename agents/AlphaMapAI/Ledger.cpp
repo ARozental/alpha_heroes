@@ -123,6 +123,9 @@ std::string ledgerJson(const CGameState & gs, int day, bool final)
 			// worth there, VCMI's damage modifiers)
 			h["attack"].Integer() = hero->getPrimSkillLevel(PrimarySkill::ATTACK);
 			h["defense"].Integer() = hero->getPrimSkillLevel(PrimarySkill::DEFENSE);
+			// Its knowledge, its items' with it, and its spellbook (game_values.spell_factor: what the spellbook makes of its army)
+			h["knowledge"].Integer() = hero->getPrimSkillLevel(PrimarySkill::KNOWLEDGE);
+			h["spellbook"].Bool() = hero->hasSpellbook();
 			int dearest = 0; // the dearest combat spell it can cast
 			if(hero->hasSpellbook())
 				for(const auto & spellID : hero->getSpellsInSpellbook())

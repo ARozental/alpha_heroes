@@ -197,6 +197,8 @@ INPUTS = (
 	# Schema 13 (after a_*: older records read with it at 0)
 	_m("artifact_mask", (HO, c.N_ARTIFACT_POSITIONS, c.N_ARTIFACT_TARGETS), "ARTIFACT: hero, its artifact's position (worn slots, then the backpack), ArtifactTarget"),
 	_i("x_heroes", (2,), "an exchange's two heroes of ours, their hero tokens + 1 (ARTIFACT's GIVE goes from one to the other), 0 none"),
+	# Schema 14 (after x_heroes: older records read with it at 0)
+	_m("multi_mask", (TO, c.N_MULTI), "MULTI: town of ours (GIVE_ALL: the exchange's receiving hero, 0 x_heroes' first, 1 its second), MultiKind"),
 )
 
 
@@ -223,6 +225,7 @@ OUTPUTS = (
 	_o("memory", (c.MEMORY_SLOTS, c.MEMORY_WIDTH), "the memory after this decision, -1..1: AlphaMapAI passes it back as the next decision's mem"),
 	_o("resource_worth", (R,), "what one unit of each resource is worth to us (gold): a purchase short of resources trades away what loses the least of it"),
 	_o("artifact_logp", (HO, c.N_ARTIFACT_POSITIONS, c.N_ARTIFACT_TARGETS), "log p(hero, position, target | ARTIFACT)"),
+	_o("multi_logp", (TO, c.N_MULTI), "log p(town or receiving hero, kind | MULTI)"),
 )
 
 # Each action type's table: (output, mask); END has none
@@ -239,6 +242,7 @@ HEADS = {
 	c.ActionType.DISMISS: ("dismiss_logp", "dismiss_mask"),
 	c.ActionType.TRAVEL: ("travel_logp", "travel_mask"),
 	c.ActionType.ARTIFACT: ("artifact_logp", "artifact_mask"),
+	c.ActionType.MULTI: ("multi_logp", "multi_mask"),
 }
 SPECS = {s.name: s for s in INPUTS + OUTPUTS}
 

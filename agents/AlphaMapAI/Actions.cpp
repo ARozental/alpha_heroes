@@ -33,8 +33,15 @@ std::vector<int64_t> fingerprint(const CCallback & cb)
 	for(const auto * h : cb.getHeroesInfo())
 	{
 		const auto pos = h->visitablePos();
-		values.insert(values.end(), {h->id.getNum(), pos.x, pos.y, pos.z, h->movementPointsRemaining(), h->mana, static_cast<int64_t>(h->artifactsWorn.size())});
+		values.insert(values.end(), {h->id.getNum(), pos.x, pos.y, pos.z, h->movementPointsRemaining(), h->mana});
 		army(h);
+		// Its artifacts, which and where (their count alone: an EQUIP replacing the worn one, a GIVE from backpack to
+		// backpack read as no effect, then futile, 2026-11-05)
+		for(const auto & [position, slot] : h->artifactsWorn)
+			values.insert(values.end(), {position.num, slot.getArt() ? slot.getArt()->getTypeId().getNum() : -1});
+		values.push_back(static_cast<int64_t>(h->artifactsInBackpack.size()));
+		for(const auto & slot : h->artifactsInBackpack)
+			values.push_back(slot.getArt() ? slot.getArt()->getTypeId().getNum() : -1);
 	}
 	for(const auto * t : cb.getTownsInfo(true))
 	{
@@ -179,11 +186,56 @@ bool AlphaMapAI::execute(const Decision & decision, const Choice & choice)
 		case ActionType::TRAVEL: // as far along the path to the area's tile as today's movement goes (moveHero stops there)
 			moveHero(e.first, e.tile);
 			break;
+		case ActionType::MULTI: // (Encoder.cpp encodeMulti: the source, the destination, a the MultiKind)
+			executeMulti(e);
+			break;
 		default:
 			logAi->error("AlphaMapAI %s: action type %d is not carried out", playerID.toString(), choice.type);
 			return false;
 	}
 	return fingerprint(*cb) != before;
+}
+
+void AlphaMapAI::executeMulti(const Entry & e)
+{
+	const auto kind = static_cast<MultiKind>(e.a);
+	if(kind == MultiKind::RECRUIT_ALL || kind == MultiKind::RECRUIT_ALL_HERO)
+	{
+		// Each level's creature for hire (the best of it, as RECRUIT's) from the highest level down, as many as we can pay
+		// for (whole creatures, our resources as they are after the ones before) and the army can take
+		const auto * town = cb->getTown(e.first);
+		const auto * into = armyOf(*cb, e.second);
+		if(!town || !into)
+			return;
+		for(int level = std::min<int>(town->creatures.size(), N_LEVELS) - 1; level >= 0; --level)
+		{
+			const auto & [count, ids] = town->creatures[level];
+			if(ids.empty() || count <= 0 || !into->getSlotFor(ids.back()).validSlot())
+				continue;
+			const int amount = std::min<int>(count, cb->getResourceAmount() / ids.back().toCreature()->getFullRecruitCost());
+			if(amount > 0)
+				cb->recruitCreatures(town, into, ids.back(), amount, level);
+		}
+		++multiActions;
+		return;
+	}
+	// GATHER, GIVE_ALL: the source's army into the destination as far as it fits (VCMI's bulk move, merging the same
+	// creatures; one creature of the source's weakest stack stays if all would go), and GIVE_ALL's artifacts too (VCMI's
+	// bulk move: each into its slot if free, else the backpack)
+	const auto * from = armyOf(*cb, e.first);
+	const auto * to = armyOf(*cb, e.second);
+	if(!from || !to)
+		return;
+	SlotID weakest;
+	uint64_t least = std::numeric_limits<uint64_t>::max();
+	for(const auto & [slot, stack] : from->Slots())
+		if(const uint64_t power = stack->getPower(); power < least)
+			std::tie(weakest, least) = std::tuple(slot, power);
+	if(weakest.validSlot())
+		cb->bulkMoveArmy(from->id, to->id, weakest);
+	if(kind == MultiKind::GIVE_ALL)
+		cb->bulkMoveArtifacts(from->id, to->id, false, true, true);
+	++multiActions;
 }
 
 void AlphaMapAI::payByTrades(const TResources & cost, const Decision & decision)

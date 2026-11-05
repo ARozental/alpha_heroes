@@ -266,6 +266,7 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optiona
 		accept.assign(entries.begin(), entries.end());
 	}
 #endif
+	acceptMulti(decision, advice, accept);
 	adviceSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 	++advised;
 	if(advice)
@@ -276,6 +277,28 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optiona
 #else
 	return std::nullopt;
 #endif
+}
+
+void AlphaMapAI::acceptMulti(const Decision & decision, const std::optional<Choice> & advice, std::vector<std::pair<int, int>> & accept) const
+{
+	// The multi-actions that do what Nullkiller2 does over its next requests, accepted beside its own label (the user,
+	// 2026-11-05: a multi-action chosen must not cost the teacher's loss when the teacher would do the same): all a town
+	// has for hire when its advice recruits there (its BuyArmy recruits each level it can pay for, a request each, into
+	// the town or the hero visiting it), and a town's garrison into the hero of ours visiting it (its moveCreaturesToHero,
+	// on every visit, none of them a request)
+	ObjectInstanceID recruiting;
+	if(advice && advice->type == static_cast<int>(ActionType::RECRUIT))
+		if(const auto found = decision.entries[static_cast<int>(ActionType::RECRUIT)].find(advice->index); found != decision.entries[static_cast<int>(ActionType::RECRUIT)].end())
+			recruiting = found->second.first;
+	std::vector<std::pair<int, int>> multi; // (first in the list: the trainer keeps a decision's first SET_SIZE, the plan's steps after these)
+	for(const auto & [index, e] : decision.entries[static_cast<int>(ActionType::MULTI)])
+	{
+		const auto kind = static_cast<MultiKind>(e.a);
+		const bool recruits = (kind == MultiKind::RECRUIT_ALL || kind == MultiKind::RECRUIT_ALL_HERO) && recruiting != ObjectInstanceID() && e.first == recruiting;
+		if(recruits || kind == MultiKind::GATHER)
+			multi.emplace_back(static_cast<int>(ActionType::MULTI), index);
+	}
+	accept.insert(accept.begin(), multi.begin(), multi.end());
 }
 
 std::optional<Choice> AlphaMapAI::adviseExchange(const Decision & decision, ObjectInstanceID first, ObjectInstanceID second, std::vector<std::pair<int, int>> & accept)
@@ -376,7 +399,14 @@ std::optional<Choice> AlphaMapAI::adviseExchange(const Decision & decision, Obje
 		choice.index = move;
 		advice = choice;
 	}
-	else if(!needed)
+	// GIVE_ALL to the hero that gets the army, while Nullkiller2 still moves troops to it: all of the other's army there
+	// is what its next moves make, as far as its best army takes them (the user, 2026-11-05: a multi-action chosen must
+	// not cost the teacher's loss when the teacher does the same in its next actions)
+	if(needed)
+		for(const auto & [index, e] : decision.entries[static_cast<int>(ActionType::MULTI)])
+			if(static_cast<MultiKind>(e.a) == MultiKind::GIVE_ALL && e.second == destination->id)
+				accept.emplace_back(static_cast<int>(ActionType::MULTI), index);
+	if(!advice && !needed)
 	{
 		Choice choice;
 		choice.type = static_cast<int>(ActionType::END);

@@ -827,7 +827,7 @@ void AlphaMapAI::sendRecords(bool final)
 			sendToRecordServer(recordSocket, gameKey + ":" + color + ":battle#" + std::to_string(battlesSent++), battleJson);
 		if(final)
 		{
-			const auto done = ", \"traded_purchases\": " + std::to_string(tradedPurchases) + ", \"boats\": " + std::to_string(boatsBuilt) + ", \"skills_bought\": " + std::to_string(skillsBought) + ", \"stacks_merged\": " + std::to_string(stacksMerged);
+			const auto done = ", \"traded_purchases\": " + std::to_string(tradedPurchases) + ", \"boats\": " + std::to_string(boatsBuilt) + ", \"skills_bought\": " + std::to_string(skillsBought) + ", \"stacks_merged\": " + std::to_string(stacksMerged) + ", \"multi_actions\": " + std::to_string(multiActions);
 			const auto summary = "{\"errors\": " + std::to_string(errors) + ", \"failed_actions\": " + std::to_string(failedActions) + done + teacherJson() + adviceJson() + "}";
 			sendToRecordServer(recordSocket, gameKey + ":" + color + ":done", summary);
 		}
@@ -1062,14 +1062,14 @@ void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, Query
 	for(int n = 0; n < 8 && !stopping; ++n)
 	{
 		auto decision = encode(DecisionKind::EXCHANGE, first, second);
-		if(!decision.inputs.any(In::army_mask) && !decision.inputs.any(In::artifact_mask))
+		if(!decision.inputs.any(In::army_mask) && !decision.inputs.any(In::artifact_mask) && !decision.inputs.any(In::multi_mask))
 			break;
 		std::optional<Choice> advice;
 		std::vector<std::pair<int, int>> accept;
 		if(adviceDrawn())
 			advice = adviseExchange(decision, first, second, accept);
 		const auto choice = decide(decision, advice, std::nullopt, accept);
-		if(choice.type != static_cast<int>(ActionType::ARMY) && choice.type != static_cast<int>(ActionType::ARTIFACT))
+		if(choice.type != static_cast<int>(ActionType::ARMY) && choice.type != static_cast<int>(ActionType::ARTIFACT) && choice.type != static_cast<int>(ActionType::MULTI))
 			break;
 		if(!execute(decision, choice))
 		{
@@ -1078,6 +1078,8 @@ void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, Query
 		}
 		else
 			futile.clear();
+		if(choice.type == static_cast<int>(ActionType::MULTI)) // (GIVE_ALL is the whole exchange: the troop moves after it sent
+			break;                                                  // its troops back, 567 of 870, 2026-11-05)
 	}
 	futile.clear();
 	answer(queryID, 0);

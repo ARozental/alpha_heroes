@@ -358,6 +358,10 @@ class CampaignModelV2(nn.Module):
 		# at 0 to begin with; its prior: what the move does to Φ (model.CustomFeatures.artifact_prior)
 		self.artifact_q = zero_output(nn.Linear(d, d))
 		self.artifact_target = small_embedding(c.N_ARTIFACT_TARGETS, d)
+		# MULTI (schema 14): a town's query (GIVE_ALL's: the receiving hero's) against each MultiKind's row, at 0 to begin
+		# with; its prior: what the multi-action does to Φ (model.CustomFeatures.multi_prior)
+		self.multi_q = zero_output(nn.Linear(d, d))
+		self.multi_kind = small_embedding(c.N_MULTI, d)
 		# A question (the user, 2026-11-04: every option its own embedding, never one YES vector for every question; a
 		# choice's logit the atanh of a cosine): the decision's state, from the global token and the hero asked, against
 		# each option's key: its identity (encode_options: the model's own vectors of what it names, with what it does with
@@ -764,6 +768,16 @@ class CampaignModelV2(nn.Module):
 		learned[A_.ARTIFACT] = (own_artifacts.unsqueeze(-1) + targets.unsqueeze(2)) / math.sqrt(d)
 		prior[A_.ARTIFACT] = known.artifact_prior
 		offers[A_.ARTIFACT] = best_legal(prior[A_.ARTIFACT], x["artifact_mask"])
+		pair = x["x_heroes"] - 1  # (GIVE_ALL's rows: the exchange's receiving hero, x_heroes' first and second)
+		receivers = torch.gather(state.heroes, 1, pair.clamp(min=0).unsqueeze(-1).expand(-1, -1, d)) * (pair >= 0).unsqueeze(-1).float()  # [B, 2, d]
+		receivers = torch.cat([receivers, receivers.new_zeros(b, TO - receivers.shape[1], d)], dim=1)  # [B, TO, d]
+		kinds = self.multi_kind.weight  # [N_MULTI, d]
+		by_town = (self.multi_q(own_towns) @ kinds.t()) / math.sqrt(d)  # [B, TO, N_MULTI]
+		by_receiver = (self.multi_q(receivers) @ kinds.t()) / math.sqrt(d)
+		give_all = (torch.arange(c.N_MULTI, device=kinds.device) == c.MultiKind.GIVE_ALL)
+		learned[A_.MULTI] = torch.where(give_all, by_receiver, by_town)
+		prior[A_.MULTI] = known.multi_prior
+		offers[A_.MULTI] = best_legal(prior[A_.MULTI], x["multi_mask"])
 		learned[A_.DISMISS] = self.dismiss_out(own_heroes).squeeze(-1)
 		prior[A_.DISMISS] = torch.zeros_like(learned[A_.DISMISS])
 		# A question: the decision's state (the global token, the hero asked) against each option's key (its identity and
@@ -960,9 +974,9 @@ GROWN_INPUTS = ("recruit_head.0.weight", "option_weights.weight")  # (2026-11-04
 
 
 def migrate_action_types(state_dict, own):
-	"""A state dict from before ARTIFACT (schema 13: a 13th action type): type_bias gains its entry and the global
-	encoder's previous-type table its row before the "none" row (vocab_index's last), both as the fresh model (own) has
-	them; as it is otherwise."""
+	"""A state dict from before an action type was added (schema 13: ARTIFACT, the 13th; 14: MULTI, the 14th): type_bias
+	gains their entries and the global encoder's previous-type table their rows before the "none" row (vocab_index's
+	last), both as the fresh model (own) has them; as it is otherwise."""
 	state = dict(state_dict)
 	key = "type_bias"
 	if key in state and key in own and state[key].shape[0] < own[key].shape[0]:

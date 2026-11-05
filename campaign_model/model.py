@@ -274,6 +274,7 @@ class CustomFeatures(nn.Module):
 		self.object_gain, self.fight_sharpness, self.enemy_value, self.explore_gain, self.hero_value = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.danger_gain, self.garrison_penalty, self.fort_gain = zeros(), zeros(), zeros()
 		self.meeting_gain = zeros()  # (2026-11-05: what meeting a hero of ours or entering a town of ours gains, tile_features)
+		self.multi_weight = zeros()  # (2026-11-05: how far a multi-action's gain to Φ biases it: multi_prior)
 		self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight = zeros(), zeros(), zeros(), zeros()
 		self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight = (zeros() for _ in range(6))
 		self.travel_exponent, self.end_coupling, self.travel_coupling = zeros(), zeros(), zeros()
@@ -301,7 +302,7 @@ class CustomFeatures(nn.Module):
 		return [
 			self.object_gain, self.object_type_gain.weight, self.object_type_delta.weight, self.object_subtype_delta.weight,
 			self.fight_sharpness, self.enemy_value, self.hero_value, self.danger_gain, self.meeting_gain, self.explore_gain, self.class_gain, self.travel_exponent,
-			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost,
+			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost, self.multi_weight,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
@@ -496,6 +497,7 @@ class CustomFeatures(nn.Module):
 			f.update(self.tile_features(x, windows, f))
 		f.option_prior, f.option_features = self.option_knowledge(x, f)
 		f.artifact_prior = self.artifact_prior(x, f)
+		f.multi_prior = self.multi_prior(x, f)
 		return f
 
 	def question_guards(self, x, f):
@@ -572,6 +574,49 @@ class CustomFeatures(nn.Module):
 		value = torch.where(amounts, x["o_amount"], torch.full_like(x["o_amount"], -1))
 		most = amounts & (value == value.amax(dim=-1, keepdim=True)) & (value > 0)
 		return most.float() * ft.bounded(self.recruit_all, 0.0, 4.0, 2.0, CORRECTION_STEP)
+
+	def multi_gain(self, x, f):
+		"""What each MULTI entry does to Φ [B, TO, N_MULTI] (gold; c.MultiKind; the user, 2026-11-05: multi-actions biased
+		by what they gain): RECRUIT_ALL every creature the town has for hire we can pay for, the highest level first (each
+		town's from all of our resources), at its worth (cost + u) x unled_share for its cost and the u it was worth for
+		hire: its worth x (unled_share - 1), a little below 0; RECRUIT_ALL_HERO the same into the visiting hero: x (its
+		factor - 1); GATHER the garrison x (the visiting hero's factor - unled_share); GIVE_ALL (rows 0 and 1: the exchange's
+		receiving hero, x_heroes' first and second) the other's army x (the receiver's factor - the giver's). The factors
+		are Φ's (f.hero_multiplier: features.hero_multipliers)."""
+		b = x["g_day"].shape[0]
+		have = x["g_resources"][:, None, :].clamp(min=0).float().expand(b, TO, -1)  # [B, TO, R]
+		creatures = x["t_available_creature"][:, :TO]  # [B, TO, LV]
+		index = vocab_index(creatures, c.CREATURE_VOCAB)
+		counts = x["t_available"][:, :TO].clamp(min=0).float() * (creatures >= 0)
+		worth = torch.zeros(b, TO, device=have.device)
+		for level in reversed(range(c.N_LEVELS)):
+			cost = self.creature_resources[index[:, :, level]]  # [B, TO, R]
+			afford = torch.where(cost > 0, torch.floor(have / cost.clamp(min=1e-6)), torch.full_like(cost, 1e9)).amin(dim=-1)
+			amount = torch.minimum(counts[:, :, level], afford)
+			have = have - amount.unsqueeze(-1) * cost
+			worth = worth + amount * (self.creature_cost[index[:, :, level]] + self.creature_unit[index[:, :, level]])
+		ours = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF) & ~x["h_garrisoned"][:, :HO]
+		at = (x["h_town"][:, :HO].unsqueeze(-1) == torch.arange(TO, device=have.device)) & ours.unsqueeze(-1)  # [B, HO, TO]
+		visitor = (at.float() * f.hero_multiplier.unsqueeze(-1)).amax(dim=1)  # [B, TO]: the visiting hero's factor (0 none)
+		gains = torch.zeros(b, TO, c.N_MULTI, device=have.device)
+		gains[..., c.MultiKind.RECRUIT_ALL] = worth * (self.unled_share - 1.0)
+		gains[..., c.MultiKind.RECRUIT_ALL_HERO] = worth * (visitor - 1.0)
+		gains[..., c.MultiKind.GATHER] = f.town_gold[:, :TO] * (visitor - self.unled_share)
+		pair = x["x_heroes"] - 1  # [B, 2]: the exchange's heroes (tokens + 1; -1 none)
+		factor, army = f.hero_multiplier.gather(1, pair.clamp(min=0)), f.hero_gold[:, :HO].gather(1, pair.clamp(min=0))  # [B, 2]
+		both = (pair >= 0).all(dim=1).float()
+		gains[:, 0, c.MultiKind.GIVE_ALL] = army[:, 1] * (factor[:, 0] - factor[:, 1]) * both  # (to the first hero)
+		gains[:, 1, c.MultiKind.GIVE_ALL] = army[:, 0] * (factor[:, 1] - factor[:, 0]) * both
+		return gains
+
+	def multi_weight_value(self):
+		"""How far a multi-action's gain to Φ (multi_gain, as value_logit prices it) biases MULTI's entries: 1 at the start, 0..2."""
+		return ft.bounded(self.multi_weight, 0.0, 2.0, 1.0, CORRECTION_STEP)
+
+	def multi_prior(self, x, f):
+		"""MULTI's prior logits [B, TO, N_MULTI]: what each multi-action does to Φ (multi_gain) as value_logit prices it, at
+		multi_weight_value."""
+		return self.multi_weight_value() * ft.value_logit(self.multi_gain(x, f))
 
 	def artifact_prior(self, x, f):
 		"""What each ARTIFACT entry does to Φ, as a prior logit [B, HO, N_ARTIFACT_POSITIONS, N_ARTIFACT_TARGETS]
@@ -1138,7 +1183,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
@@ -1148,7 +1193,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	# model_v2.migrate_option_head)
 	"foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option", "option_flags",
 	"decision", "option_context", "option_weights", "encode_options.component", "encode_options.primary", "encode_options.resource",
-	"encode_options.numbers", "build_identity", "artifact_q", "artifact_target", "encode_hero.carried",
+	"encode_options.numbers", "build_identity", "artifact_q", "artifact_target", "encode_hero.carried", "multi_q", "multi_kind",
 )
 
 
@@ -1499,6 +1544,7 @@ class CampaignModel(nn.Module):
 		out["memory"] = torch.zeros_like(x["mem"], dtype=torch.float32)  # (v1 has no memory: the contract's output, kept at 0)
 		out["resource_worth"] = f.resource_worth
 		out["artifact_logp"] = flat_log_softmax(f.artifact_prior, x["artifact_mask"])  # (v1: the prior only, schema 13's ARTIFACT)
+		out["multi_logp"] = flat_log_softmax(f.multi_prior, x["multi_mask"])  # (v1: the prior only, schema 14's MULTI)
 		return out
 
 	def move_and_travel(self, x, f, out, own_heroes, cells, areas, windows, n):

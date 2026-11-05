@@ -256,6 +256,7 @@ Decision AlphaMapAI::encode(DecisionKind kind, ObjectInstanceID exchangeFirst, O
 	{
 		encodeTurnActions(decision, paths);
 		encodeArtifacts(decision, -1, -1);
+		encodeMulti(decision, -1, -1);
 	}
 	if(kind == DecisionKind::EXCHANGE)
 	{
@@ -283,6 +284,7 @@ Decision AlphaMapAI::encode(DecisionKind kind, ObjectInstanceID exchangeFirst, O
 			decision.inputs.at(In::x_heroes, 0) = a + 1;
 			decision.inputs.at(In::x_heroes, 1) = b + 1;
 			encodeArtifacts(decision, a, b);
+			encodeMulti(decision, a, b);
 		}
 	}
 	dropFutile(decision);
@@ -862,6 +864,84 @@ void AlphaMapAI::encodeArtifacts(Decision & decision, int first, int second)
 			else if(const auto combinations = ArtifactUtils::assemblyPossibilities(hero, id, true); !combinations.empty())
 				add(h, p, ArtifactTarget::ASSEMBLE, Entry{hero->id, {}, p, id.getNum(), combinations.front()->getId().getNum()});
 		}
+	}
+}
+
+namespace
+{
+// Whether one creature of a town's creatures for hire at some level can be paid for and go into the army
+bool recruitsAny(const CGTownInstance * town, const CArmedInstance * into, TResources resources) // (by value: ResourceSet's division is not const)
+{
+	for(int level = 0; level < std::min<int>(town->creatures.size(), N_LEVELS); ++level)
+	{
+		const auto & [count, ids] = town->creatures[level];
+		if(!ids.empty() && count > 0 && resources / ids.back().toCreature()->getFullRecruitCost() > 0 && into->getSlotFor(ids.back()).validSlot())
+			return true;
+	}
+	return false;
+}
+
+// Whether some of the army's creatures can go into the other: VCMI's bulk move keeps one of the source's when all of
+// them would go (a hero must keep one), so a source of a single creature moves nothing (2026-11-05: GATHER of a lone
+// creature changed nothing)
+bool movesAny(const CArmedInstance * from, const CArmedInstance * to)
+{
+	int creatures = 0;
+	bool fits = false;
+	for(const auto & [slot, stack] : from->Slots())
+	{
+		creatures += stack->getCount();
+		fits = fits || to->getSlotFor(stack->getCreature()).validSlot();
+	}
+	return fits && creatures > 1;
+}
+}
+
+void AlphaMapAI::encodeMulti(Decision & decision, int first, int second)
+{
+	// MULTI (schema 14; the user, 2026-11-05: "multi-actions", several of the engine's requests in one decision, the C++
+	// making them): in a turn, a town of ours: all we can pay for of what it has for hire, into its garrison
+	// (RECRUIT_ALL) or into the hero of ours visiting it (RECRUIT_ALL_HERO), its garrison into that hero (GATHER); in an
+	// exchange of two heroes of ours, all of one's army (one creature kept) and artifacts to the other (GIVE_ALL, each
+	// way: row 0 the first hero receiving). Entry: the source, the destination, a the MultiKind
+	auto & in = decision.inputs;
+	const auto add = [&](int row, MultiKind kind, ObjectInstanceID from, ObjectInstanceID to)
+	{
+		in.at(In::multi_mask, row, static_cast<int>(kind)) = 1;
+		decision.entries[static_cast<int>(ActionType::MULTI)][row * N_MULTI + static_cast<int>(kind)] = Entry{from, to, static_cast<int>(kind)};
+	};
+	if(first >= 0)
+	{
+		const std::array<const CGHeroInstance *, 2> pair = {cb->getHero(decision.heroes[first]), cb->getHero(decision.heroes[second])};
+		for(int r = 0; r < 2; ++r)
+		{
+			const auto * receiver = pair[r];
+			const auto * giver = pair[1 - r];
+			if(!receiver || !giver)
+				continue;
+			bool artifacts = false; // (encodeArtifacts' GIVE entries from the giver to the receiver)
+			for(const auto & [index, e] : decision.entries[static_cast<int>(ActionType::ARTIFACT)])
+				artifacts = artifacts || (e.first == giver->id && e.second == receiver->id);
+			if(movesAny(giver, receiver) || artifacts)
+				add(r, MultiKind::GIVE_ALL, giver->id, receiver->id);
+		}
+		return;
+	}
+	const auto resources = cb->getResourceAmount();
+	for(int t = 0; t < OWN_TOWNS; ++t)
+	{
+		const auto * town = decision.towns[t] == ObjectInstanceID() ? nullptr : cb->getTown(decision.towns[t]);
+		if(!town || town->tempOwner != playerID)
+			continue;
+		const auto * garrison = town->getUpperArmy();
+		const auto * visitor = town->getVisitingHero();
+		const bool visited = visitor && visitor->tempOwner == playerID;
+		if(recruitsAny(town, garrison, resources))
+			add(t, MultiKind::RECRUIT_ALL, town->id, garrison->id);
+		if(visited && recruitsAny(town, visitor, resources))
+			add(t, MultiKind::RECRUIT_ALL_HERO, town->id, visitor->id);
+		if(visited && movesAny(garrison, visitor))
+			add(t, MultiKind::GATHER, garrison->id, visitor->id);
 	}
 }
 

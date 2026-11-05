@@ -1356,12 +1356,15 @@ def test_records_from_before_schema_11_read_with_no_guards_battle_join_or_armed_
 	x["a_count"][:, 0, 0] = 5
 	x["artifact_mask"][:, 0, 0, 0] = True
 	x["x_heroes"][:, :] = [1, 2]
+	x["multi_mask"][:, 0, 0] = True
 	full = zlib.decompress(encoded(x, 0))
-	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 3
+	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 4
 	for n in sorted(SHORT_RECORDS):
 		got = decode_inputs([SimpleNamespace(inputs=zlib.compress(full[:n]))])
-		before_11 = ("o_battle", "o_join", "d_guard_count", "a_present", "a_count") if n < max(SHORT_RECORDS) else ()
-		for name in before_11 + ("artifact_mask", "x_heroes"):  # (schema 13's: none in any older record)
+		lengths = sorted(SHORT_RECORDS)  # (records of schemas 9, 10, 11-12, 13: each ends where the next's inputs start)
+		before_11 = ("o_battle", "o_join", "d_guard_count", "a_present", "a_count") if n < lengths[2] else ()
+		before_14 = ("artifact_mask", "x_heroes") if n < lengths[3] else ()  # (schema 13's: none in any record before it)
+		for name in before_11 + before_14 + ("multi_mask",):  # (schema 14's: none in any older record)
 			assert not got[name].any(), (n, name)
 
 
@@ -1496,3 +1499,39 @@ def test_stepping_on_a_hero_or_a_town_of_ours_is_worth_what_the_army_gains_where
 	assert float(value[r, r + 2]) == pytest.approx(8_000 * (1.30 - 1.05), rel=1e-4)  # (hero 1's army: it makes less of it)
 	assert float(value[r + 3, r]) == pytest.approx(50_000 * (1.30 - t.unled_share), rel=1e-4)
 	assert float(value[r, r]) == 0.0 and float(value.sum()) == pytest.approx(8_000 * 0.25 + 50_000 * (1.30 - t.unled_share), rel=1e-4)
+
+
+def test_a_multi_actions_prior_is_what_it_does_to_phi():
+	"""model.CustomFeatures.multi_gain (schema 14, the user 2026-11-05): RECRUIT_ALL buys what we can pay for, the highest
+	level first, at (unled_share - 1) of its worth (a little below 0); RECRUIT_ALL_HERO into a visiting starting hero
+	(attack and defense 0, spell power 3, knowledge 2, a spellbook) 0; GATHER the garrison x (the visitor's factor -
+	unled_share); GIVE_ALL, each way, the giver's army x the factors' difference."""
+	from game_values import REFERENCE_KNOWLEDGE, REFERENCE_POWER
+
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	t = m.features
+	x = tensors(rich_inputs(1, 5))
+	x["h_present"][:] = False
+	x["h_present"][0, :2], x["h_owner"][0, :2], x["h_garrisoned"][0, :2] = True, c.OWNER_SELF, False
+	x["h_town"][0, :2] = torch.tensor([0, -1])  # (hero 0 visits town 0)
+	x["h_primary"][0, 0] = torch.tensor([0, 0, REFERENCE_POWER, REFERENCE_KNOWLEDGE])
+	x["h_artifacts"][0, :2] = -1
+	x["h_artifacts"][0, 0, 0] = 0  # (a spellbook)
+	x["h_primary"][0, 1] = torch.tensor([10, 10, 0, 0])  # (hero 1: no spellbook, x sqrt(1.5 / 0.75))
+	x["t_available_creature"][0, 0] = -1
+	x["t_available_creature"][0, 0, 0], x["t_available"][0, 0, 0] = 12, 10
+	t.creature_resources[12] = torch.tensor([0.0, 0, 0, 0, 0, 0, 100.0])
+	x["g_resources"][0] = torch.tensor([0, 0, 0, 0, 0, 0, 650])  # (6 of the 10 affordable)
+	x["x_heroes"][0] = torch.tensor([1, 2])  # (an exchange of heroes 0 and 1)
+	with torch.no_grad():
+		known = m.domain_knowledge(x)
+		gains = t.multi_gain(x, known)[0]
+	K, U = c.MultiKind, t.unled_share
+	worth = 6 * float(t.creature_cost[12] + t.creature_unit[12])
+	assert float(gains[0, K.RECRUIT_ALL]) == pytest.approx(worth * (U - 1), rel=1e-4) and float(gains[0, K.RECRUIT_ALL]) < 0
+	assert float(gains[0, K.RECRUIT_ALL_HERO]) == pytest.approx(0.0, abs=1e-2)  # (the starting hero: neutral)
+	assert float(gains[0, K.GATHER]) == pytest.approx(float(known.town_gold[0, 0]) * (1.0 - U), rel=1e-4)
+	strong, start = float(known.hero_multiplier[0, 1]), float(known.hero_multiplier[0, 0])
+	assert strong == pytest.approx(U * math.sqrt(1.5 / 0.75), rel=1e-5) and start == pytest.approx(1.0, rel=1e-5)
+	assert float(gains[1, K.GIVE_ALL]) == pytest.approx(float(known.hero_gold[0, 0]) * (strong - start), rel=1e-4)  # (to hero 1, the stronger)
+	assert float(gains[0, K.GIVE_ALL]) == pytest.approx(float(known.hero_gold[0, 1]) * (start - strong), rel=1e-4)
