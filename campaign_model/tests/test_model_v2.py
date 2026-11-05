@@ -1584,6 +1584,19 @@ def test_a_bulk_move_takes_what_fits_and_give_all_is_priced_on_it():
 	before = led(list(range(7)), [10.0] * 7, 0) + led([0, 9] + [-1] * 5, [5.0, 5.0] + [0.0] * 5, 1)
 	after = led(list(range(7)) + [0], [10.0] * 7 + [5.0], 0) + led([9] + [-1] * 6, [5.0] + [0.0] * 6, 1)
 	assert gain == pytest.approx(after - before, rel=1e-4)
+	# RECRUIT_ALL_HERO into that full hero buys nothing it has no slot for (executeMulti leaves such a level out); into
+	# the town's empty garrison RECRUIT_ALL buys it
+	x["h_town"][0, :2] = torch.tensor([0, -1])
+	x["t_present"][0, 0], x["t_owner"][0, 0] = True, c.OWNER_SELF
+	x["t_garrison_creature"][0, 0], x["t_garrison_count"][0, 0] = -1, 0
+	x["t_available_creature"][0, 0], x["t_available"][0, 0] = -1, 0
+	x["t_available_creature"][0, 0, 0], x["t_available"][0, 0, 0] = 9, 5
+	x["g_resources"][0] = torch.tensor([50, 50, 50, 50, 50, 50, 100_000])
+	with torch.no_grad():
+		known = m.domain_knowledge(x)
+		gains = t.multi_gain(x, known)[0, 0]
+	assert float(gains[c.MultiKind.RECRUIT_ALL_HERO]) == pytest.approx(0.0, abs=1e-3)
+	assert float(gains[c.MultiKind.RECRUIT_ALL]) == pytest.approx(5 * float(t.creature_cost[9] + t.creature_unit[9]) * (t.unled_share - 1), rel=1e-4)
 
 
 def test_a_take_best_and_a_drop_are_priced_on_the_armies_they_make():

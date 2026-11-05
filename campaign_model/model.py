@@ -598,16 +598,21 @@ class CustomFeatures(nn.Module):
 		creatures = x["t_available_creature"][:, :TO]  # [B, TO, LV]
 		index = vocab_index(creatures, c.CREATURE_VOCAB)
 		counts = x["t_available"][:, :TO].clamp(min=0).float() * (creatures >= 0)
-		worth = torch.zeros(b, TO, device=have.device)
-		bought = []
-		for level in reversed(range(c.N_LEVELS)):
-			cost = self.creature_resources[index[:, :, level]]  # [B, TO, R]
-			afford = torch.where(cost > 0, torch.floor(have / cost.clamp(min=1e-6)), torch.full_like(cost, 1e9)).amin(dim=-1)
-			amount = torch.minimum(counts[:, :, level], afford)
-			have = have - amount.unsqueeze(-1) * cost
-			worth = worth + amount * (self.creature_cost[index[:, :, level]] + self.creature_unit[index[:, :, level]])
-			bought.append(amount)
-		bought = torch.stack(bought[::-1], dim=-1)  # [B, TO, LV]: each level's creatures bought
+		def recruited(into):  # (executeMulti's: the highest level first, a level the army has no slot for left out)
+			cash, free = have, (into < 0).sum(dim=-1)  # [B, TO]
+			worth, bought = torch.zeros(b, TO, device=have.device), []
+			for level in reversed(range(c.N_LEVELS)):
+				creature = creatures[:, :, level]
+				cost = self.creature_resources[index[:, :, level]]  # [B, TO, R]
+				afford = torch.where(cost > 0, torch.floor(cash / cost.clamp(min=1e-6)), torch.full_like(cost, 1e9)).amin(dim=-1)
+				there = ((into == creature.unsqueeze(-1)) & (into >= 0)).any(dim=-1)
+				fits = there | (free > 0)
+				amount = torch.minimum(counts[:, :, level], afford) * fits
+				free = free - ((amount > 0) & ~there).long()
+				cash = cash - amount.unsqueeze(-1) * cost
+				worth = worth + amount * (self.creature_cost[index[:, :, level]] + self.creature_unit[index[:, :, level]])
+				bought.append(amount)
+			return worth, torch.stack(bought[::-1], dim=-1)  # [B, TO], [B, TO, LV]: each level's creatures bought
 		# Our heroes' armies as Φ prices them, and the hero visiting each town (at most one)
 		army_c, army_n = x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO].float()
 		rest = x["h_morale"][:, :HO].float() - ft.make_up_morales(army_c, army_n, self)  # (each hero's morale without its army's make-up's)
@@ -618,6 +623,8 @@ class CustomFeatures(nn.Module):
 		slots = lambda v: v.gather(1, who.unsqueeze(-1).expand(-1, -1, A))  # noqa: E731 ([B, HO, A] -> the visitor's [B, TO, A])
 		visitor_c, visitor_n = slots(army_c), slots(army_n)
 		visitor_m, visitor_r, visitor_led = f.hero_multiplier.gather(1, who), rest.gather(1, who), led.gather(1, who)
+		worth, _ = recruited(x["t_garrison_creature"][:, :TO])  # (RECRUIT_ALL's: into the garrison)
+		hero_worth, bought = recruited(visitor_c)  # (RECRUIT_ALL_HERO's: into the visitor)
 		with_recruits = ft.led_values(torch.cat([visitor_c, creatures], dim=-1), torch.cat([visitor_n, bought], dim=-1), visitor_m, visitor_r, self)
 		garrison_c, garrison_n = x["t_garrison_creature"][:, :TO], x["t_garrison_count"][:, :TO].float()
 		gathered = ft.bulk_moves(visitor_c, garrison_c)  # [B, TO, A]: what of the garrison fits into the visitor
@@ -626,7 +633,7 @@ class CustomFeatures(nn.Module):
 		gathered_worth = (garrison_n * gathered * (self.creature_cost[index] + self.creature_unit[index]) * (garrison_c >= 0)).sum(dim=-1)  # [B, TO]
 		gains = torch.zeros(b, TO, c.N_MULTI, device=have.device)
 		gains[..., c.MultiKind.RECRUIT_ALL] = worth * (self.unled_share - 1.0)
-		gains[..., c.MultiKind.RECRUIT_ALL_HERO] = (with_recruits - visitor_led - worth) * has
+		gains[..., c.MultiKind.RECRUIT_ALL_HERO] = (with_recruits - visitor_led - hero_worth) * has
 		gains[..., c.MultiKind.GATHER] = (with_garrison - visitor_led - self.unled_share * gathered_worth) * has - self.gather_loss(f)
 		pair = x["x_heroes"] - 1  # [B, 2]: the exchange's heroes (tokens + 1; -1 none)
 		p = pair.clamp(min=0)
@@ -891,9 +898,9 @@ class CustomFeatures(nn.Module):
 		best the exchange or the gather there would make to Φ (the user, 2026-11-05: a meeting's expected gain, as a
 		pickup's and a fight's), at least 0, priced as the actions are (features.led_values: each army at its hero's
 		multiplier, movement and make-up's morale):
-		  - a hero: the two armies joined under the stronger (stronger_hero: the higher level, else the multiplier, else
-		    the army), or joined less their slowest creatures, which the other keeps (TAKE_BEST_FAST's way), over the two
-		    apart. Before (Φ v4's factors alone, 2026-11-05 morning) a hero that had handed its slow creatures over was
+		  - a hero: the other's army brought to the stronger (the higher level, else the multiplier, else the army) as far
+		    as VCMI's bulk move takes it (GIVE_ALL's way, features.bulk_moves), or the two joined less their slowest
+		    creatures, which the other keeps (TAKE_BEST_FAST's way), over the two apart. Before (Φ v4's factors alone, 2026-11-05 morning) a hero that had handed its slow creatures over was
 		    still a meeting worth making: schema 15's first games met 308 times a game, a pair up to 6 times a day;
 		  - a town, for a main hero (f.main; a scout's GATHER pays gather_cost_weight): its army joined with the garrison,
 		    less the garrison at unled_share and what taking it adds to the town's expected loss (gather_loss).
@@ -911,6 +918,7 @@ class CustomFeatures(nn.Module):
 		other_m, other_r, other_v = f.hero_multiplier.index_select(0, decision), rest.index_select(0, decision), led.index_select(0, decision)  # [K, HO]
 		joined_c = torch.cat([mover_c.unsqueeze(1).expand(-1, HO, -1), other_c], dim=-1)  # [K, HO, 2A]
 		joined_n = torch.cat([mover_n.unsqueeze(1).expand(-1, HO, -1), other_n], dim=-1)
+		mine_c, mine_n = mover_c.unsqueeze(1).expand(-1, HO, -1), mover_n.unsqueeze(1).expand(-1, HO, -1)  # [K, HO, A]
 		level = x["h_level"][:, :HO].float()
 		mover_l, other_l = flat(level), level.index_select(0, decision)
 		mover_a, other_a = flat(f.hero_gold[:, :HO]), f.hero_gold[:, :HO].index_select(0, decision)
@@ -919,7 +927,14 @@ class CustomFeatures(nn.Module):
 		receiver_r = torch.where(mover_first, mover_r[:, None].expand(-1, HO), other_r)
 		giver_m = torch.where(mover_first, other_m, mover_m[:, None].expand(-1, HO))
 		giver_r = torch.where(mover_first, other_r, mover_r[:, None].expand(-1, HO))
-		all_in = ft.led_values(joined_c, joined_n, receiver_m, receiver_r, self)
+		mover_first_a = mover_first.unsqueeze(-1)
+		receiver_c, receiver_n = torch.where(mover_first_a, mine_c, other_c), torch.where(mover_first_a, mine_n, other_n)
+		giver_c, giver_n = torch.where(mover_first_a, other_c, mine_c), torch.where(mover_first_a, other_n, mine_n)
+		given = ft.bulk_moves(receiver_c, giver_c)  # (GIVE_ALL's way: what fits)
+		none = torch.full_like(giver_c, -1)
+		all_in = ft.led_values(torch.cat([receiver_c, torch.where(given, giver_c, none)], dim=-1), torch.cat([receiver_n, giver_n * given], dim=-1), receiver_m, receiver_r, self) + ft.led_values(
+			torch.where(given, none, giver_c), giver_n * ~given, giver_m, giver_r, self
+		)
 		speed = self.creature_speed[vocab_index(joined_c, c.CREATURE_VOCAB)]
 		present = (joined_c >= 0) & (joined_n > 0)
 		slowest = torch.where(present, speed, torch.full_like(speed, 1e9)).amin(dim=-1, keepdim=True)
