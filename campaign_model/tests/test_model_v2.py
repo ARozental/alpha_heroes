@@ -1501,6 +1501,56 @@ def test_stepping_on_a_hero_or_a_town_of_ours_is_worth_what_the_army_gains_where
 	assert float(value[r, r]) == 0.0 and float(value.sum()) == pytest.approx(8_000 * 0.25 + 50_000 * (1.30 - t.unled_share), rel=1e-4)
 
 
+def test_a_gather_counts_what_it_leaves_its_town_to():
+	"""model.CustomFeatures.gather_loss: an enemy hero beside a town of ours that its garrison holds and its empty fort
+	would not: GATHER's gain falls by about the town's buildings (features.emptied_danger ~1, town_danger ~0); with no
+	enemy in sight it is Φ's alone. And a GATHER into a scout pays gather_cost_weight."""
+	from campaign_model import features as ft
+
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	t = m.features
+	x = tensors(rich_inputs(1, 5))
+	x["h_present"][:] = False
+	x["h_present"][0, 0], x["h_owner"][0, 0], x["h_garrisoned"][0, 0], x["h_town"][0, 0] = True, c.OWNER_SELF, False, 0  # (our hero in town 0)
+	x["h_primary"][0, 0], x["h_artifacts"][0, 0], x["h_artifacts"][0, 0, 0] = torch.tensor([2, 2, 3, 2]), -1, 0  # (a spellbook)
+	x["t_present"][0, 0], x["t_owner"][0, 0], x["t_garrison_hero"][0, 0], x["t_visiting"][0, 0] = True, c.OWNER_SELF, -1, 0
+	x["t_garrison_creature"][0, 0], x["t_garrison_count"][0, 0], x["t_detailed"][0, 0] = -1, 0, True
+	x["t_garrison_creature"][0, 0, 0], x["t_garrison_count"][0, 0, 0] = 12, 500  # (a garrison that holds)
+	with torch.no_grad():
+		calm = m.domain_knowledge(x)
+		calm_gain = float(t.multi_gain(x, calm)[0, 0, c.MultiKind.GATHER])
+	assert float(calm.emptied_danger[0, 0]) == 0.0 and float(calm.town_danger[0, 0]) == 0.0
+	assert float(calm.hero_multiplier[0, 0]) > t.unled_share
+	assert calm_gain == pytest.approx(float(calm.town_gold[0, 0]) * (float(calm.hero_multiplier[0, 0]) - t.unled_share), rel=1e-4)
+	e = c.OWN_HEROES  # (an enemy hero on the town's tile, 20 of the same creature)
+	x["h_present"][0, e], x["h_owner"][0, e], x["h_pos"][0, e] = True, c.OWNER_SELF + 1, x["t_pos"][0, 0]
+	x["h_army_creature"][0, e], x["h_army_count"][0, e], x["h_detailed"][0, e] = -1, 0, True
+	x["h_army_creature"][0, e, 0], x["h_army_count"][0, e, 0] = 12, 20
+	with torch.no_grad():
+		known = m.domain_knowledge(x)
+		gain = float(t.multi_gain(x, known)[0, 0, c.MultiKind.GATHER])
+	empty, now = float(known.emptied_danger[0, 0]), float(known.town_danger[0, 0])
+	stakes, gold = float(known.town_stakes[0, 0]), float(known.town_gold[0, 0])
+	assert empty > 0.9 and now < 0.1 and stakes > gold > 0
+	assert float(t.gather_risk_weight()) == pytest.approx(1.0, abs=1e-5)
+	assert gain == pytest.approx(gold * (float(known.hero_multiplier[0, 0]) - t.unled_share) - (empty * (stakes - gold) - now * stakes), rel=1e-4)
+	assert gain < calm_gain - 0.8 * (stakes - gold)
+	# Its prior: the gain as value_logit prices it while the visitor is our main hero (the only one: main); a stronger
+	# hero of ours elsewhere makes it a scout (one town, one main hero), whose GATHER pays gather_cost_weight (3)
+	with torch.no_grad():
+		prior = float(t.multi_prior(x, known)[0, 0, c.MultiKind.GATHER])
+	assert bool(known.main[0, 0]) and prior == pytest.approx(float(ft.value_logit(torch.tensor(gain))), abs=1e-4)
+	x["h_present"][0, 1], x["h_owner"][0, 1], x["h_garrisoned"][0, 1], x["h_town"][0, 1] = True, c.OWNER_SELF, False, -1
+	x["h_army_creature"][0, 1], x["h_army_count"][0, 1], x["h_detailed"][0, 1] = -1, 0, True
+	x["h_army_creature"][0, 1, 0], x["h_army_count"][0, 1, 0] = 12, 1000
+	with torch.no_grad():
+		known = m.domain_knowledge(x)
+		scout = float(t.multi_prior(x, known)[0, 0, c.MultiKind.GATHER])
+		gain = float(t.multi_gain(x, known)[0, 0, c.MultiKind.GATHER])
+	assert not bool(known.main[0, 0]) and bool(known.main[0, 1]) and float(t.gather_cost_weight()) == pytest.approx(3.0, abs=1e-5)
+	assert scout == pytest.approx(float(ft.value_logit(torch.tensor(gain))) - 3.0, abs=1e-4)
+
+
 def test_a_multi_actions_prior_is_what_it_does_to_phi():
 	"""model.CustomFeatures.multi_gain (schema 14, the user 2026-11-05): RECRUIT_ALL buys what we can pay for, the highest
 	level first, at (unled_share - 1) of its worth (a little below 0); RECRUIT_ALL_HERO into a visiting starting hero
@@ -1548,8 +1598,10 @@ def test_a_multi_actions_prior_is_what_it_does_to_phi():
 		x["h_level"][0, :2] = torch.tensor(levels)
 		with torch.no_grad():
 			prior = t.multi_prior(x, m.domain_knowledge(x))[0]
-		for kind in (K.RECRUIT_ALL, K.RECRUIT_ALL_HERO, K.GATHER):
+		for kind in (K.RECRUIT_ALL, K.RECRUIT_ALL_HERO):
 			assert float(prior[0, kind]) == pytest.approx(float(ft.value_logit(gains[0, kind])), abs=1e-5)
+		scout = 1.0 - float(t.main_visitor(x, m.domain_knowledge(x))[0, 0])  # (hero 0 visits; hero 1, stronger, is the main one)
+		assert scout == 1.0 and float(prior[0, K.GATHER]) == pytest.approx(float(ft.value_logit(gains[0, K.GATHER])) - scout * float(t.gather_cost_weight()), abs=1e-5)
 		assert float(prior[stronger, K.GIVE_ALL]) == pytest.approx(logit(stronger), abs=1e-5), levels
 		assert float(prior[1 - stronger, K.GIVE_ALL]) == pytest.approx(logit(1 - stronger) - cost, abs=1e-5), levels
 	# One level and one factor: the bigger army (hero 1's 30 against hero 0's 20)

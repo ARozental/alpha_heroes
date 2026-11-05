@@ -422,6 +422,19 @@ def town_danger(x, hero_strength, town_strength):
 	return (near * torch.sigmoid(2 * (theirs - defence.unsqueeze(-1)))).amax(dim=-1) * (x["t_present"][:, :to] & (x["t_owner"][:, :to] == c.OWNER_SELF))
 
 
+def emptied_danger(x, hero_strength):
+	"""Our towns' danger once their garrison and visiting hero have left [B, OWN_TOWNS] (town_danger's, the defence a
+	hero in the garrison alone: an empty town's fort does not fight, town_strength): what a town's army taken into its
+	visitor (MULTI's GATHER) leaves it to."""
+	to = c.OWN_TOWNS
+	index = x["t_garrison_hero"][:, :to]
+	found = torch.gather(hero_strength, 1, index.clamp(min=0))
+	defence = log_add(torch.zeros_like(found), torch.where(index >= 0, found, torch.full_like(found, -30.0)))  # (an empty town's log1p(0))
+	pos = x["t_pos"][:, :to]
+	near, theirs = reach(enemies(x, hero_strength), pos[..., 0], pos[..., 1], pos[..., 2])  # [B, TO, E]
+	return (near * torch.sigmoid(2 * (theirs - defence.unsqueeze(-1)))).amax(dim=-1) * (x["t_present"][:, :to] & (x["t_owner"][:, :to] == c.OWNER_SELF))
+
+
 def expected_loss(ratio, has_enemy):
 	"""The share of the army a won fight costs: NK2's (their strength / ours)^2, at most all of it."""
 	return has_enemy * torch.exp(-2 * torch.relu(ratio))
