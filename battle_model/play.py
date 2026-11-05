@@ -292,7 +292,11 @@ class RecordServer:
 				while True:
 					if size == len(data):
 						data.extend(bytes(len(data)))
-					n = connection.recv_into(memoryview(data)[size:])
+					# (the views released here, not when their temporaries die: under Python 3.14 one outlived its call and
+					# the next extend raised BufferError, "Existing exports of data", ending this thread and its battle's
+					# record, joint7 2026-11-05 03:58)
+					with memoryview(data) as whole, whole[size:] as tail:
+						n = connection.recv_into(tail)
 					if not n:
 						break
 					size += n
