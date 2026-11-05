@@ -217,7 +217,7 @@ class AlphaMapAI : public CAdventureAI
 	int exchangeAdvised = 0;
 	int exchangeAdviceMatched = 0;
 	int exchangeAdviceEnds = 0;
-	int gatherAdvised = 0; // (turn decisions advised to gather a town's troops into its visiting hero: adviseGather)
+	std::array<int, 3> visitAdvised{}; // (turn decisions advised a town visit's upgrade, gathering, spellbook: adviseVisit)
 	double adviceSeconds = 0;
 	std::map<std::string, int> adviceUnmatched;
 	void initAdvice();
@@ -229,8 +229,9 @@ class AlphaMapAI : public CAdventureAI
 	// Our move toward the army Nullkiller2 would leave the hero (destination) of its own and the source's troops;
 	// needed: that army is not there yet; accept: our other moves toward it
 	std::optional<Choice> adviseToward(const Decision & decision, const CGHeroInstance * destination, const CArmedInstance * source, bool & needed, std::vector<std::pair<int, int>> & accept);
-	// A hero of ours visiting a town of ours with troops: Nullkiller2's gathering of them (its every such visit's)
-	std::optional<Choice> adviseGather(const Decision & decision, std::vector<std::pair<int, int>> & accept);
+	// A hero of ours visiting a town of ours: Nullkiller2's visit there (its stacks' upgrades, the town's troops gathered,
+	// a main hero's spellbook; step: which, 0..2)
+	std::optional<Choice> adviseVisit(const Decision & decision, std::vector<std::pair<int, int>> & accept, int & step);
 	std::string adviceJson() const;
 	// A request of Nullkiller2's as our turn decision's legal entry doing the same; false (unmatched: why) when none.
 	// intended: a move's destination when the caller knows it (its plan's tile), else the request's own tile is taken

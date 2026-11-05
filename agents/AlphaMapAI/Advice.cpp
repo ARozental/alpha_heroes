@@ -9,6 +9,7 @@
 #include "lib/callback/CCallback.h"
 #include "lib/callback/IClient.h"
 #include "lib/gameState/CGameState.h"
+#include "lib/gameState/UpgradeInfo.h"
 #include "lib/mapObjects/CGHeroInstance.h"
 #include "lib/mapping/TerrainTile.h"
 #include "lib/networkPacks/PacksForServer.h"
@@ -214,13 +215,14 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optiona
 	if(!advisor)
 		return std::nullopt;
 	const auto started = std::chrono::steady_clock::now();
-	if(auto gathered = adviseGather(decision, accept)) // (a hero of ours in a town of ours: its gathering first)
+	int step = -1;
+	if(auto visit = adviseVisit(decision, accept, step)) // (a hero of ours in a town of ours: its visit's habits first)
 	{
 		adviceSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 		++advised;
 		++adviceMatched;
-		++gatherAdvised;
-		return gathered;
+		++visitAdvised[step];
+		return visit;
 	}
 	std::optional<Choice> advice;
 	std::string unmatched = "no request";
@@ -417,27 +419,72 @@ std::optional<Choice> AlphaMapAI::adviseToward(const Decision & decision, const 
 	return std::nullopt;
 }
 
-std::optional<Choice> AlphaMapAI::adviseGather(const Decision & decision, std::vector<std::pair<int, int>> & accept)
+std::optional<Choice> AlphaMapAI::adviseVisit(const Decision & decision, std::vector<std::pair<int, int>> & accept, int & step)
 {
+	step = -1;
 #ifdef ALPHA_MAP_NK2_ADVICE
-	// Nullkiller2 gathers a town's troops into its hero there whenever its hero enters a town of its own, leaves its
-	// garrison or has recruited there (AIGateway::moveCreaturesToHero: pickBestCreatures): a part of its visit, none
-	// of its turn's requests, so the advice of its turn's first request never said so, and at 0.6-0.8 of the loss it
-	// taught our model to take no town's troops at all (2026-11-05: P(ARMY) 0.0002 at 1,482 turn decisions where a
-	// hero of ours stood in a town of ours with troops; our heroes led 2% of our army at day 60). So a hero of ours
-	// visiting a town of ours with troops gets that first: our move toward the army it would leave the hero
+	// Nullkiller2's visit to a town of its own (AIGateway::objectVisited; buildArmyIn alike), in its order: its hero's
+	// stacks upgraded where its free resources pay for the best upgrade by AI value (makePossibleUpgrades), the town's
+	// troops it wants gathered into the hero (moveCreaturesToHero: pickBestCreatures), a spellbook bought for a main
+	// hero without one (its free gold, a mage guild). All of it is a part of the visit and none of its turn's requests:
+	// the advice of its turn's first request never said so, and at 0.6-0.8 of the loss our model came to do none of it
+	// (2026-11-05, 5,509 turn decisions with a hero of ours in a town of ours: ARMY town -> hero P 0.0002, our heroes
+	// leading 2% of our army at day 60; BUY legal in 4,219, chosen 0; UPGRADE legal in 1,689, chosen 26). So a hero of
+	// ours visiting a town of ours gets those first, each our entry doing the same (step: 0 upgrade, 1 gather, 2 book)
+	const auto & nk = *advisor->nk2->nullkiller;
+	const auto & upgrades = decision.entries[static_cast<int>(ActionType::UPGRADE)];
+	const auto & buys = decision.entries[static_cast<int>(ActionType::BUY)];
+	const auto chosen = [](ActionType type, int index)
+	{
+		Choice choice;
+		choice.type = static_cast<int>(type);
+		choice.index = index;
+		return choice;
+	};
 	for(const auto * town : cb->getTownsInfo(true))
 	{
 		const auto * hero = town->getVisitingHero();
-		if(!hero || hero->tempOwner != playerID || !town->armedGarrison())
+		if(!hero || hero->tempOwner != playerID)
 			continue;
-		bool needed = false;
-		std::vector<std::pair<int, int>> others;
-		if(auto advice = adviseToward(decision, hero, town->getUpperArmy(), needed, others))
+		auto free = cb->getResourceAmount() - nk.getLockedResources(); // (Nullkiller::getFreeResources, not exported: its body)
+		free.positive();
+		for(int s = 0; s < ARMY_SLOTS; ++s)
 		{
-			accept = std::move(others);
-			return advice;
+			const auto * stack = hero->getStackPtr(SlotID(s));
+			if(!stack)
+				continue;
+			UpgradeInfo info(stack->getId());
+			cb->fillUpgradeInfo(hero, SlotID(s), info);
+			if(!info.hasUpgrades())
+				continue;
+			const CreatureID best = *vstd::maxElementByFun(info.getAvailableUpgrades(), [](const CreatureID & id) { return id.toCreature()->getAIValue(); });
+			if(best.toCreature()->getAIValue() <= stack->getCreature()->getAIValue() || !free.canAfford(info.getUpgradeCostsFor(best) * stack->getCount()))
+				continue;
+			for(const auto & [index, e] : upgrades)
+				if(e.first == hero->id && e.a == s)
+				{
+					step = 0;
+					return chosen(ActionType::UPGRADE, index);
+				}
 		}
+		if(town->armedGarrison())
+		{
+			bool needed = false;
+			std::vector<std::pair<int, int>> others;
+			if(auto advice = adviseToward(decision, hero, town->getUpperArmy(), needed, others))
+			{
+				accept = std::move(others);
+				step = 1;
+				return advice;
+			}
+		}
+		if(nk.heroManager->getHeroRoleOrDefaultInefficient(hero) == NK2AI::HeroRole::MAIN && !hero->hasSpellbook() && free[EGameResID::GOLD] >= GameConstants::SPELLBOOK_GOLD_COST)
+			for(const auto & [index, e] : buys)
+				if(e.first == hero->id && e.a == ArtifactID(ArtifactID::SPELLBOOK).getNum())
+				{
+					step = 2;
+					return chosen(ActionType::BUY, index);
+				}
 	}
 #endif
 	return std::nullopt;
@@ -450,7 +497,7 @@ std::string AlphaMapAI::adviceJson() const
 	std::string unmatched;
 	for(const auto & [kind, count] : adviceUnmatched)
 		unmatched += (unmatched.empty() ? "\"" : ", \"") + kind + "\": " + std::to_string(count);
-	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + "}, \"gather\": " + std::to_string(gatherAdvised) + ", \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
+	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + "}, \"visit\": {\"upgrade\": " + std::to_string(visitAdvised[0]) + ", \"gather\": " + std::to_string(visitAdvised[1]) + ", \"book\": " + std::to_string(visitAdvised[2]) + "}, \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
 }
 
 // The events of a seated Nullkiller2's memory (AlphaMapAI.h), passed on to the advising one; none of our own uses them
