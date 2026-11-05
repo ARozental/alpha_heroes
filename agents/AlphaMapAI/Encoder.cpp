@@ -870,6 +870,36 @@ void AlphaMapAI::encodeArtifacts(Decision & decision, int first, int second)
 
 namespace
 {
+// Whether Town Portal would take the hero anywhere, as the server casts it (TownPortalEffect, TownRelatedAdventureSpell-
+// Effect): its movement left at least its school level's movementPointsTaken and movementPointsRequired (the spell's
+// config, the base level's where its own level leaves one out), and a town of ours to land in: the nearest one (no
+// town selection) or any (selection) without a visiting hero, its tile entrable from the hero's. Its canBeCast checks
+// none of this: joint7's Town Portals that changed nothing (51 in the kept logs) were all the server's refusals, all on
+// what the player sees
+bool townPortalWorks(const CCallback & cb, const CGHeroInstance & hero, const CSpell & spell)
+{
+	const auto & effect = spell.getLevelInfo(hero.getSpellSchoolLevel(&spell)).adventureEffect;
+	const auto & base = spell.getLevelInfo(0).adventureEffect;
+	const auto field = [&](const std::string & name) -> const JsonNode & { return effect[name].isNull() ? base[name] : effect[name]; };
+	const auto movement = static_cast<int64_t>(hero.movementPointsRemaining());
+	if(movement < field("movementPointsTaken").Integer() || movement < field("movementPointsRequired").Integer())
+		return false;
+	const auto * from = cb.getTile(hero.visitablePos(), false);
+	const auto lands = [&](const CGTownInstance * town)
+	{
+		const auto * tile = cb.getTile(town->visitablePos(), false);
+		return town->getVisitingHero() == nullptr && from && tile && tile->entrableTerrain(from);
+	};
+	const auto towns = cb.getTownsInfo(true);
+	if(field("allowTownSelection").Bool())
+		return std::any_of(towns.begin(), towns.end(), lands);
+	const CGTownInstance * nearest = nullptr;
+	for(const auto * town : towns)
+		if(!nearest || town->visitablePos().dist2dSQ(hero.visitablePos()) < nearest->visitablePos().dist2dSQ(hero.visitablePos()))
+			nearest = town;
+	return nearest && lands(nearest);
+}
+
 // Whether one creature of a town's creatures for hire at some level can be paid for and go into the army
 bool recruitsAny(const CGTownInstance * town, const CArmedInstance * into, TResources resources) // (by value: ResourceSet's division is not const)
 {
@@ -1237,7 +1267,7 @@ void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)
 					continue;
 				spells::detail::ProblemImpl problem;
 				const auto & mechanics = spell->getAdventureMechanics();
-				if(!mechanics.canBeCast(problem, cb.get(), h))
+				if(!mechanics.canBeCast(problem, cb.get(), h) || (s == SpellID::TOWN_PORTAL && !townPortalWorks(*cb, *h, *spell)))
 					continue;
 				const bool targeted = std::find(TARGETED_SPELLS.begin(), TARGETED_SPELLS.end(), s) != TARGETED_SPELLS.end();
 				if(s == SpellID::SCUTTLE_BOAT)
