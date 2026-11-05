@@ -368,11 +368,14 @@ class CustomFeatures(nn.Module):
 
 	def trade_weights(self):
 		"""TRADE's prior (the user, 2026-11-04: every trade is dumb unless it buys what could not be bought without it):
-		(what a trade that unlocks a building gains, 2 logits at the start, 0..4; what a unit of its cost loses, log(1 + Φ's
-		gold lost / 1000), 0.5, 0..2; features.trade_options). joint7 traded 135 times a game, 77% with no purchase that
-		day, ~900 of Φ a trade at the median: the old prior, 0.5 for a trade toward a building short of resources, 0 for
-		the rest, said nothing of what a trade costs."""
-		return ft.bounded(self.trade_unlock, 0.0, 4.0, 2.0, CORRECTION_STEP), ft.bounded(self.trade_cost, 0.0, 2.0, 0.5, CORRECTION_STEP)
+		(what a trade that unlocks a building gains, 2 logits at the start, 0..4; the weight of what a trade loses, its
+		gold of worth as value_logit prices every change of Φ, 1 at the start, 0..2; features.trade_options), the same
+		weight on the trades a purchase short of resources makes (features.purchase_trades). joint7 traded 135 times a
+		game, 77% with no purchase that day, ~900 of Φ a trade at the median: the old prior, 0.5 for a trade toward a
+		building short of resources, 0 for the rest, said nothing of what a trade costs. 2026-11-05: at 0.5 x log(1 +
+		lost / 1000), a 4,000 loss 0.8 logits against value_logit's 3.3 for a 4,000 gain, a fifth of the purchases
+		traded for themselves, ~5,200 of worth each, ~150,000 a game (joint7 v1024's games)."""
+		return ft.bounded(self.trade_unlock, 0.0, 4.0, 2.0, CORRECTION_STEP), ft.bounded(self.trade_cost, 0.0, 2.0, 1.0, CORRECTION_STEP)
 
 	def recruit_yes_weight(self):
 		"""What YES to a dwelling's "Would you like to recruit?" gains, in logits (4 at the start, 0..8): Nullkiller2 answers

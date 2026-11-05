@@ -169,15 +169,16 @@ class StepGraph:
 
 		StepGraph(model, fn).run(inputs, batch)  fn's outputs past the loss (copies), or None: not recorded (eager then)
 
-	fn(out, batch) -> (loss, *outputs): tensors only, nothing read to the host. A graph is recorded per shape of the
-	inputs and the batch, and checked the first time against the eager step on the same micro-batch (its gradient and
-	outputs); one that differs, that could not be recorded or whose check found no memory, is dropped for good and the
-	caller steps eagerly."""
+	fn(out, batch) -> (loss, *outputs): tensors only, nothing read to the host. forward(inputs) -> out: the model's
+	(default), or another pass over it (model_v2.forward_steps: a micro-batch of sequences). A graph is recorded per
+	shape of the inputs and the batch, and checked the first time against the eager step on the same micro-batch (its
+	gradient and outputs); one that differs, that could not be recorded or whose check found no memory, is dropped for
+	good and the caller steps eagerly."""
 
 	TOLERANCE = 1e-3  # the largest gradient difference, relative to the largest gradient (TF32 matmuls: ~1e-3 each)
 
-	def __init__(self, model, fn):
-		self.model, self.fn = model, fn
+	def __init__(self, model, fn, forward=None):
+		self.model, self.fn, self.forward = model, fn, forward or model
 		self.entries = {}  # (shape signature, window budget) -> {"inputs", "batch", "outputs", "graph", "checked"} or None
 		# A budget graph's check (against the eager step over every slot): None before the first, then whether it held;
 		# the update uses budgets while not False, and in its first pass (no check there) once True
@@ -233,7 +234,7 @@ class StepGraph:
 				side.wait_stream(torch.cuda.current_stream())
 				with torch.cuda.stream(side):
 					for _ in range(2):  # (the allocator and the libraries' choices settle before the recording)
-						loss, *_ = self.fn(self.model(prepare(static_inputs) if prepare is not None else static_inputs), static_batch)
+						loss, *_ = self.fn(self.forward(prepare(static_inputs) if prepare is not None else static_inputs), static_batch)
 						loss.backward()
 						del loss
 				torch.cuda.current_stream().wait_stream(side)
@@ -241,7 +242,7 @@ class StepGraph:
 					p.grad.copy_(g)
 				graph = torch.cuda.CUDAGraph()
 				with torch.cuda.graph(graph):
-					loss, *outputs = self.fn(self.model(prepare(static_inputs) if prepare is not None else static_inputs), static_batch)
+					loss, *outputs = self.fn(self.forward(prepare(static_inputs) if prepare is not None else static_inputs), static_batch)
 					loss.backward()
 			return {"inputs": static_inputs, "batch": static_batch, "outputs": tuple(None if o is None else o.detach() for o in outputs), "graph": graph, "checked": False}
 		except Exception as error:
@@ -257,7 +258,7 @@ class StepGraph:
 		set only while recording; its inputs converted outside); the gradient added either way."""
 		params = self._params()
 		try:
-			loss, *eager_outputs = self.fn(self.model(prepare(inputs) if prepare is not None else inputs), batch)
+			loss, *eager_outputs = self.fn(self.forward(prepare(inputs) if prepare is not None else inputs), batch)
 			eager = torch.autograd.grad(loss, params, allow_unused=True)
 			del loss
 		except torch.OutOfMemoryError as error:

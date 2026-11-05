@@ -405,11 +405,11 @@ class _EagerStep:
 
 	budget_ok = None
 
-	def __init__(self, model, fn):
-		self.model, self.fn = model, fn
+	def __init__(self, model, fn, forward=None):
+		self.model, self.fn, self.forward = model, fn, forward or model
 
 	def run(self, inputs, batch, budget=None, prepare=None):
-		loss, *outputs = self.fn(self.model(prepare(inputs) if prepare is not None else inputs), batch)
+		loss, *outputs = self.fn(self.forward(prepare(inputs) if prepare is not None else inputs), batch)
 		loss.backward()
 		return tuple(None if o is None else o.detach() for o in outputs)
 

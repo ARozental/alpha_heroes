@@ -769,9 +769,10 @@ def market_rates(x, t):
 def purchase_trades(x, t):
 	"""What a purchase short of resources costs Φ in the trades the agent makes for it (AlphaMapAI::payByTrades, since
 	2026-11-04: building or recruiting trades for itself, the user's): (each building's [B, TO, N_BUILDINGS] where
-	build_short, one creature's of each RECRUIT level [B, TO, N_LEVELS] where we cannot afford one, as log(1 + gold
-	lost / 1000); whether we cannot afford that one creature [B, TO, N_LEVELS]). Each resource short bought from the
-	spare one that loses the least a unit (market_rates; the spare's depletion left out: the agent's plan is exact)."""
+	build_short, one creature's of each RECRUIT level [B, TO, N_LEVELS] where we cannot afford one, as the gold of worth
+	lost: the resources sold at their prices less those bought, as Φ counts them; whether we cannot afford that one
+	creature [B, TO, N_LEVELS]). Each resource short bought from the spare one that loses the least a unit (market_rates;
+	the spare's depletion left out: the agent's plan is exact)."""
 	price = t.resource_price
 	give, get = market_rates(x, t)
 	have = x["g_resources"].clamp(min=0).float()  # [B, R]
@@ -783,7 +784,7 @@ def purchase_trades(x, t):
 		usable = spare.unsqueeze(-1) >= give[:, None, None]  # [B, TO, K, R (sold), R (bought)]
 		best = torch.where(usable, unit[:, None, None], torch.full_like(usable, float("inf"), dtype=unit.dtype)).amin(dim=-2)
 		gold = torch.where(torch.isfinite(best) & (short > 0), short * (best - price), torch.zeros_like(short))
-		return torch.log1p(gold.sum(dim=-1).clamp(min=0.0) / 1000.0)
+		return gold.sum(dim=-1).clamp(min=0.0)
 
 	faction = vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)
 	creature = t.creature_resources[vocab_index(x["t_available_creature"][:, : c.OWN_TOWNS], c.CREATURE_VOCAB)]  # [B, TO, LV, R]
@@ -794,7 +795,7 @@ def purchase_trades(x, t):
 
 def trade_options(x, t):
 	"""Each TRADE entry's (sell, buy, TRADE_FRACTIONS) [B, R, R, F, 2] (the user, 2026-11-04: every trade is dumb unless
-	it buys what could not be bought without it): what it costs Φ (log(1 + gold / 1000): the resources sold at their
+	it buys what could not be bought without it): what it costs Φ (the gold of worth lost: the resources sold at their
 	prices less those bought; joint7's trades cost a median 900) and whether it unlocks a purchase: a building (one of
 	our towns' buildings short of resources, build_short) or a creature for hire in our towns we cannot afford one of,
 	either short of the one resource bought alone and affordable after it (Nullkiller2 mostly sells rare resources for
@@ -818,7 +819,7 @@ def trade_options(x, t):
 	covers = have[:, None, :, None, None, None] + bought[..., None, None] >= need[:, None, :, None]  # [B, R, R, F, TO, NB]
 	keeps = have[:, :, None, None, None, None] - sold[..., None, None] >= need[:, :, None, None]
 	unlocks = (alone[:, None, :, None] & covers & keeps).flatten(4).any(dim=-1)  # [B, R, R, F]
-	return torch.stack([torch.log1p(cost.clamp(min=0.0) / 1000.0), unlocks.float()], dim=-1)
+	return torch.stack([cost.clamp(min=0.0), unlocks.float()], dim=-1)
 
 
 def area_index(x, pos):

@@ -213,6 +213,31 @@ def batch_heroes(decoded):
 	return int(heroes_in(decoded).sum())
 
 
+def sequence_heroes(steps):
+	"""batch_heroes for a micro-batch of sequence_order's: steps x the most any one step holds, so that the whole batch's
+	window budget holds for each step's share of it (model_v2.forward_steps)."""
+	return lambda decoded: steps * int(heroes_in(decoded).reshape(steps, -1).sum(axis=1).max())
+
+
+def sequence_order(stream, position, steps, size, micro_batches):
+	"""A pass's rows as sequences of `steps` of a player's consecutive decisions (config.memory_steps): each run of one
+	player's consecutive records (stream [N]: the game and player; position [N]: the record's place among the player's)
+	cut into sequences from a random offset, the sequences shuffled and laid out a micro-batch at a time, step-major
+	(step 0 of its sequences, then step 1, ...: model_v2.forward_steps' order). Whole minibatches of `size` rows only:
+	the rows left over (a run's ends, a last partial minibatch) sit this pass out, another offset the next."""
+	n = len(stream)
+	by = np.lexsort((position, stream))  # (each player's records in their order)
+	s, p = stream[by], position[by]
+	new = np.ones(n, dtype=bool)
+	new[1:] = (s[1:] != s[:-1]) | (p[1:] != p[:-1] + 1)
+	bounds = np.append(np.flatnonzero(new), n)
+	starts = np.concatenate([np.zeros(0, dtype=np.int64)] + [np.arange(a + np.random.randint(steps), b - steps + 1, steps) for a, b in zip(bounds[:-1], bounds[1:])])
+	per_micro = size // micro_batches // steps
+	usable = len(starts) - len(starts) % (per_micro * micro_batches)
+	starts = np.random.permutation(starts)[:usable].reshape(-1, 1, per_micro)
+	return by[(starts + np.arange(steps).reshape(1, steps, 1)).reshape(-1)]
+
+
 def windows_for(rows, heroes, config):
 	"""The hero windows a step's graph computes for a batch of `rows` decisions holding `heroes` of ours
 	(model_v2.windows_of's budget): config.window_budget a decision, or None (every slot) when the batch has more."""
@@ -648,7 +673,7 @@ def taught(advice_types, advised, config):
 def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
 	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None, teacher=None, teacher_weight=None,
-	share_trust=1.0, head_scale=None, teacher_sets=None, loss_weights=None,
+	share_trust=1.0, head_scale=None, teacher_sets=None, loss_weights=None, streams=None,
 ):
 	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
 	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
@@ -663,7 +688,9 @@ def ppo_update(
 	credit is computed here, from V_end of the model as the update starts (the KL anchor's pass), and blended with
 	advantages (labels.blend_credit) before they are normalized. decode(rows) gives the inputs of those decisions
 	(default: decode_inputs). share_trust 0..1: how far the schedule credit's share term takes the V7 change head as its
-	baseline (share_baseline; the learner's trust). Returns (metrics, the KL control's new lr_scale)."""
+	baseline (share_baseline; the learner's trust). streams: (stream [N], position [N]) of each decision, its game and
+	player and its place among the player's records, for config.memory_steps (sequence_order; None: each decision
+	alone). Returns (metrics, the KL control's new lr_scale)."""
 	n, started = len(decisions), time.time()
 	clock = {"prepass": 0.0, "wait": 0.0, "steps": 0.0, "forward": 0.0, "losses": 0.0, "backward": 0.0, "optimizer": 0.0, "cpu": time.thread_time()}  # where the update's time goes (logged: the PC's step ran at half the GPU's pace, 2026-10-30)
 	# The foresight's labels (foresight.game_labels, v2), each decision's row: its loss joins the minibatch's, a share
@@ -712,6 +739,14 @@ def ppo_update(
 	for group in optimizer.param_groups:
 		group["lr"] = config.learning_rate * lr_scale
 	size = config.batch_size
+	# config.memory_steps: the passes' micro-batches as sequences of a player's decisions, the memory carried through
+	# them (model_v2.forward_steps) and its gradient back into the writes; the first pass's (the anchor's, the old
+	# values') each decision on its recorded memory, as played
+	unroll = max(1, int(getattr(config, "memory_steps", 1))) if streams is not None else 1
+	if unroll > 1 and (size % config.micro_batches or (size // config.micro_batches) % unroll):
+		print(f"campaign: FAILURE: memory_steps {unroll} does not divide a micro-batch ({size} / {config.micro_batches} rows): each decision alone", flush=True)
+		unroll = 1
+	forward = (lambda inputs: model.forward_steps(inputs, unroll)) if unroll > 1 else model
 	# The KL control's anchor: each decision's choice under the model as the update starts; and V_end there (the end
 	# credit's)
 	graphs = None
@@ -735,7 +770,7 @@ def ppo_update(
 	weights_t = {f"lw:{name}": torch.full((), float(loss_weights[name]), device=device) for name in ("value", "foresight")} if loss_weights is not None else {}
 	steps_graph = None
 	if graphs is not None and config.step_graphs:
-		steps_graph = model.__dict__.setdefault("_step_graph", StepGraph(model, lambda out, batch: micro_loss(out, batch, config, foresight_config)[:3]))
+		steps_graph = model.__dict__.setdefault("_step_graph" if unroll == 1 else f"_step_graph_{unroll}", StepGraph(model, lambda out, batch: micro_loss(out, batch, config, foresight_config)[:3], forward))
 	# The wire's conversion recorded in the graphs (config.convert_in_graphs): they take the decoded batches as sent
 	# ({"wire": [N, IN_BYTES]}) and prepare them inside; everything else here converts them itself (model_inputs)
 	prepare = (lambda raw: convert(raw["wire"])) if convert is not None and graphs is not None and config.convert_in_graphs else None
@@ -870,14 +905,17 @@ def ppo_update(
 	for pass_number in range(1, config.passes + 1):
 		if stopped:
 			break
-		order = torch.randperm(n).numpy()
-		if n >= size:
-			order = order[: n - n % size]
+		if unroll > 1:
+			order = sequence_order(*streams, unroll, size, config.micro_batches)
+		else:
+			order = torch.randperm(n).numpy()
+			if n >= size:
+				order = order[: n - n % size]
 		# Decoded a micro-batch at a time (a minibatch at once held ~4 of them decoded in pinned memory, a campaign
 		# decision several MB: the PC's learner at 9.5 GB, 2026-10-30); the minibatch's gradient as before
 		minibatches = [order[i : i + size] for i in range(0, len(order), size)]
 		splits = [np.array_split(np.arange(len(rows)), max(1, min(config.micro_batches, len(rows)))) for rows in minibatches]
-		decoded = _prefetched([rows[part] for rows, parts in zip(minibatches, splits) for part in parts], decode, device, fed, config.decode_threads, measure=batch_heroes)
+		decoded = _prefetched([rows[part] for rows, parts in zip(minibatches, splits) for part in parts], decode, device, fed, config.decode_threads, measure=sequence_heroes(unroll) if unroll > 1 else batch_heroes)
 		# The pass's order on the device once: a minibatch's and each micro-batch's rows as slices of it (each copy of a
 		# small index array from pageable memory waited for the GPU: five a minibatch, 2026-10-31)
 		order_t = torch.from_numpy(order).to(device)
@@ -934,7 +972,7 @@ def ppo_update(
 					# of that forward is dropped before the graphed step: its autograd graph alive (one tensor of it kept) made
 					# the parameters' AccumulateGrad nodes reference the default stream, and the capture refused them ("a stale
 					# reference to the default stream (stream 0) from warmup", 2026-10-30)
-					check = micro_loss(model(model_inputs(raw)), batch, config, foresight_config, split=True)
+					check = micro_loss(forward(model_inputs(raw)), batch, config, foresight_config, split=True)
 					if check[3] is not None:
 						checked = gradient_check(model, check[0] - check[3], check[3], check[4], prefix="grad_raw_")
 					del check
@@ -945,7 +983,7 @@ def ppo_update(
 					clock["forward"] += time.perf_counter() - mark
 				else:
 					inputs = model_inputs(raw)
-					out = model(inputs) if eager else graphs.train(inputs) if graphs else model(inputs)
+					out = graphs.train(inputs) if graphs and not eager and unroll == 1 else forward(inputs)
 					clock["forward"] += time.perf_counter() - mark
 					mark = time.perf_counter()
 					loss, metrics, fs_parts, _ = micro_loss(out, batch, config, foresight_config)
@@ -1015,6 +1053,7 @@ def ppo_update(
 		optimizer_seconds=clock["optimizer"],
 		cpu_share=(time.thread_time() - clock["cpu"]) / max(time.time() - started, 1e-9),  # of the update's time this thread ran on the CPU
 		full_windows=full_windows,
+		memory_steps=unroll,
 		window_budget_ok=steps_graph.budget_ok if steps_graph is not None else None,
 		**({f"foresight_{name}": value / max(foresight_sums["steps_seen"], 1e-9) for name, value in zip(PART_NAMES, foresight_sum.tolist())} if foresight_sum is not None else {}),
 		**checked,

@@ -468,6 +468,7 @@ class CampaignLearner:
 		decisions, targets, labels, growth, returns, advantages, errors, players, forecasts, row = [], [], [], [], [], [], [], [], [], Counter()
 		growth_real, attributed = [], {"share_now": [], "taken": []}
 		end = {"targets": [], "real": [], "step": [], "week": [], "price": []}
+		streams = ([], [])  # each decision's game and player, and its place among the player's records (config.memory_steps)
 		for g, game in enumerate(played):
 			# The labeler's labels, as the game arrived (b1, 2026-10-30: a game's labels from one table version, one update
 			# old, act like a target network); past MAX_LABEL_STALENESS updates they are computed here with today's tables
@@ -498,6 +499,11 @@ class CampaignLearner:
 			end["real"].append(real[fresh])
 			end["price"].append(price[fresh])
 			decisions += [d for d, keep in zip(game.decisions, fresh) if keep]
+			place, count = {}, Counter()  # (all_decisions: every record as sent, unusable ones too: a gap breaks a sequence)
+			for d in getattr(game, "all_decisions", game.decisions):
+				place[id(d)], count[d.color] = count[d.color], count[d.color] + 1
+			streams[0].append(np.array([g * len(COLORS) + COLORS.index(d.color) for d in game.decisions], dtype=np.int64)[fresh])
+			streams[1].append(np.array([place[id(d)] for d in game.decisions], dtype=np.int64)[fresh])
 			if foresight is not None:
 				# (labels precomputed before a label was added, a spooled game's at a resume: computed again here)
 				rows = pre["foresight"] if pre is not None and "foresight" in pre and LABEL_NAMES <= pre["foresight"].keys() else labels_of(game, self.features_cpu)
@@ -567,7 +573,7 @@ class CampaignLearner:
 			out_of_memory = None
 			with self.model_lock:
 				try:
-					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale={"var": getattr(self, "head_var", None), "ramp": min(1.0, getattr(self, "head_scale_updates", 0) / HEAD_SCALE_RAMP)} if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0)
+					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale={"var": getattr(self, "head_var", None), "ramp": min(1.0, getattr(self, "head_scale_updates", 0) / HEAD_SCALE_RAMP)} if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])))
 				except torch.OutOfMemoryError as error:  # (handled below, once the error's frames, and their tensors, are gone)
 					out_of_memory = str(error)[:200]
 			if out_of_memory is not None:

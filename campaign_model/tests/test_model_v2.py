@@ -832,10 +832,10 @@ def test_a_trade_unlocks_a_building_only_if_it_buys_its_last_missing_resource_an
 	x["build_short"][0, 0, 5] = True
 	options = ft.trade_options(x, t)[0]  # [R, R, F, 2]
 	assert options.shape == (R, R, F, 2)
-	torch.testing.assert_close(options[WOOD, CRYSTAL, :, 0], torch.full((F,), math.log1p(4.5)))
+	torch.testing.assert_close(options[WOOD, CRYSTAL, :, 0], torch.full((F,), 4500.0))
 	assert options[WOOD, CRYSTAL, :, 1].tolist() == [1.0] * F
 	assert float(options[WOOD, GOLD, :, 1].sum()) == 0.0
-	torch.testing.assert_close(options[WOOD, GOLD, 0, 0], torch.tensor(math.log1p((3 * 250 - 3 * 25) / 1000)))  # (10% of 30 trades: 3)
+	torch.testing.assert_close(options[WOOD, GOLD, 0, 0], torch.tensor(3 * 250 - 3 * 25.0))  # (10% of 30 trades: 3)
 	x["build_short"][0, 0, 5], x["build_short"][0, 0, 6] = False, True
 	assert float(ft.trade_options(x, t)[0, ..., 1].sum()) == 0.0
 	# a creature for hire we cannot afford one of (an Angel: no gem), with 3,000 gold: the wood for a gem unlocks it
@@ -1127,9 +1127,45 @@ def test_a_purchase_short_of_resources_is_priced_by_the_trades_it_makes():
 	give, get = ft.market_rates(x, t)
 	price = t.resource_price
 	wood = min(float(price[s] * give[0, s, 0] / get[0, s, 0]) for s in range(7) if s != 0 and float(x["g_resources"][0, s]) - float(t.building_resources[faction, short_one, s]) >= float(give[0, s, 0]))
-	assert float(build[0, 0, short_one]) == pytest.approx(math.log1p(5 * (wood - float(price[0])) / 1000), rel=1e-5)
+	assert float(build[0, 0, short_one]) == pytest.approx(5 * (wood - float(price[0])), rel=1e-5)
 	assert float(build[0, 0, enough]) == 0.0
 	assert bool(cannot[0, 0, 0]) and float(recruit[0, 0, 0]) > 0
+
+
+def test_a_build_with_nothing_affordable_pays_its_least_trade_in_its_types_score():
+	"""model_v2 (2026-11-05): a purchase short of resources pays its trades' loss of Φ at value_logit's price, in its entry
+	and in its type's offer: with every legal building short, BUILD's score against END's falls by the charge (else, the
+	table normalized, every entry paying it cancelled); with an affordable building legal too, it is as it was."""
+	from campaign_model import features as ft
+
+	torch.manual_seed(7)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = {k: np.repeat(v, 2, axis=0) for k, v in rich_inputs(1, 5).items()}
+	x["g_kind"][:] = c.DecisionKind.TURN
+	x["g_markets"][:] = 1
+	x["g_resources"][:] = [5, 0, 0, 0, 0, 0, 10_000]
+	faction = int(x["t_faction"][0, 0])
+	m.features.building_resources[faction, 30] = torch.tensor([10.0, 0, 0, 0, 0, 0, 2000])  # (short of 5 wood)
+	x["build_mask"][:], x["build_short"][:] = False, False
+	x["build_mask"][:, 0, 30], x["build_short"][:, 0, 30] = True, True
+	x["build_mask"][1, 0, 31] = True  # (row 1: an affordable building legal too)
+	original = m.domain_knowledge
+
+	def free_trades(x):
+		known = original(x)
+		known.build_trade = torch.zeros_like(known.build_trade)
+		return known
+
+	with torch.no_grad():
+		lost = float(original(tensors(x)).build_trade[0, 0, 30])
+		charged = m(tensors(x))["type_logp"]
+		m.domain_knowledge = free_trades
+		free = m(tensors(x))["type_logp"]
+	B, END = int(c.ActionType.BUILD), int(c.ActionType.END)
+	drop = (free[:, B] - free[:, END]) - (charged[:, B] - charged[:, END])
+	_, weight = m.features.trade_weights()
+	assert lost > 1000 and float(drop[0]) == pytest.approx(float(weight * ft.value_logit(torch.tensor(lost))), rel=1e-4)
+	assert abs(float(drop[1])) < 1e-5
 
 
 def test_an_artifacts_move_is_priced_by_what_it_does_to_the_armies_the_heroes_lead():
@@ -1326,3 +1362,74 @@ def test_records_from_before_schema_11_read_with_no_guards_battle_join_or_armed_
 		before_11 = ("o_battle", "o_join", "d_guard_count", "a_present", "a_count") if n < max(SHORT_RECORDS) else ()
 		for name in before_11 + ("artifact_mask", "x_heroes"):  # (schema 13's: none in any older record)
 			assert not got[name].any(), (n, name)
+
+
+def test_a_sequence_carries_the_memory_its_turn_decisions_leave_and_its_gradient_reaches_the_writer():
+	"""model_v2.forward_steps: each sequence's step 1 starts from the memory its step 0 left (a TURN decision's output,
+	else the memory step 0 started from: AlphaMapAI's rule), its outputs those of a plain forward with that memory; a loss
+	on step 1 reaches the memory's writer through step 0."""
+	from campaign_model.model_v2 import Memory
+
+	torch.manual_seed(3)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	with torch.no_grad():  # (a trained model's stand-in: a fresh one's read and heads start at 0, nothing depends on its memory)
+		for p in m.parameters():
+			p.add_(0.05 * torch.randn_like(p))
+	x = rich_inputs(4, 7)  # (2 sequences of 2 steps, step-major: rows 0 and 1 step 0 of each, rows 2 and 3 step 1)
+	x["g_kind"][:] = [c.DecisionKind.TURN, c.DecisionKind.YES_NO, c.DecisionKind.TURN, c.DecisionKind.TURN]
+	x["mem"][:] = np.random.default_rng(8).integers(-c.MEMORY_SCALE // 2, c.MEMORY_SCALE // 2, x["mem"].shape)
+	t = tensors(x)
+	out = m.forward_steps(t, 2)
+	with torch.no_grad():
+		first = m({k: v[:2] for k, v in t.items()})
+		left = torch.stack([first["memory"][0].clamp(-1, 1), Memory.of(t)[1]])  # (the question writes nothing)
+		second = m({**{k: v[2:] for k, v in t.items()}, "mem_float": left})
+	for name in ("type_logp", "value_logit", "memory"):
+		assert torch.allclose(out[name][:2], first[name], atol=1e-5) and torch.allclose(out[name][2:], second[name], atol=1e-5), name
+	assert not torch.allclose(second["value_logit"][0], m({k: v[2:3] for k, v in t.items()})["value_logit"][0])  # (the recorded memory would differ)
+	out["value_logit"][2].sum().backward()
+	assert float(m.memory.candidate.weight.grad.abs().max()) > 0 and float(m.memory.gate.weight.grad.abs().max()) > 0
+
+
+def test_a_pass_as_sequences_keeps_each_players_consecutive_records_together():
+	"""train.sequence_order: each sequence is one player's consecutive records (another player's or a gap in the
+	positions starts a new run), laid out step-major a micro-batch at a time, whole minibatches only, no row twice."""
+	from campaign_model.train import sequence_order
+
+	np.random.seed(4)
+	stream = np.array([0] * 11 + [1] * 9 + [2] * 6)
+	position = np.concatenate([np.delete(np.arange(12), 4), np.arange(9), np.arange(6)])  # (player 0's fifth record missing)
+	mixed = np.random.permutation(len(stream))  # (the update's rows: the players' records interleaved)
+	stream, position = stream[mixed], position[mixed]
+	for steps, size, micro in ((2, 8, 2), (3, 6, 1)):
+		order = sequence_order(stream, position, steps, size, micro)
+		assert len(order) > 0 and len(order) % size == 0 and len(set(order.tolist())) == len(order)
+		for block in order.reshape(-1, steps, size // micro // steps):  # (a micro-batch: its steps x its sequences)
+			for s in range(block.shape[1]):
+				rows = block[:, s]
+				assert len(set(stream[rows].tolist())) == 1 and (np.diff(position[rows]) == 1).all(), (steps, rows)
+
+
+def test_an_update_over_sequences_trains_the_memorys_writer_and_one_without_leaves_it():
+	"""ppo_update with config.memory_steps 2 and the decisions' streams: the memory's writer learns (its write reaches
+	the next decision's losses); with 1, as before, no loss reaches it."""
+	torch.manual_seed(5)
+	x = rich_inputs(16, 9)
+	x["g_kind"][:] = c.DecisionKind.TURN
+	x["mem"][:] = np.random.default_rng(10).integers(-c.MEMORY_SCALE // 2, c.MEMORY_SCALE // 2, x["mem"].shape)
+	n = len(x["g_kind"])
+	streams = (np.repeat([0, 1], n // 2), np.tile(np.arange(n // 2), 2))
+	moved = {}
+	for steps in (1, 2):
+		torch.manual_seed(6)
+		m = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+		with torch.no_grad():  # (a trained model's stand-in: a fresh one's read and heads start at 0)
+			for p in m.parameters():
+				p.add_(0.05 * torch.randn_like(p))
+		decisions = decisions_for(m.eval(), x)
+		before = m.memory.candidate.weight.detach().clone()
+		config = CampaignConfig(batch_size=8, micro_batches=2, passes=1, memory_steps=steps, model_architecture="v2")
+		metrics, _ = ppo_update(m, torch.optim.Adam(m.parameters(), lr=1e-3), decisions, np.full((n, c.N_VALUE_OFFSETS), 0.5, np.float32), np.zeros(n, np.float32), config, decode=lambda rows: {k: v[rows] for k, v in x.items()}, streams=streams)
+		assert metrics["memory_steps"] == steps and metrics["steps"] > 0
+		moved[steps] = float((m.memory.candidate.weight - before).abs().max())
+	assert moved[1] == 0 and moved[2] > 0

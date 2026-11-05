@@ -42,6 +42,11 @@ class CampaignConfig:
 	passes: int = 2
 	batch_size: int = 256
 	micro_batches: int = 4  # each minibatch's forward and backward in this many parts, their gradients summed: the same step at a fraction of the peak memory
+	# The memory's training (train.sequence_order, model_v2.forward_steps): each pass's rows as sequences of this many of
+	# a player's consecutive decisions, each after the first reading the memory the one before left, so the losses'
+	# gradient reaches the writer. 1: every decision alone on its recorded memory, which no loss ever reached (the writer
+	# frozen as the imitation left it, 2026-11-04). A micro-batch's rows must be a multiple (batch_size / micro_batches)
+	memory_steps: int = 1
 	prepass_batch: int = 0  # the update's first pass (no gradients: the KL anchor, the old values) in batches of this many; 0: a micro-batch's
 	cuda_graphs: bool = True  # on CUDA: the update's forward and backward replayed from recorded graphs (graphs.py: launches cost under WSL)
 	step_graphs: bool = True  # with cuda_graphs: a micro-batch's forward, loss and backward as one recorded graph (graphs.StepGraph)
