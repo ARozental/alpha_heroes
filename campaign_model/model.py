@@ -588,10 +588,11 @@ class CustomFeatures(nn.Module):
 		town's from all of our resources), at its worth (cost + u) x unled_share for its cost and the u it was worth for
 		hire: its worth x (unled_share - 1), a little below 0. The others as Φ prices a hero's army (features.led_values:
 		its worth x the hero's multiplier x its movement, and its make-up's morale), the armies joined: RECRUIT_ALL_HERO the
-		visiting hero's army with the creatures bought, less their worth; GATHER its army with the garrison, less the
-		garrison at unled_share and what it adds to the town's expected loss (gather_loss); GIVE_ALL (rows 0 and 1: the
-		exchange's receiving hero, x_heroes' first and second) the receiver's army with the other's, less both apart. The
-		multipliers are Φ's (f.hero_multiplier: features.hero_multipliers)."""
+		visiting hero's army with the creatures bought, less their worth; GATHER its army with what of the garrison VCMI's
+		bulk move takes (features.bulk_moves: onto its creature or into a free slot), less that at unled_share and what
+		it adds to the town's expected loss (gather_loss); GIVE_ALL (rows 0 and 1: the exchange's receiving hero,
+		x_heroes' first and second) the receiver's army with what of the other's the bulk move takes, and the other's
+		left, less both apart. The multipliers are Φ's (f.hero_multiplier: features.hero_multipliers)."""
 		b = x["g_day"].shape[0]
 		have = x["g_resources"][:, None, :].clamp(min=0).float().expand(b, TO, -1)  # [B, TO, R]
 		creatures = x["t_available_creature"][:, :TO]  # [B, TO, LV]
@@ -619,18 +620,25 @@ class CustomFeatures(nn.Module):
 		visitor_m, visitor_r, visitor_led = f.hero_multiplier.gather(1, who), rest.gather(1, who), led.gather(1, who)
 		with_recruits = ft.led_values(torch.cat([visitor_c, creatures], dim=-1), torch.cat([visitor_n, bought], dim=-1), visitor_m, visitor_r, self)
 		garrison_c, garrison_n = x["t_garrison_creature"][:, :TO], x["t_garrison_count"][:, :TO].float()
-		with_garrison = ft.led_values(torch.cat([visitor_c, garrison_c], dim=-1), torch.cat([visitor_n, garrison_n], dim=-1), visitor_m, visitor_r, self)
+		gathered = ft.bulk_moves(visitor_c, garrison_c)  # [B, TO, A]: what of the garrison fits into the visitor
+		with_garrison = ft.led_values(torch.cat([visitor_c, torch.where(gathered, garrison_c, torch.full_like(garrison_c, -1))], dim=-1), torch.cat([visitor_n, garrison_n * gathered], dim=-1), visitor_m, visitor_r, self)
+		index = vocab_index(garrison_c, c.CREATURE_VOCAB)
+		gathered_worth = (garrison_n * gathered * (self.creature_cost[index] + self.creature_unit[index]) * (garrison_c >= 0)).sum(dim=-1)  # [B, TO]
 		gains = torch.zeros(b, TO, c.N_MULTI, device=have.device)
 		gains[..., c.MultiKind.RECRUIT_ALL] = worth * (self.unled_share - 1.0)
 		gains[..., c.MultiKind.RECRUIT_ALL_HERO] = (with_recruits - visitor_led - worth) * has
-		gains[..., c.MultiKind.GATHER] = (with_garrison - visitor_led - self.unled_share * f.town_gold[:, :TO]) * has - self.gather_loss(f)
+		gains[..., c.MultiKind.GATHER] = (with_garrison - visitor_led - self.unled_share * gathered_worth) * has - self.gather_loss(f)
 		pair = x["x_heroes"] - 1  # [B, 2]: the exchange's heroes (tokens + 1; -1 none)
 		p = pair.clamp(min=0)
 		pair_c, pair_n = army_c.gather(1, p.unsqueeze(-1).expand(-1, -1, A)), army_n.gather(1, p.unsqueeze(-1).expand(-1, -1, A))  # [B, 2, A]
-		joined = ft.led_values(torch.cat([pair_c, pair_c.flip(1)], dim=-1), torch.cat([pair_n, pair_n.flip(1)], dim=-1), f.hero_multiplier.gather(1, p), rest.gather(1, p), self)  # [B, 2]: row r's receiver leading both
+		giver_c, giver_n = pair_c.flip(1), pair_n.flip(1)  # [B, 2, A]: row r's giver's army
+		given = ft.bulk_moves(pair_c, giver_c)  # (GIVE_ALL's bulk move: what fits into row r's receiver)
+		none = torch.full_like(giver_c, -1)
+		joined = ft.led_values(torch.cat([pair_c, torch.where(given, giver_c, none)], dim=-1), torch.cat([pair_n, giver_n * given], dim=-1), f.hero_multiplier.gather(1, p), rest.gather(1, p), self)  # [B, 2]: row r's receiver leading its own and what came
+		left = ft.led_values(torch.where(given, none, giver_c), giver_n * ~given, f.hero_multiplier.gather(1, p.flip(1)), rest.gather(1, p.flip(1)), self)  # (the giver's that did not fit)
 		both = (pair >= 0).all(dim=1).float().unsqueeze(-1)
 		apart = led.gather(1, p).sum(dim=1, keepdim=True)  # [B, 1]: the two armies before
-		gains[:, :2, c.MultiKind.GIVE_ALL] = (joined - apart) * both
+		gains[:, :2, c.MultiKind.GIVE_ALL] = (joined + left - apart) * both
 		# TAKE_BEST, TAKE_BEST_FAST: the armies after as the C++ makes them (x_take_*: receiving row, variant, side), the
 		# receiver's led by it, the other's by the other
 		take_c, take_n = x["x_take_creature"], x["x_take_count"].float()  # [B, 2, 2, 2, A]

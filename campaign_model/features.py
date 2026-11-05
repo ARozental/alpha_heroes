@@ -308,6 +308,23 @@ def make_up_values(creatures, counts, rest, t):
 	return t.army_morale * gained * (worth * t.creature_morale[index]).sum(dim=-1)
 
 
+def bulk_moves(into, source):
+	"""Which of an army's stacks VCMI's bulk move (CGameHandler::bulkMoveArmy: GIVE_ALL's, GATHER's) takes into another
+	[..., A] bool (into, source: creature ids [..., A], -1 empty): in the source's slots' order, onto the creature's stack
+	there, else into a free slot while one is left (each new creature's stack takes one), else it stays."""
+	there_now = into >= 0
+	free = (~there_now).sum(dim=-1)
+	moved = []
+	for slot in range(source.shape[-1]):
+		creature = source[..., slot]
+		present = creature >= 0
+		there = ((into == creature.unsqueeze(-1)) & there_now).any(dim=-1)
+		takes = present & ~there & (free > 0)
+		moved.append(present & (there | takes))
+		free = free - takes.long()
+	return torch.stack(moved, dim=-1)
+
+
 def led_values(creatures, counts, multiplier, rest, t):
 	"""What armies [..., A] count in Φ led by a hero (gold, [...]): their worth x the hero's multiplier (hero_multipliers)
 	x its movement (speed_factors), and their make-up's morale (make_up_values, over rest: the hero's morale without its

@@ -1554,6 +1554,38 @@ def test_stepping_on_a_hero_or_a_town_of_ours_is_worth_what_the_army_gains_where
 	assert float(slowed[r + 3, r]) == pytest.approx(0.0, abs=1e-3)
 
 
+def test_a_bulk_move_takes_what_fits_and_give_all_is_priced_on_it():
+	"""features.bulk_moves as VCMI's CGameHandler::bulkMoveArmy: the source's stacks in slot order, onto the creature's
+	stack there, else into a free slot while one is left (a second stack of a new creature takes one too), else they
+	stay. GIVE_ALL into a hero whose 7 slots are full gains on the stack that merges alone, the rest left with the giver."""
+	from campaign_model import features as ft
+
+	full = torch.tensor([[0, 1, 2, 3, 4, 5, 6]])
+	assert ft.bulk_moves(full, torch.tensor([[0, 7, 8, -1, -1, -1, -1]])).tolist() == [[True, False, False, False, False, False, False]]
+	one_free = torch.tensor([[0, 1, 2, 3, 4, 5, -1]])
+	assert ft.bulk_moves(one_free, torch.tensor([[7, 8, 7, 1, -1, -1, -1]])).tolist() == [[True, False, False, True, False, False, False]]
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	t = m.features
+	x = tensors(rich_inputs(1, 5))
+	x["h_present"][:] = False
+	x["h_present"][0, :2], x["h_owner"][0, :2], x["h_garrisoned"][0, :2] = True, c.OWNER_SELF, False
+	x["h_primary"][0, 0], x["h_primary"][0, 1], x["h_artifacts"][0, :2] = torch.tensor([6, 6, 1, 1]), torch.tensor([0, 0, 1, 1]), -1
+	x["h_army_creature"][0, 0], x["h_army_count"][0, 0] = torch.arange(7), 10  # (hero 0: 7 creatures, no free slot)
+	x["h_army_creature"][0, 1], x["h_army_count"][0, 1] = -1, 0
+	x["h_army_creature"][0, 1, :2], x["h_army_count"][0, 1, :2] = torch.tensor([0, 9]), torch.tensor([5, 5])  # (hero 1: more of hero 0's first, and a creature it has no slot for)
+	x["h_morale"][0, :2] = 0
+	x["x_heroes"][0] = torch.tensor([1, 2])
+	with torch.no_grad():
+		known = m.domain_knowledge(x)
+		gain = float(t.multi_gain(x, known)[0, 0, c.MultiKind.GIVE_ALL])
+	army_c, army_n = x["h_army_creature"][0, :2], x["h_army_count"][0, :2].float()
+	rest = x["h_morale"][0, :2].float() - ft.make_up_morales(army_c, army_n, t)
+	led = lambda cs, ns, h: float(ft.led_values(torch.tensor(cs), torch.tensor(ns, dtype=torch.float32), known.hero_multiplier[0, h], rest[h], t))  # noqa: E731
+	before = led(list(range(7)), [10.0] * 7, 0) + led([0, 9] + [-1] * 5, [5.0, 5.0] + [0.0] * 5, 1)
+	after = led(list(range(7)) + [0], [10.0] * 7 + [5.0], 0) + led([9] + [-1] * 6, [5.0] + [0.0] * 6, 1)
+	assert gain == pytest.approx(after - before, rel=1e-4)
+
+
 def test_a_take_best_and_a_drop_are_priced_on_the_armies_they_make():
 	"""Schema 15 (the user, 2026-11-05): DROP_SLOW of a hero leading five Angels and two Dwarves (speed 3: the army at
 	1500 a day) into the garrison it visits gains what the Angels' movement and morale win back, the Dwarves at
