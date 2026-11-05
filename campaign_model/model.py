@@ -418,6 +418,7 @@ class CustomFeatures(nn.Module):
 		decision x OWN_HEROES + hero indices, CampaignModel.windows)."""
 		f = Features()
 		f.phi_parts, f.phi_total = ft.empire_value(x, self)
+		f.resource_worth = self.resource_worth(x)
 		f.phi = ft.phi_features(f.phi_parts, f.phi_total)
 		f.hero_counts, f.hero_power, f.hero_gold, f.hero_health = ft.army(x["h_army_creature"], x["h_army_count"], x["h_detailed"], self)
 		f.hero_strength = ft.hero_strength(x["h_primary"], f.hero_power)
@@ -455,6 +456,7 @@ class CustomFeatures(nn.Module):
 		f.hire_gain = ft.hire_gain(x, self, f.tavern_worth)
 		f.trade_needs = ft.trade_needs(x, self)
 		f.trade_options = ft.trade_options(x, self)
+		f.build_trade, f.recruit_trade, f.recruit_short = ft.purchase_trades(x, self)
 		f.area_centres = ft.centres(x, TG)
 		f.travel_prior = self.travel_prior(x, f)
 		if windows.shape[0] > 0:
@@ -536,6 +538,12 @@ class CustomFeatures(nn.Module):
 		value = torch.where(amounts, x["o_amount"], torch.full_like(x["o_amount"], -1))
 		most = amounts & (value == value.amax(dim=-1, keepdim=True)) & (value > 0)
 		return most.float() * ft.bounded(self.recruit_all, 0.0, 4.0, 2.0, CORRECTION_STEP)
+
+	def resource_worth(self, x):
+		"""What one unit of each resource is worth to us [B, R] (schema 12's resource_worth: a purchase short of resources
+		trades away what loses the least of it, AlphaMapAI's plan): VCMI's prices, the ones its market's offers come from
+		and Φ counts resources at."""
+		return self.resource_price.unsqueeze(0).expand(x["g_day"].shape[0], -1)
 
 	def recruit_fit(self, x):
 		"""What buying each AMOUNT option's creatures does to the asked hero's army [B, O, RECRUIT_FIT] (the user, 2026-11-04:
@@ -1385,6 +1393,7 @@ class CampaignModel(nn.Module):
 		self.action_types(x, f, out, g, offers)
 		self.value(x, f, out, g, own_heroes, own_towns)
 		out["memory"] = torch.zeros_like(x["mem"], dtype=torch.float32)  # (v1 has no memory: the contract's output, kept at 0)
+		out["resource_worth"] = f.resource_worth
 		return out
 
 	def move_and_travel(self, x, f, out, own_heroes, cells, areas, windows, n):

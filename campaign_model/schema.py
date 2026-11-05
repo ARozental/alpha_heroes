@@ -218,6 +218,7 @@ OUTPUTS = (
 	_o("option_logp", (O,), "log p(option) of a question"),
 	_o("value", (c.N_VALUE_OFFSETS,), "predicted share of all empires' value VALUE_OFFSETS days after this day"),
 	_o("memory", (c.MEMORY_SLOTS, c.MEMORY_WIDTH), "the memory after this decision, -1..1: AlphaMapAI passes it back as the next decision's mem"),
+	_o("resource_worth", (R,), "what one unit of each resource is worth to us (gold): a purchase short of resources trades away what loses the least of it"),
 )
 
 # Each action type's table: (output, mask); END has none

@@ -110,6 +110,68 @@ int distanceSq(const int3 & a, const int3 & b)
 }
 }
 
+std::optional<std::vector<Trade>> tradesFor(const IMarket * market, const TResources & cost, const TResources & have, const std::array<float, N_RESOURCES> & worth)
+{
+	if(!market)
+		return std::nullopt;
+	std::array<int, N_RESOURCES> need{};
+	std::array<int, N_RESOURCES> spare{};
+	for(int r = 0; r < N_RESOURCES; ++r)
+	{
+		need[r] = std::max(0, cost[GameResID(r)] - have[GameResID(r)]);
+		spare[r] = std::max(0, have[GameResID(r)] - cost[GameResID(r)]);
+	}
+	std::vector<Trade> trades;
+	for(int buy = 0; buy < N_RESOURCES; ++buy)
+		while(need[buy] > 0)
+		{
+			int best = -1;
+			int bestGive = 0;
+			int bestGet = 0;
+			float bestLoss = 0;
+			for(int sell = 0; sell < N_RESOURCES; ++sell)
+			{
+				int give = 0;
+				int get = 0;
+				if(sell == buy || !market->getOffer(sell, buy, give, get, EMarketMode::RESOURCE_RESOURCE) || give <= 0 || get <= 0 || spare[sell] < give)
+					continue;
+				const float loss = worth[sell] * give / get; // (what a unit bought gives away)
+				if(best < 0 || loss < bestLoss)
+					std::tie(best, bestGive, bestGet, bestLoss) = std::tuple(sell, give, get, loss);
+			}
+			if(best < 0)
+				return std::nullopt;
+			const int lots = std::min((need[buy] + bestGet - 1) / bestGet, spare[best] / bestGive);
+			trades.push_back(Trade{best, buy, lots * bestGive});
+			spare[best] -= lots * bestGive;
+			need[buy] -= lots * bestGet;
+		}
+	return trades;
+}
+
+std::array<float, N_RESOURCES> marketWorth(const IMarket * market)
+{
+	std::array<float, N_RESOURCES> worth{};
+	for(int r = 0; r < N_RESOURCES; ++r)
+	{
+		int give = 0;
+		int get = 0;
+		if(r == EGameResID::GOLD)
+			worth[r] = 1.0f;
+		else if(market && market->getOffer(r, EGameResID::GOLD, give, get, EMarketMode::RESOURCE_RESOURCE) && give > 0)
+			worth[r] = static_cast<float>(get) / give;
+	}
+	return worth;
+}
+
+const IMarket * AlphaMapAI::ourMarket() const
+{
+	for(const auto * town : cb->getTownsInfo(true))
+		if(town->hasBuiltResourceMarketplace())
+			return cb->getMarket(town->id);
+	return nullptr;
+}
+
 int3 Decision::windowTile(int hero, int row, int column) const
 {
 	const auto & center = centers[hero];
@@ -633,7 +695,11 @@ void AlphaMapAI::encodeMap(Decision & decision, const std::vector<int3> & ours)
 		// A garrison fights a hero that steps on it (CGGarrison::onHeroVisit), its army as a human's right-click shows it
 		// (CInfoBoxPopup: VCMI's quantity ids): the model's fight on that tile (2026-11-04: 9 of 49 lost fights of joint7's
 		// near-empty heroes were garrisons it took for empty tiles)
-		if((obj->ID == Obj::GARRISON || obj->ID == Obj::GARRISON2) && armed < ARMED_OBJECTS && owner(obj->tempOwner) != OWNER_SELF)
+		// An object whose guards a question showed us (revealedGuards: a bank, a guarded artifact) likewise, its army as it is
+		// now (fewer after a battle there): a hero that declined once walked back 40 times to a guarded artifact it took
+		// for a free pickup, 2026-11-04
+		const bool garrison = obj->ID == Obj::GARRISON || obj->ID == Obj::GARRISON2;
+		if((garrison || revealedGuards.count(obj->id)) && armed < ARMED_OBJECTS && owner(obj->tempOwner) != OWNER_SELF)
 			if(const auto * army = dynamic_cast<const CArmedInstance *>(obj); army && army->stacksCount() > 0)
 			{
 				in.at(In::a_present, armed) = 1;
@@ -790,6 +856,8 @@ void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)
 
 	auto resources = cb->getResourceAmount(); // not const: ResourceSet's operator/ is not
 	const int gold = resources[EGameResID::GOLD];
+	const IMarket * market = ourMarket(); // (purchases short of resources trade there: tradesFor at its own prices)
+	const auto prices = marketWorth(market);
 
 	for(int t = 0; t < OWN_TOWNS; ++t)
 	{
@@ -798,7 +866,9 @@ void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)
 			continue;
 		// BUILD: the server's rules (CGameHandler::buildStructure): canBuildStructure for normal buildings; automatic and
 		// special ones are never built by hand; the grail's needs a visiting hero with the grail (canBuildStructure
-		// does not check that)
+		// does not check that). One short of resources only is built too when our market's trades of what it leaves
+		// over cover the rest (tradesFor; the entry's d: payByTrades first; the user, 2026-11-04: build+trade, no amount
+		// for the model to set), still build_short: the model's prior prices the trades
 		for(int b = 0; b < N_BUILDINGS; ++b)
 		{
 			const auto found = town->getTown()->buildings.find(BuildingID(b));
@@ -813,7 +883,26 @@ void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)
 				decision.entries[static_cast<int>(ActionType::BUILD)][t * N_BUILDINGS + b] = Entry{town->id, {}, b};
 			}
 			else if(mode == CBuilding::BUILD_NORMAL && state == EBuildingState::NO_RESOURCES)
+			{
 				in.at(In::build_short, t, b) = 1; // the engine's word: buildable but for resources
+				if(tradesFor(market, found->second->resources, resources, prices))
+				{
+					in.at(In::build_mask, t, b) = 1;
+					decision.entries[static_cast<int>(ActionType::BUILD)][t * N_BUILDINGS + b] = Entry{town->id, {}, b, 0, 0, 1};
+				}
+			}
+		}
+		// A boat at the town's shipyard (the user, 2026-11-04: another thing to build where the town can), BUILD's SHIP
+		// entry: the shipyard built, its water free (IShipyard::shipyardStatus), its price ours (getBoatCost)
+		if(const auto * yard = dynamic_cast<const IShipyard *>(town); yard && town->hasBuilt(BuildingID::SHIPYARD) && BuildingID::SHIP < N_BUILDINGS)
+		{
+			TResources price;
+			yard->getBoatCost(price);
+			if(yard->shipyardStatus() == IBoatGenerator::GOOD && resources.canAfford(price))
+			{
+				in.at(In::build_mask, t, BuildingID::SHIP) = 1;
+				decision.entries[static_cast<int>(ActionType::BUILD)][t * N_BUILDINGS + BuildingID::SHIP] = Entry{town->id, {}, BuildingID::SHIP};
+			}
 		}
 		// RECRUIT: into the town's garrison (its upper army: a hero garrisoned there takes them) or into the hero visiting
 		// it, the model's choice (2026-10-28, the user: "buy and give it to the hero" in one decision, not two)
@@ -825,7 +914,25 @@ void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)
 			if(ids.empty() || count <= 0)
 				continue;
 			const auto creature = ids.back();
-			const int most = std::min<int>(count, resources / creature.toCreature()->getFullRecruitCost());
+			const auto & price = creature.toCreature()->getFullRecruitCost();
+			int most = std::min<int>(count, resources / price);
+			// Not even one affordable: as many as our market's trades of the rest make affordable (the user, 2026-11-04:
+			// trade-hire when we cannot afford a single creature; the entry's d: payByTrades first)
+			const bool trading = most <= 0;
+			if(trading)
+			{
+				int low = 0;
+				int high = count;
+				while(low < high)
+				{
+					const int middle = (low + high + 1) / 2;
+					if(tradesFor(market, price * middle, resources, prices))
+						low = middle;
+					else
+						high = middle - 1;
+				}
+				most = low;
+			}
 			if(most <= 0)
 				continue;
 			for(int d = 0; d < N_RECRUIT_TARGETS; ++d)
@@ -841,7 +948,7 @@ void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)
 						continue;
 					previous = amount;
 					in.at(In::recruit_mask, t, level, k, d) = 1;
-					decision.entries[static_cast<int>(ActionType::RECRUIT)][((t * N_LEVELS + level) * N_RECRUIT_AMOUNTS + k) * N_RECRUIT_TARGETS + d] = Entry{town->id, destination->id, creature.getNum(), amount, level};
+					decision.entries[static_cast<int>(ActionType::RECRUIT)][((t * N_LEVELS + level) * N_RECRUIT_AMOUNTS + k) * N_RECRUIT_TARGETS + d] = Entry{town->id, destination->id, creature.getNum(), amount, level, trading ? 1 : 0};
 				}
 			}
 		}
@@ -909,11 +1016,7 @@ void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)
 	}
 
 	// TRADE: at a marketplace of ours (the rates improve with each one we own)
-	const CGTownInstance * marketTown = nullptr;
-	for(const auto * town : cb->getTownsInfo(true))
-		if(!marketTown && town->hasBuiltResourceMarketplace())
-			marketTown = town;
-	if(const auto * market = marketTown ? cb->getMarket(marketTown->id) : nullptr)
+	if(market)
 		for(int sell = 0; sell < N_RESOURCES; ++sell)
 			for(int buy = 0; buy < N_RESOURCES; ++buy)
 			{
@@ -930,7 +1033,7 @@ void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)
 						continue;
 					previous = trades;
 					in.at(In::trade_mask, sell, buy, k) = 1;
-					decision.entries[static_cast<int>(ActionType::TRADE)][(sell * N_RESOURCES + buy) * N_TRADE_AMOUNTS + k] = Entry{marketTown->id, {}, sell, buy, trades * give};
+					decision.entries[static_cast<int>(ActionType::TRADE)][(sell * N_RESOURCES + buy) * N_TRADE_AMOUNTS + k] = Entry{market->getObjInstanceID(), {}, sell, buy, trades * give};
 				}
 			}
 
@@ -1098,6 +1201,7 @@ void AlphaMapAI::encodeQuestionGuards(Decision & decision, const std::string & t
 	if(price >= 0 || flees)
 		return; // (a monster's question whose monster is not found: nothing known of what its options do)
 	in.at(In::o_battle, YES) = 1;
+	revealedGuards.insert(obj->id); // (its army in a_* from now on)
 	int i = 0;
 	for(const auto & component : components) // (a bank's guards as its dialog shows them: exact)
 		if(component.type == ComponentType::CREATURE && i < ARMY_SLOTS)

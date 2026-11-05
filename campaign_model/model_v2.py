@@ -342,7 +342,7 @@ class CampaignModelV2(nn.Module):
 		self.build_bias = nn.Parameter(torch.zeros(c.N_BUILDINGS))
 		self.nk2_build, self.nk2_upgrade, self.nk2_trade = zero_output(nn.Linear(4, 1)), zero_output(nn.Linear(2, 1)), zero_output(nn.Linear(2, 1))
 		self.trade_option = zero_output(nn.Linear(2, 1))  # (2026-11-04: each TRADE option's cost and whether it unlocks a building)
-		self.recruit_head = nn.Sequential(nn.Linear(3 * d + 9, d), nn.GELU(), zero_output(nn.Linear(d, c.N_RECRUIT_AMOUNTS * c.N_RECRUIT_TARGETS)))  # (2026-11-04: + the town's visiting hero)
+		self.recruit_head = nn.Sequential(nn.Linear(3 * d + 11, d), nn.GELU(), zero_output(nn.Linear(d, c.N_RECRUIT_AMOUNTS * c.N_RECRUIT_TARGETS)))  # (2026-11-04: + the town's visiting hero, a purchase's trades)
 		self.hire_q, self.hire_k = zero_output(nn.Linear(d, d)), nn.Linear(d, d)
 		self.hire_worth = zero_output(nn.Linear(4, 1))
 		self.army_src, self.army_dst = nn.Linear(2 * d, d), nn.Linear(d, d)
@@ -389,7 +389,7 @@ class CampaignModelV2(nn.Module):
 		state = self.think(state)
 		foresight = self.foresee(state, known)
 		state = self.think_again(state, foresight, known)
-		out = {**self.decide(state, known), **foresight["outputs"], "memory": state.memory_out}
+		out = {**self.decide(state, known), **foresight["outputs"], "memory": state.memory_out, "resource_worth": known.resource_worth}
 		if self.plan_outputs:
 			out["fs_plan"] = self.plan_of(state)
 		return out
@@ -672,7 +672,9 @@ class CampaignModelV2(nn.Module):
 		prior[A_.TRAVEL] = known.travel_prior.reshape(b, HO, L, TG, TG)
 		offers[A_.TRAVEL] = ft.offer(prior[A_.TRAVEL], x["travel_mask"])
 		# BUILD: the town's query against each building
-		learned[A_.BUILD], prior[A_.BUILD] = self.build_scores(own_towns, x) + self.build_bias, self.nk2_build(known.build_rewards).squeeze(-1)
+		_, trade_cost = self.features.trade_weights()  # (a purchase short of resources pays the trades it makes: known.build_trade, recruit_trade)
+		learned[A_.BUILD] = self.build_scores(own_towns, x) + self.build_bias
+		prior[A_.BUILD] = self.nk2_build(known.build_rewards).squeeze(-1) - trade_cost * known.build_trade
 		# RECRUIT: the town and each creature level's token, the amounts; Nullkiller2's prior
 		available = x["t_available"][:, :TO].clamp(min=0).float()
 		gold = x["g_resources"][:, 6].clamp(min=0).float()
@@ -682,11 +684,12 @@ class CampaignModelV2(nn.Module):
 				scales(gold, (1000, 5000, 20000)).reshape(b, 1, 1, 3).expand(b, TO, c.N_LEVELS, 3),
 				scales(self.features.creature_cost[vocab_index(x["t_available_creature"][:, :TO], c.CREATURE_VOCAB)] * available, (1000, 5000, 20000)),
 				self.visitors(state)[:, :TO].unsqueeze(2).expand(b, TO, c.N_LEVELS, d),
+				torch.stack([known.recruit_short.float(), known.recruit_trade], dim=-1),  # (not one affordable alone: the agent trades for it)
 			],
 			dim=-1,
 		)
 		learned[A_.RECRUIT] = self.recruit_head(recruit_in).reshape(b, TO, c.N_LEVELS, c.N_RECRUIT_AMOUNTS, c.N_RECRUIT_TARGETS)
-		prior[A_.RECRUIT] = self.features.recruit_prior(known.town_danger).expand_as(learned[A_.RECRUIT])
+		prior[A_.RECRUIT] = self.features.recruit_prior(known.town_danger).expand_as(learned[A_.RECRUIT]) - trade_cost * known.recruit_trade[..., None, None]
 		_, upgrade_weight, book_weight, pause_weight = self.features.nk2_weights()  # (a skill's: model.CustomFeatures.option_knowledge)
 		home_weight, defend_weight, ferry_weight, hire_weight, _ = self.features.pull_weights()  # (TRADE: trade_weights since 2026-11-04)
 		offers[A_.RECRUIT] = -pause_weight * known.recruit_pause  # (no army bought while saving for a hall: Nullkiller2's habit)

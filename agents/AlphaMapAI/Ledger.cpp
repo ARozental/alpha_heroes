@@ -119,6 +119,10 @@ std::string ledgerJson(const CGameState & gs, int day, bool final)
 			h["exp"].Integer() = hero->exp;
 			h["mana"].Integer() = hero->mana;
 			h["power"].Integer() = hero->getPrimSkillLevel(PrimarySkill::SPELL_POWER);
+			// Its attack and defense in a battle, its items' with them (campaign_model/empire.py: what the army it leads is
+			// worth there, VCMI's damage modifiers)
+			h["attack"].Integer() = hero->getPrimSkillLevel(PrimarySkill::ATTACK);
+			h["defense"].Integer() = hero->getPrimSkillLevel(PrimarySkill::DEFENSE);
 			int dearest = 0; // the dearest combat spell it can cast
 			if(hero->hasSpellbook())
 				for(const auto & spellID : hero->getSpellsInSpellbook())

@@ -743,6 +743,45 @@ def trade_needs(x, t):
 	return torch.stack([torch.log1p(lack * price / 1000), torch.log1p(spare * price / 1000)], dim=-1)
 
 
+def market_rates(x, t):
+	"""VCMI's market at our marketplaces' rate (IMarket::getOffer: its efficiency min((markets + 1) / 20, 0.5) of the
+	resource prices): (give, get) [B, R (sold), R (bought)], give units sold for get units bought, as the agent trades."""
+	price = t.resource_price  # [R] (VCMI's resource prices)
+	efficiency = ((x["g_markets"].float() + 1.0) / 20.0).clamp(max=0.5)  # [B]
+	given = price[None, :, None]  # [1, R (sold), 1]
+	wanted = price[None, None, :] / efficiency[:, None, None]  # [B, 1, R (bought)]
+	dearer = given > wanted
+	give = torch.where(dearer, torch.ones_like(given * wanted), torch.floor(wanted / given + 0.5))  # [B, R, R]
+	get = torch.where(dearer, torch.ceil(given / wanted), torch.ones_like(given * wanted))
+	return give, get
+
+
+def purchase_trades(x, t):
+	"""What a purchase short of resources costs Φ in the trades the agent makes for it (AlphaMapAI::payByTrades, since
+	2026-11-04: building or recruiting trades for itself, the user's): (each building's [B, TO, N_BUILDINGS] where
+	build_short, one creature's of each RECRUIT level [B, TO, N_LEVELS] where we cannot afford one, as log(1 + gold
+	lost / 1000); whether we cannot afford that one creature [B, TO, N_LEVELS]). Each resource short bought from the
+	spare one that loses the least a unit (market_rates; the spare's depletion left out: the agent's plan is exact)."""
+	price = t.resource_price
+	give, get = market_rates(x, t)
+	have = x["g_resources"].clamp(min=0).float()  # [B, R]
+	unit = price[None, :, None] * give / get  # [B, R (sold), R (bought)]: what a unit bought gives away
+
+	def lost(cost):  # cost [B, TO, K, R] -> [B, TO, K]
+		mine = have[:, None, None, :]
+		short, spare = (cost - mine).clamp(min=0.0), (mine - cost).clamp(min=0.0)
+		usable = spare.unsqueeze(-1) >= give[:, None, None]  # [B, TO, K, R (sold), R (bought)]
+		best = torch.where(usable, unit[:, None, None], torch.full_like(usable, float("inf"), dtype=unit.dtype)).amin(dim=-2)
+		gold = torch.where(torch.isfinite(best) & (short > 0), short * (best - price), torch.zeros_like(short))
+		return torch.log1p(gold.sum(dim=-1).clamp(min=0.0) / 1000.0)
+
+	faction = vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)
+	creature = t.creature_resources[vocab_index(x["t_available_creature"][:, : c.OWN_TOWNS], c.CREATURE_VOCAB)]  # [B, TO, LV, R]
+	needs = creature > 0
+	cannot = (needs & (have[:, None, None, :] < creature)).any(dim=-1)  # (not one creature affordable alone)
+	return lost(t.building_resources[faction]) * x["build_short"][:, : c.OWN_TOWNS], lost(creature) * cannot, cannot
+
+
 def trade_options(x, t):
 	"""Each TRADE entry's (sell, buy, TRADE_FRACTIONS) [B, R, R, F, 2] (the user, 2026-11-04: every trade is dumb unless
 	it buys what could not be bought without it): what it costs Φ (log(1 + gold / 1000): the resources sold at their
@@ -753,12 +792,7 @@ def trade_options(x, t):
 	entries: VCMI's market (IMarket::getOffer) at our marketplaces' rate, each fraction of the trades our stock of the
 	resource sold allows, rounded up, at least one."""
 	price = t.resource_price  # [R] (VCMI's resource prices)
-	efficiency = ((x["g_markets"].float() + 1.0) / 20.0).clamp(max=0.5)  # [B]
-	given = price[None, :, None]  # [1, R (sold), 1]
-	wanted = price[None, None, :] / efficiency[:, None, None]  # [B, 1, R (bought)]
-	dearer = given > wanted
-	give = torch.where(dearer, torch.ones_like(given * wanted), torch.floor(wanted / given + 0.5))  # [B, R, R]
-	get = torch.where(dearer, torch.ceil(given / wanted), torch.ones_like(given * wanted))
+	give, get = market_rates(x, t)
 	have = x["g_resources"].clamp(min=0).float()  # [B, R]
 	units = torch.floor(have[:, :, None] / give.clamp(min=1.0))
 	trades = torch.ceil(units.unsqueeze(-1) * constant(c.TRADE_FRACTIONS, price.device, torch.float32)).clamp(min=1.0)  # [B, R, R, F]

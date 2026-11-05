@@ -10,6 +10,7 @@
 #include "lib/AsyncRunner.h"
 #include "lib/CConfigHandler.h"
 #include "lib/CCreatureHandler.h"
+#include "lib/IGameSettings.h"
 #include "lib/UnlockGuard.h"
 #include "lib/battle/BattleStateInfoForRetreat.h"
 #include "lib/callback/CCallback.h"
@@ -239,6 +240,7 @@ void AlphaMapAI::makeTurn()
 			waitTillFree();
 			if(cb->getPlayerStatus(playerID, false) != EPlayerStatus::INGAME)
 				return;
+			unifyStacks();
 			auto decision = encode(DecisionKind::TURN);
 			std::optional<Choice> advice; // (Nullkiller2's, at this decision's chance: before ours, in the same state)
 			std::optional<PlanTargets> plan; // (and its plan there: labels both, never inputs)
@@ -561,6 +563,8 @@ Choice AlphaMapAI::decide(Decision & decision, const std::optional<Choice> & adv
 			}
 		}
 		const auto outputs = Outputs::fromWire(reply);
+		for(int r = 0; r < N_RESOURCES; ++r) // (what a purchase short of resources trades away the least of: payByTrades)
+			decision.worth[r] = outputs[Out::resource_worth][r];
 		// The memory this decision leaves, for the next one: turn decisions only (the others read it). The imitation
 		// learned it over the teacher's turn decisions alone (Teacher.cpp records no questions or exchanges), so the
 		// memory's sequence here is that one
@@ -823,7 +827,8 @@ void AlphaMapAI::sendRecords(bool final)
 			sendToRecordServer(recordSocket, gameKey + ":" + color + ":battle#" + std::to_string(battlesSent++), battleJson);
 		if(final)
 		{
-			const auto summary = "{\"errors\": " + std::to_string(errors) + ", \"failed_actions\": " + std::to_string(failedActions) + teacherJson() + adviceJson() + "}";
+			const auto done = ", \"traded_purchases\": " + std::to_string(tradedPurchases) + ", \"boats\": " + std::to_string(boatsBuilt) + ", \"skills_bought\": " + std::to_string(skillsBought) + ", \"stacks_merged\": " + std::to_string(stacksMerged);
+			const auto summary = "{\"errors\": " + std::to_string(errors) + ", \"failed_actions\": " + std::to_string(failedActions) + done + teacherJson() + adviceJson() + "}";
 			sendToRecordServer(recordSocket, gameKey + ":" + color + ":done", summary);
 		}
 	}
@@ -1106,6 +1111,92 @@ void AlphaMapAI::showMarketWindow(const IMarket * market, const CGHeroInstance *
 
 void AlphaMapAI::showUniversityWindow(const IMarket * market, const CGHeroInstance * visitor, QueryID queryID)
 {
-	addQuery(queryID, "university"); // not yet a decision
-	runAsync("closing a university", [this, queryID]() { answer(queryID, 0); });
+	// Each skill on offer the hero can learn, a yes/no (the user, 2026-11-04: four yes/no choices, the skill's own
+	// embedding for YES): YES buys it (CGameHandler::buySecSkill's rules: not known, learnable, its price ours)
+	addQuery(queryID, "university");
+	const auto marketID = market->getObjInstanceID();
+	const auto heroID = visitor ? visitor->id : ObjectInstanceID();
+	runAsync("a university", [this, marketID, heroID, queryID]()
+	{
+		struct Close // (the window answered however the questions end: an open query would stall the turn)
+		{
+			AlphaMapAI * ai;
+			QueryID id;
+			~Close() { ai->answer(id, 0); }
+		} close{this, queryID};
+		const auto * m = cb->getMarket(marketID);
+		const int price = cb->getSettings().getInteger(EGameSettings::MARKETS_UNIVERSITY_GOLD_COST);
+		for(const auto & item : m ? m->availableItemsIds(EMarketMode::RESOURCE_SKILL) : std::vector<TradeItemBuy>())
+		{
+			const auto * hero = cb->getHero(heroID);
+			const auto skill = item.as<SecondarySkill>();
+			if(!hero || hero->getSecSkillLevel(skill) || !hero->canLearnSkill(skill) || cb->getResourceAmount()[EGameResID::GOLD] < price)
+				continue;
+			auto decision = universityQuestion(hero, skill, price);
+			if(decide(decision).index == 0)
+			{
+				cb->trade(marketID, EMarketMode::RESOURCE_SKILL, GameResID(EGameResID::GOLD), skill, 1, hero);
+				++skillsBought;
+			}
+		}
+	});
+}
+
+Decision AlphaMapAI::universityQuestion(const CGHeroInstance * hero, SecondarySkill skill, int price)
+{
+	auto decision = encode(DecisionKind::YES_NO);
+	encodeOptionContext(decision, hero->id, hero->visitablePos());
+	auto & in = decision.inputs;
+	in.at(In::o_kind, 0) = static_cast<int>(OptionKind::SKILL);
+	in.at(In::o_type, 0) = skill.getNum();
+	in.at(In::o_subtype, 0) = 1; // (a University teaches the basic level)
+	in.at(In::o_amount, 0) = price;
+	in.at(In::o_kind, 1) = static_cast<int>(OptionKind::NO);
+	in.at(In::option_mask, 0) = in.at(In::option_mask, 1) = 1;
+	decision.answers = {1, 0};
+	return decision;
+}
+
+void AlphaMapAI::showShipyardDialog(const IShipyard * obj)
+{
+	// A map shipyard a hero of ours visits (a town's boat is BUILD's SHIP): a yes/no on its embedding (the user,
+	// 2026-11-04), YES builds the boat, when its water is free and its price ours. No query of the server's: held as
+	// one (the turn waits for it), released however the decision ends
+	const auto * object = dynamic_cast<const CGObjectInstance *>(obj->getObject());
+	TResources price;
+	obj->getBoatCost(price);
+	if(!object || dynamic_cast<const CGTownInstance *>(object) || obj->shipyardStatus() != IBoatGenerator::GOOD || !cb->getResourceAmount().canAfford(price))
+		return;
+	const QueryID hold(-2);
+	addQuery(hold, "a shipyard");
+	const auto id = object->id;
+	runAsync("a shipyard", [this, id, hold]()
+	{
+		struct Release
+		{
+			AlphaMapAI * ai;
+			QueryID id;
+			~Release()
+			{
+				std::scoped_lock lock(ai->statusMutex);
+				ai->queries.erase(id);
+				ai->statusChanged.notify_all();
+			}
+		} release{this, hold};
+		const auto * yard = dynamic_cast<const IShipyard *>(cb->getObj(id, false));
+		if(!yard)
+			return;
+		auto decision = encode(DecisionKind::YES_NO);
+		encodeOptionContext(decision, activeHero, activeTarget);
+		auto & in = decision.inputs;
+		in.at(In::o_kind, 0) = static_cast<int>(OptionKind::YES);
+		in.at(In::o_kind, 1) = static_cast<int>(OptionKind::NO);
+		in.at(In::option_mask, 0) = in.at(In::option_mask, 1) = 1;
+		decision.answers = {1, 0};
+		if(decide(decision).index == 0)
+		{
+			cb->buildBoat(yard);
+			++boatsBuilt;
+		}
+	});
 }

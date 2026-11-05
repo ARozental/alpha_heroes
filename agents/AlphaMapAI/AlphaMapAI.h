@@ -4,6 +4,9 @@
 #include "Tensors.h"
 
 #include "lib/callback/CAdventureAI.h"
+#include "lib/ResourceSet.h"
+#include "lib/mapObjects/IMarket.h"
+#include "lib/mapObjects/IObjectInterface.h"
 #include "lib/int3.h"
 #include "lib/json/JsonNode.h"
 
@@ -47,10 +50,27 @@ struct Decision
 	std::array<int3, MapSchema::OWN_HEROES> centers;            // the tile in the middle of each window
 	std::array<std::unordered_map<int, Entry>, MapSchema::N_ACTION_TYPES> entries;
 	std::vector<int> answers; // the reply to send for each option of a question
+	// The model's resource_worth for it (schema 12): what a purchase short of resources trades away the least of
+	std::array<float, MapSchema::N_RESOURCES> worth{};
 
 	int3 windowTile(int hero, int row, int column) const;
 	int holderOf(ObjectInstanceID id) const;
 };
+
+/// A trade of a purchase short of resources: give units of sell (whole lots of the market's offer) for buy
+struct Trade
+{
+	int sell = 0;
+	int buy = 0;
+	int give = 0;
+};
+
+/// What a purchase of cost lacks from have, bought at the market with what it leaves over: for each resource short, the
+/// lots of the spare resource that lose the least worth a unit bought, the fewest that cover it (the user, 2026-11-04:
+/// building or recruiting trades for itself, no amount for the model to set); none when no such trades cover it
+std::optional<std::vector<Trade>> tradesFor(const IMarket * market, const TResources & cost, const TResources & have, const std::array<float, MapSchema::N_RESOURCES> & worth);
+/// Each resource's gold at the market (its own sale price; gold 1): the worth that tests whether trades can cover a cost
+std::array<float, MapSchema::N_RESOURCES> marketWorth(const IMarket * market);
 
 /// The model's choice: an action type and its table entry (turn), or an option (question)
 struct Choice
@@ -152,6 +172,15 @@ class AlphaMapAI : public CAdventureAI
 	int decisionsToday = 0;
 	int errors = 0;
 	int failedActions = 0;
+	// What the agent did for the model's choices beyond the action itself (the game's summary): purchases short of
+	// resources paid by trades, boats built, skills bought at a University, stacks of one creature merged
+	int tradedPurchases = 0;
+	int boatsBuilt = 0;
+	int skillsBought = 0;
+	int stacksMerged = 0;
+	// The objects whose guards a question has shown us (encodeQuestionGuards): their armies in a_* from then on, as they
+	// are each time (after a battle, a new week), as a scouted bank's or guarded artifact's army shows to a human
+	std::set<ObjectInstanceID> revealedGuards;
 	bool done = false;
 	// (action type, table entry, target tile) of the actions that changed nothing since the state last changed: not
 	// offered again until something changes (dropFutile), else the same no-op could be chosen MAX_DECISIONS_PER_DAY
@@ -201,6 +230,16 @@ class AlphaMapAI : public CAdventureAI
 	// intended: a move's destination when the caller knows it (its plan's tile), else the request's own tile is taken
 	bool matchRequest(const Decision & decision, const CPackForServer * pack, Choice & choice, bool & exact, std::string & unmatched, int3 intended = int3(-1, -1, -1)) const;
 	std::string teacherJson() const;
+	// Our marketplace (the first town of ours with one; its rates count all of them): trades and purchases short of
+	// resources go through it; nullptr with none
+	const IMarket * ourMarket() const;
+	// A purchase of cost short of resources: its trades made first (tradesFor at decision's worth; the market's own
+	// prices when that finds none)
+	void payByTrades(const TResources & cost, const Decision & decision);
+	// The stacks of one creature in an army of ours merged into one (the user, 2026-11-04: "whenever possible, unify")
+	void unifyStacks();
+	// A University's skill as a yes/no: YES buys it (the option a SKILL: the skill, basic, its price)
+	Decision universityQuestion(const CGHeroInstance * hero, SecondarySkill skill, int price);
 
 public:
 	AlphaMapAI();
@@ -230,6 +269,7 @@ public:
 	void showTavernWindow(const CGObjectInstance * object, const CGHeroInstance * visitor, QueryID queryID) override;
 	void showMarketWindow(const IMarket * market, const CGHeroInstance * visitor, QueryID queryID) override;
 	void showUniversityWindow(const IMarket * market, const CGHeroInstance * visitor, QueryID queryID) override;
+	void showShipyardDialog(const IShipyard * obj) override;
 	void heroExchangeStarted(ObjectInstanceID hero1, ObjectInstanceID hero2, QueryID queryID) override;
 	std::optional<BattleAction> makeSurrenderRetreatDecision(const BattleID & battleID, const BattleStateInfoForRetreat & battleState) override;
 

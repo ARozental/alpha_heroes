@@ -7,8 +7,8 @@
 
 namespace MapSchema
 {
-constexpr int SCHEMA_VERSION = 11;
-constexpr const char * CONTRACT_HASH = "3653f6c54ad2233b";
+constexpr int SCHEMA_VERSION = 12;
+constexpr const char * CONTRACT_HASH = "6ee1ae97fd6670c0";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;
@@ -449,6 +449,7 @@ enum class Out : int
 	option_logp,
 	value,
 	memory,
+	resource_worth,
 	COUNT
 };
 
@@ -469,6 +470,7 @@ constexpr std::array<TensorSpec, static_cast<int>(Out::COUNT)> OUTPUTS = {{
 	TensorSpec{"option_logp", DType::FLOAT32, 1, {8, 1, 1, 1}, 0},
 	TensorSpec{"value", DType::FLOAT32, 1, {3, 1, 1, 1}, 0},
 	TensorSpec{"memory", DType::FLOAT32, 2, {8, 64, 1, 1}, 0},
+	TensorSpec{"resource_worth", DType::FLOAT32, 1, {7, 1, 1, 1}, 0},
 }};
 
 /// The table (output) and its legality mask (input) of an action type; END has none

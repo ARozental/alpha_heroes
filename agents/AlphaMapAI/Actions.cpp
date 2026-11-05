@@ -1,7 +1,10 @@
 #include "StdInc.h"
 #include "AlphaMapAI.h"
 
+#include "lib/CCreatureHandler.h"
 #include "lib/callback/CCallback.h"
+#include "lib/entities/building/CBuilding.h"
+#include "lib/entities/faction/CTown.h"
 #include "lib/mapObjects/CGHeroInstance.h"
 #include "lib/mapObjects/CGTownInstance.h"
 #include "lib/networkPacks/TradeItem.h"
@@ -78,14 +81,33 @@ bool AlphaMapAI::execute(const Decision & decision, const Choice & choice)
 	{
 		case ActionType::BUILD:
 			if(const auto * town = cb->getTown(e.first))
-				cb->buildBuilding(town, BuildingID(e.a));
+			{
+				if(e.a == BuildingID::SHIP)
+				{
+					if(const auto * yard = dynamic_cast<const IShipyard *>(town))
+					{
+						cb->buildBoat(yard);
+						++boatsBuilt;
+					}
+				}
+				else
+				{
+					if(e.d) // (short of resources: our market's trades first)
+						payByTrades(town->getTown()->buildings.at(BuildingID(e.a))->resources, decision);
+					cb->buildBuilding(town, BuildingID(e.a));
+				}
+			}
 			break;
 		case ActionType::RECRUIT:
 		{
 			const auto * town = cb->getTown(e.first);
 			const auto * destination = armyOf(*cb, e.second);
 			if(town && destination)
+			{
+				if(e.d) // (not one affordable: our market's trades first)
+					payByTrades(CreatureID(e.a).toCreature()->getFullRecruitCost() * e.b, decision);
 				cb->recruitCreatures(town, destination, CreatureID(e.a), e.b, e.c);
+			}
 			break;
 		}
 		case ActionType::HIRE:
@@ -155,6 +177,40 @@ bool AlphaMapAI::execute(const Decision & decision, const Choice & choice)
 			return false;
 	}
 	return fingerprint(*cb) != before;
+}
+
+void AlphaMapAI::payByTrades(const TResources & cost, const Decision & decision)
+{
+	const auto * market = ourMarket();
+	auto trades = tradesFor(market, cost, cb->getResourceAmount(), decision.worth);
+	if(!trades) // (the model's worth found none: the market's own prices did, when the entry was made)
+		trades = tradesFor(market, cost, cb->getResourceAmount(), marketWorth(market));
+	if(!trades)
+		return;
+	for(const auto & trade : *trades)
+		cb->trade(market->getObjInstanceID(), EMarketMode::RESOURCE_RESOURCE, GameResID(trade.sell), GameResID(trade.buy), trade.give, nullptr);
+	++tradedPurchases;
+}
+
+void AlphaMapAI::unifyStacks()
+{
+	std::vector<const CArmedInstance *> armies;
+	for(const auto * hero : cb->getHeroesInfo()) // (ours)
+		armies.push_back(hero);
+	for(const auto * town : cb->getTownsInfo(true))
+		armies.push_back(town);
+	for(const auto * army : armies)
+		for(int first = 0; first < ARMY_SLOTS; ++first)
+			for(int second = first + 1; second < ARMY_SLOTS; ++second)
+			{
+				const auto * one = army->getStackPtr(SlotID(first));
+				const auto * other = army->getStackPtr(SlotID(second));
+				if(one && other && one->getId() == other->getId())
+				{
+					cb->mergeStacks(army, army, SlotID(second), SlotID(first)); // (the later slot into the earlier)
+					++stacksMerged;
+				}
+			}
 }
 
 bool AlphaMapAI::moveHero(ObjectInstanceID heroID, int3 destination)

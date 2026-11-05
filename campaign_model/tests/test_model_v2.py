@@ -1103,6 +1103,35 @@ def test_the_teachers_trade_advice_is_left_out_unless_asked_for():
 	assert taught(types, advised, CampaignConfig(nk2_trade_advice=True)).tolist() == advised.tolist()
 
 
+def test_a_purchase_short_of_resources_is_priced_by_the_trades_it_makes():
+	"""features.purchase_trades (the agent trades for a purchase short of resources: AlphaMapAI::payByTrades): a building
+	short of 5 wood with gold to spare costs what the cheapest spare source of wood gives away beyond the wood's price
+	(market_rates, as the agent trades); one we can afford costs nothing; a creature we cannot afford one of is short
+	and priced the same way."""
+	from campaign_model import features as ft
+
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	t = m.features
+	x = tensors(rich_inputs(1, 5))
+	x["g_markets"][:] = 1
+	x["g_resources"][0] = torch.tensor([5, 0, 0, 0, 0, 0, 10_000])
+	faction = int(x["t_faction"][0, 0])
+	short_one, enough = 30, 31  # (two buildings of the town's faction: costs set here)
+	t.building_resources[faction, short_one] = torch.tensor([10.0, 0, 0, 0, 0, 0, 2000])
+	t.building_resources[faction, enough] = torch.tensor([5.0, 0, 0, 0, 0, 0, 2000])
+	x["build_short"][0] = False
+	x["build_short"][0, 0, short_one] = x["build_short"][0, 0, enough] = True
+	x["t_available_creature"][0, 0, 0] = 12  # (a creature priced here: 100 crystal)
+	t.creature_resources[12] = torch.tensor([0.0, 0, 0, 0, 100, 0, 0])
+	build, recruit, cannot = ft.purchase_trades(x, t)
+	give, get = ft.market_rates(x, t)
+	price = t.resource_price
+	wood = min(float(price[s] * give[0, s, 0] / get[0, s, 0]) for s in range(7) if s != 0 and float(x["g_resources"][0, s]) - float(t.building_resources[faction, short_one, s]) >= float(give[0, s, 0]))
+	assert float(build[0, 0, short_one]) == pytest.approx(math.log1p(5 * (wood - float(price[0])) / 1000), rel=1e-5)
+	assert float(build[0, 0, enough]) == 0.0
+	assert bool(cannot[0, 0, 0]) and float(recruit[0, 0, 0]) > 0
+
+
 def test_options_that_differ_never_share_an_identity():
 	"""encoders.OptionEncoder has no hashed rows (features.bucket put 546 of 954 options on a shared row, 2026-11-04: NO with
 	a scroll of spell 57, a skill with a creature's amount): those pairs differ, and so do two resources and two primary
