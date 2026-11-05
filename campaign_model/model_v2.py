@@ -35,7 +35,7 @@ from . import constants as c
 from . import encoders as E
 from . import features as ft
 from . import priors
-from .model import MOVE_FEATURES, CustomFeatures, PairBias, dense, flat_log_softmax, with_added
+from .model import MOVE_FEATURES, QUESTION_FEATURES, CustomFeatures, PairBias, dense, flat_log_softmax, with_added
 from .schema import HEADS
 
 HO, TO, A, W, HD = c.OWN_HEROES, c.OWN_TOWNS, c.ARMY_SLOTS, c.WINDOW, c.N_HOLDERS
@@ -48,6 +48,7 @@ FORESIGHT_HIDDEN = 16
 ACTION_TARGETS = 2 + len(ft.PHI_PARTS)
 HERO_TARGETS = 2  # alive and ours tomorrow (logit), its army's log ratio tomorrow
 TURN_TARGETS = 1 + R  # Φ's log ratio at the end of our turn, each resource's log ratio tomorrow
+COSINE_BOUND = 0.995  # a choice's cosine scaled by it under the atanh (cosine_logit): each logit within ±3.0
 DISTANCE_BUCKETS = 12  # the tile readers' distance bias: Chebyshev tiles 0, 1, 2, 3-4, 5-7, 8-11, ..., 96+, another level
 
 
@@ -244,8 +245,9 @@ class CampaignModelV2(nn.Module):
 
 	def load_state_dict(self, state_dict, strict=True, assign=False):
 		"""A checkpoint from before a parameter was added (model.ADDED) loads with it at 0: the model as it was; one from
-		before 2026-11-04's MOVE features with move_pair's first layer moved to its inputs now (migrate_move_inputs)."""
-		return super().load_state_dict(with_added(migrate_move_inputs(state_dict), self.state_dict()), strict=strict, assign=assign)
+		before 2026-11-04's MOVE features with move_pair's first layer moved to its inputs now (migrate_move_inputs); one
+		from before 2026-11-04's question head with its fight and join weights in option_weights (migrate_option_head)."""
+		return super().load_state_dict(with_added(migrate_option_head(migrate_move_inputs(state_dict)), self.state_dict()), strict=strict, assign=assign)
 
 	def __init__(self, dim=64, cell_dim=16, heads=4, layers=2, share_target="share"):
 		"""cell_dim: the map tiles' width (the U-Net's at full resolution; twice and four times it at half and a quarter):
@@ -346,12 +348,16 @@ class CampaignModelV2(nn.Module):
 		self.buy_item = small_embedding(c.N_BUY_ITEMS, d)
 		self.buy_q = zero_output(nn.Linear(d, d))
 		self.dismiss_out = zero_output(nn.Linear(d, 1))
-		self.option_q = zero_output(nn.Linear(2 * d, d))
-		# A question's battle and join (2026-11-04; model.CustomFeatures.question_features): what each option does with
-		# its creatures into the option's token (o_battle, o_join) and their fight's and join's features onto the option's
-		# logit, beside their priors; at 0 to begin with
+		# A question (the user, 2026-11-04: every option its own embedding, never one YES vector for every question; a
+		# choice's logit the atanh of a cosine): the decision's state, from the global token and the hero asked, against
+		# each option's key: its identity (encode_options: the model's own vectors of what it names, with what it does with
+		# the question's creatures, option_flags: o_battle, o_join, at 0 to begin with) and its token after the blocks (at
+		# 0 to begin with); the options' known features (model.CustomFeatures.option_knowledge) onto the logit, at 0
 		self.option_flags = zero_output(nn.Linear(2, d))
-		self.answer_fight, self.answer_join = zero_output(nn.Linear(6, 1)), zero_output(nn.Linear(3, 1))
+		self.decision = SwiGLU(2 * d, d, d)
+		self.option_context = zero_output(nn.Linear(d, d))
+		self.option_weights = nn.Linear(QUESTION_FEATURES, 1, bias=False)
+		nn.init.zeros_(self.option_weights.weight)
 		self.end_out = zero_output(nn.Linear(d, 1))
 		self.type_bias = nn.Parameter(priors.action_types().clone())
 		self.value_hidden = nn.Sequential(nn.Linear(3 * d + ft_phi_features(), d), nn.GELU())
@@ -419,9 +425,18 @@ class CampaignModelV2(nn.Module):
 		state.towns, state.town_stacks, state.town_levels = self.encode_town(x)
 		state.tavern, _ = self.encode_hero(E.tavern_fields(x))
 		state.other_stacks, state.other = self.encode_other(x["x_creature"], x["x_count"], torch.ones_like(x["x_creature"][:, 0], dtype=torch.bool))
-		state.options = self.encode_options(x) + self.option_flags(torch.stack([x["o_battle"], x["o_join"]], dim=-1).float()) * x["option_mask"].unsqueeze(-1)
+		tokens, identities = self.encode_options(x, self.option_tables())
+		flags = self.option_flags(torch.stack([x["o_battle"], x["o_join"]], dim=-1).float()) * x["option_mask"].unsqueeze(-1)
+		state.options, state.option_keys = tokens + flags, identities + flags  # (the key: a choice's in decide)
 		state.tiles = self.encode_tiles(x)  # [B, L, S, S, dc]
 		return state
+
+	def option_tables(self):
+		"""The embeddings an option's identity names (encoders.OptionTables): the hero encoder's skill and artifact rows, spells
+		and army encoder, the global encoder's object and pair rows: the same vectors the model reads those things as
+		elsewhere."""
+		hero, glob = self.encode_hero, self.encode_global
+		return E.OptionTables(hero.skill, hero.artifact, hero.spells, hero.army, glob.object, glob.subtype, glob.pairs)
 
 	# ---- take_sides: ownership transforms every vector ----
 
@@ -643,7 +658,7 @@ class CampaignModelV2(nn.Module):
 		)
 		learned[A_.RECRUIT] = self.recruit_head(recruit_in).reshape(b, TO, c.N_LEVELS, c.N_RECRUIT_AMOUNTS, c.N_RECRUIT_TARGETS)
 		prior[A_.RECRUIT] = self.features.recruit_prior(known.town_danger).expand_as(learned[A_.RECRUIT])
-		skill_weight, upgrade_weight, book_weight, pause_weight = self.features.nk2_weights()
+		_, upgrade_weight, book_weight, pause_weight = self.features.nk2_weights()  # (a skill's: model.CustomFeatures.option_knowledge)
 		home_weight, defend_weight, ferry_weight, hire_weight, _ = self.features.pull_weights()  # (TRADE: trade_weights since 2026-11-04)
 		offers[A_.RECRUIT] = -pause_weight * known.recruit_pause  # (no army bought while saving for a hall: Nullkiller2's habit)
 		# HIRE: the town's query against each hero for hire (the same hero space as ours) + what the hire does to Φ
@@ -679,17 +694,13 @@ class CampaignModelV2(nn.Module):
 		offers[A_.BUY] = best_legal(prior[A_.BUY], x["buy_mask"])
 		learned[A_.DISMISS] = self.dismiss_out(own_heroes).squeeze(-1)
 		prior[A_.DISMISS] = torch.zeros_like(learned[A_.DISMISS])
-		# A question's options: each against the global token and the hero it is about; Nullkiller2's skill scores
+		# A question: the decision's state (the global token, the hero asked) against each option's key (its identity and
+		# its token after the blocks); the options' priors and known features (model.CustomFeatures.option_knowledge)
 		about = torch.gather(state.heroes, 1, x["d_hero"].clamp(min=0).reshape(b, 1, 1).expand(b, 1, d)).squeeze(1) * (x["d_hero"] >= 0).float().unsqueeze(-1)
-		query = self.option_q(torch.cat([state.glob, about], dim=-1))
-		# (the option that starts a battle: its fight's prior, MOVE's fight's, and features; the one that takes the creatures
-		# in: what they are worth less their price; a dwelling's "recruit?", a guard's "pass?", a quest's
-		# "complete it?": YES, as Nullkiller2 answers them; the rest: neither)
-		q = known.question
-		answers = x["o_battle"].float() * (q["battle_prior"] + self.answer_fight(q["fight"]).squeeze(-1)).unsqueeze(1) + x["o_join"].float() * (q["join_prior"] + self.answer_join(q["join"]).squeeze(-1)).unsqueeze(1)
-		nk2_yes = q["recruit"].float() * self.features.recruit_yes_weight() + q["visit"].float() * self.features.visit_yes_weight()
-		answers = answers + nk2_yes.unsqueeze(1) * (x["o_kind"] == int(c.OptionKind.YES)).float()
-		out["option_logp"] = masked_log_softmax((state.options * query.unsqueeze(1)).sum(dim=-1) / math.sqrt(d) + skill_weight * known.skill_scores + answers, x["option_mask"])
+		decision = self.decision(torch.cat([state.glob, about], dim=-1))
+		keys = state.option_keys + self.option_context(state.options)
+		chosen = cosine_logit(decision, keys) + known.option_prior + self.option_weights(known.option_features).squeeze(-1)
+		out["option_logp"] = masked_log_softmax(chosen, x["option_mask"])
 		# The action type: each table normalised within itself (the contract's: the AI samples a type, then an entry).
 		# A type is as good as its best option: its score is its bias (priors/action_types.csv), what its domain prior
 		# offers (offers: the best legal prior entry, as v1's; MOVE's and TRAVEL's the best tile's and area's value as a
@@ -847,6 +858,30 @@ def move_pair_columns(old, fold=True):
 		new[:, base + MOVE_KEPT.index(MOVE_FEATURES.index("value"))] += old[:, base + OLD_MOVE_KNOWN - 1]
 	new[:, base + MOVE_KEPT.index(MOVE_FEATURES.index("behind"))] = 0.0
 	return new
+
+
+def cosine_logit(query, keys, bound=COSINE_BOUND):
+	"""Each choice's logit [B, O] (the user, 2026-11-04): the atanh of its key's cosine with the decision's query (query
+	[B, d], keys [B, O, d]), scaled by bound to keep it and its gradient finite; about 0 for a fresh model's (random
+	vectors are nearly orthogonal), every choice as likely."""
+	cosine = bound * F.cosine_similarity(query.unsqueeze(1), keys, dim=-1, eps=1e-6)
+	return 0.5 * (torch.log1p(cosine) - torch.log1p(-cosine))  # (atanh: ONNX's opset 17 has none)
+
+
+def migrate_option_head(state_dict):
+	"""A state dict from before 2026-11-04's question head (option_q's dot product, answer_fight and answer_join, the
+	options' hashed rows): the fight's and the join's weights become option_weights' columns (model.QUESTION_FEATURES:
+	the fight's 6, the join's 3, then their flags, which take the two biases), exactly; option_q and the hashed rows go
+	(encoders.OptionEncoder: each option's identity now the model's own vectors of what it names); as it is otherwise."""
+	gone = ("option_q.", "answer_fight.", "answer_join.", "encode_options.subtype.")
+	if not any(key.startswith(gone) for key in state_dict):
+		return state_dict
+	state = {key: value for key, value in state_dict.items() if not key.startswith(gone)}
+	if "answer_fight.weight" in state_dict:
+		fight, join = state_dict["answer_fight.weight"], state_dict["answer_join.weight"]
+		biases = torch.stack([state_dict["answer_fight.bias"][0], state_dict["answer_join.bias"][0]]).reshape(1, 2).to(fight)
+		state["option_weights.weight"] = torch.cat([fight, join, biases], dim=1)
+	return state
 
 
 def migrate_move_inputs(state_dict):

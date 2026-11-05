@@ -38,11 +38,14 @@ def test_a_blocked_tile_is_blocked_and_nothing_else():
 
 def test_an_old_checkpoint_folds_its_subtype_tables():
 	"""Each new row is the mean of the old rows folded into it (a pair's row modulo SUBTYPE_BUCKETS) that a gradient
-	reached; a row none reached keeps the fresh model's; Adam's moments fold alike."""
+	reached; a row none reached keeps the fresh model's; Adam's moments fold alike. (v1's table: v2's options have no
+	hashed rows since 2026-11-04, encoders.OptionEncoder.)"""
+	from campaign_model.model import CampaignModel
+
 	torch.manual_seed(1)
-	model = CampaignModelV2(dim=16, cell_dim=8, layers=1)
+	model = CampaignModel(dim=16, cell_dim=8, layers=1)
 	optimizer = make_optimizer(model, CampaignConfig())
-	name = "encode_options.subtype.weight"  # (still hashed: folded)
+	name = "subtype.weight"  # (still hashed: folded)
 	state = {"model": {k: v.clone() for k, v in model.state_dict().items()}}
 	old = torch.randn(c.SUBTYPE_HASH, state["model"][name].shape[1])
 	state["model"][name] = old

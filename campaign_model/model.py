@@ -63,6 +63,7 @@ PHI_FEATURES = len(ft.PHI_SCALES) + len(ft.PHI_PARTS)
 HERO_FEATURES = 3 + 1 + 3 * c.N_PRIMARY + 2 + 1 + 3 + 1 + 1 + 1 + 3 + 1 + 6 + 1 + 3
 TOWN_FEATURES = 3 + 4 + 1 + 3 + 2 + 1
 OPTION_FEATURES = 3 + 3 + 1
+QUESTION_FEATURES = 6 + 3 + 2  # (v2's option_knowledge: a question's fight on the option that fights, its join on the one that takes, the two flags)
 MOVE_FEATURES = ("value", "object", "fight", "loss", "win", "explore", "danger", "defend", "move_left", "enemy", "behind", "home", "under_threat", "to_main")
 CELL_FEATURES = c.N_TILE_FLAGS + 3 + 2 + 4 + 3 + 1 + len(MOVE_FEATURES)
 OBJECT_FEATURES = 7 + 3 + 1
@@ -446,19 +447,16 @@ class CustomFeatures(nn.Module):
 		f.travel_prior = self.travel_prior(x, f)
 		if windows.shape[0] > 0:
 			f.update(self.tile_features(x, windows, f))
-		f.question = self.question_features(x, f)
+		f.option_prior, f.option_features = self.option_knowledge(x, f)
 		return f
 
-	def question_features(self, x, f):
-		"""A question's battle and join (schema 11: d_guard_*, o_battle, o_join; the user, 2026-11-04: a battle decided as a
-		MOVE's fight is, an offer to join easy to take): the hero asked (d_hero) against the question's creatures by
-		tile_features' estimates (army, total, race, spells), their hopeless view and the fight's value (its experience
-		and a guarded object's worth, the bank's reward, as often as we win; its losses as fight_return counts them); and
-		what taking them is worth (at cost + u) less the join option's price. {"fight": [B, 6], "battle_prior": [B]
-		(value_logit of the fight's value less safety x hopeless, as MOVE's), "join": [B, 3], "join_prior": [B], "recruit": [B]
-		a dwelling's "recruit?" (its YES: recruit_yes_weight), "visit": [B] a guard's "pass?", a quest's "complete it?", a
-		Tree of Knowledge's level (visit_yes_weight)}; the options they are for are model_v2's to pick (o_battle,
-		o_join, o_kind YES)."""
+	def question_guards(self, x, f):
+		"""A question's guards (schema 11: d_guard_*; the user, 2026-11-04: a battle decided as a MOVE's fight is, an offer to
+		join easy to take): the hero asked (d_hero) against them by tile_features' estimates (army, total, race, spells),
+		their hopeless view and the fight's value (its experience and a guarded object's worth, the bank's reward, as often
+		as we win; its losses as fight_return counts them); and what taking them is worth (at cost + u) less the join
+		option's price. (the fight's features [B, 6], its prior [B]: value_logit of its value less safety x hopeless, as
+		MOVE's; the join's features [B, 3], its prior [B])."""
 		hero = x["d_hero"].clamp(min=0, max=HO - 1)  # (our hero asked; with none, its options carry no battle or join)
 
 		def asked(values):  # [B] of a [B, H or HO] per-hero value
@@ -489,14 +487,34 @@ class CustomFeatures(nn.Module):
 		fight = ft.fight_return(win, loss, asked(f.hero_gold), at_stake, gain) + win * reward
 		price = (x["o_amount"].clamp(min=0).float() * x["o_join"]).sum(dim=-1)
 		joined = gold - price
-		return {
-			"fight": torch.cat([ft.strength_view(ratios), hopeless.unsqueeze(-1), torch.tanh(ft.value_logit(fight) / 4).unsqueeze(-1)], dim=-1),
-			"battle_prior": ft.value_logit(fight) - self.safety_weight() * hopeless,
-			"join": torch.stack([torch.log1p(gold / 1000.0), torch.log1p(price / 1000.0), torch.tanh(ft.value_logit(joined) / 4)], dim=-1),
-			"join_prior": ft.value_logit(joined),
-			"recruit": functools.reduce(torch.logical_or, [obj == o for o in ft.DWELLING_OBJECTS]) & ~(x["o_battle"] | x["o_join"]).any(dim=-1),
-			"visit": functools.reduce(torch.logical_or, [obj == o for o in ft.VISIT_OBJECTS]) & ~(x["o_battle"] | x["o_join"]).any(dim=-1),
-		}
+		return (
+			torch.cat([ft.strength_view(ratios), hopeless.unsqueeze(-1), torch.tanh(ft.value_logit(fight) / 4).unsqueeze(-1)], dim=-1),
+			ft.value_logit(fight) - self.safety_weight() * hopeless,
+			torch.stack([torch.log1p(gold / 1000.0), torch.log1p(price / 1000.0), torch.tanh(ft.value_logit(joined) / 4)], dim=-1),
+			ft.value_logit(joined),
+		)
+
+	def nk2_yes(self, x):
+		"""What YES gains [B] where Nullkiller2 answers YES and joint7 had answered NO (2026-11-04): a dwelling's "recruit?"
+		(recruit_yes_weight), a guard's "pass?", a quest's "complete it?", a Tree of Knowledge's level (visit_yes_weight);
+		0 elsewhere, and wherever an option fights or takes the question's creatures."""
+		obj = x["d_object"]
+		plain = ~(x["o_battle"] | x["o_join"]).any(dim=-1)
+		of = lambda objects: (functools.reduce(torch.logical_or, [obj == o for o in objects]) & plain).float()  # noqa: E731
+		return of(ft.DWELLING_OBJECTS) * self.recruit_yes_weight() + of(ft.VISIT_OBJECTS) * self.visit_yes_weight()
+
+	def option_knowledge(self, x, f):
+		"""What is known of each option of a question (the user, 2026-11-04: every expert rule its own function, gathered
+		here): (its prior [B, O]: the known AI's values with their corrections, the guards' fight on the option that fights
+		them and their join on the one that takes them (question_guards), Nullkiller2's YES (nk2_yes) and its skill scores
+		x their weight; its features [B, O, QUESTION_FEATURES] for the model's zero-init weights: the fight's 6 and the join's
+		3 on those options, then those two flags)."""
+		fight, battle_prior, join, join_prior = self.question_guards(x, f)
+		battle, takes = x["o_battle"].float(), x["o_join"].float()
+		yes = (x["o_kind"] == int(c.OptionKind.YES)).float()
+		prior = battle * battle_prior.unsqueeze(1) + takes * join_prior.unsqueeze(1) + yes * self.nk2_yes(x).unsqueeze(1) + self.nk2_weights()[0] * f.skill_scores
+		features = torch.cat([battle.unsqueeze(-1) * fight.unsqueeze(1), takes.unsqueeze(-1) * join.unsqueeze(1), battle.unsqueeze(-1), takes.unsqueeze(-1)], dim=-1)
+		return prior, features
 
 	def town_strength(self, x, power):
 		"""Each town's log strength [B, T]: its garrison's, plus its fort's while it is defended (FORT_STRENGTH x a gain)."""
@@ -946,8 +964,12 @@ ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
 # the mixer (move_mix*: its direct path as the fresh model has it, Nullkiller2's rule) and the foresight's battle heads)
-ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; answer_fight, answer_join, option_flags: a question's battle and join, at 0)
-	"foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option", "answer_fight", "answer_join", "option_flags",
+ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_flags: a question's battle and join, at 0; the question's
+	# decision state, its keys' context at 0, the options' known features' weights at 0 and the components' own rows:
+	# model_v2.migrate_option_head)
+	"foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option", "option_flags",
+	"decision", "option_context", "option_weights", "encode_options.component", "encode_options.primary", "encode_options.resource",
+	"encode_options.numbers",
 )
 
 

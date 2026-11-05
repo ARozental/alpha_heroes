@@ -5,6 +5,8 @@ import math
 import numpy as np
 import pytest
 import torch
+from torch import nn
+from torch.nn import functional as F
 
 from campaign_model import constants as c
 from campaign_model.config import CampaignConfig
@@ -121,11 +123,11 @@ def test_every_part_learns_after_its_zero_starts_move():
 		"encode_hero.", "encode_town.", "encode_tiles.", "encode_global.", "encode_options.", "encode_other.", "reach.", "travel_days.", "sides.", "tile_sides.",
 		"player.", "players.", "join_", "stamp_", "unet.", "read_tiles.", "area.", "blocks.", "norm.", "pair_", "foresight.", "again_", "move_pair.", "travel_",
 		"move_out.", "move_mix", "act_", "build_q.", "building.", "recruit_head.", "hire_", "army_src.", "army_dst.", "army_out.", "trade_head.", "cast_q.", "spell.",
-		"buy_q.", "buy_item.", "option_q.", "end_out.", "type_bias", "value_hidden.", "value_heads.", "growth_heads.", "end_head.",
+		"buy_q.", "buy_item.", "decision.", "option_context.", "end_out.", "type_bias", "value_hidden.", "value_heads.", "growth_heads.", "end_head.",
 	)
 	dead = [name for name, p in model.named_parameters() if name.startswith(required) and (p.grad is None or float(p.grad.abs().sum()) == 0)]
 	# (embedding rows of ids absent from these inputs get none: what must learn is every block's dense part)
-	dead = [name for name in dead if not any(e in name for e in ("hero_type", "klass", "artifact", "skill", "creature", "quantity", "faction", "subtype", "terrain", "road", "object", "sound", "kind", "last", "player.weight", "building", "spell.weight", "buy_item.weight"))]
+	dead = [name for name in dead if not any(e in name for e in ("hero_type", "klass", "artifact", "skill", "creature", "quantity", "faction", "subtype", "terrain", "road", "object", "sound", "kind", "last", "player.weight", "building", "spell.weight", "buy_item.weight", "primary", "resource"))]
 	assert not dead, sorted({".".join(name.split(".")[:3]) for name in dead})
 
 
@@ -891,7 +893,7 @@ def _question(x, b, creature, count, battle=None, join=None, d_object=16):
 
 
 def test_a_banks_strong_guards_make_yes_unlikely_and_a_free_join_likely():
-	"""model.CustomFeatures.question_features: a bank's 'fight the guards?' (o_battle on YES) against 200 of the strongest
+	"""model.CustomFeatures.option_knowledge: a bank's 'fight the guards?' (o_battle on YES) against 200 of the strongest
 	creatures puts YES far below NO (the fight's value, NK2's safety rule); a wandering monster's free offer of 30 of
 	them to join (o_join on YES, NO the battle) puts YES far above NO. The priors land on those options only."""
 	strong, _ = _strongest_and_cheapest()
@@ -904,16 +906,17 @@ def test_a_banks_strong_guards_make_yes_unlikely_and_a_free_join_likely():
 	with torch.no_grad():
 		known = m.domain_knowledge(tensors(x))
 		out = m(tensors(x))
-	q = known.question
-	assert float(q["battle_prior"][0]) < -5.0
-	assert float(q["join_prior"][1]) > 3.0
+	prior = known.option_prior
+	assert float(prior[0, 0]) < -5.0 and float(prior[0, 1]) == 0.0
+	assert float(prior[1, 0]) > 3.0 and float(prior[1, 1]) < 0.0  # (the join; refusing it, the battle)
+	assert float(prior[2].abs().max()) == 0.0
 	p = out["option_logp"].exp()
 	assert float(p[0, 0]) < 0.01 and float(p[1, 0]) > 0.99
 	assert abs(float(p[2, 0]) - 0.5) < 0.2  # (unflagged: no prior moves it)
 
 
 def test_a_monsters_question_counts_no_reward_wherever_it_is_asked():
-	"""question_features: a fleeing monster's offer (o_battle on YES) values the same whether d_object is the monster
+	"""question_guards: a fleeing monster's offer (o_battle on YES) values the same whether d_object is the monster
 	(an attack), our hero itself (a step into its zone: topObject's blocking fallback), or a town; a join counts none
 	either; a bank's question still counts its reward (its object_gold, as often as we win)."""
 	from battle_model.layers import vocab_index
@@ -931,13 +934,13 @@ def test_a_monsters_question_counts_no_reward_wherever_it_is_asked():
 	_question(x, 4, weak, 2, join=0, battle=1, d_object=ft.OBJ_HERO)
 	_question(x, 5, weak, 2, battle=0, d_object=84)  # (a Crypt's guards)
 	with torch.no_grad():
-		q = m.domain_knowledge(tensors(x)).question
+		prior = m.domain_knowledge(tensors(x)).option_prior
 		gold = float(m.features.object_gold(torch.tensor([84]), torch.tensor([0]))[0])
 		hero_gold = float(m.features.object_gold(torch.tensor([ft.OBJ_HERO]), torch.tensor([0]))[0])
 	assert hero_gold < -1000
-	prior = q["battle_prior"]
-	assert torch.allclose(prior[:3], prior[0].expand(3)) and torch.allclose(prior[3], prior[4])
-	assert gold > 0 and float(prior[5]) > float(prior[0])  # (the same fight with a bank's reward on top)
+	fights = torch.cat([prior[:3, 0], prior[3:5, 1], prior[5:, 0]])  # (the option that fights: YES, or NO for a join)
+	assert torch.allclose(fights[:3], fights[0].expand(3)) and torch.allclose(fights[3], fights[4])
+	assert gold > 0 and float(fights[5]) > float(fights[0])  # (the same fight with a bank's reward on top)
 
 
 def test_the_questions_nullkiller2_answers_yes_lean_yes_and_nothing_else_does():
@@ -962,9 +965,7 @@ def test_the_questions_nullkiller2_answers_yes_lean_yes_and_nothing_else_does():
 		return logp[:, 0] - logp[:, 1]
 
 	with torch.no_grad():
-		q = m.domain_knowledge(tensors(x)).question
-		assert q["recruit"].tolist() == [True, False, True, False, False, False]
-		assert q["visit"].tolist() == [False, False, False, False, True, True]
+		assert m.features.nk2_yes(tensors(x)).tolist() == pytest.approx([4.0, 0.0, 4.0, 0.0, 4.0, 4.0], abs=1e-4)
 		starts = float(m.features.recruit_yes_weight()), float(m.features.visit_yes_weight())
 	with_priors = yes_over_no()
 	with torch.no_grad():
@@ -973,6 +974,129 @@ def test_the_questions_nullkiller2_answers_yes_lean_yes_and_nothing_else_does():
 	without = yes_over_no()
 	assert max(abs(w - 4.0) for w in starts) < 1e-4
 	assert torch.allclose(with_priors - without, torch.tensor([4.0, 0.0, 4.0, 0.0, 4.0, 4.0]), atol=1e-3)
+
+
+def test_a_yes_names_what_it_does_and_a_no_does_not():
+	"""encoders.OptionEncoder (the user, 2026-11-04: never one YES vector for every question): a YES's key names the object
+	asked about, so YES at a Quest Guard and YES at a dwelling differ; NO, declining, is the same at both; the option that
+	fights the question's guards holds them."""
+	strong, _ = _strongest_and_cheapest()
+	torch.manual_seed(1)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = {k: np.repeat(v, 3, axis=0) for k, v in rich_inputs(1, 5).items()}
+	_question(x, 0, 0, 0, d_object=215)
+	_question(x, 1, 0, 0, d_object=17)
+	_question(x, 2, strong, 5, battle=0, d_object=17)
+	with torch.no_grad():
+		_, keys = m.encode_options(tensors(x), m.option_tables())
+	assert not torch.allclose(keys[0, 0], keys[1, 0], atol=1e-3)
+	assert torch.allclose(keys[0, 1], keys[1, 1])
+	assert not torch.allclose(keys[1, 0], keys[2, 0], atol=1e-3)
+
+
+def test_options_that_differ_never_share_an_identity():
+	"""encoders.OptionEncoder has no hashed rows (features.bucket put 546 of 954 options on a shared row, 2026-11-04: NO with
+	a scroll of spell 57, a skill with a creature's amount): those pairs differ, and so do two resources and two primary
+	skills a component names."""
+	torch.manual_seed(1)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = {k: np.repeat(v, 4, axis=0) for k, v in rich_inputs(1, 5).items()}
+	x["option_mask"][:] = False
+	x["option_mask"][:, :2] = True
+	x["o_battle"][:], x["o_join"][:], x["o_amount"][:] = False, False, 0
+	rows = [  # (kind, type, subtype) of each row's two options
+		((c.OptionKind.NO, 0, 0), (c.OptionKind.COMPONENT, 6, 57)),
+		((c.OptionKind.SKILL, 0, 1), (c.OptionKind.AMOUNT, 12, 0)),
+		((c.OptionKind.COMPONENT, 2, 0), (c.OptionKind.COMPONENT, 2, 6)),  # (wood, gold)
+		((c.OptionKind.COMPONENT, 0, 0), (c.OptionKind.COMPONENT, 0, 1)),  # (attack, defence)
+	]
+	for b, options in enumerate(rows):
+		for o, (kind, what, sub) in enumerate(options):
+			x["o_kind"][b, o], x["o_type"][b, o], x["o_subtype"][b, o] = int(kind), what, sub
+	with torch.no_grad():
+		_, keys = m.encode_options(tensors(x), m.option_tables())
+	for b in range(len(rows)):
+		assert float(F.cosine_similarity(keys[b, 0], keys[b, 1], dim=0)) < 0.99, rows[b]
+
+
+def test_a_choices_logit_is_the_atanh_of_a_bounded_cosine():
+	"""model_v2.cosine_logit: about 0 for random vectors (a fresh model's choices nearly even), atanh(COSINE_BOUND) (3.0)
+	for a key along the query, its negative against it."""
+	from campaign_model.model_v2 import COSINE_BOUND, cosine_logit
+
+	torch.manual_seed(0)
+	query, keys = torch.randn(64, 128), torch.randn(64, 4, 128)
+	assert float(cosine_logit(query, keys).abs().mean()) < 0.15
+	along = torch.stack([query, -query, 2 * query], dim=1)
+	top = math.atanh(COSINE_BOUND)
+	assert torch.allclose(cosine_logit(query, along), torch.tensor([top, -top, top]).expand(64, 3), atol=1e-3)
+
+
+def test_a_level_ups_choice_teaches_the_heroes_own_skill_rows():
+	"""The options' identities are the model's own vectors: a level-up's log-probability has a gradient on the hero
+	encoder's (skill, level) rows it offers (no hero here has those skills: the options are their only way in)."""
+	torch.manual_seed(1)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	x = rich_inputs(1, 5)
+	x["h_skills"][0, :, 3], x["h_skills"][0, :, 7] = 0, 0
+	x["d_hero"][0] = 0
+	x["option_mask"][0] = False
+	x["option_mask"][0, :2] = True
+	x["o_kind"][0, :2], x["o_type"][0, :2], x["o_subtype"][0, :2] = int(c.OptionKind.SKILL), (3, 7), 1
+	m(tensors(x))["option_logp"][0, 0].backward()
+	grad = m.encode_hero.skill.weight.grad
+	assert float(grad[3 * 4 + 1].abs().sum()) > 0 and float(grad[7 * 4 + 1].abs().sum()) > 0
+	assert float(grad[5 * 4 + 1].abs().sum()) == 0  # (a skill nobody has and nothing offers)
+
+
+def test_an_old_question_head_loads_with_its_fight_and_join_weights_exactly():
+	"""model_v2.migrate_option_head: a checkpoint from before the question head's keys (option_q, answer_fight,
+	answer_join) loads; the fight's and the join's weights and biases land in option_weights, giving each flagged option
+	what answer_fight or answer_join gave it."""
+	torch.manual_seed(4)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	state = {k: v for k, v in m.state_dict().items() if not k.startswith(("option_weights.", "decision.", "option_context."))}
+	fight, join = nn.Linear(6, 1), nn.Linear(3, 1)
+	state.update({"option_q.weight": torch.randn(32, 64), "option_q.bias": torch.randn(32)})
+	state.update({"answer_fight.weight": fight.weight.detach(), "answer_fight.bias": fight.bias.detach(), "answer_join.weight": join.weight.detach(), "answer_join.bias": join.bias.detach()})
+	fresh = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	fresh.load_state_dict(state)
+	f, j = torch.randn(5, 6), torch.randn(5, 3)
+	ones, zeros = torch.ones(5, 1), torch.zeros(5, 1)
+	with torch.no_grad():
+		fights = fresh.option_weights(torch.cat([f, torch.zeros(5, 3), ones, zeros], dim=-1))
+		takes = fresh.option_weights(torch.cat([torch.zeros(5, 6), j, zeros, ones], dim=-1))
+		assert torch.allclose(fights, fight(f), atol=1e-6) and torch.allclose(takes, join(j), atol=1e-6)
+
+
+def test_adams_moments_survive_a_model_that_lost_parameters():
+	"""train.load_optimizer: a checkpoint's optimizer from a model with parameters since removed (2026-11-04: option_q,
+	in the middle of the order) keeps every remaining parameter's moments by name and drops the gone ones'."""
+	config = CampaignConfig(learning_rate=1e-3)
+	torch.manual_seed(0)
+	model = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	optimizer = make_optimizer(model, config)
+	for p in model.parameters():
+		p.grad = torch.randn_like(p)
+	optimizer.step()
+	saved = optimizer.state_dict()
+	keys = list(model.state_dict())
+	rest = optimizer.param_groups[0]["params"]
+	names = {id(p): n for n, p in model.named_parameters()}
+	at = [names[id(p)] for p in rest].index("option_flags.weight")
+	gone = {"option_q.weight": torch.randn(32, 64), "option_q.bias": torch.randn(32)}
+	place = lambda i: i + len(gone) * (i >= at)  # noqa: E731  (each parameter's place among the old model's)
+	old_state = {place(i): s for i, s in saved["state"].items()}
+	old_state.update({at + k: {"step": torch.tensor(1.0), "exp_avg": v, "exp_avg_sq": v.abs()} for k, v in enumerate(gone.values())})
+	groups = [{**saved["param_groups"][0], "params": list(range(len(rest) + len(gone)))}, {**saved["param_groups"][1], "params": [place(i) for i in saved["param_groups"][1]["params"]]}]
+	where = keys.index("option_flags.weight")
+	old_keys = keys[:where] + list(gone) + keys[where:]
+	fresh = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	fresh_optimizer = make_optimizer(fresh, config)
+	load_optimizer(fresh_optimizer, fresh, {"state": old_state, "param_groups": groups}, old_keys)
+	trained = dict(model.named_parameters())
+	for name, p in fresh.named_parameters():
+		assert torch.equal(fresh_optimizer.state[p]["exp_avg"], optimizer.state[trained[name]]["exp_avg"]), name
 
 
 def test_records_from_before_schema_11_read_with_no_guards_battle_join_or_armed_object():

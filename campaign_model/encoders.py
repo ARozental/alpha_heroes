@@ -10,6 +10,9 @@ knowledge here (it joins after, model_v2.join), and no ownership (model_v2.take_
 A token is its fields' encodings through a gated MLP, then RMSNorm (Tokenizer); a set (a hero's army, its artifacts,
 skills, spells) is its elements' embeddings, summed.
 """
+import functools
+from typing import NamedTuple
+
 import torch
 from torch import nn
 
@@ -301,21 +304,85 @@ class GlobalEncoder(nn.Module):
 		return self.token(embedded, numbers)
 
 
+class OptionTables(NamedTuple):
+	"""The model's own embeddings an option's identity names (OptionEncoder): the hero encoder's (skill, level) rows,
+	artifact rows, spells (its layer's column a spell) and army encoder (a creature's row; a question's guards as an
+	army), the global encoder's object and (object, subtype) pair rows and its pair table."""
+
+	skill: nn.Embedding
+	artifact: nn.Embedding
+	spells: nn.Linear
+	army: nn.Module
+	object: nn.Embedding
+	pair: nn.Embedding
+	pairs: torch.Tensor
+
+
+# VCMI's ComponentType (lib/networkPacks/Component.h): a COMPONENT option's o_type
+PRIM_SKILL, SEC_SKILL, RESOURCE, RESOURCE_PER_DAY, CREATURE, ARTIFACT, SPELL_SCROLL = range(7)
+SPELL = 10
+COMPONENT_TYPES = 16
+
+
 class OptionEncoder(nn.Module):
-	"""A question's options -> their vectors [B, O, d]: kind, type and subtype, amount, and where (from the hero asked)."""
+	"""A question's options -> (their tokens [B, O, d], their identities [B, O, d]: the sum the token is made of, its numbers
+	projected in, a choice's key; the token, through its MLP, starts as its bias: every option's alike), each its own
+	identity (the user, 2026-11-04: an embedding for every option, never one YES vector for every question; no hashed
+	rows either: 546 of 954 options shared one): what it
+	names is the model's own vector for that thing (tables), a skill's of the heroes' skill rows, a creature's of their
+	armies', an artifact's, a spell's, an object's of the question's table; a component (a chest's gold or experience, a
+	school's attack or defence) by its type and what it names (primary skills and resources their own rows); a YES acts
+	on the object asked about (not our hero itself: a step into a monster's zone names it) and an option that fights or
+	takes the question's creatures (o_battle, o_join) holds them as an army; with its kind, amount and where (from the
+	hero asked)."""
 
 	def __init__(self, dim):
 		super().__init__()
 		self.kind = small_embedding(len(c.OptionKind) + 1, dim)
-		self.subtype = small_embedding(c.SUBTYPE_ROWS, dim)
+		self.component = small_embedding(COMPONENT_TYPES + 1, dim)
+		self.primary = small_embedding(c.N_PRIMARY + 1, dim)
+		self.resource = small_embedding(c.N_RESOURCES + 1, dim)
 		self.token = Tokenizer(AMOUNT_FEATURES + 8 + 1, dim)
+		self.numbers = nn.Linear(AMOUNT_FEATURES + 8 + 1, dim, bias=False)  # (no bias: one vector in every key tells none apart)
 
-	def forward(self, x):
-		from .features import bucket, relative_position
+	def forward(self, x, tables):
+		from .features import OBJ_HERO, object_pair, relative_position
 
+		kind, what, sub = x["o_kind"], x["o_type"], x["o_subtype"]
 		hero = x["d_hero"].clamp(min=0)
 		at = torch.gather(x["h_pos"], 1, hero.reshape(-1, 1, 1).expand(-1, 1, 3)).float()  # [B, 1, 3]
-		placed = (x["o_kind"] == c.OptionKind.OBJECT) & (x["d_hero"] >= 0).unsqueeze(-1)
+		placed = (kind == c.OptionKind.OBJECT) & (x["d_hero"] >= 0).unsqueeze(-1)
 		where = relative_position(x["o_pos"].float() - at) * placed.unsqueeze(-1)
-		embedded = self.kind(vocab_index(x["o_kind"], len(c.OptionKind))) + self.subtype(bucket(x["o_kind"], x["o_type"], x["o_subtype"]))
-		return self.token(embedded, torch.cat([amount(x["o_amount"], "gold"), where, placed.float().unsqueeze(-1)], dim=-1)) * x["option_mask"].unsqueeze(-1)
+		of_kind = lambda k: (kind == k).unsqueeze(-1).float()  # noqa: E731
+		named = (
+			tables.skill(what.clamp(0, c.N_SECONDARY_SKILLS - 1) * 4 + sub.clamp(0, 3)) * of_kind(c.OptionKind.SKILL)
+			+ tables.army.creature(vocab_index(what, c.CREATURE_VOCAB)) * of_kind(c.OptionKind.AMOUNT)
+			+ (tables.object(vocab_index(what, c.OBJECT_VOCAB)) + tables.pair(object_pair(tables.pairs, what, sub))) * of_kind(c.OptionKind.OBJECT)
+			+ self.component_names(what, sub, tables) * of_kind(c.OptionKind.COMPONENT)
+		)
+		obj = x["d_object"]
+		asked = (tables.object(vocab_index(obj, c.OBJECT_VOCAB)) + tables.pair(object_pair(tables.pairs, obj, x["d_subtype"]))) * ((obj >= 0) & (obj != OBJ_HERO)).unsqueeze(-1)
+		present = x["d_guard_count"] > 0
+		_, guards = tables.army(torch.where(present, x["d_guard_creature"], torch.full_like(x["d_guard_creature"], -1)), x["d_guard_count"], x["d_guard_detailed"])
+		holds = (x["o_battle"] | x["o_join"]).unsqueeze(-1).float()
+		named = named + asked.unsqueeze(1) * of_kind(c.OptionKind.YES) + (guards * present.any(dim=-1, keepdim=True)).unsqueeze(1) * holds
+		embedded = self.kind(vocab_index(kind, len(c.OptionKind))) + named
+		numbers = torch.cat([amount(x["o_amount"], "gold"), where, placed.float().unsqueeze(-1)], dim=-1)
+		mask = x["option_mask"].unsqueeze(-1)
+		return self.token(embedded, numbers) * mask, (embedded + self.numbers(numbers)) * mask
+
+	def component_names(self, kind, sub, tables):
+		"""A component's identity [..., d] (kind: VCMI's ComponentType, sub: its subtype): its type's row and what it names
+		(a primary skill, a resource, a secondary skill at basic, a creature, an artifact, a spell); the rest (mana,
+		experience, a level, morale, luck, ...) only by its type, their amounts in the option's numbers."""
+		is_ = lambda *types: functools.reduce(torch.logical_or, [kind == t for t in types]).unsqueeze(-1).float()  # noqa: E731
+		spell = tables.spells.weight.t()[sub.clamp(0, c.N_SPELLS - 1)] * ((sub >= 0) & (sub < c.N_SPELLS)).unsqueeze(-1)
+		return (
+			self.component(vocab_index(kind, COMPONENT_TYPES))
+			+ self.primary(vocab_index(sub, c.N_PRIMARY)) * is_(PRIM_SKILL)
+			+ self.resource(vocab_index(sub, c.N_RESOURCES)) * is_(RESOURCE, RESOURCE_PER_DAY)
+			+ tables.skill(sub.clamp(0, c.N_SECONDARY_SKILLS - 1) * 4 + 1) * is_(SEC_SKILL)
+			+ tables.army.creature(vocab_index(sub, c.CREATURE_VOCAB)) * is_(CREATURE)
+			+ tables.artifact(vocab_index(sub, c.ARTIFACT_VOCAB)) * is_(ARTIFACT)
+			+ spell * is_(SPELL_SCROLL, SPELL)
+		)
