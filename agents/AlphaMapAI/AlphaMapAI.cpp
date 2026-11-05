@@ -248,6 +248,7 @@ void AlphaMapAI::makeTurn()
 			if(adviceDrawn())
 				advice = advise(decision, plan, accept);
 			const auto choice = decide(decision, advice, plan, accept);
+			noteChoice(choice); // (a town visit's advice taken or not: adviseVisit)
 			if(choice.type <= static_cast<int>(ActionType::END))
 				break;
 			const bool changed = execute(decision, choice);
