@@ -639,6 +639,12 @@ def share_baseline(real_change, predicted, trust):
 	return trust * predicted + (1.0 - trust) * mean
 
 
+def taught(advice_types, advised, config):
+	"""Which advised decisions the teacher's cross-entropy counts [N]: Nullkiller2's TRADE advice only with
+	config.nk2_trade_advice (False since 2026-11-04)."""
+	return advised if config.nk2_trade_advice else advised & (np.asarray(advice_types) != c.ActionType.TRADE)
+
+
 def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
 	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None, teacher=None, teacher_weight=None,
@@ -679,7 +685,7 @@ def ppo_update(
 	has = np.array([d.advice is not None for d in decisions], dtype=bool)
 	if has.any() or (teacher_sets is not None and teacher_sets[2].any()):
 		advice = np.array([d.advice if d.advice is not None else (0, 0, -1) for d in decisions], dtype=np.int64).reshape(-1, 3)
-		advised = has | teacher_sets[2].any(axis=1) if teacher_sets is not None else has
+		advised = taught(advice[:, 0], has | teacher_sets[2].any(axis=1) if teacher_sets is not None else has, config)
 		advice_t = {
 			"advice_action": torch.from_numpy(advice[:, 0]).to(device), "advice_index": torch.from_numpy(advice[:, 1]).to(device), "advice_cell": torch.from_numpy(advice[:, 2]).to(device),
 			"advised": torch.from_numpy(advised.astype(np.float32)).to(device),

@@ -63,7 +63,8 @@ PHI_FEATURES = len(ft.PHI_SCALES) + len(ft.PHI_PARTS)
 HERO_FEATURES = 3 + 1 + 3 * c.N_PRIMARY + 2 + 1 + 3 + 1 + 1 + 1 + 3 + 1 + 6 + 1 + 3
 TOWN_FEATURES = 3 + 4 + 1 + 3 + 2 + 1
 OPTION_FEATURES = 3 + 3 + 1
-QUESTION_FEATURES = 6 + 3 + 2  # (v2's option_knowledge: a question's fight on the option that fights, its join on the one that takes, the two flags)
+RECRUIT_FIT = 5  # (CustomFeatures.recruit_fit: what buying a creature does to the hero's army)
+QUESTION_FEATURES = 6 + 3 + 2 + RECRUIT_FIT  # (v2's option_knowledge: a question's fight on the option that fights, its join on the one that takes, the two flags; a purchase's fit)
 MOVE_FEATURES = ("value", "object", "fight", "loss", "win", "explore", "danger", "defend", "move_left", "enemy", "behind", "home", "under_threat", "to_main")
 CELL_FEATURES = c.N_TILE_FLAGS + 3 + 2 + 4 + 3 + 1 + len(MOVE_FEATURES)
 OBJECT_FEATURES = 7 + 3 + 1
@@ -103,12 +104,16 @@ def game_tables():
 		"spell_value": torch.zeros(c.N_SPELLS),
 		"creature_luck": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_morale": torch.zeros(c.CREATURE_VOCAB + 1),
+		"creature_faction": torch.full((c.CREATURE_VOCAB + 1,), -1, dtype=torch.long),  # (its faction's id; neutral's its own)
+		"creature_undead": torch.zeros(c.CREATURE_VOCAB + 1),
 	}
 	try:
 		from .empire import EmpireConfig, _unit, building_value
 		from game_values import resources_value
 
-		from .vocab import NO_LUCK, NO_MORALE, artifact_prices, buildings, creature_cost, creatures, experience_table, feels, spell_levels, town_creatures
+		from .vocab import NO_LUCK, NO_MORALE, artifact_prices, buildings, creature_cost, creatures, experience_table, feels, raw, spell_levels, town_creatures
+
+		faction_ids = {row["key"]: row["id"] for row in raw()["factions"]}
 
 		for creature_id, row in creatures().items():
 			if 0 <= creature_id < c.CREATURE_VOCAB:
@@ -124,6 +129,8 @@ def game_tables():
 				tables["creature_growth"][creature_id] = float(row.get("growth", 0))
 				tables["creature_luck"][creature_id] = float(feels(creature_id, NO_LUCK))
 				tables["creature_morale"][creature_id] = float(feels(creature_id, NO_MORALE))
+				tables["creature_faction"][creature_id] = faction_ids.get(row.get("faction"), -1)
+				tables["creature_undead"][creature_id] = float("UNDEAD" in row.get("abilities", []))
 		for spell, level in spell_levels().items():
 			if 0 <= spell < c.N_SPELLS:
 				tables["spell_value"][spell] = EmpireConfig().spell_level * level
@@ -530,13 +537,42 @@ class CustomFeatures(nn.Module):
 		most = amounts & (value == value.amax(dim=-1, keepdim=True)) & (value > 0)
 		return most.float() * ft.bounded(self.recruit_all, 0.0, 4.0, 2.0, CORRECTION_STEP)
 
+	def recruit_fit(self, x):
+		"""What buying each AMOUNT option's creatures does to the asked hero's army [B, O, RECRUIT_FIT] (the user, 2026-11-04:
+		do these creatures exist in the hero, do they belong to a faction it has; 39% of the dwelling purchases had lowered
+		the army's morale): the creature already in it, its faction already in it, the morale change (H3's: one faction
+		+1, two 0, each more -1; undead among the living -1) / 3, a new slot taken, the slots free after / 7; 0 for an
+		option that buys nothing."""
+		hero = x["d_hero"].clamp(0, HO - 1).reshape(-1, 1, 1).expand(-1, 1, A)
+		army = x["h_army_creature"].gather(1, hero).squeeze(1)  # [B, A]
+		present = (army >= 0) & (x["h_army_count"].gather(1, hero).squeeze(1) > 0)
+		creature = x["o_type"]  # [B, O]
+		buys = (x["o_kind"] == int(c.OptionKind.AMOUNT)) & (x["o_amount"] > 0) & x["option_mask"]
+		faction = lambda ids: self.creature_faction[vocab_index(ids, c.CREATURE_VOCAB)]  # noqa: E731
+		undead = lambda ids: self.creature_undead[vocab_index(ids, c.CREATURE_VOCAB)] > 0  # noqa: E731
+		has = ((army.unsqueeze(1) == creature.unsqueeze(-1)) & present.unsqueeze(1)).any(dim=-1)
+		kinds = faction(army).masked_fill(~present, -2)
+		has_faction = ((kinds.unsqueeze(1) == faction(creature).unsqueeze(-1)) & present.unsqueeze(1)).any(dim=-1)
+		ids = torch.arange(-1, c.FACTION_VOCAB + 1, device=army.device)  # (-1: a creature of no faction)
+		factions = (kinds.unsqueeze(-1) == ids).any(dim=1).sum(dim=-1, keepdim=True).float()  # [B, 1]
+		after = factions + (~has_faction).float()
+
+		def morale(n, dead, living):
+			return torch.where(n == 1, 1.0, torch.where(n <= 2, 0.0, 2.0 - n)) - (dead & living).float()
+
+		dead, living = (undead(army) & present).any(dim=-1, keepdim=True), (~undead(army) & present).any(dim=-1, keepdim=True)
+		change = morale(after, dead | undead(creature), living | ~undead(creature)) - morale(factions, dead, living)
+		slot = (~has).float()
+		free = (A - present.sum(dim=-1, keepdim=True).float() - slot) / A
+		return torch.stack([has.float(), has_faction.float(), change / 3, slot, free], dim=-1) * buys.unsqueeze(-1).float()
+
 	def option_knowledge(self, x, f):
 		"""What is known of each option of a question (the user, 2026-11-04: every expert rule its own function, gathered
 		here): (its prior [B, O]: the known AI's values with their corrections, the guards' fight on the option that fights
 		them and their join on the one that takes them (question_guards), Nullkiller2's YES (nk2_yes), its pick among a
 		selection's components (nk2_select), its dwelling purchase (nk2_amount) and its skill scores x their weight; its
 		features [B, O, QUESTION_FEATURES] for the model's zero-init weights: the fight's 6 and the join's 3 on those
-		options, then those two flags)."""
+		options, those two flags, and a purchase's fit with the hero's army: recruit_fit)."""
 		fight, battle_prior, join, join_prior = self.question_guards(x, f)
 		battle, takes = x["o_battle"].float(), x["o_join"].float()
 		yes = (x["o_kind"] == int(c.OptionKind.YES)).float()
@@ -544,7 +580,7 @@ class CustomFeatures(nn.Module):
 			battle * battle_prior.unsqueeze(1) + takes * join_prior.unsqueeze(1) + yes * self.nk2_yes(x).unsqueeze(1)
 			+ self.nk2_select(x, f) + self.nk2_amount(x) + self.nk2_weights()[0] * f.skill_scores
 		)
-		features = torch.cat([battle.unsqueeze(-1) * fight.unsqueeze(1), takes.unsqueeze(-1) * join.unsqueeze(1), battle.unsqueeze(-1), takes.unsqueeze(-1)], dim=-1)
+		features = torch.cat([battle.unsqueeze(-1) * fight.unsqueeze(1), takes.unsqueeze(-1) * join.unsqueeze(1), battle.unsqueeze(-1), takes.unsqueeze(-1), self.recruit_fit(x)], dim=-1)
 		return prior, features
 
 	def town_strength(self, x, power):
@@ -1000,7 +1036,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	# model_v2.migrate_option_head)
 	"foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option", "option_flags",
 	"decision", "option_context", "option_weights", "encode_options.component", "encode_options.primary", "encode_options.resource",
-	"encode_options.numbers",
+	"encode_options.numbers", "build_identity",
 )
 
 

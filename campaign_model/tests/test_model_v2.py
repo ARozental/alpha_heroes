@@ -1025,6 +1025,84 @@ def test_nullkiller2s_selection_and_purchase_priors_lean_where_it_goes():
 	assert float(prior[0, 1]) == pytest.approx(3.0, abs=1e-3) and float(prior[3, 3]) == pytest.approx(2.0, abs=1e-3)
 
 
+def test_a_purchases_fit_with_the_heros_army():
+	"""model.CustomFeatures.recruit_fit: into an army of Pikemen (Castle), more Pikemen fit (no new slot, morale kept);
+	Swordsmen keep its one faction but take a slot; Centaurs (Rampart) bring a second faction (+1 morale to 0); Skeletons
+	(Necropolis, undead) a second faction and the undead among the living (+1 to -1); an amount of 0 buys nothing."""
+	from campaign_model import vocab
+
+	by_name = {row["name"]: k for k, row in vocab.creatures().items()}
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = {k: np.repeat(v, 5, axis=0) for k, v in rich_inputs(1, 5).items()}
+	x["d_hero"][:] = 0
+	x["h_army_creature"][:, 0] = -1
+	x["h_army_count"][:, 0] = 0
+	x["h_army_creature"][:, 0, 0], x["h_army_count"][:, 0, 0] = by_name["Pikeman"], 20
+	x["option_mask"][:], x["o_battle"][:], x["o_join"][:] = False, False, False
+	x["option_mask"][:, 0] = True
+	x["o_kind"][:, 0] = int(c.OptionKind.AMOUNT)
+	x["o_type"][:, 0] = [by_name["Pikeman"], by_name["Swordsman"], by_name["Centaur"], by_name["Skeleton"], by_name["Pikeman"]]
+	x["o_amount"][:, 0] = [5, 5, 5, 5, 0]
+	with torch.no_grad():
+		fit = m.features.recruit_fit(tensors(x))[:, 0]  # (has, faction, morale change / 3, new slot, free after / 7)
+	free = (c.ARMY_SLOTS - 1) / c.ARMY_SLOTS
+	expected = torch.tensor([
+		[1, 1, 0, 0, free], [0, 1, 0, 1, free - 1 / c.ARMY_SLOTS], [0, 0, -1 / 3, 1, free - 1 / c.ARMY_SLOTS],
+		[0, 0, -2 / 3, 1, free - 1 / c.ARMY_SLOTS], [0, 0, 0, 0, 0],
+	])
+	assert torch.allclose(fit, expected, atol=1e-5), fit
+
+
+def test_a_buildings_key_starts_as_before_and_can_tell_factions_apart():
+	"""model_v2.build_scores: with build_identity at 0 (a fresh model's, and a migrated checkpoint's) BUILD's learned part
+	is the old query . row exactly; once it moves, the same building id in towns of two factions scores apart."""
+	torch.manual_seed(2)
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = tensors(rich_inputs(1, 5))
+	x["t_faction"][0, :2] = torch.tensor([0, 4])  # (Castle, Necropolis)
+	towns = torch.randn(1, c.OWN_TOWNS, 32)
+	towns[0, 1] = towns[0, 0]  # (the same query: only the identity tells them apart)
+	with torch.no_grad():
+		m.build_q.weight.normal_(0, 0.1)
+		start = m.build_scores(towns, x)
+		old = m.build_q(towns) @ m.building.weight.t() / math.sqrt(32)
+		assert torch.allclose(start, old, atol=1e-6)
+		m.build_identity.weight.normal_(0, 0.1)
+		moved = m.build_scores(towns, x)
+	dwelling = 30  # (the level 1 dwelling: Pikemen in Castle, Skeletons in Necropolis)
+	assert abs(float(moved[0, 0, dwelling] - moved[0, 1, dwelling])) > 1e-3
+
+
+def test_a_towns_visitor_is_our_hero_there_not_its_garrison_or_a_rival():
+	"""model_v2.visitors: a town's visiting hero of ours (h_town, not h_garrisoned) is its token there; a garrisoned hero
+	and a rival's hero in the same town are not."""
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = tensors(rich_inputs(1, 5))
+	x["h_present"][0, :3] = True
+	x["h_owner"][0, :3] = torch.tensor([c.OWNER_SELF, c.OWNER_SELF, c.OWNER_SELF + 1])
+	x["h_town"][0, :3] = torch.tensor([0, 0, 0])
+	x["h_garrisoned"][0, :3] = torch.tensor([False, True, False])
+
+	class State:
+		pass
+
+	state = State()
+	state.x, state.heroes = x, torch.randn(1, x["h_present"].shape[1], 32)
+	seen = m.visitors(state)
+	assert torch.allclose(seen[0, 0], state.heroes[0, 0]) and float(seen[0, 1:].abs().max()) == 0.0
+
+
+def test_the_teachers_trade_advice_is_left_out_unless_asked_for():
+	"""train.taught: Nullkiller2's TRADE advice is not taught (config.nk2_trade_advice False, the default), its other
+	advice is; with the flag every advised decision counts."""
+	from campaign_model.train import taught
+
+	types = np.array([int(c.ActionType.TRADE), int(c.ActionType.BUILD), int(c.ActionType.TRADE), int(c.ActionType.MOVE)])
+	advised = np.array([True, True, False, True])
+	assert taught(types, advised, CampaignConfig()).tolist() == [False, True, False, True]
+	assert taught(types, advised, CampaignConfig(nk2_trade_advice=True)).tolist() == advised.tolist()
+
+
 def test_options_that_differ_never_share_an_identity():
 	"""encoders.OptionEncoder has no hashed rows (features.bucket put 546 of 954 options on a shared row, 2026-11-04: NO with
 	a scroll of spell 57, a skill with a creature's amount): those pairs differ, and so do two resources and two primary
@@ -1084,6 +1162,8 @@ def test_an_old_question_head_loads_with_its_fight_and_join_weights_exactly():
 	"""model_v2.migrate_option_head: a checkpoint from before the question head's keys (option_q, answer_fight,
 	answer_join) loads; the fight's and the join's weights and biases land in option_weights, giving each flagged option
 	what answer_fight or answer_join gave it."""
+	from campaign_model.model import RECRUIT_FIT
+
 	torch.manual_seed(4)
 	m = CampaignModelV2(dim=32, cell_dim=8, layers=1)
 	state = {k: v for k, v in m.state_dict().items() if not k.startswith(("option_weights.", "decision.", "option_context."))}
@@ -1095,8 +1175,9 @@ def test_an_old_question_head_loads_with_its_fight_and_join_weights_exactly():
 	f, j = torch.randn(5, 6), torch.randn(5, 3)
 	ones, zeros = torch.ones(5, 1), torch.zeros(5, 1)
 	with torch.no_grad():
-		fights = fresh.option_weights(torch.cat([f, torch.zeros(5, 3), ones, zeros], dim=-1))
-		takes = fresh.option_weights(torch.cat([torch.zeros(5, 6), j, zeros, ones], dim=-1))
+		fit = torch.zeros(5, RECRUIT_FIT)  # (a purchase's fit after them: model.recruit_fit, at 0 here)
+		fights = fresh.option_weights(torch.cat([f, torch.zeros(5, 3), ones, zeros, fit], dim=-1))
+		takes = fresh.option_weights(torch.cat([torch.zeros(5, 6), j, zeros, ones, fit], dim=-1))
 		assert torch.allclose(fights, fight(f), atol=1e-6) and torch.allclose(takes, join(j), atol=1e-6)
 
 

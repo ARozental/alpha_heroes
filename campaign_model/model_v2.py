@@ -247,7 +247,9 @@ class CampaignModelV2(nn.Module):
 		"""A checkpoint from before a parameter was added (model.ADDED) loads with it at 0: the model as it was; one from
 		before 2026-11-04's MOVE features with move_pair's first layer moved to its inputs now (migrate_move_inputs); one
 		from before 2026-11-04's question head with its fight and join weights in option_weights (migrate_option_head)."""
-		return super().load_state_dict(with_added(migrate_option_head(migrate_move_inputs(state_dict)), self.state_dict()), strict=strict, assign=assign)
+		own = self.state_dict()
+		state = with_added(migrate_option_head(migrate_move_inputs(state_dict)), own)
+		return super().load_state_dict(pad_new_inputs(state, own), strict=strict, assign=assign)
 
 	def __init__(self, dim=64, cell_dim=16, heads=4, layers=2, share_target="share"):
 		"""cell_dim: the map tiles' width (the U-Net's at full resolution; twice and four times it at half and a quarter):
@@ -332,11 +334,15 @@ class CampaignModelV2(nn.Module):
 		self.move_out, self.cast_cell_out, self.travel_out = zero_output(nn.Linear(dp, 1)), zero_output(nn.Linear(dp, 1)), zero_output(nn.Linear(dp, 1))
 		self.act_move, self.act_travel = zero_output(nn.Linear(d, 1)), zero_output(nn.Linear(d, 1))
 		self.building = small_embedding(c.N_BUILDINGS, d)
+		# A building's key is its row and, at 0 to begin with, what it is in that town: the town's faction and the creature a
+		# dwelling of that faction makes (the same building id is another creature and cost in each faction: 2026-11-04)
+		self.build_identity = nn.Linear(d, d, bias=False)
+		nn.init.zeros_(self.build_identity.weight)
 		self.build_q = zero_output(nn.Linear(d, d))
 		self.build_bias = nn.Parameter(torch.zeros(c.N_BUILDINGS))
 		self.nk2_build, self.nk2_upgrade, self.nk2_trade = zero_output(nn.Linear(4, 1)), zero_output(nn.Linear(2, 1)), zero_output(nn.Linear(2, 1))
 		self.trade_option = zero_output(nn.Linear(2, 1))  # (2026-11-04: each TRADE option's cost and whether it unlocks a building)
-		self.recruit_head = nn.Sequential(nn.Linear(2 * d + 9, d), nn.GELU(), zero_output(nn.Linear(d, c.N_RECRUIT_AMOUNTS * c.N_RECRUIT_TARGETS)))
+		self.recruit_head = nn.Sequential(nn.Linear(3 * d + 9, d), nn.GELU(), zero_output(nn.Linear(d, c.N_RECRUIT_AMOUNTS * c.N_RECRUIT_TARGETS)))  # (2026-11-04: + the town's visiting hero)
 		self.hire_q, self.hire_k = zero_output(nn.Linear(d, d)), nn.Linear(d, d)
 		self.hire_worth = zero_output(nn.Linear(4, 1))
 		self.army_src, self.army_dst = nn.Linear(2 * d, d), nn.Linear(d, d)
@@ -430,6 +436,28 @@ class CampaignModelV2(nn.Module):
 		state.options, state.option_keys = tokens + flags, identities + flags  # (the key: a choice's in decide)
 		state.tiles = self.encode_tiles(x)  # [B, L, S, S, dc]
 		return state
+
+	def build_scores(self, own_towns, x):
+		"""BUILD's learned part [B, TO, N_BUILDINGS]: each town's query against each building's key, its row plus
+		build_identity of the town's faction and of the creature that building makes there (a dwelling), as
+		(query . row) + (query W . faction) + (query W . creature), the creature's from the creature table's every row."""
+		d = self.dim
+		query = self.build_q(own_towns)  # [B, TO, d]
+		faction = vocab_index(x["t_faction"][:, :TO], c.FACTION_VOCAB)
+		turned = query @ self.build_identity.weight  # (query W: W's input side, as the key is W applied to the identity)
+		creature = self.features.dwelling_creature[faction]  # [B, TO, N_BUILDINGS], -1 not a dwelling
+		creatures = turned @ self.encode_hero.army.creature.weight.t()  # [B, TO, CREATURE_VOCAB + 1]
+		made = creatures.gather(2, vocab_index(creature, c.CREATURE_VOCAB)) * (creature >= 0)
+		town = (turned * self.encode_town.faction(faction)).sum(dim=-1, keepdim=True)
+		return (query @ self.building.weight.t() + town + made) / math.sqrt(d)
+
+	def visitors(self, state):
+		"""Each town token's visiting hero of ours [B, T, d] (h_town, not the garrison's), 0 where none: RECRUIT's "into the
+		visiting hero" sees whom it arms."""
+		x = state.x
+		ours = x["h_present"] & (x["h_owner"] == c.OWNER_SELF) & ~x["h_garrisoned"]
+		at = (x["h_town"].unsqueeze(-1) == torch.arange(x["t_present"].shape[1], device=x["h_town"].device)) & ours.unsqueeze(-1)  # [B, H, T]
+		return torch.einsum("bht,bhd->btd", at.float(), state.heroes)
 
 	def option_tables(self):
 		"""The embeddings an option's identity names (encoders.OptionTables): the hero encoder's skill and artifact rows, spells
@@ -644,7 +672,7 @@ class CampaignModelV2(nn.Module):
 		prior[A_.TRAVEL] = known.travel_prior.reshape(b, HO, L, TG, TG)
 		offers[A_.TRAVEL] = ft.offer(prior[A_.TRAVEL], x["travel_mask"])
 		# BUILD: the town's query against each building
-		learned[A_.BUILD], prior[A_.BUILD] = self.build_q(own_towns) @ self.building.weight.t() / math.sqrt(d) + self.build_bias, self.nk2_build(known.build_rewards).squeeze(-1)
+		learned[A_.BUILD], prior[A_.BUILD] = self.build_scores(own_towns, x) + self.build_bias, self.nk2_build(known.build_rewards).squeeze(-1)
 		# RECRUIT: the town and each creature level's token, the amounts; Nullkiller2's prior
 		available = x["t_available"][:, :TO].clamp(min=0).float()
 		gold = x["g_resources"][:, 6].clamp(min=0).float()
@@ -653,6 +681,7 @@ class CampaignModelV2(nn.Module):
 				own_towns.unsqueeze(2).expand(b, TO, c.N_LEVELS, d), state.town_levels[:, :TO], scales(available, (5, 20, 80)),
 				scales(gold, (1000, 5000, 20000)).reshape(b, 1, 1, 3).expand(b, TO, c.N_LEVELS, 3),
 				scales(self.features.creature_cost[vocab_index(x["t_available_creature"][:, :TO], c.CREATURE_VOCAB)] * available, (1000, 5000, 20000)),
+				self.visitors(state)[:, :TO].unsqueeze(2).expand(b, TO, c.N_LEVELS, d),
 			],
 			dim=-1,
 		)
@@ -881,6 +910,20 @@ def migrate_option_head(state_dict):
 		fight, join = state_dict["answer_fight.weight"], state_dict["answer_join.weight"]
 		biases = torch.stack([state_dict["answer_fight.bias"][0], state_dict["answer_join.bias"][0]]).reshape(1, 2).to(fight)
 		state["option_weights.weight"] = torch.cat([fight, join, biases], dim=1)
+	return state
+
+
+GROWN_INPUTS = ("recruit_head.0.weight", "option_weights.weight")  # (2026-11-04: + the visiting hero; + a purchase's fit)
+
+
+def pad_new_inputs(state_dict, own):
+	"""A state dict whose GROWN_INPUTS layers have fewer input columns than the model's (own: its state_dict): their new
+	columns, at the end, at 0 (the model as it was); as it is otherwise."""
+	state = dict(state_dict)
+	for key in GROWN_INPUTS:
+		if key in state and key in own and state[key].shape[1] < own[key].shape[1]:
+			old = state[key]
+			state[key] = torch.cat([old, old.new_zeros(old.shape[0], own[key].shape[1] - old.shape[1])], dim=1)
 	return state
 
 
