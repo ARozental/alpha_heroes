@@ -1062,14 +1062,14 @@ void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, Query
 	for(int n = 0; n < 8 && !stopping; ++n)
 	{
 		auto decision = encode(DecisionKind::EXCHANGE, first, second);
-		if(!decision.inputs.any(In::army_mask))
+		if(!decision.inputs.any(In::army_mask) && !decision.inputs.any(In::artifact_mask))
 			break;
 		std::optional<Choice> advice;
 		std::vector<std::pair<int, int>> accept;
 		if(adviceDrawn())
 			advice = adviseExchange(decision, first, second, accept);
 		const auto choice = decide(decision, advice, std::nullopt, accept);
-		if(choice.type != static_cast<int>(ActionType::ARMY))
+		if(choice.type != static_cast<int>(ActionType::ARMY) && choice.type != static_cast<int>(ActionType::ARTIFACT))
 			break;
 		if(!execute(decision, choice))
 		{

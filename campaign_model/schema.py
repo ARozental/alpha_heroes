@@ -194,6 +194,9 @@ INPUTS = (
 	_i("a_creature", (c.ARMED_OBJECTS, A), "its army's creatures (0 with no count)"),
 	_i("a_count", (c.ARMED_OBJECTS, A), "their counts: VCMI's quantity id unless a_detailed, 0 none"),
 	_m("a_detailed", (c.ARMED_OBJECTS,), "a_count is exact"),
+	# Schema 13 (after a_*: older records read with it at 0)
+	_m("artifact_mask", (HO, c.N_ARTIFACT_POSITIONS, c.N_ARTIFACT_TARGETS), "ARTIFACT: hero, its artifact's position (worn slots, then the backpack), ArtifactTarget"),
+	_i("x_heroes", (2,), "an exchange's two heroes of ours, their hero tokens + 1 (ARTIFACT's GIVE goes from one to the other), 0 none"),
 )
 
 
@@ -219,6 +222,7 @@ OUTPUTS = (
 	_o("value", (c.N_VALUE_OFFSETS,), "predicted share of all empires' value VALUE_OFFSETS days after this day"),
 	_o("memory", (c.MEMORY_SLOTS, c.MEMORY_WIDTH), "the memory after this decision, -1..1: AlphaMapAI passes it back as the next decision's mem"),
 	_o("resource_worth", (R,), "what one unit of each resource is worth to us (gold): a purchase short of resources trades away what loses the least of it"),
+	_o("artifact_logp", (HO, c.N_ARTIFACT_POSITIONS, c.N_ARTIFACT_TARGETS), "log p(hero, position, target | ARTIFACT)"),
 )
 
 # Each action type's table: (output, mask); END has none
@@ -234,6 +238,7 @@ HEADS = {
 	c.ActionType.BUY: ("buy_logp", "buy_mask"),
 	c.ActionType.DISMISS: ("dismiss_logp", "dismiss_mask"),
 	c.ActionType.TRAVEL: ("travel_logp", "travel_mask"),
+	c.ActionType.ARTIFACT: ("artifact_logp", "artifact_mask"),
 }
 SPECS = {s.name: s for s in INPUTS + OUTPUTS}
 

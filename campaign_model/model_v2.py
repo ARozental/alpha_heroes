@@ -248,7 +248,7 @@ class CampaignModelV2(nn.Module):
 		before 2026-11-04's MOVE features with move_pair's first layer moved to its inputs now (migrate_move_inputs); one
 		from before 2026-11-04's question head with its fight and join weights in option_weights (migrate_option_head)."""
 		own = self.state_dict()
-		state = with_added(migrate_option_head(migrate_move_inputs(state_dict)), own)
+		state = with_added(migrate_action_types(migrate_option_head(migrate_move_inputs(state_dict)), own), own)
 		return super().load_state_dict(pad_new_inputs(state, own), strict=strict, assign=assign)
 
 	def __init__(self, dim=64, cell_dim=16, heads=4, layers=2, share_target="share"):
@@ -354,6 +354,10 @@ class CampaignModelV2(nn.Module):
 		self.buy_item = small_embedding(c.N_BUY_ITEMS, d)
 		self.buy_q = zero_output(nn.Linear(d, d))
 		self.dismiss_out = zero_output(nn.Linear(d, 1))
+		# ARTIFACT (schema 13): a hero's query against its artifact's own row (the hero encoder's) and what to do with it,
+		# at 0 to begin with; its prior: what the move does to Φ (model.CustomFeatures.artifact_prior)
+		self.artifact_q = zero_output(nn.Linear(d, d))
+		self.artifact_target = small_embedding(c.N_ARTIFACT_TARGETS, d)
 		# A question (the user, 2026-11-04: every option its own embedding, never one YES vector for every question; a
 		# choice's logit the atanh of a cosine): the decision's state, from the global token and the hero asked, against
 		# each option's key: its identity (encode_options: the model's own vectors of what it names, with what it does with
@@ -724,6 +728,13 @@ class CampaignModelV2(nn.Module):
 		learned[A_.BUY] = self.buy_q(own_heroes) @ self.buy_item.weight.t() / math.sqrt(d)
 		prior[A_.BUY] = (book_weight * known.spellbook_wanted.float().unsqueeze(-1) * book).expand_as(learned[A_.BUY])
 		offers[A_.BUY] = best_legal(prior[A_.BUY], x["buy_mask"])
+		ids = torch.cat([x["h_artifacts"][:, :HO], x["h_backpack"][:, :HO]], dim=-1)
+		query = self.artifact_q(own_heroes)  # [B, HO, d]
+		own_artifacts = (query.unsqueeze(2) * self.encode_hero.artifact(vocab_index(ids, c.ARTIFACT_VOCAB))).sum(dim=-1)  # [B, HO, P]
+		targets = query @ self.artifact_target.weight.t()  # [B, HO, N_ARTIFACT_TARGETS]
+		learned[A_.ARTIFACT] = (own_artifacts.unsqueeze(-1) + targets.unsqueeze(2)) / math.sqrt(d)
+		prior[A_.ARTIFACT] = known.artifact_prior
+		offers[A_.ARTIFACT] = best_legal(prior[A_.ARTIFACT], x["artifact_mask"])
 		learned[A_.DISMISS] = self.dismiss_out(own_heroes).squeeze(-1)
 		prior[A_.DISMISS] = torch.zeros_like(learned[A_.DISMISS])
 		# A question: the decision's state (the global token, the hero asked) against each option's key (its identity and
@@ -917,6 +928,21 @@ def migrate_option_head(state_dict):
 
 
 GROWN_INPUTS = ("recruit_head.0.weight", "option_weights.weight")  # (2026-11-04: + the visiting hero; + a purchase's fit)
+
+
+def migrate_action_types(state_dict, own):
+	"""A state dict from before ARTIFACT (schema 13: a 13th action type): type_bias gains its entry and the global
+	encoder's previous-type table its row before the "none" row (vocab_index's last), both as the fresh model (own) has
+	them; as it is otherwise."""
+	state = dict(state_dict)
+	key = "type_bias"
+	if key in state and key in own and state[key].shape[0] < own[key].shape[0]:
+		state[key] = torch.cat([state[key], own[key][state[key].shape[0] :].to(state[key])])
+	key = "encode_global.last.weight"
+	if key in state and key in own and state[key].shape[0] < own[key].shape[0]:
+		old, types = state[key], state[key].shape[0] - 1  # (the old none row: its last)
+		state[key] = torch.cat([old[:types], own[key][types : own[key].shape[0] - 1].to(old), old[types:]])
+	return state
 
 
 def pad_new_inputs(state_dict, own):

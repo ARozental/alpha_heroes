@@ -8,7 +8,7 @@ Every decision is one of two families:
 """
 from enum import IntEnum
 
-SCHEMA_VERSION = 12  # 12: resource_worth out (a purchase short of resources trades for itself: AlphaMapAI pays with what is worth the least), the inputs as 11; 11: a question's guards and what its options do with them (o_battle, o_join, d_guard_*), the armed objects that fight a hero stepping on them (a_*: garrisons), after mem (older records read with them at 0); 10: the model's memory (mem in, memory out: a player's decisions carry it forward); 9: the whole map tile by tile (tile_*, MAP_TILES a side), for the model's map CNN (docs/campaign_model_v2_draft.md); 8: heroes' luck and morale with their parts until the next battle (h_luck, h_morale, h_battle_*), the spells of heroes for hire (g_tavern_spells); 7: what a hero for hire brings (g_tavern_exp, g_tavern_army_*, g_tavern_artifacts); 6: build_short (buildable but for resources); 5: every object we see (MAP_OBJECTS 8192), no g_objects (torch counts them); 4: RECRUIT's destination, TRAVEL's days, our previous decision (g_last_*); 3: the whole map (m_* objects, g_tiles, g_objects), TRAVEL, g_object_income, h_spell_cost; 2: counts as a human sees them
+SCHEMA_VERSION = 13  # 13: ARTIFACT (artifact_mask, after a_*; older records read with it at 0), artifact_logp out; 12: resource_worth out (a purchase short of resources trades for itself: AlphaMapAI pays with what is worth the least), the inputs as 11; 11: a question's guards and what its options do with them (o_battle, o_join, d_guard_*), the armed objects that fight a hero stepping on them (a_*: garrisons), after mem (older records read with them at 0); 10: the model's memory (mem in, memory out: a player's decisions carry it forward); 9: the whole map tile by tile (tile_*, MAP_TILES a side), for the model's map CNN (docs/campaign_model_v2_draft.md); 8: heroes' luck and morale with their parts until the next battle (h_luck, h_morale, h_battle_*), the spells of heroes for hire (g_tavern_spells); 7: what a hero for hire brings (g_tavern_exp, g_tavern_army_*, g_tavern_artifacts); 6: build_short (buildable but for resources); 5: every object we see (MAP_OBJECTS 8192), no g_objects (torch counts them); 4: RECRUIT's destination, TRAVEL's days, our previous decision (g_last_*); 3: the whole map (m_* objects, g_tiles, g_objects), TRAVEL, g_object_income, h_spell_cost; 2: counts as a human sees them
 
 N_RESOURCES = 7  # wood, mercury, ore, sulfur, crystal, gems, gold (VCMI's order)
 
@@ -110,9 +110,23 @@ class ActionType(IntEnum):
 	BUY = 9  # spellbook, war machines
 	DISMISS = 10
 	TRAVEL = 11  # a hero heads for an area of the map (TRAVEL_GRID) days away: it walks the path there as far as it can today
+	ARTIFACT = 12  # a hero's artifact: given to the hero it meets (EXCHANGE), worn from its backpack, or assembled with its worn parts (ArtifactTarget)
 
 
 N_ACTION_TYPES = len(ActionType)
+
+
+class ArtifactTarget(IntEnum):
+	"""What ARTIFACT does with a hero's artifact (the user, 2026-11-04: move them to the strongest hero; wear one from the
+	backpack, the worn one replaced; assemble a combination)."""
+
+	GIVE = 0  # to the other hero of an exchange: its own slot there if free, else that hero's backpack
+	EQUIP = 1  # from the backpack into its slot, the artifact worn there into the backpack
+	ASSEMBLE = 2  # into the combination it completes with the hero's worn parts
+
+
+N_ARTIFACT_POSITIONS = N_WORN_SLOTS + N_BACKPACK  # worn slots 0..18, then the backpack's first 8 (VCMI's ArtifactPosition: BACKPACK_START 19)
+N_ARTIFACT_TARGETS = len(ArtifactTarget)
 RESERVED_ACTION_TYPES = (ActionType.DISMISS,)  # in the contract, never legal yet
 
 

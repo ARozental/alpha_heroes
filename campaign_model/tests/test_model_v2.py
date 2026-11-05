@@ -1132,6 +1132,41 @@ def test_a_purchase_short_of_resources_is_priced_by_the_trades_it_makes():
 	assert bool(cannot[0, 0, 0]) and float(recruit[0, 0, 0]) > 0
 
 
+def test_an_artifacts_move_is_priced_by_what_it_does_to_the_armies_the_heroes_lead():
+	"""model.CustomFeatures.artifact_prior (schema 13): a +2 attack sword handed by a hero leading nothing to one leading
+	an army gains (the army's multiplier rises); the other way it loses; worn from the backpack into an empty slot it
+	gains; a combination's parts worn together assemble at its price over theirs."""
+	from campaign_model import features as ft
+
+	T = c.ArtifactTarget
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	t = m.features
+	sword, part, combination = 7, 40, 129  # (Centaur's Axe and the tables set here)
+	t.artifact_primary[sword] = torch.tensor([2.0, 0, 0, 0])
+	t.artifact_slot[sword] = 3
+	t.artifact_combination[part] = combination
+	t.artifact_price[part], t.artifact_price[combination] = 1000.0, 9000.0
+	x = {k: np.repeat(v, 2, axis=0) for k, v in rich_inputs(1, 5).items()}
+	x["h_present"][:, :2], x["h_owner"][:, :2] = True, c.OWNER_SELF
+	x["h_primary"][:, :2] = 0
+	x["h_artifacts"][:, :2], x["h_backpack"][:, :2] = -1, -1
+	x["h_army_creature"][:, :2], x["h_army_count"][:, :2] = -1, 0
+	x["h_army_creature"][:, 1, 0], x["h_army_count"][:, 1, 0] = 12, 30  # (hero 1 leads an army, hero 0 none)
+	x["h_artifacts"][0, 0, 3] = sword  # (row 0: hero 0 wears it; hero 1 wears it in row 1)
+	x["h_artifacts"][1, 1, 3] = sword
+	x["h_primary"][0, 0, 0] = x["h_primary"][1, 1, 0] = 2  # (h_primary counts what its items add)
+	x["h_backpack"][1, 1, 0] = sword  # (and carries another in its backpack, slot 3 taken)
+	x["h_artifacts"][0, 1, 5], x["h_artifacts"][0, 1, 6] = part, part  # (two parts worn by hero 1 in row 0)
+	x["x_heroes"][:] = [1, 2]  # (an exchange of heroes 0 and 1)
+	with torch.no_grad():
+		prior = m.domain_knowledge(tensors(x)).artifact_prior  # [B, HO, P, T]
+	assert float(prior[0, 0, 3, T.GIVE]) > 0.5  # (to the hero leading the army)
+	assert float(prior[1, 1, 3, T.GIVE]) < -0.5  # (away from it)
+	assert abs(float(prior[1, 1, c.N_WORN_SLOTS, T.EQUIP])) < 1e-4  # (its slot holds the same sword: no change)
+	gained = float(prior[0, 1, 5, T.ASSEMBLE])
+	assert gained == pytest.approx(float(ft.value_logit(torch.tensor(9000.0 - 2000.0))), rel=1e-4)
+
+
 def test_options_that_differ_never_share_an_identity():
 	"""encoders.OptionEncoder has no hashed rows (features.bucket put 546 of 954 options on a shared row, 2026-11-04: NO with
 	a scroll of spell 57, a skill with a creature's amount): those pairs differ, and so do two resources and two primary
@@ -1253,9 +1288,12 @@ def test_records_from_before_schema_11_read_with_no_guards_battle_join_or_armed_
 	x["o_battle"][:, 0] = True
 	x["a_present"][:, 0] = True
 	x["a_count"][:, 0, 0] = 5
+	x["artifact_mask"][:, 0, 0, 0] = True
+	x["x_heroes"][:, :] = [1, 2]
 	full = zlib.decompress(encoded(x, 0))
-	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 2
+	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 3
 	for n in sorted(SHORT_RECORDS):
 		got = decode_inputs([SimpleNamespace(inputs=zlib.compress(full[:n]))])
-		for name in ("o_battle", "o_join", "d_guard_count", "a_present", "a_count"):
+		before_11 = ("o_battle", "o_join", "d_guard_count", "a_present", "a_count") if n < max(SHORT_RECORDS) else ()
+		for name in before_11 + ("artifact_mask", "x_heroes"):  # (schema 13's: none in any older record)
 			assert not got[name].any(), (n, name)

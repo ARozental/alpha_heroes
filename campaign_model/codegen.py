@@ -37,7 +37,7 @@ def render():
 		"TILE_ON_MAP", "TILE_REVEALED", "TILE_BLOCKED", "TILE_VISITABLE", "TILE_WATER", "TILE_GUARDED",
 		"TILE_VISITED_BY_PLAYER", "TILE_VISITED_BY_HERO", "TILE_EXACT_COUNT",
 		"MAP_OBJECTS", "ARMED_OBJECTS", "MAP_GRID", "MAP_LEVELS", "MAP_TILES", "N_GRID_COUNTS", "OBJECT_VISITED_BY_PLAYER", "OBJECT_EXACT_COUNT", "OBJECT_GUARDED",
-		"TRAVEL_GRID", "OBJECT_VOCAB", "OWNED_STACKS",
+		"TRAVEL_GRID", "OBJECT_VOCAB", "OWNED_STACKS", "N_ARTIFACT_POSITIONS", "N_ARTIFACT_TARGETS",
 	]
 	heads = "\n".join(
 		f"\t\tcase ActionType::{action.name}: return {{Out::{output}, In::{mask}}};" for action, (output, mask) in HEADS.items()
@@ -65,6 +65,8 @@ constexpr const char * FAMILY = "campaign";
 {_enum("OptionKind", c.OptionKind)}
 
 {_enum("ArmyAmount", c.ArmyAmount)}
+
+{_enum("ArtifactTarget", c.ArtifactTarget)}
 
 {_enum("GridCount", c.GridCount)}
 

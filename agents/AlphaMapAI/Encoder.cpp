@@ -9,6 +9,7 @@
 #include "lib/callback/CCallback.h"
 #include "lib/entities/artifact/CArtifact.h"
 #include "lib/entities/artifact/CArtifactInstance.h"
+#include "lib/entities/artifact/ArtifactUtils.h"
 #include "lib/entities/building/CBuilding.h"
 #include "lib/entities/faction/CTown.h"
 #include "lib/entities/hero/CHeroClass.h"
@@ -252,7 +253,10 @@ Decision AlphaMapAI::encode(DecisionKind kind, ObjectInstanceID exchangeFirst, O
 	encodeMap(decision, ours);
 	encodeTiles(decision);
 	if(kind == DecisionKind::TURN)
+	{
 		encodeTurnActions(decision, paths);
+		encodeArtifacts(decision, -1, -1);
+	}
 	if(kind == DecisionKind::EXCHANGE)
 	{
 		// The two armies that may trade: our heroes or towns, or the dialog's other army (OTHER_ARMY)
@@ -274,6 +278,12 @@ Decision AlphaMapAI::encode(DecisionKind kind, ObjectInstanceID exchangeFirst, O
 		const int a = holder(exchangeFirst);
 		const int b = holder(exchangeSecond);
 		encodeArmyMoves(decision, {{a, b}, {b, a}});
+		if(a < OWN_HEROES && b < OWN_HEROES) // (two heroes of ours: their artifacts may change hands)
+		{
+			decision.inputs.at(In::x_heroes, 0) = a + 1;
+			decision.inputs.at(In::x_heroes, 1) = b + 1;
+			encodeArtifacts(decision, a, b);
+		}
 	}
 	dropFutile(decision);
 	return decision;
@@ -800,6 +810,59 @@ void AlphaMapAI::encodeTiles(Decision & decision)
 				}
 				in.at(In::tile_flags, z, y, x) = flags;
 			}
+}
+
+void AlphaMapAI::encodeArtifacts(Decision & decision, int first, int second)
+{
+	// ARTIFACT (schema 13; the user, 2026-11-04: move them to the strongest hero, wear one from the backpack, assemble):
+	// in an exchange of two heroes of ours (first, second), each artifact one can hand to the other (GIVE: into its
+	// own slot there if free, else that hero's backpack: getArtAnyPosition); in a turn, a backpack artifact worn in its
+	// slot (EQUIP: the one worn there into the backpack) and a worn one completing a combination with the hero's worn
+	// parts (ASSEMBLE). The spellbook, the catapult, the grail and the parts locked in a combination stay
+	auto & in = decision.inputs;
+	const auto add = [&](int hero, int position, ArtifactTarget target, const Entry & entry)
+	{
+		in.at(In::artifact_mask, hero, position, static_cast<int>(target)) = 1;
+		decision.entries[static_cast<int>(ActionType::ARTIFACT)][(hero * N_ARTIFACT_POSITIONS + position) * N_ARTIFACT_TARGETS + static_cast<int>(target)] = entry;
+	};
+	for(int h = 0; h < OWN_HEROES; ++h)
+	{
+		const auto * hero = decision.heroes[h] == ObjectInstanceID() ? nullptr : cb->getHero(decision.heroes[h]);
+		if(!hero || (first >= 0 && h != first && h != second))
+			continue;
+		const auto * other = first >= 0 ? cb->getHero(decision.heroes[h == first ? second : first]) : nullptr;
+		for(int p = 0; p < N_ARTIFACT_POSITIONS; ++p)
+		{
+			const ArtifactPosition position(p); // (worn slots, then the backpack: VCMI's BACKPACK_START is N_WORN_SLOTS)
+			const auto * slot = hero->getSlot(position);
+			const auto * art = hero->getArt(position);
+			if(!art || !slot || slot->locked)
+				continue;
+			const auto id = art->getTypeId();
+			if(id == ArtifactID::SPELLBOOK || id == ArtifactID::CATAPULT || id == ArtifactID::GRAIL || !ArtifactUtils::isArtRemovable(std::make_pair(position, *slot)))
+				continue;
+			if(first >= 0)
+			{
+				const auto to = other ? ArtifactUtils::getArtAnyPosition(other, id) : ArtifactPosition(ArtifactPosition::PRE_FIRST);
+				if(to != ArtifactPosition::PRE_FIRST)
+					add(h, p, ArtifactTarget::GIVE, Entry{hero->id, other->id, p, id.getNum(), to.num});
+			}
+			else if(ArtifactUtils::isSlotBackpack(position))
+			{
+				const auto & slots = art->getType()->getPossibleSlots();
+				const auto found = slots.find(ArtBearer::HERO);
+				if(found != slots.end())
+					for(const auto & wear : found->second)
+						if(ArtifactUtils::isSlotEquipment(wear) && art->canBePutAt(hero, wear, true))
+						{
+							add(h, p, ArtifactTarget::EQUIP, Entry{hero->id, {}, p, id.getNum(), wear.num});
+							break;
+						}
+			}
+			else if(const auto combinations = ArtifactUtils::assemblyPossibilities(hero, id, true); !combinations.empty())
+				add(h, p, ArtifactTarget::ASSEMBLE, Entry{hero->id, {}, p, id.getNum(), combinations.front()->getId().getNum()});
+		}
+	}
 }
 
 void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)

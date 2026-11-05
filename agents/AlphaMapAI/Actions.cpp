@@ -7,6 +7,7 @@
 #include "lib/entities/faction/CTown.h"
 #include "lib/mapObjects/CGHeroInstance.h"
 #include "lib/mapObjects/CGTownInstance.h"
+#include "lib/networkPacks/ArtifactLocation.h"
 #include "lib/networkPacks/TradeItem.h"
 #include "lib/pathfinder/CGPathNode.h"
 #include "lib/pathfinder/PathfinderCache.h"
@@ -168,6 +169,12 @@ bool AlphaMapAI::execute(const Decision & decision, const Choice & choice)
 		case ActionType::BUY:
 			if(const auto * hero = cb->getHero(e.first))
 				cb->buyArtifact(hero, ArtifactID(e.a));
+			break;
+		case ActionType::ARTIFACT: // (Encoder.cpp encodeArtifacts: the artifact's position a, its destination c)
+			if(static_cast<ArtifactTarget>(choice.index % N_ARTIFACT_TARGETS) == ArtifactTarget::ASSEMBLE)
+				cb->assembleArtifacts(e.first, ArtifactPosition(e.a), true, ArtifactID(e.c));
+			else
+				cb->swapArtifacts(ArtifactLocation(e.first, ArtifactPosition(e.a)), ArtifactLocation(e.second == ObjectInstanceID() ? e.first : e.second, ArtifactPosition(e.c)));
 			break;
 		case ActionType::TRAVEL: // as far along the path to the area's tile as today's movement goes (moveHero stops there)
 			moveHero(e.first, e.tile);

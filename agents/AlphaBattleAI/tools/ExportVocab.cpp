@@ -179,10 +179,23 @@ JsonNode artifacts()
 		node["class"].String() = classes.count(a->aClass) ? classes.at(a->aClass) : "special";
 		node["combined"].Bool() = a->isCombined();
 		std::set<std::string> bonuses; // what it does (battle_model/rules.py picks the ones that change rules)
+		std::array<si64, 4> primary{}; // what it adds to its hero's attack, defense, spell power and knowledge
 		for(const auto & bonus : a->getExportedBonusList())
+		{
 			bonuses.insert(bonusName(bonus->type));
+			if(bonus->type == BonusType::PRIMARY_SKILL)
+			{
+				const int skill = bonus->subtype.as<PrimarySkill>().getNum();
+				if(skill >= 0 && skill < 4)
+					primary[skill] += bonus->val;
+			}
+		}
 		for(const auto & name : bonuses)
 			node["bonuses"].Vector().emplace_back(name);
+		for(const auto value : primary)
+			node["primary"].Vector().emplace_back(value);
+		for(const auto * part : a->getConstituents()) // (a combination's parts: worn together they assemble into it)
+			node["parts"].Vector().emplace_back(static_cast<si64>(part->getId().getNum()));
 		if(a->getPossibleSlots().count(ArtBearer::HERO))
 			for(const auto & slot : a->getPossibleSlots().at(ArtBearer::HERO))
 				node["slots"].Vector().emplace_back(static_cast<si64>(slot.num)); // ArtifactPosition (encode names them wrongly)

@@ -105,6 +105,9 @@ def game_tables():
 		"creature_luck": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_morale": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_faction": torch.full((c.CREATURE_VOCAB + 1,), -1, dtype=torch.long),  # (its faction's id; neutral's its own)
+		"artifact_primary": torch.zeros(c.ARTIFACT_VOCAB + 1, c.N_PRIMARY),  # (what it adds to its hero's primary skills)
+		"artifact_slot": torch.full((c.ARTIFACT_VOCAB + 1,), -1, dtype=torch.long),  # (the first worn slot it fits)
+		"artifact_combination": torch.full((c.ARTIFACT_VOCAB + 1,), -1, dtype=torch.long),  # (the combination it is a part of)
 		"creature_undead": torch.zeros(c.CREATURE_VOCAB + 1),
 	}
 	try:
@@ -159,6 +162,16 @@ def game_tables():
 		for artifact, price in artifact_prices().items():
 			if 0 <= artifact < c.ARTIFACT_VOCAB:
 				tables["artifact_price"][artifact] = float(price)
+		for row in raw()["artifacts"]:
+			artifact = row.get("id", -1)
+			if 0 <= artifact < c.ARTIFACT_VOCAB:
+				tables["artifact_primary"][artifact] = torch.tensor([float(v) for v in (row.get("primary") or [0] * c.N_PRIMARY)[: c.N_PRIMARY]])
+				slots = [s for s in row.get("slots", []) if 0 <= s < c.N_WORN_SLOTS]
+				if slots:
+					tables["artifact_slot"][artifact] = slots[0]
+				for part in row.get("parts", []):
+					if 0 <= part < c.ARTIFACT_VOCAB:
+						tables["artifact_combination"][part] = artifact
 		tables["level_experience"] = torch.tensor([float(v) for v in experience_table()])
 	except (ImportError, FileNotFoundError):
 		pass
@@ -462,6 +475,7 @@ class CustomFeatures(nn.Module):
 		if windows.shape[0] > 0:
 			f.update(self.tile_features(x, windows, f))
 		f.option_prior, f.option_features = self.option_knowledge(x, f)
+		f.artifact_prior = self.artifact_prior(x, f)
 		return f
 
 	def question_guards(self, x, f):
@@ -538,6 +552,47 @@ class CustomFeatures(nn.Module):
 		value = torch.where(amounts, x["o_amount"], torch.full_like(x["o_amount"], -1))
 		most = amounts & (value == value.amax(dim=-1, keepdim=True)) & (value > 0)
 		return most.float() * ft.bounded(self.recruit_all, 0.0, 4.0, 2.0, CORRECTION_STEP)
+
+	def artifact_prior(self, x, f):
+		"""What each ARTIFACT entry does to Φ, as a prior logit [B, HO, N_ARTIFACT_POSITIONS, N_ARTIFACT_TARGETS]
+		(value_logit; the user, 2026-11-04: move them to the strongest hero): an artifact's attack and defense change what
+		each hero makes of the army it leads (army_multiplier); GIVE takes a worn one's off its hero and puts it on the
+		other of the exchange (x_heroes); EQUIP wears one from the backpack in place of its slot's; ASSEMBLE turns the
+		worn parts into their combination (its price over theirs, its bonuses in place of theirs). An artifact's price
+		stays ours wherever it is: Φ's artifacts part moves only with an assembly."""
+		ids = torch.cat([x["h_artifacts"][:, :HO], x["h_backpack"][:, :HO]], dim=-1)  # [B, HO, P]
+		index = vocab_index(ids, c.ARTIFACT_VOCAB)
+		present = ids >= 0
+		worn = (torch.arange(ids.shape[-1], device=ids.device) < c.N_WORN_SLOTS) & present  # (a backpack artifact gives its hero nothing)
+		bonus = self.artifact_primary[index] * present.unsqueeze(-1).float()  # [B, HO, P, N_PRIMARY]
+		attack, defense = (x["h_primary"][:, :HO, k].clamp(min=0).float() for k in (0, 1))  # [B, HO]
+		army = f.hero_gold[:, :HO]
+		lead = ft.army_multiplier(attack, defense)
+
+		def change(gained_attack, gained_defense):  # [B, HO, P]: what the hero's army gains in Φ
+			return army.unsqueeze(-1) * (ft.army_multiplier(attack.unsqueeze(-1) + gained_attack, defense.unsqueeze(-1) + gained_defense) - lead.unsqueeze(-1))
+
+		on = lambda values, condition: values * condition.float()  # noqa: E731
+		first, second = x["x_heroes"][:, 0:1] - 1, x["x_heroes"][:, 1:2] - 1  # (tokens + 1; 0, none: -1)
+		heroes = torch.arange(HO, device=ids.device).unsqueeze(0)
+		partner = torch.where(heroes == first, second, torch.where(heroes == second, first, torch.full_like(heroes.expand_as(first.expand(-1, HO)), -1)))
+		other = partner.clamp(min=0)
+		gained = army.gather(1, other).unsqueeze(-1) * (
+			ft.army_multiplier(attack.gather(1, other).unsqueeze(-1) + bonus[..., 0], defense.gather(1, other).unsqueeze(-1) + bonus[..., 1])
+			- lead.gather(1, other).unsqueeze(-1)
+		)
+		give = (change(-on(bonus[..., 0], worn), -on(bonus[..., 1], worn)) + gained) * (partner >= 0).unsqueeze(-1).float()
+		slot = self.artifact_slot[index]  # (where it is worn)
+		there = x["h_artifacts"][:, :HO].gather(2, slot.clamp(min=0)) * (slot >= 0) + -1 * (slot < 0)
+		replaced = self.artifact_primary[vocab_index(there, c.ARTIFACT_VOCAB)] * (there >= 0).unsqueeze(-1).float()
+		equip = on(change(bonus[..., 0] - replaced[..., 0], bonus[..., 1] - replaced[..., 1]), present & ~worn)
+		combination = self.artifact_combination[index]  # [B, HO, P]
+		parts = (combination.unsqueeze(-1) == combination.unsqueeze(-2)) & (combination >= 0).unsqueeze(-1) & worn.unsqueeze(-2)  # [B, HO, P, P (the parts worn)]
+		parts_price = (parts.float() * self.artifact_price[index].unsqueeze(-2)).sum(dim=-1)
+		parts_bonus = (parts.float().unsqueeze(-1) * bonus.unsqueeze(-3)).sum(dim=-2)  # [B, HO, P, N_PRIMARY]
+		whole = self.artifact_primary[vocab_index(combination, c.ARTIFACT_VOCAB)]
+		assemble = on(self.artifact_price[vocab_index(combination, c.ARTIFACT_VOCAB)] - parts_price + change(whole[..., 0] - parts_bonus[..., 0], whole[..., 1] - parts_bonus[..., 1]), combination >= 0)
+		return ft.value_logit(torch.stack([give, equip, assemble], dim=-1))
 
 	def resource_worth(self, x):
 		"""What one unit of each resource is worth to us [B, R] (schema 12's resource_worth: a purchase short of resources
@@ -1044,7 +1099,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	# model_v2.migrate_option_head)
 	"foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option", "option_flags",
 	"decision", "option_context", "option_weights", "encode_options.component", "encode_options.primary", "encode_options.resource",
-	"encode_options.numbers", "build_identity",
+	"encode_options.numbers", "build_identity", "artifact_q", "artifact_target",
 )
 
 
@@ -1394,6 +1449,7 @@ class CampaignModel(nn.Module):
 		self.value(x, f, out, g, own_heroes, own_towns)
 		out["memory"] = torch.zeros_like(x["mem"], dtype=torch.float32)  # (v1 has no memory: the contract's output, kept at 0)
 		out["resource_worth"] = f.resource_worth
+		out["artifact_logp"] = flat_log_softmax(f.artifact_prior, x["artifact_mask"])  # (v1: the prior only, schema 13's ARTIFACT)
 		return out
 
 	def move_and_travel(self, x, f, out, own_heroes, cells, areas, windows, n):

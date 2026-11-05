@@ -321,6 +321,9 @@ private:
 	void dropFutile(Decision & decision);
 	void encodeTurnActions(Decision & decision, PathfinderCache & paths);
 	void encodeArmyMoves(Decision & decision, const std::vector<std::pair<int, int>> & pairs);
+	// ARTIFACT's entries: GIVE between an exchange's two heroes of ours (first, second: their hero tokens), EQUIP and
+	// ASSEMBLE in a turn (first < 0)
+	void encodeArtifacts(Decision & decision, int first, int second);
 	void encodeQuestionGuards(Decision & decision, const std::string & text, const std::vector<Component> & components);
 	void encodeOptionContext(Decision & decision, ObjectInstanceID hero, int3 target);
 	// The questions' decisions, as asked (the handlers decide them; the teacher's recorder keeps them for the answer)

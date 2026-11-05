@@ -7,8 +7,8 @@
 
 namespace MapSchema
 {
-constexpr int SCHEMA_VERSION = 12;
-constexpr const char * CONTRACT_HASH = "6ee1ae97fd6670c0";
+constexpr int SCHEMA_VERSION = 13;
+constexpr const char * CONTRACT_HASH = "de82f54cc368f0b3";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;
@@ -38,7 +38,7 @@ constexpr int N_RECRUIT_AMOUNTS = 4;
 constexpr int N_RECRUIT_TARGETS = 2;
 constexpr int N_TRADE_AMOUNTS = 4;
 constexpr int N_ARMY_AMOUNTS = 3;
-constexpr int N_ACTION_TYPES = 12;
+constexpr int N_ACTION_TYPES = 13;
 constexpr int N_VALUE_OFFSETS = 3;
 constexpr int MAX_DECISIONS_PER_DAY = 256;
 constexpr int OWNER_NONE = 0;
@@ -69,6 +69,8 @@ constexpr int OBJECT_GUARDED = 4;
 constexpr int TRAVEL_GRID = 18;
 constexpr int OBJECT_VOCAB = 256;
 constexpr int OWNED_STACKS = 16;
+constexpr int N_ARTIFACT_POSITIONS = 27;
+constexpr int N_ARTIFACT_TARGETS = 3;
 
 enum class DecisionKind : int
 {
@@ -95,6 +97,7 @@ enum class ActionType : int
 	BUY = 9,
 	DISMISS = 10,
 	TRAVEL = 11,
+	ARTIFACT = 12,
 };
 
 enum class OptionKind : int
@@ -113,6 +116,13 @@ enum class ArmyAmount : int
 	ALL = 0,
 	HALF = 1,
 	ONE = 2,
+};
+
+enum class ArtifactTarget : int
+{
+	GIVE = 0,
+	EQUIP = 1,
+	ASSEMBLE = 2,
 };
 
 enum class GridCount : int
@@ -288,6 +298,8 @@ enum class In : int
 	a_creature,
 	a_count,
 	a_detailed,
+	artifact_mask,
+	x_heroes,
 	COUNT
 };
 
@@ -429,6 +441,8 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"a_creature", DType::INT64, 2, {32, 7, 1, 1}, 0},
 	TensorSpec{"a_count", DType::INT64, 2, {32, 7, 1, 1}, 0},
 	TensorSpec{"a_detailed", DType::BOOL, 1, {32, 1, 1, 1}, 0},
+	TensorSpec{"artifact_mask", DType::BOOL, 3, {8, 27, 3, 1}, 0},
+	TensorSpec{"x_heroes", DType::INT64, 1, {2, 1, 1, 1}, 0},
 }};
 
 enum class Out : int
@@ -450,11 +464,12 @@ enum class Out : int
 	value,
 	memory,
 	resource_worth,
+	artifact_logp,
 	COUNT
 };
 
 constexpr std::array<TensorSpec, static_cast<int>(Out::COUNT)> OUTPUTS = {{
-	TensorSpec{"type_logp", DType::FLOAT32, 1, {12, 1, 1, 1}, 0},
+	TensorSpec{"type_logp", DType::FLOAT32, 1, {13, 1, 1, 1}, 0},
 	TensorSpec{"move_logp", DType::FLOAT32, 3, {8, 33, 33, 1}, 0},
 	TensorSpec{"build_logp", DType::FLOAT32, 2, {8, 44, 1, 1}, 0},
 	TensorSpec{"recruit_logp", DType::FLOAT32, 4, {8, 7, 4, 2}, 0},
@@ -471,6 +486,7 @@ constexpr std::array<TensorSpec, static_cast<int>(Out::COUNT)> OUTPUTS = {{
 	TensorSpec{"value", DType::FLOAT32, 1, {3, 1, 1, 1}, 0},
 	TensorSpec{"memory", DType::FLOAT32, 2, {8, 64, 1, 1}, 0},
 	TensorSpec{"resource_worth", DType::FLOAT32, 1, {7, 1, 1, 1}, 0},
+	TensorSpec{"artifact_logp", DType::FLOAT32, 3, {8, 27, 3, 1}, 0},
 }};
 
 /// The table (output) and its legality mask (input) of an action type; END has none
@@ -489,6 +505,7 @@ constexpr std::pair<Out, In> head(ActionType type)
 		case ActionType::BUY: return {Out::buy_logp, In::buy_mask};
 		case ActionType::DISMISS: return {Out::dismiss_logp, In::dismiss_mask};
 		case ActionType::TRAVEL: return {Out::travel_logp, In::travel_mask};
+		case ActionType::ARTIFACT: return {Out::artifact_logp, In::artifact_mask};
 		default: return {Out::COUNT, In::COUNT};
 	}
 }
