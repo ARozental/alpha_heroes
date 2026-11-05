@@ -1358,14 +1358,38 @@ def test_records_from_before_schema_11_read_with_no_guards_battle_join_or_armed_
 	x["x_heroes"][:, :] = [1, 2]
 	x["multi_mask"][:, 0, 0] = True
 	full = zlib.decompress(encoded(x, 0))
-	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 4
-	for n in sorted(SHORT_RECORDS):
+	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 5
+	lengths = sorted(SHORT_RECORDS)  # (records of schemas 9, 10, 11-12, 13, and 14 widened: each ends where the next's inputs start)
+	for n in lengths[:4]:
 		got = decode_inputs([SimpleNamespace(inputs=zlib.compress(full[:n]))])
-		lengths = sorted(SHORT_RECORDS)  # (records of schemas 9, 10, 11-12, 13: each ends where the next's inputs start)
 		before_11 = ("o_battle", "o_join", "d_guard_count", "a_present", "a_count") if n < lengths[2] else ()
 		before_14 = ("artifact_mask", "x_heroes") if n < lengths[3] else ()  # (schema 13's: none in any record before it)
 		for name in before_11 + before_14 + ("multi_mask",):  # (schema 14's: none in any older record)
 			assert not got[name].any(), (n, name)
+
+
+def test_a_record_of_schema_14_reads_with_its_multi_mask_widened():
+	"""records.widen_schema_14: a record of schema 14 ends with multi_mask at 4 kinds a town; decoded (both ways: the
+	trainer's decode_wire, padded) its kinds keep their towns, kinds 4-7 and schema 15's armies read as none."""
+	import zlib
+	from types import SimpleNamespace
+
+	from campaign_model.records import IN_LAYOUT, SCHEMA_14_BYTES, decode_inputs, padded
+	from campaign_model.tests.test_model import encoded
+
+	x = rich_inputs(1, 7)
+	x["multi_mask"][:] = False
+	x["multi_mask"][0, 0, c.MultiKind.RECRUIT_ALL] = x["multi_mask"][0, 3, c.MultiKind.GATHER] = x["multi_mask"][0, 1, c.MultiKind.GIVE_ALL] = True
+	full = zlib.decompress(encoded(x, 0))
+	start = sum(e[-1] for e in IN_LAYOUT[: [e[0] for e in IN_LAYOUT].index("multi_mask")])
+	mask = np.frombuffer(full[start : start + c.OWN_TOWNS * c.N_MULTI], dtype=np.uint8).reshape(c.OWN_TOWNS, c.N_MULTI)
+	old = full[:start] + mask[:, :4].tobytes()  # (schema 14's: its 4 kinds a town, nothing after)
+	assert len(old) == SCHEMA_14_BYTES
+	for got in (decode_inputs([SimpleNamespace(inputs=zlib.compress(old))]), {"multi_mask": np.frombuffer(padded(old), dtype=np.uint8)[start : start + c.OWN_TOWNS * c.N_MULTI].reshape(1, c.OWN_TOWNS, c.N_MULTI).astype(bool)}):
+		assert got["multi_mask"][0].sum() == 3 and got["multi_mask"][0, 0, c.MultiKind.RECRUIT_ALL] and got["multi_mask"][0, 3, c.MultiKind.GATHER] and got["multi_mask"][0, 1, c.MultiKind.GIVE_ALL]
+		assert not got["multi_mask"][0, :, 4:].any()
+	got = decode_inputs([SimpleNamespace(inputs=zlib.compress(old))])
+	assert not got["h_drop"].any() and not got["h_drop_kept"].any() and not got["x_take_count"].any()
 
 
 def test_a_sequence_carries_the_memory_its_turn_decisions_leave_and_its_gradient_reaches_the_writer():
@@ -1499,6 +1523,49 @@ def test_stepping_on_a_hero_or_a_town_of_ours_is_worth_what_the_army_gains_where
 	assert float(value[r, r + 2]) == pytest.approx(8_000 * (1.30 - 1.05), rel=1e-4)  # (hero 1's army: it makes less of it)
 	assert float(value[r + 3, r]) == pytest.approx(50_000 * (1.30 - t.unled_share), rel=1e-4)
 	assert float(value[r, r]) == 0.0 and float(value.sum()) == pytest.approx(8_000 * 0.25 + 50_000 * (1.30 - t.unled_share), rel=1e-4)
+
+
+def test_a_take_best_and_a_drop_are_priced_on_the_armies_they_make():
+	"""Schema 15 (the user, 2026-11-05): DROP_SLOW of a hero leading five Angels and two Dwarves (speed 3: the army at
+	1500 a day) into the garrison it visits gains what the Angels' movement and morale win back, the Dwarves at
+	unled_share in the garrison; disbanded, less their worth. TAKE_BEST is priced on the armies the C++ makes (x_take_*:
+	the receiver's led by it, the giver's by it)."""
+	from campaign_model import features as ft
+	from campaign_model import vocab
+
+	key = {row["key"]: i for i, row in vocab.creatures().items()}
+	angel, dwarf, pikeman = key["core:angel"], key["core:dwarf"], key["core:pikeman"]
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	t = m.features
+	x = tensors(rich_inputs(1, 5))
+	x["h_present"][:] = False
+	x["h_present"][0, :2], x["h_owner"][0, :2], x["h_garrisoned"][0, :2] = True, c.OWNER_SELF, False
+	x["h_army_creature"][0, :2], x["h_army_count"][0, :2] = -1, 0
+	x["h_army_creature"][0, 0, :2], x["h_army_count"][0, 0, :2] = torch.tensor([angel, dwarf]), torch.tensor([5, 2])
+	x["h_army_creature"][0, 1, 0], x["h_army_count"][0, 1, 0] = pikeman, 20
+	x["h_morale"][0, :2] = torch.tensor([0, 1])  # (VCMI's: two factions 0; one +1)
+	x["h_drop"][:], x["h_drop_kept"][:] = False, False
+	x["h_drop"][0, 0, 0, 1] = x["h_drop_kept"][0, 0, 0] = True  # (DROP_SLOW: the Dwarves, into the garrison)
+	x["x_heroes"][0] = torch.tensor([1, 2])
+	x["x_take_creature"][:], x["x_take_count"][:] = -1, 0
+	x["x_take_creature"][0, 0, 0, 0, :2], x["x_take_count"][0, 0, 0, 0, :2] = torch.tensor([angel, dwarf]), torch.tensor([5, 2])  # (TAKE_BEST to hero 0: the Angels and Dwarves;
+	x["x_take_creature"][0, 0, 0, 1, 0], x["x_take_count"][0, 0, 0, 1, 0] = pikeman, 20  # the Pikemen stay: nothing changes)
+	K = c.MultiKind
+	with torch.no_grad():
+		known = m.domain_knowledge(x)
+		kept = float(t.multi_gain(x, known)[0, 0, K.DROP_SLOW])
+		x["h_drop_kept"][0, 0, 0] = False
+		disbanded = float(t.multi_gain(x, known)[0, 0, K.DROP_SLOW])
+		take = float(t.multi_gain(x, known)[0, 0, K.TAKE_BEST])
+	mult = known.hero_multiplier[0, 0]
+	army_c, army_n = x["h_army_creature"][0, 0], x["h_army_count"][0, 0].float()
+	rest = x["h_morale"][0, 0].float() - ft.make_up_morales(army_c, army_n, t)
+	both = float(ft.led_values(army_c, army_n, mult, rest, t))
+	angels = float(ft.led_values(torch.tensor([angel] + [-1] * 6), torch.tensor([5.0] + [0.0] * 6), mult, rest, t))
+	dwarves = 2 * float(t.creature_cost[dwarf] + t.creature_unit[dwarf])
+	assert kept == pytest.approx(angels - both + t.unled_share * dwarves, rel=1e-4) and kept > 0  # (faster, +1 morale)
+	assert disbanded == pytest.approx(angels - both, rel=1e-4) and disbanded < kept
+	assert take == pytest.approx(0.0, abs=1e-2)  # (the armies as they were)
 
 
 def test_a_gather_counts_what_it_leaves_its_town_to():

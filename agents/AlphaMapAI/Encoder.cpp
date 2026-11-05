@@ -1,5 +1,6 @@
 #include "StdInc.h"
 #include "AlphaMapAI.h"
+#include "Armies.h"
 #include "Ledger.h"
 
 #include "lib/GameConstants.h"
@@ -901,9 +902,12 @@ void AlphaMapAI::encodeMulti(Decision & decision, int first, int second)
 {
 	// MULTI (schema 14; the user, 2026-11-05: "multi-actions", several of the engine's requests in one decision, the C++
 	// making them): in a turn, a town of ours: all we can pay for of what it has for hire, into its garrison
-	// (RECRUIT_ALL) or into the hero of ours visiting it (RECRUIT_ALL_HERO), its garrison into that hero (GATHER); in an
-	// exchange of two heroes of ours, all of one's army (one creature kept) and artifacts to the other (GIVE_ALL, each
-	// way: row 0 the first hero receiving). Entry: the source, the destination, a the MultiKind
+	// (RECRUIT_ALL) or into the hero of ours visiting it (RECRUIT_ALL_HERO), its garrison into that hero (GATHER); a hero
+	// of ours (schema 15): its slowest creatures (DROP_SLOW) or those of its lesser factions (DROP_FOREIGN) into the
+	// garrison of the town it visits, else disbanded (Armies.h; h_drop*). In an exchange of two heroes of ours, all of
+	// one's army (one creature kept) and artifacts to the other (GIVE_ALL), Nullkiller2's best army of the two to it
+	// (TAKE_BEST, less its slowest creatures TAKE_BEST_FAST; x_take_*: the armies after), each way: row 0 the first hero
+	// receiving. Entry: the source, the destination (none: disbanded), a the MultiKind
 	auto & in = decision.inputs;
 	const auto add = [&](int row, MultiKind kind, ObjectInstanceID from, ObjectInstanceID to)
 	{
@@ -924,8 +928,41 @@ void AlphaMapAI::encodeMulti(Decision & decision, int first, int second)
 				artifacts = artifacts || (e.first == giver->id && e.second == receiver->id);
 			if(movesAny(giver, receiver) || artifacts)
 				add(r, MultiKind::GIVE_ALL, giver->id, receiver->id);
+			for(int fast = 0; fast < 2; ++fast)
+				if(const auto take = armies::takeBest(*receiver, *giver, cb->getSettings(), fast == 1))
+				{
+					for(int side = 0; side < 2; ++side)
+					{
+						const auto & army = side == 0 ? take->receiver : take->giver;
+						for(int slot = 0; slot < static_cast<int>(army.size()) && slot < ARMY_SLOTS; ++slot)
+						{
+							in.at(In::x_take_creature, r, fast, side, slot) = army[slot].first.getNum();
+							in.at(In::x_take_count, r, fast, side, slot) = army[slot].second;
+						}
+					}
+					add(r, fast == 1 ? MultiKind::TAKE_BEST_FAST : MultiKind::TAKE_BEST, giver->id, receiver->id);
+				}
 		}
 		return;
+	}
+	for(int h = 0; h < OWN_HEROES; ++h)
+	{
+		const auto * hero = decision.heroes[h] == ObjectInstanceID() ? nullptr : cb->getHero(decision.heroes[h]);
+		if(!hero || hero->tempOwner != playerID || hero->isGarrisoned())
+			continue;
+		const auto * town = hero->getVisitedTown();
+		const CArmedInstance * garrison = town && town->tempOwner == playerID ? town->getUpperArmy() : nullptr;
+		for(int k = 0; k < 2; ++k)
+		{
+			const auto stacks = k == 0 ? armies::slowestStacks(*hero) : armies::foreignStacks(*hero);
+			if(stacks.empty() || static_cast<int>(stacks.size()) >= hero->stacksCount()) // (never its whole army)
+				continue;
+			const bool kept = garrison && garrison != hero && armies::takes(*garrison, *hero, stacks);
+			for(const auto & slot : stacks)
+				in.at(In::h_drop, h, k, slot.getNum()) = 1;
+			in.at(In::h_drop_kept, h, k) = kept ? 1 : 0;
+			add(h, k == 0 ? MultiKind::DROP_SLOW : MultiKind::DROP_FOREIGN, hero->id, kept ? garrison->id : ObjectInstanceID());
+		}
 	}
 	const auto resources = cb->getResourceAmount();
 	for(int t = 0; t < OWN_TOWNS; ++t)

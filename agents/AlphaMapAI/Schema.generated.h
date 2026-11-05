@@ -7,8 +7,8 @@
 
 namespace MapSchema
 {
-constexpr int SCHEMA_VERSION = 14;
-constexpr const char * CONTRACT_HASH = "379a041445961a27";
+constexpr int SCHEMA_VERSION = 15;
+constexpr const char * CONTRACT_HASH = "f6221a1478dad5cf";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;
@@ -71,7 +71,7 @@ constexpr int OBJECT_VOCAB = 256;
 constexpr int OWNED_STACKS = 16;
 constexpr int N_ARTIFACT_POSITIONS = 27;
 constexpr int N_ARTIFACT_TARGETS = 3;
-constexpr int N_MULTI = 4;
+constexpr int N_MULTI = 8;
 
 enum class DecisionKind : int
 {
@@ -133,6 +133,10 @@ enum class MultiKind : int
 	RECRUIT_ALL_HERO = 1,
 	GATHER = 2,
 	GIVE_ALL = 3,
+	TAKE_BEST = 4,
+	TAKE_BEST_FAST = 5,
+	DROP_SLOW = 6,
+	DROP_FOREIGN = 7,
 };
 
 enum class GridCount : int
@@ -311,6 +315,10 @@ enum class In : int
 	artifact_mask,
 	x_heroes,
 	multi_mask,
+	x_take_creature,
+	x_take_count,
+	h_drop,
+	h_drop_kept,
 	COUNT
 };
 
@@ -454,7 +462,11 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"a_detailed", DType::BOOL, 1, {32, 1, 1, 1}, 0},
 	TensorSpec{"artifact_mask", DType::BOOL, 3, {8, 27, 3, 1}, 0},
 	TensorSpec{"x_heroes", DType::INT64, 1, {2, 1, 1, 1}, 0},
-	TensorSpec{"multi_mask", DType::BOOL, 2, {8, 4, 1, 1}, 0},
+	TensorSpec{"multi_mask", DType::BOOL, 2, {8, 8, 1, 1}, 0},
+	TensorSpec{"x_take_creature", DType::INT64, 4, {2, 2, 2, 7}, -1},
+	TensorSpec{"x_take_count", DType::INT64, 4, {2, 2, 2, 7}, 0},
+	TensorSpec{"h_drop", DType::BOOL, 3, {8, 2, 7, 1}, 0},
+	TensorSpec{"h_drop_kept", DType::BOOL, 2, {8, 2, 1, 1}, 0},
 }};
 
 enum class Out : int
@@ -500,7 +512,7 @@ constexpr std::array<TensorSpec, static_cast<int>(Out::COUNT)> OUTPUTS = {{
 	TensorSpec{"memory", DType::FLOAT32, 2, {8, 64, 1, 1}, 0},
 	TensorSpec{"resource_worth", DType::FLOAT32, 1, {7, 1, 1, 1}, 0},
 	TensorSpec{"artifact_logp", DType::FLOAT32, 3, {8, 27, 3, 1}, 0},
-	TensorSpec{"multi_logp", DType::FLOAT32, 2, {8, 4, 1, 1}, 0},
+	TensorSpec{"multi_logp", DType::FLOAT32, 2, {8, 8, 1, 1}, 0},
 }};
 
 /// The table (output) and its legality mask (input) of an action type; END has none

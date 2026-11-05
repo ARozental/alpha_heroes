@@ -1,7 +1,7 @@
 # Built as part of VCMI via its EXTRA_AI_DIRS option. The adventure-map AI of campaign_model/: every decision is the
 # model's, asked of the inference server (battle_model/inference.py, family "campaign"); battles are a battle AI's.
 set(ALPHA_MAP_AI_SOURCES
-	AlphaMapAI.cpp Actions.cpp Advice.cpp Encoder.cpp Ledger.cpp Match.cpp Tensors.cpp main.cpp ../AlphaBattleAI/InferenceClient.cpp
+	AlphaMapAI.cpp Actions.cpp Advice.cpp Armies.cpp Encoder.cpp Ledger.cpp Match.cpp Tensors.cpp main.cpp ../AlphaBattleAI/InferenceClient.cpp
 	AlphaMapAI.h Ledger.h Schema.generated.h StdInc.h Tensors.h ../AlphaBattleAI/InferenceClient.h
 )
 find_package(ZLIB REQUIRED)

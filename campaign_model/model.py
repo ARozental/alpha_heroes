@@ -629,7 +629,24 @@ class CustomFeatures(nn.Module):
 		pair_c, pair_n = army_c.gather(1, p.unsqueeze(-1).expand(-1, -1, A)), army_n.gather(1, p.unsqueeze(-1).expand(-1, -1, A))  # [B, 2, A]
 		joined = ft.led_values(torch.cat([pair_c, pair_c.flip(1)], dim=-1), torch.cat([pair_n, pair_n.flip(1)], dim=-1), f.hero_multiplier.gather(1, p), rest.gather(1, p), self)  # [B, 2]: row r's receiver leading both
 		both = (pair >= 0).all(dim=1).float().unsqueeze(-1)
-		gains[:, :2, c.MultiKind.GIVE_ALL] = (joined - led.gather(1, p).sum(dim=1, keepdim=True)) * both
+		apart = led.gather(1, p).sum(dim=1, keepdim=True)  # [B, 1]: the two armies before
+		gains[:, :2, c.MultiKind.GIVE_ALL] = (joined - apart) * both
+		# TAKE_BEST, TAKE_BEST_FAST: the armies after as the C++ makes them (x_take_*: receiving row, variant, side), the
+		# receiver's led by it, the other's by the other
+		take_c, take_n = x["x_take_creature"], x["x_take_count"].float()  # [B, 2, 2, 2, A]
+		hero_of = torch.stack([p, p.flip(1)], dim=-1).unsqueeze(2).expand(-1, -1, 2, -1)  # [B, 2 rows, 2 variants, 2 sides]: the hero leading each
+		after = ft.led_values(take_c, take_n, f.hero_multiplier.gather(1, hero_of.reshape(b, -1)).reshape(hero_of.shape), rest.gather(1, hero_of.reshape(b, -1)).reshape(hero_of.shape), self).sum(dim=-1)  # [B, 2, 2]
+		for variant, kind in enumerate((c.MultiKind.TAKE_BEST, c.MultiKind.TAKE_BEST_FAST)):
+			gains[:, :2, kind] = (after[:, :, variant] - apart) * both
+		# DROP_SLOW, DROP_FOREIGN (a hero of ours a row): the army without the stacks dropped (h_drop), and those at
+		# unled_share in the garrison that takes them (h_drop_kept), else disbanded
+		drop = x["h_drop"].float()  # [B, HO, 2, A]
+		keep_c = army_c.unsqueeze(2).expand(-1, -1, 2, -1)
+		kept = ft.led_values(torch.where(drop > 0, torch.full_like(keep_c, -1), keep_c), army_n.unsqueeze(2) * (1 - drop), f.hero_multiplier.unsqueeze(-1), rest.unsqueeze(-1), self)  # [B, HO, 2]
+		index = vocab_index(keep_c, c.CREATURE_VOCAB)
+		dropped = (army_n.unsqueeze(2) * drop * (self.creature_cost[index] + self.creature_unit[index]) * (keep_c >= 0)).sum(dim=-1)  # [B, HO, 2]: their worth
+		for variant, kind in enumerate((c.MultiKind.DROP_SLOW, c.MultiKind.DROP_FOREIGN)):
+			gains[:, :HO, kind] = kept[:, :, variant] - led + self.unled_share * dropped[:, :, variant] * x["h_drop_kept"][:, :, variant].float()
 		return gains
 
 	def gather_risk_weight(self):
@@ -689,11 +706,13 @@ class CustomFeatures(nn.Module):
 
 	def multi_prior(self, x, f):
 		"""MULTI's prior logits [B, TO, N_MULTI]: what each multi-action does to Φ (multi_gain) as value_logit prices it, at
-		multi_weight_value; the army sent to another than the strongest hero pays: a GIVE_ALL to the weaker hero
-		give_all_cost_weight, a GATHER into a scout gather_cost_weight."""
+		multi_weight_value; the army sent to another than the strongest hero pays: a GIVE_ALL, TAKE_BEST or TAKE_BEST_FAST
+		to the weaker hero give_all_cost_weight, a GATHER into a scout gather_cost_weight."""
 		prior = self.multi_weight_value() * ft.value_logit(self.multi_gain(x, f))
 		cost = torch.zeros_like(prior)
-		cost[:, :2, c.MultiKind.GIVE_ALL] = (1.0 - self.stronger_receiver(x, f)) * self.give_all_cost_weight()
+		weaker = (1.0 - self.stronger_receiver(x, f)) * self.give_all_cost_weight()
+		for kind in (c.MultiKind.GIVE_ALL, c.MultiKind.TAKE_BEST, c.MultiKind.TAKE_BEST_FAST):
+			cost[:, :2, kind] = weaker
 		cost[..., c.MultiKind.GATHER] = (1.0 - self.main_visitor(x, f)) * self.gather_cost_weight()
 		return prior - cost
 

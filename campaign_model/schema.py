@@ -198,7 +198,12 @@ INPUTS = (
 	_m("artifact_mask", (HO, c.N_ARTIFACT_POSITIONS, c.N_ARTIFACT_TARGETS), "ARTIFACT: hero, its artifact's position (worn slots, then the backpack), ArtifactTarget"),
 	_i("x_heroes", (2,), "an exchange's two heroes of ours, their hero tokens + 1 (ARTIFACT's GIVE goes from one to the other), 0 none"),
 	# Schema 14 (after x_heroes: older records read with it at 0)
-	_m("multi_mask", (TO, c.N_MULTI), "MULTI: town of ours (GIVE_ALL: the exchange's receiving hero, 0 x_heroes' first, 1 its second), MultiKind"),
+	_m("multi_mask", (TO, c.N_MULTI), "MULTI: town of ours, the exchange's receiving hero (0 x_heroes' first, 1 its second) or hero of ours by MultiKind, MultiKind"),
+	# Schema 15 (after multi_mask: older records read with them at 0, a record of 14 with its multi_mask's 4 kinds widened)
+	_i("x_take_creature", (2, 2, 2, A), "TAKE_BEST's armies (the receiving hero: x_heroes' first, second; TAKE_BEST, TAKE_BEST_FAST; the receiver's after, the other's after): creature ids, -1 empty", fill=-1),
+	_i("x_take_count", (2, 2, 2, A), "their counts"),
+	_m("h_drop", (HO, 2, A), "DROP_SLOW's and DROP_FOREIGN's army slots of each hero of ours"),
+	_m("h_drop_kept", (HO, 2), "whether they go into the garrison of the town it visits (else disbanded)"),
 )
 
 

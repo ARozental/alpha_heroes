@@ -399,12 +399,13 @@ std::optional<Choice> AlphaMapAI::adviseExchange(const Decision & decision, Obje
 		choice.index = move;
 		advice = choice;
 	}
-	// GIVE_ALL to the hero that gets the army, while Nullkiller2 still moves troops to it: all of the other's army there
-	// is what its next moves make, as far as its best army takes them (the user, 2026-11-05: a multi-action chosen must
-	// not cost the teacher's loss when the teacher does the same in its next actions)
+	// TAKE_BEST to the hero that gets the army, while Nullkiller2 still moves troops to it: its exchange's whole (its
+	// pickBestCreatures, ArmyManager::getBestArmy: Armies.h's takeBest) in one decision (the user, 2026-11-05: a
+	// multi-action chosen must not cost the teacher's loss when the teacher does the same in its next actions; schema
+	// 14's GIVE_ALL, all of the army, was its only approximation)
 	if(needed)
 		for(const auto & [index, e] : decision.entries[static_cast<int>(ActionType::MULTI)])
-			if(static_cast<MultiKind>(e.a) == MultiKind::GIVE_ALL && e.second == destination->id)
+			if(static_cast<MultiKind>(e.a) == MultiKind::TAKE_BEST && e.second == destination->id)
 				accept.emplace_back(static_cast<int>(ActionType::MULTI), index);
 	if(!advice && !needed)
 	{

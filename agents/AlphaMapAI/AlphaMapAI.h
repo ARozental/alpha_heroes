@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Armies.h"
 #include "Schema.generated.h"
 #include "Tensors.h"
 
@@ -177,6 +178,7 @@ class AlphaMapAI : public CAdventureAI
 	int tradedPurchases = 0;
 	int boatsBuilt = 0;
 	int multiActions = 0; // (MULTI's made: executeMulti)
+	int takeMismatches = 0; // (TAKE_BEST's made whose receiver ended other than the army priced: arrange)
 	int skillsBought = 0;
 	int stacksMerged = 0;
 	// The objects whose guards a question has shown us (encodeQuestionGuards): their armies in a_* from then on, as they
@@ -329,6 +331,7 @@ private:
 	void encodeArtifacts(Decision & decision, int first, int second);
 	void encodeMulti(Decision & decision, int first, int second); // (MULTI: a turn's towns' with first -1, else an exchange of heroes first and second's)
 	void executeMulti(const Entry & e); // (MULTI's requests: Actions.cpp)
+	void arrange(const CArmedInstance * giver, const CArmedInstance * receiver, const armies::Take & take); // (TAKE_BEST's moves: the armies made take's)
 	void encodeQuestionGuards(Decision & decision, const std::string & text, const std::vector<Component> & components);
 	void encodeOptionContext(Decision & decision, ObjectInstanceID hero, int3 target);
 	// The questions' decisions, as asked (the handlers decide them; the teacher's recorder keeps them for the answer)

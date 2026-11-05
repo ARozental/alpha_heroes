@@ -1,5 +1,6 @@
 #include "StdInc.h"
 #include "AlphaMapAI.h"
+#include "Armies.h"
 
 #include "lib/CCreatureHandler.h"
 #include "lib/callback/CCallback.h"
@@ -219,6 +220,61 @@ void AlphaMapAI::executeMulti(const Entry & e)
 		++multiActions;
 		return;
 	}
+	if(kind == MultiKind::TAKE_BEST || kind == MultiKind::TAKE_BEST_FAST)
+	{
+		// The armies the encoder priced (the same state: Armies.h), made by our own moves
+		const auto * giver = armyOf(*cb, e.first);
+		const auto * receiver = armyOf(*cb, e.second);
+		if(!giver || !receiver)
+			return;
+		if(const auto take = armies::takeBest(*receiver, *giver, cb->getSettings(), kind == MultiKind::TAKE_BEST_FAST))
+		{
+			arrange(giver, receiver, *take);
+			std::map<CreatureID, int> made, priced;
+			for(const auto & [slot, stack] : receiver->Slots())
+				made[stack->getCreatureID()] += stack->getCount();
+			for(const auto & [creature, count] : take->receiver)
+				priced[creature] += count;
+			if(made != priced)
+			{
+				++takeMismatches;
+				std::string text;
+				for(const auto & [creature, count] : priced)
+					text += " " + std::to_string(creature.getNum()) + "x" + std::to_string(count) + "/" + std::to_string(made[creature]);
+				logAi->warn("AlphaMapAI %s: TAKE_BEST made another army than priced (creature x priced / made):%s", playerID.toString(), text);
+			}
+		}
+		++multiActions;
+		return;
+	}
+	if(kind == MultiKind::DROP_SLOW || kind == MultiKind::DROP_FOREIGN)
+	{
+		// The hero's stacks (Armies.h's rule, as encoded) into the garrison, else disbanded
+		const auto * hero = cb->getHero(e.first);
+		if(!hero)
+			return;
+		const auto * garrison = e.second == ObjectInstanceID() ? nullptr : armyOf(*cb, e.second);
+		for(const auto & slot : kind == MultiKind::DROP_SLOW ? armies::slowestStacks(*hero) : armies::foreignStacks(*hero))
+		{
+			const auto * stack = hero->getStackPtr(slot);
+			if(!stack)
+				continue;
+			if(!garrison)
+			{
+				cb->dismissCreature(hero, slot);
+				continue;
+			}
+			const SlotID to = garrison->getSlotFor(stack->getCreatureID());
+			if(!to.validSlot())
+				continue;
+			if(garrison->slotEmpty(to))
+				cb->swapCreatures(hero, garrison, slot, to);
+			else
+				cb->mergeStacks(hero, garrison, slot, to);
+		}
+		++multiActions;
+		return;
+	}
 	// GATHER, GIVE_ALL: the source's army into the destination as far as it fits (VCMI's bulk move, merging the same
 	// creatures; one creature of the source's weakest stack stays if all would go), and GIVE_ALL's artifacts too (VCMI's
 	// bulk move: each into its slot if free, else the backpack)
@@ -236,6 +292,104 @@ void AlphaMapAI::executeMulti(const Entry & e)
 	if(kind == MultiKind::GIVE_ALL)
 		cb->bulkMoveArtifacts(from->id, to->id, false, true, true);
 	++multiActions;
+}
+
+void AlphaMapAI::arrange(const CArmedInstance * giver, const CArmedInstance * receiver, const armies::Take & take)
+{
+	// TAKE_BEST's requests (as Nullkiller2's pickBestCreatures, by our moves): each creature the receiver keeps made up
+	// to its count there from the giver's stacks, onto its stack there, else into a free slot, else swapped whole for a
+	// stack the receiver does not keep, the giver left its own count of it (the creature a hero giving keeps:
+	// armies::takeBest's choice, whatever the order of the moves); then the receiver's stacks it does not keep to the
+	// giver, onto their creature there or into a free slot
+	const auto & target = take.receiver;
+	const auto in = [](const armies::Army & army, CreatureID creature)
+	{
+		int n = 0;
+		for(const auto & [kept, count] : army)
+			n += kept == creature ? count : 0;
+		return n;
+	};
+	const auto wanted = [&](CreatureID creature) { return in(target, creature); };
+	const auto countOf = [](const CArmedInstance * army, CreatureID creature)
+	{
+		int n = 0;
+		for(const auto & [slot, stack] : army->Slots())
+			n += stack->getCreatureID() == creature ? stack->getCount() : 0;
+		return n;
+	};
+	const auto total = [](const CArmedInstance * army)
+	{
+		int n = 0;
+		for(const auto & [slot, stack] : army->Slots())
+			n += stack->getCount();
+		return n;
+	};
+	const bool keepsOne = dynamic_cast<const CGHeroInstance *>(giver) != nullptr;
+	for(const auto & [creature, count] : target)
+		for(int guard = 0; guard < 2 * ARMY_SLOTS; ++guard) // (a request a stack at most)
+		{
+			const int have = countOf(receiver, creature);
+			SlotID from;
+			for(const auto & [slot, stack] : giver->Slots())
+				if(stack->getCreatureID() == creature)
+				{
+					from = slot;
+					break;
+				}
+			if(have >= count || !from.validSlot())
+				break;
+			const int there = giver->getStackCount(from);
+			int move = std::min({count - have, there, countOf(giver, creature) - in(take.giver, creature)});
+			SlotID out; // (a stack the receiver does not keep: swapped for the whole stack where it has no room, or where
+			for(const auto & [slot, stack] : receiver->Slots()) // the move would leave a hero giving with nothing)
+				if(wanted(stack->getCreatureID()) == 0)
+				{
+					out = slot;
+					break;
+				}
+			if(keepsOne && move == total(giver))
+			{
+				if(out.validSlot() && move == there)
+				{
+					cb->swapCreatures(giver, receiver, from, out);
+					continue;
+				}
+				--move; // (a hero keeps a creature)
+			}
+			if(move <= 0)
+				break;
+			const SlotID to = receiver->getSlotFor(creature);
+			if(!to.validSlot())
+			{
+				if(!out.validSlot() || move < there)
+					break;
+				cb->swapCreatures(giver, receiver, from, out);
+				continue;
+			}
+			if(move < there)
+				cb->splitStack(giver, receiver, from, to, receiver->getStackCount(to) + move);
+			else if(receiver->slotEmpty(to))
+				cb->swapCreatures(giver, receiver, from, to);
+			else
+				cb->mergeStacks(giver, receiver, from, to);
+		}
+	std::vector<SlotID> leaving;
+	for(const auto & [slot, stack] : receiver->Slots())
+		if(wanted(stack->getCreatureID()) == 0)
+			leaving.push_back(slot);
+	for(const auto & slot : leaving)
+	{
+		const auto * stack = receiver->getStackPtr(slot);
+		if(!stack)
+			continue;
+		const SlotID to = giver->getSlotFor(stack->getCreatureID());
+		if(!to.validSlot())
+			continue;
+		if(giver->slotEmpty(to))
+			cb->swapCreatures(receiver, giver, slot, to);
+		else
+			cb->mergeStacks(receiver, giver, slot, to);
+	}
 }
 
 void AlphaMapAI::payByTrades(const TResources & cost, const Decision & decision)

@@ -206,6 +206,8 @@ def decode_wire(decisions, out=None):
 	inflate, address = _inflater(), out.ctypes.data
 	for i, d in enumerate(decisions):
 		n = inflate(d.inputs, out[i], address + i * IN_BYTES)
+		if n == SCHEMA_14_BYTES:
+			n = widen_schema_14(out[i])
 		if n != IN_BYTES:
 			if n not in SHORT_RECORDS:
 				raise ValueError(f"a decision's inputs are {n} bytes, not {IN_BYTES}")
@@ -258,14 +260,34 @@ def _libz():
 # Records made before inputs were added at the end (schema 10: mem; schema 11: the question's guards and armed objects,
 # from o_battle on) end where those start: decoded with zeros there, which each of them reads as none (no memory, no
 # guard, no battle, no armed object)
-TAIL_STARTS = ("mem", "o_battle", "artifact_mask", "multi_mask")
+TAIL_STARTS = ("mem", "o_battle", "artifact_mask", "multi_mask", "x_take_creature")
 _STARTS = {entry[0]: sum(e[-1] for e in IN_LAYOUT[:i]) for i, entry in enumerate(IN_LAYOUT)}
 SHORT_RECORDS = frozenset(_STARTS[name] for name in TAIL_STARTS if name in _STARTS)  # the byte lengths of older records
 MEM_BYTES = IN_BYTES - _STARTS["mem"]  # what a record of schema 9 (before the memory) lacks
+# A record of schema 14 ends with its multi_mask of MULTI's first 4 kinds (one byte each, town by town): widened to
+# N_MULTI with zeros, it ends where schema 15's armies start
+SCHEMA_14_KINDS = 4
+SCHEMA_14_BYTES = _STARTS["multi_mask"] + c.OWN_TOWNS * SCHEMA_14_KINDS
+
+
+def widen_schema_14(row):
+	"""A record of schema 14 in a row buffer [IN_BYTES] uint8 (its bytes first): its multi_mask's kinds widened to
+	N_MULTI in place, zeros after; the bytes it ends at now (schema 15's armies' start)."""
+	start = _STARTS["multi_mask"]
+	kinds = row[start : start + c.OWN_TOWNS * SCHEMA_14_KINDS].copy().reshape(c.OWN_TOWNS, SCHEMA_14_KINDS)
+	widened = row[start : start + c.OWN_TOWNS * c.N_MULTI].reshape(c.OWN_TOWNS, c.N_MULTI)
+	widened[:] = 0
+	widened[:, :SCHEMA_14_KINDS] = kinds
+	return start + c.OWN_TOWNS * c.N_MULTI
 
 
 def padded(row):
-	"""A decision's decompressed inputs, a record of an older schema (SHORT_RECORDS) given zeros where it ends."""
+	"""A decision's decompressed inputs, a record of an older schema (SHORT_RECORDS) given zeros where it ends (a record
+	of schema 14 its multi_mask widened first: widen_schema_14)."""
+	if len(row) == SCHEMA_14_BYTES:
+		buffer = np.zeros(IN_BYTES, dtype=np.uint8)
+		buffer[: len(row)] = np.frombuffer(row, dtype=np.uint8)
+		row = buffer[: widen_schema_14(buffer)].tobytes()
 	return row + bytes(IN_BYTES - len(row)) if len(row) in SHORT_RECORDS else row
 
 

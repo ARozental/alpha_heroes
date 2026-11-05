@@ -8,7 +8,7 @@ Every decision is one of two families:
 """
 from enum import IntEnum
 
-SCHEMA_VERSION = 14  # 14: MULTI (multi_mask, after x_heroes; older records read with it at 0), multi_logp out; 13: ARTIFACT (artifact_mask, after a_*; older records read with it at 0), artifact_logp out; 12: resource_worth out (a purchase short of resources trades for itself: AlphaMapAI pays with what is worth the least), the inputs as 11; 11: a question's guards and what its options do with them (o_battle, o_join, d_guard_*), the armed objects that fight a hero stepping on them (a_*: garrisons), after mem (older records read with them at 0); 10: the model's memory (mem in, memory out: a player's decisions carry it forward); 9: the whole map tile by tile (tile_*, MAP_TILES a side), for the model's map CNN (docs/campaign_model_v2_draft.md); 8: heroes' luck and morale with their parts until the next battle (h_luck, h_morale, h_battle_*), the spells of heroes for hire (g_tavern_spells); 7: what a hero for hire brings (g_tavern_exp, g_tavern_army_*, g_tavern_artifacts); 6: build_short (buildable but for resources); 5: every object we see (MAP_OBJECTS 8192), no g_objects (torch counts them); 4: RECRUIT's destination, TRAVEL's days, our previous decision (g_last_*); 3: the whole map (m_* objects, g_tiles, g_objects), TRAVEL, g_object_income, h_spell_cost; 2: counts as a human sees them
+SCHEMA_VERSION = 15  # 15: MULTI's TAKE_BEST, TAKE_BEST_FAST, DROP_SLOW and DROP_FOREIGN (multi_mask 8 kinds wide: a record of 14 read with its 4 widened), their armies (x_take_*, h_drop*, after multi_mask); 14: MULTI (multi_mask, after x_heroes; older records read with it at 0), multi_logp out; 13: ARTIFACT (artifact_mask, after a_*; older records read with it at 0), artifact_logp out; 12: resource_worth out (a purchase short of resources trades for itself: AlphaMapAI pays with what is worth the least), the inputs as 11; 11: a question's guards and what its options do with them (o_battle, o_join, d_guard_*), the armed objects that fight a hero stepping on them (a_*: garrisons), after mem (older records read with them at 0); 10: the model's memory (mem in, memory out: a player's decisions carry it forward); 9: the whole map tile by tile (tile_*, MAP_TILES a side), for the model's map CNN (docs/campaign_model_v2_draft.md); 8: heroes' luck and morale with their parts until the next battle (h_luck, h_morale, h_battle_*), the spells of heroes for hire (g_tavern_spells); 7: what a hero for hire brings (g_tavern_exp, g_tavern_army_*, g_tavern_artifacts); 6: build_short (buildable but for resources); 5: every object we see (MAP_OBJECTS 8192), no g_objects (torch counts them); 4: RECRUIT's destination, TRAVEL's days, our previous decision (g_last_*); 3: the whole map (m_* objects, g_tiles, g_objects), TRAVEL, g_object_income, h_spell_cost; 2: counts as a human sees them
 
 N_RESOURCES = 7  # wood, mercury, ore, sulfur, crystal, gems, gold (VCMI's order)
 
@@ -131,13 +131,20 @@ N_ARTIFACT_TARGETS = len(ArtifactTarget)
 
 
 class MultiKind(IntEnum):
-	"""MULTI's actions (the user, 2026-11-05: "multi-actions" the C++ makes as several requests): each a town of ours
-	(multi_mask's first axis), but GIVE_ALL's, an exchange's, whose first axis is the hero receiving (0: x_heroes' first)."""
+	"""MULTI's actions (the user, 2026-11-05: "multi-actions" the C++ makes as several requests, predetermined chains of
+	the engine's single actions, the model choosing among them by what they make). multi_mask's first axis: a town of
+	ours for RECRUIT_ALL, RECRUIT_ALL_HERO and GATHER; in an exchange the hero receiving (0: x_heroes' first) for
+	GIVE_ALL, TAKE_BEST and TAKE_BEST_FAST; a hero of ours (its token) for DROP_SLOW and DROP_FOREIGN."""
 
 	RECRUIT_ALL = 0  # every creature the town has for hire that we can pay for, the highest level first, into its garrison
 	RECRUIT_ALL_HERO = 1  # the same into the hero of ours visiting it
 	GATHER = 2  # the town's garrison into the hero of ours visiting it, as much as fits (VCMI's bulk move)
 	GIVE_ALL = 3  # an exchange: the other hero's army (one creature kept) and artifacts to this one
+	# Schema 15
+	TAKE_BEST = 4  # an exchange: Nullkiller2's best army of the two (ArmyManager::getBestArmy) into this one, the rest to the other (x_take_*)
+	TAKE_BEST_FAST = 5  # the same less its slowest creatures (the army's movement), which go to the other
+	DROP_SLOW = 6  # a hero's slowest creatures (its movement) into the garrison of the town it visits, else disbanded (h_drop)
+	DROP_FOREIGN = 7  # a hero's creatures not of its army's main faction (its morale) the same way (h_drop)
 
 
 N_MULTI = len(MultiKind)

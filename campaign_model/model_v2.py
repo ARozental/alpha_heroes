@@ -774,8 +774,11 @@ class CampaignModelV2(nn.Module):
 		kinds = self.multi_kind.weight  # [N_MULTI, d]
 		by_town = (self.multi_q(own_towns) @ kinds.t()) / math.sqrt(d)  # [B, TO, N_MULTI]
 		by_receiver = (self.multi_q(receivers) @ kinds.t()) / math.sqrt(d)
-		give_all = (torch.arange(c.N_MULTI, device=kinds.device) == c.MultiKind.GIVE_ALL)
-		learned[A_.MULTI] = torch.where(give_all, by_receiver, by_town)
+		kind = torch.arange(c.N_MULTI, device=kinds.device)
+		by_hero = (self.multi_q(own_heroes) @ kinds.t()) / math.sqrt(d)  # [B, HO (= TO), N_MULTI]: DROP_SLOW's, DROP_FOREIGN's rows
+		exchange = (kind == c.MultiKind.GIVE_ALL) | (kind == c.MultiKind.TAKE_BEST) | (kind == c.MultiKind.TAKE_BEST_FAST)
+		hero = (kind == c.MultiKind.DROP_SLOW) | (kind == c.MultiKind.DROP_FOREIGN)
+		learned[A_.MULTI] = torch.where(exchange, by_receiver, torch.where(hero, by_hero, by_town))
 		prior[A_.MULTI] = known.multi_prior
 		offers[A_.MULTI] = best_legal(prior[A_.MULTI], x["multi_mask"])
 		learned[A_.DISMISS] = self.dismiss_out(own_heroes).squeeze(-1)
@@ -974,13 +977,14 @@ GROWN_INPUTS = ("recruit_head.0.weight", "option_weights.weight")  # (2026-11-04
 
 
 def migrate_action_types(state_dict, own):
-	"""A state dict from before an action type was added (schema 13: ARTIFACT, the 13th; 14: MULTI, the 14th): type_bias
-	gains their entries and the global encoder's previous-type table their rows before the "none" row (vocab_index's
-	last), both as the fresh model (own) has them; as it is otherwise."""
+	"""A state dict from before an action type was added (schema 13: ARTIFACT, the 13th; 14: MULTI, the 14th) or MULTI's
+	kinds were (schema 15: 4 -> 8): type_bias gains their entries, multi_kind its rows, and the global encoder's
+	previous-type table its rows before the "none" row (vocab_index's last), all as the fresh model (own) has them; as it
+	is otherwise."""
 	state = dict(state_dict)
-	key = "type_bias"
-	if key in state and key in own and state[key].shape[0] < own[key].shape[0]:
-		state[key] = torch.cat([state[key], own[key][state[key].shape[0] :].to(state[key])])
+	for key in ("type_bias", "multi_kind.weight"):
+		if key in state and key in own and state[key].shape[0] < own[key].shape[0]:
+			state[key] = torch.cat([state[key], own[key][state[key].shape[0] :].to(state[key])])
 	key = "encode_global.last.weight"
 	if key in state and key in own and state[key].shape[0] < own[key].shape[0]:
 		old, types = state[key], state[key].shape[0] - 1  # (the old none row: its last)

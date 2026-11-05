@@ -827,7 +827,7 @@ void AlphaMapAI::sendRecords(bool final)
 			sendToRecordServer(recordSocket, gameKey + ":" + color + ":battle#" + std::to_string(battlesSent++), battleJson);
 		if(final)
 		{
-			const auto done = ", \"traded_purchases\": " + std::to_string(tradedPurchases) + ", \"boats\": " + std::to_string(boatsBuilt) + ", \"skills_bought\": " + std::to_string(skillsBought) + ", \"stacks_merged\": " + std::to_string(stacksMerged) + ", \"multi_actions\": " + std::to_string(multiActions);
+			const auto done = ", \"traded_purchases\": " + std::to_string(tradedPurchases) + ", \"boats\": " + std::to_string(boatsBuilt) + ", \"skills_bought\": " + std::to_string(skillsBought) + ", \"stacks_merged\": " + std::to_string(stacksMerged) + ", \"multi_actions\": " + std::to_string(multiActions) + ", \"take_mismatches\": " + std::to_string(takeMismatches);
 			const auto summary = "{\"errors\": " + std::to_string(errors) + ", \"failed_actions\": " + std::to_string(failedActions) + done + teacherJson() + adviceJson() + "}";
 			sendToRecordServer(recordSocket, gameKey + ":" + color + ":done", summary);
 		}
