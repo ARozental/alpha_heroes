@@ -1,9 +1,10 @@
 import copy
+import math
 
 import pytest
 
 from campaign_model import vocab
-from campaign_model.empire import EmpireConfig, army_worth, boost_value, building_value, empire_value, hero_base_value, heroes_value, shares, skill_value
+from campaign_model.empire import EmpireConfig, army_worth, boost_value, building_value, empire_value, hero_base_value, hero_multiplier, heroes_value, shares, skill_value
 from game_values import HERO_HIRE_COST, capped_mana_value, resources_value
 
 CASTLE = 0
@@ -66,9 +67,10 @@ def test_a_new_dwelling_with_its_first_batch_is_neutral_and_growth_is_a_gain():
 	assert total(monday) > total(after)
 
 
-def test_recruiting_and_upgrading_are_neutral():
+def test_recruiting_into_a_town_is_neutral_and_an_upgrade_gains_what_its_hero_makes_of_it():
 	"""For a hero already armed (an army worth armed_army or more): below that, creatures also lift its HERO_BASE
-	(test_a_hero_with_nothing_is_worth_less_than_one_with_creatures)."""
+	(test_a_hero_with_nothing_is_worth_less_than_one_with_creatures). A garrison's creatures count at their worth; a
+	hero's at its army_multiplier, so upgrading them adds that much more of the upgrade's worth (2026-11-04)."""
 	before = player()
 	before["heroes"][0]["army"] = [[PIKEMAN, 30]]  # (30 x (60 + u): armed)
 	assert army_worth(before["heroes"][0]["army"]) >= EmpireConfig().armed_army
@@ -80,7 +82,23 @@ def test_recruiting_and_upgrading_are_neutral():
 	upgraded = copy.deepcopy(before)
 	upgraded["resources"][6] -= 30 * (vocab.creature_cost(HALBERDIER) - vocab.creature_cost(PIKEMAN))
 	upgraded["heroes"][0]["army"] = [[HALBERDIER, 30]]
-	assert total(upgraded) == pytest.approx(total(before))
+	gain = (hero_multiplier(before["heroes"][0]) - 1) * 30 * (vocab.creature_cost(HALBERDIER) - vocab.creature_cost(PIKEMAN))
+	assert gain > 0 and total(upgraded) - total(before) == pytest.approx(gain)
+
+
+def test_an_army_is_worth_more_with_the_stronger_hero():
+	"""(the user, 2026-11-04: keeping the army with the strongest hero must be good) Moving an army from a hero of attack
+	and defense 1 to one of 10 and 10 adds its worth x the difference of their army_multiplier; VCMI's modifiers: 10
+	attack deals x1.5, 10 defense takes x0.75."""
+	before = player()
+	weak = fresh_hero(1, army=((PIKEMAN, 30),), attack=1, defense=1)
+	strong = fresh_hero(2, army=((PIKEMAN, 1),), attack=10, defense=10)
+	before["heroes"] = [weak, strong]
+	after = copy.deepcopy(before)
+	after["heroes"][0]["army"], after["heroes"][1]["army"] = [[PIKEMAN, 1]], [[PIKEMAN, 30]]
+	moved = army_worth(((PIKEMAN, 29),))
+	assert hero_multiplier(strong) == pytest.approx(math.sqrt(1.5 / 0.75))
+	assert total(after) - total(before) == pytest.approx(moved * (hero_multiplier(strong) - hero_multiplier(weak)))
 
 
 def test_a_hire_brings_a_hero_and_its_army_for_its_price_and_the_crowding():
@@ -97,7 +115,7 @@ def test_a_hire_brings_a_hero_and_its_army_for_its_price_and_the_crowding():
 	crowding = config.hero_penalty * (2**2 - 1**2)
 	ten = army_worth(((PIKEMAN, 10),))
 	assert ten == pytest.approx(10 * vocab.creature_cost(PIKEMAN) * (1 + config.alpha))
-	assert hire(((PIKEMAN, 10),)) == pytest.approx(hero_base_value(ten) + ten - HERO_HIRE_COST - crowding)
+	assert hire(((PIKEMAN, 10),)) == pytest.approx(hero_base_value(ten) + ten * hero_multiplier(fresh_hero(1)) - HERO_HIRE_COST - crowding)
 	assert hire(((PIKEMAN, 30), (HALBERDIER, 10))) > 0 and hire(((PIKEMAN, 1),)) < 0
 
 

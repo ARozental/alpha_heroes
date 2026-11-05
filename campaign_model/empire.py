@@ -46,7 +46,7 @@ from dataclasses import dataclass
 
 import math
 
-from game_values import capped_mana_value, fractional_level, resources_value
+from game_values import army_multiplier, capped_mana_value, fractional_level, resources_value
 
 from . import vocab
 from .vocab import DWELLING_FIRST, DWELLING_LAST
@@ -150,6 +150,12 @@ def army_worth(stacks, config=EmpireConfig()):
 	return sum(count * (vocab.creature_cost(creature) + _unit(creature, config)) for creature, count in stacks)
 
 
+def hero_multiplier(hero):
+	"""What a hero makes of the army it leads (game_values.army_multiplier) at its battle attack and defense, items
+	included (the ledger's "attack" and "defense"; its base primary skills in a ledger from before them)."""
+	return army_multiplier(hero.get("attack", hero["primary"][0]), hero.get("defense", hero["primary"][1]))
+
+
 def hero_base_value(army, config=EmpireConfig()):
 	"""A hero's HERO_BASE at its army's worth (gold): armyless_share of it with none, all of it from armed_army on."""
 	return config.hero_base * (config.armyless_share + (1 - config.armyless_share) * min(1.0, max(army, 0.0) / config.armed_army))
@@ -172,14 +178,14 @@ def empire_value(player, config=EmpireConfig()):
 		return {"total": 0.0}
 	parts = dict.fromkeys(("resources", "buildings", "income", "army", "for_hire", "heroes", "artifacts", "mana", "hero_penalty", "explored"), 0.0)
 	parts["resources"] = resources_value(player["resources"])
-	stacks = [pair for hero in player["heroes"] for pair in hero["army"]] + list(player.get("armies", []))
+	stacks = list(player.get("armies", []))  # (armies no hero leads, at their worth; the heroes' by army_multiplier below)
 	for town in player["towns"]:
 		parts["buildings"] += sum(building_value(town["faction"], b, config) for b in town["built"])
 		stacks += town["garrison"]
 		parts["for_hire"] += sum(count * _unit(creature, config) for creature, count in town["available"] if creature >= 0)
 	for dwelling in player.get("dwellings", []):
 		parts["for_hire"] += sum(count * _unit(creature, config) for creature, count in dwelling["available"] if creature >= 0)
-	parts["army"] = sum(count * (vocab.creature_cost(creature) + _unit(creature, config)) for creature, count in stacks)
+	parts["army"] = army_worth(stacks, config) + sum(army_worth(hero["army"], config) * hero_multiplier(hero) for hero in player["heroes"])
 	parts["income"] = config.income_days * resources_value(player.get("income", [0] * 7))
 	prices = vocab.artifact_prices()
 	parts["heroes"] = heroes_value(player["heroes"], config)

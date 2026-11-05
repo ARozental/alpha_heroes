@@ -10,6 +10,8 @@ does, so it is expected to make most of the later changes here; every change mov
 	               level 2 2000, 3 6000, 4 12 000, 10 48 000, 20 108 000 (hero_level_value)
 	mana           battle: MANA_VALUE x spell power x mana;
 	               campaign: the same, but only of the mana a hero can spend in a short battle (capped_mana_value)
+	an army        campaign: its worth x what the hero leading it makes of it (army_multiplier: VCMI's damage
+	               modifiers at the hero's battle attack and defense), 1 for no hero (a garrison's)
 
 The tables are the engine's (battle_model/artifacts/vocab.json, scripts/export_vocab.sh); nothing here is trained.
 """
@@ -31,6 +33,21 @@ LEVEL_STEPS = 3
 MANA_VALUE = 2.0
 # The battle the campaign prices mana for: a hero casts at most once a round
 MANA_ROUNDS = 3
+
+
+# VCMI's damage modifiers (an attack against the defender's defense): +5% damage a point over it, at most +300%; -2.5%
+# a point under it, at most -70%
+ATTACK_STEP, ATTACK_POINTS = 0.05, 60
+DEFENSE_STEP, DEFENSE_POINTS = 0.025, 28
+
+
+def army_multiplier(attack, defense):
+	"""What a hero's battle attack and defense (its items' included) make of the army it leads (the user, 2026-11-04:
+	keeping the army with the strongest hero must be worth more), against an enemy of none: the root of the damage it
+	deals over the damage it takes, by VCMI's modifiers; 1 for attack and defense 0 (a garrison's)."""
+	dealt = 1.0 + ATTACK_STEP * min(max(attack, 0), ATTACK_POINTS)
+	taken = 1.0 - DEFENSE_STEP * min(max(defense, 0), DEFENSE_POINTS)
+	return math.sqrt(dealt / taken)
 
 
 def resources_value(resources):

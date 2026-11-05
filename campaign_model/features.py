@@ -16,6 +16,7 @@ from torch.nn import functional as F
 from battle_model.device import constant, moved
 from battle_model.features import scales, signed_scales
 from battle_model.layers import vocab_index
+from game_values import ATTACK_POINTS, ATTACK_STEP, DEFENSE_POINTS, DEFENSE_STEP
 from game_values import HERO_HIRE_COST as HERO_GOLD_COST
 
 from . import constants as c
@@ -165,8 +166,15 @@ def army_battle(creatures, counts, detailed, t):
 
 def damage_modifier(difference):
 	"""VCMI's damage factor for an attack of `difference` points over the defender's defense: +5% a point (at most
-	+300%), -2.5% a point under it (at most -70%)."""
-	return 1.0 + 0.05 * difference.clamp(0.0, 60.0) - 0.025 * (-difference).clamp(0.0, 28.0)
+	+300%), -2.5% a point under it (at most -70%; game_values' constants)."""
+	return 1.0 + ATTACK_STEP * difference.clamp(0.0, ATTACK_POINTS) - DEFENSE_STEP * (-difference).clamp(0.0, DEFENSE_POINTS)
+
+
+def army_multiplier(attack, defense):
+	"""game_values.army_multiplier of tensors: what each hero's battle attack and defense make of the army it leads."""
+	dealt = 1.0 + ATTACK_STEP * attack.float().clamp(0.0, ATTACK_POINTS)
+	taken = 1.0 - DEFENSE_STEP * defense.float().clamp(0.0, DEFENSE_POINTS)
+	return torch.sqrt(dealt / taken)
 
 
 def spell_damage(x, t):
@@ -311,8 +319,9 @@ def hero_worth(x, t):
 def tavern_worth(x, t):
 	"""What hiring each hero for hire would add to Φ [B, N_TAVERN] (gold), before its price and the crowding: the
 	heroes part's change (empire.heroes_value: HERO_BASE, its skills in full if they beat our strongest hero's, else at
-	SECONDARY_SHARE, and ours re-weighed), the army it comes with at cost + u and its worn artifacts (a spellbook, war
-	machines), as empire_value counts a hero of ours (its mana left out); 0 for an empty slot."""
+	SECONDARY_SHARE, and ours re-weighed), the army it comes with at cost + u by what it makes of it (army_multiplier at
+	its primary skills) and its worn artifacts (a spellbook, war machines), as empire_value counts a hero of ours (its
+	mana left out); 0 for an empty slot."""
 	present = (x["g_tavern"] >= 0).float()
 	_, _, army_gold, _ = army(x["g_tavern_army_creature"], x["g_tavern_army_count"], torch.ones_like(x["g_tavern_army_creature"][..., 0], dtype=torch.bool), t)
 	worn = x["g_tavern_artifacts"]
@@ -322,7 +331,8 @@ def tavern_worth(x, t):
 	armed, theirs_armed = own_armed(x, t), armed_share(army_gold, t)
 	before = heroes_value(ours, mine, armed, t).unsqueeze(-1)
 	after = torch.stack([heroes_value(torch.cat([ours, theirs[:, s : s + 1]], dim=1), torch.cat([mine, torch.ones_like(mine[:, :1])], dim=1), torch.cat([armed, theirs_armed[:, s : s + 1]], dim=1), t) for s in range(theirs.shape[1])], dim=1)
-	return (after - before + army_gold + carried) * present
+	led = army_gold * army_multiplier(x["g_tavern_primary"][..., 0], x["g_tavern_primary"][..., 1])
+	return (after - before + led + carried) * present
 
 
 def hire_gain(x, t, worth):
@@ -362,7 +372,7 @@ def empire_value(x, t):
 			(x["g_resources"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
 			((x["t_built"][:, : c.OWN_TOWNS].float() * t.building_value[faction]).sum(dim=-1) * own_towns).sum(dim=-1),
 			t.income_days * (x["g_object_income"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
-			(hero_army * own_heroes).sum(dim=-1) + (garrison * own_towns).sum(dim=-1) + owned,
+			(hero_army * army_multiplier(x["h_primary"][:, :HO, 0], x["h_primary"][:, :HO, 1]) * own_heroes).sum(dim=-1) + (garrison * own_towns).sum(dim=-1) + owned,
 			((x["t_available"][:, : c.OWN_TOWNS].clamp(min=0).float() * t.creature_unit[vocab_index(available, c.CREATURE_VOCAB)] * (available >= 0)).sum(dim=-1) * own_towns).sum(dim=-1) + dwelling_hire,
 			heroes_value(*own_skill_values(x, t), armed_share(hero_army, t), t) + (boost_values(x, t) * own_heroes).sum(dim=-1),
 			((t.artifact_price[vocab_index(artifacts, c.ARTIFACT_VOCAB)] * (artifacts >= 0)).sum(dim=-1) * own_heroes).sum(dim=-1),
