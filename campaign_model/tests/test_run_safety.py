@@ -41,3 +41,25 @@ def test_no_eval_begins_while_the_run_drains(tmp_path):
 	assert not CampaignLearner.eval_due(learner)
 	(tmp_path / "drain").unlink()
 	assert CampaignLearner.eval_due(learner)
+
+
+def test_an_evals_checkpoint_holds_the_weights_it_scores(tmp_path, monkeypatch):
+	"""learner.evaluate saves checkpoint_<version>.pt as it pins the eval's weights: saved once the eval ended, it held
+	the weights of the updates that landed meanwhile (2026-11-06: the rollback to "v1288" restored v1293's)."""
+	from types import SimpleNamespace
+
+	from campaign_model.learner import CampaignLearner
+
+	saved = []
+	learner = SimpleNamespace(model_lock=threading.Lock(), version=1288, model=None, out=tmp_path, config=CampaignConfig(), stop=None)
+	learner.server = SimpleNamespace(set_model=lambda name, version, model: None)
+	learner.battle = SimpleNamespace(pin_eval=lambda: None)
+	learner._save = lambda path: saved.append((path.name, learner.version))
+
+	def play(config, server, battle, version, epoch, stop, model):
+		learner.version = 1293  # (updates land while the eval plays)
+		return None  # (stopped with the run: no row)
+
+	monkeypatch.setattr(evaluate, "evaluate", play)
+	assert CampaignLearner.evaluate(learner, epoch=1) is None
+	assert saved == [("checkpoint_01288.pt", 1288)]

@@ -890,6 +890,9 @@ class CampaignLearner:
 			version = self.version
 			self.server.set_model("eval", version, self.model)
 			self.battle.pin_eval()
+			# The weights this eval scores (saved once it ended, they were the updates' since: the rollback to "v1288"
+			# restored v1293's, 2026-11-06). _save: the lock is held
+			self._save(self.out / f"checkpoint_{version:05d}.pt")
 		try:
 			row = evaluate.evaluate(self.config, self.server, self.battle, version=version, epoch=epoch, stop=self.stop, model="eval")
 		finally:
@@ -901,7 +904,6 @@ class CampaignLearner:
 			self.teacher_weight = teacher_weight_for(row["score"])  # (config.teacher_mix: the teacher's share by our strength)
 			self.teacher_share = teacher_share_for(row["score"])  # (config.loss_shares: its share of the gradient)
 			print(f"campaign: the teacher's weight {self.teacher_weight:.2f} (its share of the loss {self.teacher_weight / (1 + self.teacher_weight):.2f}) for an eval score of {row['score']:.3f}", flush=True)
-		self.save(self.out / f"checkpoint_{version:05d}.pt")
 		return row
 
 	def start_eval(self, epoch):
