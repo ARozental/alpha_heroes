@@ -721,10 +721,11 @@ class CustomFeatures(nn.Module):
 
 	def disband_cost_weight(self):
 		"""What a DROP_SLOW or DROP_FOREIGN that disbands its stacks (no garrison takes them: h_drop_kept) loses before what
-		it gains, in logits (3 at the start, 0..8): creatures destroyed. multi_gain prices the loss, but value_logit
-		compresses it (a third of a hero's army about -3), and sampled at that the joint7 games of v1233-v1236 disbanded 98
-		times in 14 games, a median 19% of the hero's army each time (12k gold a game), twice v1188-v1192's."""
-		return ft.bounded(self.disband_cost, 0.0, 8.0, 3.0, CORRECTION_STEP)
+		it gains, in logits (6 at the start, 0..10; the user, 2026-11-05: "we do not want to remove our creatures", a big
+		minus, 5 or more): creatures destroyed. multi_gain prices the loss, but value_logit compresses it (a third of a
+		hero's army about -3), and sampled at that the joint7 games of v1233-v1236 disbanded 98 times in 14 games, a median
+		19% of the hero's army each time (12k gold a game), twice v1188-v1192's; at 3 (444ebfc) 5 in 12 games."""
+		return ft.bounded(self.disband_cost, 0.0, 10.0, 6.0, CORRECTION_STEP)
 
 	def main_visitor(self, x, f):
 		"""Whether the hero visiting each town of ours is one of our main heroes [B, TO] (f.main: Nullkiller2's roles, by

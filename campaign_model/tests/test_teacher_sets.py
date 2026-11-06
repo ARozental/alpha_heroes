@@ -139,6 +139,29 @@ def test_each_weight_steps_toward_its_share_and_no_faster():
 	assert metrics["grad_shared_value"] == pytest.approx(1e-5 * before["value"])  # (as it entered the loss: at the update's weight)
 
 
+def test_the_value_share_is_a_floor_not_a_target():
+	"""learner.VALUE_SHARE_CAP: the value weight rises while the value's share is under its target, holds between it and
+	VALUE_SHARE_CAP times it (heads with a lot to re-fit keep their gradient), and is cut past that."""
+	from campaign_model.learner import VALUE_SHARE_CAP
+
+	learner = learner_with(score=0.285)
+	shares = learner.loss_shares()
+	metrics = {"grad_raw_policy": 0.1, "grad_raw_value": 1e-5, "grad_raw_teacher": 0.2, "grad_raw_foresight": 0.01}
+	for _ in range(80):  # (at its share: weight = share / share_policy x norm_policy / norm)
+		learner._note_gradients(dict(metrics))
+	settled = learner.loss_scale["weight"]["value"]
+	assert settled == pytest.approx(shares["value"] / shares["policy"] * 0.1 / 1e-5, rel=1e-6)
+	for _ in range(60):  # the value's gradient twice as large: its share twice the target, the weight holds
+		learner._note_gradients(dict(metrics, grad_raw_value=2e-5))
+	assert learner.loss_scale["weight"]["value"] == pytest.approx(settled, rel=1e-6)
+	for _ in range(80):  # five times: past the cap, cut to VALUE_SHARE_CAP times the share
+		learner._note_gradients(dict(metrics, grad_raw_value=5e-5))
+	assert learner.loss_scale["weight"]["value"] == pytest.approx(VALUE_SHARE_CAP * shares["value"] / shares["policy"] * 0.1 / 5e-5, rel=1e-3)
+	for _ in range(80):  # a tenth of the first: under the share, raised back to it
+		learner._note_gradients(dict(metrics, grad_raw_value=1e-6))
+	assert learner.loss_scale["weight"]["value"] == pytest.approx(shares["value"] / shares["policy"] * 0.1 / 1e-6, rel=1e-3)
+
+
 def test_without_the_shares_the_teacher_is_at_its_weight_and_nothing_moves():
 	learner = learner_with(shares=False, weight=6.4)
 	assert learner.loss_weights() == {"value": 1.0, "foresight": 1.0, "teacher": 6.4}

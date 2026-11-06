@@ -75,6 +75,12 @@ LOSS_TERMS = ("policy", "value", "teacher", "foresight")
 TEACHER_SHARE_MAX = 0.6
 LOSS_SCALE_STEP = 1.25
 LOSS_SCALE_MEMORY = 0.9  # (each term's log gradient norm, averaged over ~10 updates)
+# The value term's share is a floor (the user's "never under 15%", 2026-11-02), not a target: its weight is raised while
+# its share is below its target, and cut only past VALUE_SHARE_CAP times it. Held at the target, the balancer cut the
+# weight exactly when the heads were most wrong: after schema 14 (v1138-v1145) the value's gradient rose to a share of
+# 0.33-0.47 against 0.15 and its weight fell 356 -> 146; the 7-day growth heads' explained variance 0.40-0.45 -> 0.19-0.23,
+# and ~100 updates later it had won back half (2026-11-05)
+VALUE_SHARE_CAP = 3.0
 COLUMNS = [
 	"version", "epoch", "games", "decisions", "dropped_old", "unsound", "credited", "days", "players", "phi_end", "heroes", "label_mean", "price_mean",
 	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_weighted", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "teacher_kl", "teacher_weight", "advised", "teacher_agree", "teacher_ce", "teacher_outside", "clip_fraction", "grad_norm", "steps", "learning_rate",
@@ -856,6 +862,8 @@ class CampaignLearner:
 				if term in norms:
 					target = shares[term] / shares["policy"] * math.exp(norms["policy"] - norms[term])
 					weight = state["weight"][term]
+					if term == "value":  # (a floor: between its share and VALUE_SHARE_CAP times it, the weight holds)
+						target = float(np.clip(weight, target, VALUE_SHARE_CAP * target))
 					state["weight"][term] = float(np.clip(np.clip(target, weight / LOSS_SCALE_STEP, weight * LOSS_SCALE_STEP), 1e-4, 1e6))
 		now = {term: metrics[f"grad_shared_{term}"] for term in LOSS_TERMS}
 		total = sum(v for v in now.values() if np.isfinite(v))
