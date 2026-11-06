@@ -75,6 +75,10 @@
 # foresight ~0.66); trust max(0.4, its 0.98 average); the trunk's beta1 0.95; each parameter group clipped at its own
 # median norm (calibrated over the first 200 steps, then all x 0.5 / the total's median); the value heads' weights by
 # their running residual (ramped in over 20 updates). The battle learner: its value heads at 10x, clipped by group
+# campaign.target_kl=0.03 since 2026-11-06 ~14:20 (~v1468; the plan's step-2 fallback, "the eval falls two evals
+# running": 0.441 (v1422, before) -> 0.363 -> 0.335): at 0.015 the policy's rate fell to 0.2-0.4x, because the update's
+# KL barely follows the rate (2.5x less rate, 1.6x less KL; it varies ~5x with the batch at one rate), so the control
+# ratchets on the batch's noise; at 0.03 the rate goes back to its cap, the critic still at 10x it (step 1)
 cd "$HOME/projects/alpha_heroes"
 export MALLOC_ARENA_MAX=2
 # (no expandable CUDA segments here: the learner's step graph failed to record with them, "device not ready"; the
@@ -91,5 +95,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.memory_steps=2 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
