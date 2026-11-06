@@ -30,6 +30,7 @@ import multiprocessing
 import os
 import random
 import secrets
+import shutil
 import signal
 import socket
 import sys
@@ -393,7 +394,9 @@ class Games(IterableDataset):
 	def __iter__(self):
 		info = get_worker_info()
 		index = info.id if info else 0
-		rng = random.Random(1_000_003 * (self.config.seed + 1) + 7919 * index + (104_729 * self.config.campaign.seed if self.kind == "campaign" else 0))
+		# (and the battle model's version at the worker's start: seeded by its index alone, each worker played the same
+		# battles and games again after every restart, w2_g2_11 among them five times in a day, 2026-11-05)
+		rng = random.Random(1_000_003 * (self.config.seed + 1) + 7919 * index + (104_729 * self.config.campaign.seed if self.kind == "campaign" else 0) + 15_485_863 * self.shared.version.value)
 		runner = Runner(self.config, self.run_dir, self.battle_sockets[index % len(self.battle_sockets)], self.campaign_sockets[index % len(self.campaign_sockets)] if self.campaign_sockets else None, self.link, f"w{index}", self.shared.version, self.shared.credit)
 		stop = self.shared.stop
 		n = 0
@@ -554,7 +557,11 @@ class Runner:
 			if spec["past"] is not None:  # the other side is our AI with an older model, not recorded
 				game = replace(game, settings=game.settings + ((f"ALPHA_BATTLE_INFERENCE_MODEL_{game.colors[1 - our_side]}", str(spec["past"])),))
 			game = replace(game, sampler_seed=spec["sampler_seed"])
-			records = self.process.play(game, self.link)
+			try:
+				records = self.process.play(game, self.link)
+			except RuntimeError:  # its scenario kept beside the client's folder, which play kept (BattleProcess.close_process)
+				keep_scenario(files[0], spec["key"])
+				raise
 		finally:
 			for path in files:
 				path.unlink(missing_ok=True)
@@ -646,6 +653,23 @@ class Runner:
 					continue
 				item, problem = prepare(record, "real", record_key.split(":", 1)[0], self.advantage_config())
 				yield item if item else {"kind": "failed", "what": "battle", "message": problem}
+
+
+STALLED_SCENARIOS = Path(__file__).resolve().parent.parent / "runtime" / "stalled_scenarios"
+STALLED_SCENARIOS_KEPT = 20
+
+
+def keep_scenario(path, key):
+	"""A failed generated battle's scenario file into STALLED_SCENARIOS (the newest STALLED_SCENARIOS_KEPT): the battle
+	that stalled can be played again from it (2026-11-05: one stalled at its start every time it came, its scenario deleted
+	with the battle)."""
+	try:
+		STALLED_SCENARIOS.mkdir(parents=True, exist_ok=True)
+		shutil.copy2(path, STALLED_SCENARIOS / f"{time.strftime('%Y%m%d-%H%M%S')}-{key}.json")
+		for old in sorted(STALLED_SCENARIOS.glob("*.json"))[:-STALLED_SCENARIOS_KEPT]:
+			old.unlink(missing_ok=True)
+	except OSError as error:
+		print(f"supply: a stalled battle's scenario not kept: {error}", flush=True)
 
 
 def _worker_init(_index):

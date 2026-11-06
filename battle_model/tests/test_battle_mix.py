@@ -99,3 +99,17 @@ def test_a_game_takes_the_least_loaded_inference_process():
 	games.release_server(0)
 	games.release_server(0)
 	assert games.take_server() == 0 and list(games.shared.server_games) == [1, 1, 1]
+
+
+def test_a_stalled_battles_scenario_is_kept_the_newest_twenty(tmp_path, monkeypatch):
+	"""supply.keep_scenario: a failed generated battle's scenario file copied into STALLED_SCENARIOS, the newest
+	STALLED_SCENARIOS_KEPT of them."""
+	monkeypatch.setattr(supply, "STALLED_SCENARIOS", tmp_path / "kept")
+	monkeypatch.setattr(supply, "STALLED_SCENARIOS_KEPT", 2)
+	scenario = tmp_path / "w2_g2_11.json"
+	scenario.write_text('{"seed": 1}')
+	for key in ("a", "b", "c"):
+		supply.keep_scenario(scenario, key)
+	kept = sorted((tmp_path / "kept").glob("*.json"))
+	assert len(kept) == 2 and kept[-1].read_text() == '{"seed": 1}'
+	supply.keep_scenario(tmp_path / "missing.json", "d")  # (a file gone: a note, no exception)

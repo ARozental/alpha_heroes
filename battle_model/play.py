@@ -472,7 +472,7 @@ class BattleProcess:
 				if time.monotonic() > deadline or self.process.poll() is not None:
 					status = "stalled" if self.process.poll() is None else f"exited ({self.process.poll()})"
 					# (the runner's own status says how the client ended: headless.sh exits 0 whatever happened to it)
-					raise RuntimeError(f"battle did not finish cleanly ({status} in a battle process; its runner: {self.close_process() or '?'}), map {name}")
+					raise RuntimeError(f"battle did not finish cleanly ({status} in a battle process; its runner: {self.close_process(stalled=True) or '?'}), map {name}")
 				time.sleep(0.02)
 		finally:
 			if prefix:
@@ -482,9 +482,11 @@ class BattleProcess:
 			received = {key: self.records.records.pop(key) for key in keys}
 		return [parse_record(received[key][-1]) for key in keys]
 
-	def close_process(self):
+	def close_process(self, stalled=False):
 		"""Ends the client; returns its runner's status line (headless.sh's "status:", e.g. "killed: no log output for
-		60s ..." or "finished (exit code 139)"), or "" when there was none."""
+		60s ..." or "finished (exit code 139)"), or "" when there was none. stalled: a battle was playing (play's failure),
+		so a stall's folder is kept; a client killed while it waited for its next battle (the actors had none for it a
+		minute: ~115 of the first 8 hours' kept folders) is not a stall."""
 		status = ""
 		if self.conn:
 			try:
@@ -503,7 +505,7 @@ class BattleProcess:
 			output = self.process.communicate()[0] if self.process.stdout and not self.process.stdout.closed else ""
 			run = next((line.split(":", 1)[1].strip() for line in (output or "").splitlines() if line.startswith("run:")), "")
 			status = next((line.split(":", 1)[1].strip() for line in (output or "").splitlines() if line.startswith("status:")), "")
-			if run and status.startswith("killed: no log output"):
+			if run and stalled and status.startswith("killed: no log output"):
 				_stalled_runs.append(run)
 				while len(_stalled_runs) > STALLED_KEPT:
 					shutil.rmtree(_stalled_runs.popleft(), ignore_errors=True)
