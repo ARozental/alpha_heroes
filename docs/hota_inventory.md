@@ -57,3 +57,14 @@ Recommended: per-ruleset value tables.
 **Exporter gaps the match needs fixed** (Part 1):
 - Buildings are not unique by key: core factions share `core:mageGuild1` etc. The key must carry the faction.
 - Object types are keyed by display name: SoD's "Quest Guard" is missing under HotA (renamed). They need VCMI's identifiers, with subtype keys.
+
+**The match by key (Part 1's library, agents/AlphaContent; Python mirror content/).**
+- SoD vocabulary against the SoD engine, strict: 193 tables, 2,219 keys, all matched, the identity on every row.
+- Against the HotA engine:
+  - 775 unknown: HotA's content, now under its real keys (hota.cove:nix, hota.factory:mageGuild5, hota.bulwark:runes, hota.mapobjects:warlocksLab...).
+  - 60 absent: SoD's two-way monolith subtypes 41-100, whose subtype ids HotA reuses for its decoration monoliths. An id-based encoder would have mapped those silently.
+  - No collisions once HotA's second prison subtype gets its own key. Its hero camp is also named "prison", so it becomes `core:prison#2`, listed as a rename.
+- The SoD vocabulary grown append-only by HotA (`python -m content merge`):
+  - matches the HotA engine strictly with 0 unknown;
+  - matches the SoD engine strictly too;
+  - keeps every SoD row at its runtime id, so today's checkpoints map 1:1.

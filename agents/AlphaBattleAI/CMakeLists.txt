@@ -15,10 +15,15 @@ foreach(target AlphaBattleAI AlphaBattleAIDev)
 	vcmi_set_output_dir(${target} "AI")
 endforeach()
 
+# The content match both agents and the tools link (docs/hota_transfer_plan.md, Part 1)
+if(NOT TARGET alpha_content)
+	add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../AlphaContent ${CMAKE_CURRENT_BINARY_DIR}/AlphaContent)
+endif()
+
 # Exports the id -> name/stats tables the Python side uses (scripts/export_vocab.sh)
 add_executable(alpha_export_vocab tools/ExportVocab.cpp)
 target_include_directories(alpha_export_vocab PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR})
-target_link_libraries(alpha_export_vocab PRIVATE vcmi)
+target_link_libraries(alpha_export_vocab PRIVATE alpha_content vcmi)
 vcmi_set_output_dir(alpha_export_vocab "")
 
 # Builds a battle-only map from a battle_model scenario file (battle_model/play.py)

@@ -8,6 +8,7 @@
 //
 // Usage (scripts/export_vocab.sh sets this up): VCMI_USER_DIR=... build/bin/alpha_export_vocab <out.json>
 #include "StdInc.h"
+#include "Content.h"
 
 #include "lib/BattleFieldHandler.h"
 #include "lib/CBonusTypeHandler.h"
@@ -375,6 +376,8 @@ int main(int argc, const char * argv[])
 	vocab["object_types"] = objectTypes();
 	vocab["terrains"] = simple(LIBRARY->terrainTypeHandler->objects);
 	vocab["roads"] = simple(LIBRARY->roadTypeHandler->objects);
+	// Every table's keys by runtime id, the engine facts and hashes (alpha_content): what the match runs against
+	vocab["content"] = alpha_content::readEngine().toJson();
 	std::ofstream(out) << vocab.toString();
 	std::cout << "wrote " << out << "\n";
 
