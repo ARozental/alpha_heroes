@@ -922,6 +922,49 @@ def test_a_neutral_towns_garrison_is_a_fight_on_its_tile_and_an_empty_one_a_capt
 	assert float(empty.tile_object_gold[k, R, R + 1]) > 1000.0  # the town's village hall and income at least
 
 
+def _unseen_guard_window(far=None, next_to=None):
+	"""rich_inputs whose hero 0 of decision 0 sees no wandering monster but these, with a guarded tile right of it and fog
+	beyond (a monster in the fog guards it): far (creature, count) 6 tiles up-left, next_to one up-right of the tile."""
+	x = rich_inputs(2, 3)
+	b, hero, R = 0, 0, c.WINDOW_RADIUS
+	x["w_creature"][b, hero] = -1
+	x["w_flags"][b, hero] &= ~c.TILE_GUARDED
+	x["w_flags"][b, hero, R, R + 1] = c.TILE_ON_MAP | c.TILE_REVEALED | c.TILE_GUARDED
+	x["w_flags"][b, hero, R, R + 2] = c.TILE_ON_MAP
+	for monster, (y, z) in ((far, (R - 6, R - 6)), (next_to, (R - 1, R + 2))):
+		if monster is not None:
+			x["w_creature"][b, hero, y, z], x["w_count"][b, hero, y, z] = monster
+			x["w_flags"][b, hero, y, z] = c.TILE_ON_MAP | c.TILE_REVEALED | c.TILE_EXACT_COUNT
+	return x
+
+
+def test_an_unseen_guard_is_the_worst_fight_in_view_not_a_free_tile():
+	"""2026-11-05: VCMI flags a visible tile next to a monster in fog as guarded; with no monster we saw next to it, its
+	fight was worth 0 and its exploration on top (5 of joint7's 46 hopeless MOVE attacks on fight tiles). Now it is the
+	worst fight the window shows: as hopeless as a strong monster in view; UNSEEN_GUARD_RATIO with none in view; and a
+	guard we see next to the tile keeps its own fight."""
+	from campaign_model import features as ft
+	from campaign_model.model import UNSEEN_GUARD_RATIO
+
+	strong, cheap = _strongest_and_cheapest()
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	R = c.WINDOW_RADIUS
+	with torch.no_grad():
+		far = m.domain_knowledge(tensors(_unseen_guard_window(far=(strong, 40))))
+		none = m.domain_knowledge(tensors(_unseen_guard_window()))
+		seen = m.domain_knowledge(tensors(_unseen_guard_window(far=(strong, 40), next_to=(cheap, 1))))
+		plain_x = _unseen_guard_window(far=(strong, 40))
+		plain_x["w_flags"][0, 0, R, R + 1] &= ~c.TILE_GUARDED
+		plain = m.domain_knowledge(tensors(plain_x))
+	k = [i for i, w in enumerate(far.windows.tolist()) if w == 0 and bool(far.real[i])][0]
+	assert float(far.tile_fights[k, R, R + 1]) == 1.0
+	assert torch.allclose(far.move_strength[k, R, R + 1], far.move_strength[k, R - 6, R - 6])
+	assert float(far.move_relative[k, R, R + 1, 0]) > 0.3
+	assert float(far.tile_prior[k, R, R + 1]) < float(plain.tile_prior[k, R, R + 1]) - 1.0  # (no longer a free step into fog)
+	assert torch.allclose(none.move_strength[k, R, R + 1, :4], ft.strength_view(torch.full((4,), UNSEEN_GUARD_RATIO)))  # (as a feature)
+	assert float(seen.move_strength[k, R, R + 1, :4].min()) > 0.0  # (one of the cheapest creatures next to it: its own fight)
+
+
 def _question(x, b, creature, count, battle=None, join=None, d_object=16):
 	x["d_hero"][b] = 0
 	x["d_object"][b], x["d_subtype"][b] = d_object, 0

@@ -56,6 +56,9 @@ FORT_STRENGTH = (0.0, 0.0, 4000.0, 10000.0)
 # unseen), and the village hall's income for income_days
 VILLAGE_HALL, FORT_BUILDINGS, VILLAGE_HALL_INCOME = 10, (7, 8, 9), 500.0
 DWELLINGS, UPGRADED_DWELLINGS = 30, 37  # VCMI's building ids of the level 1 dwelling, and of its upgrade
+# A guard we cannot see (it stands in fog), in a window that shows no wandering monster: its log strength ratio (ours over
+# theirs), an e-fold stronger than us (features.hopeless's onset). Where the window shows some, it is the worst of theirs
+UNSEEN_GUARD_RATIO = -1.0
 PRIOR_SUBTYPES = 16  # subtypes 0..15 of an object may have a prior of their own (object_values.csv, bank_guards.csv)
 
 GLOBAL_FEATURES = 7 + 4 + 3 + 3 * c.N_RESOURCES + 3 * c.N_RESOURCES + 3 + 1 + 3 + 1 + 3 + 2 + 2 * c.N_TAVERN + 3 + 3 + 1
@@ -1072,7 +1075,8 @@ class CustomFeatures(nn.Module):
 			+ of(armed_here, f.armed_health) + ft.HERO_XP * on_hero + ft.TOWN_XP * on_town
 		)
 		# The fight's expected return (gold): win it and gain its experience and the enemy's loss, minus what it costs
-		loss, win = ft.expected_loss(ratio, has_enemy), ft.win_chance(ratio, ft.bounded(self.fight_sharpness, 0.5, 8.0, 4.0, CORRECTION_STEP))
+		sharpness = ft.bounded(self.fight_sharpness, 0.5, 8.0, 4.0, CORRECTION_STEP)
+		loss, win = ft.expected_loss(ratio, has_enemy), ft.win_chance(ratio, sharpness)
 		gain = their_gold * self.gain(self.enemy_value) + ft.experience_value(ours(x["h_exp"].clamp(min=0).float())[:, None, None], their_health, ours(f.level_gain)[:, None, None], self)
 		# What a lost battle takes besides the army: the hero's worth (a fresh one's HERO_BASE and what it has gained since)
 		# and the rest of a hire's price (a fresh hero's loss: a hire's 2,500, as before skills were priced)
@@ -1094,6 +1098,17 @@ class CustomFeatures(nn.Module):
 		fight = fight + ft.worst_guard(fight, monster, guarded)
 		loss = torch.maximum(loss, -ft.worst_guard(-loss, monster, guarded))
 		win = torch.where(guarded, ft.worst_guard(win, monster, guarded), win * has_enemy)
+		# A guard we cannot see: VCMI flags a visible tile of the zone of a monster that stands in fog (its
+		# guardingCreaturePosition checks only the tile), and worst_guard finds no monster next to it, so the fight was
+		# worth 0 and the tile's exploration came on top (2026-11-05: 5 of joint7's 46 hopeless MOVE attacks on fight
+		# tiles, heroes of 50-1,300 gold against 2,420-7,350, each with fog next to the tile). Its fight is the worst this
+		# window's monsters show (an RMG zone's are of one strength), UNSEEN_GUARD_RATIO's where it shows none; no gain
+		unseen = guarded & ~ft.next_to_monster(monster)
+		unseen_ratio = ft.window_worst(ratio, monster, UNSEEN_GUARD_RATIO)
+		unseen_loss, unseen_win = ft.expected_loss(unseen_ratio, unseen), ft.win_chance(unseen_ratio, sharpness)
+		fight_ratio = torch.where(unseen, unseen_ratio, fight_ratio)
+		fight = torch.where(unseen, ft.fight_return(unseen_win, unseen_loss, ours(f.hero_gold)[:, None, None], hero[:, None, None], 0.0), fight)
+		loss, win = torch.where(unseen, unseen_loss, loss), torch.where(unseen, unseen_win, win)
 		fights = has_enemy | guarded
 		# The fight in four estimates of strength (the user, 2026-11-04: several that agree are easier to act on), each a
 		# log ratio ours over theirs, for this hero and for our main army (our strongest hero), where a fight starts (the
@@ -1132,7 +1147,8 @@ class CustomFeatures(nn.Module):
 			out = []
 			for r in (army, side(f.hero_strength) - their_strength, torch.where(bank, army, race), torch.where(bank, army, spells)):
 				r = r * has_enemy
-				out.append(torch.where(guarded, ft.worst_guard(r, monster, guarded), r))
+				guard = torch.where(guarded, ft.worst_guard(r, monster, guarded), r)
+				out.append(torch.where(unseen, ft.window_worst(r, monster, UNSEEN_GUARD_RATIO), guard))
 			return torch.stack(out, dim=-1)
 
 		this_hero, main_army = estimates(ours), estimates(of_main)

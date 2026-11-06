@@ -524,6 +524,19 @@ def worst_guard(values, monster, guarded):
 	return torch.where(guarded & (worst < big / 2), worst, torch.zeros_like(worst))
 
 
+def next_to_monster(monster):
+	"""[K, W, W]: a wandering monster we see on the tile or next to it (worst_guard finds a guard there)."""
+	return F.max_pool2d(monster.float().unsqueeze(1), 3, stride=1, padding=1).squeeze(1) > 0
+
+
+def window_worst(values, monster, default):
+	"""[K, W, W]: the lowest of values [K, W, W] among the window's wandering monsters we see (each window's own), default
+	in a window that shows none: a guard we cannot see, as the worst fight in view."""
+	big = 1e9
+	low = torch.where(monster, values, torch.full_like(values, big)).flatten(1).amin(dim=1)
+	return torch.where(low < big / 2, low, torch.full_like(low, default))[:, None, None].expand_as(values)
+
+
 # ---- exploration and the map's blocks ----
 
 def unexplored_around(flags, radius=SIGHT_RADIUS):
