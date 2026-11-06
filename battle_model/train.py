@@ -188,6 +188,11 @@ class TrainConfig:
 	# learning_rate x this. No teacher or balancer here: the critic's one handicap was the shared rate
 	value_lr_factor: float = 10.0
 	value_lr_kl: bool = False  # the KL control's lr_scale scales the values' group too (False: the policy's KL never moves them)
+	# The trunk's momentum (docs/optimizer_plan.md step 5, the battle's since 2026-11-06): Adam's beta1 for the trunk group
+	# (the priors' and the values' stay 0.9). The battle trunk's gradient read as pure noise a step (signal fraction ~0,
+	# since 8797125 cut accumulate 24 -> 2: 512 decisions a step): at 0.95 each step's direction averages ~20 steps,
+	# ~10k decisions, and the noise part of a step shrinks ~30% (pure noise |m| / sqrt(v): 0.23 at 0.9, 0.16 at 0.95)
+	trunk_beta1: float = 0.95
 	# KL control, so the step size does not hang on a hand-picked learning rate: an update stops its steps once its KL
 	# (old against new policy) passes 1.5x target_kl; then the learning rate's scale is cut by 1.5, and raised by 1.5
 	# after an update that took all its steps and ended under half of target_kl (within 0.1..lr_scale_max). The KL is the mean
@@ -462,7 +467,7 @@ def signal_ratio(optimizer):
 # value heads' (at value_lr_factor x the rate), the prior-initialised rule and value parameters', the trunk the rest
 BATTLE_GROUPS = ("trunk", "priors", "values")
 BATTLE_VALUE_MODULES = ("values.", "value_strength.")
-BATTLE_PRIORS = ("actions.escape_rules", "actions.spell_mastery", "actions.spell_value", "actions.creature_spell_value", "actions.value_gains", "actions.type_head.bias", "actions.type_rules.weight", "actions.type_strength.weight", "actions.spell_head.bias")
+BATTLE_PRIORS = ("actions.escape_rules", "actions.escape_ahead", "actions.spell_mastery", "actions.spell_value", "actions.creature_spell_value", "actions.value_gains", "actions.type_head.bias", "actions.type_rules.weight", "actions.type_strength.weight", "actions.spell_head.bias")
 
 
 def battle_parameter_groups(model):
@@ -484,8 +489,8 @@ def battle_group_lr(group, config, lr_scale=1.0, schedule=1.0):
 
 def make_optimizer(model, config):
 	"""Adam over battle_parameter_groups' groups, each named, its parameters' names kept (load_optimizer matches moments
-	by them), beta2 config.adam_beta2."""
-	groups = [{"params": params, "name": name, "betas": (0.9, config.adam_beta2)} for name, params in battle_parameter_groups(model).items() if params]
+	by them), beta2 config.adam_beta2, the trunk's beta1 config.trunk_beta1."""
+	groups = [{"params": params, "name": name, "betas": (config.trunk_beta1 if name == "trunk" else 0.9, config.adam_beta2)} for name, params in battle_parameter_groups(model).items() if params]
 	optimizer = torch.optim.Adam(groups, lr=config.learning_rate)
 	for group in optimizer.param_groups:
 		group["lr"] = battle_group_lr(group, config)

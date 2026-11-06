@@ -380,3 +380,38 @@ def test_a_checkpoint_from_before_the_shot_type_features_loads_with_their_prior(
 	assert key not in kept and "actions.type_head.weight" in kept and len(kept) == len(state["optimizer"]["state"]) - 1
 	new(x)["value"].sum().backward()
 	fresh.step()  # (moments of the old shape would fail here)
+
+
+def test_escapes_are_pressed_down_while_the_value_head_says_we_are_ahead():
+	"""priors.escape_ahead (the user, 2026-11-06): both escapes' logits get w_step x tanh(max(0, V) / 0.1) + w_scale x
+	max(0, V), from (-3, -3): 0 even or behind, -3.5 at V 0.2, -6 at a sure win; every other type unchanged, V's gradient
+	untouched (read detached); an older checkpoint (no escape_ahead) loads with it at its prior."""
+	from battle_model import priors
+
+	at = lambda v: float(priors.escape_ahead(torch.tensor([v]), torch.tensor(priors.ESCAPE_AHEAD)))  # noqa: E731
+	assert at(-0.5) == 0.0 and at(0.0) == 0.0
+	assert at(0.1) == pytest.approx(-3 * np.tanh(1.0) - 0.3) and at(0.2) == pytest.approx(-3.49, abs=0.01) and at(1.0) == pytest.approx(-6.0, abs=1e-3)
+	torch.manual_seed(3)
+	model = BattleModel(dim=32, layers=1).eval()
+	x = {k: torch.from_numpy(v) for k, v in random_inputs(batch=6, seed=4).items()}
+	escapes = [ActionType.RETREAT, ActionType.SURRENDER]
+	for t in escapes:  # (random inputs never offer an escape)
+		x["m_type"][:, t] = True
+	with torch.no_grad():
+		pressed = model(x)
+		model.actions.escape_ahead.zero_()
+		free = model(x)
+	v = pressed["value"][:, -1]
+	assert (v > 0.05).any() and (v < 0).any()  # (both cases: pressed and not)
+	for b in range(6):
+		legal = x["m_type"][b].bool()
+		shift = pressed["logp_type"][b] - free["logp_type"][b]  # (a logit change, less the normaliser's change)
+		other = [t for t in range(shift.shape[0]) if legal[t] and t not in escapes]
+		for t in escapes:
+			if legal[t] and other:
+				assert float(shift[t] - shift[other[0]]) == pytest.approx(at(float(v[b])), abs=1e-4)
+		assert all(float(shift[t] - shift[other[0]]) == pytest.approx(0.0, abs=1e-5) for t in other)
+	state = {k: v for k, v in model.state_dict().items() if k != "actions.escape_ahead"}
+	old = BattleModel(dim=32, layers=1)
+	old.load_state_dict(state)
+	assert old.actions.escape_ahead.tolist() == list(priors.ESCAPE_AHEAD)

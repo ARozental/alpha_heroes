@@ -556,6 +556,9 @@ class ActionHeads(nn.Module):
 		escapes[2:, ActionType.RETREAT] = escapes[2:, ActionType.SURRENDER] = 1.0  # the exposure features: both escapes
 		self.register_buffer("escape_types", escapes, persistent=False)  # [outcome feature, type]
 		self.register_buffer("escape_bias", -priors.action_types() * escapes.sum(dim=0), persistent=False)  # what relief lifts
+		# and pressed down while the value head says we are ahead (priors.escape_ahead: (w_step, w_scale), learned)
+		self.escape_ahead = nn.Parameter(torch.tensor(priors.ESCAPE_AHEAD))
+		self.register_buffer("escape_any", (escapes.sum(dim=0) > 0).float(), persistent=False)  # [type]: RETREAT, SURRENDER
 		self.spell_head = nn.Linear(dim, N_SPELLS)
 		self.spell_query = small_embedding(N_SPELLS, dim)
 		self.creature_spell_query = small_embedding(EFFECT_VOCAB + 1, dim)  # by the acting unit's spell
@@ -592,6 +595,8 @@ class ActionHeads(nn.Module):
 		prior."""
 		if prefix + "value_gains" not in state_dict:
 			state_dict[prefix + "value_gains"] = torch.zeros_like(self.value_gains)
+		if prefix + "escape_ahead" not in state_dict:  # (2026-11-06: older checkpoints and league snapshots at its prior)
+			state_dict[prefix + "escape_ahead"] = torch.tensor(priors.ESCAPE_AHEAD)
 		priors.widen_type_rules(state_dict, prefix + "type_rules.weight", F.TYPE_FEATURES)
 		super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
@@ -622,8 +627,9 @@ class ActionHeads(nn.Module):
 			out[head] = torch.cat([f[..., :best], versus[..., None], f[..., best + 1 :]], dim=-1)
 		return out
 
-	def forward(self, context, units, hexes, actions, x, strength, outcomes, ratios, acting):
-		"""acting [B, d]: the acting unit's token."""
+	def forward(self, context, units, hexes, actions, x, strength, outcomes, ratios, acting, value=None):
+		"""acting [B, d]: the acting unit's token; value [B] or None: the value head's estimate of the battle's end (its
+		final head, V), which presses the escapes down while we are ahead (priors.escape_ahead; read detached)."""
 		scale = 1.0 / math.sqrt(context.shape[-1])
 		q = {name: layer(context) + self.actor_queries[name](acting) for name, layer in self.queries.items()}
 		k = self.keys
@@ -671,6 +677,8 @@ class ActionHeads(nn.Module):
 		#   and outcomes behind any action: experience and Necromancy for the winner, Eagle Eye, more than two players
 		relief = priors.escape_relief(ratios[:, F.STRENGTH_VARIANTS.index("all")].sum(dim=-1))  # [B]
 		escape = relief[:, None] * self.escape_bias + (outcomes * self.escape_rules) @ self.escape_types
+		if value is not None:
+			escape = escape + priors.escape_ahead(value.detach(), self.escape_ahead)[:, None] * self.escape_any
 		kind = self.type_head(context) + self.type_rules(actions["type"]) + self.type_strength(strength) + follow + escape
 		return {
 			"logp_type": masked_log_softmax(kind, x["m_type"]),
@@ -761,8 +769,9 @@ class BattleModel(nn.Module):
 		actions = F.action_features(b, facts["melee"], facts["shot"], facts["maps"], facts["can_attack"], facts["battle"])
 		actions.update({k.split(":", 1)[1]: v for k, v in facts.items() if k.startswith("spell:")})
 		acting = units[torch.arange(units.shape[0], device=units.device), b.acting]
-		heads = self.actions(context, units, hexes, actions, x, strength, facts["outcomes"], facts["strength"], acting)
-		return {**heads, **self.values(context, self.value_strength(strength)), **foresight}  # (foresight: training only)
+		values = self.values(context, self.value_strength(strength))  # (before the actions: V presses the escapes while ahead)
+		heads = self.actions(context, units, hexes, actions, x, strength, facts["outcomes"], facts["strength"], acting, value=values["value"][:, -1])
+		return {**heads, **values, **foresight}  # (foresight: training only)
 
 	def set_rule_weights(self, head, **weights):
 		"""Set a head's linear feature weights by name, e.g. set_rule_weights("melee_target", wipe_chance=2.0)."""

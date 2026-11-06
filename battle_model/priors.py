@@ -51,6 +51,23 @@ def escape_relief(z):
 	return torch.sigmoid((ESCAPE_AT - z) / ESCAPE_WIDTH)
 
 
+# Escaping while ahead (the user, 2026-11-06: "another -3 for the logit if we are ahead and maybe something that scales
+# nicely with how much we are ahead"): both escapes' logits get w_step x tanh(lead / ESCAPE_AHEAD_WIDTH) + w_scale x
+# lead, lead = max(0, V), V the value head's own estimate of the battle's end (-1..1; the failure count's "ahead" is
+# V > 0): 0 even or behind, -1.5 at V 0.05, -2.6 at 0.1, -3.5 at 0.2, -4.5 at 0.5, -6 at a sure win. The relief above
+# judges by the armies' strength alone, and the learned type head's RETREAT row (its norm 7x MOVE's by epoch 8476) could
+# lift an escape past the -6 while V said we were winning (~2% of escapes, 2026-11-06). Learned from (-3, -3), as the
+# idle shooter's -5: a prior that presses, no mask
+ESCAPE_AHEAD = (-3.0, -3.0)  # (w_step, w_scale)
+ESCAPE_AHEAD_WIDTH = 0.1
+
+
+def escape_ahead(value, weights):
+	"""[B] the logit both escapes get at the value head's estimate value [B] (above); weights: (w_step, w_scale)."""
+	lead = value.clamp(min=0.0)
+	return weights[0] * torch.tanh(lead / ESCAPE_AHEAD_WIDTH) + weights[1] * lead
+
+
 def spells():
 	return biases("spells.csv", N_SPELLS)
 

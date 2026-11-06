@@ -79,6 +79,9 @@
 # running": 0.441 (v1422, before) -> 0.363 -> 0.335): at 0.015 the policy's rate fell to 0.2-0.4x, because the update's
 # KL barely follows the rate (2.5x less rate, 1.6x less KL; it varies ~5x with the batch at one rate), so the control
 # ratchets on the batch's noise; at 0.03 the rate goes back to its cap, the critic still at 10x it (step 1)
+# The battle learner since 2026-11-06 ~19:30: its trunk's beta1 0.95 (the plan's step 5: its gradient read as pure noise
+# a step since accumulate 2), and the escapes pressed down while its value head says we are ahead (the user: "another -3
+# for the logit if we are ahead and maybe something that scales nicely with how much we are ahead": priors.escape_ahead)
 cd "$HOME/projects/alpha_heroes"
 export MALLOC_ARENA_MAX=2
 # (no expandable CUDA segments here: the learner's step graph failed to record with them, "device not ready"; the

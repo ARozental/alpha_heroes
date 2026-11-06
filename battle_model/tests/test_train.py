@@ -130,7 +130,9 @@ def test_the_battle_optimizers_groups_and_a_one_group_checkpoint():
 	assert sum(len(g["params"]) for g in optimizer.param_groups) == len(list(model.parameters()))
 	assert set(groups["values"]["param_names"]) == {n for n, _ in model.named_parameters() if n.startswith(("values.", "value_strength."))}
 	assert {"actions.value_gains", "actions.type_rules.weight", "actions.rules.move.linear"} <= set(groups["priors"]["param_names"])
-	assert groups["values"]["lr"] == 1e-4 and groups["trunk"]["lr"] == 1e-5 and all(g["betas"] == (0.9, 0.99) for g in optimizer.param_groups)
+	assert groups["values"]["lr"] == 1e-4 and groups["trunk"]["lr"] == 1e-5
+	assert {name: g["betas"] for name, g in groups.items()} == {"trunk": (0.95, 0.99), "priors": (0.9, 0.99), "values": (0.9, 0.99)}  # (trunk_beta1, step 5)
+	assert "actions.escape_ahead" in groups["priors"]["param_names"]
 	assert battle_group_lr(groups["values"], config, 0.3, 0.5) == 5e-5 and battle_group_lr(groups["trunk"], config, 0.3, 0.5) == 1e-5 * 0.3 * 0.5
 	old = torch.optim.Adam(model.parameters(), lr=1e-5)  # (the one group of before)
 	for _ in range(2):
