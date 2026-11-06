@@ -885,6 +885,43 @@ def test_a_garrison_on_a_tile_is_a_fight_there_by_its_army():
 	assert float(plain.tile_fights[k, R, R + 1]) == float(without["w_creature"].reshape(-1, c.WINDOW, c.WINDOW)[b * c.OWN_HEROES + hero, R, R + 1] >= 0)
 
 
+def _neutral_town_next_to_a_hero(garrison):
+	"""rich_inputs with a neutral town (VCMI's visitable tile, OWNER_NONE) right of hero 0 of decision 0, its garrison
+	(creature, count) or none, the town's tile plain (no monster, no guard) as the encoder shows a visible town."""
+	from campaign_model import features as ft
+
+	x = rich_inputs(2, 3)
+	b, hero, slot, R = 0, 0, c.OWN_TOWNS + 1, c.WINDOW_RADIUS
+	px, py, pz = (int(v) for v in x["h_pos"][b, hero])
+	x["t_present"][b, slot], x["t_owner"][b, slot], x["t_faction"][b, slot], x["t_fort"][b, slot] = True, c.OWNER_NONE, 0, 0
+	x["t_pos"][b, slot] = (px + 1, py, pz)
+	if garrison is not None:
+		x["t_detailed"][b, slot] = True
+		x["t_garrison_creature"][b, slot, 0], x["t_garrison_count"][b, slot, 0] = garrison
+	x["w_creature"][b, hero, R, R + 1] = -1
+	x["w_object"][b, hero, R, R + 1], x["w_subtype"][b, hero, R, R + 1], x["w_owner"][b, hero, R, R + 1] = ft.OBJ_TOWN, 0, c.OWNER_NONE
+	x["w_flags"][b, hero, R, R + 1] = c.TILE_ON_MAP | c.TILE_REVEALED | c.TILE_VISITABLE
+	return x
+
+
+def test_a_neutral_towns_garrison_is_a_fight_on_its_tile_and_an_empty_one_a_capture():
+	"""2026-11-05: the encoder listed only players' towns (VCMI's getTownsInfo), so heroes walked into neutral towns'
+	garrisons as if they were free (all 17 of joint7's hopeless MOVE attacks we saw no fight in). Listed, 40 of the
+	strongest creatures in one are hopeless, as a garrison's are; an empty one is a fight we win, worth the town."""
+	strong, _ = _strongest_and_cheapest()
+	m = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	R = c.WINDOW_RADIUS
+	with torch.no_grad():
+		guarded = m.domain_knowledge(tensors(_neutral_town_next_to_a_hero((strong, 40))))
+		empty = m.domain_knowledge(tensors(_neutral_town_next_to_a_hero(None)))
+	k = [i for i, w in enumerate(guarded.windows.tolist()) if w == 0 and bool(guarded.real[i])][0]
+	assert float(guarded.tile_fights[k, R, R + 1]) == 1.0
+	assert float(guarded.move_strength[k, R, R + 1, :4].max()) < -1.5 and float(guarded.move_relative[k, R, R + 1, 0]) > 0.3
+	assert float(empty.tile_fights[k, R, R + 1]) == 1.0 and float(empty.move_relative[k, R, R + 1, 0]) < 1e-6
+	assert float(empty.move_strength[k, R, R + 1, :4].min()) > 0.0
+	assert float(empty.tile_object_gold[k, R, R + 1]) > 1000.0  # the town's village hall and income at least
+
+
 def _question(x, b, creature, count, battle=None, join=None, d_object=16):
 	x["d_hero"][b] = 0
 	x["d_object"][b], x["d_subtype"][b] = d_object, 0

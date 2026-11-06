@@ -227,10 +227,14 @@ Decision AlphaMapAI::encode(DecisionKind kind, ObjectInstanceID exchangeFirst, O
 		if(obj->ID == Obj::HERO && obj->tempOwner != playerID)
 			otherHeroes.push_back(obj);
 	std::sort(otherHeroes.begin(), otherHeroes.end(), [&](auto * a, auto * b) { return nearness(a) < nearness(b); });
+	// Every town we see that is not ours, neutral ones too: getTownsInfo(false) walks the players' own towns only, so a
+	// neutral town was never listed and its garrison was no fight to the model (2026-11-05, 40 games of joint7: all 17
+	// hopeless MOVE attacks our features saw no fight in were on neutral towns, 25-2,120 gold against 720-12,020)
 	std::vector<const CGTownInstance *> otherTowns;
-	for(const auto * town : cb->getTownsInfo(false))
-		if(town->tempOwner != playerID)
-			otherTowns.push_back(town);
+	for(const auto * obj : cb->getAllVisitableObjs())
+		if(obj->ID == Obj::TOWN && obj->tempOwner != playerID)
+			if(const auto * town = dynamic_cast<const CGTownInstance *>(obj))
+				otherTowns.push_back(town);
 	std::sort(otherTowns.begin(), otherTowns.end(), [&](auto * a, auto * b) { return nearness(a) < nearness(b); });
 
 	for(int i = 0; i < std::min<int>(ownHeroes.size(), OWN_HEROES); ++i)
