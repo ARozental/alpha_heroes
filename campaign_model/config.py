@@ -93,6 +93,7 @@ class CampaignConfig:
 	grad_clip_by_group: bool = True
 	grad_clip_calibration: int = 200
 	grad_clip_groups: tuple = ()
+	grad_clip_since: int = 0  # clips calibrated before this version are measured again (a deploy's recalibration; 0: kept)
 	# AdamW weight decay of the prior corrections (train.make_optimizer; model.CORRECTION_STEP 10): under a steady push a
 	# correction settles at ~CORRECTION_STEP / prior_decay = 2 (a log-gain of 2 is the x5 bound; +2 logits), under noise
 	# near 0; left alone it halves in ~1,400 steps (lr 1e-4: 5e-4 a step), ~45 minutes of joint1's updates

@@ -66,7 +66,7 @@ from .data import collate, credit_check, make_dataloader, summarize, widened  # 
 from .distributions import log_prob
 from .export import export, verify
 from .device import sync, use_fused
-from .optim import calibrated_clips, clip_gradients, clip_settings, moments_by_name, signal_fraction
+from .optim import calibrated_clips, clip_gradients, clip_settings, moments_by_name, signal_fraction, stale_clips
 from .losses import FORESIGHT_PARTS, AdvantageConfig, PPOConfig, foresight_loss, ppo_loss, search_loss, value_excess, weighted_mean
 from .constants import N_ACTION_TYPES, ActionType
 from .model import VALUE_PRIOR_GAIN, VALUE_PRIOR_KINDS, VALUE_PRIOR_STEP, build_model
@@ -182,6 +182,7 @@ class TrainConfig:
 	grad_clip_by_group: bool = True
 	grad_clip_calibration: int = 200
 	grad_clip_groups: tuple = ()
+	grad_clip_since: int = 0  # clips calibrated before this epoch are measured again (a deploy's recalibration; 0: kept)
 	# The critic on its own timescale (step 1, 2026-11-06; the user's OK above the 3e-5 cap for the value heads): the
 	# value heads' parameters (ValueHeads and the strengths' direct path into them, BATTLE_GROUPS "values") at
 	# learning_rate x this. No teacher or balancer here: the critic's one handicap was the shared rate
@@ -1106,6 +1107,9 @@ def train(config, resume=False):
 				shutil.copy2(baseline, out / baseline.name)
 		print(f"starting from {source} (epoch {state['epoch']})")
 	use_fused(optimizer)
+	if stale_clips(grad_clips, config.grad_clip_since):  # (a recalibration: config.grad_clip_since)
+		print(f"the gradient clips of update {grad_clips.get('version', '?')} measured again (grad_clip_since {config.grad_clip_since})", flush=True)
+		grad_clips, clip_samples = None, []
 	if clip_settings(config.grad_clip_groups):  # (the groups' clips by hand, over any calibrated ones)
 		grad_clips = clip_settings(config.grad_clip_groups)
 	# (a run from another's checkpoint keeps its average only on a resume: a new run averages from its start)
@@ -1523,7 +1527,7 @@ def train(config, resume=False):
 			if config.grad_clip_by_group and grad_clips is None and read:
 				clip_samples = clip_samples + [step[: 1 + width] for step in read]
 				if len(clip_samples) >= config.grad_clip_calibration:
-					grad_clips = calibrated_clips(clip_samples, BATTLE_GROUPS)
+					grad_clips = {**calibrated_clips(clip_samples, BATTLE_GROUPS), "version": epoch}
 					print(f"update {epoch}: the gradient clipped by group from the next update, at the medians of {len(clip_samples)} steps' norms: " + "  ".join(f"{name} {grad_clips[name]:.4g}" for name in BATTLE_GROUPS) + f"; all then x {config.grad_clip} / {grad_clips['typical']:.4g} (the total's median)", flush=True)
 			fractions = signal_fraction(optimizer)
 			optimizer_columns = {

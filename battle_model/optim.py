@@ -67,6 +67,12 @@ def calibrated_clips(samples, names):
 	return {"typical": float(np.median(columns[:, 0])), **{name: float(np.median(columns[:, 1 + i])) or float("inf") for i, name in enumerate(names)}}
 
 
+def stale_clips(clips, since):
+	"""Whether calibrated clips (their "version": the version or epoch they were measured at; none before 2026-11-06's
+	recalibration switch) are older than since (a config's grad_clip_since; 0: never stale)."""
+	return clips is not None and since > 0 and clips.get("version", 0) < since
+
+
 def clip_gradients(optimizer, grad_clip, clips=None, names=None):
 	"""The gradient's clip before an optimizer step, on the device (no sync). Returns the total norm before it, and each
 	group of names' (default: the optimizer's) norm before it and whether its clip bound, [len(names)] each, 0 for a

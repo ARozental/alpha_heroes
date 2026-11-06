@@ -41,7 +41,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from battle_model import play as battle_play
 from battle_model.device import use_fused
-from battle_model.optim import calibrated_clips, clip_settings
+from battle_model.optim import calibrated_clips, clip_settings, stale_clips
 from battle_model.inference import InferenceServer
 from battle_model.supply import trim_memory
 
@@ -193,6 +193,9 @@ class CampaignLearner:
 			migrate_subtypes(state, self.model)
 			self.model.load_state_dict(state["model"])
 			print(f"campaign: starting from {config.init_from}", flush=True)
+		if stale_clips(self.grad_clips, config.grad_clip_since):  # (a recalibration: config.grad_clip_since)
+			print(f"campaign: the gradient clips of v{self.grad_clips.get('version', '?')} measured again (grad_clip_since {config.grad_clip_since})", flush=True)
+			self.grad_clips, self.clip_samples = None, []
 		if clip_settings(config.grad_clip_groups, "campaign.grad_clip_groups"):  # (the groups' clips by hand, over any calibrated ones)
 			self.grad_clips = clip_settings(config.grad_clip_groups, "campaign.grad_clip_groups")
 		# The teacher (config.teacher_kl): a frozen imitation of Nullkiller2 whose KL the update adds
@@ -798,7 +801,7 @@ class CampaignLearner:
 		if metrics.get("value_unexplained", float("nan")) == metrics.get("value_unexplained", float("nan")):  # (train.ppo_update: not a column)
 			self.writer.add_scalar("eval/campaign_value_unexplained", metrics["value_unexplained"], self.version)
 		for name in ("value_corr", "value_spread", "label_spread", "gpu_anchor_mb", "update_seconds", "prepass_seconds", "wait_seconds", "sync_seconds", "cpu_share", "stopped_pass", "signal_ratio", "attributed_taken_share", "attributed_taken_mean", "attributed_own_std", "attributed_taken_std", "forward_seconds", "losses_seconds", "backward_seconds", "optimizer_seconds",
-				"value_learning_rate", "value_readout_rms", *(f"grad_norm_{g}" for g in GRAD_GROUPS), *(f"clip_bound_{g}" for g in GRAD_GROUPS)):
+				"value_learning_rate", "value_readout_rms", *(f"grad_norm_{g}" for g in GRAD_GROUPS), *(f"clip_bound_{g}" for g in GRAD_GROUPS), "kl_first", "kl_growth"):
 			if metrics.get(name, float("nan")) == metrics.get(name, float("nan")):
 				self.writer.add_scalar(f"campaign/{name}", metrics[name], self.version)
 		# docs/optimizer_plan.md's readings: the trust before its floor and average, the share of each group's gradient that
@@ -897,7 +900,7 @@ class CampaignLearner:
 			return
 		self.clip_samples = self.clip_samples + [[float(x) for x in step] for step in norms]
 		if len(self.clip_samples) >= self.config.grad_clip_calibration:
-			self.grad_clips = calibrated_clips(self.clip_samples, GRAD_GROUPS)
+			self.grad_clips = {**calibrated_clips(self.clip_samples, GRAD_GROUPS), "version": self.version}
 			print(f"campaign: the gradient clipped by group from the next update, at the medians of {len(self.clip_samples)} steps' norms: " + "  ".join(f"{name} {self.grad_clips[name]:.4g}" for name in GRAD_GROUPS) + f"; all then x {self.config.grad_clip} / {self.grad_clips['typical']:.4g} (the total's median)", flush=True)
 
 	def _note_gradients(self, metrics):

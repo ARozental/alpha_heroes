@@ -1052,6 +1052,7 @@ def ppo_update(
 			torch.cuda.empty_cache()
 	totals, steps, stopped, update_kl, recent = Counter(), 0, False, 0.0, deque(maxlen=KL_WINDOW)
 	step_norms, step_bound = [], []  # each step's gradient norms before the clip ([total, GRAD_GROUPS']) and which clips bound
+	kl_trace = []  # each step's KL before it, in order (the KL control's reading: kl_first, kl_growth)
 	full_windows = 0  # micro-batches stepped over every hero slot (more of our heroes than config.window_budget allows)
 	stopped_pass = 0  # the pass the KL control ended (0: none; b1, 2026-10-31: with passes=2, a second pass mostly cut short adds nothing)
 	model.train()
@@ -1162,6 +1163,7 @@ def ppo_update(
 			gpu_mb = max(gpu_mb, gpu_held(device))
 			steps += 1
 			recent.append(step["kl"])
+			kl_trace.append(step["kl"])
 			update_kl = float(np.mean(recent))  # the update's KL: the last KL_WINDOW minibatches', not one's
 			totals.update(step, grad_norm=grad_norm)
 			if config.target_kl and update_kl > 1.5 * kl_target:
@@ -1199,6 +1201,11 @@ def ppo_update(
 		end_step_error=end_step_error,
 		last_kl=update_kl,
 		kl_target=kl_target,
+		# (2026-11-06: the KL barely followed the rate, 2.5x less rate for 1.6x less KL) the first step's KL, before any
+		# step of this update (what the training forward differs from the anchor's by at the same weights:
+		# config.memory_steps' memory, its window budget), and its growth a step (a line through the steps' KLs)
+		kl_first=kl_trace[0] if kl_trace else float("nan"),
+		kl_growth=float(np.polyfit(np.arange(len(kl_trace)), kl_trace, 1)[0]) if len(kl_trace) > 2 else float("nan"),
 		unsound=int(unsound.sum()),
 		decisions=n,
 		value_fresh=value_fresh,

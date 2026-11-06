@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from battle_model.optim import calibrated_clips, clip_gradients, clip_settings, signal_fraction
+from battle_model.optim import calibrated_clips, clip_gradients, clip_settings, signal_fraction, stale_clips
 from campaign_model import constants as c
 from campaign_model.config import CampaignConfig
 from campaign_model.learner import CampaignLearner
@@ -217,6 +217,8 @@ def test_an_update_moves_the_value_heads_at_their_rate_and_reports_the_plans_rea
 	assert metrics["head_residual"]["share"] == pytest.approx(metrics["head_fresh"]["share"])  # (its first update: the batch's)
 	assert metrics["head_var_slow"]["share"] == pytest.approx(metrics["head_var"]["share"])
 	assert metrics["value_readout_rms"] > 0 and metrics["value_learning_rate"] == pytest.approx(1e-4)
+	assert metrics["kl_first"] == pytest.approx(0.0, abs=1e-6)  # (no step before the first: the anchor's weights, no memory unrolled here)
+	assert steps < 3 or np.isfinite(metrics["kl_growth"])
 	import dataclasses
 
 	advised = [dataclasses.replace(d, advice=(d.action_type, d.index, d.cell)) for d in decisions]  # (a teacher's pull: the inflation's case)
@@ -287,6 +289,9 @@ def test_the_clips_calibrate_once_and_stay():
 	assert one.grad_clips["typical"] == 11.0 and one.grad_clips["trunk"] == 0.4 and one.grad_clips["type"] == float("inf")
 	one._calibrate_clips({"grad_norms": [[100.0] * 6] * 10})
 	assert one.grad_clips["typical"] == 11.0  # (kept: re-measured at a deploy only)
+	assert one.grad_clips["version"] == one.version
+	assert not stale_clips(one.grad_clips, 0) and not stale_clips(one.grad_clips, one.version) and stale_clips(one.grad_clips, one.version + 1)
+	assert stale_clips({"typical": 1.0}, 5) and not stale_clips(None, 5)  # (clips of before the switch: version 0)
 	off = learner(CampaignConfig(grad_clip_by_group=False, grad_clip_calibration=1))
 	off._calibrate_clips({"grad_norms": [[1.0] * 6]})
 	assert off.grad_clips is None and off.clip_samples == []
