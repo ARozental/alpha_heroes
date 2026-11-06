@@ -233,6 +233,11 @@ def test_the_fresh_value_loss_is_zero_only_for_exact_predictions():
 	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
 	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, np.zeros(8, np.float32), CampaignConfig(batch_size=4, passes=1), decode=decode, growth=growth)
 	assert np.isfinite(metrics["value_fresh"]) and metrics["value_fresh"] > 0
+	assert np.isnan(metrics["value_unexplained"])  # (targets all alike: the batch's mean guesses them exactly)
+	# Targets that differ: the heads' loss over the batch-mean guess's, finite and positive (an untrained head: ~1 or more)
+	spread = np.random.default_rng(3).uniform(0.1, 0.9, (8, c.N_VALUE_OFFSETS)).astype(np.float32)
+	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, spread, np.zeros(8, np.float32), CampaignConfig(batch_size=4, passes=1), decode=decode, growth=growth)
+	assert np.isfinite(metrics["value_unexplained"]) and 0.0 < metrics["value_unexplained"] < 100.0
 
 
 def test_the_teachers_kl_is_zero_against_itself_and_positive_against_another_model():

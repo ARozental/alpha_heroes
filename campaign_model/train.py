@@ -872,6 +872,13 @@ def ppo_update(
 			torch.cuda.synchronize(device)
 		clock["prepass"] = time.perf_counter() - prepass_started
 	masked = lambda x, valid: ((x * valid).sum(dim=0) / valid.sum(dim=0).clamp(min=1)).sum()
+	# The share heads' fresh loss over a constant guess's, each head's mean target in this batch (a head that knew nothing
+	# but the batch): 1 is no fit at all. value_fresh's jumps that come with the targets' spread (v1265-1266, 2026-11-05:
+	# a batch of lopsided games) leave it flat, a worse fit does not (TensorBoard eval/campaign_value_unexplained)
+	share_mean = (targets_t * share_valid).sum(dim=0) / share_valid.sum(dim=0).clamp(min=1)
+	guess = torch.logit(share_mean.clamp(1e-4, 1 - 1e-4)).expand_as(targets_t)
+	baseline = float(masked(excess_loss(guess, targets_t), share_valid))
+	value_unexplained = float(masked(fresh["share"], share_valid)) / baseline if baseline > 1e-6 else float("nan")  # (nan: targets all alike)
 	value_fresh, heads = masked(fresh["share"], share_valid), float(c.N_VALUE_OFFSETS)
 	if growth is not None:
 		value_fresh, heads = value_fresh + config.growth_weight * masked(fresh["growth"], growth_valid), heads + config.growth_weight * c.N_VALUE_OFFSETS
@@ -1095,6 +1102,7 @@ def ppo_update(
 		unsound=int(unsound.sum()),
 		decisions=n,
 		value_fresh=value_fresh,
+		value_unexplained=value_unexplained,
 		learning_rate=config.learning_rate * lr_scale,
 		credited=int(credited.sum()),
 		gpu_mb=gpu_mb,
