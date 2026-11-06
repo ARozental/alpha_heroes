@@ -753,7 +753,7 @@ class CampaignModelV2(nn.Module):
 		options = known.trade_options  # [B, R, R, F, 2]: the gold of worth lost, unlocks
 		read = torch.stack([torch.log1p(options[..., 0] / 1000.0), options[..., 1]], dim=-1)  # (the learned part's reading: log(1 + cost / 1000))
 		learned[A_.TRADE] = self.trade_head(state.glob).reshape(b, R, R, c.N_TRADE_AMOUNTS) + self.nk2_trade(needs) + self.trade_option(read).squeeze(-1)
-		prior[A_.TRADE] = -trade_cost * ft.value_logit(options[..., 0])  # (the charge a purchase trading for itself pays: no route cheaper)
+		prior[A_.TRADE] = -trade_cost * ft.value_logit(options[..., 0]) - self.features.trade_waste_weight() * (1.0 - options[..., 1])  # (the charge a purchase trading for itself pays: no route cheaper; a trade unlocking nothing more)
 		offers[A_.TRADE] = best_legal(prior[A_.TRADE], x["trade_mask"])
 		learned[A_.CAST] = self.cast_q(own_heroes) @ self.spell.weight.t() / math.sqrt(d)
 		prior[A_.CAST] = torch.zeros_like(learned[A_.CAST])

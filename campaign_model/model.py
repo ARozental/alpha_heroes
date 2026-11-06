@@ -282,6 +282,8 @@ class CustomFeatures(nn.Module):
 		self.gather_risk = zeros()  # (2026-11-05: how far a GATHER's risk to its town counts; gather_risk_weight)
 		self.gather_cost = zeros()  # (2026-11-05: what a GATHER into a scout loses; gather_cost_weight)
 		self.disband_cost = zeros()  # (2026-11-05: what a DROP that disbands loses; disband_cost_weight)
+		self.drop_scale, self.drop_sign = zeros(), zeros()  # (2026-11-05: a DROP's gain as a share of its hero's army; drop_weights)
+		self.trade_waste = zeros()  # (2026-11-05: a TRADE that unlocks no purchase; trade_waste_weight)
 		self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight = zeros(), zeros(), zeros(), zeros()
 		self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight = (zeros() for _ in range(6))
 		self.travel_exponent, self.end_coupling, self.travel_coupling = zeros(), zeros(), zeros()
@@ -309,7 +311,7 @@ class CustomFeatures(nn.Module):
 		return [
 			self.object_gain, self.object_type_gain.weight, self.object_type_delta.weight, self.object_subtype_delta.weight,
 			self.fight_sharpness, self.enemy_value, self.hero_value, self.danger_gain, self.meeting_gain, self.explore_gain, self.class_gain, self.travel_exponent,
-			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost, self.multi_weight, self.give_all_cost, self.gather_risk, self.gather_cost, self.disband_cost,
+			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost, self.multi_weight, self.give_all_cost, self.gather_risk, self.gather_cost, self.disband_cost, self.drop_scale, self.drop_sign, self.trade_waste,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
@@ -390,6 +392,12 @@ class CustomFeatures(nn.Module):
 		charge, TRADE and then BUILD came 2 logits cheaper than BUILD alone, and TRADE rose from 4 to 23 a game, 61% of
 		them with nothing bought that day."""
 		return ft.bounded(self.trade_cost, 0.0, 2.0, 1.0, CORRECTION_STEP)
+
+	def trade_waste_weight(self):
+		"""What a TRADE that unlocks no purchase (features.trade_options: a building, a creature for hire or a hero for hire
+		we cannot pay for now and can after it) costs beside what it loses, in logits (5 at the start, 0..10; the user,
+		2026-11-05: any trade that is not part of a buy or a hire is suspect)."""
+		return ft.bounded(self.trade_waste, 0.0, 10.0, 5.0, CORRECTION_STEP)
 
 	def recruit_yes_weight(self):
 		"""What YES to a dwelling's "Would you like to recruit?" gains, in logits (4 at the start, 0..8): Nullkiller2 answers
@@ -727,6 +735,29 @@ class CustomFeatures(nn.Module):
 		19% of the hero's army each time (12k gold a game), twice v1188-v1192's; at 3 (444ebfc) 5 in 12 games."""
 		return ft.bounded(self.disband_cost, 0.0, 10.0, 6.0, CORRECTION_STEP)
 
+	def drop_weights(self):
+		"""DROP's prior over its gain as a share of its hero's army (drop_prior): (the share's weight, 20 at the start, 0..60:
+		a 5% gain +1 logit, a 20% loss -4; the gain's sign's weight for a disband, 6 at the start, 0..12: as the disband's
+		cost, so a disband that gains starts about neutral and one that loses at -12 or less). The user, 2026-11-05: a sign
+		and the share, each with a trainable weight, easy to learn, to kill dumb dismisses; a disband with a positive
+		value neutral, learned from real data."""
+		return ft.bounded(self.drop_scale, 0.0, 60.0, 20.0, CORRECTION_STEP), ft.bounded(self.drop_sign, 0.0, 12.0, 6.0, CORRECTION_STEP)
+
+	def drop_prior(self, x, f, gains):
+		"""DROP_SLOW's and DROP_FOREIGN's prior logits [B, HO, 2] from their gains (multi_gain, gold): the gain as a share of
+		the hero's army as Φ prices it led (features.led_values: what the drop loses, less what the rest wins in movement
+		and morale), in -1..1, at the share's weight; and a disband (no garrison takes the stacks: h_drop_kept) pays
+		disband_cost_weight and is pushed by its gain's sign at the sign's weight. At the start a disband that loses
+		anything costs 12 logits or more (a fifth of the army -16), one that wins 5% of the army +1, about neutral (another
+		hero would usually take the stacks better: learned from real data); a drop into a garrison its share's alone."""
+		army_c, army_n = x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO].float()
+		rest = x["h_morale"][:, :HO].float() - ft.make_up_morales(army_c, army_n, self)
+		led = ft.led_values(army_c, army_n, f.hero_multiplier, rest, self)  # [B, HO]
+		share = (gains / led.clamp(min=1.0).unsqueeze(-1)).clamp(-1.0, 1.0)  # [B, HO, 2]
+		disbands = 1.0 - x["h_drop_kept"][:, :HO].float()
+		scale, sign = self.drop_weights()
+		return scale * share + disbands * (sign * torch.sign(share) - self.disband_cost_weight())
+
 	def main_visitor(self, x, f):
 		"""Whether the hero visiting each town of ours is one of our main heroes [B, TO] (f.main: Nullkiller2's roles, by
 		fighting strength), 1 or 0 (0 where none visits)."""
@@ -737,17 +768,16 @@ class CustomFeatures(nn.Module):
 	def multi_prior(self, x, f):
 		"""MULTI's prior logits [B, TO, N_MULTI]: what each multi-action does to Φ (multi_gain) as value_logit prices it, at
 		multi_weight_value; the army sent to another than the strongest hero pays: a GIVE_ALL, TAKE_BEST or TAKE_BEST_FAST
-		to the weaker hero give_all_cost_weight, a GATHER into a scout gather_cost_weight; a DROP that disbands
-		disband_cost_weight."""
-		prior = self.multi_weight_value() * ft.value_logit(self.multi_gain(x, f))
+		to the weaker hero give_all_cost_weight, a GATHER into a scout gather_cost_weight. DROP's its own (drop_prior)."""
+		gains = self.multi_gain(x, f)
+		prior = self.multi_weight_value() * ft.value_logit(gains)
+		drops = (c.MultiKind.DROP_SLOW, c.MultiKind.DROP_FOREIGN)
+		prior[:, :HO, list(drops)] = self.drop_prior(x, f, gains[:, :HO, list(drops)])  # (DROP rows are our heroes)
 		cost = torch.zeros_like(prior)
 		weaker = (1.0 - self.stronger_receiver(x, f)) * self.give_all_cost_weight()
 		for kind in (c.MultiKind.GIVE_ALL, c.MultiKind.TAKE_BEST, c.MultiKind.TAKE_BEST_FAST):
 			cost[:, :2, kind] = weaker
 		cost[..., c.MultiKind.GATHER] = (1.0 - self.main_visitor(x, f)) * self.gather_cost_weight()
-		disbands = (~x["h_drop_kept"][:, :HO]).float() * self.disband_cost_weight()  # [B, HO, 2]: (DROP rows are our heroes)
-		cost[:, :HO, c.MultiKind.DROP_SLOW] = disbands[..., 0]
-		cost[:, :HO, c.MultiKind.DROP_FOREIGN] = disbands[..., 1]
 		return prior - cost
 
 	def artifact_prior(self, x, f):
@@ -1357,7 +1387,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,

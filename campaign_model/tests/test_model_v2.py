@@ -827,7 +827,7 @@ def test_a_trade_unlocks_a_building_only_if_it_buys_its_last_missing_resource_an
 	creatures[0, GOLD], creatures[0, 5] = 3000, 1  # an Angel: 3,000 gold and a gem
 	t = SimpleNamespace(resource_price=torch.tensor([250.0, 500, 250, 500, 500, 500, 1]), building_resources=tables, creature_resources=creatures)
 	x = {"g_markets": torch.tensor([1]), "g_resources": torch.zeros(1, R, dtype=torch.long), "t_faction": torch.full((1, c.N_TOWNS), -1), "build_short": torch.zeros(1, c.OWN_TOWNS, c.N_BUILDINGS, dtype=torch.bool),
-		"t_available_creature": torch.full((1, c.N_TOWNS, c.N_LEVELS), -1), "t_available": torch.zeros(1, c.N_TOWNS, c.N_LEVELS, dtype=torch.long)}
+		"t_available_creature": torch.full((1, c.N_TOWNS, c.N_LEVELS), -1), "t_available": torch.zeros(1, c.N_TOWNS, c.N_LEVELS, dtype=torch.long), "g_tavern": torch.full((1, c.N_TAVERN), -1)}
 	x["g_resources"][0, WOOD] = 30
 	x["t_faction"][0, 0] = 0
 	x["build_short"][0, 0, 5] = True
@@ -844,6 +844,13 @@ def test_a_trade_unlocks_a_building_only_if_it_buys_its_last_missing_resource_an
 	x["t_available_creature"][0, 0, 6], x["t_available"][0, 0, 6] = 0, 2
 	options = ft.trade_options(x, t)[0]
 	assert options[WOOD, 5, :, 1].tolist() == [1.0] * F and float(options[..., 1].sum()) == F
+	# a hero for hire in our tavern with 2,000 gold: selling 30 wood (25 gold each) unlocks it, a tenth of it not (2026-11-05)
+	x["t_available"][0, 0, 6], x["g_resources"][0, GOLD] = 0, 2000
+	x["g_tavern"][0, 0] = 3
+	options = ft.trade_options(x, t)[0]
+	assert options[WOOD, GOLD, -1, 1] == 1.0 and options[WOOD, GOLD, 0, 1] == 0.0 and options[WOOD, CRYSTAL, :, 1].sum() == 0.0
+	x["g_tavern"][0, 0] = -1
+	assert float(ft.trade_options(x, t)[0, ..., 1].sum()) == 0.0
 
 
 # ---- 2026-11-04: garrisons, a question's battle and join (schema 11) ----
@@ -1640,14 +1647,25 @@ def test_a_take_best_and_a_drop_are_priced_on_the_armies_they_make():
 	assert kept == pytest.approx(angels - both + t.unled_share * dwarves, rel=1e-4) and kept > 0  # (faster, +1 morale)
 	assert disbanded == pytest.approx(angels - both, rel=1e-4) and disbanded < kept
 	assert take == pytest.approx(0.0, abs=1e-2)  # (the armies as they were)
-	# Its prior: a DROP that disbands pays disband_cost_weight (6) beside its gain; one a garrison takes does not
+	# Its prior (drop_prior): the gain as a share of the hero's army at its weight (20); a disband also pays
+	# disband_cost_weight (6) and its gain's sign at the sign's weight (2); a drop into a garrison its share's alone
 	with torch.no_grad():
 		lost = float(t.multi_prior(x, known)[0, 0, K.DROP_SLOW])
 		x["h_drop_kept"][0, 0, 0] = True
 		parked = float(t.multi_prior(x, known)[0, 0, K.DROP_SLOW])
-	assert float(t.disband_cost_weight()) == pytest.approx(6.0, abs=1e-5)
-	assert lost == pytest.approx(float(t.multi_weight_value() * ft.value_logit(torch.tensor(disbanded))) - 6.0, abs=1e-4)
-	assert parked == pytest.approx(float(t.multi_weight_value() * ft.value_logit(torch.tensor(kept))), abs=1e-4)
+	scale, sign = (float(w) for w in t.drop_weights())
+	assert (scale, sign, float(t.disband_cost_weight())) == (pytest.approx(20.0, abs=1e-4), pytest.approx(6.0, abs=1e-5), pytest.approx(6.0, abs=1e-5))
+	assert lost == pytest.approx(scale * disbanded / both + sign * math.copysign(1.0, disbanded) - 6.0, abs=1e-4)
+	assert parked == pytest.approx(scale * kept / both, abs=1e-4) and disbanded > 0 and lost == pytest.approx(scale * disbanded / both, abs=1e-4)  # (a gain: about neutral)
+	# disbanding the Angels instead (a loss of most of the army): -12 and its share, ~0 chance
+	x["h_drop"][0, 0, 0] = False
+	x["h_drop"][0, 0, 0, 0] = True
+	x["h_drop_kept"][0, 0, 0] = False
+	with torch.no_grad():
+		known = m.domain_knowledge(x)
+		angels_gone = float(t.multi_gain(x, known)[0, 0, K.DROP_SLOW])
+		killed = float(t.multi_prior(x, known)[0, 0, K.DROP_SLOW])
+	assert angels_gone < 0 and killed == pytest.approx(scale * angels_gone / both - 12.0, abs=1e-4) and killed < -20.0
 
 
 def test_a_gather_counts_what_it_leaves_its_town_to():

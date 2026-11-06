@@ -62,8 +62,9 @@ def mastery():
 
 # A unit that can shoot at full damage shoots: BattleAI's rule, as the type rules' prior (the user's learnable penalty for
 # idle shooters, 2026-11-05). DEFEND starts this much lower there (features.SHOT_TYPE_FEATURES' full_shot); every other
-# type rule starts at 0. In joint2 the 5% of shooter states where an idle type beat SHOOT were behind by up to ~1 logit
-IDLE_SHOT_BIAS = -2.0
+# type rule starts at 0. In joint2 the 5% of shooter states where an idle type beat SHOOT were behind by up to ~1 logit.
+# -2 first, -5 since the evening (the user: "maybe have -5 there just in case")
+IDLE_SHOT_BIAS = -5.0
 
 
 def type_rules(names):

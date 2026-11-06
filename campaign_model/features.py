@@ -895,7 +895,12 @@ def trade_options(x, t):
 	covers = have[:, None, :, None, None, None] + bought[..., None, None] >= need[:, None, :, None]  # [B, R, R, F, TO, NB]
 	keeps = have[:, :, None, None, None, None] - sold[..., None, None] >= need[:, :, None, None]
 	unlocks = (alone[:, None, :, None] & covers & keeps).flatten(4).any(dim=-1)  # [B, R, R, F]
-	return torch.stack([cost.clamp(min=0.0), unlocks.float()], dim=-1)
+	# or a hero for hire in a tavern of ours we cannot pay for now and can after it (2026-11-05: a trade that buys or hires)
+	gold = c.N_RESOURCES - 1
+	tavern = (x["g_tavern"] >= 0).any(dim=1)  # [B]
+	gold_after = have[:, gold, None, None, None] + bought * (torch.arange(c.N_RESOURCES, device=have.device) == gold)[None, None, :, None] - sold * (torch.arange(c.N_RESOURCES, device=have.device) == gold)[None, :, None, None]
+	hires = (tavern & (have[:, gold] < HERO_GOLD_COST))[:, None, None, None] & (gold_after >= HERO_GOLD_COST)
+	return torch.stack([cost.clamp(min=0.0), (unlocks | hires).float()], dim=-1)
 
 
 def area_index(x, pos):
