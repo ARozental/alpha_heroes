@@ -99,7 +99,10 @@ def test_the_kl_control_stops_an_update_that_moves_too_far():
 
 
 def test_a_teachers_weight_widens_the_kl_target_by_one_plus_it():
-	"""An update with Nullkiller2's advice at teacher_weight w may move (1 + w) x target_kl: its pull is supervised."""
+	"""With config.kl_teacher_inflation (as until 2026-11-06), an update with Nullkiller2's advice at teacher_weight w may
+	move (1 + w) x target_kl: its pull is supervised. Without (the default since): target_kl, the actor on the slow
+	timescale (docs/optimizer_plan.md step 2)."""
+	import copy
 	import dataclasses
 
 	torch.manual_seed(3)
@@ -109,7 +112,10 @@ def test_a_teachers_weight_widens_the_kl_target_by_one_plus_it():
 	targets = np.full((16, c.N_VALUE_OFFSETS), 0.5, dtype=np.float32)
 	returns = np.linspace(-1, 1, 16).astype(np.float32)
 	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
-	config = CampaignConfig(batch_size=4, passes=20, learning_rate=0.05, target_kl=1e-4)
+	default = CampaignConfig(batch_size=4, passes=1, learning_rate=0.05, target_kl=1e-4)
+	metrics, _ = ppo_update(copy.deepcopy(model), torch.optim.Adam(model.parameters()), decisions, targets, returns, default, decode=decode, teacher_weight=19.0)
+	assert metrics["kl_target"] == pytest.approx(1e-4)
+	config = CampaignConfig(batch_size=4, passes=20, learning_rate=0.05, target_kl=1e-4, kl_teacher_inflation=True)
 	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters()), decisions, targets, returns, config, decode=decode, teacher_weight=19.0)
 	assert metrics["kl_target"] == pytest.approx(20 * 1e-4)
 	assert not metrics["stopped"] or metrics["last_kl"] > 1.5 * 20 * 1e-4  # (stopped only past the wider target)

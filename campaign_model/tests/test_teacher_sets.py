@@ -200,7 +200,7 @@ def test_an_update_with_the_teachers_sets_and_the_loss_shares_runs():
 	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, np.full((n, c.N_VALUE_OFFSETS), 0.5, np.float32), np.zeros(n, np.float32), CampaignConfig(batch_size=4, passes=1, model_architecture="v2"), decode=lambda rows: {k: v[rows] for k, v in x.items()}, teacher_weight=2.0, teacher_sets=(types, indices, valid), loss_weights={"value": 3.0, "foresight": 0.5, "kl_teacher": 1.5})
 	assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters()))
 	assert all(math.isfinite(float(p.detach().sum())) for p in model.parameters())
-	assert metrics["kl_target"] == pytest.approx(CampaignConfig().target_kl * 2.5) and math.isfinite(metrics["teacher_ce"])
+	assert metrics["kl_target"] == pytest.approx(CampaignConfig().target_kl) and math.isfinite(metrics["teacher_ce"])  # (no teacher inflation since 2026-11-06: config.kl_teacher_inflation)
 
 
 def test_the_teachers_label_is_weighed_against_its_family_and_end_only():

@@ -37,7 +37,23 @@ class CampaignConfig:
 	min_games_per_update: int = 4  # one game's decisions are alike: an update takes several games
 	max_record_age: int = 4  # model versions: older decisions are dropped
 	learning_rate: float = 1e-5  # at most 3e-5, 1e-5 recommended (the user's rule, 2026-10-31; was 1e-4)
+	# The critic on its own timescale (docs/optimizer_plan.md step 1, 2026-11-06; the user's OK for the value group above
+	# the 3e-5 cap, which was the policy's): the value heads' parameters (train.VALUE_MODULES) at learning_rate x this.
+	# Two-timescale actor-critic wants the critic the faster: at the policy's rate a label change took ~200 updates to
+	# re-fit and the readouts' rms was 0.006-0.012 after 1,300 updates
+	value_lr_factor: float = 10.0
+	# The KL control's lr_scale scales the value group too (the plan's wording). False: the critic's rate is its own. Its
+	# parameters never move the policy, so the policy's KL is no reason to slow them, and a KL target cut 4x (step 2)
+	# would have cut the critic's rate with the policy's
+	value_lr_kl: bool = False
+	# The trunk's momentum (step 5): Adam's beta1 for the groups that are not the value heads' or the corrections'
+	# (trunk, embeddings, type). For pure noise Adam steps |m| / sqrt(v) ~ sqrt((1 - beta1) / (1 + beta1)): 0.23 at 0.9,
+	# 0.16 at 0.95, at full size whatever the signal; the campaign's median ratio was 0.17-0.26
+	trunk_beta1: float = 0.95
 	target_kl: float = 0.015
+	# The KL target inflated by the teacher's share against the policy's (1 + kl_teacher: 0.015 x 4 = 0.06 at the 60%
+	# teacher share). False since 2026-11-06 (step 2): the target is target_kl, the actor on the slow timescale
+	kl_teacher_inflation: bool = False
 	lr_scale_max: float = 1.0
 	passes: int = 2
 	batch_size: int = 256
@@ -67,6 +83,16 @@ class CampaignConfig:
 	entropy_floor: float = 0.3
 	entropy_floor_weight: float = 0.1
 	grad_clip: float = 0.5
+	# Clipping by parameter group (step 6; train.GRAD_GROUPS, train.clip_gradients): each group's gradient clipped at its own
+	# median norm, so a spike in one (the corrections' x10 step, the value heads' ~350 weight) no longer shrinks the
+	# others' on that step, then every group times grad_clip / the median total norm: the scale Adam's moments were
+	# built at (the one clip at grad_clip always bound, the norm ~10; clipped at their own medians the trunk's gradients
+	# would be ~25x larger at once, and with a second moment ~1,000 steps slow its steps up to ~6x their size for hours).
+	# The medians are the first grad_clip_calibration optimizer steps' (the one clip meanwhile), kept in the checkpoint;
+	# grad_clip_groups ("trunk:0.4,value:9,...") sets them by hand instead. False: the one clip at grad_clip
+	grad_clip_by_group: bool = True
+	grad_clip_calibration: int = 200
+	grad_clip_groups: tuple = ()
 	# AdamW weight decay of the prior corrections (train.make_optimizer; model.CORRECTION_STEP 10): under a steady push a
 	# correction settles at ~CORRECTION_STEP / prior_decay = 2 (a log-gain of 2 is the x5 bound; +2 logits), under noise
 	# near 0; left alone it halves in ~1,400 steps (lr 1e-4: 5e-4 a step), ~45 minutes of joint1's updates
@@ -98,6 +124,11 @@ class CampaignConfig:
 	outcome_share_min: float = 0.25
 	myopic_weight: float = 0.5
 	trust_full_ev: float = 0.4
+	# Trust as a floored slow average (step 4; learner.trust): max(trust_floor, its exponential average at trust_memory a
+	# update, ~50 updates), not today's value: a re-fit (a label or a Φ change) cut it 0.40 -> 0.25 and the credit went
+	# three quarters Monte Carlo, slowing the re-fit's own signal. 0 and 0: today's value, as before
+	trust_floor: float = 0.4
+	trust_memory: float = 0.98
 	# The end head's credit (labels.end_advantages): the policy's advantage is (1 - b) x the 7-day one + b x the end
 	# one, b = end_credit_max x the trust in V_end (its explained variance at the day starts over the share prior's,
 	# 1 / players, smoothed, over trust_full_ev): while V_end predicts the end no better than the player count does,
@@ -141,6 +172,11 @@ class CampaignConfig:
 	# kept, ramped in over HEAD_SCALE_RAMP updates): V_end's loss at a constant prediction was 35-100x a share-change
 	# head's (2026-11-02)
 	head_scale: bool = False
+	# What head_scale weighs each head by (step 7, 2026-11-06): "residual", 1 / the running mean of its fresh excess loss
+	# (train.head_weights' residuals; the heads that learn get more of the shared layers, the ones whose residual is large
+	# less), ramped in over HEAD_SCALE_RAMP updates from the variance's weights; "variance", 1 / its targets' running
+	# variance (swung with the batch's label spread: the share weights 6 to 9.8 update to update)
+	head_scale_by: str = "residual"
 	# The teacher's KL (AlphaStar's KL to its supervised policy, 2026-10-31: 1,020 -> 1,400 Elo in its ablation): each
 	# decision's KL(teacher || model) over the action type and each type's table (train.teacher_kl), at this weight in
 	# the loss, the teacher a frozen imitation of Nullkiller2 (imitate.py's bc_latest.pt: teacher_checkpoint). It keeps
@@ -172,6 +208,10 @@ class CampaignConfig:
 	# shared layers (GradNorm's balance in closed form) so the terms get their shares (learner.loss_shares); off: the
 	# teacher at its weight (teacher_mix), the others at 1
 	loss_shares: bool = False
+	# The loss shares' weights frozen from this version on (step 3; 0: never): measured and logged still, no longer moved.
+	# The balancer gave the policy's mostly-noise gradient (noise scale 300-6,000 decisions, at 4,096 a step) its share by
+	# norm, and moved with the trust and the KL control on one ~10-update time constant through 19 restarts in 19.5 hours
+	loss_shares_freeze: int = 0
 	label_weights: tuple = (1 / 3, 1 / 3, 1 / 3)  # of the shares at VALUE_OFFSETS (labels.py)
 	decision_price: float = 1e-4  # share points per turn decision
 	# Evaluation against Nullkiller2 (evaluate.py): our models in one seat, Nullkiller2 in the others

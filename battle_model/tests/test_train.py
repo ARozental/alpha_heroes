@@ -109,3 +109,40 @@ def test_campaign_permits_keep_games_playing_while_an_update_waits_and_runs():
 	supply = SimpleNamespace(campaign=learner, shared=shared, received=0, game_decisions=12_000.0, config=SimpleNamespace(ahead=3.0, campaign=SimpleNamespace(decisions_per_update=32768, min_games_per_update=20)))
 	Supply.allow(supply)
 	assert shared.permits.value == 40  # (3 updates of 20 games, one of them in)
+
+
+def test_the_battle_optimizers_groups_and_a_one_group_checkpoint():
+	"""docs/optimizer_plan.md's battle side: make_optimizer's named groups (the value heads and the strengths' direct path
+	into them at value_lr_factor x the rate, the prior-initialised rules apart, the trunk the rest), each parameter in
+	one; a checkpoint of before 2026-11-06 (one unnamed group) resumes into them with every moment by name, at the
+	config's settings; the KL control's scale moves the policy's groups, not the values'."""
+	import torch
+
+	from battle_model.model import BattleModel
+	from battle_model.train import BATTLE_GROUPS, TrainConfig, battle_group_lr, load_optimizer, make_optimizer
+
+	torch.manual_seed(0)
+	model = BattleModel(dim=32, layers=1)
+	config = TrainConfig(learning_rate=1e-5, value_lr_factor=10.0, adam_beta2=0.99)
+	optimizer = make_optimizer(model, config)
+	groups = {g["name"]: g for g in optimizer.param_groups}
+	assert list(groups) == list(BATTLE_GROUPS)
+	assert sum(len(g["params"]) for g in optimizer.param_groups) == len(list(model.parameters()))
+	assert set(groups["values"]["param_names"]) == {n for n, _ in model.named_parameters() if n.startswith(("values.", "value_strength."))}
+	assert {"actions.value_gains", "actions.type_rules.weight", "actions.rules.move.linear"} <= set(groups["priors"]["param_names"])
+	assert groups["values"]["lr"] == 1e-4 and groups["trunk"]["lr"] == 1e-5 and all(g["betas"] == (0.9, 0.99) for g in optimizer.param_groups)
+	assert battle_group_lr(groups["values"], config, 0.3, 0.5) == 5e-5 and battle_group_lr(groups["trunk"], config, 0.3, 0.5) == 1e-5 * 0.3 * 0.5
+	old = torch.optim.Adam(model.parameters(), lr=1e-5)  # (the one group of before)
+	for _ in range(2):
+		for p in model.parameters():
+			p.grad = torch.randn_like(p)
+		old.step()
+	fresh = make_optimizer(model, config)
+	load_optimizer(fresh, model, {"model": model.state_dict(), "optimizer": old.state_dict()})
+	for p in model.parameters():
+		assert torch.equal(fresh.state[p]["exp_avg"], old.state[p]["exp_avg"]) and torch.equal(fresh.state[p]["step"], old.state[p]["step"])
+	assert [(g["name"], g["lr"], g["betas"]) for g in fresh.param_groups] == [(g["name"], g["lr"], g["betas"]) for g in optimizer.param_groups]
+	again = make_optimizer(model, config)  # (and today's named checkpoint round-trips)
+	load_optimizer(again, model, {"model": model.state_dict(), "optimizer": fresh.state_dict()})
+	for p in model.parameters():
+		assert torch.equal(again.state[p]["exp_avg_sq"], old.state[p]["exp_avg_sq"])

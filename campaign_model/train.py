@@ -5,8 +5,8 @@
 PPO as the battle model's (battle_model/train.py): the clipped surrogate on advantages normalized over the update,
 passes over minibatches of fixed size, the KL control (an update stops once its KL from the policy at its start passes
 1.5 x target_kl, and the rate's scale is cut by 1.5, or raised back by 1.5 after an update that ended under half of it,
-never above lr_scale_max: the user's rule, never above 3e-5; with a teacher, its advice or its KL at teacher_weight
-against PPO's 1, the target is (1 + teacher_weight) x target_kl: kl_target). Entropy: a floor, not a bonus (battle_model/losses.py's
+never above lr_scale_max: the user's rule, never above 3e-5; with a teacher and config.kl_teacher_inflation, the
+target is (1 + its share against PPO's) x target_kl, as until 2026-11-06). Entropy: a floor, not a bonus (battle_model/losses.py's
 lesson of 2026-10-28: a constant bonus is a consistent push that beats a noise-level policy gradient), with the
 parents' probabilities detached (a type's table entropy weighs by p(type), which gets no gradient from it:
 test_entropy_bonus_does_not_favour_types_with_many_options). The value heads are trained with cross-entropy (the
@@ -15,7 +15,9 @@ their grades (labels.ladder_targets: the shares VALUE_OFFSETS days on, the longe
 ones' later forecasts), and the growth heads, at growth_weight each, against our own value's log growth on their 0..1
 scale (labels.growth_scale), and V_end, at a share head's weight, against its grades (labels.end_targets); a missing
 grade (nan: past the day cap) is left out, and so is a decision without credit from the policy's loss. The optimizer (make_optimizer) is Adam, with weight decay only on the
-corrections of the model's fixed priors (model.prior_corrections): back to the prior unless the games keep pushing.
+corrections of the model's fixed priors (model.prior_corrections): back to the prior unless the games keep pushing. Its
+groups (GRAD_GROUPS, docs/optimizer_plan.md): the value heads' at value_lr_factor x the rate (the critic on the fast
+timescale), the trunk's at trunk_beta1, each group's gradient clipped apart (clip_gradients).
 """
 import argparse
 import collections
@@ -35,6 +37,7 @@ import torch.nn.functional as F
 
 from battle_model import play as battle_play
 from battle_model.inference import InferenceServer
+from battle_model.optim import clip_gradients, moments_by_name, signal_fraction
 
 from . import constants as c
 from .config import CampaignConfig
@@ -292,16 +295,76 @@ def windows_for(rows, heroes, config):
 	return budget if 0 < budget < rows * c.OWN_HEROES and heroes <= budget else None
 
 
+# The parameter groups (docs/optimizer_plan.md, 2026-11-06), each an Adam group of its own: their gradient norms logged
+# (campaign/grad_norm_<group>), each clipped apart (clip_gradients), the value heads' at their own rate
+# (config.value_lr_factor), the trunk's, the embeddings' and the action types' bias at the trunk's momentum
+# (config.trunk_beta1)
+VALUE_MODULES = ("value_hidden", "value_heads", "growth_heads", "end_head")
+GRAD_GROUPS = ("trunk", "embeddings", "type", "value", "corrections")
+TRUNK_GROUPS = ("trunk", "embeddings", "type")
+
+
+def parameter_groups(model):
+	"""{group: [(name, parameter)]} over GRAD_GROUPS, each parameter in one, in the model's order: the prior corrections
+	(model.prior_corrections), the value heads' (VALUE_MODULES), every embedding table's (nn.Embedding), the action
+	types' bias (type_bias), the trunk the rest. A group may be empty (v1 has no value_hidden)."""
+	corrections = {id(p) for p in model.prior_corrections()}
+	value = {id(p) for name in VALUE_MODULES if isinstance(getattr(model, name, None), torch.nn.Module) for p in getattr(model, name).parameters()}
+	embeddings = {id(m.weight) for m in model.modules() if isinstance(m, torch.nn.Embedding)}
+	groups = {name: [] for name in GRAD_GROUPS}
+	for name, p in model.named_parameters():
+		group = "corrections" if id(p) in corrections else "value" if id(p) in value else "embeddings" if id(p) in embeddings else "type" if name == "type_bias" else "trunk"
+		groups[group].append((name, p))
+	return groups
+
+
+def group_lr(group, config, lr_scale=1.0):
+	"""An Adam group's rate: learning_rate x the KL control's lr_scale, the value heads' x value_lr_factor (and without
+	lr_scale unless config.value_lr_kl)."""
+	if group.get("name") == "value":
+		return config.learning_rate * config.value_lr_factor * (lr_scale if config.value_lr_kl else 1.0)
+	return config.learning_rate * lr_scale
+
+
+def group_settings(name, config):
+	"""A group's hyperparameters from the config (load_optimizer sets them again after a checkpoint's: its saved ones
+	would win): weight decay on the corrections alone, the trunk's beta1 for TRUNK_GROUPS."""
+	return {"name": name, "weight_decay": config.prior_decay if name == "corrections" else 0.0, "betas": (config.trunk_beta1 if name in TRUNK_GROUPS else 0.9, 0.999)}
+
+
 def make_optimizer(model, config=CampaignConfig()):
-	"""AdamW: no weight decay but on the corrections of the model's fixed priors (model.prior_corrections: the object
-	values' gains and deltas), decayed by config.prior_decay toward 0, the prior (the user, 2026-10-28: the
-	regularization penalizes the change from Nullkiller2's values). Adam moves a weight ~lr a step when its gradient is
-	consistent and the decay pulls lr x prior_decay x weight back, so a correction's weight settles near 1 / prior_decay
-	under a steady push (its effect: CORRECTION_STEP times that) and near 0 under noise."""
-	corrections = model.prior_corrections()
-	ids = {id(p) for p in corrections}
-	rest = [p for p in model.parameters() if id(p) not in ids]
-	return torch.optim.AdamW([{"params": rest, "weight_decay": 0.0}, {"params": corrections, "weight_decay": config.prior_decay}], lr=config.learning_rate)
+	"""AdamW over parameter_groups' groups, each named (its "name") with its parameters' names (torch's "param_names", which
+	the checkpoint keeps: load_optimizer matches moments by them). No weight decay but on the corrections of the model's
+	fixed priors (model.prior_corrections: the object values' gains and deltas), decayed by config.prior_decay toward 0,
+	the prior (the user, 2026-10-28: the regularization penalizes the change from Nullkiller2's values). Adam moves a
+	weight ~lr a step when its gradient is consistent and the decay pulls lr x prior_decay x weight back, so a
+	correction's weight settles near 1 / prior_decay under a steady push (its effect: CORRECTION_STEP times that) and
+	near 0 under noise."""
+	groups = [{"params": params, **group_settings(name, config)} for name, params in parameter_groups(model).items() if params]
+	optimizer = torch.optim.AdamW(groups, lr=config.learning_rate)
+	for group in optimizer.param_groups:
+		group["lr"] = group_lr(group, config)
+	return optimizer
+
+
+def saved_parameter_names(saved, model, saved_keys):
+	"""The names of a saved optimizer's parameters, in its numbering (its groups' order). Its groups' "param_names" since
+	2026-11-06; before, two groups: the rest as the checkpoint's state_dict lists them but its buffers, the corrections
+	as ours (prior_corrections' list: a new one takes its place in it)."""
+	if all("param_names" in group for group in saved["param_groups"]):
+		if any(len(group["param_names"]) != len(group["params"]) for group in saved["param_groups"]):
+			raise ValueError("the checkpoint's optimizer groups name a different number of parameters than they hold")
+		return [name for group in saved["param_groups"] for name in group["param_names"]]
+	names = {id(p): name for name, p in model.named_parameters()}
+	corrections = [names[id(p)] for p in model.prior_corrections()]
+	present, buffers, skip = set(saved_keys), {name for name, _ in model.named_buffers()}, set(corrections)
+	orders = [[key for key in saved_keys if key not in buffers and key not in skip], [name for name in corrections if name in present]]
+	if len(saved["param_groups"]) != len(orders):
+		raise ValueError(f"the checkpoint's optimizer has {len(saved['param_groups'])} groups and no parameter names (2 expected)")
+	for order, group in zip(orders, saved["param_groups"]):
+		if len(order) != len(group["params"]):
+			raise ValueError(f"the checkpoint's optimizer group has {len(group['params'])} parameters, its model {len(order)}")
+	return [name for order in orders for name in order]
 
 
 def migrate_subtypes(state, model):
@@ -317,12 +380,13 @@ def migrate_subtypes(state, model):
 	if not names:
 		return []
 	saved = state.get("optimizer")
-	index = {}  # a parameter's key in the optimizer's state: its place in make_optimizer's groups
+	index = {}  # a parameter's key in the optimizer's state: its place in the saved optimizer's groups
 	if saved:
-		corrections = model.prior_corrections()
-		ids, by_id = {id(p) for p in corrections}, {id(p): n for n, p in model.named_parameters()}
-		order = [by_id[id(p)] for p in model.parameters() if id(p) not in ids] + [by_id[id(p)] for p in corrections]
 		flat = [i for group in saved["param_groups"] for i in group["params"]]
+		try:
+			order = saved_parameter_names(saved, model, state["model"].keys())
+		except ValueError:
+			order = []
 		if len(flat) == len(order):
 			index = dict(zip(order, flat))
 	pairs = list(c.OBJECT_PAIRS.items())
@@ -356,37 +420,17 @@ def migrate_subtypes(state, model):
 
 def load_optimizer(optimizer, model, saved, saved_keys):
 	"""The optimizer's state from a checkpoint (saved: its state_dict; saved_keys: its model's state_dict keys, in their
-	order). Adam's moments follow their parameters by name within make_optimizer's groups: a model that has gained
-	parameters since (schema 7: hire_worth) starts the new ones fresh, one that has lost some (2026-11-04: the question
-	head's option_q, answer_fight, answer_join) drops theirs. The checkpoint's order in each group: the corrections' as
-	ours (prior_corrections' list: a new one takes its place in it), the rest's as its state_dict lists them but our
-	buffers (state_dict lists a module's parameters as named_parameters does)."""
-	names = {id(p): name for name, p in model.named_parameters()}
-	groups = [[names[id(p)] for p in group["params"]] for group in optimizer.param_groups]
-	saved_keys = list(saved_keys)
-	present, buffers, corrections = set(saved_keys), {name for name, _ in model.named_buffers()}, set(groups[1])
-	orders = [[key for key in saved_keys if key not in buffers and key not in corrections], [name for name in groups[1] if name in present]]
-	if groups == orders:
-		optimizer.load_state_dict(saved)
-		fit_moments(optimizer, model)
-		return
-	state, param_groups, index = {}, [], 0
-	for group, order, saved_group in zip(groups, orders, saved["param_groups"]):
-		if len(order) != len(saved_group["params"]):
-			raise ValueError(f"the checkpoint's optimizer group has {len(saved_group['params'])} parameters, its model {len(order)}")
-		old = dict(zip(order, saved_group["params"]))
-		ids = []
-		for name in group:
-			if name in old and old[name] in saved["state"]:
-				state[index] = saved["state"][old[name]]
-			ids.append(index)
-			index += 1
-		param_groups.append({**saved_group, "params": ids})
-	optimizer.load_state_dict({"state": state, "param_groups": param_groups})
+	order). Adam's moments follow their parameters by name (saved_parameter_names) into whatever group make_optimizer
+	puts them now (2026-11-06: two groups became GRAD_GROUPS' five): a model that has gained parameters since (schema 7:
+	hire_worth) starts the new ones fresh, one that has lost some (2026-11-04: the question head's option_q,
+	answer_fight, answer_join) drops theirs. The groups' hyperparameters stay the optimizer's, the config's (the
+	checkpoint's would win in load_state_dict: a changed prior_decay or beta1 never applied to a resumed run)."""
+	saved_names = saved_parameter_names(saved, model, list(saved_keys))
+	fresh, gone = moments_by_name(optimizer, model, saved, saved_names)
 	fit_moments(optimizer, model)
-	fresh = [name for group in groups for name in group if name not in present]
-	gone = [name for order in orders for name in order if name not in set(names.values())]
-	print(f"campaign optimizer: Adam's moments kept, fresh for the new parameters: {', '.join(fresh) or 'none'}; dropped for the gone: {', '.join(gone) or 'none'}", flush=True)
+	moved = sorted({group.get("name", "?") for group in optimizer.param_groups} - {group.get("name", "?") for group in saved["param_groups"]})
+	if fresh or gone or moved:
+		print(f"campaign optimizer: Adam's moments kept by name{' (new groups: ' + ', '.join(moved) + ')' if moved else ''}, fresh for the new parameters: {', '.join(fresh) or 'none'}; dropped for the gone: {', '.join(gone) or 'none'}", flush=True)
 
 
 def fit_moments(optimizer, model):
@@ -457,27 +501,55 @@ def head_loss(logits, targets, valid, count=None):
 HEAD_SCALE_EPS = 1e-4  # (config.head_scale) a head's target variance floor, on its 0..1 scale (a spread of 0.01)
 HEAD_SCALE_RAMP = 20  # updates over which the heads' weights go from 1 (and growth_weight) to head_weights' (Adam's second moments adapt over ~1,000 steps)
 HEAD_SCALE_MEMORY = 0.8  # the running variance's share of the old estimate at each update
+# (config.head_scale_by "residual") each head's fresh excess loss, averaged at this memory an update (the plan's 0.9),
+# floored at HEAD_RESIDUAL_EPS (the share-change heads' ~5e-4); the variances that scale the weights to the old total
+# at a slower memory: at 0.8 the total, V_end's spread most of it, swung every head's weight with the batch
+HEAD_RESIDUAL_MEMORY = 0.9
+HEAD_RESIDUAL_EPS = 1e-5
+HEAD_SCALE_SLOW_MEMORY = 0.98
 
 
-def head_weights(variances, ramp, growth_weight, eps=HEAD_SCALE_EPS):
+def head_weights(variances, ramp, growth_weight, eps=HEAD_SCALE_EPS, residuals=None):
 	"""(config.head_scale) Each value head's weight in the value loss, {"share": [V2, V5, V7], "growth": [G2, G5, G7],
 	"end": [Vend]}: inversely to its targets' variance (each head's loss, a constant prediction's, equally large), scaled
 	so the heads' losses at a constant prediction add up to what they did at the old weights (1, growth_weight, 1): the
 	value loss keeps its size against the policy's and the teacher's, only its split between the heads changes; and ramp
 	(0..1) of the way from the old weights. variances: the same layout (a missing head keeps its old weight).
 	2026-11-02: V_end's targets spread 0.097 on the 0..1 scale and the share-change heads' 0.010-0.017, V_end's loss at
-	a constant prediction 35-100x theirs: the share-change heads were near-constant after a day."""
+	a constant prediction 35-100x theirs: the share-change heads were near-constant after a day.
+	residuals (config.head_scale_by "residual", docs/optimizer_plan.md step 7): inversely to each head's running fresh
+	excess loss instead, its residual (a head learning well gets more of the shared layers, one whose residual stays
+	large, the long horizons and V_end, less), scaled the same way."""
 	old = {"share": [1.0] * c.N_VALUE_OFFSETS, "growth": [growth_weight] * c.N_VALUE_OFFSETS, "end": [1.0]}
-	pairs = [(name, k) for name in old for k in range(len(old[name])) if variances.get(name) is not None and k < len(variances[name])]
+	known = lambda table, name, k: table is not None and table.get(name) is not None and k < len(table[name]) and table[name][k] == table[name][k]  # noqa: E731 (nan: unknown)
+	pairs = [(name, k) for name in old for k in range(len(old[name])) if known(variances, name, k) and (residuals is None or known(residuals, name, k))]
 	if not pairs:
 		return old
 	baseline = sum(old[name][k] * variances[name][k] for name, k in pairs)
-	raw = {(name, k): old[name][k] / (variances[name][k] + eps) for name, k in pairs}
+	raw = {(name, k): old[name][k] / (variances[name][k] + eps if residuals is None else max(residuals[name][k], HEAD_RESIDUAL_EPS)) for name, k in pairs}
 	scale = baseline / max(sum(raw[p] * variances[p[0]][p[1]] for p in pairs), 1e-12)
 	out = {name: list(values) for name, values in old.items()}
 	for name, k in pairs:
 		out[name][k] = (1 - ramp) * old[name][k] + ramp * scale * raw[(name, k)]
 	return out
+
+
+def running(old, measured, memory):
+	"""{name: [values]}: measured blended into old at memory, list by list (a name old lacks, or has at another length,
+	starts at measured; a value not measured, nan, keeps the old one)."""
+	old = old or {}
+	blend = lambda o, m: o if m != m else memory * o + (1 - memory) * m  # noqa: E731
+	return {name: [blend(o, m) for o, m in zip(old[name], values)] if old.get(name) is not None and len(old[name]) == len(values) else list(values) for name, values in measured.items()}
+
+
+def value_readout_rms(model):
+	"""The value heads' readouts' root mean square (value_heads', growth_heads', end_head's weights): they start at 0, so
+	how far the critic has come (docs/optimizer_plan.md step 1: 0.006-0.012 after 1,300 updates at the policy's rate)."""
+	weights = [getattr(model, name).weight for name in ("value_heads", "growth_heads", "end_head") if isinstance(getattr(model, name, None), torch.nn.Linear)]
+	if not weights:
+		return float("nan")
+	with torch.no_grad():
+		return float(torch.cat([w.detach().flatten().float() for w in weights]).pow(2).mean().sqrt())
 
 
 def masked_variance(t, valid):
@@ -728,7 +800,7 @@ def taught(advice_types, advised, config):
 def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
 	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None, teacher=None, teacher_weight=None,
-	share_trust=1.0, head_scale=None, teacher_sets=None, loss_weights=None, streams=None,
+	share_trust=1.0, head_scale=None, teacher_sets=None, loss_weights=None, streams=None, clips=None,
 ):
 	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
 	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
@@ -745,7 +817,8 @@ def ppo_update(
 	(default: decode_inputs). share_trust 0..1: how far the schedule credit's share term takes the V7 change head as its
 	baseline (share_baseline; the learner's trust). streams: (stream [N], position [N]) of each decision, its game and
 	player and its place among the player's records, for config.memory_steps (sequence_order; None: each decision
-	alone). Returns (metrics, the KL control's new lr_scale)."""
+	alone). clips: the groups' gradient clips (clip_gradients; None: the one clip at grad_clip). Returns (metrics, the
+	KL control's new lr_scale)."""
 	n, started = len(decisions), time.time()
 	clock = {"prepass": 0.0, "wait": 0.0, "steps": 0.0, "forward": 0.0, "losses": 0.0, "backward": 0.0, "optimizer": 0.0, "cpu": time.thread_time()}  # where the update's time goes (logged: the PC's step ran at half the GPU's pace, 2026-10-30)
 	# The foresight's labels (foresight.game_labels, v2), each decision's row: its loss joins the minibatch's, a share
@@ -794,7 +867,7 @@ def ppo_update(
 		end_valid = torch.isfinite(end_t).float()
 		end_t = end_t.nan_to_num(0.0)
 	for group in optimizer.param_groups:
-		group["lr"] = config.learning_rate * lr_scale
+		group["lr"] = group_lr(group, config, lr_scale)  # (the value heads' at value_lr_factor, apart from lr_scale)
 	size = config.batch_size
 	# config.memory_steps: the passes' micro-batches as sequences of a player's decisions, the memory carried through
 	# them (model_v2.forward_steps) and its gradient back into the writes; the first pass's (the anchor's, the old
@@ -823,7 +896,9 @@ def ppo_update(
 	# (loss_weights, the learner's loss shares: the value's and the foresight's weights, and kl_teacher, the teacher's share
 	# against the policy's: the KL its pull makes, as teacher_weight was against PPO's 1 before them)
 	kl_teacher = float(loss_weights["kl_teacher"]) if loss_weights is not None else float(teacher_weight_t)
-	kl_target = config.target_kl * (1.0 + kl_teacher) if advice_t is not None or teacher is not None else config.target_kl
+	# (config.kl_teacher_inflation False since 2026-11-06, docs/optimizer_plan.md step 2: the target is target_kl, the
+	# actor on the slow timescale: inflated, the policy's budget was 0.015 x (1 + 0.6 / 0.2) = 0.06 an update)
+	kl_target = config.target_kl * (1.0 + kl_teacher) if config.kl_teacher_inflation and (advice_t is not None or teacher is not None) else config.target_kl
 	weights_t = {f"lw:{name}": torch.full((), float(loss_weights[name]), device=device) for name in ("value", "foresight")} if loss_weights is not None else {}
 	steps_graph = None
 	if graphs is not None and config.step_graphs:
@@ -885,10 +960,17 @@ def ppo_update(
 	if end is not None:
 		value_fresh, heads = value_fresh + masked(fresh["end"], end_valid.unsqueeze(-1)), heads + 1.0
 	value_fresh = float(value_fresh) / heads
+	# Each head's fresh excess loss (TensorBoard campaign_heads/fresh_<head>; config.head_scale_by "residual" weighs by it)
+	per_head = lambda x, valid: torch.where(valid.sum(dim=0) > 0, (x * valid).sum(dim=0) / valid.sum(dim=0).clamp(min=1), torch.full_like(valid[0], float("nan"))).tolist()  # noqa: E731 (nan: no grade in this batch)
+	head_fresh = {"share": per_head(fresh["share"], share_valid)}
+	if growth is not None:
+		head_fresh["growth"] = per_head(fresh["growth"], growth_valid)
+	if end is not None:
+		head_fresh["end"] = per_head(fresh["end"], end_valid.unsqueeze(-1))
 	del fresh
 	# config.head_scale: the heads' target variances this update (the growth heads' on their 0..1 scale, over the value
 	# now), into the running ones (head_scale["var"]), and the heads' weights from them (head_weights)
-	head_w, head_var = None, None
+	head_w, head_var, head_residual, head_var_slow = None, None, None, None
 	if head_scale is not None:
 		measured = {"share": masked_variance(targets_t, share_valid).tolist()}
 		if growth is not None:
@@ -897,8 +979,14 @@ def ppo_update(
 		if end is not None:
 			measured["end"] = masked_variance(end_t.unsqueeze(-1), end_valid.unsqueeze(-1)).tolist()
 		old = head_scale.get("var") or {}
-		head_var = {name: [HEAD_SCALE_MEMORY * o + (1 - HEAD_SCALE_MEMORY) * m for o, m in zip(old[name], values)] if name in old and len(old[name]) == len(values) else values for name, values in measured.items()}
+		head_var = running(old, measured, HEAD_SCALE_MEMORY)
 		weights = head_weights(head_var, float(head_scale.get("ramp", 1.0)), config.growth_weight)
+		if config.head_scale_by == "residual":  # (ramped in from the variance's weights over HEAD_SCALE_RAMP updates)
+			head_residual = running(head_scale.get("residual"), {name: values for name, values in head_fresh.items() if name in measured}, HEAD_RESIDUAL_MEMORY)
+			head_var_slow = running(head_scale.get("var_slow") or old, measured, HEAD_SCALE_SLOW_MEMORY)
+			by_residual = head_weights(head_var_slow, float(head_scale.get("ramp", 1.0)), config.growth_weight, residuals=head_residual)
+			share = float(head_scale.get("residual_ramp", 1.0))
+			weights = {name: [(1 - share) * a + share * b for a, b in zip(values, by_residual[name])] for name, values in weights.items()}
 		head_w = {f"w:{name}": torch.tensor(values, dtype=torch.float32, device=device) for name, values in weights.items() if name in measured}
 	gpu_mb = 0.0
 	end_step_error = None
@@ -963,6 +1051,7 @@ def ppo_update(
 		if device.type == "cuda":
 			torch.cuda.empty_cache()
 	totals, steps, stopped, update_kl, recent = Counter(), 0, False, 0.0, deque(maxlen=KL_WINDOW)
+	step_norms, step_bound = [], []  # each step's gradient norms before the clip ([total, GRAD_GROUPS']) and which clips bound
 	full_windows = 0  # micro-batches stepped over every hero slot (more of our heroes than config.window_budget allows)
 	stopped_pass = 0  # the pass the KL control ended (0: none; b1, 2026-10-31: with passes=2, a second pass mostly cut short adds nothing)
 	model.train()
@@ -1060,11 +1149,14 @@ def ppo_update(
 					foresight_sums["steps_seen"] += share
 				parts.append(metrics)  # (summed on the device: one sync a step, not six a micro-batch)
 			mark = time.perf_counter()
-			grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+			grad_norm, group_norms, bound = clip_gradients(optimizer, config.grad_clip, clips, GRAD_GROUPS)
 			optimizer.step()
 			stepped = time.perf_counter()
 			clock["optimizer"] += stepped - mark
-			*sums, grad_norm = torch.cat([torch.stack(parts).sum(dim=0), grad_norm.detach().float().reshape(1)]).tolist()  # (a sync: the minibatch's GPU work is done here)
+			read = torch.cat([torch.stack(parts).sum(dim=0), grad_norm.detach().float().reshape(1), group_norms, bound]).tolist()  # (a sync: the minibatch's GPU work is done here)
+			sums, grad_norm, norms_now, bound_now = read[: len(STEP_PARTS)], read[len(STEP_PARTS)], read[len(STEP_PARTS) + 1 : len(STEP_PARTS) + 1 + len(GRAD_GROUPS)], read[len(STEP_PARTS) + 1 + len(GRAD_GROUPS) :]
+			step_norms.append([grad_norm, *norms_now])
+			step_bound.append(bound_now)
 			clock["steps"] += time.perf_counter() - stepped
 			step = Counter(dict(zip(STEP_PARTS, sums)))
 			gpu_mb = max(gpu_mb, gpu_held(device))
@@ -1096,6 +1188,14 @@ def ppo_update(
 		**attributed_stats,
 		**schedule_stats,
 		signal_ratio=signal_ratio(optimizer),  # (the steps' noise: the user's 2026-10-31 aim of 0.25+, with 4,096-decision steps)
+		signal_fraction=signal_fraction(optimizer),  # (the share of each group's gradient that is signal, at any beta1)
+		grad_norms=step_norms,  # (each step's: the learner's clip calibration, config.grad_clip_by_group)
+		**{f"grad_norm_{name}": float(np.median([norms[1 + i] for norms in step_norms])) for i, name in enumerate(GRAD_GROUPS) if step_norms},
+		**{f"clip_bound_{name}": float(np.mean([bound[i] for bound in step_bound])) for i, name in enumerate(GRAD_GROUPS) if step_bound},
+		clipped_by_group=clips is not None,
+		value_learning_rate=group_lr({"name": "value"}, config, lr_scale),
+		value_readout_rms=value_readout_rms(model),
+		head_fresh=head_fresh,
 		end_step_error=end_step_error,
 		last_kl=update_kl,
 		kl_target=kl_target,
@@ -1127,6 +1227,8 @@ def ppo_update(
 		**value_fit(predicted[:, -1], actual[:, -1]),
 		head_var=head_var,  # (config.head_scale: the running target variances, for the next update)
 		head_weights={name[2:]: tensor.tolist() for name, tensor in head_w.items()} if head_w is not None else None,
+		head_residual=head_residual,  # (config.head_scale_by "residual": the heads' running fresh excess, for the next update)
+		head_var_slow=head_var_slow,
 	)
 	return metrics, lr_scale
 

@@ -282,9 +282,36 @@ def test_the_move_discount_starts_as_the_old_score_and_moves_only_the_move_score
 	assert grad is not None and torch.isfinite(grad).all() and float(grad.abs()) > 0
 
 
+def legacy_optimizer_state(model, optimizer):
+	"""The optimizer's state_dict as saved before 2026-11-06 (train.make_optimizer's two groups, no names): the rest in
+	the model's order, then the corrections in prior_corrections' order."""
+	saved = optimizer.state_dict()
+	ids = {id(p) for p in model.prior_corrections()}
+	order = [p for p in model.parameters() if id(p) not in ids] + list(model.prior_corrections())
+	index = {id(p): i for i, p in enumerate(p for g in optimizer.param_groups for p in g["params"])}
+	state = {new: saved["state"][index[id(p)]] for new, p in enumerate(order) if index[id(p)] in saved["state"]}
+	rest = len(order) - len(ids)
+	settings = {key: value for key, value in saved["param_groups"][0].items() if key not in ("params", "param_names", "name")}
+	return {"state": state, "param_groups": [{**settings, "params": list(range(rest))}, {**settings, "weight_decay": 5.0, "params": list(range(rest, len(order)))}]}
+
+
+def drop_parameter(saved, at):
+	"""A saved optimizer's state_dict without its parameter number at (each later one moved up, its name gone too)."""
+	place = lambda i: i - (i > at)  # noqa: E731
+	groups = []
+	for g in saved["param_groups"]:
+		keep = [k for k, i in enumerate(g["params"]) if i != at]
+		group = {**g, "params": [place(g["params"][k]) for k in keep]}
+		if "param_names" in g:
+			group["param_names"] = [g["param_names"][k] for k in keep]
+		groups.append(group)
+	return {"state": {place(i): s for i, s in saved["state"].items() if i != at}, "param_groups": groups}
+
+
 def test_adams_moments_carry_over_to_a_model_that_gained_a_parameter():
 	"""train.load_optimizer: a checkpoint's optimizer from before features.move_discount keeps every other parameter's
-	moments, matched by name (the new one sits among them, not at the end), and the new one starts fresh."""
+	moments, matched by name (the new one sits among them, not at the end), and the new one starts fresh: from a
+	checkpoint of today's named groups, and from one of the two unnamed groups before 2026-11-06."""
 	config = CampaignConfig(learning_rate=1e-3)
 	torch.manual_seed(0)
 	model = CampaignModelV2(dim=32, cell_dim=8, layers=1)
@@ -293,26 +320,25 @@ def test_adams_moments_carry_over_to_a_model_that_gained_a_parameter():
 		p.grad = torch.randn_like(p)
 	optimizer.step()
 	names = {id(p): n for n, p in model.named_parameters()}
+	keys = [k for k in model.state_dict() if k != "features.move_discount"]
 	order = [names[id(p)] for group in optimizer.param_groups for p in group["params"]]
-	gone = order.index("features.move_discount")
-	assert gone < len(order) - 1
-	saved = optimizer.state_dict()
-	place = {i: i - (i > gone) for i in range(len(order)) if i != gone}  # each parameter's place in the old model's
-	old = {
-		"state": {place[i]: s for i, s in saved["state"].items() if i != gone},
-		"param_groups": [{**g, "params": [place[i] for i in g["params"] if i != gone]} for g in saved["param_groups"]],
-	}
-	fresh = CampaignModelV2(dim=32, cell_dim=8, layers=1)
-	fresh_optimizer = make_optimizer(fresh, config)
-	load_optimizer(fresh_optimizer, fresh, old, [k for k in model.state_dict() if k != "features.move_discount"])
-	trained = dict(model.named_parameters())
-	for name, p in fresh.named_parameters():
-		state = fresh_optimizer.state.get(p, {})
-		if name == "features.move_discount":
-			assert not state
-		else:
-			assert torch.equal(state["exp_avg"], optimizer.state[trained[name]]["exp_avg"]), name
-			assert torch.equal(state["exp_avg_sq"], optimizer.state[trained[name]]["exp_avg_sq"]), name
+	legacy = legacy_optimizer_state(model, optimizer)
+	ids = {id(p) for p in model.prior_corrections()}
+	legacy_order = [names[id(p)] for p in model.parameters() if id(p) not in ids] + [names[id(p)] for p in model.prior_corrections()]
+	for old in (drop_parameter(optimizer.state_dict(), order.index("features.move_discount")), drop_parameter(legacy, legacy_order.index("features.move_discount"))):
+		assert old["param_groups"][0]["params"][-1] > 0
+		fresh = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+		fresh_optimizer = make_optimizer(fresh, config)
+		load_optimizer(fresh_optimizer, fresh, old, keys)
+		trained = dict(model.named_parameters())
+		for name, p in fresh.named_parameters():
+			state = fresh_optimizer.state.get(p, {})
+			if name == "features.move_discount":
+				assert not state
+			else:
+				assert torch.equal(state["exp_avg"], optimizer.state[trained[name]]["exp_avg"]), name
+				assert torch.equal(state["exp_avg_sq"], optimizer.state[trained[name]]["exp_avg_sq"]), name
+		assert [(g["name"], g["lr"], g["betas"], g["weight_decay"]) for g in fresh_optimizer.param_groups] == [(g["name"], g["lr"], g["betas"], g["weight_decay"]) for g in make_optimizer(fresh, config).param_groups]
 
 
 def test_the_plan_head_changes_nothing_the_ai_reads(model):
@@ -1408,9 +1434,10 @@ def test_adams_moments_survive_a_model_that_lost_parameters():
 	for p in model.parameters():
 		p.grad = torch.randn_like(p)
 	optimizer.step()
-	saved = optimizer.state_dict()
+	saved = legacy_optimizer_state(model, optimizer)  # (a checkpoint of before 2026-11-06: two unnamed groups)
 	keys = list(model.state_dict())
-	rest = optimizer.param_groups[0]["params"]
+	ids = {id(p) for p in model.prior_corrections()}
+	rest = [p for p in model.parameters() if id(p) not in ids]
 	names = {id(p): n for n, p in model.named_parameters()}
 	at = [names[id(p)] for p in rest].index("option_flags.weight")
 	gone = {"option_q.weight": torch.randn(32, 64), "option_q.bias": torch.randn(32)}

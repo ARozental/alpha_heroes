@@ -66,6 +66,7 @@ from .data import collate, credit_check, make_dataloader, summarize, widened  # 
 from .distributions import log_prob
 from .export import export, verify
 from .device import sync, use_fused
+from .optim import calibrated_clips, clip_gradients, clip_settings, moments_by_name, signal_fraction
 from .losses import FORESIGHT_PARTS, AdvantageConfig, PPOConfig, foresight_loss, ppo_loss, search_loss, value_excess, weighted_mean
 from .constants import N_ACTION_TYPES, ActionType
 from .model import VALUE_PRIOR_GAIN, VALUE_PRIOR_KINDS, VALUE_PRIOR_STEP, build_model
@@ -174,6 +175,18 @@ class TrainConfig:
 	# eval flat at ~+0.09 for ~1,100 updates, 2026-10-31): the user's call, ~10x the batch at a third of the rate (1e-5)
 	accumulate: int = 1
 	grad_clip: float = 0.5  # max gradient norm, the usual PPO value
+	# Clipping by parameter group (docs/optimizer_plan.md step 6; optim.clip_gradients, BATTLE_GROUPS): each group at its
+	# median norm over the first grad_clip_calibration optimizer steps (the one clip meanwhile; kept in the checkpoint),
+	# then all times grad_clip / the total's median, the scale Adam's moments were built at. grad_clip_groups
+	# ("trunk:0.3,priors:0.1,values:2,typical:2.5") sets them by hand instead. False: the one clip at grad_clip
+	grad_clip_by_group: bool = True
+	grad_clip_calibration: int = 200
+	grad_clip_groups: tuple = ()
+	# The critic on its own timescale (step 1, 2026-11-06; the user's OK above the 3e-5 cap for the value heads): the
+	# value heads' parameters (ValueHeads and the strengths' direct path into them, BATTLE_GROUPS "values") at
+	# learning_rate x this. No teacher or balancer here: the critic's one handicap was the shared rate
+	value_lr_factor: float = 10.0
+	value_lr_kl: bool = False  # the KL control's lr_scale scales the values' group too (False: the policy's KL never moves them)
 	# KL control, so the step size does not hang on a hand-picked learning rate: an update stops its steps once its KL
 	# (old against new policy) passes 1.5x target_kl; then the learning rate's scale is cut by 1.5, and raised by 1.5
 	# after an update that took all its steps and ended under half of target_kl (within 0.1..lr_scale_max). The KL is the mean
@@ -302,6 +315,11 @@ COLUMNS = [
 	f"train_{name}" for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")
 ] + [f"value_gain_{kind}" for kind in VALUE_PRIOR_KINDS] + [f"foresight_{k}" for k in FORESIGHT_PARTS] + [
 	"grad_trunk_main", "grad_trunk_foresight", "grad_trunk_cosine", "grad_dead_share",
+	# docs/optimizer_plan.md (2026-11-06): each BATTLE_GROUPS group's gradient norm before the clip (the update's steps'
+	# median), the share of steps its clip bound, the share of its gradient that is signal (optim.signal_fraction), and
+	# the values' rate
+	"grad_norm", *(f"grad_norm_{g}" for g in ("trunk", "priors", "values")), *(f"clip_bound_{g}" for g in ("trunk", "priors", "values")),
+	"signal_fraction", *(f"signal_fraction_{g}" for g in ("trunk", "priors", "values")), "value_learning_rate", "clipped_by_group",
 ]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
 # error. decisions: all decisions of the epoch; rounds: attack + defence battle rounds, averaged over the games.
@@ -325,6 +343,7 @@ TENSORBOARD_TAGS = {
 	# Gradient health (trunk_gradients): the trunk's gradient norm from the PPO losses and from the foresight's, how much
 	# they agree (cosine; strongly negative = they fight), and the share of parameters no loss reaches
 	**{name: f"gradients/{name[5:]}" for name in ("grad_trunk_main", "grad_trunk_foresight", "grad_trunk_cosine", "grad_dead_share")},
+	**{name: f"stability/{name}" for name in ("grad_norm", "signal_fraction", "value_learning_rate", "clipped_by_group", *(f"{kind}_{g}" for kind in ("grad_norm", "clip_bound", "signal_fraction") for g in ("trunk", "priors", "values")))},
 	**{f"{side}_share_{kind.lower()}": f"actions_{side}/{kind.lower()}" for side in ("attack", "defence") for kind in ACTION_KINDS},
 	**{f"{side}_{name}": f"credit_{side}/{name}" for side in ("attack", "defence") for name in ("value_ev", "credit_own_lost", "credit_killed")},
 	"mean_reward": "reward/mean", "attack_reward": "reward/attack", "defence_reward": "reward/defence",
@@ -423,17 +442,53 @@ def outcome_text(summaries):
 def signal_ratio(optimizer):
 	"""Median over all weights of |m| / sqrt(v) in Adam's state (1 = the gradients always agree, 0 = they cancel out).
 
-	m and v are bias-corrected as in Adam's step; without it the ratio is ~3 on the first step.
+	m and v are bias-corrected as in Adam's step (each group's betas); without it the ratio is ~3 on the first step.
 	"""
-	beta1, beta2 = optimizer.param_groups[0]["betas"]
 	ratios = []
-	for state in optimizer.state.values():
-		if "exp_avg" in state:
-			step = float(state["step"])
-			m = state["exp_avg"].flatten() / (1 - beta1**step)
-			v = state["exp_avg_sq"].flatten() / (1 - beta2**step)
-			ratios.append(m.abs() / (v.sqrt() + 1e-12))
+	for group in optimizer.param_groups:
+		beta1, beta2 = group["betas"]
+		for p in group["params"]:
+			state = optimizer.state.get(p, {})
+			if "exp_avg" in state:
+				step = float(state["step"])
+				m = state["exp_avg"].flatten() / (1 - beta1**step)
+				v = state["exp_avg_sq"].flatten() / (1 - beta2**step)
+				ratios.append(m.abs() / (v.sqrt() + 1e-12))
 	return float(torch.cat(ratios).median()) if ratios else float("nan")
+
+
+# The battle model's parameter groups (docs/optimizer_plan.md's battle side), each an Adam group of its own, named: the
+# value heads' (at value_lr_factor x the rate), the prior-initialised rule and value parameters', the trunk the rest
+BATTLE_GROUPS = ("trunk", "priors", "values")
+BATTLE_VALUE_MODULES = ("values.", "value_strength.")
+BATTLE_PRIORS = ("actions.escape_rules", "actions.spell_mastery", "actions.spell_value", "actions.creature_spell_value", "actions.value_gains", "actions.type_head.bias", "actions.type_rules.weight", "actions.type_strength.weight", "actions.spell_head.bias")
+
+
+def battle_parameter_groups(model):
+	"""{group: [(name, parameter)]} over BATTLE_GROUPS, each parameter in one, in the model's order."""
+	groups = {name: [] for name in BATTLE_GROUPS}
+	for name, p in model.named_parameters():
+		prior = name in BATTLE_PRIORS or (name.startswith("actions.rules.") and name.endswith(".linear"))
+		groups["values" if name.startswith(BATTLE_VALUE_MODULES) else "priors" if prior else "trunk"].append((name, p))
+	return groups
+
+
+def battle_group_lr(group, config, lr_scale=1.0, schedule=1.0):
+	"""A group's rate: learning_rate x the schedule's and the KL control's scales; the values' x value_lr_factor (with
+	lr_scale only with config.value_lr_kl)."""
+	if group.get("name") == "values":
+		return config.learning_rate * config.value_lr_factor * schedule * (lr_scale if config.value_lr_kl else 1.0)
+	return config.learning_rate * schedule * lr_scale
+
+
+def make_optimizer(model, config):
+	"""Adam over battle_parameter_groups' groups, each named, its parameters' names kept (load_optimizer matches moments
+	by them), beta2 config.adam_beta2."""
+	groups = [{"params": params, "name": name, "betas": (0.9, config.adam_beta2)} for name, params in battle_parameter_groups(model).items() if params]
+	optimizer = torch.optim.Adam(groups, lr=config.learning_rate)
+	for group in optimizer.param_groups:
+		group["lr"] = battle_group_lr(group, config)
+	return optimizer
 
 
 def flat_weights(model):
@@ -951,25 +1006,30 @@ def trunk_gradients(model, main, foresight):
 
 
 def load_optimizer(optimizer, model, state):
-	"""The checkpoint's optimizer state. A checkpoint from before parameters were added (2026-10-29: the value priors,
-	model.VALUE_PRIOR_KINDS) or reshaped (2026-11-05: the type rules' shot features) keeps Adam's moments for the
-	parameters it had at their shapes, matched by name in the model's order; the others start fresh."""
+	"""The checkpoint's optimizer state, Adam's moments by parameter name into make_optimizer's groups (2026-11-06: one
+	group became BATTLE_GROUPS' three; the groups' hyperparameters stay the optimizer's). A checkpoint from before
+	parameters were added (2026-10-29: the value priors, model.VALUE_PRIOR_KINDS) or reshaped (2026-11-05: the type
+	rules' shot features) keeps the moments of the parameters it had at their shapes; the others start fresh. Before
+	2026-11-06 a checkpoint's one group named none: its parameters were the model's, in its order, that it had."""
 	saved = state["optimizer"]
 	names = [name for name, _ in model.named_parameters()]
-	shapes = [p.shape for _, p in model.named_parameters()]
-	# (the same parameters, none reshaped: 2026-11-05's type rules widened in place, model.ActionHeads._load_from_state_dict)
-	if len(saved["param_groups"][0]["params"]) == len(names) and all(s["exp_avg"].shape == shapes[i] for i, s in saved["state"].items() if "exp_avg" in s):
-		optimizer.load_state_dict(saved)
-		return
-	had = [i for i, name in enumerate(names) if name in state["model"]]  # the checkpoint's parameters, in its order
-	if len(had) != len(saved["param_groups"][0]["params"]):
-		raise ValueError(f"the checkpoint's optimizer has {len(saved['param_groups'][0]['params'])} parameters, its model {len(had)}")
-	moments = {new: saved["state"][old] for old, new in enumerate(had) if old in saved["state"] and saved["state"][old]["exp_avg"].shape == shapes[new]}
-	reshaped = [names[new] for old, new in enumerate(had) if old in saved["state"] and new not in moments]
+	shapes = dict((name, p.shape) for name, p in model.named_parameters())
+	if all("param_names" in group for group in saved["param_groups"]):
+		if any(len(group["param_names"]) != len(group["params"]) for group in saved["param_groups"]):
+			raise ValueError("the checkpoint's optimizer groups name a different number of parameters than they hold")
+		saved_names = [name for group in saved["param_groups"] for name in group["param_names"]]
+	else:
+		saved_names = [name for name in names if name in state["model"]]  # the checkpoint's parameters, in its order
+		if len(saved["param_groups"]) != 1 or len(saved_names) != len(saved["param_groups"][0]["params"]):
+			raise ValueError(f"the checkpoint's optimizer has {sum(len(g['params']) for g in saved['param_groups'])} parameters in {len(saved['param_groups'])} groups, its model {len(saved_names)}")
+	flat = [i for group in saved["param_groups"] for i in group["params"]]
+	reshaped = [name for name, i in zip(saved_names, flat) if i in saved["state"] and name in shapes and "exp_avg" in saved["state"][i] and saved["state"][i]["exp_avg"].shape != shapes[name]]
 	if reshaped:
 		print("optimizer: fresh moments for the parameters whose shape changed: " + ", ".join(reshaped), flush=True)
-	optimizer.load_state_dict({"state": moments, "param_groups": [{**saved["param_groups"][0], "params": list(range(len(names)))}]})
-	print(f"optimizer: Adam's moments kept for {len(had)} parameters, fresh for {len(names) - len(had)} new: " + ", ".join(n for i, n in enumerate(names) if i not in set(had)), flush=True)
+		saved = {**saved, "state": {i: s for name, i in zip(saved_names, flat) if (s := saved["state"].get(i)) is not None and name not in reshaped}}
+	fresh, gone = moments_by_name(optimizer, model, saved, saved_names)
+	if fresh or gone or reshaped or len(saved["param_groups"]) != len(optimizer.param_groups):
+		print(f"optimizer: Adam's moments kept by name into the groups {', '.join(g.get('name', '?') for g in optimizer.param_groups)}; fresh for {len(fresh)} new: " + ", ".join(fresh) + (f"; dropped for the gone: {', '.join(gone)}" if gone else ""), flush=True)
 
 
 def save_atomically(state, path):
@@ -981,11 +1041,13 @@ def save_atomically(state, path):
 	os.replace(tmp, path)
 
 
-def save_checkpoint(path, model, optimizer, epoch, config, elapsed=0.0, lr_scale=1.0, value_ev=None, average=None):
+def save_checkpoint(path, model, optimizer, epoch, config, elapsed=0.0, lr_scale=1.0, value_ev=None, average=None, clips=None):
 	"""elapsed: the training's seconds so far (run_hours counts them across resumes); lr_scale: the KL control's;
 	value_ev: the smoothed explained variance the window credit's outcome share follows; average: the WeightAverage
-	(saved as "average", the weights the evals played; "model" is the trained weights the optimizer goes on from)."""
+	(saved as "average", the weights the evals played; "model" is the trained weights the optimizer goes on from);
+	clips: {"grad_clips", "clip_samples"} (config.grad_clip_by_group's calibration)."""
 	extra = {"average": average.model.state_dict(), "average_updates": average.updates} if average else {}
+	extra.update(clips or {})
 	save_atomically({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "model_kwargs": model_kwargs(config), "elapsed": elapsed, "lr_scale": lr_scale, "value_ev": value_ev, **extra}, path)
 
 
@@ -1003,31 +1065,33 @@ def train(config, resume=False):
 		print(f"cuda: this process holds {config.cuda_memory_fraction:.0%} of the GPU's {torch.cuda.get_device_properties(device).total_memory / 2**30:.1f} GB at most", flush=True)
 	architecture = model_kwargs(config)
 	model = build_model(architecture).to(device)
-	optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+	optimizer = make_optimizer(model, config)
 	first_epoch = 1
 	elapsed_before = 0.0
 	lr_scale = 1.0  # the KL control's (target_kl)
 	value_ev = None  # the value head's explained variance (credit_check), smoothed: sets the window credit's outcome share
+	grad_clips, clip_samples = None, []  # (config.grad_clip_by_group) the groups' clips once calibrated, the calibration's steps' norms till then
 	latest = out / "checkpoint_latest.pt"
 	state = {}
 	if resume and latest.exists():
 		state = torch.load(latest, map_location=device)
 		architecture = state.get("model_kwargs", {})
 		model = build_model(architecture).to(device)  # the architecture the run was started with
-		optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+		optimizer = make_optimizer(model, config)
 		model.load_state_dict(state["model"])
 		load_optimizer(optimizer, model, state)
 		first_epoch = state["epoch"] + 1
 		elapsed_before = state.get("elapsed", 0.0)
 		lr_scale = state.get("lr_scale", 1.0)
 		value_ev = state.get("value_ev")
+		grad_clips, clip_samples = state.get("grad_clips"), state.get("clip_samples", [])
 		print(f"resuming after epoch {state['epoch']} ({elapsed_before / 3600:.2f} h)")
 	elif config.init_from:  # a new run going on from another's checkpoint
 		source = Path(config.init_from)
 		state = torch.load(source, map_location=device)
 		architecture = state.get("model_kwargs", {})
 		model = build_model(architecture).to(device)
-		optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+		optimizer = make_optimizer(model, config)
 		model.load_state_dict(state["model"])
 		load_optimizer(optimizer, model, state)
 		first_epoch = state["epoch"] + 1  # its numbering goes on, so its league snapshots keep their versions
@@ -1042,6 +1106,8 @@ def train(config, resume=False):
 				shutil.copy2(baseline, out / baseline.name)
 		print(f"starting from {source} (epoch {state['epoch']})")
 	use_fused(optimizer)
+	if clip_settings(config.grad_clip_groups):  # (the groups' clips by hand, over any calibrated ones)
+		grad_clips = clip_settings(config.grad_clip_groups)
 	# (a run from another's checkpoint keeps its average only on a resume: a new run averages from its start)
 	average = WeightAverage(model, config.weight_average, *((state["average"], state["average_updates"]) if resume and "average" in state else ())) if config.weight_average else None
 
@@ -1293,10 +1359,10 @@ def train(config, resume=False):
 			if config.lr_schedule == "linear":
 				done = min(1.0, elapsed() / (config.run_hours * 3600)) if config.run_hours else (epoch - 1) / config.epochs
 				for group in optimizer.param_groups:
-					group["lr"] = config.learning_rate * (1 - (1 - config.lr_final_fraction) * done) * lr_scale
+					group["lr"] = battle_group_lr(group, config, lr_scale, 1 - (1 - config.lr_final_fraction) * done)
 			elif config.target_kl:
 				for group in optimizer.param_groups:
-					group["lr"] = config.learning_rate * lr_scale
+					group["lr"] = battle_group_lr(group, config, lr_scale)
 			actor_stats, items = {}, None
 			if pool:
 				# Whichever is ready first: the battles of an update, or (learner "turns") a campaign update while they are not
@@ -1381,6 +1447,7 @@ def train(config, resume=False):
 			sync(device)
 			marks.append(time.time())
 			stopped, update_kl, kl_sum, recent = False, 0.0, 0.0, deque(maxlen=KL_WINDOW)
+			step_norms = []  # each optimizer step's gradient norms before the clip, [total, BATTLE_GROUPS'..., their clips bound...] on the device
 			kl_of = lambda out, rows: (lambda d: (d.exp() - 1 - d).mean())(log_prob(out, rows["action"]).detach() - rows["anchor_log_prob"])  # k3: KL(anchor || now)
 			group = max(1, config.accumulate)  # minibatches an optimizer step averages its gradient over
 			steps = 0
@@ -1427,7 +1494,8 @@ def train(config, resume=False):
 						optimizer.zero_grad()
 						stopped = True
 						break
-					torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+					total, norms, bound = clip_gradients(optimizer, config.grad_clip, grad_clips if config.grad_clip_by_group else None, BATTLE_GROUPS)
+					step_norms.append(torch.cat([total.reshape(1), norms, bound]))  # (read once, after the update)
 					optimizer.step()
 					steps += 1
 					# The KL control once a step, one read of the GPU (a float() of each minibatch's waited for it every minibatch)
@@ -1448,6 +1516,25 @@ def train(config, resume=False):
 					lr_scale = max(0.1, lr_scale / 1.5)
 				elif update_kl < config.target_kl / 2:  # the update's last minibatches: nearest where it ended
 					lr_scale = min(config.lr_scale_max, lr_scale * 1.5)
+			# The groups' gradient norms (docs/optimizer_plan.md): into the clip's calibration until it holds
+			# grad_clip_calibration steps, then each group clipped at its median for the run (re-measured at a deploy only)
+			read, width = (torch.stack(step_norms).tolist() if step_norms else []), len(BATTLE_GROUPS)
+			clipped_by_group = int(bool(config.grad_clip_by_group and grad_clips is not None))  # (this update's: before the calibration below ends)
+			if config.grad_clip_by_group and grad_clips is None and read:
+				clip_samples = clip_samples + [step[: 1 + width] for step in read]
+				if len(clip_samples) >= config.grad_clip_calibration:
+					grad_clips = calibrated_clips(clip_samples, BATTLE_GROUPS)
+					print(f"update {epoch}: the gradient clipped by group from the next update, at the medians of {len(clip_samples)} steps' norms: " + "  ".join(f"{name} {grad_clips[name]:.4g}" for name in BATTLE_GROUPS) + f"; all then x {config.grad_clip} / {grad_clips['typical']:.4g} (the total's median)", flush=True)
+			fractions = signal_fraction(optimizer)
+			optimizer_columns = {
+				**({"grad_norm": round(float(np.median([step[0] for step in read])), 5)} if read else {}),
+				**({f"grad_norm_{name}": round(float(np.median([step[1 + i] for step in read])), 5) for i, name in enumerate(BATTLE_GROUPS)} if read else {}),
+				**({f"clip_bound_{name}": round(float(np.mean([step[1 + width + i] for step in read])), 3) for i, name in enumerate(BATTLE_GROUPS)} if read else {}),
+				**({"signal_fraction": round(fractions["all"], 4)} if "all" in fractions else {}),
+				**{f"signal_fraction_{name}": round(fractions[name], 4) for name in BATTLE_GROUPS if name in fractions},
+				"value_learning_rate": round(battle_group_lr({"name": "values"}, config, lr_scale), 8),
+				"clipped_by_group": clipped_by_group,
+			}
 			epoch_data = batch = out_batch = loss = None  # (none of them may exist: an update with no minibatch)
 			if device.type == "mps":
 				# The update's tensors differ in size every update (its battles' decisions): MPS's caching allocator kept
@@ -1490,7 +1577,8 @@ def train(config, resume=False):
 				**{f"{part}_seconds": round(b - a, 2) for part, a, b in zip(("data", "prepass", "steps", "publish"), [trained] + marks, marks)},
 				**{k: actor_stats.get(k, "") for k in ("real_share", "games_in_update", "buffer_decisions", "record_age", "actor_failures", "dropped_stale", "dropped_overflow")},
 				**(supply_columns(supply.status()) if supply else {}),
-				"learning_rate": round(optimizer.param_groups[0]["lr"], 8),
+				"learning_rate": round(next(g["lr"] for g in optimizer.param_groups if g.get("name") != "values"), 8),
+				**optimizer_columns,
 				"ppo_steps": steps,
 				"update_kl": round(kl_sum / max(batches, 1), 5),  # KL(start of the update || during it), what the KL control uses
 				"outcome_share": round(advantage_config.outcome_share, 3),
@@ -1561,7 +1649,7 @@ def train(config, resume=False):
 			eval_pending = eval_pending or bool(due)
 			if eval_pending and idle:
 				eval_pending = False
-				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average)  # every evaluated model
+				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, {"grad_clips": grad_clips, "clip_samples": clip_samples})  # every evaluated model
 				if pool:
 					# Beside training (2026-10-30: the run stood still ~2 minutes an hour for it): the actors go on and the
 					# learner trains while the eval plays copies of the weights as they are now. Its battles are greedy, so
@@ -1572,9 +1660,9 @@ def train(config, resume=False):
 					last_eval = time.monotonic()
 			if campaign and campaign.eval_due():  # against Nullkiller2, beside training (the models pinned: learner.evaluate)
 				campaign.start_eval(epoch)
-			save_checkpoint(latest, model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average)
+			save_checkpoint(latest, model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, {"grad_clips": grad_clips, "clip_samples": clip_samples})
 			if config.checkpoint_every and epoch % config.checkpoint_every == 0:
-				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average)
+				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, {"grad_clips": grad_clips, "clip_samples": clip_samples})
 		evals.join()  # (the run's end: its last eval's row too)
 	finally:
 		evals.close()  # (stopped: no new eval battle; the ones playing end)

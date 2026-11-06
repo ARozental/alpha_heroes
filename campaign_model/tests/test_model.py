@@ -171,19 +171,20 @@ def test_the_optimizer_decays_only_the_prior_corrections():
 	model = CampaignModel(dim=32, cell_dim=16, layers=1)
 	config = CampaignConfig(learning_rate=1e-3, prior_decay=5.0)
 	optimizer = make_optimizer(model, config)
-	assert [g["weight_decay"] for g in optimizer.param_groups] == [0.0, 5.0]
-	assert {id(p) for p in optimizer.param_groups[1]["params"]} == {id(p) for p in model.prior_corrections()}
+	groups = {g["name"]: g for g in optimizer.param_groups}
+	assert {name: g["weight_decay"] for name, g in groups.items()} == {name: 5.0 if name == "corrections" else 0.0 for name in groups}
+	assert {id(p) for p in groups["corrections"]["params"]} == {id(p) for p in model.prior_corrections()}
 	assert sum(len(g["params"]) for g in optimizer.param_groups) == len(list(model.parameters()))
 	with torch.no_grad():
 		model.features.object_type_delta.weight[WINDMILL] = 1.0
 		model.features.object_gain.fill_(0.2)
-		weights = [p.detach().clone() for p in optimizer.param_groups[0]["params"]]
+		weights = [p.detach().clone() for g in optimizer.param_groups if g["name"] != "corrections" for p in g["params"]]
 	for p in model.parameters():
 		p.grad = torch.zeros_like(p)
 	optimizer.step()  # no gradient: only the decay acts
 	assert float(model.features.object_type_delta.weight[WINDMILL]) == pytest.approx(1.0 - 1e-3 * 5.0)
 	assert float(model.features.object_gain) == pytest.approx(0.2 * (1 - 1e-3 * 5.0))
-	assert all(torch.equal(a, b) for a, b in zip(weights, optimizer.param_groups[0]["params"]))
+	assert all(torch.equal(a, b) for a, b in zip(weights, [p for g in optimizer.param_groups if g["name"] != "corrections" for p in g["params"]]))
 
 
 def test_far_objects_reach_the_value_and_the_heroes():

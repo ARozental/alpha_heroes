@@ -41,6 +41,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from battle_model import play as battle_play
 from battle_model.device import use_fused
+from battle_model.optim import calibrated_clips, clip_settings
 from battle_model.inference import InferenceServer
 from battle_model.supply import trim_memory
 
@@ -58,7 +59,7 @@ from .foresight import LABEL_NAMES, labels_of
 from .labeler import Labeler
 from .model import build_model
 from .records import NO_EFFECT, TEACHER, decode_fields, decode_inputs
-from .train import HEAD_SCALE_RAMP, _prefetched, fit_moments, load_optimizer, make_optimizer, migrate_subtypes, model_kwargs, ppo_update, usable
+from .train import GRAD_GROUPS, HEAD_SCALE_RAMP, _prefetched, fit_moments, load_optimizer, make_optimizer, migrate_subtypes, model_kwargs, ppo_update, usable
 
 TYPES = [a.name.lower() for a in c.ActionType]
 FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answer") for part in ("battle", "score", "parts")) + ("foresight_hero_alive", "foresight_hero_army", "foresight_turn", "foresight_plan", "foresight_move_tiles", "foresight_move_win", "foresight_move_stake")
@@ -155,6 +156,9 @@ class CampaignLearner:
 		self.value_pool, self.head_pool = None, {}  # their parts (labels.pooled_ev): the residual variance and the variance, smoothed apart
 		self.head_var, self.head_scale_updates = None, 0  # (config.head_scale) the heads' running target variances, the updates since it began
 		self.loss_scale, self.teacher_share = None, None  # (config.loss_shares) {"log_norm", "weight"} of the terms; the teacher's share
+		self.trust_ema = None  # (config.trust_memory) trust's slow average, trust() floors it at config.trust_floor
+		self.head_residual, self.head_var_slow, self.head_residual_updates = None, None, 0  # (config.head_scale_by "residual") the heads' running fresh excess, the variances that scale it, the updates since it began
+		self.grad_clips, self.clip_samples = None, []  # (config.grad_clip_by_group) the groups' clips once calibrated, the calibration's steps' norms till then
 		latest = self.out / "checkpoint_latest.pt"
 		if resume and latest.exists():
 			state = torch.load(latest, map_location=device)
@@ -177,6 +181,9 @@ class CampaignLearner:
 			self.value_pool, self.head_pool = state.get("value_pool"), state.get("head_pool", {})
 			self.head_var, self.head_scale_updates = state.get("head_var"), state.get("head_scale_updates", 0)
 			self.loss_scale, self.teacher_share = state.get("loss_scale"), state.get("teacher_share")
+			self.trust_ema = state.get("trust_ema")
+			self.head_residual, self.head_var_slow, self.head_residual_updates = state.get("head_residual"), state.get("head_var_slow"), state.get("head_residual_updates", 0)
+			self.grad_clips, self.clip_samples = state.get("grad_clips"), state.get("clip_samples", [])
 			print(f"campaign: resuming at version {self.version}", flush=True)
 		elif config.init_from:
 			state = torch.load(config.init_from, map_location=device)
@@ -186,6 +193,8 @@ class CampaignLearner:
 			migrate_subtypes(state, self.model)
 			self.model.load_state_dict(state["model"])
 			print(f"campaign: starting from {config.init_from}", flush=True)
+		if clip_settings(config.grad_clip_groups, "campaign.grad_clip_groups"):  # (the groups' clips by hand, over any calibrated ones)
+			self.grad_clips = clip_settings(config.grad_clip_groups, "campaign.grad_clip_groups")
 		# The teacher (config.teacher_kl): a frozen imitation of Nullkiller2 whose KL the update adds
 		self.teacher = None
 		if config.teacher_kl > 0 and config.learner == "process":
@@ -579,7 +588,7 @@ class CampaignLearner:
 			out_of_memory = None
 			with self.model_lock:
 				try:
-					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale={"var": getattr(self, "head_var", None), "ramp": min(1.0, getattr(self, "head_scale_updates", 0) / HEAD_SCALE_RAMP)} if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])))
+					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None)
 				except torch.OutOfMemoryError as error:  # (handled below, once the error's frames, and their tensors, are gone)
 					out_of_memory = str(error)[:200]
 			if out_of_memory is not None:
@@ -600,6 +609,9 @@ class CampaignLearner:
 				self._note_value_ev(metrics)
 				self.teacher_weight = adapted_teacher_weight(self.teacher_weight, metrics.get("teacher_kl"), self.config.teacher_kl_target)
 				self._note_gradients(metrics)
+				self._calibrate_clips(metrics)
+				if metrics.get("head_residual") is not None:  # (config.head_scale_by "residual": for the next update; its ramp goes on)
+					self.head_residual, self.head_var_slow, self.head_residual_updates = metrics["head_residual"], metrics["head_var_slow"], self.head_residual_updates + 1
 				if metrics.get("head_var") is not None:  # (config.head_scale: for the next update; the ramp goes on)
 					self.head_var, self.head_scale_updates = metrics["head_var"], getattr(self, "head_scale_updates", 0) + 1
 					weights = metrics.get("head_weights") or {}
@@ -659,14 +671,28 @@ class CampaignLearner:
 		if any(pool is None for pool in pools):
 			return  # (no real shares measured yet)
 		self.value_pool, self.value_ev = pools, evs
+		today, memory = self.trust_today(), self.config.trust_memory
+		self.trust_ema = today if getattr(self, "trust_ema", None) is None else memory * self.trust_ema + (1 - memory) * today
 
-	def trust(self):
-		"""How far the credit trusts the value heads, 0..1: their smoothed explained variance over the share prior's (the
-		worse of V5 and V7: ppo_update's value_ev) over trust_full_ev. The credit check (credit_check) applies apart, in labels.horizon_advantages: a fit this good
-		on the whole can still price a quick gain that costs by day 7, which shows as the step's error by action type."""
+	def trust_today(self):
+		"""How far the value heads' fit would have the credit trust them, 0..1: their smoothed explained variance over the
+		share prior's (the worse of V5 and V7: ppo_update's value_ev) over trust_full_ev."""
 		if self.value_ev is None:
 			return 0.0
 		return float(min(1.0, max(0.0, min(self.value_ev) / self.config.trust_full_ev)))
+
+	def trust(self):
+		"""How far the credit trusts the value heads, 0..1 (the schedule credit's share baseline, labels.horizon_advantages):
+		trust_today, since 2026-11-06 as a floored slow average (config.trust_floor, trust_memory; docs/optimizer_plan.md
+		step 4): max(trust_floor, its average at trust_memory an update). As a feedback variable a re-fit cut it 0.40 ->
+		0.25 and the credit went three quarters Monte Carlo, the noise slowing the re-fit's own signal. The credit check
+		(credit_check) applies apart, in labels.horizon_advantages: a fit this good on the whole can still price a quick
+		gain that costs by day 7, which shows as the step's error by action type."""
+		if self.value_ev is None:
+			return 0.0  # (nothing measured yet: no ground for the floor either, the credit leans on the real outcome)
+		average = getattr(self, "trust_ema", None)
+		value = average if self.config.trust_memory > 0 and average is not None else self.trust_today()
+		return float(max(self.config.trust_floor, value))
 
 	def _note_head_ev(self, forecasts):
 		"""Each head's explained variance at the day starts (start_forecasts), its parts pooled over ~10 updates
@@ -771,9 +797,22 @@ class CampaignLearner:
 			self.writer.add_scalar("eval/campaign_value_loss", row["value_loss_fresh"], self.version)
 		if metrics.get("value_unexplained", float("nan")) == metrics.get("value_unexplained", float("nan")):  # (train.ppo_update: not a column)
 			self.writer.add_scalar("eval/campaign_value_unexplained", metrics["value_unexplained"], self.version)
-		for name in ("value_corr", "value_spread", "label_spread", "gpu_anchor_mb", "update_seconds", "prepass_seconds", "wait_seconds", "sync_seconds", "cpu_share", "stopped_pass", "signal_ratio", "attributed_taken_share", "attributed_taken_mean", "attributed_own_std", "attributed_taken_std", "forward_seconds", "losses_seconds", "backward_seconds", "optimizer_seconds"):
+		for name in ("value_corr", "value_spread", "label_spread", "gpu_anchor_mb", "update_seconds", "prepass_seconds", "wait_seconds", "sync_seconds", "cpu_share", "stopped_pass", "signal_ratio", "attributed_taken_share", "attributed_taken_mean", "attributed_own_std", "attributed_taken_std", "forward_seconds", "losses_seconds", "backward_seconds", "optimizer_seconds",
+				"value_learning_rate", "value_readout_rms", *(f"grad_norm_{g}" for g in GRAD_GROUPS), *(f"clip_bound_{g}" for g in GRAD_GROUPS)):
 			if metrics.get(name, float("nan")) == metrics.get(name, float("nan")):
 				self.writer.add_scalar(f"campaign/{name}", metrics[name], self.version)
+		# docs/optimizer_plan.md's readings: the trust before its floor and average, the share of each group's gradient that
+		# is signal (train.signal_fraction), each value head's fresh excess loss and its weight (config.head_scale)
+		self.writer.add_scalar("campaign/trust_today", self.trust_today(), self.version)
+		self.writer.add_scalar("campaign/clipped_by_group", float(bool(metrics.get("clipped_by_group"))), self.version)
+		for group, fraction in (metrics.get("signal_fraction") or {}).items():
+			self.writer.add_scalar("campaign/signal_fraction" if group == "all" else f"campaign_signal/{group}", fraction, self.version)
+		for table, prefix in ((metrics.get("head_fresh") or {}, "fresh"), (metrics.get("head_weights") or {}, "weight"), (metrics.get("head_residual") or {}, "residual")):
+			for name, values in table.items():
+				for k, value in enumerate(values):
+					head = "Vend" if name == "end" else f"{'V' if name == 'share' else 'G'}{c.VALUE_OFFSETS[k]}"
+					if value == value:
+						self.writer.add_scalar(f"campaign_heads/{prefix}_{head}", value, self.version)
 		for kind, gap in sums.get("credit_gaps", {}).items():  # (the credit check's t-statistic per action type)
 			self.writer.add_scalar(f"campaign_credit/{kind.lower()}", gap, self.version)
 		for kind, gap in sums.get("end_credit_gaps", {}).items():
@@ -804,8 +843,8 @@ class CampaignLearner:
 			# -0.65 at a correlation of +0.22 and a spread as wide as the outcomes', 2026-10-30, while the pooled rose)
 			"  value ev " + "/".join(f"{row[f'head_ev_v{k}']:+.2f}" for k in c.VALUE_OFFSETS)
 			+ f" (this update {row[f'value_ev_d{c.VALUE_OFFSETS[-1]}']:+.2f}: corr {metrics.get('value_corr', float('nan')):+.2f}, spread {metrics.get('value_spread', float('nan')):.3f} vs {metrics.get('label_spread', float('nan')):.3f}, unexplained {metrics.get('value_unexplained', float('nan')):.2f})"
-			+ "  growth ev " + "/".join(f"{row[f'head_ev_g{k}']:+.2f}" for k in c.VALUE_OFFSETS) + f"  end ev {row['head_ev_vend']:+.2f} (credit {row['end_credit']:.2f})"
-			+ f"  kl {row['last_kl']:.4f} (target {metrics.get('kl_target', float('nan')):.4f})" + (f"  teacher kl {row['teacher_kl']:.3f} (weight {row['teacher_weight']:.2f})" if self.teacher is not None else "") + (f"  advice {row['advised']:.0%} of turns and exchanges, ours its {row['teacher_agree']:.0%}, teacher ce {row['teacher_ce']:.3f} (weight {row['teacher_weight']:.2f})" if self.config.nk2_advice > 0 else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f}  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f}" + (f", every hero slot in {metrics['full_windows']} steps" if metrics.get("full_windows") else "") + (", window budget refused" if metrics.get("window_budget_ok") is False else "") + f")  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
+			+ "  growth ev " + "/".join(f"{row[f'head_ev_g{k}']:+.2f}" for k in c.VALUE_OFFSETS) + f"  end ev {row['head_ev_vend']:+.2f} (credit {row['end_credit']:.2f})  trust {row['trust']:.2f} (today {self.trust_today():.2f})"
+			+ f"  kl {row['last_kl']:.4f} (target {metrics.get('kl_target', float('nan')):.4f})" + (f"  teacher kl {row['teacher_kl']:.3f} (weight {row['teacher_weight']:.2f})" if self.teacher is not None else "") + (f"  advice {row['advised']:.0%} of turns and exchanges, ours its {row['teacher_agree']:.0%}, teacher ce {row['teacher_ce']:.3f} (weight {row['teacher_weight']:.2f})" if self.config.nk2_advice > 0 else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f} (fraction {(metrics.get('signal_fraction') or {}).get('all', float('nan')):.3f})  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f}" + (f", every hero slot in {metrics['full_windows']} steps" if metrics.get("full_windows") else "") + (", window budget refused" if metrics.get("window_budget_ok") is False else "") + f")  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
 			flush=True,
 		)
 
@@ -818,7 +857,7 @@ class CampaignLearner:
 
 		state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
 		optimizer = {} if self.worker else {"optimizer": self.optimizer.state_dict()}  # (the process's is in checkpoint_latest.pt)
-		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "model_kwargs": self.kwargs}, path)
+		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "model_kwargs": self.kwargs}, path)
 
 	# ---- the loss shares (config.loss_shares) ----
 
@@ -840,6 +879,27 @@ class CampaignLearner:
 		shares = self.loss_shares()
 		return {**self.loss_scale["weight"], "kl_teacher": shares["teacher"] / shares["policy"]}
 
+	def _head_scale(self):
+		"""ppo_update's head_scale (config.head_scale): the heads' running target variances and the weights' ramp; with
+		head_scale_by "residual" also their running fresh excess, the slow variances that scale it, and how far the
+		residual weights have ramped in (HEAD_SCALE_RAMP updates from the first)."""
+		scale = {"var": getattr(self, "head_var", None), "ramp": min(1.0, getattr(self, "head_scale_updates", 0) / HEAD_SCALE_RAMP)}
+		if self.config.head_scale_by == "residual":
+			scale.update(residual=self.head_residual, var_slow=self.head_var_slow, residual_ramp=min(1.0, self.head_residual_updates / HEAD_SCALE_RAMP))
+		return scale
+
+	def _calibrate_clips(self, metrics):
+		"""(config.grad_clip_by_group) The update's steps' gradient norms (ppo_update's grad_norms) into the calibration
+		until it holds grad_clip_calibration steps; then each group's clip is its median and the scale the total's
+		(train.calibrated_clips), kept for the run (re-measured at a deploy only: no controller)."""
+		norms = metrics.pop("grad_norms", None) or []
+		if not self.config.grad_clip_by_group or self.grad_clips is not None:
+			return
+		self.clip_samples = self.clip_samples + [[float(x) for x in step] for step in norms]
+		if len(self.clip_samples) >= self.config.grad_clip_calibration:
+			self.grad_clips = calibrated_clips(self.clip_samples, GRAD_GROUPS)
+			print(f"campaign: the gradient clipped by group from the next update, at the medians of {len(self.clip_samples)} steps' norms: " + "  ".join(f"{name} {self.grad_clips[name]:.4g}" for name in GRAD_GROUPS) + f"; all then x {self.config.grad_clip} / {self.grad_clips['typical']:.4g} (the total's median)", flush=True)
+
 	def _note_gradients(self, metrics):
 		"""After an update: each term's gradient on the shared layers as it entered the loss (grad_shared_*: its norm at
 		weight 1, grad_raw_*, times its weight) into metrics; with the loss shares, each term's log norm into its running
@@ -859,7 +919,8 @@ class CampaignLearner:
 				old = state["log_norm"].get(term)
 				state["log_norm"][term] = math.log(norm) if old is None else LOSS_SCALE_MEMORY * old + (1 - LOSS_SCALE_MEMORY) * math.log(norm)
 		shares, norms = self.loss_shares(), state["log_norm"]
-		if "policy" in norms:
+		frozen = bool(self.config.loss_shares_freeze) and self.version >= self.config.loss_shares_freeze  # (step 3: measured, not moved)
+		if "policy" in norms and not frozen:
 			for term in ("value", "teacher", "foresight"):
 				if term in norms:
 					target = shares[term] / shares["policy"] * math.exp(norms["policy"] - norms[term])
@@ -869,7 +930,7 @@ class CampaignLearner:
 					state["weight"][term] = float(np.clip(np.clip(target, weight / LOSS_SCALE_STEP, weight * LOSS_SCALE_STEP), 1e-4, 1e6))
 		now = {term: metrics[f"grad_shared_{term}"] for term in LOSS_TERMS}
 		total = sum(v for v in now.values() if np.isfinite(v))
-		print("campaign loss shares (target / this update's): " + "  ".join(f"{term} {shares[term]:.2f}/{now[term] / total if total > 0 and np.isfinite(now[term]) else float('nan'):.2f}" for term in LOSS_TERMS) + "  weights next: " + "  ".join(f"{term} {state['weight'][term]:.3g}" for term in ("value", "teacher", "foresight")), flush=True)
+		print("campaign loss shares (target / this update's): " + "  ".join(f"{term} {shares[term]:.2f}/{now[term] / total if total > 0 and np.isfinite(now[term]) else float('nan'):.2f}" for term in LOSS_TERMS) + "  weights next: " + "  ".join(f"{term} {state['weight'][term]:.3g}" for term in ("value", "teacher", "foresight")) + (f" (frozen since v{self.config.loss_shares_freeze})" if frozen else ""), flush=True)
 
 	# ---- evaluation ----
 
