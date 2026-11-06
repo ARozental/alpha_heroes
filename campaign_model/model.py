@@ -771,8 +771,11 @@ class CustomFeatures(nn.Module):
 		to the weaker hero give_all_cost_weight, a GATHER into a scout gather_cost_weight. DROP's its own (drop_prior)."""
 		gains = self.multi_gain(x, f)
 		prior = self.multi_weight_value() * ft.value_logit(gains)
-		drops = (c.MultiKind.DROP_SLOW, c.MultiKind.DROP_FOREIGN)
-		prior[:, :HO, list(drops)] = self.drop_prior(x, f, gains[:, :HO, list(drops)])  # (DROP rows are our heroes)
+		# (DROP rows are our heroes; one kind at a time: a list index is a CPU tensor, its copy breaks CUDA graph capture,
+		# and every campaign step of daac154's went eager, 3-4x slower, 2026-11-05)
+		slow, foreign = c.MultiKind.DROP_SLOW, c.MultiKind.DROP_FOREIGN
+		drops = self.drop_prior(x, f, torch.stack([gains[:, :HO, slow], gains[:, :HO, foreign]], dim=-1))
+		prior[:, :HO, slow], prior[:, :HO, foreign] = drops[..., 0], drops[..., 1]
 		cost = torch.zeros_like(prior)
 		weaker = (1.0 - self.stronger_receiver(x, f)) * self.give_all_cost_weight()
 		for kind in (c.MultiKind.GIVE_ALL, c.MultiKind.TAKE_BEST, c.MultiKind.TAKE_BEST_FAST):
