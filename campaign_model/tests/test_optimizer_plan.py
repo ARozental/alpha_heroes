@@ -296,3 +296,22 @@ def test_the_clips_calibrate_once_and_stay():
 	off = learner(CampaignConfig(grad_clip_by_group=False, grad_clip_calibration=1))
 	off._calibrate_clips({"grad_norms": [[1.0] * 7]})
 	assert off.grad_clips is None and off.clip_samples == []
+
+
+def test_moments_of_another_shape_start_fresh():
+	"""A parameter saved under the same name at another shape (a part rebuilt: model.REPLACED_HEADS) gets fresh moments
+	(moments_by_name), never the old ones: Adam's step would fail on them or mix them in."""
+	from battle_model.optim import moments_by_name
+
+	old, new = torch.nn.Linear(3, 2), torch.nn.Linear(4, 2)
+	saved = torch.optim.AdamW(old.parameters(), lr=1e-3)
+	old(torch.randn(5, 3)).sum().backward()
+	saved.step()
+	kept = saved.state[old.bias]["exp_avg"].clone()  # (the loaded moments may share its storage)
+	optimizer = torch.optim.AdamW(new.parameters(), lr=1e-3)
+	fresh, gone = moments_by_name(optimizer, new, saved.state_dict(), ["weight", "bias"])
+	assert fresh == ["weight"] and gone == []
+	new(torch.randn(5, 4)).sum().backward()
+	optimizer.step()  # (no shape error)
+	torch.testing.assert_close(optimizer.state[new.bias]["exp_avg"], kept * 0.9 + 0.1 * new.bias.grad)  # (the bias's kept)
+	assert optimizer.state[new.weight]["exp_avg"].shape == new.weight.shape

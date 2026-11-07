@@ -1419,11 +1419,19 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"encode_options.numbers", "build_identity", "artifact_q", "artifact_target", "encode_hero.carried", "multi_q", "multi_kind",
 	"privileged",  # (2026-11-06: the privileged critic, its corrections 0 at the start)
 )
+# Training-only parts rebuilt since, by prefix: a checkpoint's weights for them that the loading model lacks, or of
+# another shape, are dropped, the part starting again as a new model has it (2026-11-07: the privileged critic's first
+# design, privileged.pair and privileged.out, replaced by the user's)
+REPLACED_HEADS = ("privileged.",)
 
 
 def with_added(state_dict, own):
 	"""state_dict (a checkpoint's) with the ADDED parameters it lacks at 0 and the ADDED_HEADS' it lacks as the loading
-	model has them; own: the loading model's state_dict."""
+	model has them, and without the REPLACED_HEADS' it holds that the model has not as they are; own: the loading
+	model's state_dict."""
+	stale = [key for key, value in state_dict.items() if key.startswith(REPLACED_HEADS) and (key not in own or own[key].shape != value.shape)]
+	if stale:
+		state_dict = {key: value for key, value in state_dict.items() if key not in stale}
 	missing = {key: torch.zeros_like(own[key]) for key in ADDED if key in own and key not in state_dict}
 	missing.update({key: value.clone() for key, value in own.items() if key.startswith(ADDED_HEADS) and key not in state_dict})
 	return {**state_dict, **missing} if missing else state_dict

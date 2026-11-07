@@ -701,7 +701,8 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 	"fs:<label>": the foresight's), and its minibatch's counts (count_credit, count_keep, count_share, count_growth,
 	count_end) and its share of the minibatch ("share"): the micro-batches' gradients add up to the minibatch's.
 	privileged: the model's PrivilegedCritic, trained here on the batch's rivals ("priv_*", train.ppo_update's) at the
-	value heads' own losses, every input detached (its loss reaches only its own weights); logged as value_privileged."""
+	share heads' and V_end's own losses, every input detached (its loss reaches only its own weights); logged as
+	value_privileged (those heads' mean)."""
 	from .foresight import PART_NAMES, ForesightConfig, foresight_loss
 
 	keep = batch["keep"]
@@ -730,16 +731,12 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 	value, own = value / heads, own / heads
 	privileged_part = torch.zeros((), device=keep.device)
 	if privileged is not None and "priv_rivals" in batch:  # (the privileged critic: on top of the critic, detached)
-		corr = privileged(out["value_hidden"].detach(), batch["priv_rivals"], batch["priv_mask"], batch["priv_has"], batch["priv_own_phi"], batch["priv_rival_phi"], batch["priv_age"])
+		corr = privileged(out["value_hidden"].detach(), batch["priv_rivals"], batch["priv_mask"], batch["priv_share"])
 		k = c.N_VALUE_OFFSETS
 		privileged_part = head_loss(out["value_logit"].detach() + corr[:, :k], batch["targets"], batch["share_valid"], batch["count_share"]).sum()
-		if "growth" in batch:
-			now = out["phi"].detach().clamp(min=PHI_FLOOR).log().unsqueeze(-1)
-			scaled = ((batch["growth"] - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
-			privileged_part = privileged_part + config.growth_weight * head_loss(out["growth_logit"].detach() + corr[:, k : 2 * k], scaled, batch["growth_valid"], batch["count_growth"]).sum()
 		if "end" in batch:
-			privileged_part = privileged_part + head_loss((out["end_logit"].detach() + corr[:, 2 * k]).unsqueeze(-1), batch["end"].unsqueeze(-1), batch["end_valid"].unsqueeze(-1), batch["count_end"].unsqueeze(-1)).sum()
-		privileged_part = privileged_part / heads
+			privileged_part = privileged_part + head_loss((out["end_logit"].detach() + corr[:, k]).unsqueeze(-1), batch["end"].unsqueeze(-1), batch["end_valid"].unsqueeze(-1), batch["count_end"].unsqueeze(-1)).sum()
+		privileged_part = privileged_part / (k + (1 if "end" in batch else 0))  # (its heads' mean: the share heads and V_end)
 	bonus = (entropy * keep).sum() / batch["count_keep"]
 	floor = (torch.relu(config.entropy_floor - entropy) * keep).sum() / batch["count_keep"]  # only decisions below it
 	# (the value's and the foresight's weights from the learner's loss shares, "lw:value" "lw:foresight"; 1 without)
@@ -785,7 +782,7 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 		advice_part.detach(),  # teacher_ce
 		value.detach(),  # value_weighted
 		outside_part,  # teacher_outside: our probability outside what the teacher's label is weighed against
-		privileged_part.detach(),  # value_privileged: the privileged critic's loss at the heads' own weights (value's scale)
+		privileged_part.detach(),  # value_privileged: the privileged critic's loss, its heads' mean at their own weights
 	]).float()
 	if split:  # (each term at weight 1 against the learner's loss shares, the loss_weights it sets: the plan's apart too;
 		# the privileged critic's not among them: it reaches its own weights only)
@@ -838,8 +835,8 @@ def ppo_update(
 	player and its place among the player's records, for config.memory_steps (sequence_order; None: each decision
 	alone). clips: the groups' gradient clips (clip_gradients; None: the one clip at grad_clip). privileged: each
 	decision's rivals for the privileged critic (config.privileged_critic; learner.privileged_rivals: "rivals" [N, R]
-	their decisions' rows here, -1 none, "present" [N, R] 1 a rival in the game, "own_phi" [N], "rival_phi" [N, R] the
-	ledger's log Φ at the day's start, "age" [N, R] days), or None. Returns (metrics, the KL control's new lr_scale)."""
+	their decisions' rows here, -1 none, "present" [N, R] 1 a rival alive in the game, "share_logit" [N] our true share's
+	logit as the day began), or None. Returns (metrics, the KL control's new lr_scale)."""
 	n, started = len(decisions), time.time()
 	clock = {"prepass": 0.0, "wait": 0.0, "steps": 0.0, "forward": 0.0, "losses": 0.0, "backward": 0.0, "optimizer": 0.0, "cpu": time.thread_time()}  # where the update's time goes (logged: the PC's step ran at half the GPU's pace, 2026-10-30)
 	# The foresight's labels (foresight.game_labels, v2), each decision's row: its loss joins the minibatch's, a share
@@ -942,11 +939,13 @@ def ppo_update(
 	# logits from this pass, the rivals' states gathered from them below
 	priv_t = None
 	if privileged is not None and config.privileged_critic and privileged_module is not None:
-		priv_t = {name: torch.from_numpy(np.asarray(privileged[name])).to(device) for name in ("rivals", "present", "own_phi", "rival_phi", "age")}
-		priv_t["mask"], priv_t["has"] = priv_t.pop("present").float(), (priv_t["rivals"] >= 0).float()
+		priv_t = {name: torch.from_numpy(np.asarray(privileged[name])).to(device) for name in ("rivals", "present", "share_logit")}
+		priv_t["present"] = priv_t["present"].float()
+		priv_t["mask"] = priv_t["present"] * (priv_t["rivals"] >= 0).float()  # (pooled: the rivals alive with a state)
 		priv_t["rivals"] = priv_t["rivals"].clamp(min=0)
+		priv_t["share_logit"] = priv_t["share_logit"].float()
 		state_all = torch.zeros(n, model.value_heads.in_features, device=device)
-		logits_all = {"share": torch.zeros(n, c.N_VALUE_OFFSETS, device=device), "growth": torch.zeros(n, c.N_VALUE_OFFSETS, device=device), "end": torch.zeros(n, device=device)}
+		logits_all = {"share": torch.zeros(n, c.N_VALUE_OFFSETS, device=device), "end": torch.zeros(n, device=device)}
 	gpu_anchor_mb = 0.0
 	with torch.no_grad():
 		chunk = config.prepass_batch or max(1, size // max(1, config.micro_batches))  # (no gradients, but at a whole minibatch it was the update's peak: 5.2 GB)
@@ -975,7 +974,7 @@ def ppo_update(
 				fresh["end"][index] = excess_loss(out["end_logit"].float().unsqueeze(-1), end_t[index].unsqueeze(-1))
 			if priv_t is not None:
 				state_all[index] = out["value_hidden"].float()
-				logits_all["share"][index], logits_all["growth"][index], logits_all["end"][index] = out["value_logit"].float(), out["growth_logit"].float(), out["end_logit"].float()
+				logits_all["share"][index], logits_all["end"][index] = out["value_logit"].float(), out["end_logit"].float()
 			gpu_anchor_mb = max(gpu_anchor_mb, gpu_held(device))
 		if device.type == "cuda":
 			torch.cuda.synchronize(device)
@@ -1003,32 +1002,29 @@ def ppo_update(
 		head_fresh["end"] = per_head(fresh["end"], end_valid.unsqueeze(-1))
 	del fresh
 	# The privileged critic's corrections as the update starts (no gradient), its fit (the share heads' unexplained, as
-	# value_unexplained's), and with config.privileged_credit the schedule credit's baselines from it (V7, G7, V_end)
+	# value_unexplained's), and with config.privileged_credit the schedule credit's baselines from it (V7, V_end; G7 the
+	# public one: the growth heads have no correction)
 	privileged_stats = {}
 	if priv_t is not None:
 		k = c.N_VALUE_OFFSETS
-		corr_all = torch.zeros(n, 2 * k + 1, device=device)
+		corr_all = torch.zeros(n, k + 1, device=device)
 		with torch.no_grad():
 			for first in range(0, n, 4096):
 				part = slice(first, first + 4096)
-				corr_all[part] = privileged_module(state_all[part], state_all[priv_t["rivals"][part]], priv_t["mask"][part], priv_t["has"][part], priv_t["own_phi"][part], priv_t["rival_phi"][part], priv_t["age"][part]).float()
+				corr_all[part] = privileged_module(state_all[part], state_all[priv_t["rivals"][part]], priv_t["mask"][part], priv_t["share_logit"][part]).float()
 		fresh_priv = excess_loss(logits_all["share"] + corr_all[:, :k], targets_t)
 		privileged_stats = {
 			"value_unexplained_privileged": float(masked(fresh_priv, share_valid)) / baseline if baseline > 1e-6 else float("nan"),
 			"privileged_correction_rms": float(corr_all.pow(2).mean().sqrt()),
-			"privileged_rivals": float(priv_t["has"].sum(dim=1).mean()),  # (the rivals' states a decision had, of privileged_present's rivals in the game)
-			"privileged_present": float(priv_t["mask"].sum(dim=1).mean()),
+			"privileged_rivals": float(priv_t["mask"].sum(dim=1).mean()),  # (the rivals pooled: alive with a state, of privileged_present's alive)
+			"privileged_present": float(priv_t["present"].sum(dim=1).mean()),
 			"privileged_head_fresh": {"share": per_head(fresh_priv, share_valid)},
 		}
-		if growth is not None:
-			now = log_phi.unsqueeze(-1)
-			privileged_stats["privileged_head_fresh"]["growth"] = per_head(excess_loss(logits_all["growth"] + corr_all[:, k : 2 * k], ((growth_t - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)), growth_valid)
 		if end is not None:
-			privileged_stats["privileged_head_fresh"]["end"] = per_head(excess_loss((logits_all["end"] + corr_all[:, 2 * k]).unsqueeze(-1), end_t.unsqueeze(-1)), end_valid.unsqueeze(-1))
+			privileged_stats["privileged_head_fresh"]["end"] = per_head(excess_loss((logits_all["end"] + corr_all[:, k]).unsqueeze(-1), end_t.unsqueeze(-1)), end_valid.unsqueeze(-1))
 		if config.privileged_credit:  # (the credit's baselines from the privileged critic: still functions of the state alone)
 			value_now = value_now + corr_all[:, k - 1]
-			growth_now = growth_now + corr_all[:, 2 * k - 1]
-			end_now = torch.sigmoid(logits_all["end"] + corr_all[:, 2 * k])
+			end_now = torch.sigmoid(logits_all["end"] + corr_all[:, k])
 		del logits_all, corr_all
 	# config.head_scale: the heads' target variances this update (the growth heads' on their 0..1 scale, over the value
 	# now), into the running ones (head_scale["var"]), and the heads' weights from them (head_weights)
@@ -1175,7 +1171,7 @@ def ppo_update(
 				if head_w is not None:  # (config.head_scale: each value head's weight, the update's)
 					batch.update(head_w)
 				if priv_t is not None:  # (the privileged critic's rivals: their states as the update started)
-					batch.update(priv_rivals=state_all[priv_t["rivals"][sub]], priv_mask=priv_t["mask"][sub], priv_has=priv_t["has"][sub], priv_own_phi=priv_t["own_phi"][sub], priv_rival_phi=priv_t["rival_phi"][sub], priv_age=priv_t["age"][sub])
+					batch.update(priv_rivals=state_all[priv_t["rivals"][sub]], priv_mask=priv_t["mask"][sub], priv_share=priv_t["share_logit"][sub])
 				batch.update(weights_t)
 				if advice_t is not None:  # Nullkiller2's advice, at the teacher's weight
 					batch.update({name: value[sub] for name, value in advice_t.items()}, count_advised=counts["advised"], teacher_weight=teacher_weight_t)

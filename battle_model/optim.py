@@ -113,9 +113,9 @@ def moments_by_name(optimizer, model, saved, saved_names):
 		ids = []
 		for p in group["params"]:
 			name = names[id(p)]
-			if name in by_name:
+			if name in by_name and by_name[name].get("exp_avg", p).shape == p.shape:
 				state[index] = by_name[name]
-			elif name not in had:
+			elif name not in had or name in by_name:  # (new, or of another shape now: fresh moments)
 				fresh.append(name)
 			ids.append(index)
 			index += 1

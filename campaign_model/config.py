@@ -178,12 +178,13 @@ class CampaignConfig:
 	# less), ramped in over HEAD_SCALE_RAMP updates from the variance's weights; "variance", 1 / its targets' running
 	# variance (swung with the batch's label spread: the share weights 6 to 9.8 update to update)
 	head_scale_by: str = "residual"
-	# The privileged critic (2026-11-06, the user's call on AlphaStar's lesson; model_v2.PrivilegedCritic): every value
-	# head's logit corrected from the other players' own critic states and their true Φ, training only, learned on top
-	# of the critic (its inputs detached: the critic, the trunk and the policy train as without it). privileged_critic:
-	# it learns and its fit is logged (eval/campaign_value_unexplained_privileged); privileged_credit: the schedule
-	# credit's baselines (V7, G7, V_end) are its, a lower-variance advantage (still unbiased: no baseline depends on the
-	# action), switched on once its fit is clearly better
+	# The privileged critic (2026-11-06, the user's call on AlphaStar's lesson; model_v2.PrivilegedCritic, the user's
+	# design of 2026-11-07): the share heads' and V_end's logits corrected from the other players' own critic states
+	# (max-pooled) and our true share now, training only, learned on top of the critic (its inputs detached: the
+	# critic, the trunk and the policy train as without it). privileged_critic: it learns and its fit is logged
+	# (eval/campaign_value_unexplained_privileged); privileged_credit: the schedule credit's baselines V7 and V_end are
+	# its, a lower-variance advantage (still unbiased: no baseline depends on the action), switched on once its fit is
+	# clearly better
 	privileged_critic: bool = True
 	privileged_credit: bool = False
 	# The teacher's KL (AlphaStar's KL to its supervised policy, 2026-10-31: 1,020 -> 1,400 Elo in its ablation): each

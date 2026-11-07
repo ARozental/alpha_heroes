@@ -209,6 +209,14 @@ def share_change_scale(change):
 	return (np.clip(change, -SHARE_CHANGE_CAP, SHARE_CHANGE_CAP) + SHARE_CHANGE_CAP) / (2 * SHARE_CHANGE_CAP)
 
 
+def share_now(table, color, day, last):
+	"""A player's share as its day began (share_table's table: that day's ledger is the end of the day before), else
+	the first one there is: the change heads' anchor (share_change_labels) and the privileged critic's input."""
+	days = table.get(color, {})
+	before = [k for k in days if k <= min(day - 1, last)]
+	return days[max(before)] if before else days[min(days)] if days else 0.5
+
+
 def share_change_labels(game, empire=EmpireConfig()):
 	"""Per decision [N, N_VALUE_OFFSETS] (config.share_target "change", the user's design of 2026-10-31): how much our
 	share of all empires' value changes in logit from the decision's day to VALUE_OFFSETS days on, on the heads' 0..1
@@ -219,10 +227,7 @@ def share_change_labels(game, empire=EmpireConfig()):
 	table, _, last, ended = tables(game, empire)
 	rows = []
 	for d in game.decisions:
-		# Now: as the decision's day began (its ledger is the end of the day before), else the first one there is
-		days = table.get(d.color, {})
-		before = [day for day in days if day <= min(d.day - 1, last)]
-		now = share_logit(days[max(before)] if before else days[min(days)] if days else 0.5)
+		now = share_logit(share_now(table, d.color, d.day, last))
 		rows.append([share_logit(share_at(table, d.color, d.day + k, last)) - now if ended or d.day + k <= last else np.nan for k in c.VALUE_OFFSETS])
 	return share_change_scale(np.array(rows, dtype=np.float32).reshape(-1, c.N_VALUE_OFFSETS)).astype(np.float32)
 

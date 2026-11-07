@@ -48,12 +48,12 @@ from battle_model.supply import trim_memory
 
 from . import constants as c
 from . import evaluate
-from .empire import EmpireConfig, empire_value
+from .empire import STATUS_INGAME, EmpireConfig, empire_value
 from .failures import NAMES as FAILURES, failure_modes
 from .features import SKILLS
 from .labels import (
 	COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, attributed_labels, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
-	label, ladder_targets, pooled_ev, residual_variances, share_change_labels, tables,
+	label, ladder_targets, pooled_ev, residual_variances, share_change_labels, share_logit, share_now, tables,
 )
 from .advice import teacher_sets
 from .foresight import LABEL_NAMES, labels_of
@@ -1019,43 +1019,44 @@ def precomputed(future, game=None):
 
 
 def privileged_rivals(game, fresh, first_row, empire=EmpireConfig(), rivals=None):
-	"""The privileged critic's rivals (model_v2.PrivilegedCritic) of a game's fresh decisions, rows first_row.. of the
-	update: for each, every other player of the game's last fresh decision on a day before its own (its row; -1 none:
-	before the day, so nothing in it follows this decision), how many days before, and the ledger's log Φ at the start of
-	its day (the end of the day before: labels.tables), its own and each rival's, a rival without a decision too.
-	{"rivals" [N, R] int64, "present" [N, R] (1: a rival in the game), "age" [N, R], "own_phi" [N], "rival_phi" [N, R]};
-	R: model_v2.PRIVILEGED_RIVALS."""
+	"""The privileged critic's inputs (model_v2.PrivilegedCritic) for a game's fresh decisions, rows first_row.. of the
+	update: for each, every other player alive as its day began (the ledger's snapshot opening the day) and that
+	player's last fresh decision on a day before (its row; -1 none: before the day, so nothing in it follows this
+	decision), and our true share's logit as the day began (labels.share_now, the change labels' anchor). {"rivals" [N, R]
+	int64, "present" [N, R] (1: a rival alive in the game then), "share_logit" [N]}; R: model_v2.PRIVILEGED_RIVALS."""
 	from .model_v2 import PRIVILEGED_RIVALS
 
 	rivals = rivals or PRIVILEGED_RIVALS
-	_, value, _, _ = tables(game, empire)
+	table, _, last, _ = tables(game, empire)
 	kept = [d for d, keep in zip(game.decisions, fresh) if keep]
 	days, rows = {}, {}
 	for row, d in enumerate(kept, start=first_row):
 		days.setdefault(d.color, []).append(d.day)
 		rows.setdefault(d.color, []).append(row)
+	ledger_days, living, anchors = sorted(game.ledgers), {}, {}
 
-	known = {}
+	def alive(day):  # (the colors in the game as the day began: its snapshot, else the latest before it)
+		if day not in living:
+			i = max(bisect.bisect_right(ledger_days, day) - 1, 0)
+			snapshot = game.ledgers[ledger_days[i]] if ledger_days else {"players": []}
+			living[day] = {COLORS[p["color"]] for p in snapshot["players"] if p.get("status", STATUS_INGAME) == STATUS_INGAME}
+		return living[day]
 
-	def phi(color, day):  # (the last value on or before `day`, as labels.share_at; once a color and day)
-		if (color, day) not in known:
-			table = value.get(color, {})
-			before = [k for k in table if k <= day]
-			known[color, day] = math.log1p(table[max(before)]) if before else (math.log1p(table[min(table)]) if table else 0.0)
-		return known[color, day]
-
-	players = [color for color in COLORS if color in value]
+	players = [color for color in COLORS if color in table]
 	n = len(kept)
-	out = {"rivals": np.full((n, rivals), -1, np.int64), "present": np.zeros((n, rivals), np.float32), "age": np.zeros((n, rivals), np.float32), "own_phi": np.zeros(n, np.float32), "rival_phi": np.zeros((n, rivals), np.float32)}
+	out = {"rivals": np.full((n, rivals), -1, np.int64), "present": np.zeros((n, rivals), np.float32), "share_logit": np.zeros(n, np.float32)}
 	for i, d in enumerate(kept):
-		out["own_phi"][i] = phi(d.color, d.day - 1)
+		if (d.color, d.day) not in anchors:
+			anchors[d.color, d.day] = share_logit(share_now(table, d.color, d.day, last))
+		out["share_logit"][i] = anchors[d.color, d.day]
+		now = alive(d.day)
 		for slot, color in enumerate([other for other in players if other != d.color][:rivals]):
+			if color not in now:
+				continue
 			out["present"][i, slot] = 1.0
-			out["rival_phi"][i, slot] = phi(color, d.day - 1)
 			j = bisect.bisect_left(days.get(color, []), d.day) - 1  # (a player's decisions are in its order: days only grow)
 			if j >= 0:
 				out["rivals"][i, slot] = rows[color][j]
-				out["age"][i, slot] = d.day - days[color][j]
 	return out
 
 

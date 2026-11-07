@@ -196,42 +196,40 @@ class Foresight(nn.Module):
 
 
 # The privileged critic (2026-11-06, the user's call on AlphaStar's lesson: its value functions saw the opponent's
-# observations in training, best-response win rate 22% -> 82%): a correction to every value head's logit from each
-# other player's own critic state, training only (the policy never reads it; the server has no rival states)
+# observations in training, best-response win rate 22% -> 82%): a correction to the share heads' and V_end's logits from
+# the other players' own critic states, training only (the policy never reads it; the server has no rival states).
+# 2026-11-07, the user's design after its first day: the growth heads have none (their fresh loss was 1% worse with it:
+# our value's growth is our own data's), the rivals max-pooled as they are, our true share as an input
 PRIVILEGED_RIVALS = P - 1
-PRIVILEGED_HEADS = 2 * c.N_VALUE_OFFSETS + 1  # V2 V5 V7, G2 G5 G7, V_end
-PRIVILEGED_PAIR = 3  # each rival's own features beside the two states: its true Φ's log against ours, its state's age, whether it has one
-PRIVILEGED_WIDTH = 128
+PRIVILEGED_HEADS = c.N_VALUE_OFFSETS + 1  # V2 V5 V7 (our share's change), V_end
+PRIVILEGED_WIDTH = 32
 
 
 class PrivilegedCritic(nn.Module):
-	"""Every value head's logit correction [B, PRIVILEGED_HEADS] from what the update knows of the other players: each
-	rival's own critic state (its value_hidden at its last decision before our decision's day: in self-play every player
-	is this model, so the update has its decisions; before the day, so nothing in it follows our action there), its
-	true Φ at the day's start against ours (the ledger's) and how many days old its state is; a rival without a state
-	(day 1, or not this model's decisions) still counts by its Φ. Each (our state, its state) pair through one shared
-	two-layer block, the same for every rival (a convolution of width 1 over them: their order, the colors', means
-	nothing); pooled by max (any rival much better off: the OR the user asked for) and mean over the rivals in the game,
-	whatever their number; then with our own state to the corrections, a zero layer: 0 at the start. Its inputs are
-	detached (train.micro_loss): it learns on top of the critic and moves nothing else."""
+	"""The share heads' and V_end's logit corrections [B, PRIVILEGED_HEADS], added to theirs (the public prediction from
+	our own data, its bias theirs): x = [our critic state (value_hidden), the rivals' critic states max-pooled (each of
+	its numbers the highest over the rivals alive with a state, each rival's at its last decision before our day: one
+	shape whatever their number; 0 with none), the logit of our true share as the day began (the ledger's: the change
+	heads' anchor)]; each correction a direct path from x plus one small dense layer from x, neither with a bias, both
+	paths' outputs at 0 to start (the public prediction exactly; Adam's first steps move it by ~ the rate x |x|). Its
+	inputs are detached (train.micro_loss): it learns on top of the critic and moves nothing else."""
 
 	def __init__(self, dim, width=PRIVILEGED_WIDTH):
 		super().__init__()
-		self.pair = nn.Sequential(nn.Linear(2 * dim + PRIVILEGED_PAIR, width), nn.GELU(), nn.Linear(width, width), nn.GELU())
-		self.out = zero_output(nn.Linear(2 * width + dim + 1, PRIVILEGED_HEADS))
+		self.dense = nn.Linear(2 * dim + 1, width)
+		self.direct = nn.Linear(2 * dim + 1, PRIVILEGED_HEADS, bias=False)
+		self.read = nn.Linear(width, PRIVILEGED_HEADS, bias=False)
+		nn.init.zeros_(self.direct.weight)
+		nn.init.zeros_(self.read.weight)
 
-	def forward(self, own, rivals, mask, has, own_phi, rival_phi, age):
-		"""own [B, d] our value_hidden, rivals [B, R, d] theirs (anything where has is 0), mask [B, R] (1: a rival in the
-		game), has [B, R] (1: its state is there), own_phi [B] and rival_phi [B, R] log Φ (the ledger's at the day's
-		start), age [B, R] days."""
-		has = has.float() * mask.float()
-		features = torch.stack([(rival_phi - own_phi[:, None]).clamp(-10.0, 10.0), torch.log1p(age.clamp(min=0.0)) * has, has], dim=-1)
-		pair = self.pair(torch.cat([own[:, None, :].expand(-1, rivals.shape[1], -1), rivals * has.unsqueeze(-1), features], dim=-1))
-		m = mask.unsqueeze(-1).float()
-		any_rival = (m.sum(dim=1) > 0).float()
-		most = torch.where(m > 0, pair, torch.full_like(pair, -1e4)).amax(dim=1) * any_rival  # (none: 0)
-		mean = (pair * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
-		return self.out(torch.cat([most, mean, own, m.sum(dim=1) / rivals.shape[1]], dim=-1))
+	def forward(self, own, rivals, mask, share_logit):
+		"""own [B, d] our value_hidden, rivals [B, R, d] theirs (anything where mask is 0), mask [B, R] (1: a rival alive
+		with a state), share_logit [B] our true share's logit now."""
+		m = mask.unsqueeze(-1) > 0
+		most = torch.where(m, rivals, torch.full_like(rivals, -1e4)).amax(dim=1)
+		most = torch.where(m.any(dim=1), most, torch.zeros_like(most))  # (no rival: 0)
+		x = torch.cat([own, most, share_logit.clamp(-10.0, 10.0).unsqueeze(-1)], dim=-1)
+		return self.direct(x) + self.read(F.gelu(self.dense(x)))
 
 
 class Memory(nn.Module):
