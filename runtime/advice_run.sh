@@ -90,6 +90,9 @@ rm -f runtime/train/*-joint7/drain  # (runtime/drain_restart.sh's: a start alway
 runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # campaign.memory_steps=2 (2026-11-05): the passes over pairs of a player's decisions, the memory carried from the first
 # into the second, so the losses reach its writer (the step graph replay 117 ms against 108 at 1, the GPU idle)
+# campaign.privileged_credit=true (2026-11-07): the schedule credit's V7 and V_end baselines from the privileged critic
+# (0fe2869, the user's design: over its first 45 updates unexplained 0.863 -> 0.806, V_end's fresh excess -23%, the share
+# heads' -5.5%); still unbiased (its inputs, the rivals' earlier states and our share as the day began, precede the decision)
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -98,5 +101,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
