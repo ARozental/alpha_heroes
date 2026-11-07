@@ -710,6 +710,9 @@ def add_failure_counts(total, counts):
 	return total
 
 
+IDLE_KINDS = {"shooter_idle_defend": ActionType.DEFEND, "shooter_idle_move": ActionType.MOVE, "shooter_idle_wait": ActionType.WAIT}  # (failure_counts' split of shooter_not_shooting)
+
+
 def failure_counts(records):
 	"""Signs of dumb play in a set of battle records (eval), {name: [times, chances]} (failure_modes: their shares):
 	escape_while_ahead    retreats and surrenders while our value head thought we were winning (V > 0)
@@ -720,13 +723,16 @@ def failure_counts(records):
 	                      longer shoot at full damage (waiting, then shooting at full damage, is common and fine; a wait
 	                      when only a half-damage shot was there is no failure). Defending while blocked is none (it
 	                      cannot shoot then). Before, a unit's whole round counted, kiting included
+	shooter_idle_defend, shooter_idle_move, shooter_idle_wait   the same chances, those wasted by defending, by moving
+	                      (not escaping melee) and by waiting (2026-11-07: which kind rose from epoch 8500; they add up
+	                      to shooter_not_shooting; the eval line's, no column)
 	worthless_cast        hero casts at a unit or hex that lose us value (predicted value < 0: e.g. a Frost Ring on our own
 	                      stacks); 0 is no sign: buffs, debuffs and summons change no health when cast (Slow, Shield)
 	cast_skipped_on_loss  in battles we lost, the share of the rounds our hero could cast in (one of our decisions had a
 	                      hero spell legal) where it cast nothing: a hero that died early counts only the rounds it was
 	                      there for (the share of mana left unspent counted those too)"""
 	from .data import summarize
-	counts = {name: [0, 0] for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss")}
+	counts = {name: [0, 0] for name in ("escape_while_ahead", "shooter_not_shooting", "worthless_cast", "cast_skipped_on_loss", *IDLE_KINDS)}
 	for r in records:
 		t = r.tensors
 		full = [bool(t["m_type"][i, ActionType.SHOOT]) and full_shot(t, i) for i in range(len(r.actions))]
@@ -742,6 +748,9 @@ def failure_counts(records):
 				wasted = kind == ActionType.DEFEND or (kind == ActionType.MOVE and not escaped[i])
 			counts["shooter_not_shooting"][0] += wasted
 			counts["shooter_not_shooting"][1] += 1
+			for name, which in IDLE_KINDS.items():
+				counts[name][0] += wasted and kind == which
+				counts[name][1] += 1
 		for i, a in enumerate(r.actions):
 			kind = a["type"]
 			if kind in (ActionType.RETREAT, ActionType.SURRENDER):
@@ -1204,7 +1213,7 @@ def train(config, resume=False):
 			print(f"eval  {epoch:4d}  FAILURE vs {config_for.eval_opponent}: shooters idle in {row['shooter_not_shooting']:.3f} of their full-damage chances, over {SHOOTER_IDLE_LIMIT} (greedy: the model or the metric is wrong)", flush=True)
 		print(f"eval  {epoch:4d}  total score {row['total_score']:+.3f}  vs {config_for.eval_opponent}, greedy: attack won {row['attack_win_rate']:.2f} {row['attack_reward']:+.3f} ({row['attack_vs_baseline']:+.3f} vs its own)  defence won {row['defence_win_rate']:.2f} {row['defence_reward']:+.3f} ({row['defence_vs_baseline']:+.3f} vs its own)  {row['seconds']}s"
 			f"  | sets: " + ", ".join(f"{k} {row[f'score_{k}']:+.3f}" for k in EVAL_SETS if row[f"score_{k}"] == row[f"score_{k}"]) +
-			f"  | failures: escape ahead {row['escape_while_ahead']}, shooter idle {row['shooter_not_shooting']}, worthless cast {row['worthless_cast']}, cast skipped on loss {row['cast_skipped_on_loss']}"
+			f"  | failures: escape ahead {row['escape_while_ahead']}, shooter idle {row['shooter_not_shooting']} (defend {row.get('shooter_idle_defend')}, move {row.get('shooter_idle_move')}, wait {row.get('shooter_idle_wait')}), worthless cast {row['worthless_cast']}, cast skipped on loss {row['cast_skipped_on_loss']}"
 			+ ("  | tricks: " + ", ".join(f"{k} {v:+.3f}" for k, v in row["hard_kinds"].items()) if row.get("hard_kinds") else ""), flush=True)
 		return row
 

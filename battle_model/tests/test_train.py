@@ -148,3 +148,29 @@ def test_the_battle_optimizers_groups_and_a_one_group_checkpoint():
 	load_optimizer(again, model, {"model": model.state_dict(), "optimizer": fresh.state_dict()})
 	for p in model.parameters():
 		assert torch.equal(again.state[p]["exp_avg_sq"], old.state[p]["exp_avg_sq"])
+
+
+def test_the_wasted_shots_are_split_by_kind(monkeypatch):
+	"""failure_counts' shooter_not_shooting split by how a full-damage shot was wasted (2026-11-07): defending, moving
+	without escaping melee, waiting until the unit's next decision that round has no full shot; the kinds add up."""
+	from types import SimpleNamespace
+
+	import numpy as np
+
+	from battle_model import data as battle_data
+	from battle_model import train as battle_train
+	from battle_model.constants import ActionType, N_ACTION_TYPES
+
+	full = [True, True, True, True, False]  # (decision 4: the waiting unit again, its full shot gone)
+	monkeypatch.setattr(battle_train, "full_shot", lambda t, i: full[i])
+	monkeypatch.setattr(battle_train, "melee_escapes", lambda t, rows, actions: [False] * len(rows))
+	monkeypatch.setattr(battle_data, "summarize", lambda events: SimpleNamespace(outcome=None))
+	m_type = np.zeros((5, N_ACTION_TYPES), bool)
+	m_type[:, ActionType.SHOOT] = True
+	tensors = {"m_type": m_type, "g_round": np.ones(5, np.int64), "g_active_unit": np.array([1, 2, 3, 4, 4])}
+	kinds = [ActionType.SHOOT, ActionType.DEFEND, ActionType.MOVE, ActionType.WAIT, ActionType.SHOOT]
+	record = SimpleNamespace(tensors=tensors, actions=[{"type": k} for k in kinds], events=[])
+	counts = battle_train.failure_counts([record])
+	assert counts["shooter_not_shooting"] == [3, 4]
+	assert counts["shooter_idle_defend"] == [1, 4] and counts["shooter_idle_move"] == [1, 4] and counts["shooter_idle_wait"] == [1, 4]
+	assert sum(counts[k][0] for k in battle_train.IDLE_KINDS) == counts["shooter_not_shooting"][0]
