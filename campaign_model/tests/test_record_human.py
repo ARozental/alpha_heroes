@@ -63,3 +63,17 @@ def test_the_human_flag_reads_back_from_a_record():
 	"""RECORD_HUMAN (32: AlphaMapAI.h) carries no fields of its own: the record parses as any other."""
 	(d,) = parse_records("RED", records(HUMAN, 1))
 	assert d.flags == HUMAN and d.index == 7 and zlib.decompress(d.inputs) == bytes(IN_BYTES)
+
+
+def test_the_sessions_settings_set_the_ais_and_instant_hero_moves(tmp_path, monkeypatch):
+	"""user_dir: the shared GUI settings kept, the computer players' AIs set, every hero's map moves instant."""
+	from campaign_model import record_human
+
+	shared = tmp_path / "shared"
+	(shared / "config").mkdir(parents=True)
+	(shared / "config" / "settings.json").write_text(json.dumps({"battle": {"speedFactor": 18}, "adventure": {"tileZoom": 64}}))
+	monkeypatch.setattr(record_human, "SHARED", shared)
+	path = record_human.user_dir(tmp_path / "run", {"adventureEnemyAI": "Nullkiller2", "combatAlliedAI": "BattleAI"})
+	settings = json.loads((path / "config" / "settings.json").read_text())
+	assert settings["battle"] == {"speedFactor": 18} and settings["ai"] == {"adventureEnemyAI": "Nullkiller2", "combatAlliedAI": "BattleAI"}
+	assert settings["adventure"] == {"tileZoom": 64, "heroMoveTime": 0, "enemyMoveTime": 0}

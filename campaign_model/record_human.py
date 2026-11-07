@@ -27,7 +27,7 @@ yours: nothing of it is recorded from then on. Each run is saved in a folder of 
   summary.json     each segment's days, decisions, battles, and your requests matched, approximate, and those with no
                    equal among our actions
 The run's VCMI user directory (vcmi-user: the shared game data and saves linked in, your GUI settings with the
-computer players' AIs set) and its logs are there too."""
+computer players' AIs set, every hero's map moves instant) and its logs are there too."""
 import argparse
 import contextlib
 import json
@@ -64,6 +64,9 @@ def user_dir(out, ai):
 	shared = SHARED / "config" / "settings.json"
 	settings = json.loads(shared.read_text()) if shared.exists() else {}
 	settings["ai"] = {**settings.get("ai", {}), **ai}
+	# Heroes on the map move at once, yours and the computer players' (VCMI's heroMoveTime, enemyMoveTime: a tile in 150 ms
+	# by default; 0 instant, the moves still shown; the user, 2026-11-07: no time spent watching heroes walk)
+	settings["adventure"] = {**settings.get("adventure", {}), "heroMoveTime": 0, "enemyMoveTime": 0}
 	(path / "config" / "settings.json").write_text(json.dumps(settings, indent="\t"))
 	return path
 
