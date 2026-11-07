@@ -421,7 +421,9 @@ def test_each_value_head_is_its_own_readout_and_starts_at_its_prior():
 
 def test_dumb_decisions_are_counted():
 	"""A turn ended with an unguarded pile in reach and no enemy hero in sight is a passed pickup; with an enemy hero in
-	sight it is not; troops moved into a mine's garrison (the other army) are troops left."""
+	sight it is not. A dialog with a mine's garrison (the other army) that closes with more of our creatures there than
+	when it opened left troops; one where a creature went in and came back out shuffled (2026-11-06: the moves into it
+	were counted before, and every one of 17 in 39 games was taken back)."""
 	from campaign_model.failures import failure_counts
 
 	x, tile = window_with(79)  # a resource pile two tiles east, a legal move
@@ -429,11 +431,20 @@ def test_dumb_decisions_are_counted():
 	x2 = {k: v.copy() for k, v in x.items()}
 	x2["h_present"][0, c.OWN_HEROES], x2["h_owner"][0, c.OWN_HEROES] = True, c.OWNER_SELF + 1  # an enemy hero in sight
 	risky = Decision("RED", 1, int(c.DecisionKind.TURN), 1, 1, int(c.ActionType.END), -1, -1, 0.0, (0.5,) * 3, 0, encoded(x2, 0))
-	left = int(np.ravel_multi_index((0, 0, c.OTHER_ARMY, 0), (c.N_HOLDERS, c.ARMY_SLOTS, c.N_HOLDERS, c.N_ARMY_AMOUNTS)))
-	taken = int(np.ravel_multi_index((c.OTHER_ARMY, 0, 0, 0), (c.N_HOLDERS, c.ARMY_SLOTS, c.N_HOLDERS, c.N_ARMY_AMOUNTS)))
-	army = [Decision("RED", 1, int(c.DecisionKind.EXCHANGE), 0, 1, int(c.ActionType.ARMY), i, -1, 0.0, (0.5,) * 3, 0, b"") for i in (left, taken)]
-	counts = failure_counts([end, risky, *army])
-	assert counts["pickup_passed_end"] == (1, 2) and counts["troops_left"] == (1, 2) and counts["pickup_passed_travel"] == (0, 0)
+	shape = (c.N_HOLDERS, c.ARMY_SLOTS, c.N_HOLDERS, c.N_ARMY_AMOUNTS)
+	give, take = (int(np.ravel_multi_index(i, shape)) for i in ((0, 0, c.OTHER_ARMY, 0), (c.OTHER_ARMY, 0, 0, 0)))
+
+	def exchange(action, index, garrison):  # an EXCHANGE decision whose garrison holds `garrison` creatures (slot 0)
+		state = {k: v.copy() for k, v in x.items()}
+		state["x_creature"][0, 0], state["x_count"][0, 0] = (5 if garrison else -1), garrison
+		return Decision("RED", 2, int(c.DecisionKind.EXCHANGE), 0, 1, int(action), index, -1, 0.0, (0.5,) * 3, 0, encoded(state, 0))
+
+	turn = Decision("RED", 2, int(c.DecisionKind.TURN), 0, 1, int(c.ActionType.END), -1, -1, 0.0, (0.5,) * 3, 0, encoded(x2, 0))
+	shuffled = [exchange(c.ActionType.ARMY, give, 0), exchange(c.ActionType.ARMY, take, 5), exchange(c.ActionType.END, -1, 0)]
+	left = [exchange(c.ActionType.ARMY, give, 0), exchange(c.ActionType.END, -1, 5)]
+	counts = failure_counts([end, risky, *shuffled, turn, *left])
+	assert counts["pickup_passed_end"] == (1, 3) and counts["pickup_passed_travel"] == (0, 0)
+	assert counts["troops_left"] == (1, 2) and counts["exchange_shuffle"] == (1, 2)
 
 
 def test_an_exchange_that_can_only_leave_troops_behind_closes(model):
