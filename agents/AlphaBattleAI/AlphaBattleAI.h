@@ -74,7 +74,11 @@ class AlphaBattleAI : public CBattleGameInterface
 	std::array<const CGHeroInstance *, 2> heroes{}; // per battle side, from battleStart
 	std::mt19937 rng;
 	float temperature = 1.0f;
-	bool delegated = false; // ALPHA_BATTLE_DELEGATE
+	bool delegated = false; // ALPHA_BATTLE_DELEGATE, or observing
+	// ALPHA_BATTLE_OBSERVE: another plays (a human's interface: agents/AlphaMapAI/Recorder.cpp passes us its battle
+	// events) and we record what it does, as delegated but with no AI of ours to play, its callback left as it is
+	bool observing = false;
+	bool refreshPending = false; // (delegated: a hero spell recorded, the stack still to act: its state again after it)
 	std::unique_ptr<EncodedBattle> delegatePending; // the state the delegate was asked to act in, until its action starts
 	uint32_t delegateStack = 0;
 	bool wasWaitingForRealize = false;

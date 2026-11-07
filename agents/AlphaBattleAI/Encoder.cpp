@@ -1028,6 +1028,35 @@ std::optional<ChosenAction> chosenAction(const EncodedBattle & e, const BattleAc
 			a.type = static_cast<int>(ActionType::HEAL);
 			a.unit = slotOf(targets[0]);
 			return isLegal(e, a) ? std::optional(a) : std::nullopt;
+		case EActionType::RETREAT:
+			a.type = static_cast<int>(ActionType::RETREAT);
+			return isLegal(e, a) ? std::optional(a) : std::nullopt;
+		case EActionType::SURRENDER:
+			a.type = static_cast<int>(ActionType::SURRENDER);
+			return isLegal(e, a) ? std::optional(a) : std::nullopt;
+		case EActionType::HERO_SPELL: // (2026-11-07, a human's recorder: engineAction's inverse)
+		{
+			// The destinations in engineAction's order: a unit, a hex, a second hex, a second unit. A player may aim a
+			// unit's spell at the hex it stands on, or a hex's at a unit: each reading tried until one is the model's
+			a.type = static_cast<int>(ActionType::HERO_SPELL);
+			a.spell = action.spell.getNum();
+			for(int reading = 0; reading < 3; ++reading)
+			{
+				a.targetUnit = a.targetHex = a.target2Hex = a.target2Unit = -1;
+				for(const auto & d : targets)
+				{
+					const bool asUnit = reading == 0 ? d.unitValue >= 0 : reading == 1;
+					const int unit = asUnit ? slotOf(d) : -1;
+					if(unit >= 0)
+						(a.targetUnit < 0 ? a.targetUnit : a.target2Unit) = unit;
+					else if(d.hexValue.isValid())
+						(a.targetHex < 0 ? a.targetHex : a.target2Hex) = d.hexValue.toInt();
+				}
+				if(isLegal(e, a))
+					return a;
+			}
+			return std::nullopt;
+		}
 		case EActionType::MONSTER_SPELL: // another spell than the one encoded (another Faerie Dragon draw) has no model action
 			if(targets.empty() || action.spell.getNum() != e.tensors.get(In::g_creature_spell))
 				return std::nullopt;

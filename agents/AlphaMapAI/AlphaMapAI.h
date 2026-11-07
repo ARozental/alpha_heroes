@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <random>
@@ -119,6 +120,7 @@ constexpr uint32_t RECORD_PLAN = 8; // Nullkiller2's plan in the same state besi
 // More of our legal entries that follow Nullkiller2 there, beside the advice's own (Advice.cpp: a step along its plan's
 // path for each hero, an exchange's moves toward the army it wants): the teacher's targets, never inputs
 constexpr uint32_t RECORD_ACCEPT = 16;
+constexpr uint32_t RECORD_HUMAN = 32; // a human player's decision (Recorder.cpp), recorded as a teacher's: its choice the player's
 
 /// Adventure-map AI: every decision is the campaign model's (campaign_model/), asked of the inference server; battles
 /// are played by the configured battle AI. Built on Nullkiller2's patterns for threads and queries (AIGateway).
@@ -204,6 +206,9 @@ class AlphaMapAI : public CAdventureAI
 	// The teacher's recorder (Teacher.cpp): the requests of Nullkiller2's with no equal among our actions, by kind; the
 	// matched ones, and those matched to our nearest amount (recruits, trades, splits) or area (a move out of reach)
 	bool teacher = false;
+	uint32_t observedFlag = RECORD_TEACHER; // (RECORD_HUMAN: a human player's recorder, Recorder.cpp)
+	std::unique_ptr<std::ofstream> raw; // ALPHA_RECORD_RAW (a human's recorder): every request as sent, JSON lines
+	std::mutex rawMutex;
 	int teacherMatched = 0;
 	int teacherApproximate = 0;
 	std::map<std::string, int> teacherUnmatched;
@@ -261,6 +266,11 @@ public:
 	// with that answer (observe's QueryReply)
 	void teacherBlockingDialog(const std::string & text, const std::vector<Component> & components, QueryID askID, int soundID, bool selection, bool cancel);
 	void teacherLevelUp(const CGHeroInstance * hero, const std::vector<SecondarySkill> & skills, QueryID queryID);
+	// A human player's recorder (Recorder.cpp, the AlphaRecorderAI library beside the client's player interface): the
+	// teacher's recording of the player's requests (RECORD_HUMAN), to ALPHA_RECORD_HUMAN_SOCKET, each request raw too
+	// (ALPHA_RECORD_RAW), no day cap; finishRecording sends what is left when the player leaves the game
+	void initHuman(std::shared_ptr<Environment> environment, std::shared_ptr<CCallback> callback);
+	void finishRecording();
 
 	std::string getBattleAIName() const override;
 	void initGameInterface(std::shared_ptr<Environment> env, std::shared_ptr<CCallback> callback) override;
@@ -315,6 +325,9 @@ private:
 	Choice sample(const Decision & decision, const Outputs & outputs);
 	void record(const Decision & decision, const Choice & choice, const Outputs & outputs, uint32_t version);
 	void sendRecords(bool final);
+	// observe's raw line of a request (ALPHA_RECORD_RAW): its fields as sent, and what of ours it was (serial: its
+	// record's, 0 none; choice: our action, or none with unmatched: why)
+	void rawRequest(const CPackForServer * pack, uint64_t serial, const Choice * choice, const std::string & unmatched);
 
 	// Inputs and legality (Encoder.cpp)
 	Decision encode(MapSchema::DecisionKind kind, ObjectInstanceID exchangeFirst = {}, ObjectInstanceID exchangeSecond = {});

@@ -38,6 +38,7 @@ PLAN = 8  # Nullkiller2's plan in the same state beside it (Decision.plan: Advic
 PLAN_FIELDS = struct.Struct("<" + "hhhhf" * c.OWN_HEROES)
 PLAN_ENTRY = 5
 ACCEPT = 16  # more of our entries that follow Nullkiller2 in the same state (Decision.accept: Advice.cpp; advice.py)
+HUMAN = 32  # a human player's decision (AlphaRecorderAI: agents/AlphaMapAI/Recorder.cpp; record_human.py): their choice, no model's logp
 ACCEPT_COUNT, ACCEPT_ENTRY = struct.Struct("<H"), struct.Struct("<hi")  # (after the plan, when flags has ACCEPT: their count, then each one's type and entry)
 # The questions the teacher's recorder records Nullkiller2's answers to (Teacher.cpp): the others are the model's own
 TEACHER_QUESTIONS = (c.DecisionKind.YES_NO, c.DecisionKind.SELECT, c.DecisionKind.LEVEL_UP)

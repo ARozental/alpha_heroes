@@ -85,7 +85,7 @@ std::atomic<int> dumpedDecisions{0};
 
 AlphaBattleAI::~AlphaBattleAI()
 {
-	if(cb)
+	if(cb && !observing) // (an observer's callback is the player's: never ours to set)
 		cb->waitTillRealize = wasWaitingForRealize;
 }
 
@@ -95,13 +95,15 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 	cb = CB;
 	// Save before the fallback touches the callback, both restore the same original value
 	wasWaitingForRealize = CB->waitTillRealize;
-	delegated = !playerSetting(*CB, "ALPHA_BATTLE_DELEGATE").empty();
-	if(delegated) // the baseline evals: another AI plays, we record what it does
+	observing = !playerSetting(*CB, "ALPHA_BATTLE_OBSERVE").empty();
+	delegated = observing || !playerSetting(*CB, "ALPHA_BATTLE_DELEGATE").empty();
+	if(delegated && !observing) // the baseline evals: another AI plays, we record what it does
 	{
 		fallback = CDynLibHandler::getNewBattleAI(playerSetting(*CB, "ALPHA_BATTLE_DELEGATE"));
 		fallback->initBattleInterface(ENV, CB);
 	}
-	CB->waitTillRealize = false;
+	if(!observing)
+		CB->waitTillRealize = false;
 
 	const auto seed = playerSetting(*CB, "ALPHA_BATTLE_SEED");
 	rng.seed(seed.empty() ? std::random_device{}() : static_cast<unsigned>(std::stoul(seed)));
@@ -156,7 +158,8 @@ void AlphaBattleAI::initBattleInterface(std::shared_ptr<Environment> ENV, std::s
 	inferenceName = playerSetting(*CB, "ALPHA_BATTLE_INFERENCE_MODEL");
 	if(inferenceName.empty())
 		inferenceName = "current";
-	loadModel();
+	if(!observing || !modelPath.empty() || !inferenceSocket.empty()) // (an observer without a model records zero outputs)
+		loadModel();
 }
 
 void AlphaBattleAI::loadModel()
@@ -256,7 +259,9 @@ void AlphaBattleAI::battleStart(const BattleID & battleID, const CCreatureSet * 
 		};
 		const auto * hero = cb->getBattle(battleID)->battleGetMyHero();
 		const auto * enemyHero = heroes[1 - static_cast<int>(side)];
-		const auto & played = modelFile; // which model version plays (the link may point at a newer one by now)
+		// which model version plays (the link may point at a newer one by now); observing, "human": the player played
+		// (ALPHA_BATTLE_OBSERVE's actor, ALPHA_BATTLE_ACTOR: Recorder.cpp sets it), the model's outputs beside it if any
+		const auto played = observing ? playerSetting(*cb, "ALPHA_BATTLE_ACTOR").empty() ? std::string("observed") : playerSetting(*cb, "ALPHA_BATTLE_ACTOR") : modelFile;
 		recordEvent("{\"event\": \"start\", \"model\": \"" + played + "\", \"our_side\": " + std::to_string(static_cast<int>(side)) + ", \"armies\": [" + army(army1) + ", " + army(army2) + "], \"machines\": [" + machines(BattleSide::ATTACKER) + ", " + machines(BattleSide::DEFENDER) + "], \"our_mana\": " + std::to_string(hero ? hero->mana : 0) + ", \"our_mana_max\": " + std::to_string(hero ? hero->manaLimit() : 0) + ", \"enemy_mana\": " + std::to_string(enemyHero ? enemyHero->mana : 0) + ", \"enemy_mana_max\": " + std::to_string(enemyHero ? enemyHero->manaLimit() : 0) + ", \"powers\": [" + std::to_string(battleStartValues.power[0]) + ", " + std::to_string(battleStartValues.power[1]) + "], \"heroes\": [[" + std::to_string(battleStartValues.heroLevel[0]) + ", " + std::to_string(battleStartValues.artifacts[0]) + "], [" + std::to_string(battleStartValues.heroLevel[1]) + ", " + std::to_string(battleStartValues.artifacts[1]) + "]]}");
 		try
 		{
@@ -428,7 +433,8 @@ void AlphaBattleAI::yourTacticPhase(const BattleID & battleID, int distance)
 {
 	if(delegated)
 	{
-		fallback->yourTacticPhase(battleID, distance);
+		if(fallback) // (observing: the player places their units)
+			fallback->yourTacticPhase(battleID, distance);
 		return;
 	}
 	// Our units, most valuable first, each placed once (or the model ends the phase); each placement is chosen from
@@ -524,7 +530,8 @@ void AlphaBattleAI::activeStack(const BattleID & battleID, const CStack * stack)
 			encodeAttackValues(*delegatePending, env->game()->gameState(), battleID, player, stats.attackValues, &attackCache);
 			delegateStack = stack->unitId();
 		}
-		fallback->activeStack(battleID, stack);
+		if(fallback) // (observing: the player acts)
+			fallback->activeStack(battleID, stack);
 		return;
 	}
 	// The defender too, a few rounds later (the attacker's rule goes first when both sides are ours): against BattleAI,
@@ -797,8 +804,10 @@ void AlphaBattleAI::execute(const BattleID & battleID, const CStack * stack, con
 void AlphaBattleAI::actionStarted(const BattleID & battleID, const BattleAction & action)
 {
 	history.actionStarted(*cb->getBattle(battleID), action);
-	// ALPHA_BATTLE_DELEGATE: the action the other AI took for the state it was asked about
-	if(delegatePending && action.stackNumber == static_cast<int>(delegateStack) && action.side == cb->getBattle(battleID)->battleGetMySide())
+	// ALPHA_BATTLE_DELEGATE: the action the other AI took for the state it was asked about (observing: the player's); a
+	// hero's own (a spell, a retreat, a surrender) is the side's, not the stack's: taken in the stack's state too
+	const bool byHero = action.actionType == EActionType::HERO_SPELL || action.actionType == EActionType::RETREAT || action.actionType == EActionType::SURRENDER;
+	if(delegatePending && (action.stackNumber == static_cast<int>(delegateStack) || byHero) && action.side == cb->getBattle(battleID)->battleGetMySide())
 	{
 		if(const auto chosen = chosenAction(*delegatePending, action))
 		{
@@ -811,7 +820,10 @@ void AlphaBattleAI::actionStarted(const BattleID & battleID, const BattleAction 
 		}
 		else
 			logAi->warn("AlphaBattleAI: the delegate's action %s has no model action; not recorded", action.toString());
-		delegatePending.reset();
+		if(action.actionType == EActionType::HERO_SPELL)
+			refreshPending = true; // (the stack still acts: its state once the spell is done, actionFinished)
+		else
+			delegatePending.reset();
 	}
 	if(fallback)
 		fallback->actionStarted(battleID, action);
@@ -820,6 +832,20 @@ void AlphaBattleAI::actionStarted(const BattleID & battleID, const BattleAction 
 void AlphaBattleAI::actionFinished(const BattleID & battleID, const BattleAction & action)
 {
 	history.actionFinished();
+	if(refreshPending && action.actionType == EActionType::HERO_SPELL) // (delegated: the stack's state after the spell)
+	{
+		refreshPending = false;
+		auto battle = cb->getBattle(battleID);
+		const auto * stack = battle->battleGetStackByID(delegateStack);
+		if(stack && stack->alive())
+		{
+			const auto player = cb->getPlayerID().value_or(PlayerColor::NEUTRAL);
+			delegatePending = std::make_unique<EncodedBattle>(encodeBattle(*battle, stack, *env, player, heroes[1 - static_cast<int>(battle->battleGetMySide())], battleStartValues, &history));
+			encodeAttackValues(*delegatePending, env->game()->gameState(), battleID, player, stats.attackValues, &attackCache);
+		}
+		else
+			delegatePending.reset();
+	}
 	if(simCheck && simCheckAction && action.actionType == simCheckAction->actionType && action.stackNumber == simCheckAction->stackNumber && action.side == simCheckAction->side)
 		compareWithSimulation(battleID);
 	if(tacticsPending && action.side == cb->getBattle(battleID)->battleGetMySide() && cb->getBattle(battleID)->battleGetTacticDist())

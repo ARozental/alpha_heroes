@@ -1,7 +1,7 @@
 # Built as part of VCMI via its EXTRA_AI_DIRS option. The adventure-map AI of campaign_model/: every decision is the
 # model's, asked of the inference server (battle_model/inference.py, family "campaign"); battles are a battle AI's.
 set(ALPHA_MAP_AI_SOURCES
-	AlphaMapAI.cpp Actions.cpp Advice.cpp Armies.cpp Encoder.cpp Ledger.cpp Match.cpp Tensors.cpp main.cpp ../AlphaBattleAI/InferenceClient.cpp
+	AlphaMapAI.cpp Actions.cpp Advice.cpp Armies.cpp Encoder.cpp Ledger.cpp Match.cpp Observe.cpp Tensors.cpp main.cpp ../AlphaBattleAI/InferenceClient.cpp
 	AlphaMapAI.h Ledger.h Schema.generated.h StdInc.h Tensors.h ../AlphaBattleAI/InferenceClient.h
 )
 find_package(ZLIB REQUIRED)
@@ -15,6 +15,16 @@ if(TARGET Nullkiller2)
 	target_link_libraries(AlphaMapAI PRIVATE Nullkiller2)
 	target_compile_definitions(AlphaMapAI PRIVATE ALPHA_MAP_NK2_ADVICE)
 endif()
+
+# A human player's recorder (Recorder.cpp): beside a human's player interface when ALPHA_RECORD_HUMAN is set (our patch
+# of vcmi/client/CPlayerInterface.cpp), each of their requests recorded as our decision doing the same, their battles
+# by AlphaBattleAI observing (campaign_model/record_human.py)
+set(ALPHA_RECORDER_SOURCES ${ALPHA_MAP_AI_SOURCES})
+list(REMOVE_ITEM ALPHA_RECORDER_SOURCES main.cpp)
+add_library(AlphaRecorderAI SHARED ${ALPHA_RECORDER_SOURCES} Recorder.cpp)
+target_include_directories(AlphaRecorderAI PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../AlphaBattleAI ${CMAKE_SOURCE_DIR})
+target_link_libraries(AlphaRecorderAI PRIVATE vcmi ZLIB::ZLIB)
+vcmi_set_output_dir(AlphaRecorderAI "AI")
 
 # Nullkiller2 as the campaign model's teacher (Teacher.cpp): Nullkiller2 playing, each of its turn requests recorded as
 # our decision doing the same (VCMI_ADVENTURE_AI_<COLOR>=AlphaTeacherAI; campaign_model/teacher.py)

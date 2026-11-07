@@ -467,6 +467,25 @@ void AlphaMapAI::playerStartsTurn(PlayerColor player)
 	}
 }
 
+// A human player's recorder leaving the game (Recorder.cpp): what is left sent, and the end as gameOver sends it
+void AlphaMapAI::finishRecording()
+{
+	if(recordSocket.empty() || !teacher)
+		return;
+	try
+	{
+		sendRecords(true);
+		std::scoped_lock lock(ledgerMutex);
+		sendToRecordServer(recordSocket, gameKey + ":ledger#end-" + playerID.toString(), ledgerJson(static_cast<const IGameInfoCallback &>(*cb).gameState(), cb->getDate(Date::DAY), true));
+	}
+	catch(const std::exception & e)
+	{
+		logAi->error("AlphaMapAI %s: the last records were not sent: %s", playerID.toString(), e.what());
+	}
+	if(raw)
+		raw->flush();
+}
+
 void AlphaMapAI::gameOver(PlayerColor player, const EVictoryLossCheckResult & victoryLossCheckResult)
 {
 	if(!recordSocket.empty() && player == playerID)
