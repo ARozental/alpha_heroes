@@ -21,27 +21,42 @@ def records(flags, n):
 
 
 def test_a_session_is_saved_with_each_players_actor_and_the_humans_battles(tmp_path):
-	key = "human-test"
+	"""One start of a game: its recorders' keys seconds apart (@1000, @1003) are one segment."""
 	messages = {
-		f"{key}:RED": [records(HUMAN, 3)],
-		f"{key}:BLUE": [records(TEACHER, 2)],
-		f"{key}:TAN": [records(0, 1)],
-		f"{key}:ledger": [json.dumps({"day": 1, "players": []}).encode(), json.dumps({"day": 2, "players": []}).encode()],
-		f"{key}:RED:done": [json.dumps({"teacher": {"matched": 3, "approximate": 1, "unmatched": {"BuyArtifact": 2}}}).encode()],
-		f"{key}-human-RED": [b"ALPHAREC1\nfirst", b"ALPHAREC1\nsecond"],
+		"human-x@1000:RED": [records(HUMAN, 3)],
+		"human-x@1003:BLUE": [records(TEACHER, 2)],
+		"human-x@1003:TAN": [records(0, 1)],
+		"human-x@1000:ledger": [json.dumps({"day": 1, "players": []}).encode(), json.dumps({"day": 2, "players": []}).encode()],
+		"human-x@1000:RED:done": [json.dumps({"teacher": {"matched": 3, "approximate": 1, "unmatched": {"BuyArtifact": 2}}}).encode()],
+		"human-x@1000-human-RED": [b"ALPHAREC1\nfirst", b"ALPHAREC1\nsecond"],
 	}
 	summary = save(tmp_path, messages)
-	assert summary["players"] == {"RED": "human", "BLUE": "nk2", "TAN": "alpha"} and summary["decisions"] == 6
-	assert summary["battles"] == 2 and summary["battle_decisions"] == {f"{key}-human-RED": 2} and summary["ledger_days"] == [1, 2]
-	assert summary["human_requests"] == {"RED": {"matched": 3, "approximate": 1, "unmatched": {"BuyArtifact": 2}}}
-	assert summary["damaged_messages"] == 0  # (the battles never reached the records' parser)
-	assert sorted(p.name for p in (tmp_path / "battles").iterdir()) == [f"{key}-human-RED-000.rec", f"{key}-human-RED-001.rec"]
-	assert (tmp_path / "battles" / f"{key}-human-RED-001.rec").read_bytes() == b"ALPHAREC1\nsecond"
+	(segment,) = summary["segments"]
+	assert segment["players"] == {"RED": "human", "BLUE": "nk2", "TAN": "alpha"} and segment["decisions"] == 6 and segment["days"] == [1, 3]
+	assert segment["battles"] == 2 and segment["ledger_days"] == [1, 2] and segment["damaged_messages"] == 0  # (the battles never reached the records' parser)
+	assert segment["human_requests"] == {"RED": {"matched": 3, "approximate": 1, "unmatched": {"BuyArtifact": 2}}}
+	assert sorted(p.name for p in (tmp_path / "battles" / "1").iterdir()) == ["human-x-RED-000.rec", "human-x-RED-001.rec"]
+	assert (tmp_path / "battles" / "1" / "human-x-RED-001.rec").read_bytes() == b"ALPHAREC1\nsecond"
 	players = json.loads((tmp_path / "players.json").read_text())
-	assert players["RED"] == {"actor": "human", "decisions": 3, "by_type": {"MOVE": 3}}
-	with open(tmp_path / "game.pkl", "rb") as f:
+	assert players["1"]["RED"] == {"actor": "human", "decisions": 3, "by_type": {"MOVE": 3}}
+	with open(tmp_path / "segment-1.pkl", "rb") as f:
 		game = pickle.load(f)
 	assert sum(bool(d.flags & HUMAN) for d in game.decisions) == 3 and sum(bool(d.flags & TEACHER) for d in game.decisions) == 2
+
+
+def test_a_save_loaded_again_is_a_segment_of_its_own():
+	"""A save reloaded in the same client (a day played again): the second start's records, ledgers and battles apart
+	from the first's, so neither timeline's labels read the other's ledgers."""
+	from campaign_model.record_human import segments
+
+	messages = {
+		"k@1000:RED": [records(HUMAN, 2)], "k@1000:ledger": [json.dumps({"day": 5, "players": [], "mark": "first"}).encode()],
+		"k@1000-human-RED": [b"first battle"],
+		"k@1900:RED": [records(HUMAN, 1)], "k@1901:BLUE": [records(TEACHER, 1)], "k@1900:ledger": [json.dumps({"day": 5, "players": [], "mark": "again"}).encode()],
+	}
+	(first, a), (second, b) = segments(messages)
+	assert (first, second) == (1000, 1900)
+	assert set(a) == {"k@1000:RED", "k@1000:ledger", "k@1000-human-RED"} and set(b) == {"k@1900:RED", "k@1901:BLUE", "k@1900:ledger"}
 
 
 def test_the_human_flag_reads_back_from_a_record():

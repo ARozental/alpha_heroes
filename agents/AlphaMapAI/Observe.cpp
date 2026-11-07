@@ -37,7 +37,7 @@ void AlphaMapAI::initTeacher(std::shared_ptr<Environment> environmentPtr, std::s
 	teacher = true;
 	recordSocket = environment("ALPHA_MAP_RECORD_SOCKET");
 	recordsPerDecision = environment("ALPHA_MAP_RECORD_FORMAT", "1") == "2";
-	gameKey = environment("ALPHA_MAP_GAME_KEY", "game");
+	gameKey = sessionKey(environment("ALPHA_MAP_GAME_KEY", "game"));
 	dayCap = std::stoi(environment("ALPHA_MAP_DAYS", "0"));
 	logAi->info("AlphaMapAI %s: recording Nullkiller2 as the teacher, day cap %d", playerID.toString(), dayCap);
 }
@@ -98,6 +98,11 @@ void AlphaMapAI::observe(const CPackForServer * pack)
 	if(dynamic_cast<const MakeAction *>(pack))
 	{
 		rawRequest(pack, 0, nullptr, "a battle's action: the battle model's records have it");
+		return;
+	}
+	if(dynamic_cast<const SaveGame *>(pack) || dynamic_cast<const GamePause *>(pack))
+	{
+		rawRequest(pack, 0, nullptr, "the game's, not a decision"); // (a save: where a later session may go on from)
 		return;
 	}
 	if(const auto * reply = dynamic_cast<const QueryReply *>(pack))
@@ -294,6 +299,8 @@ std::string described(const CPackForServer * pack)
 		return "\"request\": \"SetFormation\", \"hero\": " + id(p->hid);
 	if(dynamic_cast<const EndTurn *>(pack))
 		return "\"request\": \"EndTurn\"";
+	if(const auto * p = dynamic_cast<const SaveGame *>(pack))
+		return "\"request\": \"SaveGame\", \"file\": \"" + escaped(p->fname) + "\"";
 	if(const auto * p = dynamic_cast<const QueryReply *>(pack))
 		return "\"request\": \"QueryReply\", \"query\": " + id(p->qid) + ", \"reply\": " + (p->reply ? std::to_string(*p->reply) : "null");
 	if(const auto * p = dynamic_cast<const MakeAction *>(pack))

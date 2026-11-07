@@ -271,6 +271,8 @@ public:
 	// (ALPHA_RECORD_RAW), no day cap; finishRecording sends what is left when the player leaves the game
 	void initHuman(std::shared_ptr<Environment> environment, std::shared_ptr<CCallback> callback);
 	void finishRecording();
+	const std::string & recordKey() const { return gameKey; } // (the segment's key: Recorder.cpp's battles go under it too)
+	static std::string sessionKey(const std::string & key); // ALPHA_MAP_GAME_KEY's, as this start of a game records it
 
 	std::string getBattleAIName() const override;
 	void initGameInterface(std::shared_ptr<Environment> env, std::shared_ptr<CCallback> callback) override;

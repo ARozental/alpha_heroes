@@ -105,6 +105,21 @@ std::mutex ledgerMutex;
 int ledgerDay = 0; // the last day a ledger was sent for, by any AlphaMapAI of this process
 }
 
+std::string AlphaMapAI::sessionKey(const std::string & key)
+{
+	// A human session (record_human.py: ALPHA_RECORD_HUMAN) loads saves in one client: each start of a game (a new one,
+	// a save loaded) is its own segment, every recorder's key ending in @<its start, unix seconds> (those of one start
+	// are seconds apart: record_human.py groups them), and the ledgers of the game it plays sent anew from its day (a
+	// save of an earlier day replays days this process already sent). Elsewhere the key as it is: one game a process
+	if(const char * human = std::getenv("ALPHA_RECORD_HUMAN"); !human || !*human)
+		return key;
+	{
+		std::scoped_lock lock(ledgerMutex);
+		ledgerDay = 0;
+	}
+	return key + "@" + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
 AlphaMapAI::AlphaMapAI()
 	: asyncTasks(std::make_unique<AsyncRunner>())
 {
@@ -135,7 +150,7 @@ void AlphaMapAI::initGameInterface(std::shared_ptr<Environment> environment, std
 	modelName = ::env("ALPHA_MAP_MODEL", "current");
 	recordSocket = ::env("ALPHA_MAP_RECORD_SOCKET");
 	recordsPerDecision = ::env("ALPHA_MAP_RECORD_FORMAT", "1") == "2";
-	gameKey = ::env("ALPHA_MAP_GAME_KEY", "game");
+	gameKey = sessionKey(::env("ALPHA_MAP_GAME_KEY", "game"));
 	dayCap = std::stoi(::env("ALPHA_MAP_DAYS", "0"));
 	temperature = std::stod(::env("ALPHA_MAP_TEMPERATURE", "1"));
 	rng.seed(std::stoull(::env("ALPHA_MAP_SEED_" + color, std::to_string(std::random_device()()))));

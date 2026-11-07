@@ -23,8 +23,10 @@
 //
 // The battles: an AlphaBattleAI observing this player's (ALPHA_BATTLE_OBSERVE, set here for this player alone: no other
 // battle of the game is recorded) encodes each state the player is asked to act in and records the action they took,
-// as the battle model's records (to the same socket, key <ALPHA_MAP_GAME_KEY>-human-<COLOR>). A battle fought by
-// auto-combat is not the player's: the interface passes none of its states.
+// as the battle model's records (to the same socket, key <the segment's key>-human-<COLOR>). A battle fought by
+// auto-combat is not the player's: the interface passes none of its states. Each start of a game (a new one, a save
+// loaded) is its own segment: this recorder's records, and the computer players', under keys ending in @<the start>
+// (AlphaMapAI::sessionKey), the ledgers sent anew from the day it starts at.
 class RecorderAI : public CGlobalAI
 {
 	std::shared_ptr<AlphaMapAI> map = std::make_shared<AlphaMapAI>();
@@ -47,12 +49,11 @@ public:
 		// (Set as the game starts, while the interfaces are made: no AI is playing yet to read the environment)
 		const auto color = boost::to_upper_copy(playerID.toString());
 		const char * socket = std::getenv("ALPHA_RECORD_HUMAN_SOCKET");
-		const char * key = std::getenv("ALPHA_MAP_GAME_KEY");
 		setenv(("ALPHA_BATTLE_OBSERVE_" + color).c_str(), "1", 1);
 		setenv(("ALPHA_BATTLE_ACTOR_" + color).c_str(), "human", 1); // (the record's start event: "model": "human")
 		if(socket && *socket)
 			setenv(("ALPHA_BATTLE_RECORD_SOCKET_" + color).c_str(), socket, 1);
-		setenv(("ALPHA_BATTLE_RECORD_KEY_" + color).c_str(), ((key && *key ? std::string(key) : std::string("game")) + "-human-" + color).c_str(), 1);
+		setenv(("ALPHA_BATTLE_RECORD_KEY_" + color).c_str(), (map->recordKey() + "-human-" + color).c_str(), 1); // (this segment's)
 		battle = CDynLibHandler::getNewBattleAI("AlphaBattleAI");
 		battle->initBattleInterface(ENV, CB);
 	}
