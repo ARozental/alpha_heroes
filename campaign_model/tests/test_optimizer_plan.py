@@ -39,8 +39,9 @@ def test_the_groups_hold_every_parameter_once_at_their_settings(model):
 	assert [n for n, _ in parameter_groups(model)["type"]] == ["type_bias"]
 	assert all(n.endswith("weight") for n in groups["embeddings"]["param_names"])
 	assert groups["value"]["lr"] == pytest.approx(1e-4) and groups["trunk"]["lr"] == pytest.approx(1e-5)
-	assert {name: g["betas"][0] for name, g in groups.items()} == {"trunk": 0.95, "embeddings": 0.95, "type": 0.95, "value": 0.9, "corrections": 0.9}
-	assert {name: g["weight_decay"] for name, g in groups.items()} == {"trunk": 0.0, "embeddings": 0.0, "type": 0.0, "value": 0.0, "corrections": 5.0}
+	assert {name: g["betas"][0] for name, g in groups.items()} == {"trunk": 0.95, "embeddings": 0.95, "type": 0.95, "value": 0.9, "corrections": 0.9, "privileged": 0.9}
+	assert {name: g["weight_decay"] for name, g in groups.items()} == {"trunk": 0.0, "embeddings": 0.0, "type": 0.0, "value": 0.0, "corrections": 5.0, "privileged": 0.0}
+	assert groups["privileged"]["lr"] == pytest.approx(1e-4)  # (the critic's timescale)
 	names = dict(model.named_parameters())
 	for g in optimizer.param_groups:
 		assert [names[n] for n in g["param_names"]] == g["params"]
@@ -127,9 +128,9 @@ def test_a_spike_in_one_group_leaves_the_others_gradient(model):
 
 
 def test_the_clips_calibrate_to_the_medians_and_parse():
-	samples = [[10.0 + i, 0.3, 0.1, 0.0, 8.0 + i, 5.0] for i in range(5)]
+	samples = [[10.0 + i, 0.3, 0.1, 0.0, 8.0 + i, 5.0, 0.2] for i in range(5)]
 	clips = calibrated_clips(samples, GRAD_GROUPS)
-	assert clips == {"typical": 12.0, "trunk": 0.3, "embeddings": 0.1, "type": float("inf"), "value": 10.0, "corrections": 5.0}
+	assert clips == {"typical": 12.0, "trunk": 0.3, "embeddings": 0.1, "type": float("inf"), "value": 10.0, "corrections": 5.0, "privileged": 0.2}
 	assert clip_settings(("trunk:0.4", "value:9", "typical:12")) == {"trunk": 0.4, "value": 9.0, "typical": 12.0}
 	assert clip_settings(()) == {}
 	with pytest.raises(ValueError):
@@ -207,12 +208,12 @@ def test_an_update_moves_the_value_heads_at_their_rate_and_reports_the_plans_rea
 	value = max(moved[name] for name in moved if name.startswith(VALUE_MODULES))
 	trunk = max(moved[name] for name in moved if name.startswith(("blocks.", "again_block.")))
 	steps = metrics["steps"]
-	assert 0.9e-4 < value <= steps * 1e-4 * 1.01 and 0.9e-5 < trunk <= steps * 1e-5 * 1.01
+	assert 0.5e-4 < value <= steps * 1e-4 * 1.01 and 0.5e-5 < trunk <= steps * 1e-5 * 1.01  # (a first step under lr where a gradient nears Adam's eps)
 	assert metrics["kl_target"] == pytest.approx(0.015)
 	for name in GRAD_GROUPS:
 		assert metrics[f"grad_norm_{name}"] >= 0 and metrics[f"clip_bound_{name}"] in (0.0, 0.5, 1.0)
 	assert len(metrics["grad_norms"]) == steps and len(metrics["grad_norms"][0]) == 1 + len(GRAD_GROUPS)
-	assert set(metrics["signal_fraction"]) == set(GRAD_GROUPS) | {"all"}
+	assert set(metrics["signal_fraction"]) == set(GRAD_GROUPS) - {"privileged"} | {"all"}  # (the privileged critic learns from rivals only: none here)
 	assert len(metrics["head_fresh"]["share"]) == c.N_VALUE_OFFSETS and all(v >= 0 for v in metrics["head_fresh"]["share"])
 	assert metrics["head_residual"]["share"] == pytest.approx(metrics["head_fresh"]["share"])  # (its first update: the batch's)
 	assert metrics["head_var_slow"]["share"] == pytest.approx(metrics["head_var"]["share"])
@@ -283,15 +284,15 @@ def test_the_loss_shares_freeze():
 
 def test_the_clips_calibrate_once_and_stay():
 	one = learner(CampaignConfig(grad_clip_calibration=4))
-	one._calibrate_clips({"grad_norms": [[10.0, 0.3, 0.1, 0.0, 8.0, 5.0]] * 3})
+	one._calibrate_clips({"grad_norms": [[10.0, 0.3, 0.1, 0.0, 8.0, 5.0, 0.2]] * 3})
 	assert one.grad_clips is None and len(one.clip_samples) == 3
-	one._calibrate_clips({"grad_norms": [[12.0, 0.5, 0.1, 0.0, 9.0, 5.0]] * 3})
+	one._calibrate_clips({"grad_norms": [[12.0, 0.5, 0.1, 0.0, 9.0, 5.0, 0.2]] * 3})
 	assert one.grad_clips["typical"] == 11.0 and one.grad_clips["trunk"] == 0.4 and one.grad_clips["type"] == float("inf")
-	one._calibrate_clips({"grad_norms": [[100.0] * 6] * 10})
+	one._calibrate_clips({"grad_norms": [[100.0] * 7] * 10})
 	assert one.grad_clips["typical"] == 11.0  # (kept: re-measured at a deploy only)
 	assert one.grad_clips["version"] == one.version
 	assert not stale_clips(one.grad_clips, 0) and not stale_clips(one.grad_clips, one.version) and stale_clips(one.grad_clips, one.version + 1)
 	assert stale_clips({"typical": 1.0}, 5) and not stale_clips(None, 5)  # (clips of before the switch: version 0)
 	off = learner(CampaignConfig(grad_clip_by_group=False, grad_clip_calibration=1))
-	off._calibrate_clips({"grad_norms": [[1.0] * 6]})
+	off._calibrate_clips({"grad_norms": [[1.0] * 7]})
 	assert off.grad_clips is None and off.clip_samples == []

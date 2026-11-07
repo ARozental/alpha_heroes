@@ -195,6 +195,45 @@ class Foresight(nn.Module):
 		self.outcome = zero_output(nn.Linear(FORESIGHT_HIDDEN, 2))
 
 
+# The privileged critic (2026-11-06, the user's call on AlphaStar's lesson: its value functions saw the opponent's
+# observations in training, best-response win rate 22% -> 82%): a correction to every value head's logit from each
+# other player's own critic state, training only (the policy never reads it; the server has no rival states)
+PRIVILEGED_RIVALS = P - 1
+PRIVILEGED_HEADS = 2 * c.N_VALUE_OFFSETS + 1  # V2 V5 V7, G2 G5 G7, V_end
+PRIVILEGED_PAIR = 3  # each rival's own features beside the two states: its true Φ's log against ours, its state's age, whether it has one
+PRIVILEGED_WIDTH = 128
+
+
+class PrivilegedCritic(nn.Module):
+	"""Every value head's logit correction [B, PRIVILEGED_HEADS] from what the update knows of the other players: each
+	rival's own critic state (its value_hidden at its last decision before our decision's day: in self-play every player
+	is this model, so the update has its decisions; before the day, so nothing in it follows our action there), its
+	true Φ at the day's start against ours (the ledger's) and how many days old its state is; a rival without a state
+	(day 1, or not this model's decisions) still counts by its Φ. Each (our state, its state) pair through one shared
+	two-layer block, the same for every rival (a convolution of width 1 over them: their order, the colors', means
+	nothing); pooled by max (any rival much better off: the OR the user asked for) and mean over the rivals in the game,
+	whatever their number; then with our own state to the corrections, a zero layer: 0 at the start. Its inputs are
+	detached (train.micro_loss): it learns on top of the critic and moves nothing else."""
+
+	def __init__(self, dim, width=PRIVILEGED_WIDTH):
+		super().__init__()
+		self.pair = nn.Sequential(nn.Linear(2 * dim + PRIVILEGED_PAIR, width), nn.GELU(), nn.Linear(width, width), nn.GELU())
+		self.out = zero_output(nn.Linear(2 * width + dim + 1, PRIVILEGED_HEADS))
+
+	def forward(self, own, rivals, mask, has, own_phi, rival_phi, age):
+		"""own [B, d] our value_hidden, rivals [B, R, d] theirs (anything where has is 0), mask [B, R] (1: a rival in the
+		game), has [B, R] (1: its state is there), own_phi [B] and rival_phi [B, R] log Φ (the ledger's at the day's
+		start), age [B, R] days."""
+		has = has.float() * mask.float()
+		features = torch.stack([(rival_phi - own_phi[:, None]).clamp(-10.0, 10.0), torch.log1p(age.clamp(min=0.0)) * has, has], dim=-1)
+		pair = self.pair(torch.cat([own[:, None, :].expand(-1, rivals.shape[1], -1), rivals * has.unsqueeze(-1), features], dim=-1))
+		m = mask.unsqueeze(-1).float()
+		any_rival = (m.sum(dim=1) > 0).float()
+		most = torch.where(m > 0, pair, torch.full_like(pair, -1e4)).amax(dim=1) * any_rival  # (none: 0)
+		mean = (pair * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+		return self.out(torch.cat([most, mean, own, m.sum(dim=1) / rivals.shape[1]], dim=-1))
+
+
 class Memory(nn.Module):
 	"""The model's memory (constants.MEMORY_SLOTS slots of MEMORY_WIDTH, -1..1): what one player's decisions carry
 	forward, the model's own output passed back by AlphaMapAI (x["mem"]; x["mem_float"] when a trainer unrolls it).
@@ -378,6 +417,7 @@ class CampaignModelV2(nn.Module):
 		self.value_heads = zero_output(nn.Linear(d, c.N_VALUE_OFFSETS))
 		self.growth_heads = zero_output(nn.Linear(d, c.N_VALUE_OFFSETS))
 		self.end_head = zero_output(nn.Linear(d, 1))
+		self.privileged = PrivilegedCritic(d)  # (training only: train.micro_loss, from the rivals' states the update has)
 		self.register_buffer("tile_positions", tile_positions(), persistent=False)
 		# The adventure spells the model may cast: not the ones that only show the map (constants.INFO_SPELLS)
 		self.register_buffer("castable", torch.tensor([s not in c.INFO_SPELLS for s in range(c.N_ADVENTURE_SPELLS)]), persistent=False)
@@ -829,6 +869,7 @@ class CampaignModelV2(nn.Module):
 		out["growth_logit"] = self.growth_heads(hidden)
 		out["end_logit"] = self.end_head(hidden).squeeze(-1) + share_prior
 		out["phi"] = known.phi_total
+		out["value_hidden"] = hidden  # (the privileged critic's: our state, and a rival's at its decisions)
 
 
 # ---- helpers: the known facts per entity ----

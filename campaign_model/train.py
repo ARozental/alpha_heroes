@@ -300,7 +300,9 @@ def windows_for(rows, heroes, config):
 # (config.value_lr_factor), the trunk's, the embeddings' and the action types' bias at the trunk's momentum
 # (config.trunk_beta1)
 VALUE_MODULES = ("value_hidden", "value_heads", "growth_heads", "end_head")
-GRAD_GROUPS = ("trunk", "embeddings", "type", "value", "corrections")
+# (the privileged critic its own group, last: the clips calibrated before it hold no clip for it, and its gradient
+# never moves another group's clip; at the value heads' rate)
+GRAD_GROUPS = ("trunk", "embeddings", "type", "value", "corrections", "privileged")
 TRUNK_GROUPS = ("trunk", "embeddings", "type")
 
 
@@ -310,10 +312,11 @@ def parameter_groups(model):
 	types' bias (type_bias), the trunk the rest. A group may be empty (v1 has no value_hidden)."""
 	corrections = {id(p) for p in model.prior_corrections()}
 	value = {id(p) for name in VALUE_MODULES if isinstance(getattr(model, name, None), torch.nn.Module) for p in getattr(model, name).parameters()}
+	privileged = {id(p) for p in model.privileged.parameters()} if isinstance(getattr(model, "privileged", None), torch.nn.Module) else set()
 	embeddings = {id(m.weight) for m in model.modules() if isinstance(m, torch.nn.Embedding)}
 	groups = {name: [] for name in GRAD_GROUPS}
 	for name, p in model.named_parameters():
-		group = "corrections" if id(p) in corrections else "value" if id(p) in value else "embeddings" if id(p) in embeddings else "type" if name == "type_bias" else "trunk"
+		group = "corrections" if id(p) in corrections else "privileged" if id(p) in privileged else "value" if id(p) in value else "embeddings" if id(p) in embeddings else "type" if name == "type_bias" else "trunk"
 		groups[group].append((name, p))
 	return groups
 
@@ -321,7 +324,7 @@ def parameter_groups(model):
 def group_lr(group, config, lr_scale=1.0):
 	"""An Adam group's rate: learning_rate x the KL control's lr_scale, the value heads' x value_lr_factor (and without
 	lr_scale unless config.value_lr_kl)."""
-	if group.get("name") == "value":
+	if group.get("name") in ("value", "privileged"):
 		return config.learning_rate * config.value_lr_factor * (lr_scale if config.value_lr_kl else 1.0)
 	return config.learning_rate * lr_scale
 
@@ -568,7 +571,7 @@ def excess_loss(logits, targets):
 
 # A step's metrics, in ppo_update's order: value the heads' loss at their own weights (comparable whatever head_scale
 # does), value_weighted at head_scale's (what the update takes)
-STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl", "teacher_kl", "teacher_ce", "value_weighted", "teacher_outside")
+STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl", "teacher_kl", "teacher_ce", "value_weighted", "teacher_outside", "value_privileged")
 # The teacher's outputs its KL reads (teacher_kl), put in each micro-batch as "t:<name>"
 TEACHER_OUTPUTS = ("type_logp", "option_logp") + tuple(output for output, _ in HEADS.values())
 
@@ -689,14 +692,16 @@ def loss_noise(model, decisions, decode, convert, device, t, config, rows=128, s
 	return result
 
 
-def micro_loss(out, batch, config, foresight_config=None, split=False):
+def micro_loss(out, batch, config, foresight_config=None, split=False, privileged=None):
 	"""A micro-batch's loss and metrics from the model's outputs and its rows, for the eager step and the recorded one
 	alike (graphs.StepGraph): (loss, STEP_PARTS [len], the foresight's parts [len(PART_NAMES)] or None, the foresight's
 	share of the loss or None); split: and the loss's terms ({name: tensor}, their sum the loss: gradient_check's).
 	batch: tensors on the device, each a row of the micro-batch (kind, action,
 	index, cell, old_logp, keep, advantage, credited, targets, share_valid, anchor; growth, growth_valid; end, end_valid;
 	"fs:<label>": the foresight's), and its minibatch's counts (count_credit, count_keep, count_share, count_growth,
-	count_end) and its share of the minibatch ("share"): the micro-batches' gradients add up to the minibatch's."""
+	count_end) and its share of the minibatch ("share"): the micro-batches' gradients add up to the minibatch's.
+	privileged: the model's PrivilegedCritic, trained here on the batch's rivals ("priv_*", train.ppo_update's) at the
+	value heads' own losses, every input detached (its loss reaches only its own weights); logged as value_privileged."""
 	from .foresight import PART_NAMES, ForesightConfig, foresight_loss
 
 	keep = batch["keep"]
@@ -723,10 +728,22 @@ def micro_loss(out, batch, config, foresight_config=None, split=False):
 		value = value + ((ended * batch["w:end"]).sum() if "w:end" in batch else ended.sum())
 		heads += 1.0
 	value, own = value / heads, own / heads
+	privileged_part = torch.zeros((), device=keep.device)
+	if privileged is not None and "priv_rivals" in batch:  # (the privileged critic: on top of the critic, detached)
+		corr = privileged(out["value_hidden"].detach(), batch["priv_rivals"], batch["priv_mask"], batch["priv_has"], batch["priv_own_phi"], batch["priv_rival_phi"], batch["priv_age"])
+		k = c.N_VALUE_OFFSETS
+		privileged_part = head_loss(out["value_logit"].detach() + corr[:, :k], batch["targets"], batch["share_valid"], batch["count_share"]).sum()
+		if "growth" in batch:
+			now = out["phi"].detach().clamp(min=PHI_FLOOR).log().unsqueeze(-1)
+			scaled = ((batch["growth"] - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
+			privileged_part = privileged_part + config.growth_weight * head_loss(out["growth_logit"].detach() + corr[:, k : 2 * k], scaled, batch["growth_valid"], batch["count_growth"]).sum()
+		if "end" in batch:
+			privileged_part = privileged_part + head_loss((out["end_logit"].detach() + corr[:, 2 * k]).unsqueeze(-1), batch["end"].unsqueeze(-1), batch["end_valid"].unsqueeze(-1), batch["count_end"].unsqueeze(-1)).sum()
+		privileged_part = privileged_part / heads
 	bonus = (entropy * keep).sum() / batch["count_keep"]
 	floor = (torch.relu(config.entropy_floor - entropy) * keep).sum() / batch["count_keep"]  # only decisions below it
 	# (the value's and the foresight's weights from the learner's loss shares, "lw:value" "lw:foresight"; 1 without)
-	loss = policy + config.value_weight * value * batch.get("lw:value", 1.0) - config.entropy_weight * bonus + config.entropy_floor_weight * floor
+	loss = policy + config.value_weight * value * batch.get("lw:value", 1.0) - config.entropy_weight * bonus + config.entropy_floor_weight * floor + privileged_part
 	teacher_part = torch.zeros((), device=keep.device)
 	if "t:type_logp" in batch:  # the teacher's KL (ppo_update's teacher), at its weight (a tensor: a recorded step reads it)
 		teacher_part = (teacher_kl(out, batch) * keep).sum() / batch["count_keep"]
@@ -768,8 +785,10 @@ def micro_loss(out, batch, config, foresight_config=None, split=False):
 		advice_part.detach(),  # teacher_ce
 		value.detach(),  # value_weighted
 		outside_part,  # teacher_outside: our probability outside what the teacher's label is weighed against
+		privileged_part.detach(),  # value_privileged: the privileged critic's loss at the heads' own weights (value's scale)
 	]).float()
-	if split:  # (each term at weight 1 against the learner's loss shares, the loss_weights it sets: the plan's apart too)
+	if split:  # (each term at weight 1 against the learner's loss shares, the loss_weights it sets: the plan's apart too;
+		# the privileged critic's not among them: it reaches its own weights only)
 		terms = {
 			"policy": policy, "value": config.value_weight * value,
 			"entropy": config.entropy_floor_weight * floor - config.entropy_weight * bonus, "teacher": teacher_part + advice_part,
@@ -800,7 +819,7 @@ def taught(advice_types, advised, config):
 def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
 	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None, teacher=None, teacher_weight=None,
-	share_trust=1.0, head_scale=None, teacher_sets=None, loss_weights=None, streams=None, clips=None,
+	share_trust=1.0, head_scale=None, teacher_sets=None, loss_weights=None, streams=None, clips=None, privileged=None,
 ):
 	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
 	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
@@ -817,8 +836,10 @@ def ppo_update(
 	(default: decode_inputs). share_trust 0..1: how far the schedule credit's share term takes the V7 change head as its
 	baseline (share_baseline; the learner's trust). streams: (stream [N], position [N]) of each decision, its game and
 	player and its place among the player's records, for config.memory_steps (sequence_order; None: each decision
-	alone). clips: the groups' gradient clips (clip_gradients; None: the one clip at grad_clip). Returns (metrics, the
-	KL control's new lr_scale)."""
+	alone). clips: the groups' gradient clips (clip_gradients; None: the one clip at grad_clip). privileged: each
+	decision's rivals for the privileged critic (config.privileged_critic; learner.privileged_rivals: "rivals" [N, R]
+	their decisions' rows here, -1 none, "present" [N, R] 1 a rival in the game, "own_phi" [N], "rival_phi" [N, R] the
+	ledger's log Φ at the day's start, "age" [N, R] days), or None. Returns (metrics, the KL control's new lr_scale)."""
 	n, started = len(decisions), time.time()
 	clock = {"prepass": 0.0, "wait": 0.0, "steps": 0.0, "forward": 0.0, "losses": 0.0, "backward": 0.0, "optimizer": 0.0, "cpu": time.thread_time()}  # where the update's time goes (logged: the PC's step ran at half the GPU's pace, 2026-10-30)
 	# The foresight's labels (foresight.game_labels, v2), each decision's row: its loss joins the minibatch's, a share
@@ -901,8 +922,9 @@ def ppo_update(
 	kl_target = config.target_kl * (1.0 + kl_teacher) if config.kl_teacher_inflation and (advice_t is not None or teacher is not None) else config.target_kl
 	weights_t = {f"lw:{name}": torch.full((), float(loss_weights[name]), device=device) for name in ("value", "foresight")} if loss_weights is not None else {}
 	steps_graph = None
+	privileged_module = getattr(model, "privileged", None)  # (its loss only where a batch has rivals: config.privileged_critic)
 	if graphs is not None and config.step_graphs:
-		steps_graph = model.__dict__.setdefault("_step_graph" if unroll == 1 else f"_step_graph_{unroll}", StepGraph(model, lambda out, batch: micro_loss(out, batch, config, foresight_config)[:3], forward))
+		steps_graph = model.__dict__.setdefault("_step_graph" if unroll == 1 else f"_step_graph_{unroll}", StepGraph(model, lambda out, batch: micro_loss(out, batch, config, foresight_config, privileged=privileged_module)[:3], forward))
 	# The wire's conversion recorded in the graphs (config.convert_in_graphs): they take the decoded batches as sent
 	# ({"wire": [N, IN_BYTES]}) and prepare them inside; everything else here converts them itself (model_inputs)
 	prepare = (lambda raw: convert(raw["wire"])) if convert is not None and graphs is not None and config.convert_in_graphs else None
@@ -916,6 +938,15 @@ def ppo_update(
 	# The same pass measures the value loss on these decisions before the update learns from them (the user, 2026-10-29:
 	# it should go down over time): every value head weighted as the loss below weighs it, above its targets' entropy
 	fresh = {"share": torch.zeros(n, c.N_VALUE_OFFSETS, device=device), "growth": torch.zeros(n, c.N_VALUE_OFFSETS, device=device), "end": torch.zeros(n, 1, device=device)}
+	# The privileged critic's inputs (config.privileged_critic): every decision's critic state and the value heads'
+	# logits from this pass, the rivals' states gathered from them below
+	priv_t = None
+	if privileged is not None and config.privileged_critic and privileged_module is not None:
+		priv_t = {name: torch.from_numpy(np.asarray(privileged[name])).to(device) for name in ("rivals", "present", "own_phi", "rival_phi", "age")}
+		priv_t["mask"], priv_t["has"] = priv_t.pop("present").float(), (priv_t["rivals"] >= 0).float()
+		priv_t["rivals"] = priv_t["rivals"].clamp(min=0)
+		state_all = torch.zeros(n, model.value_heads.in_features, device=device)
+		logits_all = {"share": torch.zeros(n, c.N_VALUE_OFFSETS, device=device), "growth": torch.zeros(n, c.N_VALUE_OFFSETS, device=device), "end": torch.zeros(n, device=device)}
 	gpu_anchor_mb = 0.0
 	with torch.no_grad():
 		chunk = config.prepass_batch or max(1, size // max(1, config.micro_batches))  # (no gradients, but at a whole minibatch it was the update's peak: 5.2 GB)
@@ -942,6 +973,9 @@ def ppo_update(
 				fresh["growth"][index] = excess_loss(out["growth_logit"].float(), ((growth_t[index] - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP))
 			if end is not None:
 				fresh["end"][index] = excess_loss(out["end_logit"].float().unsqueeze(-1), end_t[index].unsqueeze(-1))
+			if priv_t is not None:
+				state_all[index] = out["value_hidden"].float()
+				logits_all["share"][index], logits_all["growth"][index], logits_all["end"][index] = out["value_logit"].float(), out["growth_logit"].float(), out["end_logit"].float()
 			gpu_anchor_mb = max(gpu_anchor_mb, gpu_held(device))
 		if device.type == "cuda":
 			torch.cuda.synchronize(device)
@@ -968,6 +1002,34 @@ def ppo_update(
 	if end is not None:
 		head_fresh["end"] = per_head(fresh["end"], end_valid.unsqueeze(-1))
 	del fresh
+	# The privileged critic's corrections as the update starts (no gradient), its fit (the share heads' unexplained, as
+	# value_unexplained's), and with config.privileged_credit the schedule credit's baselines from it (V7, G7, V_end)
+	privileged_stats = {}
+	if priv_t is not None:
+		k = c.N_VALUE_OFFSETS
+		corr_all = torch.zeros(n, 2 * k + 1, device=device)
+		with torch.no_grad():
+			for first in range(0, n, 4096):
+				part = slice(first, first + 4096)
+				corr_all[part] = privileged_module(state_all[part], state_all[priv_t["rivals"][part]], priv_t["mask"][part], priv_t["has"][part], priv_t["own_phi"][part], priv_t["rival_phi"][part], priv_t["age"][part]).float()
+		fresh_priv = excess_loss(logits_all["share"] + corr_all[:, :k], targets_t)
+		privileged_stats = {
+			"value_unexplained_privileged": float(masked(fresh_priv, share_valid)) / baseline if baseline > 1e-6 else float("nan"),
+			"privileged_correction_rms": float(corr_all.pow(2).mean().sqrt()),
+			"privileged_rivals": float(priv_t["has"].sum(dim=1).mean()),  # (the rivals' states a decision had, of privileged_present's rivals in the game)
+			"privileged_present": float(priv_t["mask"].sum(dim=1).mean()),
+			"privileged_head_fresh": {"share": per_head(fresh_priv, share_valid)},
+		}
+		if growth is not None:
+			now = log_phi.unsqueeze(-1)
+			privileged_stats["privileged_head_fresh"]["growth"] = per_head(excess_loss(logits_all["growth"] + corr_all[:, k : 2 * k], ((growth_t - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)), growth_valid)
+		if end is not None:
+			privileged_stats["privileged_head_fresh"]["end"] = per_head(excess_loss((logits_all["end"] + corr_all[:, 2 * k]).unsqueeze(-1), end_t.unsqueeze(-1)), end_valid.unsqueeze(-1))
+		if config.privileged_credit:  # (the credit's baselines from the privileged critic: still functions of the state alone)
+			value_now = value_now + corr_all[:, k - 1]
+			growth_now = growth_now + corr_all[:, 2 * k - 1]
+			end_now = torch.sigmoid(logits_all["end"] + corr_all[:, 2 * k])
+		del logits_all, corr_all
 	# config.head_scale: the heads' target variances this update (the growth heads' on their 0..1 scale, over the value
 	# now), into the running ones (head_scale["var"]), and the heads' weights from them (head_weights)
 	head_w, head_var, head_residual, head_var_slow = None, None, None, None
@@ -1112,6 +1174,8 @@ def ppo_update(
 					batch.update(end=end_t[sub], end_valid=end_valid[sub], count_end=counts["end"])
 				if head_w is not None:  # (config.head_scale: each value head's weight, the update's)
 					batch.update(head_w)
+				if priv_t is not None:  # (the privileged critic's rivals: their states as the update started)
+					batch.update(priv_rivals=state_all[priv_t["rivals"][sub]], priv_mask=priv_t["mask"][sub], priv_has=priv_t["has"][sub], priv_own_phi=priv_t["own_phi"][sub], priv_rival_phi=priv_t["rival_phi"][sub], priv_age=priv_t["age"][sub])
 				batch.update(weights_t)
 				if advice_t is not None:  # Nullkiller2's advice, at the teacher's weight
 					batch.update({name: value[sub] for name, value in advice_t.items()}, count_advised=counts["advised"], teacher_weight=teacher_weight_t)
@@ -1126,7 +1190,7 @@ def ppo_update(
 					# of that forward is dropped before the graphed step: its autograd graph alive (one tensor of it kept) made
 					# the parameters' AccumulateGrad nodes reference the default stream, and the capture refused them ("a stale
 					# reference to the default stream (stream 0) from warmup", 2026-10-30)
-					check = micro_loss(forward(model_inputs(raw)), batch, config, foresight_config, split=True)
+					check = micro_loss(forward(model_inputs(raw)), batch, config, foresight_config, split=True, privileged=privileged_module)
 					if check[3] is not None:
 						checked = gradient_check(model, check[0] - check[3], check[3], check[4], prefix="grad_raw_")
 					del check
@@ -1140,7 +1204,7 @@ def ppo_update(
 					out = graphs.train(inputs) if graphs and not eager and unroll == 1 else forward(inputs)
 					clock["forward"] += time.perf_counter() - mark
 					mark = time.perf_counter()
-					loss, metrics, fs_parts, _ = micro_loss(out, batch, config, foresight_config)
+					loss, metrics, fs_parts, _ = micro_loss(out, batch, config, foresight_config, privileged=privileged_module)
 					clock["losses"] += time.perf_counter() - mark
 					mark = time.perf_counter()
 					loss.backward()
@@ -1210,6 +1274,7 @@ def ppo_update(
 		decisions=n,
 		value_fresh=value_fresh,
 		value_unexplained=value_unexplained,
+		**privileged_stats,  # (config.privileged_critic: its fit, its corrections' size, the rivals a decision had)
 		learning_rate=config.learning_rate * lr_scale,
 		credited=int(credited.sum()),
 		gpu_mb=gpu_mb,

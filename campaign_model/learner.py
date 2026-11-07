@@ -24,6 +24,7 @@ checkpoints <run>/campaign/checkpoint_latest.pt (and one per evaluation).
 import copy
 import csv
 import json
+import bisect
 import math
 import multiprocessing
 import os
@@ -52,7 +53,7 @@ from .failures import NAMES as FAILURES, failure_modes
 from .features import SKILLS
 from .labels import (
 	COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, attributed_labels, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
-	label, ladder_targets, pooled_ev, residual_variances, share_change_labels,
+	label, ladder_targets, pooled_ev, residual_variances, share_change_labels, tables,
 )
 from .advice import teacher_sets
 from .foresight import LABEL_NAMES, labels_of
@@ -485,6 +486,7 @@ class CampaignLearner:
 		sets = [] if getattr(self.config, "nk2_advice", 0) > 0 else None  # (the teacher's entries beyond the advice's: advice.teacher_sets)
 		decisions, targets, labels, growth, returns, advantages, errors, players, forecasts, row = [], [], [], [], [], [], [], [], [], Counter()
 		growth_real, attributed = [], {"share_now": [], "taken": []}
+		privileged = [] if self.config.privileged_critic and getattr(self.model, "privileged", None) is not None else None  # (privileged_rivals, each game's)
 		end = {"targets": [], "real": [], "step": [], "week": [], "price": []}
 		streams = ([], [])  # each decision's game and player, and its place among the player's records (config.memory_steps)
 		for g, game in enumerate(played):
@@ -516,6 +518,8 @@ class CampaignLearner:
 			end["targets"].append(end_targets(game, real, starts[g], trust.get("Vend", 0.0), self.config.outcome_share_min)[fresh])
 			end["real"].append(real[fresh])
 			end["price"].append(price[fresh])
+			if privileged is not None:
+				privileged.append(privileged_rivals(game, fresh, len(decisions), self.empire))
 			decisions += [d for d, keep in zip(game.decisions, fresh) if keep]
 			place, count = {}, Counter()  # (all_decisions: every record as sent, unusable ones too: a gap breaks a sequence)
 			for d in getattr(game, "all_decisions", game.decisions):
@@ -591,7 +595,7 @@ class CampaignLearner:
 			out_of_memory = None
 			with self.model_lock:
 				try:
-					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None)
+					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None, privileged={name: np.concatenate([part[name] for part in privileged]) for name in privileged[0]} if privileged else None)
 				except torch.OutOfMemoryError as error:  # (handled below, once the error's frames, and their tensors, are gone)
 					out_of_memory = str(error)[:200]
 			if out_of_memory is not None:
@@ -800,6 +804,18 @@ class CampaignLearner:
 			self.writer.add_scalar("eval/campaign_value_loss", row["value_loss_fresh"], self.version)
 		if metrics.get("value_unexplained", float("nan")) == metrics.get("value_unexplained", float("nan")):  # (train.ppo_update: not a column)
 			self.writer.add_scalar("eval/campaign_value_unexplained", metrics["value_unexplained"], self.version)
+		# The privileged critic (config.privileged_critic): its fit beside the critic's, how large its corrections have
+		# grown, how many rivals' states a decision had, its loss, each head's fresh excess with it
+		if metrics.get("value_unexplained_privileged", float("nan")) == metrics.get("value_unexplained_privileged", float("nan")):
+			self.writer.add_scalar("eval/campaign_value_unexplained_privileged", metrics["value_unexplained_privileged"], self.version)
+		for name in ("privileged_correction_rms", "privileged_rivals", "privileged_present", "value_privileged"):
+			if metrics.get(name, float("nan")) == metrics.get(name, float("nan")):
+				self.writer.add_scalar(f"campaign/{name}", metrics[name], self.version)
+		for name, values in (metrics.get("privileged_head_fresh") or {}).items():
+			for k, value in enumerate(values):
+				head = "Vend" if name == "end" else f"{'V' if name == 'share' else 'G'}{c.VALUE_OFFSETS[k]}"
+				if value == value:
+					self.writer.add_scalar(f"campaign_heads/fresh_privileged_{head}", value, self.version)
 		for name in ("value_corr", "value_spread", "label_spread", "gpu_anchor_mb", "update_seconds", "prepass_seconds", "wait_seconds", "sync_seconds", "cpu_share", "stopped_pass", "signal_ratio", "attributed_taken_share", "attributed_taken_mean", "attributed_own_std", "attributed_taken_std", "forward_seconds", "losses_seconds", "backward_seconds", "optimizer_seconds",
 				"value_learning_rate", "value_readout_rms", *(f"grad_norm_{g}" for g in GRAD_GROUPS), *(f"clip_bound_{g}" for g in GRAD_GROUPS), "kl_first", "kl_growth"):
 			if metrics.get(name, float("nan")) == metrics.get(name, float("nan")):
@@ -840,12 +856,13 @@ class CampaignLearner:
 				group = "campaign_actions/" + key[6:] if key.startswith("share_") else "campaign_failures/" + key[8:] if key.startswith("failure_") else "campaign/" + key
 				self.writer.add_scalar(group, value, self.version)
 		self.writer.flush()
+		privileged_note = f", privileged {metrics['value_unexplained_privileged']:.2f}" if "value_unexplained_privileged" in metrics else ""
 		print(
 			f"campaign {self.version:4d}  games {row['games']}  decisions {n}  days {row['days']:.1f}  Φ at the end {row['phi_end']:.0f}  heroes {row['heroes']:.2f}"
 			# (pooled over ~10 updates like the growth and end heads': this update's alone swings with its few games' spread,
 			# -0.65 at a correlation of +0.22 and a spread as wide as the outcomes', 2026-10-30, while the pooled rose)
 			"  value ev " + "/".join(f"{row[f'head_ev_v{k}']:+.2f}" for k in c.VALUE_OFFSETS)
-			+ f" (this update {row[f'value_ev_d{c.VALUE_OFFSETS[-1]}']:+.2f}: corr {metrics.get('value_corr', float('nan')):+.2f}, spread {metrics.get('value_spread', float('nan')):.3f} vs {metrics.get('label_spread', float('nan')):.3f}, unexplained {metrics.get('value_unexplained', float('nan')):.2f})"
+			+ f" (this update {row[f'value_ev_d{c.VALUE_OFFSETS[-1]}']:+.2f}: corr {metrics.get('value_corr', float('nan')):+.2f}, spread {metrics.get('value_spread', float('nan')):.3f} vs {metrics.get('label_spread', float('nan')):.3f}, unexplained {metrics.get('value_unexplained', float('nan')):.2f}{privileged_note})"
 			+ "  growth ev " + "/".join(f"{row[f'head_ev_g{k}']:+.2f}" for k in c.VALUE_OFFSETS) + f"  end ev {row['head_ev_vend']:+.2f} (credit {row['end_credit']:.2f})  trust {row['trust']:.2f} (today {self.trust_today():.2f})"
 			+ f"  kl {row['last_kl']:.4f} (target {metrics.get('kl_target', float('nan')):.4f})" + (f"  teacher kl {row['teacher_kl']:.3f} (weight {row['teacher_weight']:.2f})" if self.teacher is not None else "") + (f"  advice {row['advised']:.0%} of turns and exchanges, ours its {row['teacher_agree']:.0%}, teacher ce {row['teacher_ce']:.3f} (weight {row['teacher_weight']:.2f})" if self.config.nk2_advice > 0 else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f} (fraction {(metrics.get('signal_fraction') or {}).get('all', float('nan')):.3f})  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f}" + (f", every hero slot in {metrics['full_windows']} steps" if metrics.get("full_windows") else "") + (", window budget refused" if metrics.get("window_budget_ok") is False else "") + f")  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
 			flush=True,
@@ -999,6 +1016,47 @@ def precomputed(future, game=None):
 	if pre is None or (game is not None and pre["n"] != len(game.decisions)):
 		return None
 	return pre
+
+
+def privileged_rivals(game, fresh, first_row, empire=EmpireConfig(), rivals=None):
+	"""The privileged critic's rivals (model_v2.PrivilegedCritic) of a game's fresh decisions, rows first_row.. of the
+	update: for each, every other player of the game's last fresh decision on a day before its own (its row; -1 none:
+	before the day, so nothing in it follows this decision), how many days before, and the ledger's log Φ at the start of
+	its day (the end of the day before: labels.tables), its own and each rival's, a rival without a decision too.
+	{"rivals" [N, R] int64, "present" [N, R] (1: a rival in the game), "age" [N, R], "own_phi" [N], "rival_phi" [N, R]};
+	R: model_v2.PRIVILEGED_RIVALS."""
+	from .model_v2 import PRIVILEGED_RIVALS
+
+	rivals = rivals or PRIVILEGED_RIVALS
+	_, value, _, _ = tables(game, empire)
+	kept = [d for d, keep in zip(game.decisions, fresh) if keep]
+	days, rows = {}, {}
+	for row, d in enumerate(kept, start=first_row):
+		days.setdefault(d.color, []).append(d.day)
+		rows.setdefault(d.color, []).append(row)
+
+	known = {}
+
+	def phi(color, day):  # (the last value on or before `day`, as labels.share_at; once a color and day)
+		if (color, day) not in known:
+			table = value.get(color, {})
+			before = [k for k in table if k <= day]
+			known[color, day] = math.log1p(table[max(before)]) if before else (math.log1p(table[min(table)]) if table else 0.0)
+		return known[color, day]
+
+	players = [color for color in COLORS if color in value]
+	n = len(kept)
+	out = {"rivals": np.full((n, rivals), -1, np.int64), "present": np.zeros((n, rivals), np.float32), "age": np.zeros((n, rivals), np.float32), "own_phi": np.zeros(n, np.float32), "rival_phi": np.zeros((n, rivals), np.float32)}
+	for i, d in enumerate(kept):
+		out["own_phi"][i] = phi(d.color, d.day - 1)
+		for slot, color in enumerate([other for other in players if other != d.color][:rivals]):
+			out["present"][i, slot] = 1.0
+			out["rival_phi"][i, slot] = phi(color, d.day - 1)
+			j = bisect.bisect_left(days.get(color, []), d.day) - 1  # (a player's decisions are in its order: days only grow)
+			if j >= 0:
+				out["rivals"][i, slot] = rows[color][j]
+				out["age"][i, slot] = d.day - days[color][j]
+	return out
 
 
 def label_source(game):
