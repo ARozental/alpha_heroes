@@ -9,6 +9,7 @@ review and edit: the models' bias parameters start at these values and are learn
 
 tests/test_priors.py checks the files: every id once, names as the engine's.
 """
+import math
 import csv
 from pathlib import Path
 
@@ -60,6 +61,20 @@ def escape_relief(z):
 # idle shooter's -5: a prior that presses, no mask
 ESCAPE_AHEAD = (-3.0, -3.0)  # (w_step, w_scale)
 ESCAPE_AHEAD_WIDTH = 0.1
+
+# Escaping while our creatures are the stronger (the user, 2026-11-07: "strength_ratio_due_to_creatures_only^3 so if we
+# are 2x stronger in creatures it will -8 to the logit but if we are even it will only add a -1"): both escapes' logits
+# get w x min(r^3, ESCAPE_STRONG_CAP), r our creatures' strength over the enemy's (the relief's: features.side_strengths'
+# "all", health x damage per round, Lanchester's; no hero, no spell in it), w learned from ESCAPE_STRONG: -1 even, -0.125
+# at half our strength, -8 at twice and beyond. Capped at the user's 2x (b1): r^3 alone is -27 at 3x and -125 at 5x, a
+# mask in all but name (no gradient reaches w there), which the rule "never mask" forbids
+ESCAPE_STRONG = -1.0
+ESCAPE_STRONG_CAP = 8.0
+
+
+def escape_strong(z, weight):
+	"""[B] the logit both escapes get at our creatures' strength log-ratio z [B] (log r: above); weight: w."""
+	return weight * torch.exp((3.0 * z).clamp(max=math.log(ESCAPE_STRONG_CAP)))
 
 
 def escape_ahead(value, weights):

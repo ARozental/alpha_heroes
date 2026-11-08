@@ -467,7 +467,7 @@ def signal_ratio(optimizer):
 # value heads' (at value_lr_factor x the rate), the prior-initialised rule and value parameters', the trunk the rest
 BATTLE_GROUPS = ("trunk", "priors", "values")
 BATTLE_VALUE_MODULES = ("values.", "value_strength.")
-BATTLE_PRIORS = ("actions.escape_rules", "actions.escape_ahead", "actions.spell_mastery", "actions.spell_value", "actions.creature_spell_value", "actions.value_gains", "actions.type_head.bias", "actions.type_rules.weight", "actions.type_strength.weight", "actions.spell_head.bias")
+BATTLE_PRIORS = ("actions.escape_rules", "actions.escape_ahead", "actions.escape_strong", "actions.spell_mastery", "actions.spell_value", "actions.creature_spell_value", "actions.value_gains", "actions.type_head.bias", "actions.type_rules.weight", "actions.type_strength.weight", "actions.spell_head.bias")
 
 
 def battle_parameter_groups(model):

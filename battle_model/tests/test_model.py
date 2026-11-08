@@ -382,6 +382,43 @@ def test_a_checkpoint_from_before_the_shot_type_features_loads_with_their_prior(
 	fresh.step()  # (moments of the old shape would fail here)
 
 
+def test_escapes_are_pressed_down_while_our_creatures_are_the_stronger():
+	"""priors.escape_strong (the user, 2026-11-07): both escapes' logits get w x min(r^3, 8), r our creatures' strength
+	over the enemy's (features.side_strengths' "all"), w from -1: -1 even, -0.125 at half, -8 at twice and beyond (the
+	cap: never a mask); every other type unchanged; an older checkpoint (no escape_strong) loads with it at its prior."""
+	from battle_model import features as F
+	from battle_model import priors
+
+	at = lambda r: float(priors.escape_strong(torch.tensor([float(np.log(r))]), torch.tensor(priors.ESCAPE_STRONG)))  # noqa: E731
+	assert at(1.0) == pytest.approx(-1.0) and at(0.5) == pytest.approx(-0.125) and at(2.0) == pytest.approx(-8.0)
+	assert at(3.0) == pytest.approx(-8.0) and at(1e6) == pytest.approx(-8.0) and at(1e-6) == pytest.approx(0.0, abs=1e-9)
+	torch.manual_seed(3)
+	model = BattleModel(dim=32, layers=1).eval()
+	x = {k: torch.from_numpy(v) for k, v in random_inputs(batch=6, seed=4).items()}
+	escapes = [ActionType.RETREAT, ActionType.SURRENDER]
+	for t in escapes:  # (random inputs never offer an escape)
+		x["m_type"][:, t] = True
+	with torch.no_grad():
+		pressed = model(x)
+		z = model.facts(x)["strength"][:, F.STRENGTH_VARIANTS.index("all")].sum(dim=-1)
+		model.actions.escape_strong.zero_()
+		free = model(x)
+	assert (z > 0).any() and (z < 0).any()  # (both: our creatures the stronger, and the weaker)
+	for b in range(6):
+		legal = x["m_type"][b].bool()
+		shift = pressed["logp_type"][b] - free["logp_type"][b]
+		other = [t for t in range(shift.shape[0]) if legal[t] and t not in escapes]
+		expected = float(priors.escape_strong(z[b : b + 1], torch.tensor(priors.ESCAPE_STRONG)))
+		for t in escapes:
+			if legal[t] and other:
+				assert float(shift[t] - shift[other[0]]) == pytest.approx(expected, abs=1e-4)
+		assert all(float(shift[t] - shift[other[0]]) == pytest.approx(0.0, abs=1e-5) for t in other)
+	state = {k: v for k, v in model.state_dict().items() if k != "actions.escape_strong"}
+	old = BattleModel(dim=32, layers=1)
+	old.load_state_dict(state)
+	assert float(old.actions.escape_strong) == priors.ESCAPE_STRONG
+
+
 def test_escapes_are_pressed_down_while_the_value_head_says_we_are_ahead():
 	"""priors.escape_ahead (the user, 2026-11-06): both escapes' logits get w_step x tanh(max(0, V) / 0.1) + w_scale x
 	max(0, V), from (-3, -3): 0 even or behind, -3.5 at V 0.2, -6 at a sure win; every other type unchanged, V's gradient

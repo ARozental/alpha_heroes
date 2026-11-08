@@ -558,6 +558,8 @@ class ActionHeads(nn.Module):
 		self.register_buffer("escape_bias", -priors.action_types() * escapes.sum(dim=0), persistent=False)  # what relief lifts
 		# and pressed down while the value head says we are ahead (priors.escape_ahead: (w_step, w_scale), learned)
 		self.escape_ahead = nn.Parameter(torch.tensor(priors.ESCAPE_AHEAD))
+		# and while our creatures are the stronger (priors.escape_strong: w x min(r^3, 8), w learned from -1)
+		self.escape_strong = nn.Parameter(torch.tensor(priors.ESCAPE_STRONG))
 		self.register_buffer("escape_any", (escapes.sum(dim=0) > 0).float(), persistent=False)  # [type]: RETREAT, SURRENDER
 		self.spell_head = nn.Linear(dim, N_SPELLS)
 		self.spell_query = small_embedding(N_SPELLS, dim)
@@ -597,6 +599,8 @@ class ActionHeads(nn.Module):
 			state_dict[prefix + "value_gains"] = torch.zeros_like(self.value_gains)
 		if prefix + "escape_ahead" not in state_dict:  # (2026-11-06: older checkpoints and league snapshots at its prior)
 			state_dict[prefix + "escape_ahead"] = torch.tensor(priors.ESCAPE_AHEAD)
+		if prefix + "escape_strong" not in state_dict:  # (2026-11-07: the same)
+			state_dict[prefix + "escape_strong"] = torch.tensor(priors.ESCAPE_STRONG)
 		priors.widen_type_rules(state_dict, prefix + "type_rules.weight", F.TYPE_FEATURES)
 		super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
@@ -675,8 +679,10 @@ class ActionHeads(nn.Module):
 		#   CATAPULT        walls and towers destroyed: a loss to the town's owner, no gain to the attacker
 		#   HERO_SPELL      mana spent is destroyed, not won by the enemy (zero-sum prices it as a gain for them)
 		#   and outcomes behind any action: experience and Necromancy for the winner, Eagle Eye, more than two players
-		relief = priors.escape_relief(ratios[:, F.STRENGTH_VARIANTS.index("all")].sum(dim=-1))  # [B]
+		creatures = ratios[:, F.STRENGTH_VARIANTS.index("all")].sum(dim=-1)  # [B] our creatures' strength over theirs, its log
+		relief = priors.escape_relief(creatures)
 		escape = relief[:, None] * self.escape_bias + (outcomes * self.escape_rules) @ self.escape_types
+		escape = escape + priors.escape_strong(creatures, self.escape_strong)[:, None] * self.escape_any
 		if value is not None:
 			escape = escape + priors.escape_ahead(value.detach(), self.escape_ahead)[:, None] * self.escape_any
 		kind = self.type_head(context) + self.type_rules(actions["type"]) + self.type_strength(strength) + follow + escape
