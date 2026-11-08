@@ -366,8 +366,8 @@ void AlphaMapAI::arrange(const CArmedInstance * giver, const CArmedInstance * re
 	};
 	const bool keepsOne = dynamic_cast<const CGHeroInstance *>(giver) != nullptr;
 	// A creature in two slots of one army takes a slot the receiver may need (an exchange's own troop moves and swaps
-	// make them, and since schema 16 our own splits; before it, a merge of every army before each turn decision did not
-	// reach an exchange's): 2 of the first 5,100 schema-15 TAKE_BESTs left a creature behind for want of a slot
+	// make them, and our own splits; unifyStacks merges them only before a turn decision, and keeps singles): 2 of the
+	// first 5,100 schema-15 TAKE_BESTs left a creature behind for want of a slot
 	mergeDuplicates(receiver);
 	mergeDuplicates(giver);
 	for(const auto & [creature, count] : target)
@@ -452,7 +452,22 @@ void AlphaMapAI::payByTrades(const TResources & cost, const Decision & decision)
 	++tradedPurchases;
 }
 
-bool AlphaMapAI::mergeDuplicates(const CArmedInstance * army)
+void AlphaMapAI::unifyStacks()
+{
+	// Each army of ours with a creature in two slots: those stacks merged into the first, unless one of them is a single
+	// creature (the user, 2026-11-08: a split into singles is deliberate and stays; any other duplicate, a split's halves
+	// or what an exchange left, merged as before schema 16: 6% of turn decisions had one without this, states the value
+	// heads had not seen, their fresh loss up 40%)
+	std::vector<const CArmedInstance *> armies;
+	for(const auto * hero : cb->getHeroesInfo()) // (ours)
+		armies.push_back(hero);
+	for(const auto * town : cb->getTownsInfo(true))
+		armies.push_back(town);
+	for(const auto * army : armies)
+		mergeDuplicates(army, true);
+}
+
+bool AlphaMapAI::mergeDuplicates(const CArmedInstance * army, bool keepSingles)
 {
 	bool merged = false;
 	for(int first = 0; first < ARMY_SLOTS; ++first)
@@ -460,7 +475,7 @@ bool AlphaMapAI::mergeDuplicates(const CArmedInstance * army)
 		{
 			const auto * one = army->getStackPtr(SlotID(first));
 			const auto * other = army->getStackPtr(SlotID(second));
-			if(one && other && one->getId() == other->getId())
+			if(one && other && one->getId() == other->getId() && (!keepSingles || (one->getCount() > 1 && other->getCount() > 1)))
 			{
 				cb->mergeStacks(army, army, SlotID(second), SlotID(first)); // (the later slot into the earlier)
 				++stacksMerged;

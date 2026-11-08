@@ -255,6 +255,7 @@ void AlphaMapAI::makeTurn()
 			waitTillFree();
 			if(cb->getPlayerStatus(playerID, false) != EPlayerStatus::INGAME)
 				return;
+			unifyStacks();
 			auto decision = encode(DecisionKind::TURN);
 			std::optional<Choice> advice; // (Nullkiller2's, at this decision's chance: before ours, in the same state)
 			std::optional<PlanTargets> plan; // (and its plan there: labels both, never inputs)
