@@ -210,4 +210,29 @@ bool takes(const CCreatureSet & into, const CCreatureSet & from, const std::vect
 		free += into.slotEmpty(SlotID(s)) ? 1 : 0;
 	return static_cast<int>(needing.size()) <= free;
 }
+
+SlotID singleSource(const CCreatureSet & army)
+{
+	if(!army.getFreeSlot().validSlot())
+		return SlotID();
+	SlotID best;
+	int least = std::numeric_limits<int>::max();
+	for(const auto & [slot, stack] : army.Slots()) // (in slot order: the first of the least)
+		if(stack->getCount() > 1 && stack->getCreature()->getAIValue() < least)
+			std::tie(best, least) = std::tuple(slot, stack->getCreature()->getAIValue());
+	return best;
+}
+
+std::pair<SlotID, SlotID> duplicate(const CCreatureSet & army)
+{
+	for(int later = 1; later < GameConstants::ARMY_SIZE; ++later)
+		for(int earlier = 0; earlier < later; ++earlier)
+		{
+			const auto * one = army.getStackPtr(SlotID(earlier));
+			const auto * other = army.getStackPtr(SlotID(later));
+			if(one && other && one->getId() == other->getId())
+				return {SlotID(later), SlotID(earlier)};
+		}
+	return {SlotID(), SlotID()};
+}
 }

@@ -129,6 +129,24 @@ def chosen_logp(out, choice):
 	cells = out["cast_cell_logp"].reshape(n, c.OWN_HEROES, -1)[rows, hero]
 	targeted = turn & (action == c.ActionType.CAST) & (cell >= 0)
 	logp = logp + torch.where(targeted, cells[rows, cell.clamp(min=0)], zero)
+	# ARMY's target slot (schema 16; a record from before has none, cell -1): its row of army_slot_logp (normalized over
+	# every slot legal for the stack or a part of it), renormalized over the whole stack's legal slots or a part's fit
+	# ones (an empty slot, its own creature's: AlphaMapAI's draw), every value finite (an illegal slot's -inf in a branch
+	# not taken would make the gradient NaN)
+	if "army_slot_logp" in out:
+		flat = index.clamp(min=0)
+		amount = flat % c.N_ARMY_AMOUNTS
+		to = torch.div(flat, c.N_ARMY_AMOUNTS, rounding_mode="floor") % c.N_HOLDERS
+		slot = torch.div(flat, c.N_ARMY_AMOUNTS * c.N_HOLDERS, rounding_mode="floor") % c.ARMY_SLOTS
+		holder = torch.div(flat, c.N_ARMY_AMOUNTS * c.N_HOLDERS * c.ARMY_SLOTS, rounding_mode="floor").clamp(max=c.N_HOLDERS - 1)
+		row = out["army_slot_logp"][rows, holder, slot, to].clamp(min=-1e4)  # [N, ARMY_SLOT_CHOICES]
+		fit, none = out["army_split_mask"][rows, holder, slot, to], torch.zeros_like(out["army_split_mask"][rows, holder, slot, to])
+		whole = torch.cat([out["army_whole_mask"][rows, holder, slot, to], none], dim=-1)
+		allowed = torch.where((amount == c.ArmyAmount.ALL)[:, None], whole, torch.cat([fit, none], dim=-1))
+		allowed = torch.where((amount == c.ArmyAmount.ONE)[:, None], torch.cat([fit, fit], dim=-1), allowed)
+		taken = row[rows, cell.clamp(0, c.ARMY_SLOT_CHOICES - 1)] - torch.logsumexp(row.masked_fill(~allowed, -1e4), dim=-1)
+		moved = turn & (action == c.ActionType.ARMY) & (cell >= 0)
+		logp = logp + torch.where(moved, taken, zero)
 	entropy = torch.where(turn, entropy, head_entropy(out["option_logp"]))
 	return logp, entropy
 
@@ -807,10 +825,24 @@ def share_baseline(real_change, predicted, trust):
 	return trust * predicted + (1.0 - trust) * mean
 
 
-def taught(advice_types, advised, config):
-	"""Which advised decisions the teacher's cross-entropy counts [N]: Nullkiller2's TRADE advice only with
-	config.nk2_trade_advice (False since 2026-11-04)."""
-	return advised if config.nk2_trade_advice else advised & (np.asarray(advice_types) != c.ActionType.TRADE)
+def taught(advice, advised, config):
+	"""Which advised decisions the teacher's cross-entropy counts [N] (advice: [N, 3] type, index, cell): Nullkiller2's
+	TRADE advice only with config.nk2_trade_advice (False since 2026-11-04); schema 16's newly matched advice only with
+	config.nk2_new_advice (new_advice)."""
+	advice = np.asarray(advice).reshape(-1, 3)
+	if not config.nk2_trade_advice:
+		advised = advised & (advice[:, 0] != c.ActionType.TRADE)
+	return advised if config.nk2_new_advice else advised & ~new_advice(advice)
+
+
+def new_advice(advice):
+	"""[N] whether each advice (type, index, cell) is of a kind Match.cpp maps only since schema 16 (2026-11-07):
+	ARTIFACT, MULTI's SPLIT_SINGLES, MERGE_ALL and GARRISON_SWAP, ARMY within one army or ONE's all-but-one half."""
+	action, index, cell = advice[:, 0], advice[:, 1], advice[:, 2]
+	multi = (action == c.ActionType.MULTI) & (index % c.N_MULTI >= c.MultiKind.SPLIT_SINGLES)
+	f, _, to, _ = np.unravel_index(np.clip(index, 0, None) % (c.N_HOLDERS * c.ARMY_SLOTS * c.N_HOLDERS * c.N_ARMY_AMOUNTS), (c.N_HOLDERS, c.ARMY_SLOTS, c.N_HOLDERS, c.N_ARMY_AMOUNTS))
+	army = (action == c.ActionType.ARMY) & ((f == to) | (cell >= c.ARMY_SLOTS))
+	return (action == c.ActionType.ARTIFACT) | multi | army
 
 
 def ppo_update(
@@ -860,7 +892,7 @@ def ppo_update(
 		advice = np.array([d.advice if d.advice is not None else (0, 0, -1) for d in decisions], dtype=np.int64).reshape(-1, 3)
 		# Only where its request was matched (has): a decision where Nullkiller2 asked for what we cannot do (an artifact
 		# swap, a hero dismissed) has no label to weigh its plan's steps against (TEACHER_SPAN), 2026-11-05
-		advised = taught(advice[:, 0], has, config)
+		advised = taught(advice, has, config)
 		advice_t = {
 			"advice_action": torch.from_numpy(advice[:, 0]).to(device), "advice_index": torch.from_numpy(advice[:, 1]).to(device), "advice_cell": torch.from_numpy(advice[:, 2]).to(device),
 			"advised": torch.from_numpy(advised.astype(np.float32)).to(device),

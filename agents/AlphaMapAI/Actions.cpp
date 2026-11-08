@@ -133,18 +133,29 @@ bool AlphaMapAI::execute(const Decision & decision, const Choice & choice)
 			const auto * target = armyOf(*cb, e.second);
 			if(!source || !target)
 				break;
+			// The model's target slot (schema 16; else VCMI's, as before): a whole stack moves into an empty slot, merges
+			// onto its own creature, swaps with another; a part splits off into it (the count the slot ends with); ONE's
+			// second half all but one into it, the one staying
 			const SlotID from(e.a);
-			const SlotID to(e.b);
+			const bool stays = choice.cell >= ARMY_SLOTS;
+			const SlotID to(choice.cell >= 0 ? choice.cell % ARMY_SLOTS : e.b);
 			const int count = source->getStackCount(from);
-			if(e.c >= count)
+			if(!to.validSlot() || count <= 0)
+				break;
+			if(stays)
 			{
-				if(target->slotEmpty(to))
+				if(count > 1)
+					cb->splitStack(source, target, from, to, target->getStackCount(to) + count - 1);
+			}
+			else if(e.c >= count)
+			{
+				if(target->slotEmpty(to) || target->getCreature(to) != source->getCreature(from))
 					cb->swapCreatures(source, target, from, to);
 				else
 					cb->mergeStacks(source, target, from, to);
 			}
 			else
-				cb->splitStack(source, target, from, to, target->getStackCount(to) + e.c); // the count the target slot ends with
+				cb->splitStack(source, target, from, to, target->getStackCount(to) + e.c);
 			break;
 		}
 		case ActionType::UPGRADE:
@@ -247,6 +258,35 @@ void AlphaMapAI::executeMulti(const Entry & e)
 		++multiActions;
 		return;
 	}
+	if(kind == MultiKind::SPLIT_SINGLES)
+	{
+		// A creature into each free slot in order, from the hero's weakest stack of more than one (Armies.h)
+		const auto * hero = cb->getHero(e.first);
+		for(int guard = 0; hero && guard < ARMY_SLOTS; ++guard)
+		{
+			const auto from = armies::singleSource(*hero);
+			const auto to = hero->getFreeSlot();
+			if(!from.validSlot() || !to.validSlot())
+				break;
+			cb->splitStack(hero, hero, from, to, 1);
+		}
+		++multiActions;
+		return;
+	}
+	if(kind == MultiKind::MERGE_ALL)
+	{
+		if(const auto * hero = cb->getHero(e.first))
+			mergeDuplicates(hero);
+		++multiActions;
+		return;
+	}
+	if(kind == MultiKind::GARRISON_SWAP)
+	{
+		if(const auto * town = cb->getTown(e.first))
+			cb->swapGarrisonHero(town);
+		++multiActions;
+		return;
+	}
 	if(kind == MultiKind::DROP_SLOW || kind == MultiKind::DROP_FOREIGN)
 	{
 		// The hero's stacks (Armies.h's rule, as encoded) into the garrison, else disbanded
@@ -326,8 +366,8 @@ void AlphaMapAI::arrange(const CArmedInstance * giver, const CArmedInstance * re
 	};
 	const bool keepsOne = dynamic_cast<const CGHeroInstance *>(giver) != nullptr;
 	// A creature in two slots of one army takes a slot the receiver may need (an exchange's own troop moves and swaps
-	// make them; unifyStacks merges them only before a turn decision): 2 of the first 5,100 schema-15 TAKE_BESTs left a
-	// creature behind for want of a slot
+	// make them, and since schema 16 our own splits; before it, a merge of every army before each turn decision did not
+	// reach an exchange's): 2 of the first 5,100 schema-15 TAKE_BESTs left a creature behind for want of a slot
 	mergeDuplicates(receiver);
 	mergeDuplicates(giver);
 	for(const auto & [creature, count] : target)
@@ -410,17 +450,6 @@ void AlphaMapAI::payByTrades(const TResources & cost, const Decision & decision)
 	for(const auto & trade : *trades)
 		cb->trade(market->getObjInstanceID(), EMarketMode::RESOURCE_RESOURCE, GameResID(trade.sell), GameResID(trade.buy), trade.give, nullptr);
 	++tradedPurchases;
-}
-
-void AlphaMapAI::unifyStacks()
-{
-	std::vector<const CArmedInstance *> armies;
-	for(const auto * hero : cb->getHeroesInfo()) // (ours)
-		armies.push_back(hero);
-	for(const auto * town : cb->getTownsInfo(true))
-		armies.push_back(town);
-	for(const auto * army : armies)
-		mergeDuplicates(army);
 }
 
 bool AlphaMapAI::mergeDuplicates(const CArmedInstance * army)

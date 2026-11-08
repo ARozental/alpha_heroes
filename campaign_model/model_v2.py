@@ -35,7 +35,7 @@ from . import constants as c
 from . import encoders as E
 from . import features as ft
 from . import priors
-from .model import MOVE_FEATURES, QUESTION_FEATURES, CustomFeatures, PairBias, dense, flat_log_softmax, with_added
+from .model import MOVE_FEATURES, QUESTION_FEATURES, CustomFeatures, PairBias, army_slot_outputs, army_slots, dense, flat_log_softmax, with_added
 from .schema import HEADS
 
 HO, TO, A, W, HD = c.OWN_HEROES, c.OWN_TOWNS, c.ARMY_SLOTS, c.WINDOW, c.N_HOLDERS
@@ -47,6 +47,7 @@ FORESIGHT_HIDDEN = 16
 # formula, -1..1), and the change of each of Φ's parts until our next turn decision (symlog of thousands of gold)
 ACTION_TARGETS = 2 + len(ft.PHI_PARTS)
 HERO_TARGETS = 2  # alive and ours tomorrow (logit), its army's log ratio tomorrow
+ARMY_SLOT_KEYS = 32  # (schema 16) ARMY's target slot: the stack's query and each slot's key
 TURN_TARGETS = 1 + R  # Φ's log ratio at the end of our turn, each resource's log ratio tomorrow
 COSINE_BOUND = 0.995  # a choice's cosine scaled by it under the atanh (cosine_logit): each logit within ±3.0
 DISTANCE_BUCKETS = 12  # the tile readers' distance bias: Chebyshev tiles 0, 1, 2, 3-4, 5-7, 8-11, ..., 96+, another level
@@ -384,6 +385,11 @@ class CampaignModelV2(nn.Module):
 		self.hire_worth = zero_output(nn.Linear(4, 1))
 		self.army_src, self.army_dst = nn.Linear(2 * d, d), nn.Linear(d, d)
 		self.army_out = nn.Sequential(nn.GELU(), zero_output(nn.Linear(d, c.N_ARMY_AMOUNTS)))
+		# ARMY's target slot (schema 16): the moving stack's query against each slot's key (its holder and its stack), at 0
+		# to begin with; its prior: VCMI's own slot first, a swap rare (model.CustomFeatures.army_slot_priors)
+		self.army_slot_q = zero_output(nn.Linear(d, ARMY_SLOT_KEYS))
+		self.army_stay_q = zero_output(nn.Linear(d, ARMY_SLOT_KEYS))  # (ONE's all-but-one half: its own query, the same keys)
+		self.army_slot_k = nn.Linear(2 * d, ARMY_SLOT_KEYS)
 		self.upgrade_out = nn.Sequential(nn.GELU(), zero_output(nn.Linear(d, 1)))
 		self.trade_head = nn.Sequential(nn.Linear(d, d), nn.GELU(), zero_output(nn.Linear(d, R * R * c.N_TRADE_AMOUNTS)))
 		self.spell = small_embedding(c.N_ADVENTURE_SPELLS, d)
@@ -776,11 +782,22 @@ class CampaignModelV2(nn.Module):
 		# ARMY and UPGRADE: each stack (its holder's token with it) against each holder
 		holders = torch.cat([own_heroes, own_towns, state.other.unsqueeze(1)], dim=1)
 		holder_stacks = torch.cat([state.hero_stacks[:, :HO], state.town_stacks[:, :TO], state.other_stacks.unsqueeze(1)], dim=1)
-		src = self.army_src(torch.cat([holders.unsqueeze(2).expand(b, HD, A, d), holder_stacks], dim=-1))
+		slot_rows = torch.cat([holders.unsqueeze(2).expand(b, HD, A, d), holder_stacks], dim=-1)
+		src = self.army_src(slot_rows)
 		dst = self.army_dst(holders)
-		learned[A_.ARMY] = self.army_out(src[:, :, :, None, :] + dst[:, None, None, :, :])
-		prior[A_.ARMY] = self.features.army_prior(known.hero_strength[:, :HO]).expand_as(learned[A_.ARMY])
+		within, swap_only, default_slot, swap_slot, stay_slot = self.features.army_slot_priors()
+		same_army = torch.eye(HD, device=src.device)[None, :, None, :, None]  # (schema 16: a move within one army)
+		learned[A_.ARMY] = self.army_out(src[:, :, :, None, :] + dst[:, None, None, :, :]) + within * same_army
+		slots = army_slots(x)
+		whole = (torch.arange(c.N_ARMY_AMOUNTS, device=src.device) == c.ArmyAmount.ALL).float()
+		prior[A_.ARMY] = self.features.army_prior(known.hero_strength[:, :HO]).expand_as(learned[A_.ARMY]) + swap_only * slots.swap_only.float()[..., None] * whole
 		offers[A_.ARMY] = best_legal(prior[A_.ARMY], x["army_mask"])  # (below 0 when every legal move leaves troops in a mine)
+		# its target slot (schema 16): each (stack, slot) pair's learned score and the slot's kind
+		keys = self.army_slot_k(slot_rows)
+		slot_logits = torch.einsum("bfsk,btuk->bfstu", self.army_slot_q(src), keys) / math.sqrt(ARMY_SLOT_KEYS)
+		slot_logits = slot_logits + default_slot * slots.default.float() + swap_slot * slots.swap.float()
+		stay_logits = slot_logits + stay_slot + torch.einsum("bfsk,btuk->bfstu", self.army_stay_q(src), keys) / math.sqrt(ARMY_SLOT_KEYS)
+		army_slot_outputs(out, slots, slot_logits, stay_logits)
 		learned[A_.UPGRADE] = self.upgrade_out(src).squeeze(-1) + self.nk2_upgrade(known.upgrade_gains).squeeze(-1)
 		prior[A_.UPGRADE] = upgrade_weight * (known.upgrade_gains[..., 0] > 0).float()
 		offers[A_.UPGRADE] = best_legal(prior[A_.UPGRADE], x["upgrade_mask"])
@@ -815,7 +832,7 @@ class CampaignModelV2(nn.Module):
 		kind = torch.arange(c.N_MULTI, device=kinds.device)
 		by_hero = (self.multi_q(own_heroes) @ kinds.t()) / math.sqrt(d)  # [B, HO (= TO), N_MULTI]: DROP_SLOW's, DROP_FOREIGN's rows
 		exchange = (kind == c.MultiKind.GIVE_ALL) | (kind == c.MultiKind.TAKE_BEST) | (kind == c.MultiKind.TAKE_BEST_FAST)
-		hero = (kind == c.MultiKind.DROP_SLOW) | (kind == c.MultiKind.DROP_FOREIGN)
+		hero = (kind == c.MultiKind.DROP_SLOW) | (kind == c.MultiKind.DROP_FOREIGN) | (kind == c.MultiKind.SPLIT_SINGLES) | (kind == c.MultiKind.MERGE_ALL)
 		learned[A_.MULTI] = torch.where(exchange, by_receiver, torch.where(hero, by_hero, by_town))
 		prior[A_.MULTI] = known.multi_prior
 		offers[A_.MULTI] = best_legal(prior[A_.MULTI], x["multi_mask"])

@@ -22,7 +22,18 @@ def sample(out, x, b, rng):
 	action = draw(out["type_logp"][b])
 	if action == c.ActionType.END:
 		return action, -1, -1
-	return action, draw(out[HEADS[c.ActionType(action)][0]][b]), -1
+	index = draw(out[HEADS[c.ActionType(action)][0]][b])
+	slots = slot_choices(out, b, index) if action == c.ActionType.ARMY else None
+	return action, index, -1 if slots is None else draw(slots)
+
+
+def slot_choices(out, b, index):
+	"""ARMY's target slot log-probabilities [ARMY_SLOT_CHOICES] for its entry `index`, renormalized over the choices its
+	amount allows (AlphaMapAI's draw: the whole stack's legal slots; a part's fit ones; ONE's both halves), -inf else."""
+	holder, slot, to, amount = np.unravel_index(index, (c.N_HOLDERS, c.ARMY_SLOTS, c.N_HOLDERS, c.N_ARMY_AMOUNTS))
+	fit, whole = out["army_split_mask"][b, holder, slot, to], out["army_whole_mask"][b, holder, slot, to]
+	allowed = torch.cat([whole if amount == c.ArmyAmount.ALL else fit, fit if amount == c.ArmyAmount.ONE else torch.zeros_like(fit)])
+	return torch.log_softmax(out["army_slot_logp"][b, holder, slot, to].masked_fill(~allowed, float("-inf")), dim=-1)
 
 
 def decisions_for(model, x, seed=0):
@@ -33,6 +44,7 @@ def decisions_for(model, x, seed=0):
 	for b in range(len(x["g_kind"])):
 		action, index, cell = sample(out, x, b, rng)
 		logp = float(out["type_logp"][b, action] + (out[HEADS[c.ActionType(action)][0]][b].reshape(-1)[index] if action > 0 else 0)) if action >= 0 else float(out["option_logp"][b, index])
+		logp += float(slot_choices(out, b, index)[cell]) if cell >= 0 else 0.0
 		result.append(Decision("RED", 1, int(x["g_kind"][b]), b, 1, action, index, cell, logp, tuple(out["value"][b].tolist()), 0, b""))
 	return result
 

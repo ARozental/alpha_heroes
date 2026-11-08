@@ -36,4 +36,11 @@ std::vector<SlotID> slowestStacks(const CCreatureSet & army);
 std::vector<SlotID> foreignStacks(const CCreatureSet & army);
 // Whether `into` can take those stacks of `from`: each onto its own creature there or into a free slot
 bool takes(const CCreatureSet & into, const CCreatureSet & from, const std::vector<SlotID> & stacks);
+
+// SPLIT_SINGLES (schema 16): the stack a single creature splits off next, the army's weakest of more than one (the least
+// AI value a creature, the first slot of it: Nullkiller2's addSingleCreatureStacks), while the army has a free slot;
+// none otherwise
+SlotID singleSource(const CCreatureSet & army);
+// MERGE_ALL (schema 16): a later slot holding a creature an earlier one holds too, and that earlier one; none if none
+std::pair<SlotID, SlotID> duplicate(const CCreatureSet & army);
 }

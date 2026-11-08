@@ -204,6 +204,8 @@ INPUTS = (
 	_i("x_take_count", (2, 2, 2, A), "their counts"),
 	_m("h_drop", (HO, 2, A), "DROP_SLOW's and DROP_FOREIGN's army slots of each hero of ours"),
 	_m("h_drop_kept", (HO, 2), "whether they go into the garrison of the town it visits (else disbanded)"),
+	# Schema 16 (at the end: older records read with it at 0, a record of 15 with its multi_mask's 8 kinds widened)
+	_m("army_slot_mask", (HD, A, HD, A), "ARMY's target slot: from holder, slot, to holder, each slot a whole stack may go to (empty: a move; the same creature: a merge; another: a swap); a part of a stack only to an empty slot or its own creature's"),
 )
 
 
@@ -231,6 +233,7 @@ OUTPUTS = (
 	_o("resource_worth", (R,), "what one unit of each resource is worth to us (gold): a purchase short of resources trades away what loses the least of it"),
 	_o("artifact_logp", (HO, c.N_ARTIFACT_POSITIONS, c.N_ARTIFACT_TARGETS), "log p(hero, position, target | ARTIFACT)"),
 	_o("multi_logp", (TO, c.N_MULTI), "log p(town or receiving hero, kind | MULTI)"),
+	_o("army_slot_logp", (HD, A, HD, c.ARMY_SLOT_CHOICES), "log p(target slot | ARMY's from holder, slot, to holder): the slot the amount goes to, then (ONE alone) the slot all but one go to; normalized over all, renormalized over the amount's (a whole stack's army_slot_mask, a part's empty slots and its own creature's)"),
 )
 
 # Each action type's table: (output, mask); END has none
@@ -339,6 +342,7 @@ def random_inputs(batch=1, seed=0):
 		if kind == c.DecisionKind.EXCHANGE:
 			x["army_mask"][b, 0, 0, 1] = True
 			x["army_mask"][b, 0, 0, 1, c.ArmyAmount.ONE] = True
+			x["army_slot_mask"][b, 0, 0, 1, :3] = True  # (schema 16: the target slots open to slot 0's stack)
 		if kind in c.DIALOG_KINDS:
 			n = 2 if kind == c.DecisionKind.YES_NO else int(rng.integers(1, c.N_OPTIONS + 1))
 			x["option_mask"][b, :n] = True

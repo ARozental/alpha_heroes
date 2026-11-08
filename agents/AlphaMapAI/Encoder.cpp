@@ -110,6 +110,39 @@ int distanceSq(const int3 & a, const int3 & b)
 {
 	return (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z == b.z ? 0 : 10000);
 }
+
+/// A holder's creature in a slot as the inputs have it (-1 empty): our heroes', our towns' garrisons, the other army's
+int64_t holderCreature(const Decision & decision, int holder, int slot)
+{
+	if(holder < OWN_HEROES)
+		return decision.inputs.get(In::h_army_creature, holder, slot);
+	if(holder < OWN_HEROES + OWN_TOWNS)
+		return decision.inputs.get(In::t_garrison_creature, holder - OWN_HEROES, slot);
+	return decision.inputs.get(In::x_creature, slot);
+}
+}
+
+bool armySlotAllowed(const Decision & decision, int index, int t)
+{
+	const int amount = index % N_ARMY_AMOUNTS;
+	const int to = index / N_ARMY_AMOUNTS % N_HOLDERS;
+	const int s = index / (N_ARMY_AMOUNTS * N_HOLDERS) % ARMY_SLOTS;
+	const int from = index / (N_ARMY_AMOUNTS * N_HOLDERS * ARMY_SLOTS);
+	if(index < 0 || from >= N_HOLDERS || t < 0 || t >= ARMY_SLOT_CHOICES)
+		return false;
+	if(t >= ARMY_SLOTS) // (the one stays)
+	{
+		if(amount != static_cast<int>(ArmyAmount::ONE))
+			return false;
+		t -= ARMY_SLOTS;
+	}
+	else if(amount == static_cast<int>(ArmyAmount::ALL))
+		return decision.inputs.get(In::army_slot_mask, from, s, to, t) != 0;
+	if(from == to && t == s)
+		return false;
+	const auto source = holderCreature(decision, from, s);
+	const auto target = holderCreature(decision, to, t);
+	return target < 0 || (source >= 0 && target == source);
 }
 
 std::optional<std::vector<Trade>> tradesFor(const IMarket * market, const TResources & cost, const TResources & have, const std::array<float, N_RESOURCES> & worth)
@@ -283,7 +316,7 @@ Decision AlphaMapAI::encode(DecisionKind kind, ObjectInstanceID exchangeFirst, O
 		};
 		const int a = holder(exchangeFirst);
 		const int b = holder(exchangeSecond);
-		encodeArmyMoves(decision, {{a, b}, {b, a}});
+		encodeArmyMoves(decision, {{a, b}, {b, a}, {a, a}, {b, b}}); // (schema 16: and each within itself)
 		if(a < OWN_HEROES && b < OWN_HEROES) // (two heroes of ours: their artifacts may change hands)
 		{
 			decision.inputs.at(In::x_heroes, 0) = a + 1;
@@ -938,10 +971,12 @@ void AlphaMapAI::encodeMulti(Decision & decision, int first, int second)
 	// making them): in a turn, a town of ours: all we can pay for of what it has for hire, into its garrison
 	// (RECRUIT_ALL) or into the hero of ours visiting it (RECRUIT_ALL_HERO), its garrison into that hero (GATHER); a hero
 	// of ours (schema 15): its slowest creatures (DROP_SLOW) or those of its lesser factions (DROP_FOREIGN) into the
-	// garrison of the town it visits, else disbanded (Armies.h; h_drop*). In an exchange of two heroes of ours, all of
-	// one's army (one creature kept) and artifacts to the other (GIVE_ALL), Nullkiller2's best army of the two to it
-	// (TAKE_BEST, less its slowest creatures TAKE_BEST_FAST; x_take_*: the armies after), each way: row 0 the first hero
-	// receiving. Entry: the source, the destination (none: disbanded), a the MultiKind
+	// garrison of the town it visits, else disbanded (Armies.h; h_drop*); (schema 16, in the field or a garrison) a
+	// creature of its weakest stack into each free slot (SPLIT_SINGLES), each creature's stacks merged (MERGE_ALL). A
+	// town of ours (schema 16): its heroes in or out of the garrison (GARRISON_SWAP). In an exchange of two heroes of
+	// ours, all of one's army (one creature kept) and artifacts to the other (GIVE_ALL), Nullkiller2's best army of the
+	// two to it (TAKE_BEST, less its slowest creatures TAKE_BEST_FAST; x_take_*: the armies after), each way: row 0 the
+	// first hero receiving. Entry: the source, the destination (none: disbanded), a the MultiKind
 	auto & in = decision.inputs;
 	const auto add = [&](int row, MultiKind kind, ObjectInstanceID from, ObjectInstanceID to)
 	{
@@ -982,7 +1017,13 @@ void AlphaMapAI::encodeMulti(Decision & decision, int first, int second)
 	for(int h = 0; h < OWN_HEROES; ++h)
 	{
 		const auto * hero = decision.heroes[h] == ObjectInstanceID() ? nullptr : cb->getHero(decision.heroes[h]);
-		if(!hero || hero->tempOwner != playerID || hero->isGarrisoned())
+		if(!hero || hero->tempOwner != playerID)
+			continue;
+		if(armies::singleSource(*hero).validSlot())
+			add(h, MultiKind::SPLIT_SINGLES, hero->id, hero->id);
+		if(armies::duplicate(*hero).first.validSlot())
+			add(h, MultiKind::MERGE_ALL, hero->id, hero->id);
+		if(hero->isGarrisoned())
 			continue;
 		const auto * town = hero->getVisitedTown();
 		const CArmedInstance * garrison = town && town->tempOwner == playerID ? town->getUpperArmy() : nullptr;
@@ -1013,6 +1054,14 @@ void AlphaMapAI::encodeMulti(Decision & decision, int first, int second)
 			add(t, MultiKind::RECRUIT_ALL_HERO, town->id, visitor->id);
 		if(visited && movesAny(garrison, visitor))
 			add(t, MultiKind::GATHER, garrison->id, visitor->id);
+		// GARRISON_SWAP, as VCMI's garrisonSwap allows: the visiting hero into the garrison (its army taking the town's),
+		// the garrison hero out (below the cap of heroes on the map), or the two swapped
+		const auto * inside = town->getGarrisonHero();
+		const int cap = cb->getSettings().getInteger(EGameSettings::HEROES_PER_PLAYER_ON_MAP_CAP);
+		if(inside && inside->tempOwner == playerID && (visitor ? visited : cb->howManyHeroes(false) < cap))
+			add(t, MultiKind::GARRISON_SWAP, town->id, ObjectInstanceID());
+		else if(!inside && visited && visitor->canBeMergedWith(*town))
+			add(t, MultiKind::GARRISON_SWAP, town->id, ObjectInstanceID());
 	}
 }
 
@@ -1202,6 +1251,9 @@ void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)
 			pairs.emplace_back(visiting, garrison);
 		}
 	}
+	for(int holder = 0; holder < OWN_HEROES + OWN_TOWNS; ++holder) // (schema 16: each army of ours arranged within itself)
+		if(decision.holders[holder] != ObjectInstanceID())
+			pairs.emplace_back(holder, holder);
 	encodeArmyMoves(decision, pairs);
 
 	// UPGRADE: armies in our towns
@@ -1313,32 +1365,51 @@ void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)
 
 void AlphaMapAI::encodeArmyMoves(Decision & decision, const std::vector<std::pair<int, int>> & pairs)
 {
+	// Each stack of `from` into a slot of `to` (schema 16: `to` may be `from` itself, and the slot is the model's): a whole
+	// stack into an empty slot (a move), onto its own creature (a merge) or onto another creature (a swap), its legal
+	// slots army_slot_mask's; a part of it (HALF, ONE) into a fit slot, an empty one or its own creature's (never its
+	// own slot: the model reads them from the armies' creatures, campaign_model.model.army_slots). A hero keeps at least
+	// one creature: its last stack goes to another army only by a swap. The entry's b: the slot VCMI's getSlotFor gives
+	// (where ARMY went before schema 16; -1 none, as within an army), its c the count moved
 	for(const auto & [from, to] : pairs)
 	{
 		const auto * source = armyOf(*cb, decision.holders[from]);
 		const auto * target = armyOf(*cb, decision.holders[to]);
-		if(!source || !target || from == to)
+		if(!source || !target)
 			continue;
-		const bool sourceIsHero = source->ID == Obj::HERO;
+		const bool within = from == to;
+		const bool lastOfHero = source->ID == Obj::HERO && source->stacksCount() == 1;
 		for(int s = 0; s < ARMY_SLOTS; ++s)
 		{
 			const auto * stack = source->getStackPtr(SlotID(s));
 			if(!stack)
 				continue;
-			const auto slot = target->getSlotFor(stack->getId());
-			if(!slot.validSlot())
-				continue;
 			const int count = stack->getCount();
+			bool whole = false, part = false;
+			for(int t = 0; t < ARMY_SLOTS; ++t)
+			{
+				if(within && t == s)
+					continue;
+				const auto * there = target->getStackPtr(SlotID(t));
+				const bool fits = !there || there->getId() == stack->getId(); // (empty, or its own creature)
+				part = part || fits;
+				if(fits && !within && lastOfHero)
+					continue; // (its last stack out whole: only by a swap, which leaves it the other)
+				decision.inputs.at(In::army_slot_mask, from, s, to, t) = 1;
+				whole = true;
+			}
+			const auto slot = within ? SlotID() : target->getSlotFor(stack->getId());
 			for(int amount = 0; amount < N_ARMY_AMOUNTS; ++amount)
 			{
-				const int moved = amount == static_cast<int>(ArmyAmount::ALL) ? count : amount == static_cast<int>(ArmyAmount::HALF) ? (count + 1) / 2 : 1;
-				if(amount != static_cast<int>(ArmyAmount::ALL) && moved >= count)
+				const bool all = amount == static_cast<int>(ArmyAmount::ALL);
+				const int moved = all ? count : amount == static_cast<int>(ArmyAmount::HALF) ? (count + 1) / 2 : 1;
+				if(!all && moved >= count)
 					continue; // the same as moving the whole stack
-				if(sourceIsHero && moved == count && source->stacksCount() == 1)
-					continue; // a hero keeps at least one creature
+				if(all ? !whole : !part)
+					continue;
 				decision.inputs.at(In::army_mask, from, s, to, amount) = 1;
 				const int index = ((from * ARMY_SLOTS + s) * N_HOLDERS + to) * N_ARMY_AMOUNTS + amount;
-				decision.entries[static_cast<int>(ActionType::ARMY)][index] = Entry{source->id, target->id, s, slot.getNum(), moved};
+				decision.entries[static_cast<int>(ActionType::ARMY)][index] = Entry{source->id, target->id, s, slot.validSlot() ? slot.getNum() : -1, moved};
 			}
 		}
 	}

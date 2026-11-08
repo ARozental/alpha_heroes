@@ -22,6 +22,7 @@ scale-free: x / (x + c) at a few scales c, fractions, log-ratios; every distance
 map size.
 """
 import functools
+from typing import NamedTuple
 import math
 
 import torch
@@ -298,6 +299,10 @@ class CustomFeatures(nn.Module):
 		self.select_pick = zeros()  # (2026-11-04: Nullkiller2's pick among a selection's components; select_weight)
 		self.artifact_cost = zeros()  # (2026-11-04: what an artifact's move must gain to be worth making; artifact_cost_weight)
 		self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather = zeros(), zeros(), zeros(), zeros(), zeros()
+		# (schema 16, 2026-11-07: ARMY within one army and swaps, its target slot, MULTI's SPLIT_SINGLES, MERGE_ALL and
+		# GARRISON_SWAP; each new option rare at the start: army_slot_priors, multi_priors_16)
+		self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay = zeros(), zeros(), zeros(), zeros(), zeros()
+		self.multi_split, self.multi_merge, self.multi_garrison = zeros(), zeros(), zeros()
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -316,6 +321,7 @@ class CustomFeatures(nn.Module):
 			self.fight_sharpness, self.enemy_value, self.hero_value, self.danger_gain, self.meeting_gain, self.explore_gain, self.class_gain, self.travel_exponent,
 			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost, self.multi_weight, self.give_all_cost, self.gather_risk, self.gather_cost, self.disband_cost, self.drop_scale, self.drop_sign, self.trade_waste,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
+			self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay, self.multi_split, self.multi_merge, self.multi_garrison,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
 		]
@@ -364,6 +370,22 @@ class CustomFeatures(nn.Module):
 			-self.garrison_cost() * into_other + ft.bounded(self.army_take, 0.0, 4.0, 1.5, CORRECTION_STEP) * town_to_hero
 			+ ft.bounded(self.army_gather, 0.0, 4.0, 1.0, CORRECTION_STEP) * toward
 		)
+
+	def army_slot_priors(self):
+		"""Schema 16's ARMY priors (2026-11-07), each learned from where it starts: (a move within one army -5: on the
+		learned part, so a decision with only those keeps ARMY's type score; an entry legal only as a swap -3; the target
+		slot VCMI would have taken +4, as the encoder took it before: 93% against 4 others; a swap's slot -2; ONE's
+		second half, all but one moving, -5: ONE moved one creature until now)."""
+		step = CORRECTION_STEP
+		return (ft.bounded(self.army_within, -10.0, 0.0, -5.0, step), ft.bounded(self.army_swap, -8.0, 2.0, -3.0, step),
+			ft.bounded(self.slot_default, 0.0, 8.0, 4.0, step), ft.bounded(self.slot_swap, -6.0, 2.0, -2.0, step),
+			ft.bounded(self.slot_stay, -10.0, 2.0, -5.0, step))
+
+	def multi_priors_16(self):
+		"""Schema 16's MULTI kinds' starts [SPLIT_SINGLES, MERGE_ALL, GARRISON_SWAP], each -4 (rare until the teacher's
+		or a human's labels, or their outcomes, lift them), learned."""
+		step = CORRECTION_STEP
+		return torch.stack([ft.bounded(raw, -10.0, 4.0, -4.0, step) for raw in (self.multi_split, self.multi_merge, self.multi_garrison)])
 
 	def nk2_weights(self):
 		"""The learnable weights of Nullkiller2's habits: (a skill score point, an upgrade, a wanted spellbook, the pause)."""
@@ -784,6 +806,9 @@ class CustomFeatures(nn.Module):
 		for kind in (c.MultiKind.GIVE_ALL, c.MultiKind.TAKE_BEST, c.MultiKind.TAKE_BEST_FAST):
 			cost[:, :2, kind] = weaker
 		cost[..., c.MultiKind.GATHER] = (1.0 - self.main_visitor(x, f)) * self.gather_cost_weight()
+		starts = self.multi_priors_16()  # (schema 16: their own starts; one kind at a time, no index tensor: CUDA graphs)
+		for i, kind in enumerate((c.MultiKind.SPLIT_SINGLES, c.MultiKind.MERGE_ALL, c.MultiKind.GARRISON_SWAP)):
+			cost[..., kind] = -starts[i]
 		return prior - cost
 
 	def artifact_prior(self, x, f):
@@ -1406,7 +1431,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
@@ -1418,6 +1443,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"decision", "option_context", "option_weights", "encode_options.component", "encode_options.primary", "encode_options.resource",
 	"encode_options.numbers", "build_identity", "artifact_q", "artifact_target", "encode_hero.carried", "multi_q", "multi_kind",
 	"privileged",  # (2026-11-06: the privileged critic, its corrections 0 at the start)
+	"army_slot", "army_stay_q",  # (schema 16: ARMY's target slot, its queries 0 at the start: its priors alone)
 )
 # Training-only parts rebuilt since, by prefix: a checkpoint's weights for them that the loading model lacks, or of
 # another shape, are dropped, the part starting again as a new model has it (2026-11-07: the privileged critic's first
@@ -1435,6 +1461,48 @@ def with_added(state_dict, own):
 	missing = {key: torch.zeros_like(own[key]) for key in ADDED if key in own and key not in state_dict}
 	missing.update({key: value.clone() for key, value in own.items() if key.startswith(ADDED_HEADS) and key not in state_dict})
 	return {**state_dict, **missing} if missing else state_dict
+
+
+class ArmySlots(NamedTuple):
+	"""Schema 16's ARMY target slots [B, HD, A, HD, A] (from holder, slot, to holder, target slot): legal (army_slot_mask:
+	a whole stack's), fit (a part of a stack's: an empty slot or its own creature's, never its own slot; legal for a part
+	where a hero's last stack is not, AlphaMapAI's encodeArmyMoves), swap (another creature's: a whole stack swaps),
+	default (between two armies, the slot VCMI's getSlotFor gives: its own creature's, else the first empty: where ARMY
+	went before schema 16); swap_only [B, HD, A, HD]: an entry whose every legal slot is a swap."""
+
+	legal: torch.Tensor
+	fit: torch.Tensor
+	swap: torch.Tensor
+	default: torch.Tensor
+	swap_only: torch.Tensor
+
+
+def army_slots(x):
+	"""The holders' slots read from the inputs: our heroes' armies, our towns' garrisons, the other army (ArmySlots)."""
+	creature = torch.cat([x["h_army_creature"][:, :HO], x["t_garrison_creature"][:, :TO], x["x_creature"][:, None, :]], dim=1)  # [B, HD, A]
+	legal = x["army_slot_mask"]
+	source = creature[:, :, :, None, None]
+	target = creature[:, None, None, :, :]
+	empty = target < 0
+	same = (target == source) & (source >= 0)
+	eye_h, eye_a = torch.eye(HD, dtype=torch.bool, device=legal.device), torch.eye(A, dtype=torch.bool, device=legal.device)
+	within = eye_h[:, None, :, None]  # [HD, 1, HD, 1]: a move within one army
+	fit = (empty | same) & ~(within & eye_a[None, :, None, :])  # (its own slot: no move)
+	swap = legal & ~empty & ~same
+	# getSlotFor: the first slot of its own creature, else the first empty one (argmax of a 0/1 row: its first 1)
+	same_any, empty_any = same.any(dim=-1), empty.any(dim=-1)
+	first = torch.where(same_any, same.float().argmax(dim=-1), empty.float().argmax(dim=-1))
+	default = (first[..., None] == torch.arange(A, device=legal.device)) & (same_any | empty_any)[..., None] & ~within & (legal | fit)
+	return ArmySlots(legal, fit, swap, default, legal.any(dim=-1) & ~(legal & fit).any(dim=-1))
+
+
+def army_slot_outputs(out, slots, moves, stays):
+	"""ARMY's target slot outputs (schema 16): army_slot_logp [B, HD, A, HD, ARMY_SLOT_CHOICES] from the logits of the
+	amount going to each slot (moves) and of all but one going there, the one staying (stays: ONE's second half),
+	normalized over every slot open to some amount (train.chosen_logp and AlphaMapAI's draw renormalize over the
+	amount's); the masks training renormalizes with."""
+	out["army_slot_logp"] = masked_log_softmax(torch.cat([moves, stays], dim=-1), torch.cat([slots.legal | slots.fit, slots.fit], dim=-1))
+	out["army_split_mask"], out["army_whole_mask"] = slots.fit, slots.legal
 
 
 class CampaignModel(nn.Module):
@@ -1777,6 +1845,10 @@ class CampaignModel(nn.Module):
 		out["resource_worth"] = f.resource_worth
 		out["artifact_logp"] = flat_log_softmax(f.artifact_prior, x["artifact_mask"])  # (v1: the prior only, schema 13's ARTIFACT)
 		out["multi_logp"] = flat_log_softmax(f.multi_prior, x["multi_mask"])  # (v1: the prior only, schema 14's MULTI)
+		slots = army_slots(x)  # (v1: schema 16's target slot from its priors only)
+		_, _, default, swap, stay = self.features.army_slot_priors()
+		moves = default * slots.default.float() + swap * slots.swap.float()
+		army_slot_outputs(out, slots, moves, moves + stay)
 		return out
 
 	def move_and_travel(self, x, f, out, own_heroes, cells, areas, windows, n):

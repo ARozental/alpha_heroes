@@ -1,5 +1,6 @@
 #include "StdInc.h"
 #include "AlphaMapAI.h"
+#include "Armies.h"
 
 #include "lib/callback/CCallback.h"
 #include "lib/mapObjects/CGHeroInstance.h"
@@ -166,22 +167,151 @@ bool AlphaMapAI::matchRequest(const Decision & decision, const CPackForServer * 
 	}
 	else if(const auto * p = dynamic_cast<const ArrangeStacks *>(pack))
 	{
+		// Our ARMY entry of the same stack and destination (schema 16: within one army too), its target slot the
+		// request's (the record's cell): a whole stack moved, merged or swapped (what 1, 2: ALL; VCMI swaps two stacks
+		// of one creature where ours merge them: not exact); a part split off (what 3: val the count the target slot
+		// ends with), the amount whose count is nearest (on a log scale), all but one ONE's second half (the one stays)
 		const auto * source = armedObject(*cb, p->id1);
 		const auto * target = armedObject(*cb, p->id2);
-		if(p->id1 == p->id2)
-			unmatched = "ArrangeStacks (within one army)";
-		else if(!source || !target)
+		if(source && target && p->what == 1 && source->slotEmpty(p->p1) && !target->slotEmpty(p->p2))
+		{
+			// A swap from an empty slot: VCMI's move of the other stack into it (Nullkiller2's formation for a siege)
+			const ArrangeStacks back(1, p->p2, p->p1, p->id2, p->id1, 0);
+			return matchRequest(decision, &back, choice, exact, unmatched, intended);
+		}
+		if(!source || !target)
 			unmatched = "ArrangeStacks (no army)";
-		else if(p->what == 1 && !target->slotEmpty(p->p2))
-			unmatched = "ArrangeStacks (a swap of two stacks)";
 		else
 		{
-			const double moved = p->what == 3 ? double(p->val - target->getStackCount(p->p2)) : double(source->getStackCount(p->p1));
-			const auto key = [p](const Entry & e) { return e.first == p->id1 && e.second == p->id2 && e.a == p->p1.getNum() && e.b == p->p2.getNum(); };
-			pick(ActionType::ARMY, nearest(entries(ActionType::ARMY), key, [](const Entry & e) { return double(e.c); }, moved, exact));
-			if(choice.type < 0)
-				unmatched = "ArrangeStacks (not legal for us)";
+			const int count = source->getStackCount(p->p1);
+			const double moved = p->what == 3 ? double(p->val - target->getStackCount(p->p2)) : double(count);
+			int best = -1, bestCell = -1;
+			double gap = 1e18;
+			for(const auto & [index, e] : entries(ActionType::ARMY))
+			{
+				if(e.first != p->id1 || e.second != p->id2 || e.a != p->p1.getNum())
+					continue;
+				for(int half = 0; half < 2; ++half)
+				{
+					const int cell = p->p2.getNum() + half * ARMY_SLOTS;
+					if(!armySlotAllowed(decision, index, cell))
+						continue;
+					const double g = std::abs(std::log(std::max(1, half ? count - 1 : e.c)) - std::log(std::max(1.0, moved)));
+					if(g < gap || (g == gap && (index < best || (index == best && cell < bestCell))))
+						std::tie(gap, best, bestCell) = std::tuple(g, index, cell);
+				}
+			}
+			if(best >= 0)
+			{
+				pick(ActionType::ARMY, best);
+				choice.cell = bestCell;
+				const bool sameSwap = p->what == 1 && !target->slotEmpty(p->p2) && target->getCreature(p->p2) == source->getCreature(p->p1);
+				exact = gap < 1e-9 && !sameSwap;
+			}
+			else
+				unmatched = p->id1 == p->id2 ? "ArrangeStacks (within one army, not legal for us)" : "ArrangeStacks (not legal for us)";
 		}
+	}
+	else if(const auto * p = dynamic_cast<const ExchangeArtifacts *>(pack))
+	{
+		// ARTIFACT: to the other hero of an exchange (GIVE; ours to its own slot there if free, else the backpack: exact
+		// where the request's slot is that one), from the backpack into a worn slot (EQUIP, the same way); taking one off
+		// into the backpack, or from one worn slot to another, is not among our actions
+		const bool give = p->src.artHolder != p->dst.artHolder;
+		const auto target = give ? ArtifactTarget::GIVE : ArtifactTarget::EQUIP;
+		for(const auto & [index, e] : entries(ActionType::ARTIFACT))
+			if(index % N_ARTIFACT_TARGETS == static_cast<int>(target) && e.first == p->src.artHolder && (!give || e.second == p->dst.artHolder) && e.a == p->src.slot.num)
+			{
+				pick(ActionType::ARTIFACT, index);
+				exact = e.c == p->dst.slot.num;
+			}
+		if(choice.type < 0)
+			unmatched = give ? "ExchangeArtifacts (not legal for us)" : "ExchangeArtifacts (within a hero: not among our actions)";
+	}
+	else if(const auto * p = dynamic_cast<const AssembleArtifacts *>(pack))
+	{
+		for(const auto & [index, e] : entries(ActionType::ARTIFACT))
+			if(p->assemble && index % N_ARTIFACT_TARGETS == static_cast<int>(ArtifactTarget::ASSEMBLE) && e.first == p->heroID && e.a == p->artifactSlot.num && e.c == p->assembleTo.getNum())
+				pick(ActionType::ARTIFACT, index);
+		if(choice.type < 0)
+			unmatched = p->assemble ? "AssembleArtifacts (not legal for us)" : "AssembleArtifacts (a disassembly: not among our actions)";
+	}
+	else if(const auto * p = dynamic_cast<const GarrisonHeroSwap *>(pack))
+	{
+		for(const auto & [index, e] : entries(ActionType::MULTI))
+			if(e.first == p->tid && e.a == static_cast<int>(MultiKind::GARRISON_SWAP))
+				pick(ActionType::MULTI, index);
+		if(choice.type < 0)
+			unmatched = "GarrisonHeroSwap (not legal for us)";
+	}
+	else if(const auto * p = dynamic_cast<const BulkMergeStacks *>(pack))
+	{
+		// MERGE_ALL: every creature's stacks into its first; VCMI's this creature's into this slot (exact when that is the
+		// only creature in two slots and this its first)
+		const auto * army = armedObject(*cb, p->srcOwner);
+		for(const auto & [index, e] : entries(ActionType::MULTI))
+			if(e.first == p->srcOwner && e.a == static_cast<int>(MultiKind::MERGE_ALL))
+				pick(ActionType::MULTI, index);
+		if(choice.type < 0 || !army)
+			unmatched = "BulkMergeStacks (not legal for us)";
+		else
+		{
+			const auto [later, earlier] = armies::duplicate(*army);
+			const auto creature = army->getCreature(p->src);
+			bool others = false;
+			for(const auto & [slot, stack] : army->Slots())
+				for(const auto & [other, more] : army->Slots())
+					others = others || (other.getNum() > slot.getNum() && more->getCreature() == stack->getCreature() && stack->getCreature() != creature);
+			exact = !others && earlier == p->src;
+		}
+	}
+	else if(const auto * p = dynamic_cast<const BulkSplitStack *>(pack))
+	{
+		// A creature into each free slot (amount 1): SPLIT_SINGLES, exact when it splits this stack alone (its weakest of
+		// more than one, enough creatures for every free slot); a larger amount: a part of it into the first free slot
+		const auto * army = armedObject(*cb, p->srcOwner);
+		const SlotID free = army ? army->getFreeSlot() : SlotID();
+		if(p->amount == 1)
+			for(const auto & [index, e] : entries(ActionType::MULTI))
+				if(e.first == p->srcOwner && e.a == static_cast<int>(MultiKind::SPLIT_SINGLES))
+					pick(ActionType::MULTI, index);
+		if(choice.type >= 0)
+			exact = armies::singleSource(*army) == p->src && army->getStackCount(p->src) - 1 >= static_cast<int>(army->getFreeSlots().size());
+		else if(army && free.validSlot())
+		{
+			const ArrangeStacks split(3, p->src, free, p->srcOwner, p->srcOwner, p->amount);
+			matchRequest(decision, &split, choice, exact, unmatched, intended);
+			exact = false;
+		}
+		if(choice.type < 0)
+			unmatched = "BulkSplitStack (not legal for us)";
+	}
+	else if(const auto * p = dynamic_cast<const BulkSplitAndRebalanceStack *>(pack))
+	{
+		// Its stack spread evenly over the free slots: the first step of it, half the stack into the first free slot
+		const auto * army = armedObject(*cb, p->srcOwner);
+		const SlotID free = army ? army->getFreeSlot() : SlotID();
+		if(army && free.validSlot() && army->getStackCount(p->src) > 1)
+		{
+			const ArrangeStacks split(3, p->src, free, p->srcOwner, p->srcOwner, (army->getStackCount(p->src) + 1) / 2);
+			matchRequest(decision, &split, choice, exact, unmatched, intended);
+		}
+		exact = false;
+		if(choice.type < 0)
+			unmatched = "BulkSplitAndRebalanceStack (not legal for us)";
+	}
+	else if(const auto * p = dynamic_cast<const BulkMoveArmy *>(pack))
+	{
+		// Every stack but a creature of one (VCMI's bulk move; ours keeps one of the weakest stack): a town's garrison into
+		// its visitor (GATHER), an exchange's hero's into the other's (GIVE_ALL, its artifacts too: not exact)
+		for(const auto & [index, e] : entries(ActionType::MULTI))
+			if(e.first == p->srcArmy && e.second == p->destArmy && (e.a == static_cast<int>(MultiKind::GATHER) || e.a == static_cast<int>(MultiKind::GIVE_ALL)))
+			{
+				pick(ActionType::MULTI, index);
+				exact = e.a == static_cast<int>(MultiKind::GATHER);
+			}
+		if(choice.type < 0)
+			unmatched = "BulkMoveArmy (not legal for us)";
 	}
 	else
 		unmatched = typeid(*pack).name();

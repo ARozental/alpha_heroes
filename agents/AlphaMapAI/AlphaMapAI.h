@@ -59,6 +59,12 @@ struct Decision
 	int holderOf(ObjectInstanceID id) const;
 };
 
+/// Schema 16: whether ARMY's entry `index` (flat in its table) may take target slot choice `t` (0 .. ARMY_SLOT_CHOICES-1),
+/// read from the decision's inputs as the model reads them (campaign_model.model.army_slots): t < ARMY_SLOTS the slot the
+/// amount goes to, a whole stack's legal ones (army_slot_mask), a part's fit ones (an empty slot or its own creature's,
+/// never its own slot); t >= ARMY_SLOTS (ONE alone) the fit slot t - ARMY_SLOTS all but one go to, the one staying
+bool armySlotAllowed(const Decision & decision, int index, int t);
+
 /// A trade of a purchase short of resources: give units of sell (whole lots of the market's offer) for buy
 struct Trade
 {
@@ -79,7 +85,7 @@ struct Choice
 {
 	int type = -1;  // ActionType; -1 for a question
 	int index = -1; // flat index in the type's table, or the option
-	int cell = -1;  // a targeted spell's tile (flat index in its hero's window), -1 none
+	int cell = -1;  // a targeted spell's tile (flat index in its hero's window), or ARMY's target slot (schema 16), -1 none
 	float logp = 0;
 	uint64_t record = 0; // the serial of its Record (0: none), so a no-op flags this decision, not a later dialog's
 };
@@ -247,7 +253,6 @@ class AlphaMapAI : public CAdventureAI
 	// prices when that finds none)
 	void payByTrades(const TResources & cost, const Decision & decision);
 	// The stacks of one creature in an army of ours merged into one (the user, 2026-11-04: "whenever possible, unify")
-	void unifyStacks();
 	bool mergeDuplicates(const CArmedInstance * army); // (a creature's stacks in one army into one; whether any merged)
 	// A University's skill as a yes/no: YES buys it (the option a SKILL: the skill, basic, its price)
 	Decision universityQuestion(const CGHeroInstance * hero, SecondarySkill skill, int price);

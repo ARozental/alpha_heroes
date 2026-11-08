@@ -7,8 +7,8 @@
 
 namespace MapSchema
 {
-constexpr int SCHEMA_VERSION = 15;
-constexpr const char * CONTRACT_HASH = "f6221a1478dad5cf";
+constexpr int SCHEMA_VERSION = 16;
+constexpr const char * CONTRACT_HASH = "af140bae78f29230";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;
@@ -19,6 +19,7 @@ constexpr int OWN_TOWNS = 8;
 constexpr int OTHER_TOWNS = 8;
 constexpr int N_TOWNS = 16;
 constexpr int ARMY_SLOTS = 7;
+constexpr int ARMY_SLOT_CHOICES = 14;
 constexpr int N_LEVELS = 7;
 constexpr int N_WORN_SLOTS = 19;
 constexpr int N_BACKPACK = 8;
@@ -71,7 +72,7 @@ constexpr int OBJECT_VOCAB = 256;
 constexpr int OWNED_STACKS = 16;
 constexpr int N_ARTIFACT_POSITIONS = 27;
 constexpr int N_ARTIFACT_TARGETS = 3;
-constexpr int N_MULTI = 8;
+constexpr int N_MULTI = 11;
 
 enum class DecisionKind : int
 {
@@ -137,6 +138,9 @@ enum class MultiKind : int
 	TAKE_BEST_FAST = 5,
 	DROP_SLOW = 6,
 	DROP_FOREIGN = 7,
+	SPLIT_SINGLES = 8,
+	MERGE_ALL = 9,
+	GARRISON_SWAP = 10,
 };
 
 enum class GridCount : int
@@ -319,6 +323,7 @@ enum class In : int
 	x_take_count,
 	h_drop,
 	h_drop_kept,
+	army_slot_mask,
 	COUNT
 };
 
@@ -462,11 +467,12 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"a_detailed", DType::BOOL, 1, {32, 1, 1, 1}, 0},
 	TensorSpec{"artifact_mask", DType::BOOL, 3, {8, 27, 3, 1}, 0},
 	TensorSpec{"x_heroes", DType::INT64, 1, {2, 1, 1, 1}, 0},
-	TensorSpec{"multi_mask", DType::BOOL, 2, {8, 8, 1, 1}, 0},
+	TensorSpec{"multi_mask", DType::BOOL, 2, {8, 11, 1, 1}, 0},
 	TensorSpec{"x_take_creature", DType::INT64, 4, {2, 2, 2, 7}, -1},
 	TensorSpec{"x_take_count", DType::INT64, 4, {2, 2, 2, 7}, 0},
 	TensorSpec{"h_drop", DType::BOOL, 3, {8, 2, 7, 1}, 0},
 	TensorSpec{"h_drop_kept", DType::BOOL, 2, {8, 2, 1, 1}, 0},
+	TensorSpec{"army_slot_mask", DType::BOOL, 4, {17, 7, 17, 7}, 0},
 }};
 
 enum class Out : int
@@ -490,6 +496,7 @@ enum class Out : int
 	resource_worth,
 	artifact_logp,
 	multi_logp,
+	army_slot_logp,
 	COUNT
 };
 
@@ -512,7 +519,8 @@ constexpr std::array<TensorSpec, static_cast<int>(Out::COUNT)> OUTPUTS = {{
 	TensorSpec{"memory", DType::FLOAT32, 2, {8, 64, 1, 1}, 0},
 	TensorSpec{"resource_worth", DType::FLOAT32, 1, {7, 1, 1, 1}, 0},
 	TensorSpec{"artifact_logp", DType::FLOAT32, 3, {8, 27, 3, 1}, 0},
-	TensorSpec{"multi_logp", DType::FLOAT32, 2, {8, 8, 1, 1}, 0},
+	TensorSpec{"multi_logp", DType::FLOAT32, 2, {8, 11, 1, 1}, 0},
+	TensorSpec{"army_slot_logp", DType::FLOAT32, 4, {17, 7, 17, 14}, 0},
 }};
 
 /// The table (output) and its legality mask (input) of an action type; END has none

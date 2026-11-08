@@ -255,7 +255,6 @@ void AlphaMapAI::makeTurn()
 			waitTillFree();
 			if(cb->getPlayerStatus(playerID, false) != EPlayerStatus::INGAME)
 				return;
-			unifyStacks();
 			auto decision = encode(DecisionKind::TURN);
 			std::optional<Choice> advice; // (Nullkiller2's, at this decision's chance: before ours, in the same state)
 			std::optional<PlanTargets> plan; // (and its plan there: labels both, never inputs)
@@ -727,6 +726,27 @@ Choice AlphaMapAI::sample(const Decision & decision, const Outputs & outputs)
 			const auto [cell, cellLogp] = draw(outputs[Out::cast_cell_logp], hero * cells, (hero + 1) * cells);
 			choice.cell = cell < 0 ? -1 : cell - static_cast<int>(hero * cells);
 			choice.logp += cellLogp;
+		}
+	}
+	if(type == static_cast<int>(ActionType::ARMY) && index >= 0)
+	{
+		// Its target slot (schema 16): army_slot_logp's row of the entry's stack and destination (normalized over every
+		// choice open to some amount), renormalized over those the amount allows (armySlotAllowed: the trainer's,
+		// campaign_model/train.py chosen_logp). None drawn (the model and the masks disagree): VCMI's slot
+		const size_t row = static_cast<size_t>(index / N_ARMY_AMOUNTS) * ARMY_SLOT_CHOICES;
+		std::vector<float> slots(ARMY_SLOT_CHOICES, -std::numeric_limits<float>::infinity());
+		double total = 0;
+		for(int t = 0; t < ARMY_SLOT_CHOICES; ++t)
+			if(armySlotAllowed(decision, index, t) && std::isfinite(outputs[Out::army_slot_logp][row + t]))
+			{
+				slots[t] = outputs[Out::army_slot_logp][row + t];
+				total += std::exp(static_cast<double>(slots[t]));
+			}
+		const auto [slot, slotLogp] = draw(slots, 0, ARMY_SLOT_CHOICES);
+		if(slot >= 0 && total > 0)
+		{
+			choice.cell = slot;
+			choice.logp += slotLogp - static_cast<float>(std::log(total));
 		}
 	}
 	if(index < 0)

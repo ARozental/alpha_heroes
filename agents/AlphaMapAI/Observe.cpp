@@ -158,6 +158,24 @@ void AlphaMapAI::observe(const CPackForServer * pack, bool byPlayer)
 		bool exact = true;
 		std::string unmatched; // the request's kind, when it has no equal
 		matchRequest(decision, pack, choice, exact, unmatched);
+		// Troops or an artifact between two armies a turn does not pair (two heroes met, a hero at a garrison: only a
+		// town's garrison and its visitor are): the exchange's decision, as our AI's when they meet (AlphaMapAI::exchange)
+		ObjectInstanceID first, second;
+		if(const auto * p = dynamic_cast<const ArrangeStacks *>(pack); p && p->id1 != p->id2)
+			std::tie(first, second) = std::tuple(p->id1, p->id2);
+		else if(const auto * p = dynamic_cast<const BulkMoveArmy *>(pack))
+			std::tie(first, second) = std::tuple(p->srcArmy, p->destArmy);
+		else if(const auto * p = dynamic_cast<const ExchangeArtifacts *>(pack); p && p->src.artHolder != p->dst.artHolder)
+			std::tie(first, second) = std::tuple(p->src.artHolder, p->dst.artHolder);
+		if(choice.type < 0 && first != ObjectInstanceID() && cb->getObj(first, false) && cb->getObj(second, false))
+		{
+			auto exchange = encode(DecisionKind::EXCHANGE, first, second);
+			Choice met;
+			bool metExact = true;
+			std::string why;
+			if(matchRequest(exchange, pack, met, metExact, why))
+				std::tie(decision, choice, exact) = std::tuple(std::move(exchange), met, metExact);
+		}
 		if(choice.type < 0)
 		{
 			const auto kind = unmatched.empty() ? std::string(typeid(*pack).name()) : unmatched;
@@ -170,7 +188,7 @@ void AlphaMapAI::observe(const CPackForServer * pack, bool byPlayer)
 		}
 		Record entry;
 		entry.day = cb->getDate(Date::DAY);
-		entry.kind = static_cast<int>(DecisionKind::TURN);
+		entry.kind = static_cast<int>(decision.kind);
 		entry.decisionsToday = decisionsToday;
 		entry.flags = observedFlag;
 		entry.choice = choice;
@@ -186,9 +204,12 @@ void AlphaMapAI::observe(const CPackForServer * pack, bool byPlayer)
 			teacherApproximate += exact ? 0 : 1;
 		}
 		rawRequest(pack, serial, &choice, exact ? "" : "approximate: our nearest amount or area");
-		++decisionsToday;
-		lastChoice = choice;
-		lastChanged = 1;
+		if(decision.kind == DecisionKind::TURN) // (an exchange's moves are not our turn's: AlphaMapAI::exchange)
+		{
+			++decisionsToday;
+			lastChoice = choice;
+			lastChanged = 1;
+		}
 		if(choice.type == static_cast<int>(ActionType::END))
 			sendRecords(false);
 	}

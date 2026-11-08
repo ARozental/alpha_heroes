@@ -1212,9 +1212,32 @@ def test_the_teachers_trade_advice_is_left_out_unless_asked_for():
 	from campaign_model.train import taught
 
 	types = np.array([int(c.ActionType.TRADE), int(c.ActionType.BUILD), int(c.ActionType.TRADE), int(c.ActionType.MOVE)])
+	advice = np.stack([types, np.zeros(4, int), np.full(4, -1)], axis=1)
 	advised = np.array([True, True, False, True])
-	assert taught(types, advised, CampaignConfig()).tolist() == [False, True, False, True]
-	assert taught(types, advised, CampaignConfig(nk2_trade_advice=True)).tolist() == advised.tolist()
+	assert taught(advice, advised, CampaignConfig()).tolist() == [False, True, False, True]
+	assert taught(advice, advised, CampaignConfig(nk2_trade_advice=True)).tolist() == advised.tolist()
+
+
+def test_the_teachers_advice_new_in_schema_16_is_left_out_unless_asked_for():
+	"""train.taught: what Match.cpp maps only since schema 16 (ARTIFACT; MULTI's SPLIT_SINGLES, MERGE_ALL, GARRISON_SWAP;
+	ARMY within one army, or ONE's all-but-one half) is not taught by default; ARMY between two armies, with its target
+	slot, and the older MULTI kinds are."""
+	from campaign_model.train import taught
+
+	army = lambda f, s, to, amount: int(np.ravel_multi_index((f, s, to, amount), (c.N_HOLDERS, c.ARMY_SLOTS, c.N_HOLDERS, c.N_ARMY_AMOUNTS)))
+	A_, M = c.ActionType, c.MultiKind
+	advice = np.array([
+		(A_.ARMY, army(0, 1, c.OWN_HEROES, c.ArmyAmount.ALL), 3),  # (between: taught)
+		(A_.ARMY, army(0, 1, 0, c.ArmyAmount.ALL), 4),  # (within one army)
+		(A_.ARMY, army(0, 1, 2, c.ArmyAmount.ONE), c.ARMY_SLOTS + 2),  # (all but one moving)
+		(A_.MULTI, 2 * c.N_MULTI + M.GARRISON_SWAP, -1),
+		(A_.MULTI, 2 * c.N_MULTI + M.TAKE_BEST, -1),  # (taught)
+		(A_.ARTIFACT, 5, -1),
+		(A_.MOVE, 17, -1),  # (taught)
+	], dtype=np.int64)
+	advised = np.ones(len(advice), bool)
+	assert taught(advice, advised, CampaignConfig()).tolist() == [True, False, False, False, True, False, True]
+	assert taught(advice, advised, CampaignConfig(nk2_new_advice=True)).all()
 
 
 def test_a_purchase_short_of_resources_is_priced_by_the_trades_it_makes():
@@ -1472,8 +1495,8 @@ def test_records_from_before_schema_11_read_with_no_guards_battle_join_or_armed_
 	x["x_heroes"][:, :] = [1, 2]
 	x["multi_mask"][:, 0, 0] = True
 	full = zlib.decompress(encoded(x, 0))
-	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 5
-	lengths = sorted(SHORT_RECORDS)  # (records of schemas 9, 10, 11-12, 13, and 14 widened: each ends where the next's inputs start)
+	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 6
+	lengths = sorted(SHORT_RECORDS)  # (records of schemas 9, 10, 11-12, 13, and 14 and 15 widened: each ends where the next's inputs start)
 	for n in lengths[:4]:
 		got = decode_inputs([SimpleNamespace(inputs=zlib.compress(full[:n]))])
 		before_11 = ("o_battle", "o_join", "d_guard_count", "a_present", "a_count") if n < lengths[2] else ()
