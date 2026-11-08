@@ -261,7 +261,7 @@ public:
 	// (RECORD_TEACHER; campaign_model/imitate.py learns from them). This object only encodes and records, never acts
 	void initTeacher(std::shared_ptr<Environment> environment, std::shared_ptr<CCallback> callback);
 	void teacherTurnStarts();
-	void observe(const CPackForServer * pack);
+	void observe(const CPackForServer * pack, bool byPlayer = true); // (byPlayer false: a human's auto-combat's battle action)
 	// The teacher's questions (Teacher.cpp): each encoded as it is asked, before Nullkiller2 answers it, and recorded
 	// with that answer (observe's QueryReply)
 	void teacherBlockingDialog(const std::string & text, const std::vector<Component> & components, QueryID askID, int soundID, bool selection, bool cancel);
@@ -329,7 +329,7 @@ private:
 	void sendRecords(bool final);
 	// observe's raw line of a request (ALPHA_RECORD_RAW): its fields as sent, and what of ours it was (serial: its
 	// record's, 0 none; choice: our action, or none with unmatched: why)
-	void rawRequest(const CPackForServer * pack, uint64_t serial, const Choice * choice, const std::string & unmatched);
+	void rawRequest(const CPackForServer * pack, uint64_t serial, const Choice * choice, const std::string & unmatched, bool byPlayer = true);
 
 	// Inputs and legality (Encoder.cpp)
 	Decision encode(MapSchema::DecisionKind kind, ObjectInstanceID exchangeFirst = {}, ObjectInstanceID exchangeSecond = {});

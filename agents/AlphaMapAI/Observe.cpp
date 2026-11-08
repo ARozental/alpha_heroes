@@ -92,13 +92,13 @@ void AlphaMapAI::teacherLevelUp(const CGHeroInstance * hero, const std::vector<S
 	}
 }
 
-void AlphaMapAI::observe(const CPackForServer * pack)
+void AlphaMapAI::observe(const CPackForServer * pack, bool byPlayer)
 {
 	if(!teacher || stopping || (dayCap > 0 && cb->getDate(Date::DAY) > dayCap))
 		return;
 	if(dynamic_cast<const MakeAction *>(pack))
 	{
-		rawRequest(pack, 0, nullptr, "a battle's action: the battle model's records have it");
+		rawRequest(pack, 0, nullptr, "a battle's action: the battle model's records have it", byPlayer);
 		return;
 	}
 	// The client's own requests, no decision of the player's: a save (where a later session may go on from), a pause,
@@ -312,11 +312,11 @@ std::string described(const CPackForServer * pack)
 }
 }
 
-void AlphaMapAI::rawRequest(const CPackForServer * pack, uint64_t serial, const Choice * choice, const std::string & unmatched)
+void AlphaMapAI::rawRequest(const CPackForServer * pack, uint64_t serial, const Choice * choice, const std::string & unmatched, bool byPlayer)
 {
 	if(!raw)
 		return;
-	std::string line = "{\"serial\": " + std::to_string(serial) + ", \"day\": " + std::to_string(cb->getDate(Date::DAY)) + ", \"player\": \"" + playerID.toString() + "\", \"actor\": \"" + (observedFlag == RECORD_HUMAN ? "human" : "nk2") + "\", " + described(pack)
+	std::string line = "{\"serial\": " + std::to_string(serial) + ", \"day\": " + std::to_string(cb->getDate(Date::DAY)) + ", \"player\": \"" + playerID.toString() + "\", \"actor\": \"" + (observedFlag != RECORD_HUMAN ? "nk2" : byPlayer ? "human" : "auto") + "\", " + described(pack)
 		+ ", \"ours\": " + (choice ? "{\"type\": " + std::to_string(choice->type) + ", \"index\": " + std::to_string(choice->index) + ", \"cell\": " + std::to_string(choice->cell) + "}" : "null")
 		+ ", \"note\": " + (unmatched.empty() ? "null" : "\"" + escaped(unmatched) + "\"") + "}\n";
 	std::scoped_lock lock(rawMutex);

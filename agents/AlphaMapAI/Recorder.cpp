@@ -9,7 +9,20 @@
 
 #include <boost/algorithm/string.hpp>
 #include <cstdlib>
+#include <pthread.h>
 #include <shared_mutex>
+
+namespace
+{
+bool onMainThread() // (the GUI's: the player's own clicks; macOS only, where people play: elsewhere every request the player's)
+{
+#ifdef __APPLE__
+	return pthread_main_np() != 0;
+#else
+	return true;
+#endif
+}
+}
 
 // A human player's recorder: the AlphaRecorderAI library, which the VCMI client puts beside a human's player interface
 // when ALPHA_RECORD_HUMAN is set (alpha_heroes' patch: vcmi/client/CPlayerInterface.cpp). It never acts: the player plays
@@ -86,9 +99,10 @@ public:
 
 	void requestSent(const CPackForServer * pack, int requestID) override
 	{
-		// (the player's GUI thread, which holds no lock of the game state's: it may not change while it is encoded)
+		// (the player's GUI thread, which holds no lock of the game state's: it may not change while it is encoded; a
+		// battle action from another thread is auto-combat's, which plays for the player: raw.jsonl's actor "auto")
 		std::shared_lock lock(CGameState::mutex);
-		map->observe(pack);
+		map->observe(pack, !dynamic_cast<const MakeAction *>(pack) || onMainThread());
 	}
 
 	// The questions no recorder answers (the player's interface does)
