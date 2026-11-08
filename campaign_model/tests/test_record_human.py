@@ -77,3 +77,34 @@ def test_the_sessions_settings_set_the_ais_and_instant_hero_moves(tmp_path, monk
 	settings = json.loads((path / "config" / "settings.json").read_text())
 	assert settings["battle"] == {"speedFactor": 18} and settings["ai"] == {"adventureEnemyAI": "Nullkiller2", "combatAlliedAI": "BattleAI"}
 	assert settings["adventure"] == {"tileZoom": 64, "heroMoveTime": 0, "enemyMoveTime": 0}
+
+
+def test_a_run_makes_its_own_folder_settings_and_environment(tmp_path, monkeypatch):
+	"""main(), the GUI client stubbed (it would open a window): the run's folder under --out, the client given the
+	recorder's environment (the human recorded, the computer players too unless --player-only), the summary saved."""
+	import subprocess
+	import sys
+
+	from campaign_model import record_human
+
+	shared = tmp_path / "shared"
+	(shared / "config").mkdir(parents=True)
+	(shared / "config" / "settings.json").write_text("{}")
+	monkeypatch.setattr(record_human, "SHARED", shared)
+	runs = []
+	monkeypatch.setattr(subprocess, "run", lambda command, cwd, env: runs.append((command, env)))
+	for flags, recorded in (([], True), (["--player-only"], False)):
+		monkeypatch.setattr(sys, "argv", ["record_human", "--out", str(tmp_path / "human"), *flags])
+		record_human.main()
+		command, env = runs[-1]
+		assert command[0].endswith("build/bin/vcmiclient") and env["ALPHA_RECORD_HUMAN"] == "1" and env["ALPHA_RECORD_HUMAN_SOCKET"]
+		assert ("ALPHA_MAP_RECORD_SOCKET" in env) == recorded and "ALPHA_BATTLE_RECORD_SOCKET" not in env
+		user = env["VCMI_USER_DIR"]
+		settings = json.loads((record_human.Path(user) / "config" / "settings.json").read_text())
+		assert settings["ai"]["adventureEnemyAI"] == ("AlphaTeacherAI" if recorded else "Nullkiller2") and settings["ai"]["combatAlliedAI"] == "BattleAI"
+		run = record_human.Path(user).parent
+		assert run.parent == tmp_path / "human" and env["ALPHA_RECORD_RAW"] == str(run / "raw.jsonl")
+		assert json.loads((run / "summary.json").read_text())["segments"] == []
+		import time
+
+		time.sleep(1.1)  # (the next run's folder: another start second)
