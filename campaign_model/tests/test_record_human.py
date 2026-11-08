@@ -2,6 +2,7 @@
 human's recorder, TEACHER Nullkiller2's, neither our model's), the human's battle records kept apart and saved as sent,
 and the human's request audit (their "done" summary's "teacher" counts) in the summary."""
 import json
+import math
 import pickle
 import struct
 import zlib
@@ -104,7 +105,68 @@ def test_a_run_makes_its_own_folder_settings_and_environment(tmp_path, monkeypat
 		assert settings["ai"]["adventureEnemyAI"] == ("AlphaTeacherAI" if recorded else "Nullkiller2") and settings["ai"]["combatAlliedAI"] == "BattleAI"
 		run = record_human.Path(user).parent
 		assert run.parent == tmp_path / "human" and env["ALPHA_RECORD_RAW"] == str(run / "raw.jsonl")
-		assert json.loads((run / "summary.json").read_text())["segments"] == []
+		assert json.loads((run / "summary.json").read_text())["line"] == []  # (cut to the line played to the end: none here)
 		import time
 
 		time.sleep(1.1)  # (the next run's folder: another start second)
+
+
+def test_the_line_played_to_the_end_keeps_each_segment_up_to_the_next_load():
+	"""kept_days: a load at day s replays from s; each earlier segment keeps only the days before every later start
+	(the user's first game: a start abandoned on day 2, the game from day 1, loads of days 21 and 22)."""
+	from campaign_model.record_human import kept_days
+
+	assert kept_days([1, 1, 21, 22]) == [(1, 1), (1, 21), (21, 22), (22, math.inf)]
+	assert kept_days([1]) == [(1, math.inf)] and kept_days([1, 10, 5]) == [(1, 5), (10, 5), (5, math.inf)]  # (a load of day 5 after one of day 10: that one gone)
+
+
+def test_a_run_is_cut_to_the_line_played_to_the_end(tmp_path, monkeypatch):
+	"""keep_final_line: three segments (the game from day 1, a load of day 3, a load of day 4): every player's decisions
+	of the line, a day's ledger from the segment that played the day before, the battles of the line by their day
+	(the start event's, else the raw log's battle), the raw lines of the line; the segments' files gone."""
+	from types import SimpleNamespace
+
+	from battle_model import data as battle_data
+	from campaign_model import record_human
+	from campaign_model.records import Decision, Game
+
+	def decision(color, day, flags):
+		return Decision(color, day, c.DecisionKind.TURN, 0, c.ActionType.MOVE, 1, -1, -1, 0.0, (0.5,) * c.N_VALUE_OFFSETS, flags, b"")
+
+	def ledger(day, mark):
+		return {"day": day, "players": [], "mark": mark}
+
+	segments = [  # (days played, the ledgers it sent: day -> mark)
+		(range(1, 6), {d: f"a{d}" for d in range(1, 6)}),  # (the game to day 5: days 3-5 abandoned)
+		(range(3, 5), {3: "b3-late", 4: "b4", 5: "b5"}),  # (a load of day 3, played to day 4: day 4 abandoned)
+		(range(4, 7), {4: "c4-late", 5: "c5", 6: "c6"}),  # (a load of day 4, played to the end)
+	]
+	for n, (days, ledgers) in enumerate(segments, start=1):
+		game = Game(ledgers={d: ledger(d, m) for d, m in ledgers.items()})
+		game.decisions = [decision(color, d, flag) for d in days for color, flag in (("RED", HUMAN), ("BLUE", TEACHER))]
+		if n == 3:
+			game.final = [{"day": 6, "final": True, "players": [{"color": 0, "status": record_human.STATUS_WON}]}]
+		with open(tmp_path / f"segment-{n}.pkl", "wb") as f:
+			pickle.dump(game, f)
+		(tmp_path / "battles" / str(n)).mkdir(parents=True)
+	# battles: segment 1's on days 2 and 4 (the raw log's), segment 3's on day 5 (its start event's)
+	(tmp_path / "battles" / "1" / "a.rec").write_bytes(b"one")
+	(tmp_path / "battles" / "1" / "b.rec").write_bytes(b"two")
+	(tmp_path / "battles" / "3" / "a.rec").write_bytes(b"three")
+	records = {b"one": SimpleNamespace(events=[], actions=[1, 2]), b"two": SimpleNamespace(events=[], actions=[1]), b"three": SimpleNamespace(events=[{"event": "start", "day": 5}], actions=[1])}
+	monkeypatch.setattr(battle_data, "parse_record", lambda data: records[data])
+	raw = [{"request": "17AdvInterfaceReady", "day": 0}, {"request": "MakeAction", "battle": 0, "day": 2}, {"request": "MakeAction", "battle": 0, "day": 2},
+		{"request": "EndTurn", "day": 2}, {"request": "MakeAction", "battle": 1, "day": 4}, {"request": "EndTurn", "day": 4},
+		{"request": "17AdvInterfaceReady", "day": 3}, {"request": "EndTurn", "day": 3}, {"request": "EndTurn", "day": 4},
+		{"request": "17AdvInterfaceReady", "day": 4}, {"request": "EndTurn", "day": 6}]
+	(tmp_path / "raw.jsonl").write_text("".join(json.dumps({**r, "actor": "human", "ours": None, "note": None}) + "\n" for r in raw))
+	summary = record_human.keep_final_line(tmp_path)
+	assert summary["line"] == [{"segment": 1, "days": [1, 2]}, {"segment": 2, "days": [3, 3]}, {"segment": 3, "days": [4, None]}]
+	with open(tmp_path / "game.pkl", "rb") as f:
+		game = pickle.load(f)
+	assert sorted({d.day for d in game.decisions}) == [1, 2, 3, 4, 5, 6] and len(game.decisions) == 12
+	assert {d: s["mark"] for d, s in sorted(game.ledgers.items())} == {1: "a1", 2: "a2", 3: "a3", 4: "b4", 5: "c5", 6: "c6"}
+	assert summary["won"] and summary["players"] == {"RED": "human", "BLUE": "nk2"}
+	assert sorted(p.name for p in (tmp_path / "battles").iterdir()) == ["day002-000.rec", "day005-001.rec"]  # (day 4's abandoned)
+	assert [json.loads(l)["day"] for l in (tmp_path / "raw.jsonl").read_text().splitlines()] == [0, 2, 2, 2, 3, 3, 4, 6]  # (each load's start line at its day)
+	assert not list(tmp_path.glob("segment-*.pkl"))

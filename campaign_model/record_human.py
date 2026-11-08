@@ -31,6 +31,7 @@ computer players' AIs set, every hero's map moves instant) and its logs are ther
 import argparse
 import contextlib
 import json
+import math
 import os
 import pickle
 import re
@@ -42,10 +43,12 @@ from pathlib import Path
 
 from battle_model import play as battle_play
 
-from .records import HUMAN, TEACHER, collect, decision_name
+from .labels import COLORS
+from .records import HUMAN, TEACHER, Game, collect, decision_name
 
 ROOT = Path(__file__).resolve().parents[1]
 SHARED = ROOT / "runtime" / "vcmi-user"  # (scripts/vcmi.sh's: the game data, maps, saves and your GUI settings)
+STATUS_WON = 2  # (EPlayerStatus::WINNER: empire.py's STATUS_INGAME 0, STATUS_LOST 1)
 BATTLE_KEY = "-human-"  # (Recorder.cpp: AlphaBattleAI's record key for your battles, <segment key>-human-<COLOUR>)
 SEGMENT = re.compile(r"@(\d+)")  # (AlphaMapAI::sessionKey: every recorder's key ends in @<its game's start, unix seconds>)
 SEGMENT_SECONDS = 15  # (the recorders of one start of a game, made one after another: seconds apart at most)
@@ -129,6 +132,108 @@ def save(out, messages):
 	return summary
 
 
+def kept_days(starts):
+	"""The line played to the end, of a run's segments (starts: each one's first day, in order): a segment started at day
+	s replays from s, so each earlier one keeps only the days before every later start. [(first, end)] a segment, the
+	days first <= day < end kept (end inf: the last's; first >= end: none)."""
+	ends, low = [], math.inf
+	for start in reversed(starts):
+		ends.append(low)
+		low = min(low, start)
+	return list(zip(starts, reversed(ends)))
+
+
+def raw_segments(lines):
+	"""raw.jsonl's lines (dicts) split by the start of a game they were sent in: each start's first request is the
+	client's AdvInterfaceReady."""
+	out = []
+	for line in lines:
+		if not out or line.get("request", "").endswith("AdvInterfaceReady"):
+			out.append([])
+		out[-1].append(line)
+	return out
+
+
+def battle_days(records, lines):
+	"""Each battle record's day (records: parse_record's, in order): its start event's (since 2026-11-07), else the
+	day of the raw log's battle its decisions are in (lines: the segment's raw lines; the battles in order, each at
+	least as many actions as its record has decisions: auto-combat's are not recorded), None for a record with none."""
+	runs, last = [], None
+	for line in lines:
+		if line.get("request") == "MakeAction":
+			if last != line["battle"]:
+				runs.append([line["day"], 0])
+			runs[-1][1] += 1
+			last = line["battle"]
+		else:
+			last = None
+	days, i = [], 0
+	for record in records:
+		start = next((e for e in record.events if e.get("event") == "start"), {})
+		if "day" in start:
+			days.append(start["day"])
+			continue
+		while i < len(runs) and runs[i][1] < max(1, len(record.actions)):
+			i += 1
+		days.append(runs[i][0] if record.actions and i < len(runs) else None)
+		i += 1 if record.actions and i < len(runs) else 0
+	return days
+
+
+def keep_final_line(out):
+	"""A saved run cut to the line played to the end (the user, 2026-11-07: "we do not need to save the abandoned
+	tries... no need to use my errors"): game.pkl the line's decisions, every player's, and its ledgers (a day's from the
+	segment that played the day before: the state the day began in), the end's snapshots; battles/ the line's battles
+	of yours; raw.jsonl its requests; the segments' files and the abandoned tries removed. Returns the summary."""
+	from battle_model.data import parse_record
+
+	games = [pickle.load(open(path, "rb")) for path in sorted(out.glob("segment-*.pkl"), key=lambda p: int(p.stem.split("-")[1]))]
+	lines = [json.loads(line) for line in open(out / "raw.jsonl")] if (out / "raw.jsonl").exists() else []
+	raws = raw_segments(lines)
+	starts = [min((d.day for d in game.decisions), default=math.inf) for game in games]
+	kept = kept_days(starts)
+	line = Game()
+	first = next((i for i, (a, b) in enumerate(kept) if a < b), None)
+	battles = []
+	for i, (game, (a, b)) in enumerate(zip(games, kept)):
+		line.decisions += [d for d in game.decisions if a <= d.day < b]
+		line.ledgers.update({day: snap for day, snap in game.ledgers.items() if a < day <= b or (i == first and day == a)})
+		folder = out / "battles" / str(i + 1)
+		files = sorted(folder.iterdir()) if folder.exists() else []
+		records = [parse_record(f.read_bytes()) for f in files]
+		for f, day in zip(files, battle_days(records, raws[i] if i < len(raws) else [])):
+			if day is not None and a <= day < b:
+				battles.append((day, f))
+	line.final, line.done = games[-1].final if games else [], games[-1].done if games else {}
+	(out / "battles.tmp").mkdir(exist_ok=True)
+	for n, (day, f) in enumerate(sorted(battles, key=lambda t: t[0])):
+		shutil.move(str(f), out / "battles.tmp" / f"day{day:03d}-{n:03d}.rec")
+	shutil.rmtree(out / "battles", ignore_errors=True)
+	(out / "battles.tmp").rename(out / "battles")
+	kept_lines = [l for i, (rows, (a, b)) in enumerate(zip(raws, kept)) for l in rows if a <= l["day"] < b or (i == first and l["day"] < a)]
+	(out / "raw.jsonl").write_text("".join(json.dumps(l) + "\n" for l in kept_lines))
+	with open(out / "game.pkl", "wb") as f:
+		pickle.dump(line, f)
+	for path in out.glob("segment-*.pkl"):
+		path.unlink()
+	ours = [l for l in kept_lines if l.get("actor") == "human"]
+	unmatched = Counter(l["note"] for l in ours if l.get("ours") is None and l.get("note") and not l["note"].startswith(("the game's", "a battle's", "no question of ours")))  # (the client's, a battle's, a dialog we ask nothing in)
+	players = {}
+	for d in line.decisions:
+		players.setdefault(d.color, {"actor": actor(d), "decisions": 0})["decisions"] += 1
+	days = [d.day for d in line.decisions]
+	summary = {
+		"line": [{"segment": i + 1, "days": [a, None if b == math.inf else b - 1]} for i, (a, b) in enumerate(kept) if a < b],
+		"days": [min(days), max(days)] if days else None, "decisions": len(line.decisions), "players": {c: p["actor"] for c, p in players.items()},
+		"battles": len(battles), "ledger_days": sorted(line.ledgers),
+		"won": any(p.get("status") == STATUS_WON and players.get(COLORS[p["color"]], {}).get("actor") == "human" for f in line.final for p in f["players"]),
+		"human_requests": {"matched": sum(l.get("ours") is not None for l in ours), "approximate": sum(l.get("ours") is not None and str(l.get("note") or "").startswith("approximate") for l in ours), "unmatched": dict(unmatched.most_common())},
+	}
+	(out / "players.json").write_text(json.dumps(players, indent="\t"))
+	(out / "summary.json").write_text(json.dumps(summary, indent="\t"))
+	return summary
+
+
 def main():
 	parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 	parser.add_argument("--out", type=Path, default=ROOT / "runtime" / "human", help="the folder each run is saved in, in a folder of its own (<--out>/<start time>)")
@@ -136,7 +241,12 @@ def main():
 	parser.add_argument("--player-only", action="store_true", help="record only the human player's decisions")
 	parser.add_argument("--checkpoint", default="", help="--opponents alpha: the campaign model's checkpoint")
 	parser.add_argument("--battle-model", default="", help="an ONNX battle model: --opponents alpha's battles, and its outputs beside your battle decisions")
+	parser.add_argument("--keep-tries", action="store_true", help="keep every segment (a save loaded again: the abandoned tries too), not only the line played to the end")
+	parser.add_argument("--cut", type=Path, default=None, help="only cut a saved run (its folder) to the line played to the end, and exit")
 	args = parser.parse_args()
+	if args.cut:
+		print(json.dumps(keep_final_line(args.cut.resolve()), indent="\t"))
+		return
 	out = (args.out / time.strftime("%Y%m%d-%H%M%S")).resolve()
 	out.mkdir(parents=True, exist_ok=False)  # (a run never writes into another's)
 	if args.opponents == "alpha" and not args.checkpoint:
@@ -174,6 +284,8 @@ def main():
 		time.sleep(0.5)  # (what the last connections still carry)
 		messages = records.drain()
 	summary = save(out, messages)
+	if not args.keep_tries:  # (the line played to the end only: the user, 2026-11-07)
+		summary = keep_final_line(out)
 	summary["minutes"] = round((time.time() - started) / 60, 1)
 	(out / "summary.json").write_text(json.dumps(summary, indent="\t"))
 	print(json.dumps(summary, indent="\t"))
