@@ -303,6 +303,7 @@ class CustomFeatures(nn.Module):
 		# GARRISON_SWAP; each new option rare at the start: army_slot_priors, multi_priors_16)
 		self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.multi_split, self.multi_merge, self.multi_garrison = zeros(), zeros(), zeros()
+		self.swap_gain, self.swap_slot, self.last_swap = zeros(), zeros(), zeros()  # (2026-11-08: a swap priced by the power it moves: swap_priors)
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -322,6 +323,7 @@ class CustomFeatures(nn.Module):
 			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost, self.multi_weight, self.give_all_cost, self.gather_risk, self.gather_cost, self.disband_cost, self.drop_scale, self.drop_sign, self.trade_waste,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
 			self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay, self.multi_split, self.multi_merge, self.multi_garrison,
+			self.swap_gain, self.swap_slot, self.last_swap,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
 		]
@@ -380,6 +382,18 @@ class CustomFeatures(nn.Module):
 		return (ft.bounded(self.army_within, -10.0, 0.0, -5.0, step), ft.bounded(self.army_swap, -8.0, 2.0, -3.0, step),
 			ft.bounded(self.slot_default, 0.0, 8.0, 4.0, step), ft.bounded(self.slot_swap, -6.0, 2.0, -2.0, step),
 			ft.bounded(self.slot_stay, -10.0, 2.0, -5.0, step))
+
+	def swap_priors(self):
+		"""Schema 16's swaps priced by the power they move (2026-11-08: its first games swapped a whole stack into a full
+		hero 12 times a game, the slot given away at random: 58% gave more AI value than they took, -106k in 35 games;
+		the weakest given, +357k; and two heroes of one stack each swapped them back and forth, up to 8 times an exchange),
+		each learned from where it starts: a whole stack swapping into a full army x its gain (swap_terms, per log of
+		power: 1, 0..3); its slot x what it gives up beyond the best choice (-2 per log of power, -4..0); a hero's last
+		stack swapped away (-6, -10..0: Nullkiller2 never does it, it keeps a creature; at -4 the shuffles' recorded
+		choices still had p 0.09, from 0.50)."""
+		step = CORRECTION_STEP
+		return (ft.bounded(self.swap_gain, 0.0, 3.0, 1.0, step), ft.bounded(self.swap_slot, -4.0, 0.0, -2.0, step),
+			ft.bounded(self.last_swap, -10.0, 0.0, -6.0, step))
 
 	def multi_priors_16(self):
 		"""Schema 16's MULTI kinds' starts [SPLIT_SINGLES, MERGE_ALL, GARRISON_SWAP], each -4 (rare until the teacher's
@@ -1431,7 +1445,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
@@ -1494,6 +1508,33 @@ def army_slots(x):
 	first = torch.where(same_any, same.float().argmax(dim=-1), empty.float().argmax(dim=-1))
 	default = (first[..., None] == torch.arange(A, device=legal.device)) & (same_any | empty_any)[..., None] & ~within & (legal | fit)
 	return ArmySlots(legal, fit, swap, default, legal.any(dim=-1) & ~(legal & fit).any(dim=-1))
+
+
+def stack_power(x, fight_value):
+	"""Each holder's stacks' power [B, HD, A] (army_slots' holders: count x the creature's fight value, 0 where empty)."""
+	creature = torch.cat([x["h_army_creature"][:, :HO], x["t_garrison_creature"][:, :TO], x["x_creature"][:, None, :]], dim=1)
+	count = torch.cat([x["h_army_count"][:, :HO], x["t_garrison_count"][:, :TO], x["x_count"][:, None, :]], dim=1).float()
+	return count * fight_value[vocab_index(creature, c.CREATURE_VOCAB)] * (creature >= 0).float()
+
+
+def swap_terms(power):
+	"""A whole-stack swap's terms in logs of power (stack_power [B, HD, A]), from the side of the hero in it: (gain
+	[B, HD, A, HD]: a town's stack swapped into a hero against that hero's weakest stack, or a hero's stack into a town
+	against that garrison's strongest, clamped to +-4, 0 between other holders; given [B, HD, A]: what each target slot
+	gives up beyond the best choice, a hero's stack over its weakest, a town's under its strongest, 0 elsewhere; last
+	[B, HD]: a hero of ours with a single stack, which leaves it only by a swap)."""
+	logp = torch.log1p(power)
+	present = power > 0
+	weakest = logp.masked_fill(~present, 1e4).amin(dim=-1)
+	weakest = torch.where(present.any(dim=-1), weakest, torch.zeros_like(weakest))  # [B, HD]
+	strongest = logp.masked_fill(~present, 0.0).amax(dim=-1)
+	holders = torch.arange(HD, device=power.device)
+	hero, town = (holders < HO).float(), ((holders >= HO) & (holders < HO + TO)).float()
+	into_hero = (logp[:, :, :, None] - weakest[:, None, None, :]) * (town[:, None, None] * hero[None, None, :])
+	into_town = (strongest[:, None, None, :] - logp[:, :, :, None]) * (hero[:, None, None] * town[None, None, :])
+	given = (logp - weakest[:, :, None]) * hero[None, :, None] + (strongest[:, :, None] - logp) * town[None, :, None]
+	last = (present.sum(dim=-1) == 1).float() * hero[None, :]
+	return (into_hero + into_town).clamp(-4.0, 4.0), given * present.float(), last
 
 
 def army_slot_outputs(out, slots, moves, stays):
@@ -1847,7 +1888,9 @@ class CampaignModel(nn.Module):
 		out["multi_logp"] = flat_log_softmax(f.multi_prior, x["multi_mask"])  # (v1: the prior only, schema 14's MULTI)
 		slots = army_slots(x)  # (v1: schema 16's target slot from its priors only)
 		_, _, default, swap, stay = self.features.army_slot_priors()
-		moves = default * slots.default.float() + swap * slots.swap.float()
+		_, slot_weight, _ = self.features.swap_priors()
+		_, given, _ = swap_terms(stack_power(x, self.features.fight_value))
+		moves = default * slots.default.float() + (swap + slot_weight * given[:, None, None, :, :]) * slots.swap.float()
 		army_slot_outputs(out, slots, moves, moves + stay)
 		return out
 

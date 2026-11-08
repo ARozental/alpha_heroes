@@ -205,8 +205,9 @@ class CampaignConfig:
 	nk2_trade_advice: bool = False
 	# Its advice that schema 16's matcher newly reads taught too (False until its label mix is measured: a new label class
 	# the model gives ~0 is how 2026-11-05's collapse started): ARTIFACT, MULTI's SPLIT_SINGLES, MERGE_ALL and
-	# GARRISON_SWAP, ARMY within one army or all but one moving (ONE's second half). Its ARMY moves between two armies,
-	# and their target slots, are taught as before
+	# GARRISON_SWAP, ARMY within one army or all but one moving (ONE's second half), a whole stack legal only as a swap
+	# (train.swap_only_moves: its labels and accepted entries). Its other ARMY moves between two armies, and their target
+	# slots, are taught as before
 	nk2_new_advice: bool = False
 	# The KL a decision is kept near (0: teacher_kl stays the weight): after each update the weight is x1.5 when the
 	# update's teacher KL was over 1.5 x this, /1.5 when under 1/1.5 of it (the PPO KL control's rule), within 0.01..10.

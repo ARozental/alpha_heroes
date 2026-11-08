@@ -151,6 +151,19 @@ def chosen_logp(out, choice):
 	return logp, entropy
 
 
+def swap_only_moves(out, types, indices):
+	"""Whether each entry (types, indices: [N] or [N, K]) is an ARMY whole stack legal only as a swap (schema 16: a
+	hero's last stack, a full army without its creature), from the outputs' slot masks."""
+	flat = indices.clamp(min=0)
+	amount = flat % c.N_ARMY_AMOUNTS
+	to = torch.div(flat, c.N_ARMY_AMOUNTS, rounding_mode="floor") % c.N_HOLDERS
+	slot = torch.div(flat, c.N_ARMY_AMOUNTS * c.N_HOLDERS, rounding_mode="floor") % c.ARMY_SLOTS
+	holder = torch.div(flat, c.N_ARMY_AMOUNTS * c.N_HOLDERS * c.ARMY_SLOTS, rounding_mode="floor").clamp(max=c.N_HOLDERS - 1)
+	rows = torch.arange(flat.shape[0], device=flat.device).reshape((-1,) + (1,) * (flat.dim() - 1))
+	whole, fit = out["army_whole_mask"][rows, holder, slot, to], out["army_split_mask"][rows, holder, slot, to]
+	return (types == c.ActionType.ARMY) & (amount == c.ArmyAmount.ALL) & whole.any(dim=-1) & ~(whole & fit).any(dim=-1)
+
+
 def entries_logp(out, types, indices, valid):
 	"""[N, K] log-probabilities of K turn entries a row (types: ActionType [N, K]; indices: in their tables [N, K]), -1e4
 	where not valid or not legal: their probability 0, every gradient finite (an all-illegal row's log-sum-exp is not
@@ -767,11 +780,17 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 	outside_part = torch.zeros((), device=keep.device)
 	if "advice_action" in batch:  # Nullkiller2's advice (config.nk2_advice): its choice's cross-entropy, at the teacher's weight
 		advised = batch["advised"] * keep
+		# (schema 16's: a whole stack legal only as a swap, new since; Advice.cpp's nearest move took it for a hero's last
+		# stack, which Nullkiller2 never moves whole, and taught two heroes to swap their stacks back and forth)
+		swapping = None if config.nk2_new_advice else swap_only_moves(out, batch["advice_action"], batch["advice_index"])
+		if swapping is not None:
+			advised = advised * (~swapping).float()
 		advice_logp, _ = chosen_logp(out, {"kind": batch["kind"], "action": batch["advice_action"], "index": batch["advice_index"], "cell": batch["advice_cell"]})
 		accepted = None
 		if "accept_types" in batch:  # (and every other entry that follows it there, advice.teacher_sets: their summed probability)
 			advised_own = torch.where(batch["advice_has"], advice_logp.clamp(min=-1e4), torch.full_like(advice_logp, -1e4)).unsqueeze(1)
-			accepted = entries_logp(out, batch["accept_types"], batch["accept_index"], batch["accept_valid"])
+			valid = batch["accept_valid"] if config.nk2_new_advice else batch["accept_valid"] & ~swap_only_moves(out, batch["accept_types"], batch["accept_index"])
+			accepted = entries_logp(out, batch["accept_types"], batch["accept_index"], valid)
 			advice_logp = torch.logsumexp(torch.cat([advised_own, accepted], dim=1), dim=1)
 			advised = advised * (advice_logp > -1e3).float()  # (a row none of whose entries is legal any more: none)
 		# among what it could have asked for there (TEACHER_SPAN), not among everything we can do

@@ -35,7 +35,7 @@ from . import constants as c
 from . import encoders as E
 from . import features as ft
 from . import priors
-from .model import MOVE_FEATURES, QUESTION_FEATURES, CustomFeatures, PairBias, army_slot_outputs, army_slots, dense, flat_log_softmax, with_added
+from .model import MOVE_FEATURES, QUESTION_FEATURES, CustomFeatures, PairBias, army_slot_outputs, army_slots, dense, flat_log_softmax, stack_power, swap_terms, with_added
 from .schema import HEADS
 
 HO, TO, A, W, HD = c.OWN_HEROES, c.OWN_TOWNS, c.ARMY_SLOTS, c.WINDOW, c.N_HOLDERS
@@ -790,12 +790,15 @@ class CampaignModelV2(nn.Module):
 		learned[A_.ARMY] = self.army_out(src[:, :, :, None, :] + dst[:, None, None, :, :]) + within * same_army
 		slots = army_slots(x)
 		whole = (torch.arange(c.N_ARMY_AMOUNTS, device=src.device) == c.ArmyAmount.ALL).float()
-		prior[A_.ARMY] = self.features.army_prior(known.hero_strength[:, :HO]).expand_as(learned[A_.ARMY]) + swap_only * slots.swap_only.float()[..., None] * whole
+		gain_weight, slot_weight, last_weight = self.features.swap_priors()
+		gain, given, last = swap_terms(stack_power(x, self.features.fight_value))  # (a swap priced by the power it moves)
+		swapping = (swap_only + gain_weight * gain + last_weight * last[:, :, None, None]) * slots.swap_only.float()
+		prior[A_.ARMY] = self.features.army_prior(known.hero_strength[:, :HO]).expand_as(learned[A_.ARMY]) + swapping[..., None] * whole
 		offers[A_.ARMY] = best_legal(prior[A_.ARMY], x["army_mask"])  # (below 0 when every legal move leaves troops in a mine)
 		# its target slot (schema 16): each (stack, slot) pair's learned score and the slot's kind
 		keys = self.army_slot_k(slot_rows)
 		slot_logits = torch.einsum("bfsk,btuk->bfstu", self.army_slot_q(src), keys) / math.sqrt(ARMY_SLOT_KEYS)
-		slot_logits = slot_logits + default_slot * slots.default.float() + swap_slot * slots.swap.float()
+		slot_logits = slot_logits + default_slot * slots.default.float() + (swap_slot + slot_weight * given[:, None, None, :, :]) * slots.swap.float()
 		stay_logits = slot_logits + stay_slot + torch.einsum("bfsk,btuk->bfstu", self.army_stay_q(src), keys) / math.sqrt(ARMY_SLOT_KEYS)
 		army_slot_outputs(out, slots, slot_logits, stay_logits)
 		learned[A_.UPGRADE] = self.upgrade_out(src).squeeze(-1) + self.nk2_upgrade(known.upgrade_gains).squeeze(-1)

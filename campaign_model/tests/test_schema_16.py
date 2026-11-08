@@ -148,3 +148,52 @@ def test_a_checkpoint_from_before_schema_16_loads_as_the_model_was():
 		a, b = full(tensors(x)), old(tensors(x))
 	for name in ("type_logp", "army_logp", "multi_logp", "move_logp"):
 		assert torch.allclose(a[name], b[name], atol=1e-5), name
+
+
+def test_a_swap_into_a_full_hero_gives_its_weakest_stack_and_is_worth_what_it_brings():
+	"""model.swap_terms (2026-11-08: random swaps gave away stronger stacks): into a hero whose army is full, a town's
+	stack swaps for the hero's weakest (the slot's prior); the swap of a stack stronger than that one is the likelier entry
+	(the fresh models: their learned parts at 0)."""
+	x = empty_inputs(1)
+	x["g_kind"][0] = c.DecisionKind.TURN
+	x["h_present"][0, 0] = True
+	creatures = [0, 2, 4, 6, 8, 10, 12]  # (pikemen 100 x8, archers, griffins, ... : one weak stack, slot 3)
+	x["h_army_creature"][0, 0], x["h_army_count"][0, 0] = creatures, [8, 8, 8, 1, 8, 8, 8]
+	x["t_present"][0, 0], x["t_owner"][0, 0] = True, c.OWNER_SELF
+	x["t_garrison_creature"][0, 0, :2], x["t_garrison_count"][0, 0, :2] = [13, 1], [20, 1]  # (archangels 20; a single halberdier)
+	for s in range(2):
+		x["army_slot_mask"][0, HO, s, 0, :] = True  # (every slot a swap: the hero's army full, no creature of theirs)
+		x["army_mask"][0, HO, s, 0, c.ArmyAmount.ALL] = True
+	for model in (CampaignModel(dim=32, cell_dim=16, layers=1).eval(), CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()):
+		with torch.no_grad():
+			out = model(tensors(x))
+		slot = out["army_slot_logp"][0, HO, 0, 0, :A].exp()
+		assert int(slot.argmax()) == 3 and slot[3] > 0.6, (type(model).__name__, slot)
+		if isinstance(model, CampaignModelV2):
+			army = out["army_logp"][0].reshape(HD, A, HD, c.N_ARMY_AMOUNTS)
+			assert army[HO, 0, 0, c.ArmyAmount.ALL] > army[HO, 1, 0, c.ArmyAmount.ALL] + 2  # (archangels in, against a single halberdier)
+
+
+def test_a_heros_last_stack_swapped_away_is_rare_and_not_taught():
+	"""Two heroes of one stack each (an exchange): their whole-stack moves are legal only as swaps; train.swap_only_moves
+	finds them (the teacher's labels and accepted entries left out by default: config.nk2_new_advice), the last-stack
+	prior holds them far below a part of the stack moving (model.CustomFeatures.swap_priors)."""
+	from campaign_model.train import swap_only_moves
+
+	x = empty_inputs(1)
+	x["g_kind"][0] = c.DecisionKind.EXCHANGE
+	x["h_present"][0, :2] = True
+	x["h_army_creature"][0, 0, 1], x["h_army_count"][0, 0, 1] = IMP, 5
+	x["h_army_creature"][0, 1, 4], x["h_army_count"][0, 1, 4] = GREMLIN, 6
+	x["x_heroes"][0] = [1, 2]
+	x["army_slot_mask"][0, 0, 1, 1, 4] = True  # (its only whole-stack slot: the swap)
+	x["army_mask"][0, 0, 1, 1, [c.ArmyAmount.ALL, c.ArmyAmount.HALF, c.ArmyAmount.ONE]] = True
+	model = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	with torch.no_grad():
+		out = model(tensors(x))
+	index = lambda amount: ((0 * A + 1) * HD + 1) * c.N_ARMY_AMOUNTS + amount
+	types = torch.tensor([c.ActionType.ARMY, c.ActionType.ARMY, c.ActionType.MOVE])
+	flags = swap_only_moves({k: v.expand(3, *v.shape[1:]) for k, v in out.items() if k in ("army_whole_mask", "army_split_mask")}, types, torch.tensor([index(c.ArmyAmount.ALL), index(c.ArmyAmount.ONE), index(c.ArmyAmount.ALL)]))
+	assert flags.tolist() == [True, False, False]
+	army = out["army_logp"][0].reshape(-1)
+	assert army[index(c.ArmyAmount.ALL)] < army[index(c.ArmyAmount.ONE)] - 5
