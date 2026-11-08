@@ -14,7 +14,9 @@ cg=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/alpha-j
 started=$(date +%s)
 while true; do
 	here=$(on_pc "for p in \$(cat $cg/cgroup.procs); do cat /proc/\$p/comm 2>/dev/null; done | grep -c vcmiclient")
-	mac=$(pgrep -x vcmiclient | wc -l | tr -d ' ')  # (the process name: -f matched a shell whose command quoted the word, 2026-11-01)
+	# (the worker's games only: headless clients by process name, -f matched a shell whose command quoted the word,
+	# 2026-11-01; a GUI client is the user's own game, never waited for: a deploy waited out its 60 min on one, 2026-11-07)
+	mac=$(for p in $(pgrep -x vcmiclient); do ps -o args= -p $p | grep -q -- "--headless" && echo $p; done | wc -l | tr -d ' ')
 	[ "${here:-1}" -eq 0 ] && [ "$mac" -eq 0 ] && break
 	[ $(($(date +%s) - started)) -ge $max ] && { echo "$(date +%T) still playing after ${1:-45} min (PC $here, Mac $mac): stopping anyway"; break; }
 	sleep 15
