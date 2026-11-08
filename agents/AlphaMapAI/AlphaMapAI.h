@@ -345,6 +345,7 @@ private:
 	void encodeWindows(Decision & decision, PathfinderCache & paths);
 	void encodeMap(Decision & decision, const std::vector<int3> & ours);
 	void encodeTiles(Decision & decision);
+	void encodeTileBlocks(Decision & decision, const std::vector<const CGHeroInstance *> & heroes, int side); // (a map bigger than MAP_TILES a side)
 	void dropFutile(Decision & decision);
 	void encodeTurnActions(Decision & decision, PathfinderCache & paths);
 	void encodeArmyMoves(Decision & decision, const std::vector<std::pair<int, int>> & pairs);

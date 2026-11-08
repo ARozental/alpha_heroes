@@ -980,6 +980,9 @@ class CampaignLearner:
 			self.last_eval = time.monotonic()
 		if row is None:  # (stopped with the run)
 			return None
+		if self.config.eval_size != evaluate.EVAL_SIZE:  # (another map size: its own file, the run's scores and teacher left alone)
+			evaluate.log(row, self.out / f"eval_{self.config.eval_size}.csv", None)
+			return row
 		evaluate.log(row, self.out / "eval.csv", self.writer)
 		if self.config.teacher_mix == "score" and (self.teacher is not None or self.config.nk2_advice > 0) and np.isfinite(row.get("score", np.nan)):
 			self.teacher_weight = teacher_weight_for(row["score"])  # (config.teacher_mix: the teacher's share by our strength)

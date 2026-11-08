@@ -32,7 +32,7 @@ from battle_model.supply import memory_allows
 from .empire import EVAL_EMPIRE, EVAL_EMPIRE_VERSION, STATUS_INGAME, STATUS_LOST, empire_value
 from .failures import NAMES as FAILURES, failure_counts, failure_modes
 from .labels import COLORS, share_at, share_table
-from .play import make_map, play
+from .play import make_map, play, time_scale
 
 EVAL_SEED = 20261027
 STATUS_WON = 2  # EPlayerStatus::WINNER
@@ -63,7 +63,7 @@ def eval_map(seed, players, config):
 	"""The game's map: the kept one (EVAL_MAPS, copied into VCMI's maps when missing or different there), else one
 	generated and kept on this machine."""
 	for attempt in range(5):  # (make_map's next seeds when a player was left without a town)
-		name = f"Maps/alpha_random/s{EVAL_SIZE}-p{players}-l{config.levels}-{config.water}-{seed + 1_000_003 * attempt}"
+		name = f"Maps/alpha_random/s{config.eval_size}-p{players}-l{config.levels}-{config.water}-{seed + 1_000_003 * attempt}"
 		kept, there = EVAL_MAPS / (name.rsplit("/", 1)[-1] + ".vmap"), battle_play.USER_DIR / (name + ".vmap")
 		if kept.exists():
 			if not there.exists() or there.read_bytes() != kept.read_bytes():
@@ -72,7 +72,7 @@ def eval_map(seed, players, config):
 			return name
 		if there.exists():
 			return name
-	return make_map(seed, players, EVAL_SIZE, config.levels, config.water)[0]
+	return make_map(seed, players, config.eval_size, config.levels, config.water)[0]
 
 
 STALLED = "killed: no log output"  # (scripts/headless.sh's status for a game silent past its stall limit)
@@ -152,7 +152,7 @@ def evaluate(config, server, battle, version, epoch, stop=None, model="current")
 			# minute stood in at day 1-3 (scores 0.28-0.72) and lifted v229's eval from 0.219 to 0.267 (2026-10-31)
 			for attempt in range(2):
 				game, info = play(
-					server.socket_for(i), name, config.eval_days, seed, max_seconds=config.eval_seconds, battle_ai="BattleAI", game_key=f"e{i}",
+					server.socket_for(i), name, config.eval_days, seed, max_seconds=config.eval_seconds * time_scale(config.eval_size), battle_ai="BattleAI", game_key=f"e{i}",
 					settings=battle.eval_settings(i) + (("ALPHA_MAP_MODEL", model),), temperature=config.eval_temperature, ours=(color,), stop=stop,
 					niceness=config.eval_niceness,
 				)

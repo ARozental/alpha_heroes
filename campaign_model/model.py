@@ -1458,6 +1458,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"encode_options.numbers", "build_identity", "artifact_q", "artifact_target", "encode_hero.carried", "multi_q", "multi_kind",
 	"privileged",  # (2026-11-06: the privileged critic, its corrections 0 at the start)
 	"army_slot", "army_stay_q",  # (schema 16: ARMY's target slot, its queries 0 at the start: its priors alone)
+	"side_tile", "side_global",  # (2026-11-08: the map's block side, 0: docs/map_size_plan.md)
 )
 # Training-only parts rebuilt since, by prefix: a checkpoint's weights for them that the loading model lacks, or of
 # another shape, are dropped, the part starting again as a new model has it (2026-11-07: the privileged critic's first

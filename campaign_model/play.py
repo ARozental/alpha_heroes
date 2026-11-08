@@ -17,6 +17,7 @@ from pathlib import Path
 
 from battle_model import play as battle_play
 
+from . import constants as c
 from .records import collect
 
 ROOT = battle_play.ROOT
@@ -45,6 +46,13 @@ def players_without_a_town(path):
 	text = zipfile.ZipFile(path).read("header.json").decode()
 	header = json.loads(re.sub(r",(\s*[}\]])", r"\1", re.sub(r"//[^\n]*", "", text)))
 	return sorted(color for color, player in header.get("players", {}).items() if not player.get("mainTown"))
+
+
+def time_scale(size):
+	"""A game's time limit's factor for a map size a side: its area in the model's blocks (1 up to 36 x 36, 16 on 144 x
+	144: docs/map_size_plan.md), the day caps the same."""
+	side = max(1, -(-int(size) // c.MAP_GRID))
+	return side * side
 
 
 def make_map(seed, players=2, size=36, levels=2, water="random", attempts=5):
@@ -212,7 +220,7 @@ def main():
 	players = args.players or random.Random(args.seed).randint(2, 4)
 	map_name, template = make_map(args.seed, players, args.size)
 	with serve_model(args.checkpoint) as (model, server):
-		game, info = play(server.socket_path, map_name, args.days, args.seed)
+		game, info = play(server.socket_path, map_name, args.days, args.seed, max_seconds=170 * time_scale(args.size))
 	info.template = template
 	print(info)
 	print(f"{len(game.decisions)} decisions, ledgers for days {sorted(game.ledgers)}, done {game.done}")

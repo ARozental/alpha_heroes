@@ -71,7 +71,7 @@ class TeacherPlay(torch.utils.data.IterableDataset):
 		from battle_model import play as battle_play
 
 		from .learner import draw_days
-		from .play import GameRun, make_map
+		from .play import GameRun, make_map, time_scale
 
 		info = torch.utils.data.get_worker_info()
 		worker = info.id if info is not None else 0
@@ -84,7 +84,7 @@ class TeacherPlay(torch.utils.data.IterableDataset):
 			except Exception as error:  # (VCMI's generator hangs on some seeds: make_map's timeout; the next seed)
 				print(f"imitate: worker {worker}: no map for seed {seed} ({type(error).__name__}): the next one", flush=True)
 				continue
-			run = GameRun(battle_play.SOCKET_DIR / "teacher-none.sock", map_name, days, seed, max_seconds=self.game_seconds, battle_ai="BattleAI", game_key=f"s{seed}", teacher=True)
+			run = GameRun(battle_play.SOCKET_DIR / "teacher-none.sock", map_name, days, seed, max_seconds=self.game_seconds * time_scale(size), battle_ai="BattleAI", game_key=f"s{seed}", teacher=True)
 			try:
 				while not run.poll():
 					time.sleep(0.5)

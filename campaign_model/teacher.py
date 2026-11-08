@@ -21,7 +21,7 @@ from battle_model import play as battle_play
 
 from . import constants as c
 from .config import CampaignConfig
-from .play import GameRun, make_map
+from .play import GameRun, make_map, time_scale
 from .records import TEACHER, decision_name
 
 
@@ -82,7 +82,7 @@ def main():
 					continue
 				players, size = rng.choice(config.players), rng.choice(config.sizes)
 				map_name = make_map(seed, players, size, config.levels, config.water)[0]
-				run = GameRun(battle_play.SOCKET_DIR / "teacher-none.sock", map_name, args.days, seed, max_seconds=args.game_seconds, battle_ai="BattleAI", game_key=f"t{seed}", teacher=True)
+				run = GameRun(battle_play.SOCKET_DIR / "teacher-none.sock", map_name, args.days, seed, max_seconds=args.game_seconds * time_scale(size), battle_ai="BattleAI", game_key=f"t{seed}", teacher=True)
 				running[seed] = (run, map_name, players, time.time())
 				next_game += 1
 			if time.time() >= deadline or saved_bytes >= args.max_gb * 1e9:

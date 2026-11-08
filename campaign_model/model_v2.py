@@ -127,9 +127,13 @@ class MapUNet(nn.Module):
 		return d1, d2
 
 
-def distance_buckets(delta):
-	"""Chebyshev distance buckets [..] of tile offsets [.., 3]: 0..10 by distance, DISTANCE_BUCKETS - 1 another level."""
+def distance_buckets(delta, side=None):
+	"""Chebyshev distance buckets [..] of tile offsets [.., 3]: 0..10 by distance, DISTANCE_BUCKETS - 1 another level.
+	side (broadcast to delta's [..]): offsets in map blocks of that many tiles a side, the distance in tiles (a bigger
+	map's: docs/map_size_plan.md); None, in tiles."""
 	distance = torch.maximum(delta[..., 0].abs(), delta[..., 1].abs()).float()
+	if side is not None:
+		distance = distance * side.to(distance.dtype)
 	bucket = torch.where(distance < 3, distance, 2 + torch.floor(torch.log2(distance.clamp(min=1)) * 1.5)).clamp(max=DISTANCE_BUCKETS - 2).long()
 	return torch.where(delta[..., 2] == 0, bucket, torch.full_like(bucket, DISTANCE_BUCKETS - 1))
 
@@ -148,9 +152,10 @@ class TileReader(nn.Module):
 		self.reach = nn.Linear(cell_dim, heads)
 		self.out = zero_output(nn.Linear(dim, dim))
 
-	def forward(self, tokens, positions, placed, tiles, tile_positions, valid, reach=None):
+	def forward(self, tokens, positions, placed, tiles, tile_positions, valid, reach=None, side=None):
 		"""tokens [B, N, d] at positions [B, N, 3] (placed [B, N]); tiles [B, M, dc] at tile_positions [M, 3] (valid
-		[B, M]); reach: its bias [B, N, M, heads] (self.reach of each hero's reach to each tile) or None. Returns what each
+		[B, M]); reach: its bias [B, N, M, heads] (self.reach of each hero's reach to each tile) or None; side [B]: the
+		map's block side (the grid's cells blocks of that many tiles; distances in tiles), None tiles. Returns what each
 		token reads [B, N, d]."""
 		b, n, d = tokens.shape
 		h, dh = self.heads, d // self.heads
@@ -158,7 +163,11 @@ class TileReader(nn.Module):
 		k = self.k(tiles).reshape(b, -1, h, dh)
 		v = self.v(tiles).reshape(b, -1, h, dh)
 		logits = torch.einsum("bnhd,bmhd->bhnm", q, k) / math.sqrt(dh)
-		bucket = distance_buckets(tile_positions[None, None, :, :] - positions[:, :, None, :])  # [B, N, M]
+		if side is None:
+			bucket = distance_buckets(tile_positions[None, None, :, :] - positions[:, :, None, :])  # [B, N, M]
+		else:
+			blocks = torch.cat([torch.div(positions[..., :2], side[:, None, None], rounding_mode="floor"), positions[..., 2:]], dim=-1)
+			bucket = distance_buckets(tile_positions[None, None, :, :] - blocks[:, :, None, :], side[:, None, None])
 		logits = logits + F.embedding(bucket, self.distance.t()).permute(0, 3, 1, 2)  # (an embedding: Sides.forward)
 		if reach is not None:
 			logits = logits + reach.permute(0, 3, 1, 2)
@@ -425,6 +434,11 @@ class CampaignModelV2(nn.Module):
 		self.register_buffer("tile_positions", tile_positions(), persistent=False)
 		# The adventure spells the model may cast: not the ones that only show the map (constants.INFO_SPELLS)
 		self.register_buffer("castable", torch.tensor([s not in c.INFO_SPELLS for s in range(c.N_ADVENTURE_SPELLS)]), persistent=False)
+		# The map's block side (features.block_side: 1 up to 36 x 36, 4 on 144 x 144; docs/map_size_plan.md), for a model
+		# trained on bigger maps to read a block apart from a tile: at 0, side 1's row (every small map's) never learned
+		# (padding_idx: no gradient), so the small maps' outputs stay as they are whatever the training. Made last, the
+		# other parameters' initialisation as before
+		self.side_tile, self.side_global = side_embedding(dc), side_embedding(d)
 
 	def prior_corrections(self):
 		"""The parameters that correct a fixed prior (model.CustomFeatures): weight decay pulls them back to it."""
@@ -485,7 +499,8 @@ class CampaignModelV2(nn.Module):
 		windows, n, real = windows_of(x, fixed=self.fixed_windows, budget=self.window_budget)
 		known = self.features(x, windows)
 		known.windows, known.n, known.real = windows, n, real
-		known.window_tiles = window_tile_index(x, windows)  # [K, W, W] each window tile's map tile (-1 off the grid)
+		known.side = ft.block_side(x)  # [B] the map grid's block side in tiles (1 up to 36 x 36: docs/map_size_plan.md)
+		known.window_tiles = window_tile_index(x, windows, known.side)  # [K, W, W] each window tile's map cell (-1 off the grid)
 		ours = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
 		armies = known.hero_gold[:, :HO] * ours
 		rivals = known.hero_gold[:, HO:] * (x["h_present"][:, HO:] & (x["h_owner"][:, HO:] > c.OWNER_SELF))
@@ -501,7 +516,9 @@ class CampaignModelV2(nn.Module):
 
 	def encode(self, x):
 		state = State(x)
+		side = ft.block_side(x).clamp(max=c.MAP_SIDE_MAX)
 		state.glob = self.encode_global(x)
+		state.glob = state.glob + self.side_global(side).to(state.glob.dtype)
 		state.heroes, state.hero_stacks = self.encode_hero(E.hero_fields(x))
 		state.towns, state.town_stacks, state.town_levels = self.encode_town(x)
 		state.tavern, _ = self.encode_hero(E.tavern_fields(x))
@@ -510,6 +527,7 @@ class CampaignModelV2(nn.Module):
 		flags = self.option_flags(torch.stack([x["o_battle"], x["o_join"]], dim=-1).float()) * x["option_mask"].unsqueeze(-1)
 		state.options, state.option_keys = tokens + flags, identities + flags  # (the key: a choice's in decide)
 		state.tiles = self.encode_tiles(x)  # [B, L, S, S, dc]
+		state.tiles = state.tiles + self.side_tile(side).to(state.tiles.dtype)[:, None, None, None, :]
 		return state
 
 	def build_scores(self, own_towns, x):
@@ -577,7 +595,7 @@ class CampaignModelV2(nn.Module):
 		dc = self.cell_dim
 		cells = state.tiles.reshape(b * L * S * S, dc)
 		for vectors, positions, present, stamp in ((state.heroes, x["h_pos"], x["h_present"], self.stamp_hero), (state.towns, x["t_pos"], x["t_present"], self.stamp_town)):
-			index, inside = map_index(positions, b)
+			index, inside = map_index(positions, b, known.side)
 			keep = (present & inside).reshape(-1)
 			# (every row, the others' adding zeros: no nonzero, whose size the host must learn, for a CUDA graph)
 			stamped = torch.where(keep.unsqueeze(-1), stamp(vectors.reshape(-1, vectors.shape[-1])), 0.0)
@@ -600,9 +618,12 @@ class CampaignModelV2(nn.Module):
 			inside = ((tiles >= 0) & known.real[:, None]).reshape(-1)
 			values = torch.where(inside.unsqueeze(-1), self.read_tiles.reach(state.window_reach).reshape(-1, heads), 0.0)
 			reach = reach.index_add(0, torch.where(inside, index, 0), values.to(reach.dtype))
+			# (a bigger map's block holds several of a window's tiles: their reach averaged; at side 1 at most one, as before)
+			count = torch.zeros(reach.shape[0], 1, device=reach.device, dtype=reach.dtype).index_add(0, torch.where(inside, index, 0), inside.to(reach.dtype).unsqueeze(-1))
+			reach = reach / count.clamp(min=1)
 		reach = torch.cat([reach.reshape(b, HO, L * S * S, heads), torch.zeros(b, H - HO, L * S * S, heads, device=flat.device, dtype=flat.dtype)], dim=1)
-		state.heroes = state.heroes + self.read_tiles(state.heroes, x["h_pos"], x["h_present"], flat, self.tile_positions, valid, reach)
-		state.towns = state.towns + self.read_tiles(state.towns, x["t_pos"], x["t_present"], flat, self.tile_positions, valid)
+		state.heroes = state.heroes + self.read_tiles(state.heroes, x["h_pos"], x["h_present"], flat, self.tile_positions, valid, reach, side=known.side)
+		state.towns = state.towns + self.read_tiles(state.towns, x["t_pos"], x["t_present"], flat, self.tile_positions, valid, side=known.side)
 		state.areas = self.area(half.reshape(b, L, 2 * dc, TG * TG).permute(0, 1, 3, 2).reshape(b, AREAS, 2 * dc))
 		return state
 
@@ -1089,28 +1110,42 @@ def reach_features(x, windows):
 	return torch.cat([E.level(turns, -1, 3), E.amount(pick("w_move_left").clamp(min=0), "movement"), ft.bit(pick("w_flags"), c.TILE_VISITED_BY_HERO).float().unsqueeze(-1)], dim=-1)
 
 
+def side_embedding(dim):
+	"""A block side's embedding [MAP_SIDE_MAX + 1, dim]: every row 0 to begin with, side 1's never learned."""
+	table = nn.Embedding(c.MAP_SIDE_MAX + 1, dim, padding_idx=1)
+	nn.init.zeros_(table.weight)
+	return table
+
+
 def tile_positions():
 	"""[L * S * S, 3] each map tile's (x, y, level), in the flattened grid's order."""
 	z, y, xx = torch.meshgrid(torch.arange(L), torch.arange(S), torch.arange(S), indexing="ij")
 	return torch.stack([xx, y, z], dim=-1).reshape(-1, 3)
 
 
-def map_index(positions, b):
-	"""(flat grid indices [B, N] of positions [B, N, 3] in the batch's flattened tiles, whether each is inside)."""
+def map_index(positions, b, side=None):
+	"""(flat grid indices [B, N] of positions [B, N, 3] in the batch's flattened tiles, whether each is inside); side [B]:
+	the grid's cells blocks of that many tiles a side (a bigger map's), None tiles."""
 	px, py, pz = positions[..., 0], positions[..., 1], positions[..., 2]
+	if side is not None:
+		px, py = torch.div(px, side[:, None], rounding_mode="floor"), torch.div(py, side[:, None], rounding_mode="floor")
 	inside = (px >= 0) & (px < S) & (py >= 0) & (py < S) & (pz >= 0) & (pz < L)
 	batch = torch.arange(b, device=positions.device)[:, None]
 	index = ((batch * L + pz.clamp(0, L - 1)) * S + py.clamp(0, S - 1)) * S + px.clamp(0, S - 1)
 	return index, inside
 
 
-def window_tile_index(x, windows):
-	"""[K, W, W] each window tile's index in its decision's flattened grid (level, row, column), -1 off the grid."""
+def window_tile_index(x, windows, side=None):
+	"""[K, W, W] each window tile's index in its decision's flattened grid (level, row, column), -1 off the grid; side
+	[B]: the grid's cells blocks of that many tiles a side (a bigger map's: several window tiles share one), None tiles."""
 	k = windows.shape[0]
 	pos = x["h_pos"][:, :HO].reshape(-1, 3).index_select(0, windows)  # [K, 3]
 	offsets = torch.arange(W, device=pos.device) - c.WINDOW_RADIUS
 	dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
 	tx, ty = pos[:, 0, None, None] + dx, pos[:, 1, None, None] + dy
+	if side is not None:
+		per = side.index_select(0, torch.div(windows, HO, rounding_mode="floor"))[:, None, None]
+		tx, ty = torch.div(tx, per, rounding_mode="floor"), torch.div(ty, per, rounding_mode="floor")
 	tz = pos[:, 2, None, None].expand(k, W, W)
 	inside = (tx >= 0) & (tx < S) & (ty >= 0) & (ty < S) & (tz >= 0) & (tz < L)
 	return torch.where(inside, (tz * S + ty) * S + tx, torch.full_like(tx, -1))

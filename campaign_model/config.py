@@ -19,6 +19,12 @@ class CampaignConfig:
 	days_max: int = 112
 	players: tuple = (2, 3, 4)  # drawn uniformly (the user: more than 2 players)
 	sizes: tuple = (36,)  # map width and height, drawn uniformly (the user: small maps only, for now)
+	# Bigger maps (docs/map_size_plan.md: the model reads one a block of tiles a cell): every big_game_every-th game a
+	# supply draws on a generated map big_game_size a side (0: never; "give it one large map to see what happens"). A
+	# game's time limit (game_seconds, eval_seconds, a teacher's) grows with its map's area (play.time_scale); the day
+	# caps stay as they are
+	big_game_every: int = 0
+	big_game_size: int = 144
 	game_map_share: float = 1 / 3  # games on one of the game's own maps (maps.GAME_MAPS), the rest on generated ones
 	levels: int = 2  # with the underground (the user: water and underground stay on)
 	water: str = "random"
@@ -246,4 +252,5 @@ class CampaignConfig:
 	# from there the tile it came from, so heroes walked back and forth a tile at a time until their movement ran out
 	# (95% one-tile moves, 88% back onto a tile of that day; sampled: 19% and 2%) and the eval measured that
 	eval_temperature: float = 1.0
+	eval_size: int = 36  # its maps' side: 36 (the kept eval_maps); another size is generated here and scores into eval_<size>.csv, never eval.csv
 	eval_seconds: int = 600  # 240 cut half of the first greedy eval's games short (2026-10-29: 120-240 s a game, 24 at once); an endless siege once held a whole eval for 900 s (no longer: vcmi's stalemate rule)

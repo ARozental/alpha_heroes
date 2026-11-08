@@ -798,12 +798,15 @@ void AlphaMapAI::encodeMap(Decision & decision, const std::vector<int3> & ours)
 void AlphaMapAI::encodeTiles(Decision & decision)
 {
 	// The whole map tile by tile (MAP_TILES a side, schema 9): as a window's tiles but for no hero in particular, every
-	// hero reading the same; a monster's count exact when any of our heroes' Visions reach it
+	// hero reading the same; a monster's count exact when any of our heroes' Visions reach it. A map bigger than
+	// MAP_TILES a side is read a block of side x side tiles a cell (encodeTileBlocks), as g_tiles' blocks and TRAVEL's
+	// areas are: every map up to MAP_TILES a side (side 1) reads tile by tile, as before
 	auto & in = decision.inputs;
 	const auto size = cb->getMapSize();
-	if(size.x > MAP_TILES || size.y > MAP_TILES)
+	const int side = std::max(1, (std::max(size.x, size.y) + MAP_GRID - 1) / MAP_GRID);
+	if(side > MAP_SIDE_MAX)
 	{
-		logAi->error("AlphaMapAI %s: a %dx%d map, MAP_TILES is %d: the tiles past it are left out", playerID.toString(), size.x, size.y, MAP_TILES);
+		logAi->error("AlphaMapAI %s: a %dx%d map, blocks of %d tiles a side: the model reads sides up to %d", playerID.toString(), size.x, size.y, side, MAP_SIDE_MAX);
 		++errors;
 	}
 	std::vector<const CGHeroInstance *> heroes;
@@ -811,6 +814,11 @@ void AlphaMapAI::encodeTiles(Decision & decision)
 		if(decision.heroes[h] != ObjectInstanceID())
 			if(const auto * hero = cb->getHero(decision.heroes[h]))
 				heroes.push_back(hero);
+	if(side > 1)
+	{
+		encodeTileBlocks(decision, heroes, side);
+		return;
+	}
 	for(int z = 0; z < std::min(size.z, MAP_LEVELS); ++z)
 		for(int y = 0; y < std::min(size.y, MAP_TILES); ++y)
 			for(int x = 0; x < std::min(size.x, MAP_TILES); ++x)
@@ -849,6 +857,112 @@ void AlphaMapAI::encodeTiles(Decision & decision)
 						}
 				}
 				in.at(In::tile_flags, z, y, x) = flags;
+			}
+}
+
+void AlphaMapAI::encodeTileBlocks(Decision & decision, const std::vector<const CGHeroInstance *> & heroes, int side)
+{
+	// A map bigger than MAP_TILES a side, a block of side x side tiles a cell (docs/map_size_plan.md, "block summary rule,
+	// 2026-11-08"), from its revealed tiles only (fog stays fog): on the map if any tile is, revealed if any is; water if
+	// more than half the revealed tiles are, blocked if all are, visitable or guarded if any is; the most common terrain
+	// and nonzero road (ties: the smallest id); the object to note (a town, else one we have not visited, else a
+	// wandering monster, the strongest, else any; ties: the first, row by row), whose visit by us it carries; the
+	// strongest wandering monster (its seen count x AI value) as the block's creature, whatever the object, so a guard is
+	// never hidden by a mine beside it
+	static constexpr std::array<int, 10> TYPICAL = {15, 3, 7, 15, 35, 75, 175, 375, 750, 1500}; // (a quantity id's count: features.QUANTITY_COUNTS)
+	auto & in = decision.inputs;
+	const auto size = cb->getMapSize();
+	const auto seen = [&](const CGObjectInstance * obj)
+	{
+		auto [count, exact] = seenCount(obj, nullptr);
+		for(const auto * hero : heroes)
+			if(!exact)
+				std::tie(count, exact) = seenCount(obj, hero);
+		return std::pair(count, exact);
+	};
+	for(int z = 0; z < std::min(size.z, MAP_LEVELS); ++z)
+		for(int row = 0; row < MAP_TILES; ++row)
+			for(int column = 0; column < MAP_TILES; ++column)
+			{
+				const int x0 = column * side, y0 = row * side;
+				if(x0 >= size.x || y0 >= size.y)
+					continue; // (off the map: the fill values)
+				int revealed = 0, water = 0, blocked = 0;
+				bool visitable = false, guarded = false;
+				std::map<int, int> terrains, roads;
+				const CGObjectInstance * chosen = nullptr;
+				int chosenRank = 4;
+				uint64_t chosenPower = 0;
+				const CGObjectInstance * strongest = nullptr;
+				uint64_t strongestPower = 0;
+				std::pair<int, bool> strongestSeen{0, false};
+				for(int y = y0; y < std::min(y0 + side, size.y); ++y)
+					for(int x = x0; x < std::min(x0 + side, size.x); ++x)
+					{
+						const int3 pos(x, y, z);
+						if(!cb->isVisible(pos))
+							continue;
+						++revealed;
+						const auto * tile = cb->getTile(pos, false);
+						++terrains[tile->getTerrainID().getNum()];
+						if(tile->getRoadID().getNum() != 0)
+							++roads[tile->getRoadID().getNum()];
+						water += tile->isWater() ? 1 : 0;
+						blocked += tile->blocked() ? 1 : 0;
+						visitable = visitable || tile->visitable();
+						guarded = guarded || cb->guardingCreaturePosition(pos) != int3(-1, -1, -1);
+						const auto * obj = topNonHero(*cb, pos);
+						if(!obj)
+							continue;
+						uint64_t power = 0;
+						if(obj->ID == Obj::MONSTER)
+							if(const auto * stack = dynamic_cast<const CArmedInstance *>(obj)->getStackPtr(SlotID(0)))
+							{
+								const auto counted = seen(obj);
+								const int count = counted.second ? counted.first : TYPICAL[std::clamp(counted.first, 0, static_cast<int>(TYPICAL.size()) - 1)];
+								power = static_cast<uint64_t>(std::max(count, 1)) * static_cast<uint64_t>(std::max(stack->getCreature()->getAIValue(), 1));
+								if(!strongest || power > strongestPower)
+									std::tie(strongest, strongestPower, strongestSeen) = std::tuple(obj, power, counted);
+							}
+						const int rank = obj->ID == Obj::TOWN ? 0 : obj->ID == Obj::MONSTER ? 2 : !obj->wasVisited(playerID) ? 1 : 3;
+						if(rank < chosenRank || (rank == 2 && chosenRank == 2 && power > chosenPower))
+							std::tie(chosen, chosenRank, chosenPower) = std::tuple(obj, rank, power);
+					}
+				int64_t flags = TILE_ON_MAP;
+				if(revealed == 0)
+				{
+					in.at(In::tile_flags, z, row, column) = flags;
+					continue;
+				}
+				flags |= TILE_REVEALED;
+				const auto mode = [](const std::map<int, int> & counts) // (the most common, the smallest id of a tie; 0 none)
+				{
+					int best = 0, most = 0;
+					for(const auto & [id, n] : counts)
+						if(n > most)
+							std::tie(best, most) = std::tuple(id, n);
+					return best;
+				};
+				in.at(In::tile_terrain, z, row, column) = mode(terrains);
+				in.at(In::tile_road, z, row, column) = mode(roads);
+				flags |= 2 * water > revealed ? TILE_WATER : 0;
+				flags |= blocked == revealed ? TILE_BLOCKED : 0;
+				flags |= visitable ? TILE_VISITABLE : 0;
+				flags |= guarded ? TILE_GUARDED : 0;
+				if(chosen)
+				{
+					in.at(In::tile_object, z, row, column) = chosen->ID.getNum();
+					in.at(In::tile_subtype, z, row, column) = chosen->subID.getNum();
+					in.at(In::tile_owner, z, row, column) = owner(chosen->tempOwner);
+					flags |= chosen->wasVisited(playerID) ? TILE_VISITED_BY_PLAYER : 0;
+				}
+				if(strongest)
+				{
+					in.at(In::tile_creature, z, row, column) = dynamic_cast<const CArmedInstance *>(strongest)->getStackPtr(SlotID(0))->getId().getNum();
+					in.at(In::tile_count, z, row, column) = strongestSeen.first;
+					flags |= strongestSeen.second ? TILE_EXACT_COUNT : 0;
+				}
+				in.at(In::tile_flags, z, row, column) = flags;
 			}
 }
 

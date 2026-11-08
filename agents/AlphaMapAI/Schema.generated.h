@@ -68,6 +68,7 @@ constexpr int OBJECT_VISITED_BY_PLAYER = 1;
 constexpr int OBJECT_EXACT_COUNT = 2;
 constexpr int OBJECT_GUARDED = 4;
 constexpr int TRAVEL_GRID = 18;
+constexpr int MAP_SIDE_MAX = 8;
 constexpr int OBJECT_VOCAB = 256;
 constexpr int OWNED_STACKS = 16;
 constexpr int N_ARTIFACT_POSITIONS = 27;

@@ -537,6 +537,8 @@ class Runner:
 		config = self.config.campaign
 		players, size, seed = rng.choice(config.players), rng.choice(config.sizes), rng.randrange(1, 2**31)
 		game_map, days = rng.random() < config.game_map_share, draw_days(rng, config)
+		if config.big_game_every > 0 and n % config.big_game_every == 0:  # (a big map now and then: docs/map_size_plan.md)
+			size, game_map = config.big_game_size, False
 		spec = {"kind": "campaign", "key": f"{self.name}_c{index}_{n}", "players": players, "size": size, "seed": seed, "days": days, "map": None}
 		if game_map:
 			spec["map"], spec["players"] = rng.choice(sorted(GAME_MAPS.items()))
@@ -592,7 +594,7 @@ class Runner:
 		"""Plays one campaign game here (self-play, every player's battle by the battle model); yields each battle's
 		item as it ends, then the game: {"kind": "campaign", "key", "map", "players", "game" (records.Game), "info"
 		(play.GameInfo), "game_map"}."""
-		from campaign_model.play import GameRun, make_map
+		from campaign_model.play import GameRun, make_map, time_scale
 		from battle_model import play as battle_play
 		import shutil
 
@@ -604,7 +606,7 @@ class Runner:
 		map_name = spec["map"] if game_map else make_map(seed, players, spec["size"], config.levels, config.water)[0]
 		try:
 			self.game = GameRun(
-				self.campaign_socket, map_name, spec["days"], seed, max_seconds=config.game_seconds, battle_ai="AlphaBattleAI", game_key=key,
+				self.campaign_socket, map_name, spec["days"], seed, max_seconds=config.game_seconds * time_scale(spec["size"]), battle_ai="AlphaBattleAI", game_key=key,
 				settings=self.campaign_settings(key, seed), niceness=config.niceness, temperature=config.temperature,
 			)
 			try:

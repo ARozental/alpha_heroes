@@ -46,7 +46,8 @@ MAP_OBJECTS = 8192  # every object on revealed tiles (VCMI's getAllVisitableObjs
 ARMED_OBJECTS = 32  # armed objects that fight a hero stepping on them (garrisons not ours), the nearest first (schema a_*)
 MAP_GRID = 36  # blocks per side of each level; a block is ceil(max(width, height) / MAP_GRID) tiles on a side
 MAP_LEVELS = 2  # surface and underground
-MAP_TILES = 36  # the whole map's tiles (tile_*), this many a side: every map played so far (config.sizes); a bigger map needs this raised (the model's map encoder takes any size), its tiles past it are left out (an error, never silent)
+MAP_TILES = 36  # the whole map's cells (tile_*), this many a side: a tile each on a map up to 36 x 36, a block of side x side tiles on a bigger one (side = ceil(its larger side / MAP_GRID); docs/map_size_plan.md)
+MAP_SIDE_MAX = 8  # the largest block side the model reads (288 x 288 tiles; HotA's largest maps 252: 7): a bigger map is an error
 # The model's memory (model_v2.Memory): MEMORY_SLOTS slots of MEMORY_WIDTH numbers in -1..1 a player's decisions carry
 # forward, its own output passed back by AlphaMapAI; on the wire as integers x MEMORY_SCALE (the inputs are int32)
 MEMORY_SLOTS = 8
