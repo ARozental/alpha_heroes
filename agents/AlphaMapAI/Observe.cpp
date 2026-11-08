@@ -6,6 +6,7 @@
 #include "lib/mapObjects/CGTownInstance.h"
 #include "lib/networkPacks/PacksForClientBattle.h"
 #include "lib/networkPacks/PacksForServer.h"
+#include "lib/networkPacks/SaveLocalState.h"
 
 #include <cmath>
 
@@ -100,9 +101,11 @@ void AlphaMapAI::observe(const CPackForServer * pack)
 		rawRequest(pack, 0, nullptr, "a battle's action: the battle model's records have it");
 		return;
 	}
-	if(dynamic_cast<const SaveGame *>(pack) || dynamic_cast<const GamePause *>(pack))
+	// The client's own requests, no decision of the player's: a save (where a later session may go on from), a pause,
+	// the GUI's local state (SaveLocalState: its hero and town lists' order, sent as they change), the interface ready
+	if(dynamic_cast<const SaveGame *>(pack) || dynamic_cast<const GamePause *>(pack) || dynamic_cast<const SaveLocalState *>(pack) || dynamic_cast<const AdvInterfaceReady *>(pack))
 	{
-		rawRequest(pack, 0, nullptr, "the game's, not a decision"); // (a save: where a later session may go on from)
+		rawRequest(pack, 0, nullptr, "the game's, not a decision");
 		return;
 	}
 	if(const auto * reply = dynamic_cast<const QueryReply *>(pack))
