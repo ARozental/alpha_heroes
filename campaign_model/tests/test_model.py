@@ -674,6 +674,23 @@ def test_travel_discounts_an_area_by_the_pathfinders_days():
 		priors.append(float(model.features(tensors(x), torch.zeros(0, dtype=torch.long)).travel_prior[0, 0, 0]))
 	assert priors[0] > priors[1]
 
+def test_idle_movement_is_counted_at_the_turns_end():
+	"""At an END: hero 0 in a town of ours with all of its 1500 points, hero 1 outside with 300 of 1500 left, hero 2 a
+	town's garrison hero (not counted). A MOVE decision counts nothing."""
+	from campaign_model.failures import failure_counts
+
+	x = empty_inputs(1)
+	x["g_kind"][0], x["g_map"][0] = c.DecisionKind.TURN, [36, 36, 1]
+	for h, town, left, garrison in ((0, 3, 1500, False), (1, -1, 300, False), (2, 4, 0, True)):
+		x["h_present"][0, h], x["h_owner"][0, h], x["h_type"][0, h] = True, c.OWNER_SELF, 7 + h
+		x["h_town"][0, h], x["h_move"][0, h], x["h_move_max"][0, h], x["h_garrisoned"][0, h] = town, left, 1500, garrison
+	end = Decision("RED", 1, int(c.DecisionKind.TURN), 0, 1, int(c.ActionType.END), -1, -1, 0.0, (0.5,) * 3, 0, encoded(x, 0))
+	move = Decision("RED", 1, int(c.DecisionKind.TURN), 0, 1, int(c.ActionType.MOVE), -1, -1, 0.0, (0.5,) * 3, 0, encoded(x, 0))
+	counts = failure_counts([move, end])
+	assert counts["idle_movement"] == (1800, 3000) and counts["idle_movement_town"] == (1500, 1500)
+	assert counts["unmoved_heroes"] == (1, 2) and counts["unmoved_heroes_town"] == (1, 1)
+
+
 def test_the_meetings_counts_failing_leave_them_nan_and_the_rest():
 	"""A diagnostic never ends an update: the meetings' counts failing (here a decision whose inputs cannot be decoded)
 	leave their four shares nan, the other counts as they are."""
@@ -682,3 +699,6 @@ def test_the_meetings_counts_failing_leave_them_nan_and_the_rest():
 	broken = Decision("RED", 1, int(c.DecisionKind.TURN), 0, 1, int(c.ActionType.MOVE), 5, -1, 0.0, (0.5,) * 3, 0, b"not zlib")
 	shares = failure_modes([broken])
 	assert all(math.isnan(shares[k]) for k in ("own_hero_moves", "repeat_meetings", "meeting_movement", "town_movement"))
+	broken_end = Decision("RED", 1, int(c.DecisionKind.TURN), 0, 1, int(c.ActionType.END), -1, -1, 0.0, (0.5,) * 3, 0, b"not zlib")
+	shares = failure_modes([broken_end])  # (every part that reads it fails apart, nan; the update goes on)
+	assert all(math.isnan(shares[k]) for k in ("pickup_passed_end", "idle_movement", "idle_movement_town", "unmoved_heroes", "unmoved_heroes_town"))
