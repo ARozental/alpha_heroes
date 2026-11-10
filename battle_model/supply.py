@@ -193,12 +193,6 @@ def prepare(record, source, key, config, keep_record=False):
 	}
 	if chosen:
 		batch = collate(chosen, widen=False)
-		# (TrainConfig.battle_length_scale: the battle counts as at most ~that many decisions; "weight_base" keeps the weight
-		# without it, for the fresh value loss's series: train.py)
-		batch["weight_base"] = batch["weight"].clone()
-		factor = length_weight(len(chosen), getattr(config, "battle_length_scale", 0.0))
-		if factor != 1.0:
-			batch["weight"] = batch["weight"] * factor
 		if "foresight" not in batch:  # (a battle of one decision: no next one; the same keys as the others')
 			n = len(chosen)
 			batch["foresight"] = {"dies": torch.zeros(n, MAX_UNITS), "lost": torch.zeros(n, MAX_UNITS), "dealt": torch.zeros(n, MAX_UNITS), "unit_mask": torch.zeros(n, MAX_UNITS), "hex_enemy": torch.zeros(n, N_HEXES), "valid": torch.zeros(n)}
@@ -248,16 +242,18 @@ def dense_on(values, device):
 	return out
 
 
-def assemble(items, advantage_config, device=None):
+def assemble(items, advantage_config, device=None, length_scale=0.0):
 	"""One update's batch (as data.collate(widen=False) gives it, the int64 inputs int32) from the battle items taken, the
 	advantages normalised per side and source over the update (data.make_dataloader: the campaign games' battles got 50%
 	larger advantages than the generated ones' when normalised together); and the items' summaries, in order. device:
-	the sparse inputs made dense there (dense_on), not on the CPU; the rest as before (moved by the caller)."""
+	the sparse inputs made dense there (dense_on), not on the CPU; the rest as before (moved by the caller).
+	length_scale (TrainConfig.battle_length_scale): each item's decisions' weight x data.length_weight of its decisions,
+	here, in the trainer, for the whole buffer alike (the items keep their base weight: the value phase's replay, which
+	takes a few decisions of each battle whatever its length, must not count a long one down twice); "weight_base" the
+	weights without it (the series that must keep their meaning: train.py)."""
 	parts = [item["data"] for item in items if item["data"]]
 	if not parts:
 		return None, [item["summary"] for item in items]
-	if any("weight_base" in part for part in parts):  # (items prepared before battle_length_scale: their weight is their base)
-		parts = [part if "weight_base" in part else {**part, "weight_base": part["weight"]} for part in parts]
 
 	def join(values):
 		if isinstance(values[0], dict):
@@ -271,6 +267,11 @@ def assemble(items, advantage_config, device=None):
 	groups = torch.cat([torch.full((n,), item["summary"].our_side + 2 * (item["source"] == "real")) for n, item in zip(rows, (i for i in items if i["data"]))])
 	battles = torch.cat([torch.full((n,), i) for i, n in enumerate(rows)])
 	batch["advantage"] = normalize_advantages(batch["advantage"], groups, battles, advantage_config)
+	if "weight" in batch:  # (collate's items always have it)
+		batch["weight_base"] = batch["weight"]
+		if length_scale and length_scale > 0:
+			factors = torch.cat([torch.full((n,), length_weight(n, length_scale)) for n in rows]).to(batch["weight"].device, batch["weight"].dtype)
+			batch["weight"] = batch["weight"] * factors
 	batch["real"] = (groups >= 2).float()  # (each decision's source, for the fresh value loss by source)
 	return batch, [item["summary"] for item in items]
 

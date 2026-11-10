@@ -62,7 +62,7 @@ from torch.utils.tensorboard import SummaryWriter
 from campaign_model.config import CampaignConfig
 
 from . import generator, play, rules
-from .data import collate, credit_check, make_dataloader, summarize, widened  # noqa: F401 (make_dataloader: the Producer's path)
+from .data import collate, credit_check, length_weight, make_dataloader, summarize, widened  # noqa: F401 (make_dataloader: the Producer's path)
 from .distributions import log_prob
 from .export import export, verify
 from .device import sync, use_fused
@@ -354,7 +354,7 @@ COLUMNS = [
 	"signal_fraction", *(f"signal_fraction_{g}" for g in ("trunk", "priors", "values")), "value_learning_rate", "clipped_by_group",
 	# The value's own phase after the previous update (config.aux_value; aux_value.AuxValuePhase.run's readings)
 	*AUX_COLUMNS,
-	*SIGNAL_COLUMNS, "value_loss_fresh_weighted",
+	*SIGNAL_COLUMNS, "value_loss_fresh_weighted", "entropy_weighted",
 ]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
 # error. decisions: all decisions of the epoch; rounds: attack + defence battle rounds, averaged over the games.
@@ -389,6 +389,7 @@ TENSORBOARD_TAGS = {
 	**{name: f"aux/{name[4:]}" for name in AUX_COLUMNS},  # the value's own phase (config.aux_value)
 	**{name: f"signal/{name}" for name in SIGNAL_COLUMNS},  # optim.SignalShare, games_by_weight
 	"value_loss_fresh_weighted": VALUE_LOSS_TAB + "_weighted",  # (with battle_length_scale's weights; the plain series keeps the old ones)
+	"entropy_weighted": "loss/entropy_weighted",
 	"attack_advantage_std": "advantage_std/attack", "defence_advantage_std": "advantage_std/defence", "attack_advantage_scale": "advantage_scale/attack", "defence_advantage_scale": "advantage_scale/defence",
 	"attack_value_error": "value_error/attack", "defence_value_error": "value_error/defence",
 	"decisions": "battle/decisions", "rounds": "battle/rounds", "seconds": "time/epoch_seconds",
@@ -502,16 +503,16 @@ BATTLE_VALUE_MODULES = ("values.", "value_strength.")
 BATTLE_PRIORS = ("actions.escape_rules", "actions.escape_ahead", "actions.escape_strong", "actions.spell_mastery", "actions.spell_value", "actions.creature_spell_value", "actions.value_gains", "actions.type_head.bias", "actions.type_rules.weight", "actions.type_strength.weight", "actions.spell_head.bias")
 
 
-def games_rested_on(items):
+def games_rested_on(items, length_scale=0.0):
 	"""(by weight, by decisions): (sum of W_g)^2 / sum of W_g^2 over an update's games, W_g a game's decisions' summed
-	weight (data's "weight") or their count: how many games the update's gradient rests on (e5, 2026-11-10: 33 by
-	weight on a stop's buffer of 98 games, 68 with battle_length_scale 30)."""
+	weight as the update weighs them (data's "weight" x length_weight, as supply.assemble) or their count: how many games
+	the update's gradient rests on (e5, 2026-11-10: 33 by weight on a stop's buffer of 98 games, 68 at scale 30)."""
 	by_weight, by_count = Counter(), Counter()
 	for item in items:
 		data = item.get("data")
 		if not data:
 			continue
-		weight = np.asarray(data.get("weight", np.ones(item["decisions"])), dtype=np.float64)
+		weight = np.asarray(data.get("weight", np.ones(item["decisions"])), dtype=np.float64) * length_weight(item["decisions"], length_scale)
 		by_weight[item["game"]] += float(weight.sum())
 		by_count[item["game"]] += item["decisions"]
 	share = lambda d: (sum(d.values()) ** 2 / sum(v * v for v in d.values())) if d and sum(d.values()) > 0 else float("nan")  # noqa: E731
@@ -1416,6 +1417,8 @@ def train(config, resume=False):
 	elapsed = lambda: elapsed_before + time.monotonic() - run_started
 	last_campaign = time.monotonic()  # (learner "turns": when the campaign's last update ended)
 	signal_probe = SignalShare() if config.signal_share else None  # (the honest signal reading: optim.SignalShare)
+	if signal_probe is not None and resume and state.get("signal_share"):  # (its S as the last checkpoint left it)
+		signal_probe.load_state_dict(state["signal_share"])
 	replay = aux_phase = None  # (config.aux_value: the value's own phase, aux_value.py)
 	aux_readings = {}
 	if config.aux_value and pool is not None:
@@ -1430,7 +1433,11 @@ def train(config, resume=False):
 
 	def checkpoint_extras():
 		"""What a checkpoint keeps beside the model and the optimizer: the clips' calibration, the value phase's Adam."""
-		return {"grad_clips": grad_clips, "clip_samples": clip_samples, **({"aux_optimizer": aux_phase.state_dict()} if aux_phase is not None else {})}
+		return {
+			"grad_clips": grad_clips, "clip_samples": clip_samples,
+			**({"aux_optimizer": aux_phase.state_dict()} if aux_phase is not None else {}),
+			**({"signal_share": signal_probe.state_dict()} if signal_probe is not None else {}),
+		}
 
 	for group in optimizer.param_groups:
 		group["betas"] = (group["betas"][0], config.adam_beta2)
@@ -1472,7 +1479,7 @@ def train(config, resume=False):
 			if pool:  # the workers prepared each battle's arrays (supply.prepare): joined, the advantages normalised over the update
 				from .supply import assemble
 
-				batch_all, summaries = assemble(items, advantage_config, device=device if device.type == "cuda" else None)  # (the sparse inputs dense on the GPU: supply.dense_on)
+				batch_all, summaries = assemble(items, advantage_config, device=device if device.type == "cuda" else None, length_scale=config.battle_length_scale)  # (the sparse inputs dense on the GPU: supply.dense_on)
 				if replay is not None and aux_phase is not None:
 					replay.add(items, pool.version)  # (a few decisions of each battle, for the value's own phase)
 				n_examples = int(batch_all["advantage"].shape[0]) if batch_all is not None else 0
@@ -1483,7 +1490,7 @@ def train(config, resume=False):
 				n_examples = len(examples)
 
 			weights_before = flat_weights(model)
-			parts_sum, batches = {key: torch.zeros((), device=device) for key in ("policy", "value", "entropy", "below_floor", "approx_kl", "clip_fraction", *(f"foresight_{k}" for k in FORESIGHT_PARTS))}, 0
+			parts_sum, batches = {key: torch.zeros((), device=device) for key in ("policy", "value", "entropy", "entropy_base", "below_floor", "approx_kl", "clip_fraction", *(f"foresight_{k}" for k in FORESIGHT_PARTS))}, 0
 			gradient_check = {}
 			trained = time.time()
 			model.train()
@@ -1565,7 +1572,7 @@ def train(config, resume=False):
 						if config.search_simulations > 0 and "search" in batch:
 							loss, parts = search_loss(out_batch, batch["search"], batch["value_labels"], ppo_config)
 						else:
-							loss, parts = ppo_loss(out_batch, batch["action"], batch["old_log_prob"], batch["advantage"], batch["value_labels"], ppo_config, batch.get("weight"))
+							loss, parts = ppo_loss(out_batch, batch["action"], batch["old_log_prob"], batch["advantage"], batch["value_labels"], ppo_config, batch.get("weight"), batch.get("weight_base"))
 						if "foresight" in batch and "foresight_unit" in out_batch:
 							foresight, foresight_parts = foresight_loss(out_batch, batch["foresight"], ppo_config, batch.get("weight"))
 							loss = loss + foresight
@@ -1657,7 +1664,8 @@ def train(config, resume=False):
 				"value_loss_fresh_weighted": round(fresh_value_weighted, 5),
 				"value_loss_fresh_real": round(fresh_by_source.get("real", float("nan")), 5),
 				"value_loss_fresh_generated": round(fresh_by_source.get("generated", float("nan")), 5),
-				"entropy": round(mean["entropy"], 4),
+				"entropy": round(mean["entropy_base"], 4),  # (with the base weights: battle_length_scale)
+				"entropy_weighted": round(mean["entropy"], 4),
 				"below_floor": round(mean["below_floor"], 4),
 				"approx_kl": round(mean["approx_kl"], 5),
 				"clip_fraction": round(mean["clip_fraction"], 4),
@@ -1681,7 +1689,7 @@ def train(config, resume=False):
 				**gradient_check,
 				**{key: (round(value, 6) if isinstance(value, float) else value) for key, value in aux_readings.items()},  # (the phase after the previous update)
 				**{key: round(value, 5) for key, value in signal_readings.items()},
-				**(dict(zip(("games_by_weight", "games_by_decisions"), (round(v, 2) for v in games_rested_on(items)))) if pool else {}),
+				**(dict(zip(("games_by_weight", "games_by_decisions"), (round(v, 2) for v in games_rested_on(items, config.battle_length_scale)))) if pool else {}),
 			}
 			aux_readings = {}
 			for side, name in ((0, "attack"), (1, "defence")):

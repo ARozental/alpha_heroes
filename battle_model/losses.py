@@ -281,7 +281,7 @@ def normalize_advantages(advantages, groups, battles, config=AdvantageConfig()):
 	return out
 
 
-def ppo_loss(out, action, old_log_prob, advantage, value_labels, config=PPOConfig(), weight=None):
+def ppo_loss(out, action, old_log_prob, advantage, value_labels, config=PPOConfig(), weight=None, weight_base=None):
 	"""Steps 4-7 for a batch of decisions. out: model outputs for the batch inputs. weight: [B] how much each decision
 	counts (data.example_weight: a battle that hardly matters counts little), or None for all alike.
 
@@ -297,13 +297,17 @@ def ppo_loss(out, action, old_log_prob, advantage, value_labels, config=PPOConfi
 	clipped = ratio.clamp(1 - config.clip_range, 1 + config.clip_range)
 	policy = -weighted_mean(torch.min(ratio * advantage, clipped * advantage), weight)
 	value, per_head = value_loss(out, value_labels, config, weight)
-	entropy_loss, bonus, below = entropy_term(out, config, weight)
+	h = entropy(out)
+	entropy_loss, bonus, below = entropy_term(out, config, weight, h=h)
 	total = policy + config.value_weight * value + entropy_loss
 	return total, {
 		"policy": policy.detach(),
 		"value": value.detach(),
 		"value_per_head": per_head,
 		"entropy": bonus.detach(),
+		# (with the weights before TrainConfig.battle_length_scale: the entropy series keeps its meaning; weight_base None:
+		# the weights are those)
+		"entropy_base": weighted_mean(h.detach(), weight_base) if weight_base is not None else bonus.detach(),
 		"below_floor": below,
 		"ratio": ratio.mean().detach(),
 		"approx_kl": (old_log_prob - new_log_prob).mean().detach(),
@@ -331,10 +335,11 @@ def foresight_loss(out, labels, config=PPOConfig(), weight=None):
 	return config.foresight_weight * parts.sum(), {name: parts[i].detach() for i, name in enumerate(FORESIGHT_PARTS)}
 
 
-def entropy_term(out, config=PPOConfig(), weight=None):
+def entropy_term(out, config=PPOConfig(), weight=None, h=None):
 	"""Step 7: (the loss term, the mean entropy, the share of decisions below the floor). The floor pushes up only
-	decisions sharper than config.entropy_floor; the constant bonus (entropy_weight) pushes every decision."""
-	h = entropy(out)
+	decisions sharper than config.entropy_floor; the constant bonus (entropy_weight) pushes every decision. h: the
+	decisions' entropies when the caller has them (entropy(out))."""
+	h = entropy(out) if h is None else h
 	bonus = weighted_mean(h, weight)
 	term = -config.entropy_weight * bonus
 	if config.entropy_floor_weight:
@@ -370,6 +375,7 @@ def search_loss(out, search, value_labels, config=PPOConfig()):
 		"value": value.detach(),
 		"value_per_head": per_head,
 		"entropy": bonus.detach(),
+		"entropy_base": bonus.detach(),  # (no weights here: the same)
 		"below_floor": below,
 		"ratio": torch.ones((), device=probs.device),
 		"approx_kl": (((cross - own) * searched).sum() / count).detach(),

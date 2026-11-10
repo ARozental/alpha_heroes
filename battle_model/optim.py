@@ -135,7 +135,16 @@ class SignalShare:
 	a restart (not kept in the checkpoints)."""
 
 	def __init__(self, decay=0.98):
-		self.decay, self.mean, self.count, self.on = decay, {}, {}, True
+		self.decay, self.mean, self.count, self.on, self.loaded = decay, {}, {}, True, set()
+
+	def state_dict(self):
+		return {"decay": self.decay, "mean": dict(self.mean), "count": dict(self.count)}
+
+	def load_state_dict(self, state):
+		"""A checkpoint's S and counts (a deploy does not blind the reading for ~25 updates); a group whose S does not fit
+		the model starts cold, said once at its first reading."""
+		self.mean, self.count = dict(state.get("mean", {})), dict(state.get("count", {}))
+		self.loaded = set(self.mean)
 
 	def read(self, optimizer):
 		if not self.on:
@@ -143,11 +152,12 @@ class SignalShare:
 		try:
 			readings, gradients = {}, {}
 			for group in optimizer.param_groups:
-				params = [p for p in group["params"] if p.grad is not None]
-				if not params:
+				params = list(group["params"])
+				if not params or all(p.grad is None for p in params):
 					continue
 				name = group.get("name", "all")
-				g = torch.cat([p.grad.detach().float().flatten() for p in params])
+				# (a parameter with no gradient counts as zeros: the group's vector keeps its shape, S its meaning)
+				g = torch.cat([(p.grad.detach().float() if p.grad is not None else torch.zeros_like(p, dtype=torch.float32)).flatten() for p in params])
 				scale = []
 				for p in params:
 					state = optimizer.state.get(p, {})
@@ -165,8 +175,13 @@ class SignalShare:
 					if scale is not None:
 						ga, sa = g / scale, s / scale
 						readings[f"signal_share_applied_{name}"] = float((ga @ sa) / (ga @ ga).clamp(min=1e-30))
+				if mean is not None and mean.shape != g.shape and name in self.loaded:
+					print(f"signal_share: the checkpoint's S of {name} does not fit the model ({tuple(mean.shape)} against {tuple(g.shape)}): it starts cold", flush=True)
+				self.loaded.discard(name)
 				if mean is None or mean.shape != g.shape:
 					mean, count = torch.zeros_like(g), 0
+				else:
+					mean = mean.to(g.device)
 				self.mean[name] = self.decay * mean + (1 - self.decay) * g
 				self.count[name] = count + 1
 			return readings
