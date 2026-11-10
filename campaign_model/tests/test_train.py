@@ -542,3 +542,41 @@ def test_the_share_weight_ramps_by_the_day_slower_on_bigger_maps():
 	torch.testing.assert_close(share_weight(day, torch.full((4,), 72.0), config), torch.tensor([0.1, 0.25, 0.55, 1.0]))
 	unscaled = CampaignConfig(share_weight_start=0.1, share_weight_per_day=0.03, share_weight_side=0.0)
 	torch.testing.assert_close(share_weight(day, torch.full((4,), 144.0), unscaled), torch.tensor([0.1, 0.4, 1.0, 1.0]))
+
+
+def test_the_step_credit_is_a_terms_step_to_the_next_turn_decision_that_day():
+	"""train.step_credit (config.step_credit): (1 - s) x (the forecast at the player's next turn decision that day - the
+	forecast here) + s x the term, s = 1 - 0.75 x trust; the step alone where the term is unknown, the term alone where
+	the next turn decision is another day's (or none), nan where neither is known."""
+	from campaign_model.train import step_credit
+
+	term = torch.tensor([0.10, -0.20, 0.30, float("nan"), float("nan"), 0.05])
+	forecast = torch.tensor([1.00, 1.50, 1.20, 2.00, 2.40, 0.70])
+	step = torch.tensor([1, 2, 3, 4, -1, -1])  # (row 2's next is on day 2; row 4's, row 5's: none)
+	day = torch.tensor([1.0, 1.0, 1.0, 2.0, 2.0, 2.0])
+	got = step_credit(term, forecast, step, day, trust=0.4)
+	s = 1 - 0.75 * 0.4
+	expected = torch.tensor([(1 - s) * 0.5 + s * 0.10, (1 - s) * -0.3 + s * -0.20, 0.30, 0.40, float("nan"), 0.05])
+	assert torch.allclose(got[[0, 1, 2, 3, 5]], expected[[0, 1, 2, 3, 5]]) and torch.isnan(got[4])
+	assert torch.allclose(step_credit(term, forecast, step, day, trust=0.0)[:2], term[:2])  # (an untrusted head: the term alone)
+	assert torch.allclose(step_credit(term, forecast, step, day, trust=1.0)[:2], 0.75 * torch.tensor([0.5, -0.3]) + 0.25 * term[:2])
+
+
+def test_an_update_with_the_step_credit_runs_and_reports_both_trusts():
+	"""config.step_credit with the schedule credit and the end's step indices: the update runs, its stats carry both
+	terms' trusts; without end (no steps) it is the schedule credit as before."""
+	from campaign_model.model import build_model
+
+	torch.manual_seed(3)
+	model = build_model({"dim": 32, "cell_dim": 16, "heads": 4, "layers": 1, "architecture": "v2", "share_target": "change"})
+	x = random_inputs(8, seed=11)
+	decisions = decisions_for(model.eval(), x)
+	targets = np.full((8, c.N_VALUE_OFFSETS), 0.55, dtype=np.float32)
+	growth_real = np.full((8, c.N_VALUE_OFFSETS), 10.0, dtype=np.float32)
+	growth_real[6:] = np.nan  # (the last two: no 7-day outcome, their step alone)
+	end = {"targets": np.full(8, 0.5, np.float32), "real": np.full(8, 0.5, np.float32), "step": np.array([1, 2, 3, 4, 5, 6, 7, -1]), "week": np.full(8, -1), "price": np.zeros(8, np.float32), "outcome": 0.5, "weight": 0.0}
+	config = CampaignConfig(batch_size=4, passes=1, credit="schedule", share_target="change", step_credit=True)
+	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
+	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, np.zeros(8, dtype=np.float32), config, decode=decode, growth_real=growth_real, end=end, share_trust=0.4, growth_trust=1.0)
+	assert metrics["schedule_share_trust"] == pytest.approx(0.4) and metrics["schedule_growth_trust"] == pytest.approx(1.0)
+	assert metrics["steps"] >= 1 and np.isfinite(metrics["kl"])

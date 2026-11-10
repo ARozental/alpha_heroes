@@ -849,6 +849,21 @@ def share_baseline(real_change, predicted, trust):
 	return trust * predicted + (1.0 - trust) * mean
 
 
+def step_credit(term, forecast, step, day, trust):
+	"""A schedule credit term [N] with its forecast's step (config.step_credit; the 2026-11-09 audit): (1 - s) x (the
+	forecast [N] at the player's next turn decision that day, step [N] its row, less the forecast here) + s x the term,
+	s = 1 - 0.75 x trust; the step alone where the term is unknown (its 7-day outcome), the term alone where the step is
+	(the day's last turn decision; a step to a later day carries the night's luck). The term is the outcome less the
+	forecast: (outcome - forecast at the next decision) + the step, so the step is in it already, at weight 1 among a
+	week of others' luck: 96.5% of the advantage's variance was shared by a player-day's decisions."""
+	s = 1.0 - 0.75 * float(min(1.0, max(0.0, trust)))
+	j = step.clamp(min=0)
+	same = (step >= 0) & (day[j] == day)
+	moved = torch.where(same, forecast[j] - forecast, torch.full_like(forecast, float("nan")))
+	both = torch.isfinite(term) & torch.isfinite(moved)
+	return torch.where(both, (1 - s) * moved + s * term, torch.where(torch.isfinite(moved), moved, term))
+
+
 def taught(advice, advised, config):
 	"""Which advised decisions the teacher's cross-entropy counts [N] (advice: [N, 3] type, index, cell): Nullkiller2's
 	TRADE advice only with config.nk2_trade_advice (False since 2026-11-04); schema 16's newly matched advice only with
@@ -873,6 +888,7 @@ def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
 	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None, teacher=None, teacher_weight=None,
 	share_trust=1.0, head_scale=None, teacher_sets=None, loss_weights=None, streams=None, clips=None, privileged=None,
+	growth_trust=1.0,
 ):
 	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
 	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
@@ -887,7 +903,8 @@ def ppo_update(
 	credit is computed here, from V_end of the model as the update starts (the KL anchor's pass), and blended with
 	advantages (labels.blend_credit) before they are normalized. decode(rows) gives the inputs of those decisions
 	(default: decode_inputs). share_trust 0..1: how far the schedule credit's share term takes the V7 change head as its
-	baseline (share_baseline; the learner's trust). streams: (stream [N], position [N]) of each decision, its game and
+	baseline (share_baseline; the learner's trust); with config.step_credit, it and growth_trust (G7's, the learner's
+	grade_trust) set how far each term is its step (step_credit). streams: (stream [N], position [N]) of each decision, its game and
 	player and its place among the player's records, for config.memory_steps (sequence_order; None: each decision
 	alone). clips: the groups' gradient clips (clip_gradients; None: the one clip at grad_clip). privileged: each
 	decision's rivals for the privileged critic (config.privileged_critic; learner.privileged_rivals: "rivals" [N, R]
@@ -1118,13 +1135,18 @@ def ppo_update(
 		real7 = torch.from_numpy(np.asarray(growth_real, dtype=np.float32)[:, -1]).to(device)
 		grow = (real7 - log_phi).clamp(-GROWTH_CAP, GROWTH_CAP) - (torch.sigmoid(growth_now) * 2 * GROWTH_CAP - GROWTH_CAP)
 		real_change = torch.from_numpy(np.asarray(targets, dtype=np.float32)[:, -1]).to(device) * 2 * SHARE_CHANGE_CAP - SHARE_CHANGE_CAP
-		change = real_change - share_baseline(real_change, torch.sigmoid(value_now) * 2 * SHARE_CHANGE_CAP - SHARE_CHANGE_CAP, share_trust)
+		predicted_change = torch.sigmoid(value_now) * 2 * SHARE_CHANGE_CAP - SHARE_CHANGE_CAP
+		change = real_change - share_baseline(real_change, predicted_change, share_trust)
 		day = torch.tensor([d.day for d in decisions], dtype=torch.float32, device=device)
+		if config.step_credit and end is not None:  # (each term partly its forecast's step to the next turn decision that day)
+			step = torch.from_numpy(np.asarray(end["step"], dtype=np.int64)).to(device)
+			grow = step_credit(grow, log_phi + torch.sigmoid(growth_now) * 2 * GROWTH_CAP - GROWTH_CAP, step, day, growth_trust)
+			change = step_credit(change, predicted_change, step, day, share_trust)
 		w = share_weight(day, side, config)
 		advantage = w * change + (1 - w) * grow  # (nan where a label is unknown: no credit)
 		known = torch.isfinite(advantage)
 		if int(known.sum()) > 1:
-			schedule_stats = {"schedule_share_weight": float(w[known].mean()), "schedule_share_std": float(change[known].std()), "schedule_growth_std": float(grow[known].std()), "schedule_share_trust": float(share_trust)}
+			schedule_stats = {"schedule_share_weight": float(w[known].mean()), "schedule_share_std": float(change[known].std()), "schedule_growth_std": float(grow[known].std()), "schedule_share_trust": float(share_trust), "schedule_growth_trust": float(growth_trust)}
 	if end is not None and end["weight"] > 0:  # the policy's credit moves toward the end's as V_end proves itself
 		turn = choices(decisions)["kind"] == c.DecisionKind.TURN
 		later = end_advantages(end_now.cpu().numpy(), end["step"], end["week"], end["real"], end["price"], turn, config.decision_price, end["outcome"])

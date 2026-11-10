@@ -193,6 +193,13 @@ class CampaignConfig:
 	# clearly better
 	privileged_critic: bool = True
 	privileged_credit: bool = False
+	# The schedule credit's step (the 2026-11-09 audit; off: Φ prices a recruit and an upgrade at a loss, -0.0021 and
+	# -0.0070 a step, which this credit would teach at once): each term (1 - s) x its forecast's step + s x the term as
+	# before, the step the forecast at the player's next turn decision that day less the forecast here (growth: log Φ +
+	# G7's; share: V7's change), s = 1 - 0.75 x the head's trust (G7's grade_trust, the share term's share_trust); the
+	# step alone where the 7-day outcome is unknown. Replayed on 8 joint7 games: the advantage's std 0.081 -> 0.038, its
+	# variance shared a player-day 98.1% -> 85%, credited rows 82% -> 99% (train.step_credit)
+	step_credit: bool = False
 	# The teacher's KL (AlphaStar's KL to its supervised policy, 2026-10-31: 1,020 -> 1,400 Elo in its ablation): each
 	# decision's KL(teacher || model) over the action type and each type's table (train.teacher_kl), at this weight in
 	# the loss, the teacher a frozen imitation of Nullkiller2 (imitate.py's bc_latest.pt: teacher_checkpoint). It keeps
