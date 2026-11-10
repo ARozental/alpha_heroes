@@ -1224,13 +1224,13 @@ def teacher_share_for(score):
 
 
 def set_agreement(decisions, types, indices, valid):
-	"""How many of the decisions with an advice chose one of the teacher's entries: the advice's own or one of its set."""
+	"""How many of the decisions with an advice chose one of the teacher's entries: the advice's own (agrees: an end only
+	its type, ours -1 and the advice's 0, which an entry's comparison never matched, 2026-11-10) or one of its set."""
 	count = 0
 	for i, d in enumerate(decisions):
 		if d.advice is None:
 			continue
-		ours = (d.action_type, d.index)
-		count += ours == tuple(d.advice[:2]) or any(valid[i] & (types[i] == d.action_type) & (indices[i] == d.index))
+		count += agrees(d) or any(valid[i] & (types[i] == d.action_type) & (indices[i] == d.index))
 	return count
 
 

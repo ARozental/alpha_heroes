@@ -171,11 +171,14 @@ def test_without_the_shares_the_teacher_is_at_its_weight_and_nothing_moves():
 
 
 def test_set_agreement_counts_the_advice_or_any_entry_of_its_set():
+	"""The advice's own entry or one of its set; an end by its type alone (ours has index -1, the advice's end 0)."""
 	decisions = [turn(A.MOVE, 11, advice=(int(A.MOVE), 10, -1)), turn(A.MOVE, 10, advice=(int(A.MOVE), 10, -1)), turn(A.BUILD, 3, advice=(int(A.MOVE), 10, -1)), turn(A.END, -1)]
 	types = np.array([[A.MOVE], [A.MOVE], [A.MOVE], [A.MOVE]])
 	indices = np.array([[11], [12], [12], [12]])
 	valid = np.array([[True], [True], [True], [False]])
 	assert set_agreement(decisions, types, indices, valid) == 2
+	ended = [turn(A.END, -1, advice=(int(A.END), 0, -1)), turn(A.END, -1, advice=(int(A.MOVE), 10, -1))]
+	assert set_agreement(ended, np.array([[A.MOVE], [A.MOVE]]), np.array([[12], [12]]), np.array([[False], [False]])) == 1
 
 
 def test_an_update_with_the_teachers_sets_and_the_loss_shares_runs():
