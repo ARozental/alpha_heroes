@@ -46,7 +46,7 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from . import forkserver, generator, play, remote
 from .constants import MAX_UNITS, N_HEXES, N_VALUE_HORIZONS, ActionType
-from .data import SPARSE_INPUTS, Sparse, battle_examples, check_record, collate, compact_record, version_of
+from .data import SPARSE_INPUTS, Sparse, battle_examples, check_record, collate, compact_record, length_weight, version_of
 
 KEPT_RUNS = deque(maxlen=9)  # (the VCMI logs of clean games with actions that changed nothing: the newest 8 a process)
 from .losses import normalize_advantages
@@ -193,6 +193,12 @@ def prepare(record, source, key, config, keep_record=False):
 	}
 	if chosen:
 		batch = collate(chosen, widen=False)
+		# (TrainConfig.battle_length_scale: the battle counts as at most ~that many decisions; "weight_base" keeps the weight
+		# without it, for the fresh value loss's series: train.py)
+		batch["weight_base"] = batch["weight"].clone()
+		factor = length_weight(len(chosen), getattr(config, "battle_length_scale", 0.0))
+		if factor != 1.0:
+			batch["weight"] = batch["weight"] * factor
 		if "foresight" not in batch:  # (a battle of one decision: no next one; the same keys as the others')
 			n = len(chosen)
 			batch["foresight"] = {"dies": torch.zeros(n, MAX_UNITS), "lost": torch.zeros(n, MAX_UNITS), "dealt": torch.zeros(n, MAX_UNITS), "unit_mask": torch.zeros(n, MAX_UNITS), "hex_enemy": torch.zeros(n, N_HEXES), "valid": torch.zeros(n)}
@@ -250,6 +256,8 @@ def assemble(items, advantage_config, device=None):
 	parts = [item["data"] for item in items if item["data"]]
 	if not parts:
 		return None, [item["summary"] for item in items]
+	if any("weight_base" in part for part in parts):  # (items prepared before battle_length_scale: their weight is their base)
+		parts = [part if "weight_base" in part else {**part, "weight_base": part["weight"]} for part in parts]
 
 	def join(values):
 		if isinstance(values[0], dict):

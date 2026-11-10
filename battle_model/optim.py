@@ -122,3 +122,55 @@ def moments_by_name(optimizer, model, saved, saved_names):
 		param_groups.append({**{key: value for key, value in group.items() if key != "params"}, "params": ids})
 	optimizer.load_state_dict({"state": state, "param_groups": param_groups})
 	return fresh, [name for name in saved_names if name not in set(names.values())]
+
+
+class SignalShare:
+	"""The share of an update's gradient that other battles repeat (e5, 2026-11-10: signal_ratio and signal_fraction read
+	pure noise as signal at accumulate 24, an update's 4 steps being 4 passes over the same decisions: Adam's m held 4
+	copies of one gradient, |m|/sqrt(v) 0.31 for noise). At each update's first optimizer step, before any step on its
+	battles, each named group's clipped gradient g against S, a bias-corrected running mean (decay) of the earlier
+	updates' first-step gradients, updated after the reading: (g . S) / |g|^2, raw and with both divided by the
+	optimizer's sqrt(v-hat) (as Adam applies them). Its mean over ~25-50 updates is that share (expected ~0.005 as
+	applied, 2026-11-10). A diagnostic: an error turns it off with one line, never an update's end; S starts again at
+	a restart (not kept in the checkpoints)."""
+
+	def __init__(self, decay=0.98):
+		self.decay, self.mean, self.count, self.on = decay, {}, {}, True
+
+	def read(self, optimizer):
+		if not self.on:
+			return {}
+		try:
+			readings, gradients = {}, {}
+			for group in optimizer.param_groups:
+				params = [p for p in group["params"] if p.grad is not None]
+				if not params:
+					continue
+				name = group.get("name", "all")
+				g = torch.cat([p.grad.detach().float().flatten() for p in params])
+				scale = []
+				for p in params:
+					state = optimizer.state.get(p, {})
+					if "exp_avg_sq" not in state or "step" not in state:
+						scale = None
+						break
+					step = float(state["step"])
+					scale.append((state["exp_avg_sq"].float().flatten() / (1 - group["betas"][1] ** step)).sqrt() + group.get("eps", 1e-8))
+				gradients[name] = (g, torch.cat(scale) if scale else None)
+			for name, (g, scale) in gradients.items():
+				mean, count = self.mean.get(name), self.count.get(name, 0)
+				if mean is not None and count and mean.shape == g.shape:
+					s = mean / (1 - self.decay**count)
+					readings[f"signal_share_{name}"] = float((g @ s) / (g @ g).clamp(min=1e-30))
+					if scale is not None:
+						ga, sa = g / scale, s / scale
+						readings[f"signal_share_applied_{name}"] = float((ga @ sa) / (ga @ ga).clamp(min=1e-30))
+				if mean is None or mean.shape != g.shape:
+					mean, count = torch.zeros_like(g), 0
+				self.mean[name] = self.decay * mean + (1 - self.decay) * g
+				self.count[name] = count + 1
+			return readings
+		except Exception as error:  # noqa: BLE001
+			print(f"signal_share: FAILURE ({type(error).__name__}: {str(error)[:200]}): the reading turned off for the run", flush=True)
+			self.on = False
+			return {}
