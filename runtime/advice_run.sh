@@ -101,6 +101,11 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # advice opened, the multi-actions are inside its label's span, so the delivery its plan asked for (the TAKE_BEST it
 # accepts) is taught against the other multi-actions there; ~5% of the taught exchange rows, teacher ce +0.03 measured
 # (1.668 -> 1.697). An exchange our model walked into on its own keeps the old span
+# campaign.nk2_gather_weight=0.1 (2026-11-10, e5; after the span held over three evals: 0.511, 0.491, 0.489 against
+# 0.405-0.469 before): Nullkiller2's visit again of the town its hero stands in is our GATHER's label, at a tenth of a
+# label's weight in the teacher's cross-entropy, and the games ask its advice for it (ALPHA_MAP_GATHER_ADVICE). Our
+# model gives the label ~0 (the 2026-11-05 collapse's rule: a small weight of its own); teacher ce +0.06 expected.
+# Watch: emptied towns, eliminations, the type drift
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -109,5 +114,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.nk2_gather_weight=0.1 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
