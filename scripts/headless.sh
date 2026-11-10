@@ -108,6 +108,27 @@ while kill -0 "$PID" 2>/dev/null; do
 					echo "$(basename "$TASK") $(cat "$TASK/comm" 2>/dev/null) state $(sed 's/.*) //' "$TASK/stat" 2>/dev/null | cut -d' ' -f1) wchan $(cat "$TASK/wchan" 2>/dev/null)"
 				done
 				ls -l /proc/"$P"/fd 2>/dev/null
+				# Each socket's two ends (ss: the bytes unread on either side, the process that holds the other end), then
+				# that process's threads counted by state and kernel wait. A battle AI waited 60 s for a reply while the
+				# inference server showed no request waiting (2026-11-10 06:51, w4_g4_14; 16 such samples kept, most at a
+				# battle's start): bytes unread on the server's end mean it never read the request, bytes unread on the
+				# client's that the reply came and was not read, none on either that the request never came
+				if command -v ss > /dev/null; then
+					SOCKETS=$(ss -x -a -p -n 2>/dev/null)
+					PEERS=""
+					for INODE in $(ls -l /proc/"$P"/fd 2>/dev/null | sed -n 's/.*socket:\[\([0-9]*\)\].*/\1/p'); do
+						ENDS=$(echo "$SOCKETS" | grep -E "(^| )$INODE( |\$)" | tr -s ' ')
+						echo "$ENDS"
+						PEERS="$PEERS $(echo "$ENDS" | grep -o 'pid=[0-9]*' | cut -d= -f2 | tr '\n' ' ')"
+					done
+					for PEER in $(echo $PEERS | tr ' ' '\n' | sort -un); do
+						[ "$PEER" = "$P" ] && continue
+						echo "peer pid $PEER: $(tr '\0' ' ' < "/proc/$PEER/cmdline" 2>/dev/null | cut -c1-200)"
+						for TASK in /proc/"$PEER"/task/*; do
+							echo "$(sed 's/[0-9][0-9]*/N/' "$TASK/comm" 2>/dev/null) state $(sed 's/.*) //' "$TASK/stat" 2>/dev/null | cut -d' ' -f1) wchan $(cat "$TASK/wchan" 2>/dev/null)"
+						done | sort | uniq -c | sort -rn  # (a server's threads: its worker, the trainer's commands, a reader a connection)
+					done
+				fi
 				echo
 			done > "$RUN_DIR/stall_sample.txt" 2>&1
 		fi
