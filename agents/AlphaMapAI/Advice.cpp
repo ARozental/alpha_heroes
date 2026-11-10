@@ -178,6 +178,7 @@ struct AlphaMapAI::Advisor
 void AlphaMapAI::initAdvice()
 {
 	adviceProbability = std::stod(adviceEnvironment("ALPHA_MAP_NK2_ADVICE", "0"));
+	adviceFixes = adviceEnvironment("ALPHA_MAP_ADVICE_FIXES", "1") != "0";
 #ifdef ALPHA_MAP_NK2_ADVICE
 	if(adviceProbability <= 0)
 		return;
@@ -190,8 +191,17 @@ void AlphaMapAI::initAdvice()
 #ifdef NK2_KEEPS_PLAN
 	a->nk2->nullkiller->keepPlan = true; // (its plan, made before its turn's first request: advise's labels)
 #endif
+#ifdef NK2_ADVICE_FIXES
+	if(adviceFixes)
+	{
+		a->nk2->nullkiller->adviceFixes = true;
+		a->nk2->nullkiller->exchangeSettled = [this](const CGHeroInstance * one, const CGHeroInstance * two) { return exchangeSettled(one, two); };
+	}
+#else
+	adviceFixes = false;
+#endif
 	advisor = a;
-	logAi->info("AlphaMapAI %s: Nullkiller2's advice at a chance of %.3f a turn decision", playerID.toString(), adviceProbability);
+	logAi->info("AlphaMapAI %s: Nullkiller2's advice at a chance of %.3f a turn decision, meeting fixes %s", playerID.toString(), adviceProbability, adviceFixes ? "on" : "off");
 #else
 	if(adviceProbability > 0)
 		logAi->error("AlphaMapAI %s: ALPHA_MAP_NK2_ADVICE asked, but this build has no Nullkiller2: no advice", playerID.toString());
@@ -315,15 +325,32 @@ std::optional<Choice> AlphaMapAI::adviseExchange(const Decision & decision, Obje
 	// our legal move toward its army: the missing troops of its strongest creature still missing from the source, else
 	// troops it would not keep back to the source, else (its army is there) the end. (Its dismissal of small unwanted
 	// stacks and its artifacts are not ours.)
-	// Which hero: the higher level, else the stronger army, else Nullkiller2's own (the one met: its hero chains, a
-	// scout bringing troops to its main hero). Its own alone gave the army to whichever hero our model walked into,
-	// which it does with any two heroes: the army went back and forth between two heroes, 2026-11-01
+	// Which hero. With the meeting fixes (adviceFixes): the hero met when our move there was its advice (its own
+	// exchanges' rule, AIGateway::heroExchangeStarted: the hero it moves gives; its deliveries bring the army to the hero
+	// met), else the hero its plans gather armies into: its MAIN role (GatherArmyBehavior delivers to those alone), then
+	// its evaluateHero, the level, the army, else the hero met. Without them: the higher level, else the stronger army,
+	// else the hero met: the visitor in 39% of the meetings it advised, against the delivery it planned, which it then
+	// advised again (2026-11-09 audit). The hero met alone gave the army to whichever hero our model walked into, which it
+	// does with any two heroes: the army went back and forth between two heroes, 2026-11-01
 	const auto started = std::chrono::steady_clock::now();
 	const auto * destination = activeHero == first ? two : one;
-	if(one->level != two->level)
-		destination = one->level > two->level ? one : two;
-	else if(one->getArmyStrength() != two->getArmyStrength())
-		destination = one->getArmyStrength() > two->getArmyStrength() ? one : two;
+	if(!adviceFixes)
+	{
+		if(one->level != two->level)
+			destination = one->level > two->level ? one : two;
+		else if(one->getArmyStrength() != two->getArmyStrength())
+			destination = one->getArmyStrength() > two->getArmyStrength() ? one : two;
+	}
+	else if(!meetingAdvised || (activeHero != first && activeHero != second))
+	{
+		const auto & heroes = *advisor->nk2->nullkiller->heroManager;
+		const auto rank = [&heroes](const CGHeroInstance * hero)
+		{
+			return std::make_tuple(heroes.getHeroRoleOrDefaultInefficient(hero) == NK2AI::HeroRole::MAIN, heroes.evaluateHero(hero), hero->level, hero->getArmyStrength());
+		};
+		if(rank(one) != rank(two))
+			destination = rank(one) > rank(two) ? one : two;
+	}
 	const auto * source = destination == one ? two : one;
 	std::vector<NK2AI::SlotInfo> best;
 	if(source->stacksCount() > 0)
@@ -428,6 +455,44 @@ std::optional<Choice> AlphaMapAI::adviseExchange(const Decision & decision, Obje
 	return advice;
 #else
 	return std::nullopt;
+#endif
+}
+
+#ifdef ALPHA_MAP_NK2_ADVICE
+namespace
+{
+std::map<CreatureID, int> armyCounts(const CGHeroInstance & hero)
+{
+	std::map<CreatureID, int> counts;
+	for(const auto & [slot, stack] : hero.Slots())
+		counts[stack->getId()] += stack->getCount();
+	return counts;
+}
+}
+#endif
+
+void AlphaMapAI::settleExchange(ObjectInstanceID first, ObjectInstanceID second)
+{
+#ifdef ALPHA_MAP_NK2_ADVICE
+	const auto * one = cb->getHero(std::min(first, second));
+	const auto * two = cb->getHero(std::max(first, second));
+	if(!adviceFixes || !advisor || !one || !two) // (a garrison's dialog: no pair of heroes)
+		return;
+	std::unique_lock lock(settledMutex);
+	settled[{one->id, two->id}] = {armyCounts(*one), armyCounts(*two)};
+#endif
+}
+
+bool AlphaMapAI::exchangeSettled(const CGHeroInstance * one, const CGHeroInstance * two) const
+{
+#ifdef ALPHA_MAP_NK2_ADVICE
+	if(two->id < one->id)
+		std::swap(one, two);
+	std::shared_lock lock(settledMutex);
+	const auto found = settled.find({one->id, two->id});
+	return found != settled.end() && found->second.first == armyCounts(*one) && found->second.second == armyCounts(*two);
+#else
+	return false;
 #endif
 }
 

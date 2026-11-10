@@ -233,6 +233,16 @@ class AlphaMapAI : public CAdventureAI
 	int exchangeAdviceEnds = 0;
 	double adviceSeconds = 0;
 	std::map<std::string, int> adviceUnmatched;
+	// Its meeting fixes (the 2026-11-09 audit; ALPHA_MAP_ADVICE_FIXES, on unless "0"): its Nullkiller2's adviceFixes and
+	// exchangeSettled (Nullkiller.h). meetingAdvised: the turn decision being executed is its advice (an exchange that
+	// opens gives the hero met the army, as Nullkiller2's own do). settled: each pair's armies as their last exchange
+	// ended (the pair's lower id first), no exchange of theirs planned again while both armies are so
+	bool adviceFixes = false;
+	std::atomic<bool> meetingAdvised = false;
+	std::map<std::pair<ObjectInstanceID, ObjectInstanceID>, std::pair<std::map<CreatureID, int>, std::map<CreatureID, int>>> settled;
+	mutable std::shared_mutex settledMutex; // (read by its pathfinding's threads)
+	void settleExchange(ObjectInstanceID first, ObjectInstanceID second);
+	bool exchangeSettled(const CGHeroInstance * one, const CGHeroInstance * two) const;
 	void initAdvice();
 	bool adviceDrawn(); // this decision gets the advice (at adviceProbability)
 	// plan: Nullkiller2's plan there, its targets in our hero slots (with a Nullkiller2 that keeps it: NK2_KEEPS_PLAN)

@@ -245,6 +245,7 @@ void AlphaMapAI::makeTurn()
 		}
 		activeHero = ObjectInstanceID(); // the dialogs' context: no hero yet this turn (a question before our first
 		activeTarget = int3(-1, -1, -1); // move, a start-of-turn event, got yesterday's last hero: 2026-10-28 review)
+		meetingAdvised = false;
 		lastChoice = Choice();
 		lastChanged = -1;
 		if(dayCap > 0 && day > dayCap)
@@ -265,6 +266,7 @@ void AlphaMapAI::makeTurn()
 			const auto choice = decide(decision, advice, plan, accept);
 			if(choice.type <= static_cast<int>(ActionType::END))
 				break;
+			meetingAdvised = advice && choice.type == advice->type && choice.index == advice->index; // (adviseExchange)
 			const bool changed = execute(decision, choice);
 			if(!changed)
 			{
@@ -1137,6 +1139,7 @@ void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, Query
 			break;                                                  // its troops back, 567 of 870, 2026-11-05)
 	}
 	futile.clear();
+	settleExchange(first, second);
 	answer(queryID, 0);
 }
 
