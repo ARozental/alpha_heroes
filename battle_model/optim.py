@@ -134,15 +134,24 @@ class SignalShare:
 	applied, 2026-11-10). A diagnostic: an error turns it off with one line, never an update's end; S starts again at
 	a restart (not kept in the checkpoints)."""
 
-	def __init__(self, decay=0.98):
-		self.decay, self.mean, self.count, self.on, self.loaded = decay, {}, {}, True, set()
+	def __init__(self, decay=0.98, context=None):
+		"""context: what the gradient's meaning depends on (train.signal_context: the weighting, the credit, the losses'
+		weights); a checkpoint's S made under another context is not loaded (load_state_dict)."""
+		self.decay, self.mean, self.count, self.on, self.loaded, self.context = decay, {}, {}, True, set(), context or {}
 
 	def state_dict(self):
-		return {"decay": self.decay, "mean": dict(self.mean), "count": dict(self.count)}
+		return {"decay": self.decay, "mean": dict(self.mean), "count": dict(self.count), "context": dict(self.context)}
 
 	def load_state_dict(self, state):
-		"""A checkpoint's S and counts (a deploy does not blind the reading for ~25 updates); a group whose S does not fit
-		the model starts cold, said once at its first reading."""
+		"""A checkpoint's S and counts (a deploy does not blind the reading for ~25 updates). Made under another context
+		(e5, 2026-11-10: a new weighting's gradients set against the old one's average would muddy the before and after
+		for ~100 updates) it is not loaded: the reading starts cold, said once (cold is unbiased from its second update,
+		only noisier at first). A group whose S does not fit the model starts cold too, said at its first reading."""
+		saved = state.get("context", {})
+		if saved != self.context:
+			changed = ", ".join(f"{k} {saved.get(k, '-')} -> {self.context.get(k, '-')}" for k in sorted(set(saved) | set(self.context)) if saved.get(k) != self.context.get(k))
+			print(f"signal_share: the checkpoint's S was made under other settings ({changed[:400]}): it starts cold", flush=True)
+			return
 		self.mean, self.count = dict(state.get("mean", {})), dict(state.get("count", {}))
 		self.loaded = set(self.mean)
 

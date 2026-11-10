@@ -101,3 +101,36 @@ def test_the_signal_share_keeps_its_shape_and_state_and_never_raises():
 	assert other.count == probe.count and torch.equal(other.mean["trunk"], probe.mean["trunk"])
 	broken = SignalShare()
 	assert broken.read(SimpleNamespace(param_groups=[{"params": [SimpleNamespace(grad=object())]}], state={})) == {} and not broken.on
+
+
+def test_the_games_reading_never_ends_an_update(capsys):
+	"""e5's review: an item it cannot read (no "game") gives nan, nan and one FAILURE line; then it is off, silent."""
+	from battle_model.train import GamesRestedOn
+
+	reading = GamesRestedOn()
+	assert reading([item(4, "a"), item(4, "b")]) == (2.0, 2.0)
+	bad = {"data": {"weight": np.ones(3, np.float32)}, "decisions": 3}
+	assert all(np.isnan(v) for v in reading([bad]))
+	assert capsys.readouterr().out.count("games_rested_on: FAILURE") == 1 and not reading.on
+	assert all(np.isnan(v) for v in reading([item(4, "a")])) and capsys.readouterr().out == ""
+
+
+def test_a_signal_state_made_under_another_weighting_starts_cold(capsys):
+	"""e5's review: S from a checkpoint made under another context (the length weighting here) is not loaded, said once;
+	under the same context it is; a checkpoint without the key resumes cold without a word (train.py skips it)."""
+	from dataclasses import replace
+
+	from battle_model.losses import PPOConfig
+	from battle_model.train import TrainConfig, signal_context
+
+	before, after = signal_context(TrainConfig()), signal_context(TrainConfig(battle_length_scale=30.0))
+	assert before != after and before == signal_context(TrainConfig())  # (the same settings read the same: no cold start on a plain restart)
+	assert signal_context(TrainConfig(ppo=replace(PPOConfig(), value_weight=0.25))) != before  # (any loss field counts)
+	made = SignalShare(context=before)
+	made.mean, made.count = {"trunk": torch.ones(4)}, {"trunk": 7}
+	same = SignalShare(context=before)
+	same.load_state_dict(made.state_dict())
+	assert same.count == {"trunk": 7} and capsys.readouterr().out == ""
+	other = SignalShare(context=after)
+	other.load_state_dict(made.state_dict())
+	assert other.count == {} and other.mean == {} and capsys.readouterr().out.count("starts cold") == 1

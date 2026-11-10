@@ -503,6 +503,37 @@ BATTLE_VALUE_MODULES = ("values.", "value_strength.")
 BATTLE_PRIORS = ("actions.escape_rules", "actions.escape_ahead", "actions.escape_strong", "actions.spell_mastery", "actions.spell_value", "actions.creature_spell_value", "actions.value_gains", "actions.type_head.bias", "actions.type_rules.weight", "actions.type_strength.weight", "actions.spell_head.bias")
 
 
+SIGNAL_CONTEXT = ("battle_length_scale", "game_share", "examples_per_battle", "real_share", "fixed_mix", "league", "league_ais", "opponent", "grad_clip", "grad_clip_by_group", "grad_clip_groups", "grad_clip_since")
+
+
+def signal_context(config):
+	"""What the battle gradient's meaning depends on, for optim.SignalShare's state: the weighting and the battles' mix
+	(SIGNAL_CONTEXT), the clip (the reading is of the clipped gradient) and every field of the reward, the credit and the
+	losses (a field added later joins by itself); a deploy that changes one starts the reading cold."""
+	context = {name: repr(getattr(config, name)) for name in SIGNAL_CONTEXT}
+	for part in ("reward", "advantage", "ppo"):
+		context.update({f"{part}.{f.name}": repr(getattr(getattr(config, part), f.name)) for f in fields(getattr(config, part))})
+	return context
+
+
+class GamesRestedOn:
+	"""games_rested_on as a diagnostic (e5's review, 2026-11-10): an error gives (nan, nan), one "games_rested_on:
+	FAILURE" line, and the reading off for the run; never an update's end."""
+
+	def __init__(self):
+		self.on = True
+
+	def __call__(self, items, length_scale=0.0):
+		if not self.on:
+			return float("nan"), float("nan")
+		try:
+			return games_rested_on(items, length_scale)
+		except Exception as error:  # noqa: BLE001
+			print(f"games_rested_on: FAILURE ({type(error).__name__}: {str(error)[:200]}): the reading off for the run", flush=True)
+			self.on = False
+			return float("nan"), float("nan")
+
+
 def games_rested_on(items, length_scale=0.0):
 	"""(by weight, by decisions): (sum of W_g)^2 / sum of W_g^2 over an update's games, W_g a game's decisions' summed
 	weight as the update weighs them (data's "weight" x length_weight, as supply.assemble) or their count: how many games
@@ -1416,7 +1447,8 @@ def train(config, resume=False):
 		last_eval -= time.time() - (out / "eval_total.csv").stat().st_mtime
 	elapsed = lambda: elapsed_before + time.monotonic() - run_started
 	last_campaign = time.monotonic()  # (learner "turns": when the campaign's last update ended)
-	signal_probe = SignalShare() if config.signal_share else None  # (the honest signal reading: optim.SignalShare)
+	signal_probe = SignalShare(context=signal_context(config)) if config.signal_share else None  # (the honest signal reading: optim.SignalShare)
+	games_reading = GamesRestedOn()
 	if signal_probe is not None and resume and state.get("signal_share"):  # (its S as the last checkpoint left it)
 		signal_probe.load_state_dict(state["signal_share"])
 	replay = aux_phase = None  # (config.aux_value: the value's own phase, aux_value.py)
@@ -1689,7 +1721,7 @@ def train(config, resume=False):
 				**gradient_check,
 				**{key: (round(value, 6) if isinstance(value, float) else value) for key, value in aux_readings.items()},  # (the phase after the previous update)
 				**{key: round(value, 5) for key, value in signal_readings.items()},
-				**(dict(zip(("games_by_weight", "games_by_decisions"), (round(v, 2) for v in games_rested_on(items, config.battle_length_scale)))) if pool else {}),
+				**(dict(zip(("games_by_weight", "games_by_decisions"), (round(v, 2) for v in games_reading(items, config.battle_length_scale)))) if pool else {}),
 			}
 			aux_readings = {}
 			for side, name in ((0, "attack"), (1, "defence")):
