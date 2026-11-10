@@ -41,8 +41,8 @@ def test_outputs_are_the_models(served):
 
 
 def test_a_request_that_waits_long_is_said_and_a_command_that_fails_does_not_end_the_worker(capfd, monkeypatch):
-	"""A request for a model never set waits MODEL_WAIT (5 s) for it in the worker: with SLOW at 1 s the server says in
-	the log that it waits and what the worker is at; the reply (an error) still comes. Weights that do not fit the model
+	"""A request for a model never set waits MODEL_WAIT (5 s) for it, parked: with SLOW at 1 s the server says in the
+	log that it waits and what the worker is at; the reply (an error) still comes. Weights that do not fit the model
 	(a command of the trainer's that raises): said in the log, the model's own weights kept, the requests after it
 	answered."""
 	monkeypatch.setenv("ALPHA_INFERENCE_SLOW_SECONDS", "1")
@@ -64,8 +64,42 @@ def test_a_request_that_waits_long_is_said_and_a_command_that_fails_does_not_end
 	finally:
 		server.close()
 	said = capfd.readouterr().out
-	assert "a request for battle/v1 (2 decisions) has waited" in said and "the worker: battle/v1, 1 of 1 requests" in said, said
+	assert "a request for battle/v1 (2 decisions) has waited" in said and "the worker: idle, 1 requests parked for a model not set" in said, said
 	assert "a command of the trainer's failed" in said, said
+
+
+def test_a_request_for_a_model_not_set_holds_no_other_back_and_is_answered_when_its_weights_come(served):
+	"""A request for a model the trainer has not set is parked up to MODEL_WAIT (5 s). Meanwhile another client's
+	requests for a served model are answered at once (until 2026-11-10 they waited behind it, the worker itself
+	waiting); the parked one gets its reply as soon as its model is set, and an error if it never is."""
+	import threading
+
+	server, model = served
+	x = random_inputs(batch=2, seed=5)
+	results = {}
+
+	def ask(name):
+		started = time.monotonic()
+		try:
+			results[name] = (InferenceClient(server.socket_path).run(name, x)[0], time.monotonic() - started)
+		except RuntimeError as error:
+			results[name] = (str(error), time.monotonic() - started)
+
+	waiting = [threading.Thread(target=ask, args=(name,)) for name in ("later", "never")]
+	for thread in waiting:
+		thread.start()
+	time.sleep(0.3)  # (both parked by now)
+	client = InferenceClient(server.socket_path)
+	started = time.monotonic()
+	for _ in range(5):
+		assert client.run("current", x)[0] == server.serving()["current"][0]
+	assert time.monotonic() - started < 2.0, time.monotonic() - started
+	server.set_model("later", 11, model)
+	for thread in waiting:
+		thread.join(timeout=20)
+	assert results["later"][0] == 11 and results["later"][1] < 3.0, results
+	assert "no model named 'never'" in results["never"][0] and 4.5 < results["never"][1] < 8.0, results
+	server.drop("later")
 
 
 GPU = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else None

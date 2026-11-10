@@ -35,7 +35,14 @@ MAX_BATCH = 256  # decisions per forward pass
 # ~35 ms of launches at any batch up to 64 under WSL (the campaign model's; 0.6 ms a decision at 64, 34 ms at one,
 # measured 2026-10-30 on the PC), and the games send one decision at a time
 GRAPH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128)
-MODEL_WAIT = 5.0  # seconds a request for a model not served yet waits for its weights (apply_control)
+# Seconds a request for a model not served yet waits for its weights: set_model returns once the pipe has taken them,
+# before the server has unpickled them, and a request sent right after it found no model (every time on Linux). Such a
+# request is parked (the worker goes on with the others, looking again every PARK_POLL seconds) and answered when the
+# weights come, or with an error after MODEL_WAIT. Until 2026-11-10 the worker itself waited, MODEL_WAIT a request,
+# and every other request of its process waited behind it (at a start: the games' version probes before the
+# campaign's weights were set, on 11 of 12 processes at once)
+MODEL_WAIT = 5.0
+PARK_POLL = 0.02
 # Seconds a batch waits for more requests after its first (0: none): fewer, larger forwards. Beside a trainer on a
 # Windows GPU (WSL) every submission to the GPU is a context switch away from the trainer's (2026-10-30: a server
 # answering one-decision requests as they came cost the trainer 54% of its step rate)
@@ -187,17 +194,11 @@ def _serve(socket_path, device_name, family_names, model_kwargs, control, thread
 		finally:
 			conn.close()
 
-	def apply_control(wait_for=None):
-		"""Applies the trainer's queued commands. wait_for: a (family, name) not served yet, waited for up to MODEL_WAIT
-		seconds: set_model returns once the pipe has taken the weights, before control_reader has unpickled them, and a
-		request sent right after it found no model (every time on Linux)."""
-		deadline = time.monotonic() + MODEL_WAIT
+	def apply_control():
+		"""Applies the trainer's queued commands."""
 		while True:
 			try:
-				if wait_for is None or wait_for in models:
-					command = commands.get_nowait()
-				else:
-					command = commands.get(timeout=max(0.0, deadline - time.monotonic()))
+				command = commands.get_nowait()
 			except queue.Empty:
 				return
 			if command[0] == "set":
@@ -302,11 +303,16 @@ def _serve(socket_path, device_name, family_names, model_kwargs, control, thread
 		return replies
 
 	def worker():
+		parked = []  # (deadline, request): those for a model not served yet (MODEL_WAIT); they hold no other back
 		while True:
-			doing[:] = ["idle", time.monotonic()]
-			pending = [requests.get()]
+			doing[:] = [f"idle, {len(parked)} requests parked for a model not set" if parked else "idle", time.monotonic()]
+			pending = []
+			try:
+				pending.append(requests.get(timeout=PARK_POLL) if parked else requests.get())
+			except queue.Empty:
+				pass
 			deadline = time.monotonic() + BATCH_WAIT
-			while len(pending) < MAX_BATCH:
+			while pending and len(pending) < MAX_BATCH:
 				try:
 					pending.append(requests.get(timeout=max(0.0, deadline - time.monotonic())) if BATCH_WAIT else requests.get_nowait())
 				except queue.Empty:
@@ -318,16 +324,27 @@ def _serve(socket_path, device_name, family_names, model_kwargs, control, thread
 				# (never the worker's end: every request after it would wait for ever. The commands left are applied
 				# before the next batch)
 				say(f"a command of the trainer's failed: {type(error).__name__}: {str(error)[:300]}")
+			now = time.monotonic()
+			waiting, parked = parked, []
+			for until, item in waiting:  # the parked: into this batch once their model is served, an error at their deadline
+				key = (item[0], item[1])
+				if key in models:
+					pending.append(item)
+				elif now >= until:
+					item[4][0] = struct.pack("<I", ERROR) + f"no model named {key[1]!r} of family {key[0]} (the server has {sorted(models)})".encode()
+					item[4][1].set()
+				else:
+					parked.append((until, item))
 			by_key = {}
 			for item in pending:
-				by_key.setdefault((item[0], item[1]), []).append(item[1:])
+				key = (item[0], item[1])
+				if key in models:
+					by_key.setdefault(key, []).append(item[1:])
+				else:
+					parked.append((now + MODEL_WAIT, item))
 			for key, batch in by_key.items():
 				doing[:] = [f"{key[0]}/{key[1]}, {len(batch)} of {len(pending)} requests", time.monotonic()]
 				try:
-					if key not in models:
-						apply_control(wait_for=key)
-					if key not in models:
-						raise KeyError(f"no model named {key[1]!r} of family {key[0]} (the server has {sorted(models)})")
 					replies = [(box, struct.pack("<I", models[key][1])) for _, decisions, _, box in batch if decisions == 0]
 					work = [item for item in batch if item[1] > 0]
 					replies += run(key, work) if work else []
