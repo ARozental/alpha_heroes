@@ -71,7 +71,12 @@ def failure_counts(decisions, moves_limit=None):
 				pickups = safe_pickups(x, b)
 				counts[name][0] += bool(pickups.any() if name == "pickup_passed_end" else pickups[min(d.index // (L * TG * TG), HO - 1)])
 				counts[name][1] += 1
-	movement_counts(decisions, counts, moves_limit)
+	try:  # (a diagnostic: never the update's end, 2026-11-03)
+		movement_counts(decisions, counts, moves_limit)
+	except Exception as error:  # noqa: BLE001
+		print(f"failures: the meetings' counts failed: {error!r}", flush=True)
+		for name in ("own_hero_moves", "repeat_meetings", "meeting_movement", "town_movement"):
+			counts[name] = [0, 0]
 	for first, last, gives, takes in garrison_dialogs(decisions):
 		x = decode_fields([first, last], ("x_count",))
 		counts["troops_left"][0] += bool(x["x_count"][1].sum() > x["x_count"][0].sum())

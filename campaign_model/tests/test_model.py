@@ -647,3 +647,12 @@ def test_travel_discounts_an_area_by_the_pathfinders_days():
 		x["travel_days"][0, 0, 0, 0, 0] = days
 		priors.append(float(model.features(tensors(x), torch.zeros(0, dtype=torch.long)).travel_prior[0, 0, 0]))
 	assert priors[0] > priors[1]
+
+def test_the_meetings_counts_failing_leave_them_nan_and_the_rest():
+	"""A diagnostic never ends an update: the meetings' counts failing (here a decision whose inputs cannot be decoded)
+	leave their four shares nan, the other counts as they are."""
+	from campaign_model.failures import failure_modes
+
+	broken = Decision("RED", 1, int(c.DecisionKind.TURN), 0, 1, int(c.ActionType.MOVE), 5, -1, 0.0, (0.5,) * 3, 0, b"not zlib")
+	shares = failure_modes([broken])
+	assert all(math.isnan(shares[k]) for k in ("own_hero_moves", "repeat_meetings", "meeting_movement", "town_movement"))
