@@ -183,7 +183,9 @@ def _teacher_span(exchange_multi=False):
 	hero, town = {A.MOVE, A.TRAVEL, A.ARMY}, {A.BUILD, A.RECRUIT, A.HIRE, A.UPGRADE, A.TRADE, A.BUY}
 	span = torch.zeros(2, c.N_ACTION_TYPES, c.N_ACTION_TYPES, dtype=torch.bool)
 	for label in A:
-		family = hero | town if label == A.END or label in town else hero if label in hero or label == A.CAST else set()
+		# (a MULTI label is a town's doing before its visitor leaves: Nullkiller2's GATHER, config.nk2_gather_weight, the
+		# only one taught; alone with END, TRADE and MULTI the hero's leaving without the troops was not pushed down)
+		family = hero | town if label == A.END or label in town or label == A.MULTI else hero if label in hero or label == A.CAST else set()
 		span[0, label, sorted(family | {label, A.END, A.TRADE, A.MULTI})] = True  # (TRADE and MULTI pushed down at every turn label, as before)
 		span[1, label, sorted({A.ARMY, A.END, label} | ({A.MULTI} if exchange_multi else set()))] = True
 	return span
@@ -206,6 +208,8 @@ def _teacher_span(exchange_multi=False):
 # TAKE_BEST and GIVE_ALL stay outside (52% of exchanges took one, as long as before, no loops).
 # TRADE stays in every turn decision's: its labels are not taught (taught: Nullkiller2's trades), and the push at every
 # other label is part of what ended 135 trades a game (2026-11-04); left to the family it would be pushed at a town's only.
+# A turn's MULTI label (2026-11-09: Nullkiller2's GATHER, Advice.cpp visitAgain; none was taught before) against both
+# families as a town action's: our model left the town without the garrison's troops at 92% of those labels.
 # TEACHER_SPAN_MULTI (config.exchange_span_multi, 2026-11-09): MULTI in an exchange's as well, the TAKE_BEST its advice
 # accepts (into the hero that gets its army) the only one not pushed down
 TEACHER_SPAN = _teacher_span()
@@ -214,11 +218,15 @@ TEACHER_SPAN_MULTI = _teacher_span(exchange_multi=True)
 
 def teacher_span_logp(out, kind, label, accepted=None, accept_types=None, exchange_multi=False):
 	"""[N] the log-probability (now) of what each decision's teacher label is weighed against (TEACHER_SPAN; with
-	exchange_multi TEACHER_SPAN_MULTI), its accepted entries of other types included (accepted [N, K] entries_logp,
-	accept_types [N, K]); 0 (all of it) at a question."""
+	exchange_multi TEACHER_SPAN_MULTI: True, or [N] the rows it holds for), its accepted entries of other types
+	included (accepted [N, K] entries_logp, accept_types [N, K]); 0 (all of it) at a question."""
 	from battle_model.device import moved
 
-	span = moved(TEACHER_SPAN_MULTI if exchange_multi else TEACHER_SPAN, kind.device)[(kind == c.DecisionKind.EXCHANGE).long(), label.clamp(0, c.N_ACTION_TYPES - 1)]  # [N, types]
+	exchange, label_type = (kind == c.DecisionKind.EXCHANGE).long(), label.clamp(0, c.N_ACTION_TYPES - 1)
+	if torch.is_tensor(exchange_multi):  # (a row's own: config.exchange_span_advised, advised_exchanges)
+		span = torch.where(exchange_multi.bool().unsqueeze(1), moved(TEACHER_SPAN_MULTI, kind.device)[exchange, label_type], moved(TEACHER_SPAN, kind.device)[exchange, label_type])
+	else:
+		span = moved(TEACHER_SPAN_MULTI if exchange_multi else TEACHER_SPAN, kind.device)[exchange, label_type]  # [N, types]
 	parts = [torch.logsumexp(out["type_logp"].clamp(min=-1e4).masked_fill(~span, -1e4), dim=1, keepdim=True)]
 	if accepted is not None:
 		inside = span.gather(1, accept_types.clamp(0, c.N_ACTION_TYPES - 1))  # (counted with their type already)
@@ -799,7 +807,7 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 			advice_logp = torch.logsumexp(torch.cat([advised_own, accepted], dim=1), dim=1)
 			advised = advised * (advice_logp > -1e3).float()  # (a row none of whose entries is legal any more: none)
 		# among what it could have asked for there (TEACHER_SPAN), not among everything we can do
-		span_logp = teacher_span_logp(out, batch["kind"], batch["advice_action"], accepted, batch.get("accept_types"), config.exchange_span_multi)
+		span_logp = teacher_span_logp(out, batch["kind"], batch["advice_action"], accepted, batch.get("accept_types"), batch["exchange_multi"] if "exchange_multi" in batch else config.exchange_span_multi)
 		advice_logp = advice_logp - span_logp
 		advice_part = -(torch.where(advised > 0, advice_logp, torch.zeros_like(advice_logp)) * advised).sum() / batch["count_advised"]
 		outside_part = ((1.0 - span_logp.detach().exp()) * advised).sum() / batch["count_advised"]
@@ -849,29 +857,131 @@ def share_baseline(real_change, predicted, trust):
 	return trust * predicted + (1.0 - trust) * mean
 
 
-def step_credit(term, forecast, step, day, trust):
-	"""A schedule credit term [N] with its forecast's step (config.step_credit; the 2026-11-09 audit): (1 - s) x (the
-	forecast [N] at the player's next turn decision that day, step [N] its row, less the forecast here) + s x the term,
-	s = 1 - 0.75 x trust; the step alone where the term is unknown (its 7-day outcome), the term alone where the step is
-	(the day's last turn decision; a step to a later day carries the night's luck). The term is the outcome less the
-	forecast: (outcome - forecast at the next decision) + the step, so the step is in it already, at weight 1 among a
-	week of others' luck: 96.5% of the advantage's variance was shared by a player-day's decisions."""
-	s = 1.0 - 0.75 * float(min(1.0, max(0.0, trust)))
+STEP_CLASS_PRIOR = 50.0  # rows at 0 added to each class's mean rest (step_credit): a class of few rows is barely corrected
+
+
+def step_classes(kind, action):
+	"""[N] each decision's class for the step credit's correction (step_credit): its action type, an exchange's apart
+	from a turn's (a MULTI there is another thing); every question the class 0."""
+	return (action + 1).clamp(min=0) + (kind == c.DecisionKind.EXCHANGE).long() * (c.N_ACTION_TYPES + 1)
+
+
+def forecast_trust(real, forecast, full_ev):
+	"""0..1: how far a forecast [N] of the real outcome [N] is trusted for its step (step_credit's trust): its explained
+	variance on the rows where both are known, over full_ev (config.trust_full_ev). A fit, not a slope: the baseline's
+	coefficient (share_baseline's trust) says how to scale a forecast, not how good its steps are."""
+	known = torch.isfinite(real) & torch.isfinite(forecast)
+	if int(known.sum()) < 2:
+		return 0.0
+	spread = float(real[known].var())
+	if spread < 1e-12:
+		return 0.0
+	explained = 1.0 - float((real[known] - forecast[known]).pow(2).mean()) / spread
+	return float(min(1.0, max(0.0, explained / full_ev)))
+
+
+def forecast_steps(forecast, step, day):
+	"""[N] the forecast at the player's next turn decision that day (step [N]: its row, -1 none) less the forecast here;
+	nan where there is none that day."""
 	j = step.clamp(min=0)
 	same = (step >= 0) & (day[j] == day)
-	moved = torch.where(same, forecast[j] - forecast, torch.full_like(forecast, float("nan")))
-	both = torch.isfinite(term) & torch.isfinite(moved)
-	return torch.where(both, (1 - s) * moved + s * term, torch.where(torch.isfinite(moved), moved, term))
+	return torch.where(same, forecast[j] - forecast, torch.full_like(forecast, float("nan")))
+
+
+# The classes whose mean own step an update reports (schedule_stats' step_<name>: TensorBoard campaign_step/<name>): what
+# the step credit says of each action type before the week's outcome corrects it (step_credit)
+STEP_REPORT = (("move", 0, c.ActionType.MOVE), ("travel", 0, c.ActionType.TRAVEL), ("build", 0, c.ActionType.BUILD), ("recruit", 0, c.ActionType.RECRUIT), ("upgrade", 0, c.ActionType.UPGRADE),
+	("hire", 0, c.ActionType.HIRE), ("trade", 0, c.ActionType.TRADE), ("multi", 0, c.ActionType.MULTI), ("exchange_multi", 1, c.ActionType.MULTI), ("exchange_army", 1, c.ActionType.ARMY))
+
+
+def step_report(moved, kind, action):
+	"""{step_<name>: the mean own step of STEP_REPORT's classes with a row (floats)}: moved [N] forecast_steps'."""
+	out = {}
+	for name, exchange, kind_of in STEP_REPORT:
+		rows = torch.isfinite(moved) & (action == int(kind_of)) & ((kind == c.DecisionKind.EXCHANGE) == bool(exchange))
+		if int(rows.sum()):
+			out[f"step_{name}"] = float(moved[rows].mean())
+	return out
+
+
+def step_credit(term, forecast, step, day, trust, classes=None, price=None, outcome_share_min=0.25):
+	"""A schedule credit term [N] with its forecast's step (config.step_credit; the 2026-11-09 audit). The term is the
+	outcome less the forecast here: the step (the forecast [N] at the player's next turn decision that day, step [N] its
+	row, less the forecast here) + the rest (the outcome less the forecast there: a week of everyone's luck, shared by
+	the day's decisions: 96.5% of the advantage's variance was). The step is the decision's own; the rest counts at
+	  s = 1 - (1 - outcome_share_min) x trust       (the old horizon credit's rule, the battle credit's)
+	credit = step - price + s x rest + (1 - s) x the class's mean rest
+	classes [N] (step_classes; None: no correction): the mean rest of a class's rows this update (shrunk toward 0 by
+	STEP_CLASS_PRIOR rows) is what the forecast gets wrong right after such a decision, on average. Without it a class
+	is taught the forecast's habit as if it were the action's effect (measured on 8 joint7 games: after an UPGRADE G7's
+	forecast falls 0.0070 while Φ loses 0.0002 and the week's outcome says +0.007 +- 0.008; after an exchange's MULTI
+	-0.0028 against +0.0008 +- 0.0014). With it each class's mean credit is the outcome's, as before the step; the step
+	sorts the decisions within the class.
+	price [N] (None: none): what a decision costs (config.step_price, 0 for END and a question). A useless action's step
+	is ~0, which is right (it loses nothing) and no reason to stop: the price is the reason, a little under the
+	smallest action worth making. It is charged here, on the decision that made it, not in the 7-day labels: there
+	the whole day's count would be every decision's of that day (one number a day again), the heads would have to learn
+	it, and most of it would be a bonus for ending the day.
+	The step alone (with its class's whole mean rest) where the term is unknown (its 7-day outcome), the term alone
+	where the step is (the day's last turn decision; a step to a later day carries the night's luck and another day's
+	horizon)."""
+	s = 1.0 - (1.0 - outcome_share_min) * float(min(1.0, max(0.0, trust)))
+	moved = forecast_steps(forecast, step, day)
+	stepped = torch.isfinite(moved)
+	both = torch.isfinite(term) & stepped
+	rest = torch.where(both, term - moved, torch.zeros_like(term))
+	correction = torch.zeros_like(term)
+	if classes is not None and int(both.sum()):
+		count = int(classes.max()) + 1
+		sums = torch.zeros(count, device=term.device, dtype=term.dtype).index_add_(0, classes[both], rest[both])
+		rows = torch.zeros(count, device=term.device, dtype=term.dtype).index_add_(0, classes[both], torch.ones_like(rest[both]))
+		correction = (sums / (rows + STEP_CLASS_PRIOR))[classes]
+	own = moved - price if price is not None else moved
+	return torch.where(both, own + s * rest + (1 - s) * correction, torch.where(stepped, own + correction, term))
+
+
+def advised_exchanges(decisions, stream=None):
+	"""[N] bool: the exchange decisions opened by a move Nullkiller2 advised: the player's last turn decision before them
+	was its advice's own MOVE (config.exchange_span_advised). There its exchange label is the delivery its plan asked
+	for (Advice.cpp adviseExchange: the hero met gets the army), and the TAKE_BEST it accepts is that delivery in one
+	decision. decisions: in each player's order; stream [N] (None: the color): each one's game and player."""
+	out, last = np.zeros(len(decisions), dtype=bool), {}
+	for i, d in enumerate(decisions):
+		key = int(stream[i]) if stream is not None else d.color
+		if d.kind == c.DecisionKind.TURN:
+			last[key] = d.advice is not None and d.action_type == c.ActionType.MOVE and d.advice[0] == c.ActionType.MOVE and d.index == d.advice[1]
+		elif d.kind == c.DecisionKind.EXCHANGE:
+			out[i] = last.get(key, False)
+	return out
 
 
 def taught(advice, advised, config):
 	"""Which advised decisions the teacher's cross-entropy counts [N] (advice: [N, 3] type, index, cell): Nullkiller2's
 	TRADE advice only with config.nk2_trade_advice (False since 2026-11-04); schema 16's newly matched advice only with
-	config.nk2_new_advice (new_advice)."""
+	config.nk2_new_advice (new_advice); its GATHER advice (gather_advice) only with config.nk2_gather_weight."""
 	advice = np.asarray(advice).reshape(-1, 3)
 	if not config.nk2_trade_advice:
 		advised = advised & (advice[:, 0] != c.ActionType.TRADE)
+	if config.nk2_gather_weight <= 0:
+		advised = advised & ~gather_advice(advice)
 	return advised if config.nk2_new_advice else advised & ~new_advice(advice)
+
+
+def gather_advice(advice):
+	"""[N] whether each advice (type, index, cell) is a MULTI GATHER: Nullkiller2's visit again of the town its hero
+	stands in (Advice.cpp visitAgain, ALPHA_MAP_GATHER_ADVICE), the garrison's troops into the hero."""
+	advice = np.asarray(advice).reshape(-1, 3)
+	return (advice[:, 0] == c.ActionType.MULTI) & (advice[:, 1] % c.N_MULTI == c.MultiKind.GATHER)
+
+
+def advice_weights(advice, advised, config):
+	"""[N] float32: each advised decision's weight in the teacher's cross-entropy: 1 where it counts (taught), 0 where
+	not, config.nk2_gather_weight at a GATHER advice (a label our model gives ~0: a small weight of its own, the
+	2026-11-05 collapse's rule)."""
+	counted = taught(advice, advised, config)
+	weights = counted.astype(np.float32)
+	weights[counted & gather_advice(advice)] = config.nk2_gather_weight
+	return weights
 
 
 def new_advice(advice):
@@ -933,11 +1043,13 @@ def ppo_update(
 		advice = np.array([d.advice if d.advice is not None else (0, 0, -1) for d in decisions], dtype=np.int64).reshape(-1, 3)
 		# Only where its request was matched (has): a decision where Nullkiller2 asked for what we cannot do (an artifact
 		# swap, a hero dismissed) has no label to weigh its plan's steps against (TEACHER_SPAN), 2026-11-05
-		advised = taught(advice, has, config)
+		advised = advice_weights(advice, has, config)
 		advice_t = {
 			"advice_action": torch.from_numpy(advice[:, 0]).to(device), "advice_index": torch.from_numpy(advice[:, 1]).to(device), "advice_cell": torch.from_numpy(advice[:, 2]).to(device),
-			"advised": torch.from_numpy(advised.astype(np.float32)).to(device),
+			"advised": torch.from_numpy(advised).to(device),
 		}
+		if config.exchange_span_advised and not config.exchange_span_multi:  # (MULTI in the span at the exchanges its advice opened)
+			advice_t["exchange_multi"] = torch.from_numpy(advised_exchanges(decisions, streams[0] if streams is not None else None)).to(device)
 		if teacher_sets is not None:
 			types, indices, valid = teacher_sets
 			advice_t.update(advice_has=torch.from_numpy(has).to(device), accept_types=torch.from_numpy(types).to(device), accept_index=torch.from_numpy(indices).to(device), accept_valid=torch.from_numpy(valid).to(device))
@@ -1138,15 +1250,28 @@ def ppo_update(
 		predicted_change = torch.sigmoid(value_now) * 2 * SHARE_CHANGE_CAP - SHARE_CHANGE_CAP
 		change = real_change - share_baseline(real_change, predicted_change, share_trust)
 		day = torch.tensor([d.day for d in decisions], dtype=torch.float32, device=device)
+		step_stats = {}
 		if config.step_credit and end is not None:  # (each term partly its forecast's step to the next turn decision that day)
 			step = torch.from_numpy(np.asarray(end["step"], dtype=np.int64)).to(device)
-			grow = step_credit(grow, log_phi + torch.sigmoid(growth_now) * 2 * GROWTH_CAP - GROWTH_CAP, step, day, growth_trust)
-			change = step_credit(change, predicted_change, step, day, share_trust)
+			classes = step_classes(choice["kind"], choice["action"]) if config.step_class_correction else None
+			price = config.step_price * ((choice["action"] >= 0) & (choice["action"] != c.ActionType.END)).to(grow.dtype)
+			growth_forecast = log_phi + torch.sigmoid(growth_now) * 2 * GROWTH_CAP - GROWTH_CAP
+			# The share's forecast as its baseline scales it (share_baseline: the batch's mean is the same at both ends of a
+			# step), trusted for its step as far as that baseline explains the real change (forecast_trust: a fit;
+			# share_trust is the baseline's coefficient, and a slope of 1 would say nothing of its steps)
+			share_forecast = share_trust * predicted_change
+			share_step_trust = forecast_trust(real_change, real_change - change, config.trust_full_ev)
+			moved = forecast_steps(growth_forecast, step, day)
+			step_stats = {"schedule_step_trust": share_step_trust, **step_report(moved, choice["kind"], choice["action"])}
+			if int(torch.isfinite(moved).sum()) > 1:
+				step_stats["schedule_step_growth_std"] = float(moved[torch.isfinite(moved)].std())
+			grow = step_credit(grow, growth_forecast, step, day, growth_trust, classes, price, config.outcome_share_min)
+			change = step_credit(change, share_forecast, step, day, share_step_trust, classes, price, config.outcome_share_min)
 		w = share_weight(day, side, config)
 		advantage = w * change + (1 - w) * grow  # (nan where a label is unknown: no credit)
 		known = torch.isfinite(advantage)
 		if int(known.sum()) > 1:
-			schedule_stats = {"schedule_share_weight": float(w[known].mean()), "schedule_share_std": float(change[known].std()), "schedule_growth_std": float(grow[known].std()), "schedule_share_trust": float(share_trust), "schedule_growth_trust": float(growth_trust)}
+			schedule_stats = {"schedule_share_weight": float(w[known].mean()), "schedule_share_std": float(change[known].std()), "schedule_growth_std": float(grow[known].std()), "schedule_share_trust": float(share_trust), "schedule_growth_trust": float(growth_trust), **step_stats}
 	if end is not None and end["weight"] > 0:  # the policy's credit moves toward the end's as V_end proves itself
 		turn = choices(decisions)["kind"] == c.DecisionKind.TURN
 		later = end_advantages(end_now.cpu().numpy(), end["step"], end["week"], end["real"], end["price"], turn, config.decision_price, end["outcome"])

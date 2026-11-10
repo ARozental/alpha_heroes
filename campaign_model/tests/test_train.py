@@ -580,3 +580,87 @@ def test_an_update_with_the_step_credit_runs_and_reports_both_trusts():
 	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, np.zeros(8, dtype=np.float32), config, decode=decode, growth_real=growth_real, end=end, share_trust=0.4, growth_trust=1.0)
 	assert metrics["schedule_share_trust"] == pytest.approx(0.4) and metrics["schedule_growth_trust"] == pytest.approx(1.0)
 	assert metrics["steps"] >= 1 and np.isfinite(metrics["kl"])
+
+
+def test_an_update_with_the_step_credits_price_and_classes_runs_and_reports_the_steps():
+	"""config.step_credit with step_price and step_class_correction: the update runs and its stats carry the share
+	step's own trust (forecast_trust), the growth step's spread and each action type's mean step (step_report)."""
+	from campaign_model.model import build_model
+
+	torch.manual_seed(3)
+	model = build_model({"dim": 32, "cell_dim": 16, "heads": 4, "layers": 1, "architecture": "v2", "share_target": "change"})
+	x = random_inputs(8, seed=11)
+	decisions = decisions_for(model.eval(), x)
+	targets = np.full((8, c.N_VALUE_OFFSETS), 0.55, dtype=np.float32)
+	growth_real = np.full((8, c.N_VALUE_OFFSETS), 10.0, dtype=np.float32)
+	growth_real[6:] = np.nan
+	end = {"targets": np.full(8, 0.5, np.float32), "real": np.full(8, 0.5, np.float32), "step": np.array([1, 2, 3, 4, 5, 6, 7, -1]), "week": np.full(8, -1), "price": np.zeros(8, np.float32), "outcome": 0.5, "weight": 0.0}
+	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
+	for extra in ({"step_price": 1e-3}, {"step_class_correction": True}, {"step_price": 0.0, "step_class_correction": True}):
+		config = CampaignConfig(batch_size=4, passes=1, credit="schedule", share_target="change", step_credit=True, **extra)
+		metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, np.zeros(8, dtype=np.float32), config, decode=decode, growth_real=growth_real, end=end, share_trust=0.4, growth_trust=1.0)
+		assert 0.0 <= metrics["schedule_step_trust"] <= 1.0 and np.isfinite(metrics["kl"]) and metrics["steps"] >= 1
+		assert any(name.startswith("step_") for name in metrics) and all(np.isfinite(metrics[name]) for name in metrics if name.startswith("step_"))
+	off, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, np.zeros(8, dtype=np.float32), CampaignConfig(batch_size=4, passes=1, credit="schedule", share_target="change"), decode=decode, growth_real=growth_real, end=end, share_trust=0.4, growth_trust=1.0)
+	assert not any(name.startswith("step_") or name.startswith("schedule_step_") for name in off)  # (off: none of it)
+
+
+def test_the_step_credit_keeps_each_class_mean_at_the_outcomes_and_charges_each_action():
+	"""train.step_credit's classes and price: a class after whose decisions the forecast is biased (its rest's mean) is
+	credited the outcome's mean all the same (less the prior's shrink), whatever the step's share; without the classes
+	it loses (1 - s) x the bias. The price is taken from each row with a step, never from one without."""
+	from campaign_model.train import STEP_CLASS_PRIOR, step_credit
+
+	n = 4000
+	generator = torch.Generator().manual_seed(5)
+	forecast = torch.randn(n + 1, generator=generator) * 0.01
+	step = torch.arange(1, n + 2)
+	step[-1] = -1  # (the last row: no next turn decision)
+	day = torch.ones(n + 1)
+	classes = torch.arange(n + 1) % 2
+	bias = torch.where(classes == 1, 0.05, 0.0)  # (the forecast 0.05 too low right after a class-1 decision)
+	moved = forecast[1:] - forecast[:-1]
+	rest = bias[:-1] + torch.randn(n, generator=generator) * 0.07
+	term = torch.cat([moved + rest, torch.tensor([0.3])])
+	s = 1 - 0.75 * 1.0
+	got = step_credit(term, forecast, step, day, trust=1.0, classes=classes)
+	plain = step_credit(term, forecast, step, day, trust=1.0)
+	for k in (0, 1):
+		rows = (classes == k)[:-1]
+		shrink = STEP_CLASS_PRIOR / (int(rows.sum()) + STEP_CLASS_PRIOR)
+		assert float(got[:-1][rows].mean()) == pytest.approx(float(term[:-1][rows].mean()) - (1 - s) * float(rest[rows].mean()) * shrink, abs=1e-6)
+		assert float(plain[:-1][rows].mean()) == pytest.approx(float(term[:-1][rows].mean()) - (1 - s) * float(rest[rows].mean()), abs=1e-6)
+	assert float(term[:-1][(classes == 1)[:-1]].mean() - plain[:-1][(classes == 1)[:-1]].mean()) == pytest.approx(0.75 * 0.05, abs=0.006)
+	assert float(got[-1]) == pytest.approx(0.3) and float(plain[-1]) == pytest.approx(0.3)  # (no step: the term alone)
+	# the step alone where the term is unknown: with its class's whole mean rest
+	unknown = term.clone()
+	unknown[10] = float("nan")
+	alone = step_credit(unknown, forecast, step, day, trust=1.0, classes=classes)
+	rows = ((classes == 0)[:-1]) & (torch.arange(n) != 10)
+	assert float(alone[10]) == pytest.approx(float(moved[10]) + float(rest[rows].sum()) / (int(rows.sum()) + STEP_CLASS_PRIOR), abs=1e-6)
+	# the price: from every row with a step
+	price = torch.full((n + 1,), 2e-4)
+	priced = step_credit(term, forecast, step, day, 1.0, classes, price)
+	assert torch.allclose(got[:-1] - priced[:-1], torch.full((n,), 2e-4), atol=1e-7) and float(priced[-1]) == pytest.approx(0.3)
+
+
+def test_the_step_credits_classes_and_its_share_forecasts_trust():
+	"""train.step_classes: an action type's class, an exchange's apart, every question one class. train.forecast_trust:
+	a forecast's explained variance over trust_full_ev on the rows where both are known, 0..1."""
+	from campaign_model.train import forecast_trust, step_classes
+
+	kind = torch.tensor([c.DecisionKind.TURN, c.DecisionKind.EXCHANGE, c.DecisionKind.TURN, c.DecisionKind.YES_NO, c.DecisionKind.SELECT])
+	action = torch.tensor([c.ActionType.MULTI, c.ActionType.MULTI, c.ActionType.END, -1, -1])
+	classes = step_classes(kind, action)
+	assert len(set(classes[:3].tolist())) == 3 and int(classes[3]) == int(classes[4]) == 0 and int(classes.min()) >= 0
+	generator = torch.Generator().manual_seed(7)
+	signal, noise = torch.randn(20000, generator=generator), torch.randn(20000, generator=generator)
+	real = signal + noise  # (half of it explained by a forecast of the signal)
+	assert forecast_trust(real, signal, 1.0) == pytest.approx(0.5, abs=0.03)
+	assert forecast_trust(real, signal, 0.4) == 1.0  # (capped)
+	assert forecast_trust(real, torch.zeros_like(real), 0.4) == pytest.approx(0.0, abs=0.01)
+	assert forecast_trust(real, -signal, 0.4) == 0.0  # (worse than a constant: none)
+	holes = real.clone()
+	holes[::2] = float("nan")
+	assert forecast_trust(holes, signal, 1.0) == pytest.approx(0.5, abs=0.04)
+	assert forecast_trust(torch.full((4,), float("nan")), torch.zeros(4), 0.4) == 0.0

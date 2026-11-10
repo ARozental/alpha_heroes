@@ -264,3 +264,125 @@ def test_with_exchange_span_multi_an_exchange_label_pushes_down_the_multi_action
 	assert torch.allclose(teacher_span_logp(out, kind, label), torch.log(p[:, A.ARMY] + p[:, A.END]), atol=1e-5)  # (the default: as before)
 	(-(out["type_logp"].gather(1, label.unsqueeze(1)).squeeze(1) - span).sum()).backward()
 	assert float(logits.grad[0, A.MULTI]) > 0 and float(logits.grad[1, A.MULTI]) > 0  # (pushed down)
+
+
+def test_with_exchange_span_advised_only_the_exchanges_its_advice_opened_weigh_the_multi_actions():
+	"""config.exchange_span_advised (train.advised_exchanges): the exchange decisions after a turn decision that was the
+	advice's own MOVE are the rows MULTI is in the span for; an exchange our own move opened, a turn decision and a
+	second player's rows are not. teacher_span_logp takes the rows' mask."""
+	from campaign_model.train import advised_exchanges, teacher_span_logp
+
+	def d(color, kind, action, index, advice=None):
+		return SimpleNamespace(color=color, kind=int(kind), action_type=int(action), index=index, advice=advice)
+
+	T, X = c.DecisionKind.TURN, c.DecisionKind.EXCHANGE
+	decisions = [
+		d("RED", T, A.MOVE, 40, (int(A.MOVE), 40, -1)),  # the advice's own move
+		d("RED", X, A.MULTI, 4),  # the exchange it opened
+		d("RED", X, A.END, 0),
+		d("RED", T, A.MOVE, 41, (int(A.MOVE), 40, -1)),  # another tile than the advice's
+		d("RED", X, A.MULTI, 4),
+		d("RED", T, A.MOVE, 42),  # no advice
+		d("RED", X, A.MULTI, 4),
+		d("RED", T, A.TRAVEL, 40, (int(A.TRAVEL), 40, -1)),  # its advice, not a move
+		d("BLUE", X, A.MULTI, 4),  # another player's: no turn decision of its own before it
+		d("BLUE", T, A.MOVE, 7, (int(A.MOVE), 7, -1)),
+		d("BLUE", c.DecisionKind.YES_NO, -1, 1),  # a question in between changes nothing
+		d("BLUE", X, A.ARMY, 3),
+	]
+	rows = advised_exchanges(decisions)
+	assert rows.tolist() == [False, True, True, False, False, False, False, False, False, False, False, True]
+	stream = np.array([0] * 8 + [1] * 4)
+	assert advised_exchanges(decisions, stream).tolist() == rows.tolist()
+	torch.manual_seed(2)
+	out = {"type_logp": torch.log_softmax(torch.randn(3, c.N_ACTION_TYPES), dim=1)}
+	kind = torch.tensor([X, X, T])
+	label = torch.tensor([A.ARMY, A.ARMY, A.MOVE])
+	p = out["type_logp"].exp()
+	span = teacher_span_logp(out, kind, label, exchange_multi=torch.tensor([True, False, True]))
+	assert float(span[0]) == pytest.approx(float(torch.log(p[0, A.ARMY] + p[0, A.END] + p[0, A.MULTI])), abs=1e-5)
+	assert float(span[1]) == pytest.approx(float(torch.log(p[1, A.ARMY] + p[1, A.END])), abs=1e-5)
+	assert float(span[2]) == pytest.approx(float(teacher_span_logp(out, kind, label)[2]), abs=1e-6)  # (a turn's: as ever)
+
+
+def test_a_gather_label_is_weighed_against_the_heros_moves_and_taught_at_its_own_small_weight():
+	"""config.nk2_gather_weight (train.advice_weights, gather_advice; Advice.cpp visitAgain): Nullkiller2's GATHER advice
+	counts for nothing at 0 (the default) and at that weight above it, every other advice at 1 as before (its TRADE and
+	schema 16's new kinds still at 0); a turn's MULTI label is weighed against the hero's moves and the town's actions,
+	so leaving without the troops is pushed down."""
+	from campaign_model.config import CampaignConfig
+	from campaign_model.train import TEACHER_SPAN, advice_weights, gather_advice, taught, teacher_span_logp
+
+	K = c.MultiKind
+	advice = np.array([
+		(A.MULTI, 3 * c.N_MULTI + K.GATHER, -1),  # the pickup, at a town's fourth slot
+		(A.MOVE, 40, -1),
+		(A.TRADE, 2, -1),  # (config.nk2_trade_advice: off)
+		(A.MULTI, 1 * c.N_MULTI + K.SPLIT_SINGLES, -1),  # (config.nk2_new_advice: off)
+		(A.MULTI, 2 * c.N_MULTI + K.RECRUIT_ALL, -1),
+		(A.MULTI, 0 * c.N_MULTI + K.GATHER, -1),  # a pickup at a decision with no advice (has: False)
+	], dtype=np.int64)
+	has = np.array([True, True, True, True, True, False])
+	assert gather_advice(advice).tolist() == [True, False, False, False, False, True]
+	off, low = CampaignConfig(), CampaignConfig(nk2_gather_weight=0.1)
+	assert taught(advice, has, off).tolist() == [False, True, False, False, True, False]
+	assert taught(advice, has, low).tolist() == [True, True, False, False, True, False]
+	assert advice_weights(advice, has, off).tolist() == [0.0, 1.0, 0.0, 0.0, 1.0, 0.0]
+	weights = advice_weights(advice, has, low)
+	assert weights.dtype == np.float32 and weights.tolist() == pytest.approx([0.1, 1.0, 0.0, 0.0, 1.0, 0.0])
+
+	hero, town = {A.MOVE, A.TRAVEL, A.ARMY}, {A.BUILD, A.RECRUIT, A.HIRE, A.UPGRADE, A.TRADE, A.BUY}
+	assert {A(t) for t in range(c.N_ACTION_TYPES) if TEACHER_SPAN[0, A.MULTI, t]} == hero | town | {A.END, A.MULTI}
+	assert {A(t) for t in range(c.N_ACTION_TYPES) if TEACHER_SPAN[1, A.MULTI, t]} == {A.ARMY, A.END, A.MULTI}  # (an exchange's: as before)
+	torch.manual_seed(3)
+	logits = torch.randn(1, c.N_ACTION_TYPES, requires_grad=True)
+	out = {"type_logp": torch.log_softmax(logits, dim=1)}
+	label = torch.tensor([A.MULTI])
+	span = teacher_span_logp(out, torch.tensor([c.DecisionKind.TURN]), label)
+	(-(out["type_logp"].gather(1, label.unsqueeze(1)).squeeze(1) - span).sum()).backward()
+	assert float(logits.grad[0, A.MULTI]) < 0 and all(float(logits.grad[0, t]) > 0 for t in (A.MOVE, A.TRAVEL, A.END, A.RECRUIT))
+	assert all(float(logits.grad[0, t]) == pytest.approx(0.0, abs=1e-6) for t in (A.ARTIFACT, A.DISMISS, A.CAST))
+
+
+def test_an_update_with_the_gather_weight_and_the_advised_exchanges_span_runs():
+	"""ppo_update with config.nk2_gather_weight (a GATHER advice at a fraction of a row) and config.exchange_span_advised
+	(the rows' mask cut with every micro-batch): it trains, nothing is NaN; with the weight at 0 the GATHER row adds
+	nothing to the teacher's count."""
+	from campaign_model.model import build_model
+	from campaign_model.tests.test_model import random_inputs
+	from campaign_model.tests.test_train import decisions_for
+	from campaign_model.train import advice_weights, ppo_update
+
+	torch.manual_seed(3)
+	model = build_model({"dim": 32, "cell_dim": 16, "heads": 4, "layers": 1, "architecture": "v2", "share_target": "change"})
+	x = random_inputs(8, seed=11)
+	decisions = decisions_for(model.eval(), x)
+	advised = [i for i, d in enumerate(decisions) if d.action_type >= 0]
+	for i in advised:
+		decisions[i].advice = (decisions[i].action_type, decisions[i].index, decisions[i].cell)
+	decisions[advised[0]].advice = (int(A.MULTI), 0 * c.N_MULTI + int(c.MultiKind.GATHER), -1)
+	n = len(decisions)
+	types, indices, valid = np.zeros((n, 4), np.int64), np.zeros((n, 4), np.int64), np.zeros((n, 4), bool)
+	advice = np.array([d.advice if d.advice is not None else (0, 0, -1) for d in decisions], dtype=np.int64)
+	has = np.array([d.advice is not None for d in decisions])
+	assert advice_weights(advice, has, CampaignConfig())[advised[0]] == 0.0
+	for config in (CampaignConfig(batch_size=4, passes=1, model_architecture="v2", nk2_gather_weight=0.1, exchange_span_advised=True), CampaignConfig(batch_size=4, passes=1, model_architecture="v2", exchange_span_advised=True), CampaignConfig(batch_size=4, passes=1, model_architecture="v2", nk2_gather_weight=0.1)):
+		metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, np.full((n, c.N_VALUE_OFFSETS), 0.5, np.float32), np.zeros(n, np.float32), config, decode=lambda rows: {k: v[rows] for k, v in x.items()}, teacher_weight=2.0, teacher_sets=(types, indices, valid))
+		assert math.isfinite(metrics["teacher_ce"]) and math.isfinite(metrics["kl"])
+		assert all(math.isfinite(float(p.detach().sum())) for p in model.parameters())
+
+
+def test_the_games_record_the_gather_label_only_when_the_trainer_teaches_it():
+	"""supply.Runner.campaign_settings: a training game's ALPHA_MAP_GATHER_ADVICE is set with config.nk2_gather_weight
+	above 0 and Nullkiller2's advice on (one switch for the label and its weight); never without the advice."""
+	from battle_model.supply import Runner
+
+	def settings(**campaign):
+		runner = SimpleNamespace(battle_socket="/tmp/b.sock", link="link.pt", records=SimpleNamespace(path="/tmp/r.sock"), config=SimpleNamespace(campaign=CampaignConfigFor(**campaign)))
+		return dict(Runner.campaign_settings(runner, "game", 3))
+
+	from campaign_model.config import CampaignConfig as CampaignConfigFor
+
+	assert "ALPHA_MAP_GATHER_ADVICE" not in settings(nk2_advice=0.5) and settings(nk2_advice=0.5)["ALPHA_MAP_NK2_ADVICE"] == "0.5"
+	assert settings(nk2_advice=0.5, nk2_gather_weight=0.1)["ALPHA_MAP_GATHER_ADVICE"] == "1"
+	assert "ALPHA_MAP_GATHER_ADVICE" not in settings(nk2_gather_weight=0.1) and "ALPHA_MAP_NK2_ADVICE" not in settings(nk2_gather_weight=0.1)

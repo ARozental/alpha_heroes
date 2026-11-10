@@ -179,6 +179,7 @@ void AlphaMapAI::initAdvice()
 {
 	adviceProbability = std::stod(adviceEnvironment("ALPHA_MAP_NK2_ADVICE", "0"));
 	adviceFixes = adviceEnvironment("ALPHA_MAP_ADVICE_FIXES", "1") != "0";
+	gatherAdvice = adviceEnvironment("ALPHA_MAP_GATHER_ADVICE", "0") != "0";
 #ifdef ALPHA_MAP_NK2_ADVICE
 	if(adviceProbability <= 0)
 		return;
@@ -226,6 +227,7 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optiona
 	std::optional<Choice> advice;
 	std::string unmatched = "no request";
 	const auto started = std::chrono::steady_clock::now();
+	bool gathers = false; // (its advice is a town's visit again: our GATHER, nothing accepted beside it)
 	advisor->client.taken = [&](const CPackForServer & pack)
 	{
 		Choice choice;
@@ -239,6 +241,16 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optiona
 		if(const auto * move = dynamic_cast<const MoveHero *>(&pack))
 			if(const auto * hero = cb->getHero(move->hid); hero && advisor->nk2->nullkiller->isActive(hero))
 				intended = advisor->nk2->nullkiller->getTargetTile();
+		// Its visit again of the town its hero stands in (gatherAdvice): our GATHER there, see visitAgain
+		if(const auto * move = dynamic_cast<const MoveHero *>(&pack); move && gatherAdvice)
+			if(const int index = visitAgain(decision, *move, intended); index >= 0)
+			{
+				choice.type = static_cast<int>(ActionType::MULTI);
+				choice.index = index;
+				advice = choice;
+				gathers = true;
+				return;
+			}
 		if(matchRequest(decision, &pack, choice, exact, unmatched, intended))
 			advice = choice;
 	};
@@ -277,6 +289,14 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optiona
 	}
 #endif
 	acceptMulti(decision, advice, accept);
+	if(gathers)
+	{
+		// The plan's later steps are this hero's way out of the town, and a set's loss is satisfied by any of its entries:
+		// accepted beside the GATHER they would teach the hero to leave without the troops (the order matters here, as
+		// with a town's purchases before its visitor leaves: train.py's TEACHER_SPAN)
+		accept.clear();
+		++adviceGathers;
+	}
 	adviceSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 	++advised;
 	if(advice)
@@ -287,6 +307,37 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optiona
 #else
 	return std::nullopt;
 #endif
+}
+
+int AlphaMapAI::visitAgain(const Decision & decision, const MoveHero & move, const int3 & intended) const
+{
+#ifdef ALPHA_MAP_NK2_ADVICE
+	// Nullkiller2's request to move a hero onto the tile it stands on, in a town of ours: it visits the town again.
+	// Its visit takes the garrison's best troops into the hero (AIGateway::performObjectInteraction: moveCreaturesToHero),
+	// which its plan counted on when it joined the hero with the town's garrison (TownGarrisonActor). None of that is a
+	// request, so the visit was its last word, matched to nothing ("MoveHero (into a teleport)": 752 of its 10,781 advice
+	// calls in 8 joint7 games, 7.0%; a GATHER was legal at 3,621 of their 7,577 turn decisions and our model chose it
+	// once). For us a visit takes nothing: the GATHER entry of that town and hero is what its request does (as the
+	// recorders match its bulk move, Match.cpp; ours moves what fits, its own the best seven stacks). -1: not such a
+	// request, or no GATHER of ours there (nothing to move)
+	const auto * hero = cb->getHero(move.hid);
+	if(!advisor || !hero || hero->tempOwner != playerID || move.path.empty())
+		return -1;
+	const int3 here = hero->visitablePos();
+	if((intended.isValid() && intended != here) || hero->convertToVisitablePos(move.path.back()) != here)
+		return -1;
+	const auto * town = hero->getVisitedTown();
+	if(!town || town->tempOwner != playerID || town->getVisitingHero() != hero)
+		return -1;
+	// (a hero in the garrison: the upper army is that hero's, which Nullkiller2 leaves alone when it has locked the hero
+	// for the town's defence; its locks are not exported, and stripping a garrisoned hero is no label to guess at)
+	if(town->getGarrisonHero())
+		return -1;
+	for(const auto & [index, e] : decision.entries[static_cast<int>(ActionType::MULTI)])
+		if(static_cast<MultiKind>(e.a) == MultiKind::GATHER && e.second == hero->id)
+			return index;
+#endif
+	return -1;
 }
 
 void AlphaMapAI::acceptMulti(const Decision & decision, const std::optional<Choice> & advice, std::vector<std::pair<int, int>> & accept) const
@@ -503,7 +554,7 @@ std::string AlphaMapAI::adviceJson() const
 	std::string unmatched;
 	for(const auto & [kind, count] : adviceUnmatched)
 		unmatched += (unmatched.empty() ? "\"" : ", \"") + kind + "\": " + std::to_string(count);
-	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + "}, \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
+	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + "}, \"gathers\": " + std::to_string(adviceGathers) + ", \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
 }
 
 // The events of a seated Nullkiller2's memory (AlphaMapAI.h), passed on to the advising one; none of our own uses them

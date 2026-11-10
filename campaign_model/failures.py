@@ -37,7 +37,7 @@ NAMES = ("pickup_passed_end", "pickup_passed_travel", "troops_left", "exchange_s
 FIELDS = ("h_present", "h_owner", "w_object", "w_flags", "move_mask", "w_creature", "w_owner")
 CHUNK = 256
 # What the meetings read: our heroes' places, identities (h_type, unique a hero) and movement left, our towns' places
-MOVE_FIELDS = ("h_present", "h_owner", "h_pos", "h_type", "h_move", "t_present", "t_owner", "t_pos")
+MOVE_FIELDS = ("h_present", "h_owner", "h_pos", "h_type", "h_move", "h_garrisoned", "t_present", "t_owner", "t_pos")
 R = c.WINDOW_RADIUS
 
 
@@ -127,7 +127,8 @@ def movement_counts(decisions, counts, limit=None):
 			if move:
 				rest = d.index % (W * W)
 				target = np.array([x["h_pos"][b, h, 0] + rest % W - R, x["h_pos"][b, h, 1] + rest // W - R, x["h_pos"][b, h, 2]])
-				ours = x["h_present"][b, :HO] & (x["h_owner"][b, :HO] == c.OWNER_SELF) & (np.arange(HO) != h)
+				# (a hero in a town's garrison shares its tile and meets no one: a step there is a visit of the town, 2026-11-09)
+				ours = x["h_present"][b, :HO] & (x["h_owner"][b, :HO] == c.OWNER_SELF) & (np.arange(HO) != h) & ~x["h_garrisoned"][b, :HO].astype(bool)
 				there = np.flatnonzero(ours & (x["h_pos"][b, :HO] == target).all(axis=-1))
 				meeting = len(there) > 0
 				towns = x["t_present"][b, : c.OWN_TOWNS] & (x["t_owner"][b, : c.OWN_TOWNS] == c.OWNER_SELF)

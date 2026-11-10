@@ -588,6 +588,8 @@ class Runner:
 			settings[f"ALPHA_BATTLE_SEED_{color}"] = str(seed * 101 + i)
 		if self.config.campaign.nk2_advice > 0:  # (a training game: Nullkiller2's advice on some of our decisions)
 			settings["ALPHA_MAP_NK2_ADVICE"] = str(self.config.campaign.nk2_advice)
+			if self.config.campaign.nk2_gather_weight > 0:  # (its visits again of a town as our GATHER's label: Advice.cpp visitAgain)
+				settings["ALPHA_MAP_GATHER_ADVICE"] = "1"
 		return tuple(settings.items())
 
 	def campaign(self, spec, stop=None):

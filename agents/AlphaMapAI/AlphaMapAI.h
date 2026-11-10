@@ -27,6 +27,7 @@ class CArmedInstance;
 class CGHeroInstance;
 class CGTownInstance;
 class PathfinderCache;
+struct MoveHero;
 VCMI_LIB_NAMESPACE_END
 
 /// What one legal table entry does: the objects and the numbers the engine call needs (by action type, see Actions.cpp)
@@ -238,6 +239,11 @@ class AlphaMapAI : public CAdventureAI
 	// opens gives the hero met the army, as Nullkiller2's own do). settled: each pair's armies as their last exchange
 	// ended (the pair's lower id first), no exchange of theirs planned again while both armies are so
 	bool adviceFixes = false;
+	// Its visit again of a town its hero stands in as our GATHER (ALPHA_MAP_GATHER_ADVICE, off unless set: the trainer's
+	// campaign.nk2_gather_weight teaches the label; Advice.cpp visitAgain), and how many of its advices were
+	bool gatherAdvice = false;
+	int adviceGathers = 0;
+	int visitAgain(const Decision & decision, const MoveHero & move, const int3 & intended) const;
 	std::atomic<bool> meetingAdvised = false;
 	std::map<std::pair<ObjectInstanceID, ObjectInstanceID>, std::pair<std::map<CreatureID, int>, std::map<CreatureID, int>>> settled;
 	mutable std::shared_mutex settledMutex; // (read by its pathfinding's threads)

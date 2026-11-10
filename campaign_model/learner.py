@@ -820,6 +820,11 @@ class CampaignLearner:
 				"value_learning_rate", "value_readout_rms", *(f"grad_norm_{g}" for g in GRAD_GROUPS), *(f"clip_bound_{g}" for g in GRAD_GROUPS), "kl_first", "kl_growth"):
 			if metrics.get(name, float("nan")) == metrics.get(name, float("nan")):
 				self.writer.add_scalar(f"campaign/{name}", metrics[name], self.version)
+		# config.step_credit's readings: the share forecast's trust for its step, the growth step's spread, each action
+		# type's mean own step (train.step_report: what the step says of the type before the week's outcome corrects it)
+		for name, value in metrics.items():
+			if name.startswith(("step_", "schedule_step_")) and isinstance(value, float) and value == value:
+				self.writer.add_scalar(f"campaign_step/{name.replace('schedule_step_', '').replace('step_', '')}", value, self.version)
 		# docs/optimizer_plan.md's readings: the trust before its floor and average, the share of each group's gradient that
 		# is signal (train.signal_fraction), each value head's fresh excess loss and its weight (config.head_scale)
 		self.writer.add_scalar("campaign/trust_today", self.trust_today(), self.version)

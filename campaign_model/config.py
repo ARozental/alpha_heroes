@@ -193,13 +193,29 @@ class CampaignConfig:
 	# clearly better
 	privileged_critic: bool = True
 	privileged_credit: bool = False
-	# The schedule credit's step (the 2026-11-09 audit; off: Φ prices a recruit and an upgrade at a loss, -0.0021 and
-	# -0.0070 a step, which this credit would teach at once): each term (1 - s) x its forecast's step + s x the term as
-	# before, the step the forecast at the player's next turn decision that day less the forecast here (growth: log Φ +
-	# G7's; share: V7's change), s = 1 - 0.75 x the head's trust (G7's grade_trust, the share term's share_trust); the
-	# step alone where the 7-day outcome is unknown. Replayed on 8 joint7 games: the advantage's std 0.081 -> 0.038, its
-	# variance shared a player-day 98.1% -> 85%, credited rows 82% -> 99% (train.step_credit)
+	# The schedule credit's step (the 2026-11-09 audit; train.step_credit): each term its forecast's step to the player's
+	# next turn decision that day (growth: log Φ + G7's; share: V7's change as the baseline scales it) + s x the rest of
+	# the week, s = 1 - (1 - outcome_share_min) x the forecast's trust (G7's grade_trust; the share's own fit this update,
+	# train.forecast_trust); the step alone where the 7-day outcome is unknown. Replayed on 8 joint7 games (v2482,
+	# scratchpad audit/c5.py): the advantage's std 0.081 -> 0.042, its variance shared a player-day 98.1% -> 90.6%,
+	# credited rows 82% -> 99%; each action type's mean credit in the advantage's own std stays where the outcome alone
+	# had it (RECRUIT -0.22 -> -0.19, UPGRADE +0.14 -> +0.08, BUILD -0.01 -> +0.07, an exchange's MULTI +0.01 -> -0.00):
+	# it does not teach recruits or upgrades away. (The recruits' -733 of Φ is not Φ's price of a recruit: 149 of 591
+	# were paid by the market's trades, AlphaMapAI::payByTrades, 5,500 of resources for 655 of troops; one paid in gold
+	# loses the unled share's 4.7%. An upgrade loses 36 of Φ; its step's -0.0070 is G7's forecast.) Off until its own
+	# deploy (one change a deploy)
 	step_credit: bool = False
+	# What a decision costs in the step credit (log Φ; END and a question nothing): a useless action's step is ~0, which
+	# is right and no reason to stop; this is. 2e-4 is 30 gold of a 150k empire, a tenth of a small pickup's step; the
+	# mean MOVE's own step is 6.5e-4, a BUILD's 7e-3. On the decision that made it, not in the day's labels (step_credit)
+	step_price: float = 2e-4
+	# The step credit's class correction (train.step_credit's classes): each action type's mean rest of the week added
+	# back, so its mean credit is the outcome's whatever G7's habits right after such a decision. Off: in the replay it
+	# doubles every type's mean credit in the advantage's std (the noise halves, the means stay: RECRUIT -0.22 -> -0.44),
+	# and a type's mean rest is its days' as much as its own (recruits are made on the week's first day: the outcome less
+	# the forecast BEFORE the day's actions is -0.009 on days with a recruit, +0.006 without). For when campaign_step/*
+	# shows a type taught by a habit of the forecast's
+	step_class_correction: bool = False
 	# The teacher's KL (AlphaStar's KL to its supervised policy, 2026-10-31: 1,020 -> 1,400 Elo in its ablation): each
 	# decision's KL(teacher || model) over the action type and each type's table (train.teacher_kl), at this weight in
 	# the loss, the teacher a frozen imitation of Nullkiller2 (imitate.py's bc_latest.pt: teacher_checkpoint). It keeps
@@ -222,11 +238,31 @@ class CampaignConfig:
 	# (train.swap_only_moves: its labels and accepted entries). Its other ARMY moves between two armies, and their target
 	# slots, are taught as before
 	nk2_new_advice: bool = False
+	# Nullkiller2's GATHER advice (Advice.cpp visitAgain, the games' ALPHA_MAP_GATHER_ADVICE=1): its visit again of the
+	# town its hero stands in, which takes the garrison's troops for it and nothing for us, as our GATHER's label, at
+	# this weight in the teacher's cross-entropy (0: not taught, nor asked of the games: supply's campaign_settings). It was its advice at 752 of
+	# its 10,781 calls in 8 joint7 games (7.0%), matched to nothing; a GATHER was legal at 3,621 of their 7,577 turn
+	# decisions and our model chose it once. Not 2026-11-05's GATHER (accepted wherever legal: the emptied towns, eval
+	# 0.265, 28 of 48 players out): the label only where its plan takes those troops now, nothing
+	# accepted beside it, MULTI pushed down at every other turn label as ever. A small weight first (train.advice_weights;
+	# 0.1 to start): on 8 maps x 14 days of v2501 with the label on (313 labels, 7.1% of the taught advice, 139 pickups
+	# asked for) our model gave it 0.00003 (the median; never chose it, and left the town without the troops at 92% of
+	# them), so teacher_ce is +0.60 at once at 1.0, +0.31 at 0.5, +0.13 at 0.2, +0.06 at 0.1 (2026-11-05's rule: a jump over
+	# +0.3 means stop). The label's span is both families' (train._teacher_span: the hero's moves pushed down there)
+	nk2_gather_weight: float = 0.0
 	# MULTI inside an exchange's teacher span (train.TEACHER_SPAN_MULTI; the 2026-11-09 audit's M3): every exchange label
 	# pushes down the multi-actions it does not accept (TAKE_BEST into the hero that keeps nothing, TAKE_BEST_FAST, ...).
 	# Outside it (False) none is ever pushed: after a meeting Nullkiller2 advised, our first exchange choice was its
 	# delivery in 35%, TAKE_BEST_FAST in 40%, TAKE_BEST into the visitor in 18%
 	exchange_span_multi: bool = False
+	# The same only at the exchanges a move of Nullkiller2's advice opened (train.advised_exchanges): there its label is
+	# the delivery its plan asked for, the hero met getting the army (Advice.cpp's meeting fixes), and the TAKE_BEST it
+	# accepts is that delivery in one decision; an exchange our model walked into on its own keeps the old span (its
+	# label there is a rule of ours, Nullkiller2's ranking of the two heroes). exchange_span_multi's all at once was
+	# 32% of the decisions pushed off the multi-actions they are nearly all of (the 2026-11-05 collapse's shape). On the
+	# meeting fixes' 8 maps x 14 days (v2501): teacher ce 1.668 as it is, 2.358 with exchange_span_multi, 1.697 with
+	# this (52 of the 1,015 taught exchange rows; their ce 0.007 -> 2.26: our model's MULTI there is not the delivery)
+	exchange_span_advised: bool = False
 	# The KL a decision is kept near (0: teacher_kl stays the weight): after each update the weight is x1.5 when the
 	# update's teacher KL was over 1.5 x this, /1.5 when under 1/1.5 of it (the PPO KL control's rule), within 0.01..10.
 	# PPO moves the policy ~target_kl an update, in a random direction where the credit is noise: unanchored, the clone

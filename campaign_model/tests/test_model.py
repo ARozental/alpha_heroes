@@ -489,6 +489,32 @@ def test_meetings_are_counted_by_moves_and_by_movement():
 	assert failure_counts(decisions, moves_limit=1)["own_hero_moves"] == (3, 4)  # whole games: the first only
 
 
+def test_a_step_into_a_town_whose_garrison_holds_a_hero_is_a_visit_not_a_meeting():
+	"""A hero of ours in a town's garrison shares the town's tile and opens no exchange: a MOVE there is the town's
+	visit (town_movement), not a meeting (own_hero_moves); the same hero visiting the town (not in its garrison) is met."""
+	from campaign_model.failures import failure_counts
+
+	R, W = c.WINDOW_RADIUS, c.WINDOW
+
+	def state(move7, garrisoned):
+		x = empty_inputs(1)
+		x["g_kind"][0], x["g_map"][0] = c.DecisionKind.TURN, [36, 36, 1]
+		for row, kind, pos, move in zip((0, 1), (7, 8), ([10, 10, 0], [10, 14, 0]), (move7, 1500)):
+			x["h_present"][0, row], x["h_owner"][0, row], x["h_type"][0, row] = True, c.OWNER_SELF, kind
+			x["h_pos"][0, row], x["h_move"][0, row] = pos, move
+		x["h_garrisoned"][0, 1] = garrisoned
+		x["t_present"][0, 0], x["t_owner"][0, 0], x["t_pos"][0, 0] = True, c.OWNER_SELF, [10, 14, 0]
+		return x
+
+	def step(action, index, x):
+		return Decision("RED", 1, int(c.DecisionKind.TURN), 0, 1, int(action), index, -1, 0.0, (0.5,) * 3, 0, encoded(x, 0))
+
+	into_town = (R + 4) * W + R  # 4 south: the town's tile, hero 8 on it
+	for garrisoned, meetings, town in ((True, (0, 1), 400), (False, (1, 1), 0)):
+		counts = failure_counts([step(c.ActionType.MOVE, into_town, state(1000, garrisoned)), step(c.ActionType.END, -1, state(600, garrisoned))])
+		assert counts["own_hero_moves"] == meetings and counts["town_movement"] == (town, 400) and counts["meeting_movement"] == (400 - town, 400)
+
+
 def test_an_exchange_that_can_only_leave_troops_behind_closes(model):
 	"""When every legal troop move puts our troops into the other army (a mine), ARMY is ~e^-4 as likely as before; a
 	legal move out of the mine leaves its odds as they were."""
