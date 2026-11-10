@@ -564,7 +564,8 @@ def test_the_step_credit_is_a_terms_step_to_the_next_turn_decision_that_day():
 
 def test_an_update_with_the_step_credit_runs_and_reports_both_trusts():
 	"""config.step_credit with the schedule credit and the end's step indices: the update runs, its stats carry both
-	terms' trusts; without end (no steps) it is the schedule credit as before."""
+	terms' trusts; without end (no steps) it is the schedule credit as before. (Set aside 2026-11-09: the switch changes
+	nothing while ppo_update's call is commented out; the update runs all the same.)"""
 	from campaign_model.model import build_model
 
 	torch.manual_seed(3)
@@ -582,9 +583,11 @@ def test_an_update_with_the_step_credit_runs_and_reports_both_trusts():
 	assert metrics["steps"] >= 1 and np.isfinite(metrics["kl"])
 
 
-def test_an_update_with_the_step_credits_price_and_classes_runs_and_reports_the_steps():
-	"""config.step_credit with step_price and step_class_correction: the update runs and its stats carry the share
-	step's own trust (forecast_trust), the growth step's spread and each action type's mean step (step_report)."""
+def test_the_step_credit_is_set_aside_its_switches_change_nothing_in_an_update():
+	"""The step credit is set aside (the user, 2026-11-09: no credit on a decision's own step, the 7-day outcome only):
+	ppo_update's call of train.step_credit is commented out, so config.step_credit, step_price and
+	step_class_correction leave an update's stats without any of the step's readings (the function and its unit tests
+	are kept for a later measurement)."""
 	from campaign_model.model import build_model
 
 	torch.manual_seed(3)
@@ -596,13 +599,11 @@ def test_an_update_with_the_step_credits_price_and_classes_runs_and_reports_the_
 	growth_real[6:] = np.nan
 	end = {"targets": np.full(8, 0.5, np.float32), "real": np.full(8, 0.5, np.float32), "step": np.array([1, 2, 3, 4, 5, 6, 7, -1]), "week": np.full(8, -1), "price": np.zeros(8, np.float32), "outcome": 0.5, "weight": 0.0}
 	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
-	for extra in ({"step_price": 1e-3}, {"step_class_correction": True}, {"step_price": 0.0, "step_class_correction": True}):
-		config = CampaignConfig(batch_size=4, passes=1, credit="schedule", share_target="change", step_credit=True, **extra)
+	for extra in ({}, {"step_credit": True}, {"step_credit": True, "step_price": 1e-3, "step_class_correction": True}):
+		config = CampaignConfig(batch_size=4, passes=1, credit="schedule", share_target="change", **extra)
 		metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, np.zeros(8, dtype=np.float32), config, decode=decode, growth_real=growth_real, end=end, share_trust=0.4, growth_trust=1.0)
-		assert 0.0 <= metrics["schedule_step_trust"] <= 1.0 and np.isfinite(metrics["kl"]) and metrics["steps"] >= 1
-		assert any(name.startswith("step_") for name in metrics) and all(np.isfinite(metrics[name]) for name in metrics if name.startswith("step_"))
-	off, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, np.zeros(8, dtype=np.float32), CampaignConfig(batch_size=4, passes=1, credit="schedule", share_target="change"), decode=decode, growth_real=growth_real, end=end, share_trust=0.4, growth_trust=1.0)
-	assert not any(name.startswith("step_") or name.startswith("schedule_step_") for name in off)  # (off: none of it)
+		assert np.isfinite(metrics["kl"]) and metrics["steps"] >= 1
+		assert not any(name.startswith("step_") or name.startswith("schedule_step_") for name in metrics)
 
 
 def test_the_step_credit_keeps_each_class_mean_at_the_outcomes_and_charges_each_action():

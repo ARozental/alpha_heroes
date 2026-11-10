@@ -193,6 +193,9 @@ class CampaignConfig:
 	# clearly better
 	privileged_critic: bool = True
 	privileged_credit: bool = False
+	# SET ASIDE (the user, 2026-11-09): step_credit, step_price and step_class_correction change nothing, train.ppo_update's
+	# call of train.step_credit is commented out ("I do not want any value on actual steps, only on day+2/5/7"; to be
+	# measured apart later). The policy's schedule credit stays the 7-day outcome alone. Kept for that measurement:
 	# The schedule credit's step (the 2026-11-09 audit; train.step_credit): each term its forecast's step to the player's
 	# next turn decision that day (growth: log Φ + G7's; share: V7's change as the baseline scales it) + s x the rest of
 	# the week, s = 1 - (1 - outcome_share_min) x the forecast's trust (G7's grade_trust; the share's own fit this update,
@@ -202,8 +205,7 @@ class CampaignConfig:
 	# had it (RECRUIT -0.22 -> -0.19, UPGRADE +0.14 -> +0.08, BUILD -0.01 -> +0.07, an exchange's MULTI +0.01 -> -0.00):
 	# it does not teach recruits or upgrades away. (The recruits' -733 of Φ is not Φ's price of a recruit: 149 of 591
 	# were paid by the market's trades, AlphaMapAI::payByTrades, 5,500 of resources for 655 of troops; one paid in gold
-	# loses the unled share's 4.7%. An upgrade loses 36 of Φ; its step's -0.0070 is G7's forecast.) Off until its own
-	# deploy (one change a deploy)
+	# loses the unled share's 4.7%. An upgrade loses 36 of Φ; its step's -0.0070 is G7's forecast.)
 	step_credit: bool = False
 	# What a decision costs in the step credit (log Φ; END and a question nothing): a useless action's step is ~0, which
 	# is right and no reason to stop; this is. 2e-4 is 30 gold of a 150k empire, a tenth of a small pickup's step; the

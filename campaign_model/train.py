@@ -905,7 +905,15 @@ def step_report(moved, kind, action):
 
 
 def step_credit(term, forecast, step, day, trust, classes=None, price=None, outcome_share_min=0.25):
-	"""A schedule credit term [N] with its forecast's step (config.step_credit; the 2026-11-09 audit). The term is the
+	"""SET ASIDE (the user, 2026-11-09: "I do not want any value on actual steps, only on day+2/5/7", until its effect
+	can be measured apart): nothing calls it, ppo_update's call is commented out. What gave pause: it credits what a
+	decision does at once, so a purchase paid with traded resources starts from a loss in our value, and the price was
+	felt too high (2e-4 is ~21 gold a decision at the 8 joint7 games' median value, 0.27% of our value a player-day).
+	Measured there for when it is tried (scratchpad audit/f1.py, f2.py): a MOVE collecting 250+ gold +0.0209 (97%
+	positive), a MOVE changing nothing -0.0007; a BUILD paid by trades +0.0007 +- 0.0043 (our value -0.082 at once,
+	G7's forecast +0.083; its 7-day credit -0.006), a RECRUIT paid by trades -0.0079 +- 0.0020 (7-day credit -0.035).
+
+	A schedule credit term [N] with its forecast's step (config.step_credit; the 2026-11-09 audit). The term is the
 	outcome less the forecast here: the step (the forecast [N] at the player's next turn decision that day, step [N] its
 	row, less the forecast here) + the rest (the outcome less the forecast there: a week of everyone's luck, shared by
 	the day's decisions: 96.5% of the advantage's variance was). The step is the decision's own; the rest counts at
@@ -1251,22 +1259,26 @@ def ppo_update(
 		change = real_change - share_baseline(real_change, predicted_change, share_trust)
 		day = torch.tensor([d.day for d in decisions], dtype=torch.float32, device=device)
 		step_stats = {}
-		if config.step_credit and end is not None:  # (each term partly its forecast's step to the next turn decision that day)
-			step = torch.from_numpy(np.asarray(end["step"], dtype=np.int64)).to(device)
-			classes = step_classes(choice["kind"], choice["action"]) if config.step_class_correction else None
-			price = config.step_price * ((choice["action"] >= 0) & (choice["action"] != c.ActionType.END)).to(grow.dtype)
-			growth_forecast = log_phi + torch.sigmoid(growth_now) * 2 * GROWTH_CAP - GROWTH_CAP
-			# The share's forecast as its baseline scales it (share_baseline: the batch's mean is the same at both ends of a
-			# step), trusted for its step as far as that baseline explains the real change (forecast_trust: a fit;
-			# share_trust is the baseline's coefficient, and a slope of 1 would say nothing of its steps)
-			share_forecast = share_trust * predicted_change
-			share_step_trust = forecast_trust(real_change, real_change - change, config.trust_full_ev)
-			moved = forecast_steps(growth_forecast, step, day)
-			step_stats = {"schedule_step_trust": share_step_trust, **step_report(moved, choice["kind"], choice["action"])}
-			if int(torch.isfinite(moved).sum()) > 1:
-				step_stats["schedule_step_growth_std"] = float(moved[torch.isfinite(moved)].std())
-			grow = step_credit(grow, growth_forecast, step, day, growth_trust, classes, price, config.outcome_share_min)
-			change = step_credit(change, share_forecast, step, day, share_step_trust, classes, price, config.outcome_share_min)
+		# SET ASIDE (the user, 2026-11-09): no credit on a decision's own step for now, the schedule credit is the 7-day
+		# outcome alone (as it runs); config.step_credit changes nothing while these lines stay commented out. The step
+		# credit (step_credit below, with its price a decision, its classes, its readings) is kept to measure later: to
+		# try it, uncomment this block and set config.step_credit.
+		# if config.step_credit and end is not None:  # (each term partly its forecast's step to the next turn decision that day)
+		# 	step = torch.from_numpy(np.asarray(end["step"], dtype=np.int64)).to(device)
+		# 	classes = step_classes(choice["kind"], choice["action"]) if config.step_class_correction else None
+		# 	price = config.step_price * ((choice["action"] >= 0) & (choice["action"] != c.ActionType.END)).to(grow.dtype)
+		# 	growth_forecast = log_phi + torch.sigmoid(growth_now) * 2 * GROWTH_CAP - GROWTH_CAP
+		# 	# The share's forecast as its baseline scales it (share_baseline: the batch's mean is the same at both ends of a
+		# 	# step), trusted for its step as far as that baseline explains the real change (forecast_trust: a fit;
+		# 	# share_trust is the baseline's coefficient, and a slope of 1 would say nothing of its steps)
+		# 	share_forecast = share_trust * predicted_change
+		# 	share_step_trust = forecast_trust(real_change, real_change - change, config.trust_full_ev)
+		# 	moved = forecast_steps(growth_forecast, step, day)
+		# 	step_stats = {"schedule_step_trust": share_step_trust, **step_report(moved, choice["kind"], choice["action"])}
+		# 	if int(torch.isfinite(moved).sum()) > 1:
+		# 		step_stats["schedule_step_growth_std"] = float(moved[torch.isfinite(moved)].std())
+		# 	grow = step_credit(grow, growth_forecast, step, day, growth_trust, classes, price, config.outcome_share_min)
+		# 	change = step_credit(change, share_forecast, step, day, share_step_trust, classes, price, config.outcome_share_min)
 		w = share_weight(day, side, config)
 		advantage = w * change + (1 - w) * grow  # (nan where a label is unknown: no credit)
 		known = torch.isfinite(advantage)
