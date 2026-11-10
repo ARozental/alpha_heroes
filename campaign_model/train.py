@@ -176,15 +176,16 @@ def entries_logp(out, types, indices, valid):
 	return logp.clamp(min=-1e4).masked_fill(~valid, -1e4)
 
 
-def _teacher_span():
-	"""TEACHER_SPAN [2 (turn, exchange), label type, type]: the types Nullkiller2's label is weighed against."""
+def _teacher_span(exchange_multi=False):
+	"""TEACHER_SPAN [2 (turn, exchange), label type, type]: the types Nullkiller2's label is weighed against.
+	exchange_multi: MULTI in an exchange's too (config.exchange_span_multi)."""
 	A = c.ActionType
 	hero, town = {A.MOVE, A.TRAVEL, A.ARMY}, {A.BUILD, A.RECRUIT, A.HIRE, A.UPGRADE, A.TRADE, A.BUY}
 	span = torch.zeros(2, c.N_ACTION_TYPES, c.N_ACTION_TYPES, dtype=torch.bool)
 	for label in A:
 		family = hero | town if label == A.END or label in town else hero if label in hero or label == A.CAST else set()
 		span[0, label, sorted(family | {label, A.END, A.TRADE, A.MULTI})] = True  # (TRADE and MULTI pushed down at every turn label, as before)
-		span[1, label, sorted({A.ARMY, A.END, label})] = True
+		span[1, label, sorted({A.ARMY, A.END, label} | ({A.MULTI} if exchange_multi else set()))] = True
 	return span
 
 
@@ -204,16 +205,20 @@ def _teacher_span():
 # its disbands destroying ~12k gold of army a game; GATHER 4.8 -> 8.6, the morning's emptied towns); at an exchange
 # TAKE_BEST and GIVE_ALL stay outside (52% of exchanges took one, as long as before, no loops).
 # TRADE stays in every turn decision's: its labels are not taught (taught: Nullkiller2's trades), and the push at every
-# other label is part of what ended 135 trades a game (2026-11-04); left to the family it would be pushed at a town's only
+# other label is part of what ended 135 trades a game (2026-11-04); left to the family it would be pushed at a town's only.
+# TEACHER_SPAN_MULTI (config.exchange_span_multi, 2026-11-09): MULTI in an exchange's as well, the TAKE_BEST its advice
+# accepts (into the hero that gets its army) the only one not pushed down
 TEACHER_SPAN = _teacher_span()
+TEACHER_SPAN_MULTI = _teacher_span(exchange_multi=True)
 
 
-def teacher_span_logp(out, kind, label, accepted=None, accept_types=None):
-	"""[N] the log-probability (now) of what each decision's teacher label is weighed against (TEACHER_SPAN), its accepted
-	entries of other types included (accepted [N, K] entries_logp, accept_types [N, K]); 0 (all of it) at a question."""
+def teacher_span_logp(out, kind, label, accepted=None, accept_types=None, exchange_multi=False):
+	"""[N] the log-probability (now) of what each decision's teacher label is weighed against (TEACHER_SPAN; with
+	exchange_multi TEACHER_SPAN_MULTI), its accepted entries of other types included (accepted [N, K] entries_logp,
+	accept_types [N, K]); 0 (all of it) at a question."""
 	from battle_model.device import moved
 
-	span = moved(TEACHER_SPAN, kind.device)[(kind == c.DecisionKind.EXCHANGE).long(), label.clamp(0, c.N_ACTION_TYPES - 1)]  # [N, types]
+	span = moved(TEACHER_SPAN_MULTI if exchange_multi else TEACHER_SPAN, kind.device)[(kind == c.DecisionKind.EXCHANGE).long(), label.clamp(0, c.N_ACTION_TYPES - 1)]  # [N, types]
 	parts = [torch.logsumexp(out["type_logp"].clamp(min=-1e4).masked_fill(~span, -1e4), dim=1, keepdim=True)]
 	if accepted is not None:
 		inside = span.gather(1, accept_types.clamp(0, c.N_ACTION_TYPES - 1))  # (counted with their type already)
@@ -794,7 +799,7 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 			advice_logp = torch.logsumexp(torch.cat([advised_own, accepted], dim=1), dim=1)
 			advised = advised * (advice_logp > -1e3).float()  # (a row none of whose entries is legal any more: none)
 		# among what it could have asked for there (TEACHER_SPAN), not among everything we can do
-		span_logp = teacher_span_logp(out, batch["kind"], batch["advice_action"], accepted, batch.get("accept_types"))
+		span_logp = teacher_span_logp(out, batch["kind"], batch["advice_action"], accepted, batch.get("accept_types"), config.exchange_span_multi)
 		advice_logp = advice_logp - span_logp
 		advice_part = -(torch.where(advised > 0, advice_logp, torch.zeros_like(advice_logp)) * advised).sum() / batch["count_advised"]
 		outside_part = ((1.0 - span_logp.detach().exp()) * advised).sum() / batch["count_advised"]

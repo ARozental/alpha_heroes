@@ -215,6 +215,11 @@ class CampaignConfig:
 	# (train.swap_only_moves: its labels and accepted entries). Its other ARMY moves between two armies, and their target
 	# slots, are taught as before
 	nk2_new_advice: bool = False
+	# MULTI inside an exchange's teacher span (train.TEACHER_SPAN_MULTI; the 2026-11-09 audit's M3): every exchange label
+	# pushes down the multi-actions it does not accept (TAKE_BEST into the hero that keeps nothing, TAKE_BEST_FAST, ...).
+	# Outside it (False) none is ever pushed: after a meeting Nullkiller2 advised, our first exchange choice was its
+	# delivery in 35%, TAKE_BEST_FAST in 40%, TAKE_BEST into the visitor in 18%
+	exchange_span_multi: bool = False
 	# The KL a decision is kept near (0: teacher_kl stays the weight): after each update the weight is x1.5 when the
 	# update's teacher KL was over 1.5 x this, /1.5 when under 1/1.5 of it (the PPO KL control's rule), within 0.01..10.
 	# PPO moves the policy ~target_kl an update, in a random direction where the credit is noise: unanchored, the clone

@@ -242,3 +242,25 @@ def test_the_teachers_label_is_weighed_against_its_family_and_end_only():
 	assert all(float(logits.grad[0, t]) == pytest.approx(0.0, abs=1e-6) for t in town - {A.RECRUIT, A.TRADE})  # (a hero move's: the town's untouched)
 	assert all(float(logits.grad[1, t]) > 0 for t in hero)  # (a town action's: the heroes' pushed down, its visitor stays to buy)
 	assert float(logits.grad[0, A.MOVE]) < 0 and float(logits.grad[0, A.END]) > 0  # (the label up, END down)
+
+
+def test_with_exchange_span_multi_an_exchange_label_pushes_down_the_multi_actions_it_does_not_accept():
+	"""config.exchange_span_multi (train.TEACHER_SPAN_MULTI, 2026-11-09): an exchange's label weighed against ARMY, END
+	and MULTI; the TAKE_BEST its advice accepts counted with its label, every other MULTI pushed down. Turn decisions'
+	spans as TEACHER_SPAN's."""
+	from campaign_model.train import TEACHER_SPAN, TEACHER_SPAN_MULTI, teacher_span_logp
+
+	assert torch.equal(TEACHER_SPAN_MULTI[0], TEACHER_SPAN[0])
+	assert {A(t) for t in range(c.N_ACTION_TYPES) if TEACHER_SPAN_MULTI[1, A.ARMY, t]} == {A.ARMY, A.END, A.MULTI}
+	assert {A(t) for t in range(c.N_ACTION_TYPES) if TEACHER_SPAN_MULTI[1, A.END, t]} == {A.ARMY, A.END, A.MULTI}
+	torch.manual_seed(1)
+	logits = torch.randn(2, c.N_ACTION_TYPES, requires_grad=True)
+	out = {"type_logp": torch.log_softmax(logits, dim=1)}
+	kind = torch.tensor([c.DecisionKind.EXCHANGE, c.DecisionKind.EXCHANGE])
+	label = torch.tensor([A.ARMY, A.END])
+	p = out["type_logp"].exp()
+	span = teacher_span_logp(out, kind, label, exchange_multi=True)
+	assert torch.allclose(span, torch.log(p[:, A.ARMY] + p[:, A.END] + p[:, A.MULTI]), atol=1e-5)
+	assert torch.allclose(teacher_span_logp(out, kind, label), torch.log(p[:, A.ARMY] + p[:, A.END]), atol=1e-5)  # (the default: as before)
+	(-(out["type_logp"].gather(1, label.unsqueeze(1)).squeeze(1) - span).sum()).backward()
+	assert float(logits.grad[0, A.MULTI]) > 0 and float(logits.grad[1, A.MULTI]) > 0  # (pushed down)
