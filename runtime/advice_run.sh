@@ -96,6 +96,11 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # trunk_beta1=0.9 (2026-11-07, b1): the battle trunk's momentum back from 0.95 (6ec628f): shooters wasting a full-damage
 # shot rose from that deploy on (epoch ~8500: training 1.4% -> 2.1-2.4% of their chances, evals vs BattleAI 1-2% ->
 # 2.5%, 3.7%; the DEFEND prior unchanged at -5, so moves or waits), the escape prior only touching escapes
+# campaign.exchange_span_advised=true (2026-11-10, e5; the 2026-11-09 audit's M3 in its gentle form, after the meeting
+# fixes held over three evals: 0.420, 0.405, 0.431 against 0.434 before): at the exchanges a move of Nullkiller2's
+# advice opened, the multi-actions are inside its label's span, so the delivery its plan asked for (the TAKE_BEST it
+# accepts) is taught against the other multi-actions there; ~5% of the taught exchange rows, teacher ce +0.03 measured
+# (1.668 -> 1.697). An exchange our model walked into on its own keeps the old span
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -104,5 +109,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
