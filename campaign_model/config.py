@@ -128,6 +128,15 @@ class CampaignConfig:
 	share_weight_per_day: float = 0.02
 	share_weight_side: float = 36.0  # the map side share_weight_per_day is for: a map of side S ramps at that x share_weight_side / S (the user, 2026-11-03: faster, and slower on bigger maps, where rivals are met later); 0: the same on every map
 	attributed_end_weight: float = 0.2
+	# The schedule credit's price of an action (the user, 2026-11-09: "reduce num_actions x tiny_const from the day+N
+	# rewards"; 0: none, as it runs): taken from a decision's 7-day credit for each action the player makes from that
+	# decision on through the week (labels.actions_ahead: turn and exchange decisions other than END; the policy's
+	# credit only, the heads' labels stay the real outcomes). The user's size: 2e-6, at most 2e-5 ("as high as /10
+	# instead of /100 but no higher" of the step credit's 2e-4). On 8 joint7 games a decision has 107 actions ahead in
+	# its week (std 38; 8.7 of them that day): at 2e-6 the charge is 0.0002, 0.30% of the 7-day outcome's spread
+	# (0.0725); at 2e-5 3.0%. What one decision moves of it is its own action (0.003% of the spread at 2e-6) or, ending
+	# the day, the day's rest (0.024%; ten times those at 2e-5). A nudge by design: nothing to see within a night
+	schedule_action_price: float = 0.0
 	outcome_share_min: float = 0.25
 	myopic_weight: float = 0.5
 	trust_full_ev: float = 0.4

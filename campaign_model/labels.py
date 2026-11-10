@@ -147,6 +147,22 @@ def end_targets(game, real, starts, trust, outcome_share_min=0.25):
 	return graded
 
 
+def actions_ahead(game, days=c.VALUE_OFFSETS[-1]):
+	"""Per decision [N]: how many actions the player makes from this decision on, itself included, through the end of
+	day d + days: the window of its 7-day labels (growth_labels: our value at the end of day d + 7). An action: a turn
+	or exchange decision other than END (a question is none). What config.schedule_action_price charges
+	(train.ppo_update): the actions before a decision are no doing of its own, so they are not in its count."""
+	out, by = np.zeros(len(game.decisions), dtype=np.float32), {}
+	for i, d in enumerate(game.decisions):
+		by.setdefault(d.color, []).append(i)
+	for rows in by.values():  # (a player's decisions come in order: its days never fall)
+		day = np.array([game.decisions[i].day for i in rows])
+		acts = np.array([game.decisions[i].action_type >= 0 and game.decisions[i].action_type != c.ActionType.END for i in rows], dtype=np.float64)
+		total = np.concatenate([[0.0], np.cumsum(acts)])
+		out[rows] = total[np.searchsorted(day, day + days, side="right")] - total[: len(rows)]
+	return out
+
+
 def end_steps(game, ahead=c.VALUE_OFFSETS[-1]):
 	"""Per decision (game.decisions' order): the step's index, the player's next turn decision (that day or later), and
 	the week's, its first turn decision `ahead` days on or later; -1 where there is none (the game's end stands)."""

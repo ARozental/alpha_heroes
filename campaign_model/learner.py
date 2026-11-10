@@ -52,7 +52,7 @@ from .empire import STATUS_INGAME, EmpireConfig, empire_value
 from .failures import NAMES as FAILURES, failure_modes
 from .features import SKILLS
 from .labels import (
-	COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, attributed_labels, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
+	COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, actions_ahead, attributed_labels, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
 	label, ladder_targets, pooled_ev, residual_variances, share_change_labels, share_logit, share_now, tables,
 )
 from .advice import teacher_sets
@@ -488,6 +488,8 @@ class CampaignLearner:
 		growth_real, attributed = [], {"share_now": [], "taken": []}
 		privileged = [] if self.config.privileged_critic and getattr(self.model, "privileged", None) is not None else None  # (privileged_rivals, each game's)
 		end = {"targets": [], "real": [], "step": [], "week": [], "price": []}
+		if self.config.schedule_action_price > 0:  # (each decision's actions through its 7-day window: labels.actions_ahead)
+			end["actions"] = []
 		streams = ([], [])  # each decision's game and player, and its place among the player's records (config.memory_steps)
 		for g, game in enumerate(played):
 			# The labeler's labels, as the game arrived (b1, 2026-10-30: a game's labels from one table version, one update
@@ -518,6 +520,8 @@ class CampaignLearner:
 			end["targets"].append(end_targets(game, real, starts[g], trust.get("Vend", 0.0), self.config.outcome_share_min)[fresh])
 			end["real"].append(real[fresh])
 			end["price"].append(price[fresh])
+			if "actions" in end:
+				end["actions"].append(actions_ahead(game)[fresh])
 			if privileged is not None:
 				privileged.append(privileged_rivals(game, fresh, len(decisions), self.empire))
 			decisions += [d for d, keep in zip(game.decisions, fresh) if keep]

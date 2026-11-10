@@ -1016,7 +1016,8 @@ def ppo_update(
 	advantages [N]: the policy's (labels.horizon_advantages; nan: no credit, left out of the policy's loss), or None
 	for the mix of returns [N] (the label mix minus the decisions' price) minus the heads' mix (weights).
 	end or None: the end head's, {"targets" [N]: its grades (labels.end_targets), "real" [N] (labels.end_labels),
-	"step", "week" [N]: indices into these decisions (labels.end_steps), "price" [N] (labels.label's), "weight": the
+	"step", "week" [N]: indices into these decisions (labels.end_steps), "price" [N] (labels.label's), "actions" [N]
+	(labels.actions_ahead; only with config.schedule_action_price), "weight": the
 	end credit's share of the policy's advantage, "outcome": the week's share in it (labels.end_advantages)}; the end
 	credit is computed here, from V_end of the model as the update starts (the KL anchor's pass), and blended with
 	advantages (labels.blend_credit) before they are normalized. decode(rows) gives the inputs of those decisions
@@ -1284,6 +1285,14 @@ def ppo_update(
 		known = torch.isfinite(advantage)
 		if int(known.sum()) > 1:
 			schedule_stats = {"schedule_share_weight": float(w[known].mean()), "schedule_share_std": float(change[known].std()), "schedule_growth_std": float(grow[known].std()), "schedule_share_trust": float(share_trust), "schedule_growth_trust": float(growth_trust), **step_stats}
+		# The actions' price (config.schedule_action_price; the user, 2026-11-09): the 7-day outcome less a tiny amount for
+		# each action the player makes from this decision on through that week (labels.actions_ahead, the learner's
+		# end["actions"]), so that of two ways to the same outcome the one with fewer actions is the better
+		if config.schedule_action_price > 0 and end is not None and "actions" in end:
+			charged = config.schedule_action_price * torch.from_numpy(np.asarray(end["actions"], dtype=np.float32)).to(device)
+			if int(known.sum()) > 1:
+				schedule_stats.update(schedule_action_price_mean=float(charged[known].mean()), schedule_action_price_std=float(charged[known].std()))
+			advantage = advantage - charged
 	if end is not None and end["weight"] > 0:  # the policy's credit moves toward the end's as V_end proves itself
 		turn = choices(decisions)["kind"] == c.DecisionKind.TURN
 		later = end_advantages(end_now.cpu().numpy(), end["step"], end["week"], end["real"], end["price"], turn, config.decision_price, end["outcome"])

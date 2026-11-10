@@ -350,3 +350,72 @@ def test_an_end_agrees_with_the_advice_of_an_end_whatever_its_index():
 	assert agrees(ours(c.ActionType.ARMY, 7, (c.ActionType.ARMY, 7, -1)))
 	assert not agrees(ours(c.ActionType.ARMY, 7, (c.ActionType.ARMY, 8, -1)))
 	assert not agrees(ours(c.ActionType.ARMY, 7, (c.ActionType.END, 0, -1)))
+
+
+def test_an_update_runs_with_the_schedule_credits_action_price(tmp_path):
+	"""CampaignLearner.step end to end with credit "schedule" and config.schedule_action_price (the user, 2026-11-09):
+	each decision's actions through its week (labels.actions_ahead) reach the update with the end's arrays, and the
+	update's stats carry the charge; with the price at 0 (the default) none are counted."""
+	import collections
+	import dataclasses
+
+	import torch
+
+	from campaign_model.empire import EmpireConfig
+	from campaign_model.labels import LabelConfig
+	from campaign_model.learner import COLUMNS
+	from campaign_model.model import build_model
+	from campaign_model.schema import random_inputs
+	from campaign_model.tests.test_model import encoded
+	from campaign_model.tests.test_train import decisions_for
+	from campaign_model.train import make_optimizer
+	import campaign_model.learner as learner_module
+
+	seen = []
+	real_update = learner_module.ppo_update
+
+	def spy(*args, **kwargs):
+		seen.append(kwargs.get("end"))
+		return real_update(*args, **kwargs)
+
+	for price in (2e-6, 0.0):
+		torch.manual_seed(6)
+		kwargs = {"dim": 32, "cell_dim": 16, "heads": 4, "layers": 1, "architecture": "v2", "share_target": "change"}
+		model = build_model(kwargs).eval()
+		config = CampaignConfig(decisions_per_update=8, min_games_per_update=2, batch_size=4, passes=1, learner="thread", device="cpu", credit="schedule", share_target="change", model_architecture="v2", noise_every=0, schedule_action_price=price)
+		games = []
+		for g in range(2):
+			x = random_inputs(8, seed=30 + g)
+			decisions = [dataclasses.replace(d, inputs=encoded(x, b), day=1 + b // 3) for b, d in enumerate(decisions_for(model, x, seed=g))]
+			games.append((Game(decisions=decisions, ledgers={d: snapshot(d, 1000 + 300 * d, 1000) for d in range(1, 14)}, days=12), SimpleNamespace(seconds=1.0, map_name="Maps/alpha_random/x")))
+
+		class Writer:
+			def add_scalar(self, *args):
+				pass
+
+			def flush(self):
+				pass
+
+		out = tmp_path / str(price)
+		out.mkdir()
+		learner = SimpleNamespace(
+			config=config, labels=LabelConfig(), empire=EmpireConfig(), version=1, finished=list(games), lock=threading.Condition(), stats=collections.Counter(),
+			model=model, optimizer=make_optimizer(model, config), device=torch.device("cpu"), worker=None, model_lock=threading.Lock(), lr_scale=1.0,
+			server=SimpleNamespace(set_model=lambda *args: None), teacher=None, teacher_weight=0.0, games_used=0, out=out, kwargs=kwargs, value_ev=None, credit_evidence={}, credit_check=1.0, head_ev={"Vend": 0.2}, value_pool=None, head_pool={}, progress=out / "progress.csv", writer=Writer(),
+			features_cpu=model.features, trust_ema=None, grad_clips=None, clip_samples=[], head_residual=None, head_var_slow=None, head_residual_updates=0,
+		)
+		for name in ("_take", "trust", "trust_today", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting", "loss_shares", "loss_weights", "_note_gradients", "_head_scale", "_calibrate_clips"):
+			setattr(learner, name, getattr(CampaignLearner, name).__get__(learner))
+		learner.progress.write_text(",".join(COLUMNS) + "\n")
+		learner_module.ppo_update = spy
+		try:
+			assert CampaignLearner.step(learner, epoch=1)
+		finally:
+			learner_module.ppo_update = real_update
+		assert learner.version == 2
+		end = seen[-1]
+		if price:
+			counted = sum(len(game.decisions) for game, _ in games)
+			assert len(end["actions"]) == len(end["price"]) == counted and float(end["actions"].max()) >= 1 and float(end["actions"].min()) >= 0
+		else:
+			assert "actions" not in end

@@ -665,3 +665,28 @@ def test_the_step_credits_classes_and_its_share_forecasts_trust():
 	holes[::2] = float("nan")
 	assert forecast_trust(holes, signal, 1.0) == pytest.approx(0.5, abs=0.04)
 	assert forecast_trust(torch.full((4,), float("nan")), torch.zeros(4), 0.4) == 0.0
+
+
+def test_the_schedule_credits_action_price_charges_each_decision_its_actions_ahead():
+	"""config.schedule_action_price with the learner's end["actions"] (labels.actions_ahead): the update runs and its
+	stats carry the charge (the price x the count); at 0 (the default), or without the counts, nothing of it."""
+	from campaign_model.model import build_model
+
+	torch.manual_seed(3)
+	model = build_model({"dim": 32, "cell_dim": 16, "heads": 4, "layers": 1, "architecture": "v2", "share_target": "change"})
+	x = random_inputs(8, seed=11)
+	decisions = decisions_for(model.eval(), x)
+	targets = np.full((8, c.N_VALUE_OFFSETS), 0.55, dtype=np.float32)
+	growth_real = np.full((8, c.N_VALUE_OFFSETS), 10.0, dtype=np.float32)
+	growth_real[7:] = np.nan  # (the last: no 7-day outcome, no credit and no charge counted)
+	actions = np.array([8, 7, 6, 5, 4, 3, 2, 100], dtype=np.float32)
+	end = {"targets": np.full(8, 0.5, np.float32), "real": np.full(8, 0.5, np.float32), "step": np.array([1, 2, 3, 4, 5, 6, 7, -1]), "week": np.full(8, -1), "price": np.zeros(8, np.float32), "outcome": 0.5, "weight": 0.0}
+	decode = lambda rows: {k: v[rows] for k, v in x.items()}  # noqa: E731
+	run = lambda config, end: ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, targets, np.zeros(8, dtype=np.float32), config, decode=decode, growth_real=growth_real, end=end, share_trust=0.4, growth_trust=1.0)[0]  # noqa: E731
+	on = CampaignConfig(batch_size=4, passes=1, credit="schedule", share_target="change", schedule_action_price=2e-6)
+	metrics = run(on, {**end, "actions": actions})
+	assert metrics["schedule_action_price_mean"] == pytest.approx(2e-6 * actions[:7].mean(), rel=1e-4) and np.isfinite(metrics["kl"]) and metrics["steps"] >= 1
+	assert metrics["schedule_action_price_std"] == pytest.approx(2e-6 * actions[:7].std(ddof=1), rel=1e-3)
+	assert "schedule_action_price_mean" not in run(on, end)  # (no counts: an older caller)
+	off = CampaignConfig(batch_size=4, passes=1, credit="schedule", share_target="change")
+	assert off.schedule_action_price == 0.0 and "schedule_action_price_mean" not in run(off, {**end, "actions": actions})

@@ -3,7 +3,7 @@ import pytest
 
 from campaign_model import constants as c
 from campaign_model.empire import empire_value
-from campaign_model.labels import LabelConfig, blend_credit, end_advantages, end_labels, end_steps, end_targets, growth_labels, label, ladder_targets
+from campaign_model.labels import LabelConfig, actions_ahead, blend_credit, end_advantages, end_labels, end_steps, end_targets, growth_labels, label, ladder_targets
 from campaign_model.records import Decision, Game
 
 TURN = int(c.DecisionKind.TURN)
@@ -279,3 +279,29 @@ def test_share_change_labels_are_the_logit_change_from_the_start_of_the_decision
 	assert labels[0, 0] == pytest.approx(0.5 + math.log(3) / (2 * SHARE_CHANGE_CAP), abs=1e-5)
 	late = Game(decisions=[decision("RED", 10)], ledgers=ledgers, days=30)
 	assert np.isnan(share_change_labels(late)[0, -1])  # (day 17: past the last day played)
+
+
+def test_actions_ahead_counts_the_players_own_actions_from_the_decision_through_its_week():
+	"""labels.actions_ahead (config.schedule_action_price): each decision's count of the player's turn and exchange
+	decisions other than END from it on, itself included, through day d + 7; a question and an END count for nothing,
+	another player's decisions are its own, the eighth day on is out of the window."""
+	def d(color, day, action, kind=TURN):
+		return Decision(color, day, kind, 0, 1, int(action), 0, -1, 0.0, (0.5,) * c.N_VALUE_OFFSETS, 0, b"")
+
+	A, X, Q = c.ActionType, int(c.DecisionKind.EXCHANGE), int(c.DecisionKind.YES_NO)
+	game = Game(decisions=[
+		d("RED", 1, A.MOVE),  # 0: itself, the exchange's MULTI, day 2's two moves, day 8's build
+		d("RED", 1, A.MULTI, X),  # 1
+		d("RED", 1, -1, Q),  # 2: a question: not an action, counts what follows
+		d("BLUE", 1, A.BUILD),  # 3: BLUE's only action
+		d("RED", 1, A.END),  # 4
+		d("BLUE", 1, A.END),  # 5
+		d("RED", 2, A.MOVE),  # 6
+		d("RED", 2, A.MOVE),  # 7
+		d("RED", 2, A.END),  # 8
+		d("RED", 8, A.BUILD),  # 9: day 1 + 7: inside day 1's window
+		d("RED", 9, A.RECRUIT),  # 10: day 2 + 7: inside day 2's window, outside day 1's
+		d("RED", 10, A.MOVE),  # 11: outside both
+	])
+	assert actions_ahead(game).tolist() == [5, 4, 3, 1, 3, 0, 4, 3, 2, 3, 2, 1]
+	assert actions_ahead(game, days=0).tolist() == [2, 1, 0, 1, 0, 0, 2, 1, 0, 1, 1, 1]  # (the day's own)
