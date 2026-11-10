@@ -140,7 +140,7 @@ def test_a_phase_that_moves_the_policy_past_kl_max_is_undone_bit_for_bit():
 	readings = phase.run(model, replay, torch.device("cpu"), steps=10, batch_size=32, kl_weight=0.0, seconds=120, held_out_version=6)
 	assert readings["aux_rejected"] == 1 and readings["aux_kl_check"] > 3e-4, readings
 	assert all(torch.equal(start[name], value) for name, value in model.state_dict().items())
-	assert phase.steps_done == 0 and not phase.optimizer.state  # (cold again)
+	assert phase.steps_done == 0 and not phase.optimizer.state and phase.pending is None  # (cold again; nothing to judge)
 
 
 def test_an_error_in_the_phase_puts_the_weights_back_and_guarded_run_turns_it_off(capsys):
@@ -177,3 +177,62 @@ def test_the_phase_warms_its_rates_and_its_state_goes_through_a_checkpoint():
 	_, _, other = setup_phase(rates=1e-4, kl_max=1.0)
 	other.load_state_dict(saved)
 	assert other.steps_done == 1 and len(other.optimizer.state_dict()["state"]) == len(saved["optimizer"]["state"])
+
+
+def test_the_replay_tells_each_add_apart():
+	heads = BattleModel().eval()({k: torch.from_numpy(v) for k, v in random_inputs(batch=1).items()})["value"].shape[1]
+	replay = ValueReplay(max_decisions=1000, max_age=8, per_battle=3, seed=0)
+	replay.add([battle_item(1, 7, 5, heads)], version=5)
+	replay.add([battle_item(2, 9, 5, heads), battle_item(3, 2, 6, heads)], version=6)  # (a version can span adds)
+	assert replay.adds == 2 and replay.decisions(only_add=1) == 3 and replay.decisions(only_add=2) == 5
+	assert replay.batch(100, torch.device("cpu"), only_add=2)["value_labels"].shape[0] == 5
+
+
+class Constant(torch.nn.Module):
+	"""A stand-in that predicts one value for every head of every decision (value_logit: all judge reads)."""
+
+	def __init__(self, logit, heads):
+		super().__init__()
+		self.logit, self.heads = logit, heads
+
+	def forward(self, inputs):
+		return {"value_logit": torch.full((next(iter(inputs.values())).shape[0], self.heads), self.logit)}
+
+
+def test_the_phase_stops_itself_when_the_battles_after_it_say_it_hurts(capsys):
+	"""judge: a phase's models before and after it, read on the next add()'s battles. One that makes V worse there every
+	time: the first window after the start not judged (e5: the warm-up's), the second stops the phase with one FAILURE line
+	naming its readings, and guarded_run then gives None without a step; one that makes V better never stops."""
+	from battle_model.aux_value import WINDOW, guarded_run
+	from battle_model.losses import PPOConfig
+
+	for worse in (True, False):
+		model, replay, phase = setup_phase(rates=1e-4)
+		heads = replay.entries[0]["value_labels"].shape[1]
+		good, bad = Constant(0.0, heads), Constant(3.0, heads)  # (V 0, and V ~1 against labels spread over -1..1)
+		for k in range(2 * WINDOW):
+			phase.pending = ((good, bad) if worse else (bad, good)) + (replay.adds,)
+			replay.add([battle_item(100 + k, 8, 7 + k, heads)], version=7 + k)
+			change = phase.judge(replay, torch.device("cpu"), PPOConfig(), 64)["aux_fresh_change"]
+			assert (change > 0) == worse, change
+			if k == WINDOW - 1:
+				assert phase.on and capsys.readouterr().out == ""  # (the first window: the warm-up's, not judged)
+		out = capsys.readouterr().out
+		assert phase.on != worse and out.count("aux: FAILURE") == int(worse), out
+		if worse:
+			assert f"fresh readings {WINDOW + 1}-{2 * WINDOW} of this start" in out
+			readings, still = guarded_run(phase, model, replay, torch.device("cpu"), steps=2, batch_size=32, kl_weight=10.0, seconds=120, held_out_version=6)
+			assert still is None and readings["aux_steps"] == 0
+
+
+def test_a_phase_is_read_on_the_battles_that_come_after_it():
+	"""A phase that took steps leaves its models before and after; the next phase reads them on the battles added since
+	(aux_fresh_change), before its own steps; the first phase of a start has nothing to read."""
+	model, replay, phase = setup_phase(rates=1e-4, kl_max=1.0)
+	heads = replay.entries[0]["value_labels"].shape[1]
+	first = phase.run(model, replay, torch.device("cpu"), steps=2, batch_size=32, kl_weight=10.0, seconds=120, held_out_version=6)
+	assert "aux_fresh_change" not in first and phase.pending is not None and phase.pending[2] == replay.adds == 1
+	assert not any(p.requires_grad for p in phase.pending[1].parameters())
+	replay.add([battle_item(70 + s, 8, 7, heads) for s in range(3)], version=7)
+	second = phase.run(model, replay, torch.device("cpu"), steps=2, batch_size=32, kl_weight=10.0, seconds=120, held_out_version=7)
+	assert np.isfinite(second["aux_fresh_change"]) and second["aux_steps"] == 2 and phase.pending[2] == 2

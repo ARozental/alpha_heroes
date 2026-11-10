@@ -331,7 +331,7 @@ def run_dir(config, new=False):
 # The share of an update's gradient that other battles repeat, raw and as applied (optim.SignalShare), and the games an
 # update's gradient rests on by its decisions' weights and by their count ((sum)^2 / sum of squares over its games)
 SIGNAL_COLUMNS = (*(f"signal_share_{g}" for g in ("trunk", "priors", "values")), *(f"signal_share_applied_{g}" for g in ("trunk", "priors", "values")), "games_by_weight", "games_by_decisions")
-AUX_COLUMNS = ("aux_steps", "aux_seconds", "aux_value_loss", "aux_kl", "aux_grad_cosine", "aux_trunk_move", "aux_excess_before", "aux_excess_after", "aux_kl_held_out", "aux_kl_check", "aux_skipped", "aux_rejected", "aux_failed", "aux_replay_decisions")
+AUX_COLUMNS = ("aux_steps", "aux_seconds", "aux_value_loss", "aux_kl", "aux_grad_cosine", "aux_trunk_move", "aux_excess_before", "aux_excess_after", "aux_fresh_change", "aux_kl_held_out", "aux_kl_check", "aux_skipped", "aux_rejected", "aux_failed", "aux_replay_decisions")
 
 # Action types whose share of each side's decisions is logged every epoch (actions_<side>/<type> in TensorBoard)
 ACTION_KINDS = ("WAIT", "DEFEND", "MOVE", "MELEE", "SHOOT", "HERO_SPELL", "CREATURE_SPELL", "RETREAT", "SURRENDER")
