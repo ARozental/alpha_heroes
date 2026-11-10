@@ -188,6 +188,21 @@ class TrainConfig:
 	# learning_rate x this. No teacher or balancer here: the critic's one handicap was the shared rate
 	value_lr_factor: float = 10.0
 	value_lr_kl: bool = False  # the KL control's lr_scale scales the values' group too (False: the policy's KL never moves them)
+	# The value's own phase (aux_value.py; 2026-11-10, Phasic Policy Gradient's auxiliary phase): after each battle update
+	# (in the time the trainer waits for battles), up to aux_steps steps of aux_batch decisions from a replay of the last
+	# aux_replay_age versions' battles (aux_per_battle decisions spread over each, at most aux_replay_decisions), on
+	# value_loss + aux_kl_weight x KL(policy as the phase starts || now), its own Adam, each group at its rate x
+	# aux_lr_factor (the user's cap on the trunk holds), at most aux_seconds; never beside a campaign update
+	# (aux_allowed). Its readings in the next update's row (aux_*). Off: False
+	aux_value: bool = False
+	aux_steps: int = 8
+	aux_batch: int = 512
+	aux_seconds: float = 20.0
+	aux_kl_weight: float = 10.0  # (tests: 3.6e-3 of KL on a fixed batch against 2.4e-2 without, the value's loss as low)
+	aux_lr_factor: float = 1.0
+	aux_replay_decisions: int = 20_000
+	aux_replay_age: int = 8
+	aux_per_battle: int = 5
 	# The trunk's momentum (docs/optimizer_plan.md step 5, the battle's since 2026-11-06): Adam's beta1 for the trunk group
 	# (the priors' and the values' stay 0.9). The battle trunk's gradient read as pure noise a step (signal fraction ~0,
 	# since 8797125 cut accumulate 24 -> 2: 512 decisions a step): at 0.95 each step's direction averages ~20 steps,
@@ -307,6 +322,8 @@ def run_dir(config, new=False):
 	return TRAIN_ROOT / f"{time.strftime('%Y%m%d-%H%M')}-{config.run}"
 
 
+AUX_COLUMNS = ("aux_steps", "aux_seconds", "aux_value_loss", "aux_kl", "aux_grad_cosine", "aux_trunk_move", "aux_excess_before", "aux_excess_after", "aux_kl_held_out", "aux_replay_decisions")
+
 # Action types whose share of each side's decisions is logged every epoch (actions_<side>/<type> in TensorBoard)
 ACTION_KINDS = ("WAIT", "DEFEND", "MOVE", "MELEE", "SHOOT", "HERO_SPELL", "CREATURE_SPELL", "RETREAT", "SURRENDER")
 
@@ -326,6 +343,8 @@ COLUMNS = [
 	# the values' rate
 	"grad_norm", *(f"grad_norm_{g}" for g in ("trunk", "priors", "values")), *(f"clip_bound_{g}" for g in ("trunk", "priors", "values")),
 	"signal_fraction", *(f"signal_fraction_{g}" for g in ("trunk", "priors", "values")), "value_learning_rate", "clipped_by_group",
+	# The value's own phase after the previous update (config.aux_value; aux_value.AuxValuePhase.run's readings)
+	*AUX_COLUMNS,
 ]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
 # error. decisions: all decisions of the epoch; rounds: attack + defence battle rounds, averaged over the games.
@@ -357,6 +376,7 @@ TENSORBOARD_TAGS = {
 	"attack_win_rate": "won/attack", "defence_win_rate": "won/defence",
 	"policy_loss": "loss/policy", "value_loss": "loss/value", "value_loss_fresh": VALUE_LOSS_TAB, "value_loss_fresh_real": VALUE_LOSS_TAB + "_real", "value_loss_fresh_generated": VALUE_LOSS_TAB + "_generated", "entropy": "loss/entropy", "below_floor": "loss/entropy_below_floor",
 	"signal_ratio": "stability/signal_ratio", "weight_change": "stability/weight_change", "approx_kl": "stability/approx_kl", "clip_fraction": "stability/clip_fraction",
+	**{name: f"aux/{name[4:]}" for name in AUX_COLUMNS},  # the value's own phase (config.aux_value)
 	"attack_advantage_std": "advantage_std/attack", "defence_advantage_std": "advantage_std/defence", "attack_advantage_scale": "advantage_scale/attack", "defence_advantage_scale": "advantage_scale/defence",
 	"attack_value_error": "value_error/attack", "defence_value_error": "value_error/defence",
 	"decisions": "battle/decisions", "rounds": "battle/rounds", "seconds": "time/epoch_seconds",
@@ -1367,6 +1387,15 @@ def train(config, resume=False):
 		last_eval -= time.time() - (out / "eval_total.csv").stat().st_mtime
 	elapsed = lambda: elapsed_before + time.monotonic() - run_started
 	last_campaign = time.monotonic()  # (learner "turns": when the campaign's last update ended)
+	replay = aux_phase = None  # (config.aux_value: the value's own phase, aux_value.py)
+	aux_readings = {}
+	if config.aux_value and pool is not None:
+		from .aux_value import AuxValuePhase, ValueReplay, aux_allowed
+
+		replay = ValueReplay(config.aux_replay_decisions, config.aux_replay_age, config.aux_per_battle, seed=first_epoch)
+		groups = battle_parameter_groups(model)
+		aux_phase = AuxValuePhase(groups, {name: battle_group_lr({"name": name}, config) * config.aux_lr_factor for name in groups}, betas=(0.9, config.adam_beta2))
+		pool.replay = replay  # (its memory in the trainer's census)
 	for group in optimizer.param_groups:
 		group["betas"] = (group["betas"][0], config.adam_beta2)
 	try:
@@ -1408,6 +1437,8 @@ def train(config, resume=False):
 				from .supply import assemble
 
 				batch_all, summaries = assemble(items, advantage_config, device=device if device.type == "cuda" else None)  # (the sparse inputs dense on the GPU: supply.dense_on)
+				if replay is not None:
+					replay.add(items, pool.version)  # (a few decisions of each battle, for the value's own phase)
 				n_examples = int(batch_all["advantage"].shape[0]) if batch_all is not None else 0
 			else:
 				loader, summaries, _ = make_dataloader(records, config.batch_size, True, reward_config, advantage_config)
@@ -1605,7 +1636,9 @@ def train(config, resume=False):
 				**{f"train_{k}": v for k, v in (failure_modes(counts=sum_failure_counts(items)) if pool else failure_modes(records)).items()},  # the same signs of dumb play, in training
 				**{f"foresight_{k}": round(mean[f"foresight_{k}"], 5) for k in FORESIGHT_PARTS},
 				**gradient_check,
+				**{key: (round(value, 6) if isinstance(value, float) else value) for key, value in aux_readings.items()},  # (the phase after the previous update)
 			}
+			aux_readings = {}
 			for side, name in ((0, "attack"), (1, "defence")):
 				kinds = Counter()
 				if pool:
@@ -1658,6 +1691,11 @@ def train(config, resume=False):
 				campaign.note_epoch(epoch)  # (its updates run in its own thread)
 			if campaign:
 				campaign.check()  # (a background evaluation that failed)
+			if aux_phase is not None and aux_allowed(campaign, config):
+				# The value's own phase (aux_value.py), before the eval's snapshot and the checkpoint: they hold its weights
+				newest = max((e["version"] for e in replay.entries), default=None)
+				aux_readings = aux_phase.run(model, replay, device, steps=config.aux_steps, batch_size=config.aux_batch, kl_weight=config.aux_kl_weight, seconds=config.aux_seconds, clip=config.grad_clip, ppo_config=ppo_config, held_out_version=newest)
+				aux_readings["aux_replay_decisions"] = replay.decisions()
 			if evals.error:
 				raise evals.error
 			idle = not evals.running()

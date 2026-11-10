@@ -782,6 +782,9 @@ class Supply:
 		with self.pool.lock:
 			buffer = list(self.pool.buffer)
 		parts.append(f"battle buffer {len(buffer)} battles, {sum(b['decisions'] for b in buffer)} decisions, {sum(held_bytes(b.get('data')) for b in buffer) / 2**20:.0f} MB")
+		replay = getattr(self.pool, "replay", None)  # (train.py: config.aux_value's replay, aux_value.ValueReplay)
+		if replay is not None:
+			parts.append(f"value replay {len(replay.entries)} battles, {replay.decisions()} decisions, {replay.bytes / 2**20:.0f} MB")
 		if torch.cuda.is_available():
 			host = torch.cuda.host_memory_stats()
 			parts.append(f"pinned host {host.get('reserved_bytes.current', host.get('allocated_bytes.current', 0)) / 2**30:.2f} GB")
