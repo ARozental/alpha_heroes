@@ -7,8 +7,8 @@
 
 namespace MapSchema
 {
-constexpr int SCHEMA_VERSION = 16;
-constexpr const char * CONTRACT_HASH = "af140bae78f29230";
+constexpr int SCHEMA_VERSION = 17;
+constexpr const char * CONTRACT_HASH = "8789fc40ab7d59e8";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;
@@ -58,6 +58,7 @@ constexpr int TILE_GUARDED = 32;
 constexpr int TILE_VISITED_BY_PLAYER = 64;
 constexpr int TILE_VISITED_BY_HERO = 128;
 constexpr int TILE_EXACT_COUNT = 256;
+constexpr int TILE_UNSEEN_EXIT = 512;
 constexpr int MAP_OBJECTS = 8192;
 constexpr int ARMED_OBJECTS = 32;
 constexpr int MAP_GRID = 36;
@@ -67,6 +68,7 @@ constexpr int N_GRID_COUNTS = 5;
 constexpr int OBJECT_VISITED_BY_PLAYER = 1;
 constexpr int OBJECT_EXACT_COUNT = 2;
 constexpr int OBJECT_GUARDED = 4;
+constexpr int OBJECT_UNSEEN_EXIT = 8;
 constexpr int TRAVEL_GRID = 18;
 constexpr int MAP_SIDE_MAX = 8;
 constexpr int OBJECT_VOCAB = 256;
@@ -325,6 +327,8 @@ enum class In : int
 	h_drop,
 	h_drop_kept,
 	army_slot_mask,
+	w_extra,
+	w_extra_pos,
 	COUNT
 };
 
@@ -474,6 +478,8 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"h_drop", DType::BOOL, 3, {8, 2, 7, 1}, 0},
 	TensorSpec{"h_drop_kept", DType::BOOL, 2, {8, 2, 1, 1}, 0},
 	TensorSpec{"army_slot_mask", DType::BOOL, 4, {17, 7, 17, 7}, 0},
+	TensorSpec{"w_extra", DType::INT64, 1, {8, 1, 1, 1}, 0},
+	TensorSpec{"w_extra_pos", DType::INT64, 2, {8, 3, 1, 1}, 0},
 }};
 
 enum class Out : int

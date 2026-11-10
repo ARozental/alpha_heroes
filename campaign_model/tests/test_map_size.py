@@ -55,9 +55,9 @@ def test_block_indices_at_side_1_are_the_tile_indices():
 	positions[..., 2] = positions[..., 2].clamp(0, 2)
 	one = torch.ones(b, dtype=torch.long)
 	assert all(torch.equal(a, e) for a, e in zip(map_index(positions, b, one), map_index(positions, b)))
-	x = {"h_pos": positions[:, :HO].clone() if positions.shape[1] >= HO else torch.cat([positions, positions], dim=1)[:, :HO]}
+	middles = (positions[:, :HO].clone() if positions.shape[1] >= HO else torch.cat([positions, positions], dim=1)[:, :HO]).reshape(-1, 3)
 	windows = torch.arange(b * HO)
-	assert torch.equal(window_tile_index(x, windows, one), window_tile_index(x, windows))
+	assert torch.equal(window_tile_index(middles, windows, one), window_tile_index(middles, windows))
 	delta = torch.from_numpy(rng.integers(-60, 60, (b, 5, 7, 3))).long()
 	assert torch.equal(distance_buckets(delta, one[:, None, None]), distance_buckets(delta))
 
@@ -73,7 +73,7 @@ def test_a_144_map_maps_tiles_to_blocks_of_4():
 	index, inside = map_index(positions, b, sides)
 	assert inside.all() and (index >= 0).all() and (index < b * L * S * S).all()
 	windows = torch.arange(b * HO)
-	tiles = window_tile_index({"h_pos": positions}, windows, sides)
+	tiles = window_tile_index(positions.reshape(-1, 3), windows, sides)
 	for k in range(b * HO):
 		cells = tiles[k][tiles[k] >= 0]
 		assert len(torch.unique(cells)) <= 9 * 9 and (cells < L * S * S).all()

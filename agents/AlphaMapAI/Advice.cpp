@@ -133,11 +133,9 @@ void planEntries(const Decision & decision, const NK2AI::Goals::TTaskVec & plan,
 			{
 				if(!node.targetHero || decision.heroes[i] != node.targetHero->id)
 					continue;
-				const auto & center = decision.centers[i];
-				const int row = node.coord.y - center.y + WINDOW_RADIUS;
-				const int column = node.coord.x - center.x + WINDOW_RADIUS;
-				if(node.coord != center && node.coord.z == center.z && row >= 0 && row < WINDOW && column >= 0 && column < WINDOW && decision.inputs.get(In::move_mask, i, row, column) != 0)
-					out.insert({static_cast<int>(ActionType::MOVE), (i * WINDOW + row) * WINDOW + column});
+				// (any of the hero's windows: a tile of its path past a gate is a MOVE's target since schema 17)
+				if(const int entry = decision.moveEntry(i, node.coord); entry >= 0)
+					out.insert({static_cast<int>(ActionType::MOVE), entry});
 				if(node.turns >= 1 && node.coord.z >= 0 && node.coord.z < MAP_LEVELS)
 				{
 					const int index = ((i * MAP_LEVELS + node.coord.z) * TRAVEL_GRID + std::min(node.coord.y / area, TRAVEL_GRID - 1)) * TRAVEL_GRID + std::min(node.coord.x / area, TRAVEL_GRID - 1);

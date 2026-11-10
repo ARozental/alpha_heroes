@@ -51,12 +51,22 @@ struct Decision
 	std::array<ObjectInstanceID, MapSchema::N_TOWNS> towns;     // town tokens
 	std::array<ObjectInstanceID, MapSchema::N_HOLDERS> holders; // army holders (ARMY, UPGRADE)
 	std::array<int3, MapSchema::OWN_HEROES> centers;            // the tile in the middle of each window
+	// Each window slot's hero token, -1 none (schema 17): the slot's own hero, or in a slot no hero of ours holds one more
+	// window of a hero we have (w_extra), around tiles it reaches today that its own window does not show
+	std::array<int, MapSchema::OWN_HEROES> windowHero;
 	std::array<std::unordered_map<int, Entry>, MapSchema::N_ACTION_TYPES> entries;
 	std::vector<int> answers; // the reply to send for each option of a question
 	// The model's resource_worth for it (schema 12): what a purchase short of resources trades away the least of
 	std::array<float, MapSchema::N_RESOURCES> worth{};
 
-	int3 windowTile(int hero, int row, int column) const;
+	Decision() { windowHero.fill(-1); }
+	int3 windowTile(int window, int row, int column) const;
+	/// MOVE's entry that takes our hero token `hero` to `tile` (the first of its windows that shows the tile, where
+	/// move_mask allows it), -1 none
+	int moveEntry(int hero, const int3 & tile) const;
+	/// A choice's entry as the next decision's g_last_index echoes it: a MOVE's window slot as its hero's token (the
+	/// model reads the first axis as the hero the decision was about: features.last_actors)
+	int echoIndex(int type, int index) const;
 	int holderOf(ObjectInstanceID id) const;
 };
 
@@ -193,6 +203,9 @@ class AlphaMapAI : public CAdventureAI
 	// The objects whose guards a question has shown us (encodeQuestionGuards): their armies in a_* from then on, as they
 	// are each time (after a battle, a new week), as a scouted bank's or guarded artifact's army shows to a human
 	std::set<ObjectInstanceID> revealedGuards;
+	// The teleport channels a hero of ours entered and found to lead nowhere (showTeleportDialog's impassable: a gate
+	// with no other end): their entrances are no unseen exits from then on (unseenExit)
+	std::set<TeleportChannelID> deadChannels;
 	bool done = false;
 	// (action type, table entry, target tile) of the actions that changed nothing since the state last changed: not
 	// offered again until something changes (dropFutile), else the same no-op could be chosen MAX_DECISIONS_PER_DAY
@@ -359,6 +372,8 @@ private:
 	void encodeHeroes(Decision & decision, PathfinderCache & paths);
 	void encodeTowns(Decision & decision);
 	void encodeWindows(Decision & decision, PathfinderCache & paths);
+	/// A teleporter's entrance none of whose exits we have seen (TILE_UNSEEN_EXIT, OBJECT_UNSEEN_EXIT)
+	bool unseenExit(const CGObjectInstance * obj) const;
 	void encodeMap(Decision & decision, const std::vector<int3> & ours);
 	void encodeTiles(Decision & decision);
 	void encodeTileBlocks(Decision & decision, const std::vector<const CGHeroInstance *> & heroes, int side); // (a map bigger than MAP_TILES a side)

@@ -276,6 +276,7 @@ void AlphaMapAI::makeTurn()
 			else
 				futile.clear(); // the state changed: what failed before may work now
 			lastChoice = choice;
+			lastChoice.index = decision.echoIndex(choice.type, choice.index);
 			lastChanged = changed ? 1 : 0;
 		}
 		waitTillFree();
@@ -1147,6 +1148,8 @@ void AlphaMapAI::showTeleportDialog(const CGHeroInstance * hero, TeleportChannel
 {
 	// Not a model decision (rare: monoliths with several exits): the exit the path goes through, else the engine's choice
 	addQuery(askID, "teleport");
+	if(impassable) // (a gate with no other end: its entrances are no unseen exits from now on, Encoder's unseenExit)
+		deadChannels.insert(channel);
 	int chosen = -1;
 	for(size_t i = 0; i < exits.size(); ++i)
 	{

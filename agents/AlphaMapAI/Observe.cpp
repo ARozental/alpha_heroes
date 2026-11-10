@@ -208,6 +208,7 @@ void AlphaMapAI::observe(const CPackForServer * pack, bool byPlayer)
 		{
 			++decisionsToday;
 			lastChoice = choice;
+			lastChoice.index = decision.echoIndex(choice.type, choice.index);
 			lastChanged = 1;
 		}
 		if(choice.type == static_cast<int>(ActionType::END))

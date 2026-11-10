@@ -72,10 +72,18 @@ bool AlphaMapAI::execute(const Decision & decision, const Choice & choice)
 	const auto before = fingerprint(*cb);
 	if(type == ActionType::MOVE)
 	{
+		// (window slot, tile): the slot's hero is its own, or in a slot no hero holds the hero whose further window it
+		// carries (schema 17, Decision::windowHero)
 		const int cells = WINDOW * WINDOW;
-		const int hero = choice.index / cells;
+		const int window = choice.index / cells;
 		const int cell = choice.index % cells;
-		moveHero(decision.heroes[hero], decision.windowTile(hero, cell / WINDOW, cell % WINDOW));
+		const int hero = window >= 0 && window < OWN_HEROES ? decision.windowHero[window] : -1;
+		if(hero < 0)
+		{
+			logAi->error("AlphaMapAI %s: MOVE entry %d is in window %d, which no hero has (the mask and the windows disagree)", playerID.toString(), choice.index, window);
+			return false;
+		}
+		moveHero(decision.heroes[hero], decision.windowTile(window, cell / WINDOW, cell % WINDOW));
 		return fingerprint(*cb) != before;
 	}
 	const auto & entries = decision.entries[choice.type];

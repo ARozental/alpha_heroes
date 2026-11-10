@@ -8,7 +8,7 @@ Every decision is one of two families:
 """
 from enum import IntEnum
 
-SCHEMA_VERSION = 16  # 16: ARMY's target slot (army_slot_mask in, at the end; army_slot_logp out; the slot in a record's cell), ARMY within one army and swaps, MULTI's SPLIT_SINGLES, MERGE_ALL and GARRISON_SWAP (multi_mask 11 kinds wide: a record of 15 read with its 8 widened); 15: MULTI's TAKE_BEST, TAKE_BEST_FAST, DROP_SLOW and DROP_FOREIGN (multi_mask 8 kinds wide: a record of 14 read with its 4 widened), their armies (x_take_*, h_drop*, after multi_mask); 14: MULTI (multi_mask, after x_heroes; older records read with it at 0), multi_logp out; 13: ARTIFACT (artifact_mask, after a_*; older records read with it at 0), artifact_logp out; 12: resource_worth out (a purchase short of resources trades for itself: AlphaMapAI pays with what is worth the least), the inputs as 11; 11: a question's guards and what its options do with them (o_battle, o_join, d_guard_*), the armed objects that fight a hero stepping on them (a_*: garrisons), after mem (older records read with them at 0); 10: the model's memory (mem in, memory out: a player's decisions carry it forward); 9: the whole map tile by tile (tile_*, MAP_TILES a side), for the model's map CNN (docs/campaign_model_v2_draft.md); 8: heroes' luck and morale with their parts until the next battle (h_luck, h_morale, h_battle_*), the spells of heroes for hire (g_tavern_spells); 7: what a hero for hire brings (g_tavern_exp, g_tavern_army_*, g_tavern_artifacts); 6: build_short (buildable but for resources); 5: every object we see (MAP_OBJECTS 8192), no g_objects (torch counts them); 4: RECRUIT's destination, TRAVEL's days, our previous decision (g_last_*); 3: the whole map (m_* objects, g_tiles, g_objects), TRAVEL, g_object_income, h_spell_cost; 2: counts as a human sees them
+SCHEMA_VERSION = 17  # 17: a hero's further windows (w_extra, w_extra_pos, at the end: older records read with them at 0, every window its slot's own hero's), in the window slots of absent heroes: a square around tiles it reaches today that its own window does not show (past a gate or a monolith, on the other level, more than WINDOW_RADIUS tiles down a road), their tiles MOVE targets as its own window's are; TILE_UNSEEN_EXIT and OBJECT_UNSEEN_EXIT (a teleporter's entrance no exit of which we have seen); 16: ARMY's target slot (army_slot_mask in, at the end; army_slot_logp out; the slot in a record's cell), ARMY within one army and swaps, MULTI's SPLIT_SINGLES, MERGE_ALL and GARRISON_SWAP (multi_mask 11 kinds wide: a record of 15 read with its 8 widened); 15: MULTI's TAKE_BEST, TAKE_BEST_FAST, DROP_SLOW and DROP_FOREIGN (multi_mask 8 kinds wide: a record of 14 read with its 4 widened), their armies (x_take_*, h_drop*, after multi_mask); 14: MULTI (multi_mask, after x_heroes; older records read with it at 0), multi_logp out; 13: ARTIFACT (artifact_mask, after a_*; older records read with it at 0), artifact_logp out; 12: resource_worth out (a purchase short of resources trades for itself: AlphaMapAI pays with what is worth the least), the inputs as 11; 11: a question's guards and what its options do with them (o_battle, o_join, d_guard_*), the armed objects that fight a hero stepping on them (a_*: garrisons), after mem (older records read with them at 0); 10: the model's memory (mem in, memory out: a player's decisions carry it forward); 9: the whole map tile by tile (tile_*, MAP_TILES a side), for the model's map CNN (docs/campaign_model_v2_draft.md); 8: heroes' luck and morale with their parts until the next battle (h_luck, h_morale, h_battle_*), the spells of heroes for hire (g_tavern_spells); 7: what a hero for hire brings (g_tavern_exp, g_tavern_army_*, g_tavern_artifacts); 6: build_short (buildable but for resources); 5: every object we see (MAP_OBJECTS 8192), no g_objects (torch counts them); 4: RECRUIT's destination, TRAVEL's days, our previous decision (g_last_*); 3: the whole map (m_* objects, g_tiles, g_objects), TRAVEL, g_object_income, h_spell_cost; 2: counts as a human sees them
 
 N_RESOURCES = 7  # wood, mercury, ore, sulfur, crystal, gems, gold (VCMI's order)
 
@@ -30,7 +30,14 @@ N_BUILDINGS = 44  # BuildingID 0..43 (DWELL_LVL_7_UP); later ids belong to mods
 N_TAVERN = 2  # heroes for hire
 
 # The map around each of our heroes: (2 R + 1)^2 tiles on the hero's level, the hero in the middle. A MOVE goes to a
-# tile of this window the hero reaches today; longer trips are several moves.
+# tile of this window the hero reaches today; longer trips are several moves. Schema 17: the tiles it reaches today
+# that this window does not show (through a gate or a monolith whose exit we have seen: the other level, a far part of
+# its own; further than R tiles down a road) are shown by a further window of the same hero (config.further_windows:
+# one), a square of the level that holds the most of them around the soonest reached there, in a window slot no hero
+# of ours holds (w_extra: the PC's games had 2.8 heroes a decision in the 8 slots, never more than 4, 2026-11-03). Its
+# tiles are MOVE targets as its own window's are, with the same features: the table's entry is (window slot, tile),
+# the slot's hero w_extra's. The squares stay squares so that what is read from a tile's neighbours (a guard's zone,
+# the land a step reveals, what a guard blocks) is read the same way in both.
 WINDOW_RADIUS = 16
 WINDOW = 2 * WINDOW_RADIUS + 1
 
@@ -203,12 +210,15 @@ TILE_GUARDED = 32  # in a wandering monster's zone of control
 TILE_VISITED_BY_PLAYER = 64  # its object was visited by us (this week for weekly objects)
 TILE_VISITED_BY_HERO = 128  # its object was visited by this hero
 TILE_EXACT_COUNT = 256  # w_count is the monsters' exact count (the hero's Visions reach them), not VCMI's quantity id
+# (beyond the N_TILE_FLAGS bits the encoders read as numbers: read where it is named)
+TILE_UNSEEN_EXIT = 512  # a teleporter's entrance (a subterranean gate, a monolith, a whirlpool) no exit of which we have seen and that we have not found to lead nowhere: VCMI's pathfinder goes through one only to an exit we see, so nothing past it is a target; stepping on it shows land we know nothing of
 N_TILE_FLAGS = 9
 
 # m_flags bits of a map object
 OBJECT_VISITED_BY_PLAYER = 1  # visited by us (CRewardableObject::wasVisited(player): our own visits only, what we know)
 OBJECT_EXACT_COUNT = 2  # m_count is the monsters' exact count (one of our heroes' Visions reaches them)
 OBJECT_GUARDED = 4  # its entrance is in a wandering monster's zone of control
+OBJECT_UNSEEN_EXIT = 8  # a teleporter's entrance no exit of which we have seen (TILE_UNSEEN_EXIT's)
 
 
 class GridCount(IntEnum):

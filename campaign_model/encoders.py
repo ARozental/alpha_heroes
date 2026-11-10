@@ -227,6 +227,10 @@ class TileEncoder(nn.Module):
 		self.creature = small_embedding(c.CREATURE_VOCAB + 1, dim)
 		self.quantity = small_embedding(QUANTITY_IDS + 1, dim)
 		self.token = Tokenizer(c.N_TILE_FLAGS + AMOUNT_FEATURES, dim)
+		# A teleporter's entrance no exit of which we have seen (TILE_UNSEEN_EXIT, schema 17; the user, 2026-11-10: a gate
+		# whose end we see and one whose end we do not are different things): its own vector on that tile, 0 at the
+		# start (model.ADDED: a checkpoint from before loads it so, the model as it was)
+		self.unseen_exit = nn.Parameter(torch.zeros(dim))
 		from .features import pair_table
 
 		self.register_buffer("pairs", pair_table(), persistent=False)
@@ -251,6 +255,7 @@ class TileEncoder(nn.Module):
 			self.terrain(vocab_index(x["tile_terrain"], c.TERRAIN_VOCAB)) + self.road(vocab_index(x["tile_road"], c.ROAD_VOCAB))
 			+ self.object(vocab_index(obj, c.OBJECT_VOCAB)) + self.subtype(subtype)
 			+ (self.creature(vocab_index(creature, c.CREATURE_VOCAB)) + self.quantity(vocab_index(quantity, QUANTITY_IDS))) * (creature >= 0).unsqueeze(-1)
+			+ self.unseen_exit * bit(flags, c.TILE_UNSEEN_EXIT).unsqueeze(-1)
 		)
 		return self.token(embedded, torch.cat([bits(flags, c.N_TILE_FLAGS), numbers * (creature >= 0).unsqueeze(-1)], dim=-1)) * bit(flags, c.TILE_ON_MAP).unsqueeze(-1)
 

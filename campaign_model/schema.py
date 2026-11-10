@@ -38,7 +38,7 @@ INPUTS = (
 	# Our own previous turn decision today, as the model chose it (the engine only echoes it back): where a chain of
 	# actions stands is the model's to read from it (2026-10-28, the user: no behaviour decided outside the model)
 	_i("g_last_type", (), "ActionType of our previous turn decision today, -1 none yet", fill=-1),
-	_i("g_last_index", (), "its entry in its type's table, -1 none", fill=-1),
+	_i("g_last_index", (), "its entry in its type's table, -1 none (a MOVE's window slot as its hero's token: the first axis names the hero)", fill=-1),
 	_i("g_last_changed", (), "1 if it changed the game, 0 if it did nothing, -1 none", fill=-1),
 	_i("g_resources", (R,), "our resources"),
 	_i("g_income", (R,), "our daily income (the kingdom overview's)"),
@@ -128,7 +128,8 @@ INPUTS = (
 	_i("o_subtype", (O,), "see OptionKind"),
 	_i("o_amount", (O,), "see OptionKind"),
 	_i("o_pos", (O, 3), "x, y, level (OBJECT)"),
-	# The map around each of our heroes (WINDOW x WINDOW tiles, the hero in the middle)
+	# The map around each of our heroes (WINDOW x WINDOW tiles, the hero in the middle), and since schema 17 around the
+	# tiles one reaches today outside that (w_extra, at the end: a window slot's hero and middle)
 	# The whole map, tile by tile (schema 9: the map CNN's input, every hero reading the same tiles): as a window's, but
 	# for no hero in particular (the top object other than a hero: heroes and towns come in as their tokens)
 	_i("tile_terrain", (L, c.MAP_TILES, c.MAP_TILES), "terrain id, -1 off the map or not revealed", fill=-1),
@@ -160,7 +161,7 @@ INPUTS = (
 	_i("m_count", (MO,), "its count as a human sees it: VCMI's quantity id, the exact count when OBJECT_EXACT_COUNT"),
 	_i("g_tiles", (L, G, G, c.N_GRID_COUNTS), "per block of the map (MAP_GRID): how many of its tiles are each GridCount"),
 	# Legal actions (engine rules); a type is legal when its table has a legal entry, END by the kind
-	_m("move_mask", (HO, W, W), "MOVE: hero, tile"),
+	_m("move_mask", (HO, W, W), "MOVE: window slot (its own hero's window, or a further one of the hero w_extra names: schema 17), tile; a tile in the first of a hero's windows that shows it"),
 	_m("build_mask", (TO, c.N_BUILDINGS), "BUILD: town, building"),
 	_m("build_short", (TO, c.N_BUILDINGS), "buildings our towns could build but for resources (VCMI's EBuildingState::NO_RESOURCES)"),
 	_m("recruit_mask", (TO, c.N_LEVELS, c.N_RECRUIT_AMOUNTS, c.N_RECRUIT_TARGETS), "RECRUIT: town, level, RECRUIT_FRACTIONS, into (N_RECRUIT_TARGETS)"),
@@ -206,6 +207,11 @@ INPUTS = (
 	_m("h_drop_kept", (HO, 2), "whether they go into the garrison of the town it visits (else disbanded)"),
 	# Schema 16 (at the end: older records read with it at 0, a record of 15 with its multi_mask's 8 kinds widened)
 	_m("army_slot_mask", (HD, A, HD, A), "ARMY's target slot: from holder, slot, to holder, each slot a whole stack may go to (empty: a move; the same creature: a merge; another: a swap); a part of a stack only to an empty slot or its own creature's"),
+	# Schema 17 (at the end: older records read with them at 0, every window its slot's own hero's). The window slots
+	# (w_*, move_mask, move_logp: HO of them) of the heroes we do not have carry further windows of the heroes we have:
+	# the tiles one reaches today that its own window does not show (constants.WINDOW_RADIUS)
+	_i("w_extra", (HO,), "0: this slot's window is its own hero's, around it (hero token = the slot); h + 1: one more window of our hero token h, around w_extra_pos"),
+	_i("w_extra_pos", (HO, 3), "x, y, level of the middle tile of a further window (w_extra > 0)"),
 )
 
 
@@ -215,7 +221,7 @@ def _o(name, shape, doc):
 
 OUTPUTS = (
 	_o("type_logp", (c.N_ACTION_TYPES,), "log p(action type)"),
-	_o("move_logp", (HO, W, W), "log p(hero, tile | MOVE)"),
+	_o("move_logp", (HO, W, W), "log p(window slot, tile | MOVE)"),
 	_o("build_logp", (TO, c.N_BUILDINGS), "log p(town, building | BUILD)"),
 	_o("recruit_logp", (TO, c.N_LEVELS, c.N_RECRUIT_AMOUNTS, c.N_RECRUIT_TARGETS), "log p(town, level, amount, into | RECRUIT)"),
 	_o("hire_logp", (TO, c.N_TAVERN), "log p(town, slot | HIRE)"),

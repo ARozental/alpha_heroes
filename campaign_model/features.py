@@ -500,6 +500,39 @@ def emptied_danger(x, hero_strength):
 	return (near * torch.sigmoid(2 * theirs)).amax(dim=-1) * (x["t_present"][:, :to] & (x["t_owner"][:, :to] == c.OWNER_SELF))  # (an empty town's log1p(0))
 
 
+def slot_heroes(x):
+	"""[B, HO] each window slot's hero token (schema 17): its own, or in a slot no hero of ours holds the hero whose
+	further window it carries (w_extra h + 1). A record from before reads w_extra 0: every slot its own."""
+	own = torch.arange(HO, device=x["h_present"].device).expand(x["h_present"].shape[0], HO)
+	if "w_extra" not in x:
+		return own
+	extra = x["w_extra"]
+	return torch.where(extra > 0, (extra - 1).clamp(max=HO - 1), own)
+
+
+def window_heroes(x, windows):
+	"""The windows' heroes and middles (schema 17), windows [K] flat window slots (decision x OWN_HEROES + slot): ([K]
+	each one's hero as a flat index (decision x OWN_HEROES + hero token), [K, 3] its middle tile (x, y, level)). A
+	slot's window is its own hero's, around where it stands; a further window (w_extra) is another hero's of the same
+	decision, around w_extra_pos: tiles that hero reaches today outside its own window (past a gate or a monolith,
+	down a long road), each a MOVE's target with the features its own window's tiles have."""
+	stand = x["h_pos"][:, :HO].reshape(-1, 3).index_select(0, windows)
+	if "w_extra" not in x:
+		return windows, stand
+	extra = x["w_extra"].reshape(-1).index_select(0, windows)
+	further = extra > 0
+	first = torch.div(windows, HO, rounding_mode="floor") * HO
+	heroes = torch.where(further, first + (extra - 1).clamp(max=HO - 1), windows)
+	middle = torch.where(further.unsqueeze(-1), x["w_extra_pos"].reshape(-1, 3).index_select(0, windows), stand)
+	return heroes, middle
+
+
+def windows_present(x):
+	"""[B, HO] the window slots that hold a window: our heroes' own and their further ones (w_extra)."""
+	present = x["h_present"][:, :HO]
+	return present | (x["w_extra"] > 0) if "w_extra" in x else present
+
+
 def expected_loss(ratio, has_enemy):
 	"""The share of the army a won fight costs: NK2's (their strength / ours)^2, at most all of it."""
 	return has_enemy * torch.exp(-2 * torch.relu(ratio))
@@ -611,8 +644,24 @@ def area_contents(x, counts):
 	tiles = x["g_tiles"].float().reshape(b * L, G, G, c.N_GRID_COUNTS).permute(0, 3, 1, 2)
 	tiles = F.avg_pool2d(tiles, merge) * merge * merge
 	on_map, revealed = tiles[:, c.GridCount.ON_MAP], tiles[:, c.GridCount.REVEALED]
-	hidden = (on_map - revealed) / on_map.clamp(min=1)
-	return objects.permute(0, 2, 3, 1).reshape(b, L * TG * TG, c.N_OBJECT_CLASSES), hidden.reshape(b, L * TG * TG)
+	hidden = ((on_map - revealed) / on_map.clamp(min=1)).reshape(b, L * TG * TG)
+	return objects.permute(0, 2, 3, 1).reshape(b, L * TG * TG, c.N_OBJECT_CLASSES), torch.maximum(hidden, unseen_exits(x))
+
+
+OBJ_WHIRLPOOL = 111  # (Obj::WHIRLPOOL: a teleporter that takes part of the army it carries)
+
+
+def unseen_exits(x):
+	"""[B, L * TG^2], 0/1: the TRAVEL areas that hold a teleporter's entrance no exit of which we have seen
+	(OBJECT_UNSEEN_EXIT, schema 17; not a whirlpool, which costs troops): stepping on it shows land we know nothing of,
+	a whole sight of it, so the area counts as one we have not revealed (travel_prior's land to reveal, as the entrance's
+	tile is MOVE's: model.tile_features). A record from before has no such flag: none."""
+	b = x["g_day"].shape[0]
+	flagged = bit(x["m_flags"], c.OBJECT_UNSEEN_EXIT) & (x["m_object"] != OBJ_WHIRLPOOL)
+	index = area_index(x, x["m_pos"])
+	areas = L * TG * TG
+	index = torch.where(flagged & (index >= 0), index, torch.full_like(index, areas))
+	return torch.zeros(b, areas + 1, device=index.device).scatter_reduce(1, index, flagged.float(), reduce="amax", include_self=True)[:, :areas]
 
 
 def movement_discount(days, exponent):

@@ -22,6 +22,7 @@
 #include "lib/mapObjects/CGTownInstance.h"
 #include "lib/mapObjects/IMarket.h"
 #include "lib/mapObjects/IOwnableObject.h"
+#include "lib/mapObjects/MiscObjects.h"
 #include "lib/mapping/TerrainTile.h"
 #include "lib/pathfinder/CGPathNode.h"
 #include "lib/pathfinder/PathfinderCache.h"
@@ -104,6 +105,30 @@ const CGObjectInstance * topObject(const CCallback & cb, const int3 & pos, const
 			return *it;
 	auto blocking = cb.getBlockingObjs(pos);
 	return blocking.empty() ? nullptr : blocking.front();
+}
+
+/// Schema 17's two switches, the game's environment (every player's and every kind of game's alike: a run's unit
+/// sets them once). ALPHA_MAP_FURTHER_WINDOWS: the further windows a hero may have (1 unless set; 0: none, the windows
+/// as before schema 17). ALPHA_MAP_UNSEEN_EXITS: "0" leaves TILE_UNSEEN_EXIT and OBJECT_UNSEEN_EXIT unset (their
+/// price and inputs as before)
+int furtherWindowsAllowed()
+{
+	static const int allowed = []
+	{
+		const char * value = std::getenv("ALPHA_MAP_FURTHER_WINDOWS");
+		return value && *value ? std::max(0, std::atoi(value)) : 1;
+	}();
+	return allowed;
+}
+
+bool unseenExitsShown()
+{
+	static const bool shown = []
+	{
+		const char * value = std::getenv("ALPHA_MAP_UNSEEN_EXITS");
+		return !value || std::string(value) != "0";
+	}();
+	return shown;
 }
 
 int distanceSq(const int3 & a, const int3 & b)
@@ -207,10 +232,51 @@ const IMarket * AlphaMapAI::ourMarket() const
 	return nullptr;
 }
 
-int3 Decision::windowTile(int hero, int row, int column) const
+int3 Decision::windowTile(int window, int row, int column) const
 {
-	const auto & center = centers[hero];
+	const auto & center = centers[window];
 	return int3(center.x + column - WINDOW_RADIUS, center.y + row - WINDOW_RADIUS, center.z);
+}
+
+int Decision::moveEntry(int hero, const int3 & tile) const
+{
+	for(int w = 0; w < OWN_HEROES; ++w)
+	{
+		if(windowHero[w] != hero)
+			continue;
+		const auto & center = centers[w];
+		const int row = tile.y - center.y + WINDOW_RADIUS;
+		const int column = tile.x - center.x + WINDOW_RADIUS;
+		if(tile.z == center.z && row >= 0 && row < WINDOW && column >= 0 && column < WINDOW && inputs.get(In::move_mask, w, row, column) != 0)
+			return (w * WINDOW + row) * WINDOW + column;
+	}
+	return -1;
+}
+
+int Decision::echoIndex(int type, int index) const
+{
+	const int cells = WINDOW * WINDOW;
+	if(type != static_cast<int>(ActionType::MOVE) || index < 0 || index / cells >= OWN_HEROES || windowHero[index / cells] < 0)
+		return index;
+	return windowHero[index / cells] * cells + index % cells;
+}
+
+bool AlphaMapAI::unseenExit(const CGObjectInstance * obj) const
+{
+	// VCMI's pathfinder goes through a teleporter only to an exit the player sees (CPathfinderHelper::
+	// getAllowedTeleportChannelExits, CGameInfoCallback::getVisibleTeleportObjects), so nothing past an entrance whose
+	// exits we have not seen is anyone's target: the entrance itself is, and what it is worth is the land it shows
+	// (Nullkiller2's ExplorationBehavior sends a hero into each such entrance too). A channel found to lead nowhere
+	// (deadChannels) is none
+	if(!unseenExitsShown())
+		return false;
+	const auto * teleport = dynamic_cast<const CGTeleport *>(obj);
+	if(!teleport || !teleport->isEntrance() || deadChannels.count(teleport->channel))
+		return false;
+	for(const auto & exit : cb->getTeleportChannelExits(teleport->channel, playerID))
+		if(exit != obj->id)
+			return false;
+	return true;
 }
 
 int Decision::holderOf(ObjectInstanceID id) const
@@ -633,64 +699,150 @@ void AlphaMapAI::encodeWindows(Decision & decision, PathfinderCache & paths)
 {
 	auto & in = decision.inputs;
 	const bool turn = decision.kind == DecisionKind::TURN;
-	for(int i = 0; i < OWN_HEROES; ++i)
+	const auto inside = [](const int3 & pos, const int3 & center)
 	{
-		const auto * h = cb->getHero(decision.heroes[i]);
-		if(decision.heroes[i] == ObjectInstanceID() || !h)
-			continue;
-		const auto center = h->visitablePos();
-		decision.centers[i] = center;
-		const auto info = paths.getPathsInfo(h);
-		const bool canMove = turn && !h->isGarrisoned();
+		return pos.z == center.z && std::abs(pos.x - center.x) <= WINDOW_RADIUS && std::abs(pos.y - center.y) <= WINDOW_RADIUS;
+	};
+	// One window: the tiles around `center` as hero h sees and reaches them, in window slot `slot`. MOVE's legal tiles
+	// (canMove) are those it reaches today, each in the first of the hero's windows that shows it (earlier: the middles
+	// of its windows before this one)
+	const auto fill = [&](int slot, const CGHeroInstance * h, const int3 & center, const CPathsInfo & info, bool canMove, const std::vector<int3> & earlier)
+	{
+		const auto standing = h->visitablePos();
+		decision.centers[slot] = center;
 		for(int row = 0; row < WINDOW; ++row)
 			for(int column = 0; column < WINDOW; ++column)
 			{
-				const auto pos = decision.windowTile(i, row, column);
+				const auto pos = decision.windowTile(slot, row, column);
 				if(!cb->isInTheMap(pos))
 					continue;
 				int64_t flags = TILE_ON_MAP;
 				if(!cb->isVisible(pos))
 				{
-					in.at(In::w_flags, i, row, column) = flags;
+					in.at(In::w_flags, slot, row, column) = flags;
 					continue;
 				}
 				flags |= TILE_REVEALED;
 				const auto * tile = cb->getTile(pos, false);
-				in.at(In::w_terrain, i, row, column) = tile->getTerrainID().getNum();
-				in.at(In::w_road, i, row, column) = tile->getRoadID().getNum();
+				in.at(In::w_terrain, slot, row, column) = tile->getTerrainID().getNum();
+				in.at(In::w_road, slot, row, column) = tile->getRoadID().getNum();
 				flags |= tile->isWater() ? TILE_WATER : 0;
 				flags |= tile->blocked() ? TILE_BLOCKED : 0;
 				flags |= tile->visitable() ? TILE_VISITABLE : 0;
 				flags |= cb->guardingCreaturePosition(pos) != int3(-1, -1, -1) ? TILE_GUARDED : 0;
 				if(const auto * obj = topObject(*cb, pos, h))
 				{
-					in.at(In::w_object, i, row, column) = obj->ID.getNum();
-					in.at(In::w_subtype, i, row, column) = obj->subID.getNum();
-					in.at(In::w_owner, i, row, column) = owner(obj->tempOwner);
+					in.at(In::w_object, slot, row, column) = obj->ID.getNum();
+					in.at(In::w_subtype, slot, row, column) = obj->subID.getNum();
+					in.at(In::w_owner, slot, row, column) = owner(obj->tempOwner);
 					flags |= obj->wasVisited(playerID) ? TILE_VISITED_BY_PLAYER : 0;
 					flags |= obj->wasVisited(h) ? TILE_VISITED_BY_HERO : 0;
+					flags |= unseenExit(obj) ? TILE_UNSEEN_EXIT : 0;
 					// (a resource pile's amount is not shown to a human either: none)
 					if(obj->ID == Obj::MONSTER)
 						if(const auto * stack = dynamic_cast<const CArmedInstance *>(obj)->getStackPtr(SlotID(0)))
 						{
 							const auto [count, exact] = seenCount(obj, h);
-							in.at(In::w_creature, i, row, column) = stack->getId().getNum();
-							in.at(In::w_count, i, row, column) = count;
+							in.at(In::w_creature, slot, row, column) = stack->getId().getNum();
+							in.at(In::w_count, slot, row, column) = count;
 							flags |= exact ? TILE_EXACT_COUNT : 0;
 						}
 				}
-				in.at(In::w_flags, i, row, column) = flags;
-				const auto * node = info->getPathInfo(pos);
+				in.at(In::w_flags, slot, row, column) = flags;
+				const auto * node = info.getPathInfo(pos);
 				if(node && node->reachable())
 				{
-					in.at(In::w_turns, i, row, column) = node->turns;
+					in.at(In::w_turns, slot, row, column) = node->turns;
 					if(node->turns == 0)
-						in.at(In::w_move_left, i, row, column) = node->moveRemains;
-					if(canMove && node->turns == 0 && pos != center && node->action != EPathNodeAction::UNKNOWN)
-						in.at(In::move_mask, i, row, column) = 1;
+						in.at(In::w_move_left, slot, row, column) = node->moveRemains;
+					if(canMove && node->turns == 0 && pos != standing && node->action != EPathNodeAction::UNKNOWN
+						&& std::none_of(earlier.begin(), earlier.end(), [&](const int3 & c) { return inside(pos, c); }))
+						in.at(In::move_mask, slot, row, column) = 1;
 				}
 			}
+	};
+	// Each hero's own window, around it. Then (schema 17, a turn's decisions) the tiles a hero reaches today that its
+	// windows so far do not show: through a gate or a monolith whose exit we have seen (the pathfinder's paths go
+	// through them: the other level, a far part of its own), or more than WINDOW_RADIUS tiles down a road. Before, none
+	// of them was a MOVE's target, and TRAVEL's areas are a day or more away: the only way past a gate was a MOVE onto
+	// the gate itself, a tile worth nothing by what stands on it
+	struct Further
+	{
+		int hero;
+		const CGHeroInstance * h;
+		std::shared_ptr<const CPathsInfo> info;
+		std::vector<int3> middles;                 // of its windows so far
+		std::vector<std::pair<int, int3>> left;    // (movement left there, tile) of the tiles it reaches today, not shown yet
+	};
+	std::vector<Further> further;
+	std::vector<int> spare; // the window slots no hero of ours holds
+	const auto size = cb->getMapSize();
+	for(int i = 0; i < OWN_HEROES; ++i)
+	{
+		if(decision.heroes[i] == ObjectInstanceID())
+		{
+			spare.push_back(i);
+			continue;
+		}
+		const auto * h = cb->getHero(decision.heroes[i]);
+		if(!h)
+			continue;
+		const auto center = h->visitablePos();
+		const auto info = paths.getPathsInfo(h);
+		const bool canMove = turn && !h->isGarrisoned();
+		decision.windowHero[i] = i;
+		fill(i, h, center, *info, canMove, {});
+		if(!canMove || furtherWindowsAllowed() <= 0)
+			continue;
+		Further f{i, h, info, {center}, {}};
+		for(int z = 0; z < std::min(size.z, MAP_LEVELS); ++z)
+			for(int y = 0; y < size.y; ++y)
+				for(int x = 0; x < size.x; ++x)
+				{
+					const int3 pos(x, y, z);
+					if(inside(pos, center) || !cb->isVisible(pos))
+						continue;
+					const auto * node = info->getPathInfo(pos);
+					if(node && node->reachable() && node->turns == 0 && node->action != EPathNodeAction::UNKNOWN)
+						f.left.emplace_back(node->moveRemains, pos);
+				}
+		if(!f.left.empty())
+			further.push_back(std::move(f));
 	}
+	// A further window: a square of one level, the level holding the most of the hero's tiles not shown yet, around the
+	// soonest reached of them there (the most movement left; a tie: the first, row by row), kept on the map where the
+	// map is wider than a window (nothing off the map shown for a tile near its edge: on a 36 x 36 map the square is
+	// nearly the whole level). One a hero unless ALPHA_MAP_FURTHER_WINDOWS says otherwise, the heroes in turn while a
+	// slot is free and a tile is left. One, because the first holds most of what there is: in a Nullkiller2 game of 40
+	// days on a 36 x 36 map with its underground (2026-11-10) 43% of the hero-turns had tiles in reach today outside the
+	// hero's own window, a median of 31 against the 77 inside it; a second window held a median of 8 more, a third 3,
+	// and each window is as much work as a hero's own
+	const auto middle = [](int at, int extent) { return extent > WINDOW ? std::clamp(at, WINDOW_RADIUS, extent - 1 - WINDOW_RADIUS) : extent / 2; };
+	size_t next = 0;
+	for(int round = 0; round < furtherWindowsAllowed() && next < spare.size(); ++round)
+		for(auto & f : further)
+		{
+			if(f.left.empty() || next >= spare.size())
+				continue;
+			std::array<int, MAP_LEVELS> onLevel{};
+			for(const auto & tile : f.left)
+				++onLevel[tile.second.z];
+			const int level = static_cast<int>(std::max_element(onLevel.begin(), onLevel.end()) - onLevel.begin());
+			const std::pair<int, int3> * soonest = nullptr;
+			for(const auto & tile : f.left)
+				if(tile.second.z == level && (!soonest || tile.first > soonest->first))
+					soonest = &tile;
+			const int3 center(middle(soonest->second.x, size.x), middle(soonest->second.y, size.y), level);
+			const int slot = spare[next++];
+			decision.windowHero[slot] = f.hero;
+			in.at(In::w_extra, slot) = f.hero + 1;
+			in.at(In::w_extra_pos, slot, 0) = center.x;
+			in.at(In::w_extra_pos, slot, 1) = center.y;
+			in.at(In::w_extra_pos, slot, 2) = center.z;
+			fill(slot, f.h, center, *f.info, true, f.middles);
+			f.middles.push_back(center);
+			f.left.erase(std::remove_if(f.left.begin(), f.left.end(), [&](const auto & tile) { return inside(tile.second, center); }), f.left.end());
+		}
 }
 
 void AlphaMapAI::encodeMap(Decision & decision, const std::vector<int3> & ours)
@@ -775,6 +927,7 @@ void AlphaMapAI::encodeMap(Decision & decision, const std::vector<int3> & ours)
 		// (only on a tile we see: VCMI logs an error for each fogged one asked, ~2,300 lines in a game's first minute, 11%
 		// of a campaign client's CPU, 2026-10-30)
 		flags |= cb->isVisible(pos) && cb->guardingCreaturePosition(pos) != int3(-1, -1, -1) ? OBJECT_GUARDED : 0;
+		flags |= unseenExit(obj) ? OBJECT_UNSEEN_EXIT : 0;
 		int64_t visitors = 0;
 		for(int h = 0; h < OWN_HEROES; ++h)
 			if(heroes[h] && obj->wasVisited(heroes[h]))
@@ -844,6 +997,7 @@ void AlphaMapAI::encodeTiles(Decision & decision)
 					in.at(In::tile_subtype, z, y, x) = obj->subID.getNum();
 					in.at(In::tile_owner, z, y, x) = owner(obj->tempOwner);
 					flags |= obj->wasVisited(playerID) ? TILE_VISITED_BY_PLAYER : 0;
+					flags |= unseenExit(obj) ? TILE_UNSEEN_EXIT : 0;
 					if(obj->ID == Obj::MONSTER)
 						if(const auto * stack = dynamic_cast<const CArmedInstance *>(obj)->getStackPtr(SlotID(0)))
 						{
@@ -888,7 +1042,7 @@ void AlphaMapAI::encodeTileBlocks(Decision & decision, const std::vector<const C
 				if(x0 >= size.x || y0 >= size.y)
 					continue; // (off the map: the fill values)
 				int revealed = 0, water = 0, blocked = 0;
-				bool visitable = false, guarded = false;
+				bool visitable = false, guarded = false, unseen = false; // (unseen: an entrance with no exit seen, TILE_UNSEEN_EXIT, if any is)
 				std::map<int, int> terrains, roads;
 				const CGObjectInstance * chosen = nullptr;
 				int chosenRank = 4;
@@ -914,6 +1068,7 @@ void AlphaMapAI::encodeTileBlocks(Decision & decision, const std::vector<const C
 						const auto * obj = topNonHero(*cb, pos);
 						if(!obj)
 							continue;
+						unseen = unseen || unseenExit(obj);
 						uint64_t power = 0;
 						if(obj->ID == Obj::MONSTER)
 							if(const auto * stack = dynamic_cast<const CArmedInstance *>(obj)->getStackPtr(SlotID(0)))
@@ -949,6 +1104,7 @@ void AlphaMapAI::encodeTileBlocks(Decision & decision, const std::vector<const C
 				flags |= blocked == revealed ? TILE_BLOCKED : 0;
 				flags |= visitable ? TILE_VISITABLE : 0;
 				flags |= guarded ? TILE_GUARDED : 0;
+				flags |= unseen ? TILE_UNSEEN_EXIT : 0;
 				if(chosen)
 				{
 					in.at(In::tile_object, z, row, column) = chosen->ID.getNum();
@@ -1193,8 +1349,10 @@ void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)
 		if(decision.heroes[i] == ObjectInstanceID() || !h || h->isGarrisoned())
 			continue;
 		bool canMove = false;
-		for(int cell = 0; cell < WINDOW * WINDOW && !canMove; ++cell)
-			canMove = in.get(In::move_mask, i, cell / WINDOW, cell % WINDOW) != 0;
+		for(int w = 0; w < OWN_HEROES && !canMove; ++w)
+			if(decision.windowHero[w] == i)
+				for(int cell = 0; cell < WINDOW * WINDOW && !canMove; ++cell)
+					canMove = in.get(In::move_mask, w, cell / WINDOW, cell % WINDOW) != 0;
 		if(!canMove)
 			continue;
 		const auto info = paths.getPathsInfo(h);

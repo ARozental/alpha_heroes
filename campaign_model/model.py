@@ -987,7 +987,7 @@ class CustomFeatures(nn.Module):
 			dim=-1,
 		)
 
-	def meeting_value(self, x, f, decision, windows, on_tile):
+	def meeting_value(self, x, f, decision, heroes, on_tile):
 		"""What stepping on a hero of ours (an exchange) or into a town of ours (its garrison) gains [K, W, W] (gold): the
 		best the exchange or the gather there would make to Φ (the user, 2026-11-05: a meeting's expected gain, as a
 		pickup's and a fight's), at least 0, priced as the actions are (features.led_values: each army at its hero's
@@ -1000,13 +1000,13 @@ class CustomFeatures(nn.Module):
 		    less the garrison at unled_share and what taking it adds to the town's expected loss (gather_loss).
 		Its weight learned (meeting_gain, 1 at the start)."""
 		mine = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
-		hero = torch.remainder(windows, HO)  # [K]: the window's hero
+		hero = torch.remainder(heroes, HO)  # [K]: the window's hero (heroes: its flat index, features.window_heroes)
 		others = on_tile(x["h_pos"][:, :HO], mine) & (torch.arange(HO, device=hero.device) != hero[:, None, None, None])  # [K, W, W, HO]
 		army_c, army_n = x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO].float()  # [B, HO, A]
 		rest = x["h_morale"][:, :HO].float() - ft.make_up_morales(army_c, army_n, self)  # (each hero's morale without its army's make-up's)
 		led = ft.led_values(army_c, army_n, f.hero_multiplier, rest, self)  # [B, HO]
-		k = windows.shape[0]
-		flat = lambda v: v.reshape((-1,) + tuple(v.shape[2:])).index_select(0, windows)  # noqa: E731 ([B, HO, ...] -> the window's hero's [K, ...])
+		k = heroes.shape[0]
+		flat = lambda v: v.reshape((-1,) + tuple(v.shape[2:])).index_select(0, heroes)  # noqa: E731 ([B, HO, ...] -> the window's hero's [K, ...])
 		mover_c, mover_n, mover_m, mover_r, mover_v = flat(army_c), flat(army_n), flat(f.hero_multiplier), flat(rest), flat(led)  # [K, A] / [K]
 		other_c, other_n = army_c.index_select(0, decision), army_n.index_select(0, decision)  # [K, HO, A]
 		other_m, other_r, other_v = f.hero_multiplier.index_select(0, decision), rest.index_select(0, decision), led.index_select(0, decision)  # [K, HO]
@@ -1058,15 +1058,20 @@ class CustomFeatures(nn.Module):
 		def pick(name):  # [K, W, W] of a [B, HO, W, W] input
 			return x[name].reshape((-1,) + tuple(x[name].shape[2:])).index_select(0, windows)
 
+		# Each window's hero and middle tile (schema 17, features.window_heroes): its slot's own hero, around where it
+		# stands, or a further window of a hero of ours around tiles it reaches today outside its own (past a gate or a
+		# monolith, down a long road). Everything below is the hero's (heroes) at the window's tiles (middle), so a tile of
+		# a further window is priced as one of its own window is
+		heroes, middle = ft.window_heroes(x, windows)
+
 		def ours(values):  # [K] of a [B, H] per-hero value: the window's hero
-			return values[:, :HO].reshape(-1).index_select(0, windows)
+			return values[:, :HO].reshape(-1).index_select(0, heroes)
 
 		flags = pick("w_flags")
 		offsets = torch.arange(W, device=flags.device) - c.WINDOW_RADIUS
 		dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
-		hero_pos = x["h_pos"][:, :HO].reshape(-1, 3).index_select(0, windows)  # [K, 3]
-		tile_x, tile_y = hero_pos[:, 0, None, None] + dx, hero_pos[:, 1, None, None] + dy  # [K, W, W] (rows: y, columns: x)
-		tile_z = hero_pos[:, 2, None, None].expand_as(tile_x)
+		tile_x, tile_y = middle[:, 0, None, None] + dx, middle[:, 1, None, None] + dy  # [K, W, W] (rows: y, columns: x)
+		tile_z = middle[:, 2, None, None].expand_as(tile_x)
 
 		def on_tile(pos, present):  # [K, W, W, N]: entity n of the window's decision stands on the tile
 			pos, present = pos.index_select(0, decision), present.index_select(0, decision)
@@ -1194,9 +1199,13 @@ class CustomFeatures(nn.Module):
 		# How hopeless the fight is by the kindest of this hero's estimates (features.hopeless: smooth; a guard 54x our
 		# strength ~0.92)
 		hopeless = ft.hopeless(this_hero.amax(dim=-1)) * fights
-		explore = ft.unexplored_around(flags)
+		# The land a step there shows: the tiles in sight we have not revealed; a teleporter's entrance no exit of which
+		# we have seen (TILE_UNSEEN_EXIT, schema 17) shows land we know nothing of, a whole sight of it (VCMI's pathfinder
+		# goes through a gate only to an exit we see, so before the flag such a gate was a tile worth nothing: nothing on
+		# it, the land around it long revealed). Not a whirlpool's, which takes troops for the passage
+		explore = torch.maximum(ft.unexplored_around(flags), (ft.bit(flags, c.TILE_UNSEEN_EXIT) & (obj != ft.OBJ_WHIRLPOOL)).float())
 		# The object is ours only if we win the fight in front of it (a bank's guards, a monster's zone, a town's garrison)
-		value = object_gold * torch.where(fights, win, torch.ones_like(win)) + fight + explore * self.explore_gold() + self.meeting_value(x, f, decision, windows, on_tile)
+		value = object_gold * torch.where(fights, win, torch.ones_like(win)) + fight + explore * self.explore_gold() + self.meeting_value(x, f, decision, heroes, on_tile)
 		# That gain discounted by the time to reach the tile as Nullkiller2 discounts its targets (PriorityEvaluator::
 		# evaluateMovement, as travel_prior does TRAVEL's areas): by the part of a day's movement it costs, raised to
 		# move_discount_power, 0 at the start (the score as before) and 1 its full discount. Nullkiller2 scores every
@@ -1217,7 +1226,10 @@ class CustomFeatures(nn.Module):
 		enemies = tuple(t.index_select(0, decision) for t in ft.enemies(x, f.hero_strength))
 		near, theirs = ft.reach(enemies, tile_x, tile_y, tile_z)  # [K, W, W, E]
 		danger = (near * torch.sigmoid(2 * (theirs - our_strength[:, None, None, None]))).amax(dim=-1)
-		here = danger[:, c.WINDOW_RADIUS, c.WINDOW_RADIUS]
+		# (where the hero stands: its own window's middle tile, another tile for a further window's)
+		stand = x["h_pos"][:, :HO].reshape(-1, 3).index_select(0, heroes)[:, :, None, None]  # [K, 3, 1, 1]
+		near_here, theirs_here = ft.reach(enemies, stand[:, 0], stand[:, 1], stand[:, 2])  # [K, 1, 1, E]
+		here = (near_here * torch.sigmoid(2 * (theirs_here - our_strength[:, None, None, None]))).amax(dim=-1)[:, 0, 0]
 		at_stake = (ours(f.hero_gold) + hero) * self.gain(self.danger_gain)
 		value = value + (here[:, None, None] - danger) * at_stake[:, None, None]
 		own_towns = x["t_present"][:, :TO] & (x["t_owner"][:, :TO] == c.OWNER_SELF)
@@ -1445,7 +1457,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
@@ -1666,7 +1678,8 @@ class CampaignModel(nn.Module):
 		cells = None
 		if n > 0:  # each hero's window: convolutions over its tiles, summarised into its token
 			cells = self.window_cells(x, f, windows)
-			hero_tokens = torch.cat([hero_tokens[:, :HO] + dense(self.window_summary(x, cells, windows), windows, n, b), hero_tokens[:, HO:]], dim=1)
+			own = (ft.window_heroes(x, windows)[0] == windows).unsqueeze(-1)  # (a hero's own window: a further one, schema 17, is no summary of where it stands)
+			hero_tokens = torch.cat([hero_tokens[:, :HO] + dense(self.window_summary(x, cells, windows) * own, windows, n, b), hero_tokens[:, HO:]], dim=1)
 		blocks, block_valid, areas = self.map(x, f)  # the whole map: each hero reads it, the global token gets its summary
 		read = self.map_reader(hero_tokens[:, :HO], x["h_pos"][:, :HO], blocks, block_valid, ft.centres(x, COARSE)) * x["h_present"][:, :HO].unsqueeze(-1)
 		hero_tokens = torch.cat([hero_tokens[:, :HO] + read, hero_tokens[:, HO:]], dim=1)
@@ -1828,11 +1841,11 @@ class CampaignModel(nn.Module):
 	# ---- windows ----
 
 	def windows(self, x):
-		"""Flat indices (decision x OWN_HEROES + hero) of the windows to compute, our heroes' that are there (a player
-		has 1-3 of its 8 slots; the windows are most of the model's compute), and how many are real: on Apple's GPU
-		padded with copies of the first to a power of two (it compiles and keeps a graph, ~100 MB, for every new
-		shape); the copies are left out of the results."""
-		windows = torch.nonzero(x["h_present"][:, :HO].reshape(-1)).squeeze(-1)
+		"""Flat indices (decision x OWN_HEROES + window slot) of the windows to compute, our heroes' that are there (a
+		player has 1-3 of its 8 slots; the windows are most of the model's compute) and their further ones (schema 17,
+		features.windows_present), and how many are real: on Apple's GPU padded with copies of the first to a power of
+		two (it compiles and keeps a graph, ~100 MB, for every new shape); the copies are left out of the results."""
+		windows = torch.nonzero(ft.windows_present(x).reshape(-1)).squeeze(-1)
 		n = windows.shape[0]
 		if n > 0 and windows.device.type == "mps" and not torch.onnx.is_in_onnx_export():
 			windows = torch.cat([windows, windows[:1].expand((1 << (n - 1).bit_length()) - n)])
@@ -1902,7 +1915,7 @@ class CampaignModel(nn.Module):
 		b = x["g_day"].shape[0]
 		move = cast_cell = prior = own_heroes.new_zeros(b, HO, W, W)
 		if n > 0:
-			hero = own_heroes.reshape(b * HO, -1).index_select(0, windows)  # [K, d]
+			hero = own_heroes.reshape(b * HO, -1).index_select(0, ft.window_heroes(x, windows)[0])  # [K, d] (each window's hero)
 			gamma, beta = self.film(hero).chunk(2, dim=-1)  # [K, dc]
 			tile = F.gelu(cells * (1 + gamma[..., None, None]) + beta[..., None, None]).permute(0, 2, 3, 1)  # [K, W, W, dc]
 			legal = x["move_mask"].reshape(-1, W, W).index_select(0, windows)

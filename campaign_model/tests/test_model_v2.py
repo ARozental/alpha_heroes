@@ -102,6 +102,7 @@ def test_every_part_learns_after_its_zero_starts_move():
 	model.plan_outputs = True  # (as the trainer's: train.ppo_update)
 	x = tensors(rich_inputs(8, seed=4))
 	x["h_backpack"][:, :2, 0] = 9  # (a carried artifact: encode_hero.carried reads the backpack's)
+	x["tile_flags"][:, 0, 3, 3] = c.TILE_ON_MAP | c.TILE_REVEALED | c.TILE_VISITABLE | c.TILE_UNSEEN_EXIT  # (a gate with no exit seen: encode_tiles.unseen_exit)
 	optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
 	weights = {}
@@ -1495,8 +1496,8 @@ def test_records_from_before_schema_11_read_with_no_guards_battle_join_or_armed_
 	x["x_heroes"][:, :] = [1, 2]
 	x["multi_mask"][:, 0, 0] = True
 	full = zlib.decompress(encoded(x, 0))
-	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 6
-	lengths = sorted(SHORT_RECORDS)  # (records of schemas 9, 10, 11-12, 13, and 14 and 15 widened: each ends where the next's inputs start)
+	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 7
+	lengths = sorted(SHORT_RECORDS)  # (records of schemas 9, 10, 11-12, 13, 14 and 15 widened, and 16: each ends where the next's inputs start)
 	for n in lengths[:4]:
 		got = decode_inputs([SimpleNamespace(inputs=zlib.compress(full[:n]))])
 		before_11 = ("o_battle", "o_join", "d_guard_count", "a_present", "a_count") if n < lengths[2] else ()

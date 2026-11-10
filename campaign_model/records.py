@@ -259,7 +259,7 @@ def _libz():
 # Records made before inputs were added at the end (schema 10: mem; schema 11: the question's guards and armed objects,
 # from o_battle on) end where those start: decoded with zeros there, which each of them reads as none (no memory, no
 # guard, no battle, no armed object)
-TAIL_STARTS = ("mem", "o_battle", "artifact_mask", "multi_mask", "x_take_creature", "army_slot_mask")
+TAIL_STARTS = ("mem", "o_battle", "artifact_mask", "multi_mask", "x_take_creature", "army_slot_mask", "w_extra")
 _STARTS = {entry[0]: sum(e[-1] for e in IN_LAYOUT[:i]) for i, entry in enumerate(IN_LAYOUT)}
 SHORT_RECORDS = frozenset(_STARTS[name] for name in TAIL_STARTS if name in _STARTS)  # the byte lengths of older records
 MEM_BYTES = IN_BYTES - _STARTS["mem"]  # what a record of schema 9 (before the memory) lacks
@@ -333,15 +333,17 @@ _TORCH_DTYPES = None
 
 
 def heroes_in(decoded):
-	"""Our heroes in each decision, [N] on the host (h_present's first OWN_HEROES slots), from decode_inputs' inputs or
-	decode_wire's bytes: how many windows a batch needs (model_v2.windows_of's budget)."""
-	if isinstance(decoded, dict):
-		present = decoded["h_present"]
-	else:
-		offset, (_, shape, wire_dtype, _, nbytes) = _WIRE_AT["h_present"]
-		decoded = np.asarray(decoded)  # (a tensor: train.wire_for's pinned one)
-		present = np.ascontiguousarray(decoded[:, offset : offset + nbytes]).view(wire_dtype).reshape((len(decoded),) + shape)
-	return np.count_nonzero(present[:, : c.OWN_HEROES], axis=1)
+	"""The windows of each decision, [N] on the host: our heroes (h_present's first OWN_HEROES slots) and their further
+	windows (schema 17: w_extra, in the slots no hero holds), from decode_inputs' inputs or decode_wire's bytes: how
+	many windows a batch needs (model_v2.windows_of's budget)."""
+	def column(name):
+		if isinstance(decoded, dict):
+			return decoded[name]
+		offset, (_, shape, wire_dtype, _, nbytes) = _WIRE_AT[name]
+		wire = np.asarray(decoded)  # (a tensor: train.wire_for's pinned one)
+		return np.ascontiguousarray(wire[:, offset : offset + nbytes]).view(wire_dtype).reshape((len(wire),) + shape)
+
+	return np.count_nonzero(column("h_present")[:, : c.OWN_HEROES].astype(bool) | (column("w_extra") > 0), axis=1)
 
 
 _WIRE_AT = {entry[0]: (offset, entry) for entry, offset in zip(IN_LAYOUT, itertools.accumulate((entry[-1] for entry in IN_LAYOUT), initial=0))}

@@ -45,13 +45,22 @@ NAMES = (
 IDLE = ("idle_movement", "idle_movement_town", "unmoved_heroes", "unmoved_heroes_town")
 # The inputs safe_pickups reads, decoded CHUNK decisions at a time: the update's END and TRAVEL decisions (~a third of
 # them) decoded whole at once were ~10 GB (1.7 MB a decision), the spike that stopped the PC's run (2026-10-30)
-FIELDS = ("h_present", "h_owner", "w_object", "w_flags", "move_mask", "w_creature", "w_owner")
+FIELDS = ("h_present", "h_owner", "w_object", "w_flags", "move_mask", "w_creature", "w_owner", "w_extra")
 CHUNK = 256
 # What the turn's end reads: our heroes' movement left and their day's, where they stand
 END_FIELDS = ("h_present", "h_owner", "h_garrisoned", "h_town", "h_move", "h_move_max")
 # What the meetings read: our heroes' places, identities (h_type, unique a hero) and movement left, our towns' places
-MOVE_FIELDS = ("h_present", "h_owner", "h_pos", "h_type", "h_move", "h_garrisoned", "t_present", "t_owner", "t_pos")
+MOVE_FIELDS = ("h_present", "h_owner", "h_pos", "h_type", "h_move", "h_garrisoned", "t_present", "t_owner", "t_pos", "w_extra", "w_extra_pos")
 R = c.WINDOW_RADIUS
+
+
+def window_hero(x, b, slot):
+	"""(the hero token of decision b's window slot, its middle tile [3]): the slot's own hero where it stands, or a
+	further window's hero and middle (schema 17: w_extra h + 1, w_extra_pos)."""
+	extra = int(x["w_extra"][b, slot])
+	if extra > 0:
+		return min(extra - 1, HO - 1), x["w_extra_pos"][b, slot]
+	return slot, x["h_pos"][b, slot]
 
 
 def safe_pickups(x, b):
@@ -65,7 +74,11 @@ def safe_pickups(x, b):
 		x["move_mask"][b] & np.isin(kind, SAFE_CLASSES) & (obj >= 0) & bit(c.TILE_VISITABLE) & ~bit(c.TILE_VISITED_BY_PLAYER) & ~bit(c.TILE_VISITED_BY_HERO)
 		& ~bit(c.TILE_GUARDED) & (x["w_creature"][b] < 0) & (x["w_owner"][b] != c.OWNER_SELF)
 	)
-	return ok.reshape(HO, -1).any(axis=1)
+	slots = ok.reshape(HO, -1).any(axis=1)  # (by window slot: a further window's, schema 17, is its hero's)
+	heroes = np.zeros(HO, dtype=bool)
+	extra = x["w_extra"][b]
+	np.logical_or.at(heroes, np.where(extra > 0, np.minimum(extra - 1, HO - 1), np.arange(HO)), slots)
+	return heroes
 
 
 def failure_counts(decisions, moves_limit=None):
@@ -166,7 +179,8 @@ def movement_counts(decisions, counts, limit=None):
 		for key, d, nxt in part:
 			b = row_of[id(d)]
 			move = d.action_type == c.ActionType.MOVE
-			h = min(d.index // (W * W) if move else d.index // (L * TG * TG), HO - 1)
+			# (a MOVE's entry is (window slot, tile): the slot's hero and middle, window_hero)
+			h, middle = window_hero(x, b, min(d.index // (W * W), HO - 1)) if move else (min(d.index // (L * TG * TG), HO - 1), None)
 			spent = 0
 			if nxt is not None:
 				later = row_of[id(nxt)]
@@ -176,7 +190,7 @@ def movement_counts(decisions, counts, limit=None):
 			meeting = town = False
 			if move:
 				rest = d.index % (W * W)
-				target = np.array([x["h_pos"][b, h, 0] + rest % W - R, x["h_pos"][b, h, 1] + rest // W - R, x["h_pos"][b, h, 2]])
+				target = np.array([middle[0] + rest % W - R, middle[1] + rest // W - R, middle[2]])
 				# (a hero in a town's garrison shares its tile and meets no one: a step there is a visit of the town, 2026-11-09)
 				ours = x["h_present"][b, :HO] & (x["h_owner"][b, :HO] == c.OWNER_SELF) & (np.arange(HO) != h) & ~x["h_garrisoned"][b, :HO].astype(bool)
 				there = np.flatnonzero(ours & (x["h_pos"][b, :HO] == target).all(axis=-1))

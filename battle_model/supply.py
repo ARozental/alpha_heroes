@@ -590,6 +590,9 @@ class Runner:
 			settings["ALPHA_MAP_NK2_ADVICE"] = str(self.config.campaign.nk2_advice)
 			if self.config.campaign.nk2_gather_weight > 0:  # (its visits again of a town as our GATHER's label: Advice.cpp visitAgain)
 				settings["ALPHA_MAP_GATHER_ADVICE"] = "1"
+		from campaign_model.play import window_settings
+
+		settings.update(window_settings(self.config.campaign))  # (schema 17: a hero's further windows, the entrances with no exit seen)
 		return tuple(settings.items())
 
 	def campaign(self, spec, stop=None):

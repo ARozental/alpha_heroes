@@ -115,7 +115,7 @@ def audit(games, model):
 			actions[kind.name][1] += bool(d.flags & NO_EFFECT)
 			actions[kind.name][2] += 1
 			if kind == c.ActionType.MOVE:
-				hero, cell = divmod(d.index, W * W)
+				hero, cell = divmod(d.index, W * W)  # (the window slot: its own hero's, or a further window's, schema 17)
 				row, column = divmod(cell, W)
 				s = slot.get(i * HO + hero)
 				if s is None or change is None:

@@ -146,7 +146,7 @@ def game_labels(game, x, phi_parts, hero_gold):
 				head = "move" if is_move else "answer"
 				labels[head][i], labels[f"{head}_mask"][i], labels[f"{head}_battle"][i] = target, True, bool(fought)
 				if is_move:
-					hero, rest = divmod(d.index, W * W)
+					hero, rest = divmod(d.index, W * W)  # (the window slot, as the heads' tables are laid out: schema 17)
 					labels["move_at"][i] = (hero, rest // W, rest % W)
 					# The engine's answer to the step, never ours (the user, 2026-11-04): a wandering monster that offers to join or
 					# flees asks us first (VCMI's CGCreature: a yes/no question about it), one that fights does not

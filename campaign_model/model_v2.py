@@ -499,8 +499,11 @@ class CampaignModelV2(nn.Module):
 		windows, n, real = windows_of(x, fixed=self.fixed_windows, budget=self.window_budget)
 		known = self.features(x, windows)
 		known.windows, known.n, known.real = windows, n, real
+		# Each window's hero (its flat index, decision x OWN_HEROES + hero token) and middle tile: a slot's own hero's
+		# around it, or a further window of a hero of ours (schema 17, features.window_heroes)
+		known.heroes, known.middles = ft.window_heroes(x, windows)
 		known.side = ft.block_side(x)  # [B] the map grid's block side in tiles (1 up to 36 x 36: docs/map_size_plan.md)
-		known.window_tiles = window_tile_index(x, windows, known.side)  # [K, W, W] each window tile's map cell (-1 off the grid)
+		known.window_tiles = window_tile_index(known.middles, windows, known.side)  # [K, W, W] each window tile's map cell (-1 off the grid)
 		ours = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
 		armies = known.hero_gold[:, :HO] * ours
 		rivals = known.hero_gold[:, HO:] * (x["h_present"][:, HO:] & (x["h_owner"][:, HO:] > c.OWNER_SELF))
@@ -605,7 +608,8 @@ class CampaignModelV2(nn.Module):
 		state.tiles = grid.reshape(b, L, dc, S, S).permute(0, 1, 3, 4, 2)  # [B, L, S, S, dc]
 		flat = state.tiles.reshape(b, L * S * S, dc)
 		valid = on_map.reshape(b, L * S * S) > 0
-		# Our heroes' reach on the map, as the tile reader's bias per head: each window's tiles scattered to theirs. The
+		# Our heroes' reach on the map, as the tile reader's bias per head: each window's tiles scattered to theirs (a
+		# hero's further windows, schema 17, to the same hero's: known.heroes). The
 		# windows are computed padded (windows_of: fixed shapes on Apple's GPU, which keeps a graph per shape); the padding
 		# rows, copies of the first window, are left out of the scatter (they would count its reach twice)
 		heads = self.heads
@@ -614,7 +618,7 @@ class CampaignModelV2(nn.Module):
 			k = known.windows.shape[0]
 			state.window_reach = self.reach(None, reach_features(x, known.windows))  # [K, W, W, dc]
 			tiles = known.window_tiles.reshape(k, W * W)
-			index = (known.windows[:, None] * (L * S * S) + tiles.clamp(min=0)).reshape(-1)
+			index = (known.heroes[:, None] * (L * S * S) + tiles.clamp(min=0)).reshape(-1)
 			inside = ((tiles >= 0) & known.real[:, None]).reshape(-1)
 			values = torch.where(inside.unsqueeze(-1), self.read_tiles.reach(state.window_reach).reshape(-1, heads), 0.0)
 			reach = reach.index_add(0, torch.where(inside, index, 0), values.to(reach.dtype))
@@ -684,7 +688,7 @@ class CampaignModelV2(nn.Module):
 		its reach's projections summed."""
 		b = state.x["g_day"].shape[0]
 		k = known.windows.shape[0]
-		heroes = state.heroes[:, :HO].reshape(b * HO, -1).index_select(0, known.windows)
+		heroes = state.heroes[:, :HO].reshape(b * HO, -1).index_select(0, known.heroes)  # (each window's hero: its own slot's, or a further window's)
 		flat = state.tiles.reshape(b * L * S * S, self.cell_dim)
 		decision = torch.div(known.windows, HO, rounding_mode="floor")
 		index = known.window_tiles
@@ -760,7 +764,8 @@ class CampaignModelV2(nn.Module):
 			move = dense(real_only(self.move_out(state.move_pairs).squeeze(-1) + self.move_fight(fight_features(known)).squeeze(-1) + state.move_mix.squeeze(-1), known), known.windows, known.n, b)
 			move_prior = dense(real_only(known.tile_prior, known), known.windows, known.n, b)
 			cast_cell = dense(real_only(self.cast_cell_out(state.move_pairs).squeeze(-1), known), known.windows, known.n, b)
-		learned[A_.MOVE], prior[A_.MOVE] = move + self.act_move(own_heroes).reshape(b, HO, 1, 1), move_prior
+		# (the act-now score of each window slot's hero: its own, or the hero a further window belongs to, schema 17)
+		learned[A_.MOVE], prior[A_.MOVE] = move + self.act_move(own_heroes).reshape(b, HO).gather(1, ft.slot_heroes(x)).reshape(b, HO, 1, 1), move_prior
 		offers[A_.MOVE] = ft.offer(move_prior, x["move_mask"])
 		out["cast_cell_logp"] = masked_log_softmax(cast_cell.reshape(b, HO, W * W), x["cast_cell_mask"].reshape(b, HO, W * W)).reshape(b, HO, W, W)
 		# TRAVEL: (hero, area) pairs, + the area's prior (its value discounted by the days to it)
@@ -1135,11 +1140,11 @@ def map_index(positions, b, side=None):
 	return index, inside
 
 
-def window_tile_index(x, windows, side=None):
-	"""[K, W, W] each window tile's index in its decision's flattened grid (level, row, column), -1 off the grid; side
-	[B]: the grid's cells blocks of that many tiles a side (a bigger map's: several window tiles share one), None tiles."""
+def window_tile_index(pos, windows, side=None):
+	"""[K, W, W] each window tile's index in its decision's flattened grid (level, row, column), -1 off the grid; pos
+	[K, 3] the windows' middle tiles (features.window_heroes); side [B]: the grid's cells blocks of that many tiles a
+	side (a bigger map's: several window tiles share one), None tiles."""
 	k = windows.shape[0]
-	pos = x["h_pos"][:, :HO].reshape(-1, 3).index_select(0, windows)  # [K, 3]
 	offsets = torch.arange(W, device=pos.device) - c.WINDOW_RADIUS
 	dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
 	tx, ty = pos[:, 0, None, None] + dx, pos[:, 1, None, None] + dy
@@ -1152,14 +1157,15 @@ def window_tile_index(x, windows, side=None):
 
 
 def windows_of(x, fixed=False, budget=None):
-	"""(flat indices of the windows computed (decision x OWN_HEROES + hero), how many of them dense() places, [K] which
-	are our heroes'). Our heroes' alone, as model.CampaignModel's, padded on Apple's GPU with copies of the first (the
-	padding not real); fixed: every slot's, absent heroes' not real (CUDA graphs: one shape a batch size, no sync).
-	fixed with a budget: that many slots, ours first (each in its decision's order) and then absent ones, not real:
-	distinct slots, so dense() places them all and the absent ones' are zeroed as every slot's are. The same outputs
-	when the batch has at most `budget` of our heroes (the caller counts them: more would be left out); the PC's games,
-	2026-11-03: 2.8 a decision, never more than 4, of 8 slots."""
-	present = x["h_present"][:, :HO].reshape(-1)
+	"""(flat indices of the windows computed (decision x OWN_HEROES + window slot), how many of them dense() places, [K]
+	which hold a window). The slots that hold one alone (our heroes' own and their further ones, schema 17:
+	features.windows_present), as model.CampaignModel's, padded on Apple's GPU with copies of the first (the
+	padding not real); fixed: every slot's, empty slots' not real (CUDA graphs: one shape a batch size, no sync).
+	fixed with a budget: that many slots, those with a window first (each in its decision's order) and then empty
+	ones, not real: distinct slots, so dense() places them all and the empty ones' are zeroed as every slot's are. The
+	same outputs when the batch has at most `budget` windows (the caller counts them, records.heroes_in: more would be
+	left out); the PC's games, 2026-11-03, before further windows: 2.8 a decision, never more than 4, of 8 slots."""
+	present = ft.windows_present(x).reshape(-1)
 	if fixed and budget is not None and budget < present.shape[0]:
 		windows = torch.argsort((~present).to(torch.int8), stable=True)[:budget]
 		return windows, budget, present.index_select(0, windows)

@@ -37,6 +37,14 @@ class GameInfo:
 	run_mb: float  # the run directory (logs) on disk
 
 
+def window_settings(config):
+	"""Schema 17's switches as a game's environment (a tuple of pairs, for play's settings): the further windows a hero
+	may have and whether the entrances with no exit seen are flagged (config.further_windows, config.unseen_exits;
+	Encoder.cpp reads them once a game). Every game of a run gets the same: a model taught with one and judged with the
+	other would see inputs it never trained on."""
+	return (("ALPHA_MAP_FURTHER_WINDOWS", str(int(config.further_windows))), ("ALPHA_MAP_UNSEEN_EXITS", "1" if config.unseen_exits else "0"))
+
+
 def players_without_a_town(path):
 	"""The players of a generated map (.vmap) with no starting town: the generator sometimes leaves one out (template
 	8SM0f gave red none), and such a player is out at once (and red's loss ended the whole game)."""

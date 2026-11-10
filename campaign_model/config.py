@@ -73,7 +73,26 @@ class CampaignConfig:
 	cuda_graphs: bool = True  # on CUDA: the update's forward and backward replayed from recorded graphs (graphs.py: launches cost under WSL)
 	step_graphs: bool = True  # with cuda_graphs: a micro-batch's forward, loss and backward as one recorded graph (graphs.StepGraph)
 	convert_in_graphs: bool = True  # with cuda_graphs, on CUDA: the wire's conversion (records.inputs_on_device, ~250 small kernels a micro-batch, ~20 ms of the main thread's ~58 under WSL, 2026-11-03) recorded in the update's graphs, which take the bytes as sent; each such graph checked at its first replay, the conversion done outside again if one fails
-	window_budget: float = 4.0  # with cuda_graphs: hero windows computed a decision (model_v2.windows_of), of OWN_HEROES slots: the same outputs for a batch with no more of our heroes (it computes every slot otherwise); the PC's games, 2026-11-03: 2.8 a decision, never more than 4. 0: every slot
+	window_budget: float = 4.0  # with cuda_graphs: hero windows computed a decision (model_v2.windows_of), of OWN_HEROES slots: the same outputs for a batch with no more windows (it computes every slot otherwise); the PC's games, 2026-11-03: 2.8 heroes a decision, never more than 4; further windows (below) add theirs, ~0.4 a hero in the games looked at: 5.0 with them. 0: every slot
+	# Schema 17 (2026-11-10), the games' side of it (play.window_settings: AlphaMapAI's environment, every game's alike).
+	# further_windows: the windows a hero may have beside its own (ALPHA_MAP_FURTHER_WINDOWS; 0: none, the windows as
+	# before): a square of one level around tiles it reaches today that its own window does not show, in a window slot
+	# no hero holds, its tiles MOVE targets. Before it nothing past a gate or a monolith was a MOVE's target (the window
+	# is the hero's own level's) nor a TRAVEL's (its areas are a day or more away): the way through was a MOVE onto the
+	# gate, a tile worth nothing. One, not more: in a Nullkiller2 game of 40 days (36 x 36, two levels) 43% of the
+	# hero-turns had such tiles, a median of 31 against 77 inside the hero's window; a second window held a median of 8
+	# more, a third 3, each as much work as a hero's own (the forward on the Mac's CPU: 27.2 ms a decision at 3 windows,
+	# +1.6 a window; a game client's CPU the same with them and without, 4.4-4.7 against 4.5-4.6 ms a decision).
+	# A label change too: Nullkiller2's advised tiles past a gate become MOVE labels (18 of 865 MOVE labels, 32 of 1,192
+	# accepted entries in one game of ours with its advice): measure the type drift after the first update
+	further_windows: int = 1
+	# unseen_exits: TILE_UNSEEN_EXIT and OBJECT_UNSEEN_EXIT set (ALPHA_MAP_UNSEEN_EXITS; False: never, the prior as
+	# before): a gate's or monolith's entrance no exit of which we have seen. VCMI's pathfinder goes through one only to
+	# an exit the player sees, so nothing past it is a target and the entrance itself, with nothing on it and the land
+	# around it long revealed, was worth nothing; it is priced as a whole sight of new land (model.tile_features'
+	# explore; its TRAVEL area as unrevealed, features.unseen_exits), as Nullkiller2's ExplorationBehavior sends a hero
+	# into each. A prior change of its own: turn it on apart from further_windows
+	unseen_exits: bool = True
 	# The update's inputs decoded ahead in this many threads (train._prefetched: zlib, ~430 decisions/s a thread on the PC). With
 	# the step recorded whole the PC's update waited ~15 s for 3 of them, the CPU half idle (2026-10-31): each decision is
 	# decoded three times an update (the first pass, two passes)

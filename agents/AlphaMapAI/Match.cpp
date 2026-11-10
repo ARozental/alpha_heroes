@@ -74,11 +74,8 @@ bool AlphaMapAI::matchRequest(const Decision & decision, const CPackForServer * 
 			{
 				if(decision.heroes[i] != p->hid)
 					continue;
-				const auto & center = decision.centers[i];
-				const int row = target.y - center.y + WINDOW_RADIUS;
-				const int column = target.x - center.x + WINDOW_RADIUS;
-				if(target.z == center.z && row >= 0 && row < WINDOW && column >= 0 && column < WINDOW && decision.inputs.get(In::move_mask, i, row, column) != 0)
-					pick(ActionType::MOVE, (i * WINDOW + row) * WINDOW + column);
+				if(const int entry = decision.moveEntry(i, target); entry >= 0) // (any of its windows: schema 17)
+					pick(ActionType::MOVE, entry);
 				break;
 			}
 			if(choice.type < 0) // not a tile of its window in reach today: the area it heads for, the nearest

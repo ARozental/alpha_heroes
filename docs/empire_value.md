@@ -170,6 +170,9 @@ Every other building (defense bonuses, growth, incomes) counts as its cost, an i
   movement reaches counts when it is picked up.
 - **Information beyond the map.** The thieves' guild, the den of thieves and signs give nothing Φ can hold.
 - **Access.** Keymasters, border gates, monoliths and boats are worth what they lead to, which counts when taken.
+  (Φ only. MOVE's prior does price one case since schema 17: a gate's or a monolith's entrance no exit of which we have
+  seen is worth a sight of new land, as a tile deep in fog is, and its TRAVEL area counts as unrevealed; the tiles past
+  an exit we have seen are MOVE targets themselves, in the hero's further window.)
   Quests count when they pay.
 - **The puzzle map and the Grail.** We have no DIG action, so an obelisk is worth nothing to us.
 - **An owned dwelling's future weeks.** Φ counts the creatures there to hire, and each week's growth when it arrives.
