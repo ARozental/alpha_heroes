@@ -40,6 +40,34 @@ def test_outputs_are_the_models(served):
 		client.run("v1", x)
 
 
+def test_a_request_that_waits_long_is_said_and_a_command_that_fails_does_not_end_the_worker(capfd, monkeypatch):
+	"""A request for a model never set waits MODEL_WAIT (5 s) for it in the worker: with SLOW at 1 s the server says in
+	the log that it waits and what the worker is at; the reply (an error) still comes. Weights that do not fit the model
+	(a command of the trainer's that raises): said in the log, the model's own weights kept, the requests after it
+	answered."""
+	monkeypatch.setenv("ALPHA_INFERENCE_SLOW_SECONDS", "1")
+	torch.manual_seed(0)
+	model = BattleModel().eval()
+	play.SOCKET_DIR.mkdir(parents=True, exist_ok=True)
+	server = InferenceServer(play.SOCKET_DIR / "test-inference-slow.sock", device="cpu", model_kwargs={"architecture": "v3"}, threads=1)
+	try:
+		server.set_model("current", 3, model)
+		client = InferenceClient(server.socket_path)
+		x = random_inputs(batch=2, seed=4)
+		before = client.run("current", x)
+		with pytest.raises(RuntimeError, match="no model named"):
+			client.run("v1", x)
+		server.controls[0].send(("set", "battle", "current", 9, {"not_a_weight": torch.zeros(3)}))
+		time.sleep(0.5)
+		version, out = client.run("current", x)
+		assert version == before[0] == 3 and all(np.array_equal(out[k], before[1][k], equal_nan=True) for k in out)
+	finally:
+		server.close()
+	said = capfd.readouterr().out
+	assert "a request for battle/v1 (2 decisions) has waited" in said and "the worker: battle/v1, 1 of 1 requests" in said, said
+	assert "a command of the trainer's failed" in said, said
+
+
 GPU = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else None
 
 

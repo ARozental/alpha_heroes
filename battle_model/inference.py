@@ -40,6 +40,10 @@ MODEL_WAIT = 5.0  # seconds a request for a model not served yet waits for its w
 # Windows GPU (WSL) every submission to the GPU is a context switch away from the trainer's (2026-10-30: a server
 # answering one-decision requests as they came cost the trainer 54% of its step rate)
 BATCH_WAIT = float(os.environ.get("ALPHA_INFERENCE_BATCH_WAIT_MS", "0")) / 1000
+# Seconds a request waits for its reply before the server says so in the run's log, with what its worker is at (then
+# again every so many). 2026-11-10: of the games their stall watchdog killed (no log output for 60 s), 26 kept on the
+# PC had their AI waiting in the socket read for a reply (a client's wait has no limit), and nothing here said why
+SLOW = float(os.environ.get("ALPHA_INFERENCE_SLOW_SECONDS", "10"))
 
 
 @dataclass(frozen=True)
@@ -128,6 +132,15 @@ def _serve(socket_path, device_name, family_names, model_kwargs, control, thread
 	models = {}  # (family, name) -> [module, version]
 	requests = queue.Queue()  # (family, name, decisions, payload, reply): the worker puts its reply's bytes in reply[0], sets reply[1]
 	commands = queue.Queue()  # from the trainer, applied by the worker (the only thread that touches the device)
+	doing = ["starting", time.monotonic()]  # what the worker is at and since when (said beside a request that waits long)
+	said = [0.0]  # when a waiting request was last said (a line per SLOW seconds a process at most)
+
+	def say(text):
+		"""A line in the run's log; a diagnostic, never an error here."""
+		try:
+			print(f"inference server {os.getpid()}: {text}", flush=True)
+		except Exception:  # noqa: BLE001
+			pass
 
 	def control_reader():  # drains the pipe at once: a weights message (~1 MB) would block the trainer until read
 		while True:
@@ -158,8 +171,15 @@ def _serve(socket_path, device_name, family_names, model_kwargs, control, thread
 					reply = struct.pack("<I", ERROR) + f"{decisions} decisions need {decisions * in_bytes} bytes, got {len(payload)}".encode()
 				else:
 					box = [None, threading.Event()]
+					asked = time.monotonic()
 					requests.put((family_name, name, decisions, payload, box))
-					box[1].wait()  # one request at a time per connection: the reply goes out before the next is read
+					# one request at a time per connection: the reply goes out before the next is read. A request still
+					# waiting after SLOW seconds is said, with what the worker is at
+					while not box[1].wait(SLOW):
+						now = time.monotonic()
+						if now - said[0] >= SLOW:
+							said[0] = now
+							say(f"a request for {family_name}/{name} ({decisions} decisions) has waited {now - asked:.0f} s for its reply; the worker: {doing[0]}, for {now - doing[1]:.0f} s; {requests.qsize()} requests queued")
 					reply = box[0]
 				send_message(conn, pack(reply) if packed else reply)
 		except (ConnectionError, OSError, zlib.error):
@@ -283,6 +303,7 @@ def _serve(socket_path, device_name, family_names, model_kwargs, control, thread
 
 	def worker():
 		while True:
+			doing[:] = ["idle", time.monotonic()]
 			pending = [requests.get()]
 			deadline = time.monotonic() + BATCH_WAIT
 			while len(pending) < MAX_BATCH:
@@ -290,11 +311,18 @@ def _serve(socket_path, device_name, family_names, model_kwargs, control, thread
 					pending.append(requests.get(timeout=max(0.0, deadline - time.monotonic())) if BATCH_WAIT else requests.get_nowait())
 				except queue.Empty:
 					break
-			apply_control()
+			doing[:] = ["the trainer's commands", time.monotonic()]
+			try:
+				apply_control()
+			except Exception as error:  # noqa: BLE001
+				# (never the worker's end: every request after it would wait for ever. The commands left are applied
+				# before the next batch)
+				say(f"a command of the trainer's failed: {type(error).__name__}: {str(error)[:300]}")
 			by_key = {}
 			for item in pending:
 				by_key.setdefault((item[0], item[1]), []).append(item[1:])
 			for key, batch in by_key.items():
+				doing[:] = [f"{key[0]}/{key[1]}, {len(batch)} of {len(pending)} requests", time.monotonic()]
 				try:
 					if key not in models:
 						apply_control(wait_for=key)
