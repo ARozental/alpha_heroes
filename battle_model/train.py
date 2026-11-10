@@ -199,6 +199,7 @@ class TrainConfig:
 	aux_batch: int = 512
 	aux_seconds: float = 20.0
 	aux_kl_weight: float = 10.0  # (tests: 3.6e-3 of KL on a fixed batch against 2.4e-2 without, the value's loss as low)
+	aux_kl_max: float = 3e-4  # a phase that moved the policy more on its held-out battles is undone (aux_rejected): ~10 PPO updates' KL
 	aux_lr_factor: float = 1.0
 	aux_replay_decisions: int = 20_000
 	aux_replay_age: int = 8
@@ -322,7 +323,7 @@ def run_dir(config, new=False):
 	return TRAIN_ROOT / f"{time.strftime('%Y%m%d-%H%M')}-{config.run}"
 
 
-AUX_COLUMNS = ("aux_steps", "aux_seconds", "aux_value_loss", "aux_kl", "aux_grad_cosine", "aux_trunk_move", "aux_excess_before", "aux_excess_after", "aux_kl_held_out", "aux_replay_decisions")
+AUX_COLUMNS = ("aux_steps", "aux_seconds", "aux_value_loss", "aux_kl", "aux_grad_cosine", "aux_trunk_move", "aux_excess_before", "aux_excess_after", "aux_kl_held_out", "aux_kl_check", "aux_skipped", "aux_rejected", "aux_failed", "aux_replay_decisions")
 
 # Action types whose share of each side's decisions is logged every epoch (actions_<side>/<type> in TensorBoard)
 ACTION_KINDS = ("WAIT", "DEFEND", "MOVE", "MELEE", "SHOOT", "HERO_SPELL", "CREATURE_SPELL", "RETREAT", "SURRENDER")
@@ -1390,12 +1391,19 @@ def train(config, resume=False):
 	replay = aux_phase = None  # (config.aux_value: the value's own phase, aux_value.py)
 	aux_readings = {}
 	if config.aux_value and pool is not None:
-		from .aux_value import AuxValuePhase, ValueReplay, aux_allowed
+		from .aux_value import AuxValuePhase, ValueReplay, aux_allowed, guarded_run
 
 		replay = ValueReplay(config.aux_replay_decisions, config.aux_replay_age, config.aux_per_battle, seed=first_epoch)
 		groups = battle_parameter_groups(model)
-		aux_phase = AuxValuePhase(groups, {name: battle_group_lr({"name": name}, config) * config.aux_lr_factor for name in groups}, betas=(0.9, config.adam_beta2))
+		aux_phase = AuxValuePhase(groups, {name: battle_group_lr({"name": name}, config) * config.aux_lr_factor for name in groups}, betas=(0.9, config.adam_beta2), kl_max=config.aux_kl_max)
+		if resume and state.get("aux_optimizer"):  # (its Adam as the last checkpoint left it: a restart does not start it cold)
+			aux_phase.load_state_dict(state["aux_optimizer"])
 		pool.replay = replay  # (its memory in the trainer's census)
+
+	def checkpoint_extras():
+		"""What a checkpoint keeps beside the model and the optimizer: the clips' calibration, the value phase's Adam."""
+		return {"grad_clips": grad_clips, "clip_samples": clip_samples, **({"aux_optimizer": aux_phase.state_dict()} if aux_phase is not None else {})}
+
 	for group in optimizer.param_groups:
 		group["betas"] = (group["betas"][0], config.adam_beta2)
 	try:
@@ -1437,7 +1445,7 @@ def train(config, resume=False):
 				from .supply import assemble
 
 				batch_all, summaries = assemble(items, advantage_config, device=device if device.type == "cuda" else None)  # (the sparse inputs dense on the GPU: supply.dense_on)
-				if replay is not None:
+				if replay is not None and aux_phase is not None:
 					replay.add(items, pool.version)  # (a few decisions of each battle, for the value's own phase)
 				n_examples = int(batch_all["advantage"].shape[0]) if batch_all is not None else 0
 			else:
@@ -1694,7 +1702,7 @@ def train(config, resume=False):
 			if aux_phase is not None and aux_allowed(campaign, config):
 				# The value's own phase (aux_value.py), before the eval's snapshot and the checkpoint: they hold its weights
 				newest = max((e["version"] for e in replay.entries), default=None)
-				aux_readings = aux_phase.run(model, replay, device, steps=config.aux_steps, batch_size=config.aux_batch, kl_weight=config.aux_kl_weight, seconds=config.aux_seconds, clip=config.grad_clip, ppo_config=ppo_config, held_out_version=newest)
+				aux_readings, aux_phase = guarded_run(aux_phase, model, replay, device, steps=config.aux_steps, batch_size=config.aux_batch, kl_weight=config.aux_kl_weight, seconds=config.aux_seconds, clip=config.grad_clip, ppo_config=ppo_config, held_out_version=newest)
 				aux_readings["aux_replay_decisions"] = replay.decisions()
 			if evals.error:
 				raise evals.error
@@ -1705,7 +1713,7 @@ def train(config, resume=False):
 			eval_pending = eval_pending or bool(due)
 			if eval_pending and idle:
 				eval_pending = False
-				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, {"grad_clips": grad_clips, "clip_samples": clip_samples})  # every evaluated model
+				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, checkpoint_extras())  # every evaluated model
 				if pool:
 					# Beside training (2026-10-30: the run stood still ~2 minutes an hour for it): the actors go on and the
 					# learner trains while the eval plays copies of the weights as they are now. Its battles are greedy, so
@@ -1716,9 +1724,9 @@ def train(config, resume=False):
 					last_eval = time.monotonic()
 			if campaign and campaign.eval_due():  # against Nullkiller2, beside training (the models pinned: learner.evaluate)
 				campaign.start_eval(epoch)
-			save_checkpoint(latest, model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, {"grad_clips": grad_clips, "clip_samples": clip_samples})
+			save_checkpoint(latest, model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, checkpoint_extras())
 			if config.checkpoint_every and epoch % config.checkpoint_every == 0:
-				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, {"grad_clips": grad_clips, "clip_samples": clip_samples})
+				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, checkpoint_extras())
 		evals.join()  # (the run's end: its last eval's row too)
 	finally:
 		evals.close()  # (stopped: no new eval battle; the ones playing end)

@@ -95,7 +95,7 @@ def test_the_phase_lowers_the_value_loss_and_its_kl_holds_the_policy():
 		from battle_model.train import battle_parameter_groups
 
 		groups = battle_parameter_groups(model)
-		phase = AuxValuePhase(groups, {name: (3e-3 if name == "values" else 3e-4) for name in groups})
+		phase = AuxValuePhase(groups, {name: (3e-3 if name == "values" else 3e-4) for name in groups}, kl_max=1.0)  # (no net: the KL's own effect)
 		every = replay.batch(10_000, torch.device("cpu"))
 		with torch.no_grad():
 			before = float(value_loss(model({k: v.long() if v.dtype == torch.int32 else v for k, v in every["inputs"].items()}), every["value_labels"])[0])
@@ -118,3 +118,62 @@ def test_the_phase_never_runs_beside_a_campaign_update():
 	assert aux_allowed(object(), SimpleNamespace(campaign=SimpleNamespace(learner="turns")))
 	assert not aux_allowed(object(), SimpleNamespace(campaign=SimpleNamespace(learner="thread")))
 	assert not aux_allowed(object(), SimpleNamespace(campaign=SimpleNamespace(learner="process")))
+
+
+def setup_phase(rates, kl_max=3e-4, seed=3):
+	from battle_model.train import battle_parameter_groups
+
+	torch.manual_seed(0)
+	model = perturbed(BattleModel().eval(), scale=0.05, seed=seed)
+	heads = run(model, random_inputs(batch=1))["value"].shape[1]
+	replay = ValueReplay(max_decisions=10_000, max_age=8, per_battle=8, seed=0)
+	replay.add([battle_item(s, 8, 5, heads) for s in range(10)] + [battle_item(50 + s, 8, 6, heads) for s in range(3)], version=6)
+	groups = battle_parameter_groups(model)
+	return model, replay, AuxValuePhase(groups, {name: rates for name in groups}, kl_max=kl_max)
+
+
+def test_a_phase_that_moves_the_policy_past_kl_max_is_undone_bit_for_bit():
+	"""e5's net: kl_weight 0 at a large rate moves the policy far; the phase is undone, every weight the start's exactly,
+	its Adam cold again (aux_rejected)."""
+	model, replay, phase = setup_phase(rates=1e-2)
+	start = {name: p.detach().clone() for name, p in model.state_dict().items()}
+	readings = phase.run(model, replay, torch.device("cpu"), steps=10, batch_size=32, kl_weight=0.0, seconds=120, held_out_version=6)
+	assert readings["aux_rejected"] == 1 and readings["aux_kl_check"] > 3e-4, readings
+	assert all(torch.equal(start[name], value) for name, value in model.state_dict().items())
+	assert phase.steps_done == 0 and not phase.optimizer.state  # (cold again)
+
+
+def test_an_error_in_the_phase_puts_the_weights_back_and_guarded_run_turns_it_off(capsys):
+	"""e5's net: the replay failing on its second batch; run() puts the weights back and re-raises; guarded_run says
+	FAILURE once and gives None (the phase off for the run)."""
+	from battle_model.aux_value import guarded_run
+
+	model, replay, phase = setup_phase(rates=1e-3)
+	start = {name: p.detach().clone() for name, p in model.state_dict().items()}
+	draws = {"n": 0}
+	real_batch = replay.batch
+
+	def failing(*args, **kwargs):
+		draws["n"] += 1
+		if draws["n"] >= 3:  # (the held-out check, the first step's batch, then this)
+			raise RuntimeError("a replay batch that fails")
+		return real_batch(*args, **kwargs)
+
+	replay.batch = failing
+	readings, still = guarded_run(phase, model, replay, torch.device("cpu"), steps=5, batch_size=32, kl_weight=10.0, seconds=120, held_out_version=6)
+	assert still is None and readings == {"aux_failed": 1}
+	assert "aux: FAILURE" in capsys.readouterr().out
+	assert all(torch.equal(start[name], value) for name, value in model.state_dict().items()) and not model.training
+
+
+def test_the_phase_warms_its_rates_and_its_state_goes_through_a_checkpoint():
+	"""A cold Adam's rate is rate x 1/WARMUP on its first step; the state (moments, steps done) saved and loaded again."""
+	from battle_model.aux_value import WARMUP
+
+	model, replay, phase = setup_phase(rates=1e-4, kl_max=1.0)
+	phase.run(model, replay, torch.device("cpu"), steps=1, batch_size=32, kl_weight=10.0, seconds=120, held_out_version=6)
+	assert phase.steps_done == 1 and all(abs(g["lr"] - 1e-4 / WARMUP) < 1e-12 for g in phase.optimizer.param_groups)
+	saved = phase.state_dict()
+	_, _, other = setup_phase(rates=1e-4, kl_max=1.0)
+	other.load_state_dict(saved)
+	assert other.steps_done == 1 and len(other.optimizer.state_dict()["state"]) == len(saved["optimizer"]["state"])

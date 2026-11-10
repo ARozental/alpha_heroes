@@ -14,7 +14,20 @@ parameter at its group's rate (battle_group_lr: the user's cap on the trunk). Th
 found it: what the trunk learns for V, the policy heads follow without changing what they choose.
 
 Only between a battle update and the next: with the campaign learner "turns" (its updates on the same thread) or no
-campaign, never beside a campaign update (aux_allowed)."""
+campaign, never beside a campaign update (aux_allowed).
+
+Nets (e5's review): a step whose loss is not finite is skipped (aux_skipped); a phase that ends with a weight or a
+reading not finite, or with the policy moved more than kl_max from where it started (on the held-out battles), is
+undone, its weights the snapshot's again and its Adam reset (aux_rejected); an error inside it puts the weights back
+and re-raises, and guarded_run turns the phase off for the run with one "aux: FAILURE" line. A cold Adam's first steps
+are full-rate sign steps on one batch's noise: its rates rise linearly over its first WARMUP steps, and its state is
+kept in the checkpoints (state_dict), so a restart does not start cold.
+
+The held-out battles are the newest version's, which PPO trained on just before: the difference before and after a
+phase is a fair reading of the phase, their level is not comparable with value_loss_fresh (which the trainer reads
+before PPO trains on them). The judged series stays value_loss_fresh."""
+
+WARMUP = 16  # steps of a cold Adam over which its rates rise from 1/WARMUP to their full value
 import collections
 import copy
 import random
@@ -134,17 +147,35 @@ class AuxValuePhase:
 	"""The value's phase (the module's docstring), its own Adam over the model's groups (groups: {name: [(name,
 	parameter)]}, train.battle_parameter_groups; rates: {group: its rate})."""
 
-	def __init__(self, groups, rates, betas=(0.9, 0.999)):
+	def __init__(self, groups, rates, betas=(0.9, 0.999), kl_max=3e-4):
 		self.trunk = [p for _, p in groups.get("trunk", [])]
 		self.params = [p for params in groups.values() for _, p in params]
-		self.optimizer = torch.optim.Adam([{"params": [p for _, p in params], "name": name, "lr": rates[name]} for name, params in groups.items() if params], betas=betas)
+		self.groups, self.rates, self.betas, self.kl_max = groups, dict(rates), betas, kl_max
+		self.reset()
+
+	def reset(self):
+		"""A cold Adam (its rates warmed up again over WARMUP steps)."""
+		self.optimizer = torch.optim.Adam([{"params": [p for _, p in params], "name": name, "lr": self.rates[name]} for name, params in self.groups.items() if params], betas=self.betas)
+		self.steps_done = 0
+
+	def state_dict(self):
+		return {"optimizer": self.optimizer.state_dict(), "steps_done": self.steps_done}
+
+	def load_state_dict(self, state):
+		"""A checkpoint's phase state; a cold one kept when it does not fit (other groups or shapes), said once."""
+		try:
+			self.optimizer.load_state_dict(state["optimizer"])
+			self.steps_done = int(state.get("steps_done", 0))
+		except (KeyError, ValueError, RuntimeError) as error:
+			print(f"aux: the checkpoint's phase state does not fit ({str(error)[:200]}): a cold one", flush=True)
+			self.reset()
 
 	def run(self, model, replay, device, steps=8, batch_size=512, kl_weight=1.0, seconds=30.0, clip=1.0, ppo_config=None, held_out_version=None, held_out=512):
 		"""Up to `steps` steps (and `seconds`) on replay batches of batch_size (the battles of held_out_version left out
 		of them: the readings' held-out set); the readings (aux_*): steps, seconds, mean value loss and KL, the cosine
 		between successive steps' trunk gradients (signal when steady; ~0 is noise), the trunk's move over the phase (of
 		its norm), value_excess on the held-out battles before and after, and the policy's KL from the snapshot there."""
-		readings = {"aux_steps": 0}
+		readings = {"aux_steps": 0, "aux_skipped": 0, "aux_rejected": 0}
 		ppo_config = ppo_config if ppo_config is not None else PPOConfig()
 		if replay.decisions(exclude_version=held_out_version) < batch_size:
 			return readings
@@ -152,11 +183,32 @@ class AuxValuePhase:
 		snapshot = copy.deepcopy(model).eval()  # (the policy as the phase starts: what the KL holds it to)
 		for p in snapshot.parameters():
 			p.requires_grad_(False)
+
+		def undo():
+			model.load_state_dict(snapshot.state_dict())  # (in place: the PPO optimizer's parameters are the same tensors)
+			model.eval()
+
+		try:
+			readings.update(self._run(model, snapshot, replay, device, steps, batch_size, kl_weight, seconds, clip, ppo_config, held_out_version, held_out, started))
+		except BaseException:
+			undo()
+			raise
+		rejected = not all(np.isfinite(readings[k]) for k in ("aux_value_loss", "aux_kl", "aux_kl_check")) or not all(bool(torch.isfinite(p).all()) for p in model.parameters())
+		rejected = readings["aux_steps"] > 0 and (rejected or readings["aux_kl_check"] > self.kl_max)  # (no step taken: nothing to undo)
+		if rejected:  # (the phase undone, its Adam cold again: what led here must not carry on)
+			undo()
+			self.reset()
+			readings["aux_rejected"] = 1
+		readings["aux_seconds"] = round(time.monotonic() - started, 2)
+		return readings
+
+	def _run(self, model, snapshot, replay, device, steps, batch_size, kl_weight, seconds, clip, ppo_config, held_out_version, held_out, started):
+		readings = {"aux_steps": 0, "aux_skipped": 0}
 		check = replay.batch(held_out, device, only_version=held_out_version) if held_out_version is not None else None
+		if check is None:  # (no held-out battles: the KL's check on a draw of the replay as the phase starts)
+			check = replay.batch(held_out, device, exclude_version=held_out_version)
 
 		def held_out_readings():
-			if check is None:
-				return float("nan"), float("nan")
 			with torch.no_grad():
 				inputs = widened(check["inputs"])
 				out, snap = model(inputs), snapshot(inputs)
@@ -178,25 +230,43 @@ class AuxValuePhase:
 				snap = snapshot(inputs)
 			value, _ = value_loss(out, batch["value_labels"], ppo_config, batch.get("weight"))
 			divergence = kl(snap, out).mean()
+			loss = value + kl_weight * divergence
 			self.optimizer.zero_grad(set_to_none=True)
-			(value + kl_weight * divergence).backward()
+			if not bool(torch.isfinite(loss)):
+				readings["aux_skipped"] += 1
+				continue
+			loss.backward()
 			torch.nn.utils.clip_grad_norm_(self.params, clip)
+			warm = min(1.0, (self.steps_done + 1) / WARMUP)
+			for group in self.optimizer.param_groups:
+				group["lr"] = self.rates[group["name"]] * warm
 			if self.trunk:
 				grad = torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).flatten() for p in self.trunk])
 				if previous is not None:
 					cosines.append(torch.nn.functional.cosine_similarity(grad, previous, dim=0))
 				previous = grad.detach().clone()
 			self.optimizer.step()
+			self.steps_done += 1
 			values.append(value.detach())
 			kls.append(divergence.detach())
 			readings["aux_steps"] += 1
 		model.eval()
-		readings["aux_excess_after"], readings["aux_kl_held_out"] = held_out_readings()
+		readings["aux_excess_after"], readings["aux_kl_check"] = held_out_readings()
+		readings["aux_kl_held_out"] = readings["aux_kl_check"] if held_out_version is not None else float("nan")
 		readings["aux_value_loss"] = float(torch.stack(values).mean()) if values else float("nan")
 		readings["aux_kl"] = float(torch.stack(kls).mean()) if kls else float("nan")
 		readings["aux_grad_cosine"] = float(torch.stack(cosines).mean()) if cosines else float("nan")
 		if trunk_before is not None:
 			after = torch.cat([p.detach().flatten() for p in self.trunk])
 			readings["aux_trunk_move"] = float((after - trunk_before).norm() / trunk_before.norm().clamp(min=1e-12))
-		readings["aux_seconds"] = round(time.monotonic() - started, 2)
 		return readings
+
+
+def guarded_run(phase, *args, **kwargs):
+	"""(readings, phase or None): phase.run's, or, when it raised (its weights already put back), one "aux: FAILURE" line
+	and None: the phase off for the run (the value's phase must never end the training)."""
+	try:
+		return phase.run(*args, **kwargs), phase
+	except Exception as error:  # noqa: BLE001
+		print(f"aux: FAILURE: the value's phase failed ({type(error).__name__}: {str(error)[:300]}); its weights put back, the phase off for the run", flush=True)
+		return {"aux_failed": 1}, None
