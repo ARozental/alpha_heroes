@@ -447,6 +447,48 @@ def test_dumb_decisions_are_counted():
 	assert counts["troops_left"] == (1, 2) and counts["exchange_shuffle"] == (1, 2)
 
 
+def test_meetings_are_counted_by_moves_and_by_movement():
+	"""Two heroes of ours (types 7 and 8) and a town. Day 1: hero 7 steps onto hero 8 twice (the second a repeat), then
+	into the town, then ends the turn (the heroes' rows swapped: the hero found by its type). Day 2: onto hero 8 again (a
+	new day: no repeat), hero 8 travels. A second game's day 1 (the day going back): onto hero 8, no repeat of the first
+	game's. Movement spent: each hero's points less at the player's next decision that day."""
+	from campaign_model.failures import failure_counts
+
+	R, W, TG, L = c.WINDOW_RADIUS, c.WINDOW, c.TRAVEL_GRID, c.MAP_LEVELS
+
+	def state(move7, move8, swapped=False):
+		x = empty_inputs(1)
+		x["g_kind"][0], x["g_map"][0] = c.DecisionKind.TURN, [36, 36, 1]
+		rows = (1, 0) if swapped else (0, 1)
+		for row, kind, pos, move in zip(rows, (7, 8), ([10, 10, 0], [12, 10, 0]), (move7, move8)):
+			x["h_present"][0, row], x["h_owner"][0, row], x["h_type"][0, row] = True, c.OWNER_SELF, kind
+			x["h_pos"][0, row], x["h_move"][0, row] = pos, move
+		x["t_present"][0, 0], x["t_owner"][0, 0], x["t_pos"][0, 0] = True, c.OWNER_SELF, [10, 14, 0]
+		return x
+
+	def step(day, action, index, x):
+		return Decision("RED", day, int(c.DecisionKind.TURN), 0, 1, int(action), index, -1, 0.0, (0.5,) * 3, 0, encoded(x, 0))
+
+	onto_hero = (R + 0) * W + (R + 2)  # hero row 0's window: 2 east
+	into_town = (R + 4) * W + R  # 4 south
+	MOVE, TRAVEL, END = c.ActionType.MOVE, c.ActionType.TRAVEL, c.ActionType.END
+	decisions = [
+		step(1, MOVE, onto_hero, state(1000, 1500)),
+		step(1, MOVE, onto_hero, state(800, 1500)),
+		step(1, MOVE, into_town, state(600, 1500)),
+		step(1, END, -1, state(300, 1500, swapped=True)),
+		step(2, MOVE, onto_hero, state(1000, 1500)),
+		step(2, TRAVEL, 1 * L * TG * TG, state(900, 1500)),
+		step(2, END, -1, state(900, 1000)),
+		step(1, MOVE, onto_hero, state(1000, 1500)),
+		step(1, END, -1, state(950, 1500)),
+	]
+	counts = failure_counts(decisions)
+	assert counts["own_hero_moves"] == (4, 5) and counts["repeat_meetings"] == (1, 4)
+	assert counts["meeting_movement"] == (200 + 200 + 100 + 50, 1350) and counts["town_movement"] == (300, 1350)  # the travel: 500
+	assert failure_counts(decisions, moves_limit=1)["own_hero_moves"] == (3, 4)  # whole games: the first only
+
+
 def test_an_exchange_that_can_only_leave_troops_behind_closes(model):
 	"""When every legal troop move puts our troops into the other army (a mine), ARMY is ~e^-4 as likely as before; a
 	legal move out of the mine leaves its odds as they were."""

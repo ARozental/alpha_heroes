@@ -792,7 +792,7 @@ class CampaignLearner:
 			"gpu_mb": metrics.get("gpu_mb", float("nan")),  # the update's peak on the GPU (train.gpu_held)
 			"label_staleness": sums.get("label_staleness", 0),  # the oldest precomputed labels used, in model versions (labeler.py)
 			**{f"share_{t}": types[t] / max(len(turn), 1) for t in TYPES},
-			**{f"failure_{k}": v for k, v in failure_modes(decisions).items()},  # dumb decisions (failures.py)
+			**{f"failure_{k}": v for k, v in failure_modes(decisions, moves_limit=3000).items()},  # dumb decisions (failures.py; the meetings' over ~3k moves)
 			"kinds": " ".join(f"{k}:{n}" for k, n in sorted(Counter(c.DecisionKind(d.kind).name for d in decisions).items())),
 			"no_effect_types": " ".join(f"{t}:{n}" for t, n in sorted(Counter(c.ActionType(d.action_type).name for d in decisions if d.flags & NO_EFFECT).items())),
 			**{name: metrics.get(name, float("nan")) for name in (*FORESIGHT_COLUMNS, "grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share", *GRADIENT_COLUMNS) if name != "teacher_set_agree"},
