@@ -128,6 +128,12 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # sign (+0.00002 +- 0.00022), so a learnable gain was noise plus Nullkiller2's push, and Nullkiller2's choice is not
 # evidence of our expected loss tonight. It stays at its value (raw -0.004, gain 0.96). A departure from the rule for
 # priors (a learnable correction decayed toward the prior), for this one scalar: push_night_gain_* read nan from here
+# campaign.unseen_exits=true (2026-11-11 night, e5; deploy 53): a gate, monolith or whirlpool no exit of which we have
+# seen is flagged (VCMI's pathfinder goes through a teleporter only to an exit the player sees, so the land behind
+# it was never a target): MOVE's explore prior 1 there, TRAVEL's area unrevealed; encode_tiles.unseen_exit starts at 0.
+# Before the PC (paired_eval, v2886's weights, the eval's 48 games, three replicates an arm, both with further
+# windows): 0.472 -> 0.531, paired +0.059 +- 0.025, eliminated 7, 15, 13 -> 8, 8, 9. It follows deploy 52 after one
+# clean eval (v2934: 0.579 +- 0.054, eliminated 7, no step over the window budget, the value loss at its level)
 # campaign.value_jump_stop is 3 (config.py; the user, 2026-11-10): the campaign's updates are held when its fresh value
 # loss jumps (the median of the last 7 updates at 3 times its calm level); the line "VALUE LOSS JUMP" in the log, the
 # file campaign/held. A restart lifts the hold
@@ -148,5 +154,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=false trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
