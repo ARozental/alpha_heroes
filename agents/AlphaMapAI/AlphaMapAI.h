@@ -301,6 +301,8 @@ class AlphaMapAI : public CAdventureAI
 	// A request of Nullkiller2's as our turn decision's legal entry doing the same; false (unmatched: why) when none.
 	// intended: a move's destination when the caller knows it (its plan's tile), else the request's own tile is taken
 	bool matchRequest(const Decision & decision, const CPackForServer * pack, Choice & choice, bool & exact, std::string & unmatched, int3 intended = int3(-1, -1, -1)) const;
+	/// alpha_heroes diagnostic (2026-11-11, logging only): an own-tile move request named by what is under the hero (Match.cpp)
+	std::string ownTileRequest(const Decision & decision, const CGHeroInstance * hero, const int3 & intended, size_t path) const;
 	std::string teacherJson() const;
 	// Our marketplace (the first town of ours with one; its rates count all of them): trades and purchases short of
 	// resources go through it; nullptr with none
