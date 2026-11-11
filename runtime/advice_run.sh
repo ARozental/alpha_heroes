@@ -114,6 +114,15 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # off (config.py's defaults are 1 and true): the games build no further window and flag no unseen exit, and the model
 # is the one before it bit for bit (42 outputs and features on the same weights and inputs differ by 0). The code
 # first, then further_windows=1, then unseen_exits=true, each judged over three evals
+# campaign.further_windows=1 campaign.window_budget=5.0 (2026-11-10 night, e5; deploy 52): a hero that reaches tiles
+# outside its own window today (past a gate, a monolith, the other level) gets one more window there, so those tiles
+# are MOVE targets; Nullkiller2's advised moves there become labels (about 2% of its MOVE labels). The budget: a
+# further window is one more window a decision, and at 4.0 a third of the updates already stepped some micro-batch
+# over every hero slot (191 s against 164 s an update). Before the PC (campaign_model/paired_eval.py, v2886's
+# weights, the eval's 48 games, two replicates an arm): the score 0.484 -> 0.481, paired -0.003 +- 0.024, eliminated
+# 9 and 12 -> 7 and 15: no effect at these weights either way, as expected of targets the model has not trained on;
+# the gain, if any, is what it learns there. Watch over three evals: a fall of 0.1 or the guard takes it out;
+# "every hero slot in" in the update lines (over the budget), seconds an update, MOVE's share (type_drift)
 # campaign.value_jump_stop is 3 (config.py; the user, 2026-11-10): the campaign's updates are held when its fresh value
 # loss jumps (the median of the last 7 updates at 3 times its calm level); the line "VALUE LOSS JUMP" in the log, the
 # file campaign/held. A restart lifts the hold
@@ -134,5 +143,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=0 campaign.unseen_exits=false trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=false trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
