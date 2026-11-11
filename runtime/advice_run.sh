@@ -110,6 +110,13 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # 23, 22, 19, 28 of 48) against 0.511, 0.491, 0.489 (9, 10, 6) before; the campaign back to v2728's weights
 # (checkpoint_02728.pt, the last eval before it), the games not asked for the advice. The override is gone from the
 # line below: campaign.nk2_gather_weight is 0 (config.py)
+# campaign.further_windows=0 campaign.unseen_exits=false (2026-11-10, e5): schema 17's code with both of its switches
+# off (config.py's defaults are 1 and true): the games build no further window and flag no unseen exit, and the model
+# is the one before it bit for bit (42 outputs and features on the same weights and inputs differ by 0). The code
+# first, then further_windows=1, then unseen_exits=true, each judged over three evals
+# campaign.value_jump_stop is 3 (config.py; the user, 2026-11-10): the campaign's updates are held when its fresh value
+# loss jumps (the median of the last 7 updates at 3 times its calm level); the line "VALUE LOSS JUMP" in the log, the
+# file campaign/held. A restart lifts the hold
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -118,5 +125,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=0 campaign.unseen_exits=false trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
