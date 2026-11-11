@@ -292,6 +292,12 @@ class CampaignConfig:
 	# rho x (its choice) + (1 - rho) x (our own policy), exactly (model_v2.CampaignModelV2.follow), rho learnable
 	# around this start. Our policy is trained on what it chose itself; its choice is the model's input everywhere
 	nk2_follow: float = 0.0
+	# The advantage head (model_v2.AdvantageHead; stage 1, 2026-11-11: it only learns, the policy reads none of it): its
+	# squared error against the update's advantage (as the policy term takes it) on the rows the policy credits, at
+	# this weight. One update's 14 games give the policy no direction, while a regression averages over every game:
+	# on 192 recorded games a day's share of followed choices predicted the 7-day share change (slope +0.0124 +- 0.0023).
+	# 0: off, nothing computed (the update as before, bit for bit)
+	adv_weight: float = 0.0
 	# Its TRADE advice taught too (False since 2026-11-04: the user's rule, every trade is dumb unless it buys what could not
 	# be bought without it; ~94% of its trades bought nothing that day, and 54% of ours came where it advised one)
 	nk2_trade_advice: bool = False

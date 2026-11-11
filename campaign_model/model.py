@@ -1595,6 +1595,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"side_tile", "side_global",  # (2026-11-08: the map's block side, 0: docs/map_size_plan.md)
 	# (schema 19, 2026-11-11: the bounded views and Nullkiller2's candidates, model_v2.CampaignModelV2.advice: every one's output 0 at the start)
 	"time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global",
+	"advantage.",  # (2026-11-11: the advantage head, model_v2.AdvantageHead, its weights 0 at the start)
 )
 # Training-only parts rebuilt since, by prefix: a checkpoint's weights for them that the loading model lacks, or of
 # another shape, are dropped, the part starting again as a new model has it (2026-11-07: the privileged critic's first

@@ -104,6 +104,33 @@ def choices(decisions):
 	}
 
 
+def advantage_of(out, action, index):
+	"""The advantage head's prediction for each decision's choice [N] (model_v2.AdvantageHead: the type's, + MOVE's or
+	TRAVEL's entry's, + the type's named weight where the choice is Nullkiller2's own: its type, and its entry but for
+	END's), and whether the choice is its own [N] (bool). A question's answer (action -1) predicts 0. Gathers and wheres
+	only (the recorded step's rules: no nonzero, no indexing by a host list)."""
+	types = out["adv_type"].shape[1]
+	act = action.clamp(0, types - 1).unsqueeze(1)
+	predicted = out["adv_type"].gather(1, act).squeeze(1)
+	for kind, name in ((c.ActionType.MOVE, "adv_move"), (c.ActionType.TRAVEL, "adv_travel")):
+		table = out[name].reshape(action.shape[0], -1)
+		entry = table.gather(1, index.clamp(0, table.shape[1] - 1).unsqueeze(1)).squeeze(1)
+		predicted = predicted + torch.where(action == int(kind), entry, torch.zeros_like(entry))
+	label_action, label_index = out["adv_label"][:, 0].round().long(), out["adv_label"][:, 1].round().long()
+	named = (label_action >= 0) & (action == label_action) & ((action == int(c.ActionType.END)) | (index == label_index))
+	predicted = predicted + out["adv_named"].gather(1, act).squeeze(1) * named.to(predicted.dtype)
+	return torch.where(action >= 0, predicted, torch.zeros_like(predicted)), named
+
+
+def explained(target, predicted, rows):
+	"""1 - var(target - predicted) / var(target) over rows (bool), nan with fewer than 2."""
+	if int(rows.sum()) < 2:
+		return float("nan")
+	t, p = target[rows].double(), predicted[rows].double()
+	spread = float(t.var())
+	return 1.0 - float((t - p).var()) / spread if spread > 0 else float("nan")
+
+
 def chosen_logp(out, choice):
 	"""The log-probability (now) of each decision's choice [N] and its decision's entropy [N]: a turn's is the type's
 	plus each type's table entropy weighted by p(type) without its gradient; a question's is its options'.
@@ -343,7 +370,8 @@ def windows_for(rows, heroes, config):
 # (campaign/grad_norm_<group>), each clipped apart (clip_gradients), the value heads' at their own rate
 # (config.value_lr_factor), the trunk's, the embeddings' and the action types' bias at the trunk's momentum
 # (config.trunk_beta1)
-VALUE_MODULES = ("value_hidden", "value_heads", "growth_heads", "end_head")
+# (the advantage head, model_v2.AdvantageHead: a critic of the actions, at the critic's rate)
+VALUE_MODULES = ("value_hidden", "value_heads", "growth_heads", "end_head", "advantage")
 # (the privileged critic its own group, last: the clips calibrated before it hold no clip for it, and its gradient
 # never moves another group's clip; at the value heads' rate)
 GRAD_GROUPS = ("trunk", "embeddings", "type", "value", "corrections", "privileged")
@@ -615,7 +643,7 @@ def excess_loss(logits, targets):
 
 # A step's metrics, in ppo_update's order: value the heads' loss at their own weights (comparable whatever head_scale
 # does), value_weighted at head_scale's (what the update takes)
-STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl", "teacher_kl", "teacher_ce", "value_weighted", "teacher_outside", "value_privileged")
+STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl", "teacher_kl", "teacher_ce", "value_weighted", "teacher_outside", "value_privileged", "adv_loss")
 # The teacher's outputs its KL reads (teacher_kl), put in each micro-batch as "t:<name>"
 TEACHER_OUTPUTS = ("type_logp", "option_logp") + tuple(output for output, _ in HEADS.values())
 
@@ -812,6 +840,15 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 		advice_part = -(torch.where(advised > 0, advice_logp, torch.zeros_like(advice_logp)) * advised).sum() / batch["count_advised"]
 		outside_part = ((1.0 - span_logp.detach().exp()) * advised).sum() / batch["count_advised"]
 		loss = loss + batch["teacher_weight"] * advice_part
+	# The advantage head (config.adv_weight; stage 1: the policy reads none of it): its prediction for the choice taken
+	# against the advantage the policy term takes, on the rows the policy credits; its inputs detached (model_v2.
+	# AdvantageHead), so this reaches its own weights alone. 0: nothing computed
+	adv_part = torch.zeros((), device=keep.device)
+	if config.adv_weight > 0 and "adv_type" in out:
+		predicted, _ = advantage_of(out, batch["action"], batch["index"])
+		answered = credit * (batch["action"] >= 0).float()
+		adv_part = (((predicted.float() - a) ** 2) * answered).sum() / batch["count_credit"]
+		loss = loss + config.adv_weight * adv_part
 	fs_parts = fs_share = None
 	labels = {name[3:]: value for name, value in batch.items() if name.startswith("fs:")}
 	if labels and "fs_turn" in out:
@@ -833,6 +870,7 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 		value.detach(),  # value_weighted
 		outside_part,  # teacher_outside: our probability outside what the teacher's label is weighed against
 		privileged_part.detach(),  # value_privileged: the privileged critic's loss, its heads' mean at their own weights
+		adv_part.detach(),  # adv_loss: the advantage head's squared error (0 with config.adv_weight 0)
 	]).float()
 	if split:  # (each term at weight 1 against the learner's loss shares, the loss_weights it sets: the plan's apart too;
 		# the privileged critic's not among them: it reaches its own weights only)
@@ -842,6 +880,8 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 		}
 		if fs_share is not None:
 			terms["foresight"], terms["plan"] = batch["share"] * fs_loss, batch["share"] * fs_config.weight * parts["plan"]
+		if config.adv_weight > 0 and "adv_type" in out:
+			terms["advantage"] = config.adv_weight * adv_part
 		return loss, metrics, fs_parts, fs_share, terms
 	return loss, metrics, fs_parts, fs_share
 
@@ -1085,6 +1125,8 @@ def ppo_update(
 	foresight_t = {name: torch.from_numpy(value).to(device) for name, value in foresight.items()} if foresight is not None else None
 	if foresight_t is not None and hasattr(model, "plan_outputs"):  # (v2: its fs_plan for the plan's loss, in every graph recorded below)
 		model.plan_outputs = True
+	if hasattr(model, "adv_outputs"):  # (v2: the advantage head's outputs while it learns, config.adv_weight, in every graph recorded below)
+		model.adv_outputs = config.adv_weight > 0
 	foresight_config = ForesightConfig(weight=getattr(config, "foresight_weight", ForesightConfig.weight))
 	foresight_sums, foresight_sum, checked = Counter(), None, {}  # (foresight_sum: its parts, PART_NAMES' order, on the device)
 	# On CUDA the bytes as sent go to the device and are cut and converted there (half the copy, none of the CPU's dtype copies)
@@ -1192,6 +1234,12 @@ def ppo_update(
 		priv_t["share_logit"] = priv_t["share_logit"].float()
 		state_all = torch.zeros(n, model.value_heads.in_features, device=device)
 		logits_all = {"share": torch.zeros(n, c.N_VALUE_OFFSETS, device=device), "end": torch.zeros(n, device=device)}
+	# The advantage head's prediction for each choice before this update's steps (config.adv_weight): its explained
+	# variance of the update's advantage is a held-out reading (adv_ev), on the choices that were Nullkiller2's own and
+	# on those that left one it had (adv_ev_followed, adv_ev_deviating)
+	adv_before = adv_followed = adv_labelled = None
+	if config.adv_weight > 0 and getattr(model, "adv_outputs", False):
+		adv_before, adv_followed, adv_labelled = torch.zeros(n, device=device), torch.zeros(n, dtype=torch.bool, device=device), torch.zeros(n, dtype=torch.bool, device=device)
 	gpu_anchor_mb = 0.0
 	with torch.no_grad():
 		chunk = config.prepass_batch or max(1, size // max(1, config.micro_batches))  # (no gradients, but at a whole minibatch it was the update's peak: 5.2 GB)
@@ -1204,6 +1252,9 @@ def ppo_update(
 			out = graphs.eval(raw, budget, prepare) if graphs else model(model_inputs(raw))
 			logp, _ = chosen_logp(out, {k: choice[k][index] for k in ("kind", "action", "index", "cell")})
 			anchor[index] = logp
+			if adv_before is not None:
+				predicted, named = advantage_of(out, choice["action"][index], choice["index"][index])
+				adv_before[index], adv_followed[index], adv_labelled[index] = predicted.float(), named, out["adv_label"][:, 0] >= 0
 			end_now[index] = torch.sigmoid(out["end_logit"].float())
 			if "growth_logit" in out:
 				growth_now[index] = out["growth_logit"][:, -1].float()
@@ -1357,10 +1408,20 @@ def ppo_update(
 		else:
 			advantage = torch.from_numpy(blend_credit(advantage.cpu().numpy(), later, end["weight"])).to(device)
 	credited = torch.isfinite(advantage)
+	adv_stats = {}
+	if adv_before is not None:  # (the advantage's spread before it is standardized: its scale in the update's own units)
+		adv_stats["adv_raw_sd"] = float(advantage[credited].std()) if int(credited.sum()) > 1 else float("nan")
 	if int(credited.sum()) > 1:
 		advantage = (advantage - advantage[credited].mean()) / (advantage[credited].std() + 1e-8)
 	advantage = torch.where(credited, advantage, torch.zeros_like(advantage))
 	unsound = ~torch.isfinite(anchor)  # a choice the model calls impossible now (its legality changed): left out
+	if adv_before is not None:  # (the rows its loss takes: credited, sound, a turn's or an exchange's choice)
+		rows = credited & ~unsound & (choice["action"] >= 0)
+		adv_stats.update(
+			adv_ev=explained(advantage, adv_before, rows), adv_ev_followed=explained(advantage, adv_before, rows & adv_followed),
+			adv_ev_deviating=explained(advantage, adv_before, rows & adv_labelled & ~adv_followed), adv_followed=float((rows & adv_followed).sum()) / max(1, int(rows.sum())),
+		)
+		del adv_before, adv_followed, adv_labelled
 	credited_f, anchor_safe, shares = credited.float(), anchor.nan_to_num(neginf=0.0), {}
 	noise = {}
 	if measure_noise and growth_real is not None and labels is not None:  # (the loss terms' gradient noise, at the update's start)
@@ -1547,6 +1608,7 @@ def ppo_update(
 		value_fresh=value_fresh,
 		value_unexplained=value_unexplained,
 		**privileged_stats,  # (config.privileged_critic: its fit, its corrections' size, the rivals a decision had)
+		**adv_stats,  # (config.adv_weight: the advantage head's held-out fit, the advantage's own spread)
 		learning_rate=config.learning_rate * lr_scale,
 		credited=int(credited.sum()),
 		gpu_mb=gpu_mb,

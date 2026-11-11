@@ -253,6 +253,36 @@ class PrivilegedCritic(nn.Module):
 		return self.direct(x) + self.read(F.gelu(self.dense(x)))
 
 
+class AdvantageHead(nn.Module):
+	"""The advantage of playing (type t, entry e), as the policy's credit measures it (train.micro_loss's adv term,
+	config.adv_weight; stage 1, 2026-11-11: it only learns, the policy reads none of it):
+
+	  adv_type[t] + adv_entry[t][e] + adv_named[t] x [(t, e) is Nullkiller2's own choice]
+
+	adv_type from the global token, adv_entry MOVE's and TRAVEL's alone (from the pair vectors move_out and travel_out
+	read; 0 for the other types), adv_named one weight a type. Every input detached and every weight 0 to start: its
+	loss reaches only these weights, and it predicts 0 until it learns."""
+
+	def __init__(self, dim, pair_dim):
+		super().__init__()
+		self.types, self.move, self.travel = zero_weight(dim, len(c.ActionType)), zero_weight(pair_dim, 1), zero_weight(pair_dim, 1)
+		self.named = nn.Parameter(torch.zeros(len(c.ActionType)))
+
+	def forward(self, state, known):
+		"""{adv_type [B, types], adv_move [B, HO, W, W], adv_travel [B, HO, L, TG, TG], adv_named [B, types], adv_label
+		[B, 2]: Nullkiller2's own choice's type and index (-1 none), as floats (train.advantage_of)}."""
+		glob = state.glob.detach()
+		b = glob.shape[0]
+		move = glob.new_zeros(b, HO, W, W)
+		if known.n > 0:
+			move = dense(real_only(self.move(state.move_pairs.detach()).squeeze(-1), known), known.windows, known.n, b)
+		action, index, _ = known.advice.label
+		return {
+			"adv_type": self.types(glob), "adv_move": move, "adv_travel": self.travel(state.travel_pairs.detach()).squeeze(-1).reshape(b, HO, L, TG, TG),
+			"adv_named": self.named.to(glob.dtype).unsqueeze(0) + glob.new_zeros(b, 1), "adv_label": torch.stack([action, index], dim=-1).to(glob.dtype),
+		}
+
+
 class Memory(nn.Module):
 	"""The model's memory (constants.MEMORY_SLOTS slots of MEMORY_WIDTH, -1..1): what one player's decisions carry
 	forward, the model's own output passed back by AlphaMapAI (x["mem"]; x["mem_float"] when a trainer unrolls it).
@@ -337,6 +367,7 @@ def packed_cells(dest, decision, inverse):
 class CampaignModelV2(nn.Module):
 	ARCHITECTURE = "v2"
 	plan_outputs = False  # fs_plan too (plan_of): the trainer's model sets it (train.ppo_update); a server's does not
+	adv_outputs = False  # the advantage head's too (AdvantageHead): the trainer's model sets it with config.adv_weight (train.ppo_update); a server's does not
 
 	def load_state_dict(self, state_dict, strict=True, assign=False):
 		"""A checkpoint from before a parameter was added (model.ADDED) loads with it at 0: the model as it was; one from
@@ -512,6 +543,9 @@ class CampaignModelV2(nn.Module):
 		self.view_move, self.view_travel = FastLinear(VIEWS + PLAN_VIEWS), FastLinear(VIEWS + PLAN_VIEWS)
 		self.plan_in = zero_weight(dc + V.F, d)
 		self.nk_hero, self.nk_town, self.nk_global = zero_weight(V.THREAT_VIEWS, d), zero_weight(V.THREAT_VIEWS, d), zero_weight(V.GLOBAL_VIEWS, d)
+		# The advantage head (2026-11-11, stage 1: it only learns; config.adv_weight), made last: the other parameters'
+		# initialisation as before
+		self.advantage = AdvantageHead(d, dp)
 
 	def prior_corrections(self):
 		"""The parameters that correct a fixed prior (model.CustomFeatures): weight decay pulls them back to it."""
@@ -532,6 +566,8 @@ class CampaignModelV2(nn.Module):
 		out = {**self.decide(state, known), **foresight["outputs"], "memory": state.memory_out, "resource_worth": known.resource_worth}
 		if self.plan_outputs:
 			out["fs_plan"] = state.plan
+		if self.adv_outputs:
+			out.update(self.advantage(state, known))
 		return out
 
 	def forward_steps(self, x, steps):
