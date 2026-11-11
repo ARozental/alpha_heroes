@@ -9,7 +9,7 @@ same arms' halves read +0.15 and 0.00), and make_map gives a different map from 
 "the same seeds" are not the same games unless the maps are made first. The PC's evals after a deploy watch for harm.
 
 	python -m campaign_model.paired_eval maps [games]                     the maps, before the arms (once a machine)
-	python -m campaign_model.paired_eval play <checkpoint> <out.pkl> [--games 48] [--parallel 3] [--env NAME=VALUE ...]
+	python -m campaign_model.paired_eval play <checkpoint> <out.pkl> [--games 48] [--parallel 3] [--env NAME=VALUE ...] [--keep-games]
 	python -m campaign_model.paired_eval compare <control.pkl> <new.pkl>
 
 An arm plays the code it is run from (another tree: run it from there; its maps are its runtime's, so make them
@@ -26,20 +26,22 @@ import numpy as np
 SWITCHES = {"ALPHA_MAP_FURTHER_WINDOWS": "0", "ALPHA_MAP_UNSEEN_EXITS": "0"}
 
 
-def play_arm(checkpoint, out, games, parallel, env):
+def play_arm(checkpoint, out, games, parallel, env, keep_games=False):
 	from .config import CampaignConfig
 	from .evaluate import eval_map, score, setups
 	from .play import play
 	from .train import serve_model
 
 	os.environ.update({**SWITCHES, **env})  # (the games inherit them)
-	config, results, gate = CampaignConfig(), {}, threading.Semaphore(parallel)
+	config, results, kept, gate = CampaignConfig(), {}, {}, threading.Semaphore(parallel)
 	with serve_model(checkpoint, processes=parallel) as (_, server):
 		def one(i, seed, players, color):
 			name = eval_map(seed, players, config)
 			with gate:
 				game, info = play(server.socket_path, name, 56, seed, max_seconds=3600, max_mb=300, battle_ai="BattleAI", our_battle_ai="BattleAI", ours=(color,), temperature=1.0, game_key=f"p{os.getpid()}-{i}")
 			results[i] = {**score(game, color, players, 56), "seed": seed, "players": players, "color": color, "map": name, "status": info.status}
+			if keep_games:  # (the records, for what happened in them: <out>.games.pkl)
+				kept[i] = game
 			print(f"  {i} {seed} {players}p {color} {info.status[:40]} score {results[i]['score']:.3f}", flush=True)
 
 		threads = [threading.Thread(target=one, args=(i, *g)) for i, g in enumerate(setups(games))]
@@ -48,6 +50,8 @@ def play_arm(checkpoint, out, games, parallel, env):
 		for t in threads:
 			t.join()
 	pickle.dump({"results": results, "checkpoint": checkpoint, "env": {**SWITCHES, **env}}, open(out, "wb"))
+	if keep_games:
+		pickle.dump(kept, open(out + ".games.pkl", "wb"))
 	print(f"saved {out}")
 
 
@@ -78,6 +82,7 @@ def main():
 	arm.add_argument("--games", type=int, default=48)
 	arm.add_argument("--parallel", type=int, default=3)
 	arm.add_argument("--env", nargs="*", default=[], metavar="NAME=VALUE")
+	arm.add_argument("--keep-games", action="store_true", help="also <out>.games.pkl: each game's records by its index")
 	both = sub.add_parser("compare")
 	both.add_argument("control")
 	both.add_argument("new")
@@ -89,7 +94,7 @@ def main():
 		for seed, players, color in setups(args.games):
 			print(eval_map(seed, players, CampaignConfig()), color, flush=True)
 	elif args.command == "play":
-		play_arm(args.checkpoint, args.out, args.games, args.parallel, dict(item.split("=", 1) for item in args.env))
+		play_arm(args.checkpoint, args.out, args.games, args.parallel, dict(item.split("=", 1) for item in args.env), args.keep_games)
 	else:
 		print("\n".join(compare(args.control, args.new)))
 

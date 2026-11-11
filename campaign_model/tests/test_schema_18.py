@@ -210,3 +210,32 @@ def test_the_night_calibrated_to_the_heroes_lost(model, monkeypatch):
 	far = scene([7, 10, 0], [([30, 10, 0], [1, 20, 0])])  # (the stop at the edge of its reach: a middling reading)
 	assert night(custom_features(fitted, near), [30, 10, 0]) < -2.0
 	assert night(custom_features(fitted, far), [30, 10, 0]) > night(custom_features(model, far), [30, 10, 0]) + 0.5
+
+
+def test_our_towns_night_pays_a_hero_to_guard_an_empty_town(model, monkeypatch):
+	"""features.town_night (ALPHA_TOWN_NIGHT=2: our only town at our Φ): 300 angels of ours 3 tiles from our town, which
+	holds nobody; 100 enemy angels 9 tiles from it, too weak to beat our hero, strong enough for the empty town. Our
+	hero's own night is ~0 anywhere, so before nothing paid it to step in; the town's night does, and costs it to step
+	out of the town once inside (VCMI: a visitor with no garrison hero defends behind the walls, the garrison merged)."""
+	monkeypatch.setenv("ALPHA_TOWN_NIGHT", "2")
+	guarded = CampaignModel(dim=32, cell_dim=16, layers=1).eval()
+	guarded.load_state_dict(model.state_dict())
+	assert model.features.town_night == 0 and guarded.features.town_night == 2
+
+	def place(hero_at, inside=False):
+		x = scene(hero_at, [])
+		x["h_army_creature"][0, 0, 0], x["h_army_count"][0, 0, 0] = 13, 300
+		x["h_army_count"][0, HO, 0] = 100
+		x["t_garrison_creature"][0, 0, 0], x["t_garrison_count"][0, 0, 0] = -1, 0
+		if inside:
+			x["t_visiting"][0, 0] = 0
+		return x
+
+	R = c.WINDOW_RADIUS
+	x = place([10, 10, 0])
+	town = (R, R - 3)
+	before, after = custom_features(model, x), custom_features(guarded, x)
+	assert float(after.tile_prior[0][town] - before.tile_prior[0][town]) > 1.0
+	inside = place([7, 10, 0], inside=True)
+	out = (R, R + 3)  # (three tiles east of the town: open ground)
+	assert float(custom_features(guarded, inside).tile_prior[0][out]) < float(custom_features(model, inside).tile_prior[0][out]) - 1.0
