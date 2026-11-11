@@ -238,6 +238,10 @@ INPUTS = (
 	_i("k_flags", (c.NK,), "1 the destination is the first step (arrives today), 2 our pathfinder does not reach the destination, 4 its path takes a teleporter, 8 a chain of heroes or a composition"),
 	_i("t_nk_threat", (TO, 3), "Nullkiller2's threat to each town of ours (DangerHitMapAnalyzer): has one (0/1), the fastest's turns, the greatest danger over the town's defence x 1000"),
 	_i("h_nk_threat", (HO, 3), "its threat at each hero of ours' tile: has one, the fastest's turns, the greatest danger over the hero's strength x 1000"),
+	# Nullkiller2's own choice here (its first request, matched to our entry as Decision.advice is): what it would do now
+	_i("g_nk_action", (), "its choice's action type + 1; 0 none (no advisor, or its request matched no entry of ours)"),
+	_i("g_nk_index", (), "its choice's index in that type's table + 1; 0 none"),
+	_i("g_nk_cell", (), "its choice's cell (a targeted spell's tile, ARMY's target slot) + 1; 0 none"),
 )
 
 
@@ -452,5 +456,13 @@ def _random_schema_19(x, b, kind, heroes, rng):
 		if rng.random() < 0.2:
 			x["h_nk_threat"][b, h] = [1, rng.integers(0, 4), rng.integers(100, 3000)]
 	x["g_nk_count"][b] = count
+	# its own choice: a legal entry of a random legal type (END when none is)
+	legal = [(a, np.flatnonzero(x[mask][b].reshape(-1))) for a, (_, mask) in HEADS.items()]
+	legal = [(a, entries) for a, entries in legal if len(entries)]
+	if legal and rng.random() < 0.9:
+		action, entries = legal[int(rng.integers(0, len(legal)))]
+		x["g_nk_action"][b], x["g_nk_index"][b] = int(action) + 1, int(rng.choice(entries)) + 1
+	else:
+		x["g_nk_action"][b], x["g_nk_index"][b] = int(c.ActionType.END) + 1, 1
 	if rng.random() < 0.2:
 		x["t_nk_threat"][b, 0] = [1, rng.integers(0, 4), rng.integers(100, 3000)]

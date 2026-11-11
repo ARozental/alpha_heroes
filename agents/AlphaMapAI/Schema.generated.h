@@ -8,7 +8,7 @@
 namespace MapSchema
 {
 constexpr int SCHEMA_VERSION = 19;
-constexpr const char * CONTRACT_HASH = "0d271727879e8b3c";
+constexpr const char * CONTRACT_HASH = "581a6655f4bcfee1";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;
@@ -353,6 +353,9 @@ enum class In : int
 	k_flags,
 	t_nk_threat,
 	h_nk_threat,
+	g_nk_action,
+	g_nk_index,
+	g_nk_cell,
 	COUNT
 };
 
@@ -526,6 +529,9 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"k_flags", DType::INT64, 1, {128, 1, 1, 1}, 0},
 	TensorSpec{"t_nk_threat", DType::INT64, 2, {8, 3, 1, 1}, 0},
 	TensorSpec{"h_nk_threat", DType::INT64, 2, {8, 3, 1, 1}, 0},
+	TensorSpec{"g_nk_action", DType::INT64, 0, {1, 1, 1, 1}, 0},
+	TensorSpec{"g_nk_index", DType::INT64, 0, {1, 1, 1, 1}, 0},
+	TensorSpec{"g_nk_cell", DType::INT64, 0, {1, 1, 1, 1}, 0},
 }};
 
 enum class Out : int
