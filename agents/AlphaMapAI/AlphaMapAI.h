@@ -137,6 +137,7 @@ constexpr uint32_t RECORD_PLAN = 8; // Nullkiller2's plan in the same state besi
 // More of our legal entries that follow Nullkiller2 there, beside the advice's own (Advice.cpp: a step along its plan's
 // path for each hero, an exchange's moves toward the army it wants): the teacher's targets, never inputs
 constexpr uint32_t RECORD_ACCEPT = 16;
+constexpr uint32_t RECORD_FALLBACK = 64; // (with RECORD_ADVICE) the advice is Nullkiller2's planned next step, its first request matching nothing of ours (Advice.cpp)
 constexpr uint32_t RECORD_HUMAN = 32; // a human player's decision (Recorder.cpp), recorded as a teacher's: its choice the player's
 
 /// Adventure-map AI: every decision is the campaign model's (campaign_model/), asked of the inference server; battles
@@ -267,6 +268,10 @@ class AlphaMapAI : public CAdventureAI
 	// A test's only (ALPHA_MAP_FOLLOW_ADVICE, a chance, 0 unless set; "1" plays its every advice): the advised entry played
 	// instead of our sampled one at that chance (paired_eval's follow arms)
 	double followAdvice = 0;
+	// Its first request matching nothing of ours (a teleport's move, a boat, a disband): the advice is the first task of its
+	// plan whose first step is an entry of ours (planFirstStep), flagged RECORD_FALLBACK; counted apart in adviceJson
+	bool adviceFallback = false;
+	int adviceFallbacks = 0;
 	std::mt19937 followRng{20261111};
 	// The model's phi (our empire's value in gold) at the player's first turn decision of each day (schema 19's
 	// g_phi_past: a week ago, else the oldest day there is)

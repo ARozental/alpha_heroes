@@ -191,6 +191,64 @@ int64_t fixedPoint(double value, double scale, double most = 2147483647.0)
 	return static_cast<int64_t>(std::llround(std::clamp(value * scale, -most, most)));
 }
 
+/// Nullkiller2's planned next step as our entry, for a decision where its first request matches nothing of ours: the first
+/// task of its plan (best first) whose first step maps to an entry, as candidateInputs maps one (the destination's own
+/// MOVE entry when legal today, else the path's stop today, else the TRAVEL toward it); none when no task's does
+std::optional<Choice> planFirstStep(const Decision & decision, const NK2AI::Goals::TTaskVec & plan, const int3 & size)
+{
+	const int side = 2 * std::max(1, (std::max(size.x, size.y) + MAP_GRID - 1) / MAP_GRID);
+	const auto & travels = decision.entries[static_cast<int>(ActionType::TRAVEL)];
+	for(const auto & task : plan)
+	{
+		const NK2AI::Goals::ExecuteHeroChain * chain = dynamic_cast<const NK2AI::Goals::ExecuteHeroChain *>(task.get());
+		if(!chain)
+			if(const auto * composition = dynamic_cast<const NK2AI::Goals::Composition *>(task.get()))
+				for(const auto & step : composition->getSubtasks())
+					for(const auto & sub : step)
+						if(!chain)
+							chain = dynamic_cast<const NK2AI::Goals::ExecuteHeroChain *>(sub.get());
+		if(!chain || chain->getPath().nodes.empty())
+			continue;
+		const auto & nodes = chain->getPath().nodes;
+		const CGHeroInstance * hero = task->getHero() ? task->getHero() : nodes.front().targetHero;
+		int slot = -1;
+		for(int i = 0; hero && i < OWN_HEROES; ++i)
+			if(decision.heroes[i] == hero->id)
+				slot = i;
+		size_t own = 0;
+		while(own < nodes.size() && nodes[own].targetHero != hero)
+			++own;
+		if(slot < 0 || own == nodes.size())
+			continue;
+		int move = nodes[own].turns == 0 ? decision.moveEntry(slot, nodes[own].coord) : -1;
+		for(size_t k = own; k < nodes.size() && move < 0; ++k)
+			if(nodes[k].targetHero == hero && nodes[k].turns == 0)
+			{
+				move = decision.moveEntry(slot, nodes[k].coord);
+				break;
+			}
+		Choice choice;
+		if(move >= 0)
+		{
+			choice.type = static_cast<int>(ActionType::MOVE);
+			choice.index = move;
+			return choice;
+		}
+		for(size_t k = own; k < nodes.size(); ++k)
+		{
+			if(nodes[k].targetHero != hero || nodes[k].turns < 1)
+				continue;
+			if(const int a = areaOf(nodes[k].coord, side); a >= 0 && travels.count(slot * AREAS + a))
+			{
+				choice.type = static_cast<int>(ActionType::TRAVEL);
+				choice.index = slot * AREAS + a;
+				return choice;
+			}
+		}
+	}
+	return std::nullopt;
+}
+
 /// Our MOVE and TRAVEL entries that walk Nullkiller2's plan (more entries that follow it beside its first request:
 /// RECORD_ACCEPT, the teacher's targets): each hero's MOVE to any tile of its own part of a planned hero chain (a short
 /// step along the path or a long one alike), its TRAVEL to an area the path reaches in a day or more
@@ -351,8 +409,15 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optiona
 #ifdef NK2_KEEPS_PLAN
 	// Its plan, made before any request of this turn of its (keepPlan): our hero slots' targets, and our entries that
 	// walk it (each hero's, whichever hero it would move first: the teacher's targets beside the advice's own)
+	adviceFallback = false;
 	if(advisor->nk2->nullkiller->lastPlanValid)
 	{
+		if(!advice) // (its first request is nothing of ours: its planned next step that is, else it asks the same again)
+			if((advice = planFirstStep(decision, advisor->nk2->nullkiller->lastPlan, cb->getMapSize())))
+			{
+				adviceFallback = true;
+				++adviceFallbacks;
+			}
 		plan = planTargets(decision, advisor->nk2->nullkiller->lastPlan);
 		std::set<std::pair<int, int>> entries;
 		planEntries(decision, advisor->nk2->nullkiller->lastPlan, cb->getMapSize(), entries);
@@ -372,9 +437,9 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optiona
 	}
 	adviceSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 	++advised;
-	if(advice)
+	if(advice && !adviceFallback)
 		++adviceMatched;
-	else
+	else // (a fallback's miss counted as one all the same: what its first request was)
 		++adviceUnmatched[unmatched.empty() ? std::string("unknown") : unmatched];
 	return advice;
 #else
@@ -627,7 +692,7 @@ std::string AlphaMapAI::adviceJson() const
 	std::string unmatched;
 	for(const auto & [kind, count] : adviceUnmatched)
 		unmatched += (unmatched.empty() ? "\"" : ", \"") + kind + "\": " + std::to_string(count);
-	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + "}, \"gathers\": " + std::to_string(adviceGathers) + ", \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
+	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"fallback\": " + std::to_string(adviceFallbacks) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + "}, \"gathers\": " + std::to_string(adviceGathers) + ", \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
 }
 
 // The events of a seated Nullkiller2's memory (AlphaMapAI.h), passed on to the advising one; none of our own uses them

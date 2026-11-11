@@ -261,6 +261,7 @@ void AlphaMapAI::makeTurn()
 			std::optional<Choice> advice; // (Nullkiller2's, at this decision's chance: before ours, in the same state)
 			std::optional<PlanTargets> plan; // (and its plan there: labels both, never inputs)
 			std::vector<std::pair<int, int>> accept; // (and our other entries that follow it)
+			adviceFallback = false;
 			if(nk2Inputs || adviceDrawn()) // (its view as inputs: its plan at every turn decision, before our forward)
 				advice = advise(decision, plan, accept);
 			if(nk2Inputs)
@@ -645,7 +646,7 @@ Choice AlphaMapAI::decide(Decision & decision, const std::optional<Choice> & adv
 		if(advice)
 		{
 			entry.advice = advice;
-			entry.flags |= RECORD_ADVICE;
+			entry.flags |= RECORD_ADVICE | (adviceFallback ? RECORD_FALLBACK : 0);
 		}
 		if(plan)
 		{
@@ -1148,6 +1149,7 @@ void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, Query
 			break;
 		std::optional<Choice> advice;
 		std::vector<std::pair<int, int>> accept;
+		adviceFallback = false; // (an exchange's advice is its own: never a plan's fallback)
 		if(nk2Inputs || adviceDrawn()) // (its view as inputs: its choice at the exchange as well, before our forward)
 			advice = adviseExchange(decision, first, second, accept);
 		if(nk2Inputs)
