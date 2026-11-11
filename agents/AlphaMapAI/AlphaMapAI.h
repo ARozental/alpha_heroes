@@ -265,6 +265,12 @@ class AlphaMapAI : public CAdventureAI
 	void candidateInputs(Decision & decision);
 	/// Schema 19's g_nk_action, g_nk_index, g_nk_cell: Nullkiller2's own choice here (its advice, as the record's), 0 none
 	void labelInputs(Decision & decision, const std::optional<Choice> & advice);
+	// alpha_heroes patch (2026-11-11, the user's own-games change): ALPHA_MAP_NK2_CHOICE, 1 unless set; at 0 labelInputs
+	// writes nothing (g_nk_action, g_nk_index, g_nk_cell stay 0: Nullkiller2's own choice hidden, so the model's follow
+	// mixture and the advantage head's named term are off and our own policy plays the whole game), while its candidates,
+	// views, plan and threats are written as before and its advice is still asked and recorded on the Decision. One
+	// setting a game (play.nk2_settings), shown in the summary as "choice_shown"
+	bool nk2Choice = true;
 	// A test's only (ALPHA_MAP_FOLLOW_ADVICE, a chance, 0 unless set; "1" plays its every advice): the advised entry played
 	// instead of our sampled one at that chance (paired_eval's follow arms)
 	double followAdvice = 0;

@@ -309,6 +309,7 @@ void AlphaMapAI::initAdvice()
 	adviceFixes = adviceEnvironment("ALPHA_MAP_ADVICE_FIXES", "1") != "0";
 	gatherAdvice = adviceEnvironment("ALPHA_MAP_GATHER_ADVICE", "0") != "0";
 	nk2Inputs = adviceEnvironment("ALPHA_MAP_NK2_INPUTS", "0") != "0";
+	nk2Choice = adviceEnvironment("ALPHA_MAP_NK2_CHOICE", "1") != "0"; // (alpha_heroes patch, own games: AlphaMapAI.h)
 	followAdvice = std::clamp(std::stod(adviceEnvironment("ALPHA_MAP_FOLLOW_ADVICE", "0")), 0.0, 1.0);
 #ifdef ALPHA_MAP_NK2_ADVICE
 	if(adviceProbability <= 0 && !nk2Inputs)
@@ -332,7 +333,7 @@ void AlphaMapAI::initAdvice()
 	adviceFixes = false;
 #endif
 	advisor = a;
-	logAi->info("AlphaMapAI %s: Nullkiller2's advice at a chance of %.3f a turn decision, meeting fixes %s, its view as inputs %s", playerID.toString(), adviceProbability, adviceFixes ? "on" : "off", nk2Inputs ? "on" : "off");
+	logAi->info("AlphaMapAI %s: Nullkiller2's advice at a chance of %.3f a turn decision, meeting fixes %s, its view as inputs %s, its own choice among them %s", playerID.toString(), adviceProbability, adviceFixes ? "on" : "off", nk2Inputs ? "on" : "off", nk2Choice ? "shown" : "hidden");
 #else
 	if(adviceProbability > 0 || nk2Inputs)
 		logAi->error("AlphaMapAI %s: ALPHA_MAP_NK2_ADVICE or ALPHA_MAP_NK2_INPUTS asked, but this build has no Nullkiller2: none", playerID.toString());
@@ -692,7 +693,7 @@ std::string AlphaMapAI::adviceJson() const
 	std::string unmatched;
 	for(const auto & [kind, count] : adviceUnmatched)
 		unmatched += (unmatched.empty() ? "\"" : ", \"") + kind + "\": " + std::to_string(count);
-	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"fallback\": " + std::to_string(adviceFallbacks) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + "}, \"gathers\": " + std::to_string(adviceGathers) + ", \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
+	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"fallback\": " + std::to_string(adviceFallbacks) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + "}, \"gathers\": " + std::to_string(adviceGathers) + ", \"choice_shown\": " + std::to_string(nk2Choice && nk2Inputs ? 1 : 0) + ", \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
 }
 
 // The events of a seated Nullkiller2's memory (AlphaMapAI.h), passed on to the advising one; none of our own uses them
@@ -921,7 +922,7 @@ void AlphaMapAI::candidateInputs(Decision & decision)
 
 void AlphaMapAI::labelInputs(Decision & decision, const std::optional<Choice> & advice)
 {
-	if(!advice || advice->type < 0 || advice->index < 0)
+	if(!nk2Choice || !advice || advice->type < 0 || advice->index < 0) // (hidden: the game's own-games setting, AlphaMapAI.h)
 		return;
 	decision.inputs.at(In::g_nk_action) = advice->type + 1;
 	decision.inputs.at(In::g_nk_index) = advice->index + 1;

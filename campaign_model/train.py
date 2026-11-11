@@ -1091,7 +1091,7 @@ def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
 	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None, teacher=None, teacher_weight=None,
 	share_trust=1.0, head_scale=None, teacher_sets=None, loss_weights=None, streams=None, clips=None, privileged=None,
-	growth_trust=1.0,
+	growth_trust=1.0, hidden=None,
 ):
 	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
 	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
@@ -1113,7 +1113,9 @@ def ppo_update(
 	alone). clips: the groups' gradient clips (clip_gradients; None: the one clip at grad_clip). privileged: each
 	decision's rivals for the privileged critic (config.privileged_critic; learner.privileged_rivals: "rivals" [N, R]
 	their decisions' rows here, -1 none, "present" [N, R] 1 a rival alive in the game, "share_logit" [N] our true share's
-	logit as the day began), or None. Returns (metrics, the KL control's new lr_scale)."""
+	logit as the day began), or None. hidden [N] (bool) or None: each decision's game hid Nullkiller2's own choice
+	(config.nk2_choice_games; play.choice_hidden), for the advantage head's readings apart. Returns (metrics, the KL
+	control's new lr_scale)."""
 	n, started = len(decisions), time.time()
 	given_decode = decode  # (night_dropped's inputs: a caller's own, else the records')
 	night_drop_share = float("nan")  # (config.nk2_night_drop: the share of the advised labels it left out)
@@ -1411,6 +1413,10 @@ def ppo_update(
 	adv_stats = {}
 	if adv_before is not None:  # (the advantage's spread before it is standardized: its scale in the update's own units)
 		adv_stats["adv_raw_sd"] = float(advantage[credited].std()) if int(credited.sum()) > 1 else float("nan")
+		if hidden is not None:  # (and apart for the own games and the rest: a wider kind dominates the pooled standardization)
+			hidden_t = torch.from_numpy(np.asarray(hidden, dtype=bool)).to(device)
+			for name, rows in (("shown", credited & ~hidden_t), ("hidden", credited & hidden_t)):
+				adv_stats[f"adv_raw_sd_{name}"] = float(advantage[rows].std()) if int(rows.sum()) > 1 else float("nan")
 	if int(credited.sum()) > 1:
 		advantage = (advantage - advantage[credited].mean()) / (advantage[credited].std() + 1e-8)
 	advantage = torch.where(credited, advantage, torch.zeros_like(advantage))
@@ -1421,6 +1427,8 @@ def ppo_update(
 			adv_ev=explained(advantage, adv_before, rows), adv_ev_followed=explained(advantage, adv_before, rows & adv_followed),
 			adv_ev_deviating=explained(advantage, adv_before, rows & adv_labelled & ~adv_followed), adv_followed=float((rows & adv_followed).sum()) / max(1, int(rows.sum())),
 		)
+		if hidden is not None:  # (config.nk2_choice_games: the rows of games that hid Nullkiller2's own choice, and the rest)
+			adv_stats.update(adv_ev_shown=explained(advantage, adv_before, rows & ~hidden_t), adv_ev_hidden=explained(advantage, adv_before, rows & hidden_t))
 		del adv_before, adv_followed, adv_labelled
 	credited_f, anchor_safe, shares = credited.float(), anchor.nan_to_num(neginf=0.0), {}
 	noise = {}

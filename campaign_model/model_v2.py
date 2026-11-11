@@ -262,12 +262,15 @@ class AdvantageHead(nn.Module):
 
 	adv_type from the global token, adv_entry MOVE's and TRAVEL's alone (from the pair vectors move_out and travel_out
 	read; 0 for the other types), adv_named one weight a type. Every input detached and every weight 0 to start: its
-	loss reaches only these weights, and it predicts 0 until it learns."""
+	loss reaches only these weights, and it predicts 0 until it learns. adv_type holds unnamed[t] besides where no choice
+	of Nullkiller2's is shown (its label none: an own game's decisions, config.nk2_choice_games), so the type advantages
+	of decisions with and without it shown are apart from the start rather than left to the trunk to tell apart."""
 
 	def __init__(self, dim, pair_dim):
 		super().__init__()
 		self.types, self.move, self.travel = zero_weight(dim, len(c.ActionType)), zero_weight(pair_dim, 1), zero_weight(pair_dim, 1)
 		self.named = nn.Parameter(torch.zeros(len(c.ActionType)))
+		self.unnamed = nn.Parameter(torch.zeros(len(c.ActionType)))  # (own games, 2026-11-11: 0 to start)
 
 	def forward(self, state, known):
 		"""{adv_type [B, types], adv_move [B, HO, W, W], adv_travel [B, HO, L, TG, TG], adv_named [B, types], adv_label
@@ -279,7 +282,7 @@ class AdvantageHead(nn.Module):
 			move = dense(real_only(self.move(state.move_pairs.detach()).squeeze(-1), known), known.windows, known.n, b)
 		action, index, _ = known.advice.label
 		return {
-			"adv_type": self.types(glob), "adv_move": move, "adv_travel": self.travel(state.travel_pairs.detach()).squeeze(-1).reshape(b, HO, L, TG, TG),
+			"adv_type": self.types(glob) + self.unnamed.to(glob.dtype).unsqueeze(0) * (action < 0).to(glob.dtype).unsqueeze(1), "adv_move": move, "adv_travel": self.travel(state.travel_pairs.detach()).squeeze(-1).reshape(b, HO, L, TG, TG),
 			"adv_named": self.named.to(glob.dtype).unsqueeze(0) + glob.new_zeros(b, 1), "adv_label": torch.stack([action, index], dim=-1).float(),  # (float32 whatever the forward's dtype: an index up to 8,712 exactly)
 		}
 

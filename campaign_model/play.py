@@ -40,13 +40,28 @@ class GameInfo:
 def nk2_settings(config, seed=None):
 	"""Schema 19's switch as a game's environment (a tuple of pairs, for play's settings): Nullkiller2's view as the
 	model's inputs (config.nk2_inputs) with its gather advice (ALPHA_MAP_GATHER_ADVICE); a training game (its seed given) goes without it at config.nk2_input_dropout,
-	drawn from its seed (the same game the same way on every machine)."""
+	drawn from its seed (the same game the same way on every machine). With its view on, whether its own choice is
+	among it (ALPHA_MAP_NK2_CHOICE): a training game hides it at 1 - config.nk2_choice_games, drawn from its seed apart
+	(another stream than the dropout's); an evaluation (seed None) shows it. The game's environment: every player of a
+	game alike."""
 	import random
 
 	on = config.nk2_inputs and (seed is None or random.Random(int(seed) * 7919 + 19).random() >= config.nk2_input_dropout)
+	if not on:
+		return (("ALPHA_MAP_NK2_INPUTS", "0"),)
+	shown = seed is None or random.Random(int(seed) * 7907 + 59).random() < getattr(config, "nk2_choice_games", 1.0)
 	# (with its view as inputs its gather advice too, whatever nk2_gather_weight: without it its visit again of a town
 	# matches none of our entries, and its army gathering never reaches the inputs)
-	return (("ALPHA_MAP_NK2_INPUTS", "1"), ("ALPHA_MAP_GATHER_ADVICE", "1")) if on else (("ALPHA_MAP_NK2_INPUTS", "0"),)
+	return (("ALPHA_MAP_NK2_INPUTS", "1"), ("ALPHA_MAP_GATHER_ADVICE", "1"), ("ALPHA_MAP_NK2_CHOICE", "1" if shown else "0"))
+
+
+def choice_hidden(game):
+	"""Whether a game was played with Nullkiller2's own choice hidden from the inputs (ALPHA_MAP_NK2_CHOICE=0: its players'
+	summaries' advice "choice_shown" 0); False when any shows it, or none says (a game from before the switch, or
+	without the inputs)."""
+	said = [summary.get("advice", {}).get("choice_shown") for summary in (game.done or {}).values() if isinstance(summary, dict)]
+	said = [value for value in said if value is not None]
+	return bool(said) and not any(said)
 
 
 def window_settings(config):

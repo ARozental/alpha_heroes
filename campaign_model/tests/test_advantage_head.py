@@ -214,4 +214,6 @@ def test_the_learner_logs_its_readings(tmp_path, capsys):
 			assert "advantage head: loss" in printed and float(row["adv_loss"]) > 0 and float(row["adv_raw_sd"]) > 0 and row["adv_ev"] not in ("", "nan") and moved > 0
 		else:
 			assert "advantage head" not in printed and moved == 0.0 and all(row[name] in ("", "nan") for name in ("adv_ev", "adv_raw_sd"))
-	assert learner_module.COLUMNS[-6:] == ["adv_loss", "adv_ev", "adv_ev_followed", "adv_ev_deviating", "adv_followed", "adv_raw_sd"]
+	head = ["adv_loss", "adv_ev", "adv_ev_followed", "adv_ev_deviating", "adv_followed", "adv_raw_sd"]
+	at = learner_module.COLUMNS.index(head[0])
+	assert learner_module.COLUMNS[at : at + len(head)] == head  # (in this order, after every older column)

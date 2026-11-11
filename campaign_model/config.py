@@ -101,6 +101,15 @@ class CampaignConfig:
 	# plan head's prediction as well. Both off by default (main's games as before): the deploy turns them on
 	nk2_inputs: bool = False
 	nk2_input_dropout: float = 0.0
+	# The share of training games that show Nullkiller2's OWN CHOICE among the inputs (the user, 2026-11-11: "this can
+	# work, but it is also super risky in the sense that we will only learn to fix NK2 and not really learn good moves in
+	# general"). In the rest (ALPHA_MAP_NK2_CHOICE=0: g_nk_action, g_nk_index, g_nk_cell left 0) the follow mixture and
+	# the advantage head's named term are off and our own policy plays the whole game, at full gradient on its own
+	# states, its candidates, scores, plan and threats still among the inputs. One setting a game, every player in it
+	# alike (never a hidden-choice player against a follower: that would be training against Nullkiller2), drawn from
+	# the game's seed apart from nk2_input_dropout's draw (play.nk2_settings); evaluations and paired tests show it.
+	# 1.0: every game shows it, as before
+	nk2_choice_games: float = 1.0
 	# The update's inputs decoded ahead in this many threads (train._prefetched: zlib, ~430 decisions/s a thread on the PC). With
 	# the step recorded whole the PC's update waited ~15 s for 3 of them, the CPU half idle (2026-10-31): each decision is
 	# decoded three times an update (the first pass, two passes)

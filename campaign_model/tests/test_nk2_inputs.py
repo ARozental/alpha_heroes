@@ -37,7 +37,7 @@ def test_with_its_view_the_games_ask_its_gather_advice_too():
 	from battle_model.supply import Runner
 
 	on = dict(nk2_settings(CampaignConfig(nk2_inputs=True, nk2_gather_weight=0.0)))
-	assert on == {"ALPHA_MAP_NK2_INPUTS": "1", "ALPHA_MAP_GATHER_ADVICE": "1"}
+	assert on == {"ALPHA_MAP_NK2_INPUTS": "1", "ALPHA_MAP_GATHER_ADVICE": "1", "ALPHA_MAP_NK2_CHOICE": "1"}  # (own games: its choice shown, test_own_games)
 	assert "ALPHA_MAP_GATHER_ADVICE" not in dict(nk2_settings(CampaignConfig(nk2_inputs=False)))
 	runner = SimpleNamespace(battle_socket="/tmp/b.sock", link="link.pt", records=SimpleNamespace(path="/tmp/r.sock"), config=SimpleNamespace(campaign=CampaignConfig(nk2_inputs=True, nk2_advice=1.0, nk2_gather_weight=0.0)))
 	assert dict(Runner.campaign_settings(runner, "game", 3))["ALPHA_MAP_GATHER_ADVICE"] == "1"

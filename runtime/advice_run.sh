@@ -223,6 +223,18 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # What decides stage 2 (the policy reading it): adv_ev (its explained variance of each update's advantage, predicted
 # before the update's steps: fresh rows) above 0 over 50+ updates; adv_ev_deviating apart (the rows that left
 # Nullkiller2's choice: where reading it could change a choice). Logged in progress.csv and the update's line.
+# Deploy 59 (2026-11-11, b1 with e5): campaign.nk2_choice_games=0.5, own games. The user: "this can work, but it is
+# also super risky in the sense that we will only learn to fix NK2 and not really learn good moves in general". Half
+# of the self-play training games hide Nullkiller2's OWN CHOICE from the inputs (ALPHA_MAP_NK2_CHOICE=0: g_nk_action,
+# g_nk_index, g_nk_cell left 0): there the follow mixture is off and our own policy plays every decision of the game,
+# at full gradient on its own states; its candidates, scores, plan and threats stay among the inputs, and its advice
+# is still asked and recorded (teacher_agree). The other half stays at follow 0.9. One setting a game, every player
+# alike (never a hidden-choice player against a follower: training against Nullkiller2), drawn from the game's seed.
+# The advantage head keeps the two kinds apart (AdvantageHead.unnamed on the decisions without its choice). Readings
+# apart for the two kinds each update: choice_hidden, teacher_agree_*, adv_ev_*, adv_raw_sd_*, eliminated_*.
+# What would show it failing: the follow-off evaluation (the eval's OWN arm) not rising over a day while the hidden
+# games' eliminations stay high; the head's adv_ev falling. The headline evaluation at follow 0.9 says nothing about
+# our own policy.
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -231,5 +243,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0.5 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null

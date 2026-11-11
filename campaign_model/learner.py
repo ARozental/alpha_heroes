@@ -60,6 +60,7 @@ from .advice import teacher_sets
 from .foresight import LABEL_NAMES, labels_of
 from .labeler import Labeler
 from .model import build_model
+from .play import choice_hidden
 from .records import NO_EFFECT, TEACHER, decode_fields, decode_inputs
 from .train import GRAD_GROUPS, HEAD_SCALE_RAMP, _prefetched, fit_moments, load_optimizer, make_optimizer, migrate_subtypes, model_kwargs, ppo_update, usable
 
@@ -106,6 +107,10 @@ COLUMNS = [
 	# update's steps, apart on the choices that were Nullkiller2's own and on those that left one it had, their share,
 	# the advantage's spread before it is standardized)
 	"adv_loss", "adv_ev", "adv_ev_followed", "adv_ev_deviating", "adv_followed", "adv_raw_sd",
+	# (config.nk2_choice_games: the share of the update's games that hid Nullkiller2's own choice; in those and in the rest,
+	# how often our choice was its advice, the advantage head's explained variance, players out of their game)
+	"choice_hidden", "teacher_agree_shown", "teacher_agree_hidden", "adv_ev_shown", "adv_ev_hidden", "eliminated_shown", "eliminated_hidden",
+	"adv_raw_sd_shown", "adv_raw_sd_hidden",
 ]
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
 DROP_BEYOND = 4  # updates' worth of finished games beyond which the oldest are dropped (_take)
@@ -559,6 +564,7 @@ class CampaignLearner:
 		if self.config.schedule_action_price > 0:  # (each decision's actions through its 7-day window: labels.actions_ahead)
 			end["actions"] = []
 		streams = ([], [])  # each decision's game and player, and its place among the player's records (config.memory_steps)
+		hidden = []  # (each decision's game hid Nullkiller2's own choice: config.nk2_choice_games, play.choice_hidden)
 		for g, game in enumerate(played):
 			# The labeler's labels, as the game arrived (b1, 2026-10-30: a game's labels from one table version, one update
 			# old, act like a target network); past MAX_LABEL_STALENESS updates they are computed here with today's tables
@@ -593,6 +599,7 @@ class CampaignLearner:
 			if privileged is not None:
 				privileged.append(privileged_rivals(game, fresh, len(decisions), self.empire))
 			decisions += [d for d, keep in zip(game.decisions, fresh) if keep]
+			hidden.append(np.full(int(fresh.sum()), choice_hidden(game), dtype=bool))
 			place, count = {}, Counter()  # (all_decisions: every record as sent, unusable ones too: a gap breaks a sequence)
 			for d in getattr(game, "all_decisions", game.decisions):
 				place[id(d)], count[d.color] = count[d.color], count[d.color] + 1
@@ -677,7 +684,7 @@ class CampaignLearner:
 			out_of_memory = None
 			with self.model_lock:
 				try:
-					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, replace(self.config, nk2_gather_weight=gather_weight, target_kl=self.config.target_kl * valve_k), device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), growth_trust=self.grade_trust().get("G7", 0.0), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None, privileged={name: np.concatenate([part[name] for part in privileged]) for name in privileged[0]} if privileged else None)
+					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, replace(self.config, nk2_gather_weight=gather_weight, target_kl=self.config.target_kl * valve_k), device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), growth_trust=self.grade_trust().get("G7", 0.0), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None, privileged={name: np.concatenate([part[name] for part in privileged]) for name in privileged[0]} if privileged else None, hidden=np.concatenate(hidden) if hidden else None)
 				except torch.OutOfMemoryError as error:  # (handled below, once the error's frames, and their tensors, are gone)
 					out_of_memory = str(error)[:200]
 			if out_of_memory is not None:
@@ -845,6 +852,9 @@ class CampaignLearner:
 			"valve_r": self._valve_reading(metrics.get("value_fresh", float("nan"))),
 			"valve_s": sums.get("valve_s", float("nan")),
 			"kl_target": sums.get("kl_target", float("nan")),
+			# (config.nk2_choice_games: the games that hid Nullkiller2's own choice, and the rest: how often ours was its
+			# choice there, the advantage head's fit, players out of their game)
+			**choice_readings(games, metrics),
 			**{name: metrics.get(name, float("nan")) for name in ("adv_loss", "adv_ev", "adv_ev_followed", "adv_ev_deviating", "adv_followed", "adv_raw_sd")},
 			"label_mean": sums["label_sum"] / max(n, 1),
 			"price_mean": sums["price_sum"] / max(n, 1),
@@ -961,7 +971,7 @@ class CampaignLearner:
 			"  value ev " + "/".join(f"{row[f'head_ev_v{k}']:+.2f}" for k in c.VALUE_OFFSETS)
 			+ f" (this update {row[f'value_ev_d{c.VALUE_OFFSETS[-1]}']:+.2f}: corr {metrics.get('value_corr', float('nan')):+.2f}, spread {metrics.get('value_spread', float('nan')):.3f} vs {metrics.get('label_spread', float('nan')):.3f}, unexplained {metrics.get('value_unexplained', float('nan')):.2f}{privileged_note})"
 			+ "  growth ev " + "/".join(f"{row[f'head_ev_g{k}']:+.2f}" for k in c.VALUE_OFFSETS) + f"  end ev {row['head_ev_vend']:+.2f} (credit {row['end_credit']:.2f})  trust {row['trust']:.2f} (today {self.trust_today():.2f})"
-			+ f"  kl {row['last_kl']:.4f} (target {metrics.get('kl_target', float('nan')):.4f})" + (f"  teacher kl {row['teacher_kl']:.3f} (weight {row['teacher_weight']:.2f})" if self.teacher is not None else "") + (f"  advice {row['advised']:.0%} of turns and exchanges, ours its {row['teacher_agree']:.0%}, teacher ce {row['teacher_ce']:.3f} (weight {row['teacher_weight']:.2f})" if self.config.nk2_advice > 0 else "") + (f"  advantage head: loss {row['adv_loss']:.4f}, ev {row['adv_ev']:+.3f} (its own choice {row['adv_ev_followed']:+.3f} at {row['adv_followed']:.0%}, leaving it {row['adv_ev_deviating']:+.3f}), the advantage's sd {row['adv_raw_sd']:.3g}" if self.config.adv_weight > 0 else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f} (fraction {(metrics.get('signal_fraction') or {}).get('all', float('nan')):.3f})  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f}" + (f", every hero slot in {metrics['full_windows']} steps" if metrics.get("full_windows") else "") + (", window budget refused" if metrics.get("window_budget_ok") is False else "") + f")  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
+			+ f"  kl {row['last_kl']:.4f} (target {metrics.get('kl_target', float('nan')):.4f})" + (f"  teacher kl {row['teacher_kl']:.3f} (weight {row['teacher_weight']:.2f})" if self.teacher is not None else "") + (f"  advice {row['advised']:.0%} of turns and exchanges, ours its {row['teacher_agree']:.0%}, teacher ce {row['teacher_ce']:.3f} (weight {row['teacher_weight']:.2f})" if self.config.nk2_advice > 0 else "") + (f"  its choice hidden in {row['choice_hidden']:.0%} of the games: ours its advice {row['teacher_agree_shown']:.0%} shown, {row['teacher_agree_hidden']:.0%} hidden; the head's ev {row['adv_ev_shown']:+.3f} shown, {row['adv_ev_hidden']:+.3f} hidden, the advantage's sd {row['adv_raw_sd_shown']:.3g} shown, {row['adv_raw_sd_hidden']:.3g} hidden; eliminated {row['eliminated_shown']:.3f} shown, {row['eliminated_hidden']:.3f} hidden" if getattr(self.config, "nk2_choice_games", 1.0) < 1.0 else "") + (f"  advantage head: loss {row['adv_loss']:.4f}, ev {row['adv_ev']:+.3f} (its own choice {row['adv_ev_followed']:+.3f} at {row['adv_followed']:.0%}, leaving it {row['adv_ev_deviating']:+.3f}), the advantage's sd {row['adv_raw_sd']:.3g}" if self.config.adv_weight > 0 else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f} (fraction {(metrics.get('signal_fraction') or {}).get('all', float('nan')):.3f})  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f}" + (f", every hero slot in {metrics['full_windows']} steps" if metrics.get("full_windows") else "") + (", window budget refused" if metrics.get("window_budget_ok") is False else "") + f")  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
 			flush=True,
 		)
 
@@ -1553,6 +1563,23 @@ def army_on_heroes(games, empire):
 				on += led
 				total += led + sum(army_worth(town.get("garrison", []), empire) for town in p.get("towns", [])) + army_worth(p.get("armies", []), empire)
 	return on / total if total > 0 else float("nan")
+
+
+def choice_readings(games, metrics):
+	"""The update's readings apart for the games that hid Nullkiller2's own choice (play.choice_hidden) and the rest:
+	their share, how often our choice was its advice (agrees), the advantage head's explained variance (train.ppo_update's
+	adv_ev_shown, adv_ev_hidden), players out of their game (eliminated_share); nan where a kind has none."""
+	kinds = {True: [], False: []}
+	for game, info in games:
+		kinds[choice_hidden(game)].append((game, info))
+	out = {"choice_hidden": len(kinds[True]) / len(games) if games else float("nan")}
+	for name, hidden in (("shown", False), ("hidden", True)):
+		advised = [d for game, _ in kinds[hidden] for d in game.decisions if d.advice is not None]
+		out[f"teacher_agree_{name}"] = float(np.mean([agrees(d) for d in advised])) if advised else float("nan")
+		out[f"adv_ev_{name}"] = metrics.get(f"adv_ev_{name}", float("nan"))
+		out[f"adv_raw_sd_{name}"] = metrics.get(f"adv_raw_sd_{name}", float("nan"))
+		out[f"eliminated_{name}"] = reading(eliminated_share, kinds[hidden]) if kinds[hidden] else float("nan")
+	return out
 
 
 def eliminated_share(games):
