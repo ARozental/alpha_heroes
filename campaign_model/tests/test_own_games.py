@@ -236,3 +236,32 @@ def test_the_advantage_by_kind_of_game():
 	for name in ("shown", "hidden"):
 		assert abs(metrics[f"adv_mean_{name}"]) < 1e-5 and abs(metrics[f"adv_sd_{name}"] - 1.0) < 1e-4, (name, metrics[f"adv_mean_{name}"], metrics[f"adv_sd_{name}"])
 	assert any(not torch.equal(a, b) for (_, a), (_, b) in zip(pooled.named_parameters(), apart.named_parameters()))
+
+
+def test_a_questions_advised_option_is_followed_exactly():
+	"""Bundle 60 (the shipyard's YES): at a question whose advised option is in its inputs (g_nk_action 0, g_nk_index the
+	option + 1) P(option) = rho x [the advised one] + (1 - rho) x ours, exactly; a question without one, and every turn
+	decision, as with following off."""
+	from campaign_model import constants as c
+
+	torch.manual_seed(3)
+	model = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	x = rich_inputs(24, 5)
+	question = ~np.isin(x["g_kind"], [c.DecisionKind.TURN, c.DecisionKind.EXCHANGE])
+	rows = [b for b in np.flatnonzero(question) if x["option_mask"][b].sum() >= 2]
+	assert len(rows) >= 2
+	asked, plain = rows[0], rows[1]
+	x["g_nk_action"][question], x["g_nk_index"][question] = 0, 0
+	option = int(np.flatnonzero(x["option_mask"][asked])[-1])
+	x["g_nk_index"][asked] = option + 1
+	t = {k: torch.from_numpy(v) for k, v in x.items()}
+	with torch.no_grad():
+		model.features.nk_follow.fill_(0.0)
+		own = model(t)
+		model.features.nk_follow.fill_(0.9)
+		mixed = model(t)
+		rho = float(model.features.nk_follow_logs()[1].exp())
+	expect = (1 - rho) * own["option_logp"][asked].exp()
+	expect[option] += rho
+	assert torch.allclose(mixed["option_logp"][asked].exp(), expect, atol=1e-6)
+	assert torch.equal(mixed["option_logp"][plain], own["option_logp"][plain])

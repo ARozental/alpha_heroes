@@ -160,7 +160,8 @@ def label(x):
 	"""Nullkiller2's own choice at this decision in our terms (schema 19's g_nk_action, g_nk_index, g_nk_cell: what it
 	would do now, where its first request maps to an entry of ours): (action type [B], the index in that type's table,
 	a targeted spell's tile), each -1 where it has none (no advisor, a request no entry of ours expresses, an input
-	dict from before the fields)."""
+	dict from before the fields). At a question (bundle 60: the shipyard's YES) its advised option: action -1 (g_nk_action
+	0), the index the option (g_nk_index option + 1); everything reading an action type takes it as none."""
 	if "g_nk_action" not in x:
 		none = torch.full((x["g_day"].shape[0],), -1, dtype=torch.long, device=x["g_day"].device)
 		return none, none, none

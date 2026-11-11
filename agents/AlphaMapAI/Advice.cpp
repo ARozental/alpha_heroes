@@ -963,8 +963,13 @@ void AlphaMapAI::candidateInputs(Decision & decision)
 
 void AlphaMapAI::labelInputs(Decision & decision, const std::optional<Choice> & advice)
 {
-	if(!nk2Choice || !advice || advice->type < 0 || advice->index < 0) // (hidden: the game's own-games setting, AlphaMapAI.h)
+	if(!nk2Choice || !advice || advice->index < 0) // (hidden: the game's own-games setting, AlphaMapAI.h)
 		return;
+	if(advice->type < 0) // (a question's advised option, bundle 60: g_nk_action 0, g_nk_index the option + 1; views.label)
+	{
+		decision.inputs.at(In::g_nk_index) = advice->index + 1;
+		return;
+	}
 	decision.inputs.at(In::g_nk_action) = advice->type + 1;
 	decision.inputs.at(In::g_nk_index) = advice->index + 1;
 	decision.inputs.at(In::g_nk_cell) = advice->cell + 1; // (-1 none: 0)

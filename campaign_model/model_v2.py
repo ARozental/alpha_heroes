@@ -1205,11 +1205,12 @@ class CampaignModelV2(nn.Module):
 			type_kl = torch.where(p_type > 0, p_type * (new_types - plain_types), torch.zeros_like(p_type)).sum(dim=1)
 			state.adv["adv_kl"] = type_kl + (p_type * torch.stack(reading["kl"], dim=-1)).sum(dim=1)
 			state.adv["adv_read"] = (p_type * torch.stack(reading["read"], dim=-1)).sum(dim=1)
-		self.follow(out, label_action, label_index, torch.stack(legal_types, dim=-1))
+		question = ~((x["g_kind"] == c.DecisionKind.TURN) | (x["g_kind"] == c.DecisionKind.EXCHANGE))  # (a question's own: its options)
+		self.follow(out, label_action, label_index, torch.stack(legal_types, dim=-1), question)
 		self.value(state, known, out)
 		return out
 
-	def follow(self, out, action, index, legal):
+	def follow(self, out, action, index, legal, question=None):
 		"""Nullkiller2's own choice followed at a chance (model.CustomFeatures.nk_follow_logs: rho; off: nothing changes):
 		the policy the games sample becomes rho x (its choice) + (1 - rho) x (ours), exactly, at every decision whose
 		labelled type is legal and whose labelled entry is legal in that type's table (END: the type alone). In the
@@ -1219,8 +1220,10 @@ class CampaignModelV2(nn.Module):
 		  P(entry | its type)  = ((1 - rho) P_own(its type) P_own(entry | its type) + rho [entry is its choice]) / P(its type)
 
 		the other types' tables as they are. A targeted spell's tile and ARMY's target slot stay our own tables'.
+		A question's advised option (bundle 60: action -1, index its option, views.label; the shipyard's YES) likewise, where
+		it is legal: P(option) = (1 - rho) P_own(option) + rho [option is its], exact in option_logp.
 		out: type_logp and the tables' log-probabilities, changed in place; action, index [B]: its choice (views.label);
-		legal [B, types]."""
+		legal [B, types]; question [B]: the decision a question (None: none is)."""
 		on, log_rho, log_rest = self.features.nk_follow_logs()
 		own_types = out["type_logp"]
 		b = own_types.shape[0]
@@ -1243,6 +1246,14 @@ class CampaignModelV2(nn.Module):
 			its_entry = (index.clamp(0, table.shape[1] - 1).unsqueeze(1) == torch.arange(table.shape[1], device=index.device)) & here.unsqueeze(1)
 			mixed = torch.where(its_entry, log_sum(joint, log_rho.to(table.dtype)), joint) - type_mixed
 			out[name] = torch.where(here.unsqueeze(1), mixed.to(table.dtype), table).reshape(out[name].shape)
+		if question is not None:  # (a question's advised option, bundle 60)
+			options = out["option_logp"]
+			slot = index.clamp(0, options.shape[1] - 1).unsqueeze(1)
+			asked = on & question & (action < 0) & (index >= 0) & (index < options.shape[1]) & torch.isfinite(options.gather(1, slot).squeeze(1))
+			its = (slot == torch.arange(options.shape[1], device=index.device)) & asked.unsqueeze(1)
+			own = (log_rest.to(options.dtype) + options)
+			mixed = torch.where(its, log_sum(own, log_rho.to(options.dtype)), own)
+			out["option_logp"] = torch.where(asked.unsqueeze(1), mixed, options)
 
 	def value(self, state, known, out):
 		"""The value heads as v1's (model.CampaignModel.value): V2, V5, V7 (our share at the end of those days), the

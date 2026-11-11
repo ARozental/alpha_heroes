@@ -1292,6 +1292,8 @@ void AlphaMapAI::showShipyardDialog(const IShipyard * obj)
 			advice->type = -1;
 			advice->index = 0;
 			++boatAnswers;
+			if(nk2Inputs)
+				labelInputs(decision, advice); // (the model's follow mixture takes it, unless the game hides its choice)
 		}
 		if(decide(decision, advice).index == 0)
 		{
