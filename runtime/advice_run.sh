@@ -183,6 +183,36 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # weights against Nullkiller2: the eval's score 0.461 -> 0.595 (+0.134 +- 0.041), eliminated 11 -> 4, big losses on
 # the enemy's turn 64 -> 49, land explored not less. Watch: eliminated and score over three evals (0.497, 11 of 48
 # before), features.night_gain (if it sinks as danger_gain did, something teaches the heroes out), idle movement
+# The overhaul's first deploy (2026-11-11, e5 with b1; deploy 57; the user: "Make the feature changes and get rid of
+# the teacher"). Schema 19: Nullkiller2's view of each turn decision as the model's INPUTS (campaign.nk2_inputs=true:
+# ALPHA_MAP_NK2_INPUTS and its gather advice in every game, the evaluations' too): its candidate tasks on our MOVE and
+# TRAVEL entries with its scores, times, losses and dangers (k_*), its plan's tier and its threats, and its OWN CHOICE
+# at the decision (g_nk_action, g_nk_index, g_nk_cell; where its first request is none of our entries, its plan's
+# first task that is one); each MOVE tile and TRAVEL area also carries bounded views of its value and time
+# (campaign_model/views.py: 51 channels an entry; every new layer's output starts at 0).
+# campaign.nk2_follow=0.9: the games' policy is 0.9 x (the entry Nullkiller2 itself would play now) + 0.1 x (our own
+# policy), exactly, in the type's and its table's probabilities (model_v2's follow); the chance learns within
+# 0.31..0.96. Why this and not its teacher's loss or a prior in logits: playing its choice outright was worth
+# +0.293 +- 0.059 on 144 paired games (b1's follow test, v3045, with its gather advice); the teacher's loss held 65% of
+# the shared gradient for an agreement of 0.24; a prior on its best-scored candidate gave +0.017 +- 0.058 at 2 and
+# -0.013 +- 0.058 at 4 (v3090, 48 paired games); a prior of 8 logits on its own choice +0.052 +- 0.064 (it ran without
+# the gather advice: its choice known at 76% of turn decisions, its trades taken at 20%). The mixture itself has NO
+# paired test (the user, 12:50: no experiment over 10 minutes; use what is known): its evidence is the follow test.
+# campaign.nk2_teacher=false: the teacher's weight and its share of the gradient 0 (its advice still asked and
+# logged: teacher_agree is now how often we play its choice; the plan head's label stays). The policy learns where to
+# leave its choice from the games alone, and the chance of following learns with it.
+# Out of the line: campaign.nk2_gather_weight / nk2_gather_ramp (GATHER's label: the teacher's) and
+# campaign.value_valve / kl_valve (their premise failed: in the 2026-11-10 collapse the critic's unexplained share went
+# 0.82 -> 0.88, the 8x loss was the targets' spread).
+# campaign.value_jump_from=3107: the guard held the campaign at v3106 (11:25: fresh value loss 4.0 times its calm level
+# during GATHER's ramp). Looked into: v3090 against v3025 on 144 paired games -0.038 +- 0.042, eliminated 33 and 33, so
+# the level was the games' (armies on heroes 0.14 -> 0.30), not a collapse. The guard's memory starts again at 3107 and
+# it judges again after 57 updates; until then: eliminated, the evals, a Mac replay of the first evaluated checkpoint.
+# What takes it out again: the evaluation below its level before this deploy (0.47-0.53) over two evals with a Mac
+# replay agreeing (rollback point runtime/saved/campaign_joint7_pre_overhaul.pt). Expected: the evaluation well above
+# 0.6 (the follow test's arm was near 0.8), teacher_agree near 0.9 where its choice is known, the fresh value loss at
+# a new level (the games change), KL an update about a tenth of before (the mixture moves a tenth as far as our own
+# policy does; the rate's scale is capped at 1, so our own policy is not sped up to make up for it).
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -191,5 +221,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_gather_weight=0.1 campaign.nk2_gather_ramp=200 campaign.value_valve=true campaign.kl_valve=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3107 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
