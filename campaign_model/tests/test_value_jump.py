@@ -55,7 +55,7 @@ def test_the_level_is_the_calm_stretchs_after_a_rollback():
 def learner_of(tmp_path, readings, factor=3.0):
 	scalars = []
 	writer = SimpleNamespace(add_scalar=lambda name, value, step: scalars.append((name, value, step)))
-	return SimpleNamespace(config=CampaignConfig(value_jump_stop=factor, decisions_per_update=100, min_games_per_update=2), held=None, held_updates=0, value_readings=list(readings), value_own=0, version=7, out=tmp_path, writer=writer, scalars=scalars, lock=threading.Condition(), finished=[], stats=collections.Counter(), label_futures={})
+	return SimpleNamespace(config=CampaignConfig(value_jump_stop=factor, decisions_per_update=100, min_games_per_update=2), held=None, held_updates=0, gather_ramp_start=None, value_readings=list(readings), value_own=0, version=7, out=tmp_path, writer=writer, scalars=scalars, lock=threading.Condition(), finished=[], stats=collections.Counter(), label_futures={})
 
 
 def test_the_guard_holds_the_updates_and_says_so(tmp_path, capsys):
