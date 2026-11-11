@@ -134,6 +134,22 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # Before the PC (paired_eval, v2886's weights, the eval's 48 games, three replicates an arm, both with further
 # windows): 0.472 -> 0.531, paired +0.059 +- 0.025, eliminated 7, 15, 13 -> 8, 8, 9. It follows deploy 52 after one
 # clean eval (v2934: 0.579 +- 0.054, eliminated 7, no step over the window budget, the value loss at its level)
+# Our towns' night (2026-11-11, b1's f032d3f + 74480f8; e5 deploys as 54; no switch on this line: on in the code,
+# ALPHA_TOWN_NIGHT=0 turns it off for a test): MOVE's and TRAVEL's logit priors also pay the change in P(a town of
+# ours falls tonight) x its stake for the hero that enters or leaves it, our only town at our Φ. Why: the collapsed
+# GATHER weights (v2830) stay collapsed under the hero's night term alone (eliminated 20.7 of 48 with and without
+# it); the eliminations moved from the hero (first to go in 14 of 22 -> 5 of 21) to the town it stands beside or
+# walks out of (2 -> 11), a 30-60k army alive within 7 tiles of an empty last town. Paired, three replicates side
+# by side: v2830 0.503 -> 0.582 (+0.079 +- 0.052), eliminated 19/18/18 -> 10/18/9; v2912 (today's weights) 0.531 ->
+# 0.518 (-0.013 +- 0.040), eliminated 10/10/8 -> 11/8/11, idle_movement 0.172 -> 0.187. Neutral now, the
+# prerequisite of GATHER's return. campaign.nk2_gather_ramp (b1's 5d31166) is in the code and off: GATHER's weight
+# is not on this line; its readings (gather_weight, army_on_heroes, eliminated, value_target_std) log from here
+# battle_length_scale=30 (2026-11-11, b1's plan of 2026-11-10, deploy 2 of 3; the battle model, its own track): a
+# battle's decisions weigh 1 / (1 + (n - 1) / 30), so an update's gradient rests on more battles (one update's was
+# ~14 games' for the policy, ~4 for the value: a few 150-decision stand-offs held 28% of its decisions). Baseline
+# over 47 updates before it: games_by_weight 49 +- 14, signal_share_applied_trunk -0.001 +- 0.017, value_loss_fresh
+# 0.0076 +- 0.0022. b1's predictions: games_by_weight about x2, value_loss_fresh's update-to-update spread down a
+# third within 30 updates, signal_share about x2 within ~100; else it comes out
 # campaign.value_jump_stop is 3 (config.py; the user, 2026-11-10): the campaign's updates are held when its fresh value
 # loss jumps (the median of the last 7 updates at 3 times its calm level); the line "VALUE LOSS JUMP" in the log, the
 # file campaign/held. A restart lifts the hold
@@ -154,5 +170,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
