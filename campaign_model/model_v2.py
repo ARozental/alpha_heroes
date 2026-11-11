@@ -1150,7 +1150,7 @@ class CampaignModelV2(nn.Module):
 		valid = on & (action >= 0) & legal.gather(1, named).squeeze(1) & entry_ok  # [B]
 		its_type = (named == torch.arange(own_types.shape[1], device=named.device)) & valid.unsqueeze(1)
 		rest = (log_rest + own_types).to(own_types.dtype)
-		mixed_types = torch.where(its_type, torch.logaddexp(rest, log_rho.to(own_types.dtype)), rest)
+		mixed_types = torch.where(its_type, log_sum(rest, log_rho.to(own_types.dtype)), rest)
 		out["type_logp"] = torch.where(valid.unsqueeze(1), mixed_types, own_types)
 		type_own, type_mixed = own_types.gather(1, named), mixed_types.gather(1, named)  # [B, 1] its type's, ours and mixed
 		for kind, (name, _) in HEADS.items():
@@ -1158,7 +1158,7 @@ class CampaignModelV2(nn.Module):
 			here = valid & (action == int(kind))
 			joint = rest.new_zeros(()) + log_rest + type_own + table  # log((1 - rho) P_own(type) P_own(entry | type))
 			its_entry = (index.clamp(0, table.shape[1] - 1).unsqueeze(1) == torch.arange(table.shape[1], device=index.device)) & here.unsqueeze(1)
-			mixed = torch.where(its_entry, torch.logaddexp(joint, log_rho.to(table.dtype)), joint) - type_mixed
+			mixed = torch.where(its_entry, log_sum(joint, log_rho.to(table.dtype)), joint) - type_mixed
 			out[name] = torch.where(here.unsqueeze(1), mixed.to(table.dtype), table).reshape(out[name].shape)
 
 	def value(self, state, known, out):
@@ -1183,6 +1183,12 @@ class CampaignModelV2(nn.Module):
 
 
 # ---- helpers: the known facts per entity ----
+
+def log_sum(a, b):
+	"""log(exp(a) + exp(b)), b finite (torch.logaddexp in operators the ONNX export has; a may be -inf: then b)."""
+	top = torch.maximum(a, b)
+	return top + torch.log(torch.exp(a - top) + torch.exp(b - top))
+
 
 def best_legal(logits, mask):
 	"""The best legal entry [B] of a table [B, ...] (logits broadcastable to mask's shape), 0 where none is legal."""
