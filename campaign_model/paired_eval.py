@@ -29,11 +29,12 @@ SWITCHES = {"ALPHA_MAP_FURTHER_WINDOWS": "0", "ALPHA_MAP_UNSEEN_EXITS": "0"}
 def play_arm(checkpoint, out, games, parallel, env, keep_games=False):
 	from .config import CampaignConfig
 	from .evaluate import eval_map, score, setups
-	from .play import play
+	from .play import nk2_settings, play
 	from .train import serve_model
 
-	os.environ.update({**SWITCHES, **env})  # (the games inherit them)
 	config, results, kept, gate = CampaignConfig(), {}, {}, threading.Semaphore(parallel)
+	env = {**SWITCHES, **dict(nk2_settings(config)), **env}  # (schema 19: Nullkiller2's view as inputs as the evaluations have it, unless --env says)
+	os.environ.update(env)  # (the games inherit them)
 	with serve_model(checkpoint, processes=parallel) as (_, server):
 		def one(i, seed, players, color):
 			name = eval_map(seed, players, config)
@@ -49,7 +50,7 @@ def play_arm(checkpoint, out, games, parallel, env, keep_games=False):
 			t.start()
 		for t in threads:
 			t.join()
-	pickle.dump({"results": results, "checkpoint": checkpoint, "env": {**SWITCHES, **env}}, open(out, "wb"))
+	pickle.dump({"results": results, "checkpoint": checkpoint, "env": env}, open(out, "wb"))
 	if keep_games:
 		pickle.dump(kept, open(out + ".games.pkl", "wb"))
 	print(f"saved {out}")

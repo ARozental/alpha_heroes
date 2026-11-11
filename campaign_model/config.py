@@ -93,6 +93,14 @@ class CampaignConfig:
 	# explore; its TRAVEL area as unrevealed, features.unseen_exits), as Nullkiller2's ExplorationBehavior sends a hero
 	# into each. A prior change of its own: turn it on apart from further_windows
 	unseen_exits: bool = True
+	# Schema 19 (2026-11-11, the user's go-ahead: Nullkiller2's insight as inputs, its labels no longer a loss), the games'
+	# side (play.nk2_settings): nk2_inputs, AlphaMapAI's advisor plans before every turn decision and its candidates,
+	# tier and threats are the model's inputs (ALPHA_MAP_NK2_INPUTS), in training games, evaluations and paired evaluations
+	# alike; nk2_input_dropout, the share of training games played without them (g_nk_present 0 throughout, as where it
+	# would be too slow or in play without Nullkiller2), drawn from the game's seed: the policy learns to play from the
+	# plan head's prediction as well
+	nk2_inputs: bool = True
+	nk2_input_dropout: float = 0.2
 	# The update's inputs decoded ahead in this many threads (train._prefetched: zlib, ~430 decisions/s a thread on the PC). With
 	# the step recorded whole the PC's update waited ~15 s for 3 of them, the CPU half idle (2026-10-31): each decision is
 	# decoded three times an update (the first pass, two passes)

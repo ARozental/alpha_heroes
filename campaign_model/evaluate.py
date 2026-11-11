@@ -32,7 +32,7 @@ from battle_model.supply import memory_allows
 from .empire import EVAL_EMPIRE, EVAL_EMPIRE_VERSION, STATUS_INGAME, STATUS_LOST, empire_value
 from .failures import NAMES as FAILURES, failure_counts, failure_modes
 from .labels import COLORS, share_at, share_table
-from .play import make_map, play, time_scale, window_settings
+from .play import make_map, nk2_settings, play, time_scale, window_settings
 
 EVAL_SEED = 20261027
 STATUS_WON = 2  # EPlayerStatus::WINNER
@@ -153,7 +153,7 @@ def evaluate(config, server, battle, version, epoch, stop=None, model="current")
 			for attempt in range(2):
 				game, info = play(
 					server.socket_for(i), name, config.eval_days, seed, max_seconds=config.eval_seconds * time_scale(config.eval_size), battle_ai="BattleAI", game_key=f"e{i}",
-					settings=battle.eval_settings(i) + (("ALPHA_MAP_MODEL", model),) + window_settings(config), temperature=config.eval_temperature, ours=(color,), stop=stop,
+					settings=battle.eval_settings(i) + (("ALPHA_MAP_MODEL", model),) + window_settings(config) + nk2_settings(config), temperature=config.eval_temperature, ours=(color,), stop=stop,
 					niceness=config.eval_niceness,
 				)
 				if not info.status.startswith(STALLED):

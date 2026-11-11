@@ -37,6 +37,16 @@ class GameInfo:
 	run_mb: float  # the run directory (logs) on disk
 
 
+def nk2_settings(config, seed=None):
+	"""Schema 19's switch as a game's environment (a tuple of pairs, for play's settings): Nullkiller2's view as the
+	model's inputs (config.nk2_inputs); a training game (its seed given) goes without it at config.nk2_input_dropout,
+	drawn from its seed (the same game the same way on every machine)."""
+	import random
+
+	on = config.nk2_inputs and (seed is None or random.Random(int(seed) * 7919 + 19).random() >= config.nk2_input_dropout)
+	return (("ALPHA_MAP_NK2_INPUTS", "1" if on else "0"),)
+
+
 def window_settings(config):
 	"""Schema 17's switches as a game's environment (a tuple of pairs, for play's settings): the further windows a hero
 	may have and whether the entrances with no exit seen are flagged (config.further_windows, config.unseen_exits;
