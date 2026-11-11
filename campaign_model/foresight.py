@@ -236,10 +236,15 @@ def labels_of(game, features, chunk=512):
 	return labels
 
 
-def gradient_check(model, main, foresight, terms=None, prefix="grad_shared_"):
+WATCHED = ("night_gain", "danger_gain")  # (the prior corrections whose gradient each term gives is logged: gradient_check's watch)
+
+
+def gradient_check(model, main, foresight, terms=None, prefix="grad_shared_", watch=()):
 	"""The shared layers' gradient norm from the policy's and the values' losses (main) and from the foresight's, their
 	cosine, and the share of the parameters neither reaches (a path cut off), without touching .grad; terms ({name: a
-	term of the loss}, train.micro_loss's split): each one's norm there too (<prefix><name>), on the same scale."""
+	term of the loss}, train.micro_loss's split): each one's norm there too (<prefix><name>), on the same scale, and
+	its gradient on each of watch's parameters (model.features.<name>, a prior's correction: <prefix><name>_<term>;
+	2026-11-10: night_gain fell every update from its deploy, which term pushes it?)."""
 	shared = [p for name, p in model.named_parameters() if p.requires_grad and name.startswith(("encode_", "blocks.", "unet.", "read_tiles.", "sides.", "tile_sides.", "join_", "stamp_"))]
 	params = [p for p in model.parameters() if p.requires_grad]
 	g_main = torch.autograd.grad(main, params, retain_graph=True, allow_unused=True)
@@ -249,9 +254,15 @@ def gradient_check(model, main, foresight, terms=None, prefix="grad_shared_"):
 	a, b = flat(g_main), flat(g_fore)
 	dead = sum(1 for x, y in zip(g_main, g_fore) if (x is None or not bool(x.any())) and (y is None or not bool(y.any())))
 	norms = {}
+	watched = [(label, getattr(model.features, label, None)) for label in watch]
 	for name, term in (terms or {}).items():
 		if term.requires_grad:
-			norms[f"{prefix}{name}"] = float(flat(torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)).norm())
+			grads = torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)
+			norms[f"{prefix}{name}"] = float(flat(grads).norm())
+			for label, p in watched:
+				if p is not None and id(p) in index:
+					g = grads[index[id(p)]]
+					norms[f"{prefix}{label}_{name}"] = float(g.sum()) if g is not None else 0.0
 	return {
 		"grad_shared_main": float(a.norm()), "grad_shared_foresight": float(b.norm()),
 		"grad_shared_cosine": float(F.cosine_similarity(a, b, dim=0)), "grad_dead_share": dead / max(len(params), 1), **norms,
