@@ -98,9 +98,9 @@ class CampaignConfig:
 	# tier and threats are the model's inputs (ALPHA_MAP_NK2_INPUTS), in training games, evaluations and paired evaluations
 	# alike; nk2_input_dropout, the share of training games played without them (g_nk_present 0 throughout, as where it
 	# would be too slow or in play without Nullkiller2), drawn from the game's seed: the policy learns to play from the
-	# plan head's prediction as well
-	nk2_inputs: bool = True
-	nk2_input_dropout: float = 0.2
+	# plan head's prediction as well. Both off by default (main's games as before): the deploy turns them on
+	nk2_inputs: bool = False
+	nk2_input_dropout: float = 0.0
 	# The update's inputs decoded ahead in this many threads (train._prefetched: zlib, ~430 decisions/s a thread on the PC). With
 	# the step recorded whole the PC's update waited ~15 s for 3 of them, the CPU half idle (2026-10-31): each decision is
 	# decoded three times an update (the first pass, two passes)
