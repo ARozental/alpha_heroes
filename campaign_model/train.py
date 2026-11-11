@@ -1033,7 +1033,7 @@ def ppo_update(
 	clock = {"prepass": 0.0, "wait": 0.0, "steps": 0.0, "forward": 0.0, "losses": 0.0, "backward": 0.0, "optimizer": 0.0, "cpu": time.thread_time()}  # where the update's time goes (logged: the PC's step ran at half the GPU's pace, 2026-10-30)
 	# The foresight's labels (foresight.game_labels, v2), each decision's row: its loss joins the minibatch's, a share
 	# per micro-batch as the others'; the shared layers' gradient from it against the PPO losses', on the first one
-	from .foresight import PART_NAMES, ForesightConfig, gradient_check
+	from .foresight import PART_NAMES, WATCHED, ForesightConfig, gradient_check
 
 	foresight_t = {name: torch.from_numpy(value).to(device) for name, value in foresight.items()} if foresight is not None else None
 	if foresight_t is not None and hasattr(model, "plan_outputs"):  # (v2: its fs_plan for the plan's loss, in every graph recorded below)
@@ -1412,7 +1412,7 @@ def ppo_update(
 					# reference to the default stream (stream 0) from warmup", 2026-10-30)
 					check = micro_loss(forward(model_inputs(raw)), batch, config, foresight_config, split=True, privileged=privileged_module)
 					if check[3] is not None:
-						checked = gradient_check(model, check[0] - check[3], check[3], check[4], prefix="grad_raw_")
+						checked = gradient_check(model, check[0] - check[3], check[3], check[4], prefix="grad_raw_", watch=WATCHED)
 					del check
 				mark = time.perf_counter()
 				recorded = steps_graph.run(raw, batch, budget, prepare) if steps_graph is not None and not eager else None

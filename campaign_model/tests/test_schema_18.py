@@ -137,3 +137,26 @@ def test_a_table_of_moves_offers_less_than_staying_when_every_move_is_worse():
 	logits = torch.tensor([[[-3.0, -1.0], [5.0, -2.0]], [[1.0, 2.0], [0.0, 0.0]]])
 	legal = torch.tensor([[[True, True], [False, True]], [[False, False], [False, False]]])
 	assert ft.signed_offer(logits, legal).tolist() == [-1.0, 0.0] and ft.offer(logits, legal).tolist() == [0.0, 0.0]
+
+
+def test_the_gradient_check_reads_each_terms_gradient_on_the_watched_corrections():
+	"""foresight.gradient_check's watch: each term's gradient on model.features.<name> (signed; 0 where the term does not
+	reach it), beside the shared layers' norms as before."""
+	from campaign_model.foresight import WATCHED, gradient_check
+
+	class Features(torch.nn.Module):
+		def __init__(self):
+			super().__init__()
+			self.night_gain, self.danger_gain = torch.nn.Parameter(torch.tensor(0.0)), torch.nn.Parameter(torch.tensor(0.0))
+
+	class Model(torch.nn.Module):
+		def __init__(self):
+			super().__init__()
+			self.features, self.encode_x = Features(), torch.nn.Linear(2, 1)
+
+	m = Model()
+	shared = m.encode_x(torch.ones(2)).sum()
+	terms = {"teacher": 3 * m.features.night_gain + shared, "policy": -2 * m.features.night_gain + 5 * m.features.danger_gain}
+	out = gradient_check(m, shared + m.features.night_gain, 2 * shared, terms, prefix="grad_raw_", watch=WATCHED)
+	assert out["grad_raw_night_gain_teacher"] == 3 and out["grad_raw_night_gain_policy"] == -2
+	assert out["grad_raw_danger_gain_policy"] == 5 and out["grad_raw_danger_gain_teacher"] == 0 and out["grad_raw_teacher"] > 0

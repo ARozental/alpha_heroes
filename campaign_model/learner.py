@@ -68,6 +68,10 @@ FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answe
 # times the term's weight; grad_shared_foresight is the foresight's with its plan, these the plan's alone and the rest's),
 # and the loss shares' weights (config.loss_shares)
 GRADIENT_COLUMNS = tuple(f"grad_shared_{term}" for term in ("policy", "value", "entropy", "teacher", "plan")) + ("loss_weight_value", "loss_weight_teacher", "loss_weight_foresight", "teacher_share", "teacher_set_agree")
+# (2026-11-10) each policy term's push on the watched prior corrections (foresight.WATCHED): minus its gradient there
+# times its weight in the loss, on one micro-batch an update (the gradient check's); below 0 drives the correction down
+PUSH_COLUMNS = tuple(f"push_{label}_{term}" for label in ("night_gain", "danger_gain") for term in ("policy", "entropy", "teacher"))
+GRADIENT_COLUMNS = GRADIENT_COLUMNS + PUSH_COLUMNS
 # The loss shares (config.loss_shares; the user, 2026-11-02): each term of the loss gets a share of the shared layers'
 # gradient, its weight set from its gradient's running norm (GradNorm's balance, Chen et al. 2018, in closed form: the
 # weight that gives a term its share against the policy's, whose weight stays 1), each weight moving at most
@@ -988,6 +992,8 @@ class CampaignLearner:
 		scale = {"policy": 1.0, "entropy": 1.0, "value": weights["value"], "teacher": weights["teacher"], "foresight": weights["foresight"], "plan": weights["foresight"]}
 		for term, weight in scale.items():
 			metrics[f"grad_shared_{term}"] = metrics.get(f"grad_raw_{term}", float("nan")) * weight
+			for label in ("night_gain", "danger_gain"):
+				metrics[f"push_{label}_{term}"] = -metrics.get(f"grad_raw_{label}_{term}", float("nan")) * weight
 		metrics.update({f"loss_weight_{term}": weights[term] for term in ("value", "teacher", "foresight")}, teacher_share=self.loss_shares()["teacher"])
 		if not getattr(self.config, "loss_shares", False):
 			return
