@@ -170,3 +170,26 @@ def test_the_night_weight_is_not_learned(model):
 	f = model.features({k: torch.from_numpy(v) for k, v in x.items()}, model.windows({k: torch.from_numpy(v) for k, v in x.items()})[0])
 	(f.travel_logits.sum() + f.tile_prior.sum()).backward()
 	assert model.features.night_gain.grad is None and night(custom_features(model, x), [30, 10, 0]) < -2.0
+
+
+def test_the_logit_priors_in_shares_of_our_empire(model, monkeypatch):
+	"""prior_shares (ALPHA_PRIOR_SHARES=1, off by default): what MOVE's and TRAVEL's logit priors squash is gold x
+	PRIOR_SHARE_REF / our Φ (a gold mine: value_logit(5,000 x 50,000 / Φ)); off, gold as before; the network's inputs
+	(move_features, travel_prior) the same either way."""
+	from campaign_model.model import PRIOR_SHARE_REF
+	from campaign_model.tests.test_model import GOLD_MINE
+
+	assert not model.features.prior_shares
+	x, tile = window_with(GOLD_MINE, subtype=6)
+	x["travel_mask"][0, 0, 0, 5, 5], x["travel_days"][0, 0, 0, 5, 5] = True, 150
+	gold = custom_features(model, x)
+	shares = copy.deepcopy(model)
+	shares.features.prior_shares = True
+	f = custom_features(shares, x)
+	phi = float(f.phi_total[0])
+	assert float(gold.tile_prior[0][tile]) == pytest.approx(float(ft.value_logit(torch.tensor(5000.0))), abs=1e-4)
+	assert float(f.tile_prior[0][tile]) == pytest.approx(float(ft.value_logit(torch.tensor(5000.0 * PRIOR_SHARE_REF / phi))), abs=1e-4)
+	assert torch.equal(f.move_features, gold.move_features) and torch.equal(f.travel_prior, gold.travel_prior)
+	assert not torch.equal(f.travel_logits, gold.travel_logits) or float(gold.travel_logits.abs().max()) == 0
+	monkeypatch.setenv("ALPHA_PRIOR_SHARES", "1")
+	assert CampaignModel(dim=32, cell_dim=16, layers=1).features.prior_shares
