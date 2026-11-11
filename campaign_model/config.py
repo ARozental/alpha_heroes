@@ -298,6 +298,12 @@ class CampaignConfig:
 	# on 192 recorded games a day's share of followed choices predicted the 7-day share change (slope +0.0124 +- 0.0023).
 	# 0: off, nothing computed (the update as before, bit for bit)
 	adv_weight: float = 0.0
+	# Our own policy reads the advantage head (stage 2a; model_v2's decide): this many logits a unit of its prediction
+	# (the update's advantage in sd units: soft policy iteration's 1 / beta), its table terms clipped to +-3 and centered
+	# on their mean under our own policy, its type term clipped to +-3, all before the follow mixture; x a learned gain
+	# (1/4..2). 0: off, the model as before, bit for bit. Set into the model at every start (learner.set_advice_prior);
+	# ALPHA_ADV_GAIN for a paired test. Turned on only once adv_ev on fresh rows has held above 0 (stage 1's reading)
+	adv_gain: float = 0.0
 	# Its TRADE advice taught too (False since 2026-11-04: the user's rule, every trade is dumb unless it buys what could not
 	# be bought without it; ~94% of its trades bought nothing that day, and 54% of ours came where it advised one)
 	nk2_trade_advice: bool = False

@@ -336,8 +336,15 @@ class CustomFeatures(nn.Module):
 		# whatever our own priors make of them, and our own policy is sampled as it is wherever we do not follow
 		self.nk_follow_shift = zeros()
 		self.register_buffer("nk_follow", torch.zeros(()))
+		# The advantage head read by our own policy (stage 2a, 2026-11-11; adv_gain_weight; model_v2's decide): adv_gain
+		# logits a unit of its predicted advantage (sd units of the update's standardized advantage: soft policy
+		# iteration's 1 / beta), fixed (config.adv_gain; ALPHA_ADV_GAIN for a paired test; 0: off, the model as before),
+		# x a gain (1/4..2)
+		self.adv_gain_shift = zeros()
+		self.register_buffer("adv_gain", torch.zeros(()))
 		override = lambda name: float(os.environ[name]) if os.environ.get(name, "") != "" else None  # noqa: E731
 		self.nk_override = (override("ALPHA_NK2_PRIOR"), override("ALPHA_NK2_PRIOR_FALLBACK"), override("ALPHA_NK2_LABEL"), override("ALPHA_NK2_FOLLOW"))
+		self.adv_override = override("ALPHA_ADV_GAIN")
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -362,6 +369,7 @@ class CustomFeatures(nn.Module):
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
 			self.night_gain,
 			self.nk_gain, self.nk_gain_fallback, self.nk_survival, self.nk_risk, self.nk_label_gain, self.nk_follow_shift,
+			self.adv_gain_shift,
 		]
 
 	# ---- the bounded prior parameters ----
@@ -391,6 +399,12 @@ class CustomFeatures(nn.Module):
 		own = self.nk_override[2]
 		size = self.nk_label if own is None else self.nk_label.new_tensor(own)
 		return size * ft.bounded(self.nk_label_gain, 0.25, 2.0, 1.0, CORRECTION_STEP)
+
+	def adv_gain_weight(self):
+		"""The logits a unit of the advantage head's prediction moves our own policy by (model_v2's decide): adv_gain x its
+		gain (1/4..2, 1 at the start); 0 with adv_gain at 0, the model as before."""
+		size = self.adv_gain if self.adv_override is None else self.adv_gain.new_tensor(self.adv_override)
+		return size * ft.bounded(self.adv_gain_shift, 0.25, 2.0, 1.0, CORRECTION_STEP)
 
 	def nk_follow_logs(self):
 		"""(whether following is on, log rho, log (1 - rho)): the chance our choice is Nullkiller2's own (nk_follow at the
@@ -1579,7 +1593,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,

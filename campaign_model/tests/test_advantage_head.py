@@ -5,7 +5,6 @@ import copy
 
 import numpy as np
 import torch
-from torch import nn
 
 from campaign_model import constants as c
 from campaign_model.config import CampaignConfig
@@ -63,13 +62,13 @@ def test_an_older_checkpoint_loads_it_at_zero():
 
 
 def test_at_weight_0_the_update_is_the_one_without_the_head():
-	"""Every weight bit-identical to an update of the same model with no head at all (its parameters out of the value
-	group, nothing computed), the head unmoved, its loss 0 and no reading of it."""
+	"""Every weight bit-identical to an update of the same model with the head frozen (no gradient, nothing in the value
+	group's norm), the head unmoved, its loss 0 and no reading of it."""
 	model, x, decisions = setup()
 	config = CampaignConfig(batch_size=8, passes=1, model_architecture="v2", credit="schedule", share_target="change")
 	advantages = np.random.default_rng(3).standard_normal(len(decisions)).astype(np.float32)
 	with_head, without = copy.deepcopy(model), copy.deepcopy(model)
-	without.advantage = nn.Module()
+	without.advantage.requires_grad_(False)  # (stage 2a: decide reads the head; frozen, no gradient, out of every group's norm)
 	metrics = update(with_head, decisions, x, config, advantages)
 	update(without, decisions, x, config, advantages)
 	plain = dict(without.named_parameters())

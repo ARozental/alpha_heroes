@@ -43,6 +43,7 @@ HO, TO, A, W, HD = c.OWN_HEROES, c.OWN_TOWNS, c.ARMY_SLOTS, c.WINDOW, c.N_HOLDER
 H, T, L, S, TG, R = c.N_HEROES, c.N_TOWNS, c.MAP_LEVELS, c.MAP_TILES, c.TRAVEL_GRID, c.N_RESOURCES
 P = c.MAX_PLAYERS  # player tokens: 0 ours, k the rival whose owner code is OWNER_SELF + k
 AREAS = L * TG * TG
+ADV_CLIP = 3.0  # the advantage head's prediction read by our own policy (stage 2a): at most this many units a term
 FORESIGHT_HIDDEN = 16
 # The foresight of an action (move, answer): a battle in its consequences (logit), its score (the battle reward's
 # formula, -1..1), and the change of each of Φ's parts until our next turn decision (symlog of thousands of gold)
@@ -566,8 +567,8 @@ class CampaignModelV2(nn.Module):
 		out = {**self.decide(state, known), **foresight["outputs"], "memory": state.memory_out, "resource_worth": known.resource_worth}
 		if self.plan_outputs:
 			out["fs_plan"] = state.plan
-		if self.adv_outputs:
-			out.update(self.advantage(state, known))
+		if self.adv_outputs:  # (decide's: the trainer's model only, never the contract's)
+			out.update(state.adv)
 		return out
 
 	def forward_steps(self, x, steps):
@@ -1141,11 +1142,21 @@ class CampaignModelV2(nn.Module):
 		# logit, so value in reach holds END back) and its best legal entry's learned part (a max: the log-mean-exp of
 		# before let a few good tiles among 300 count for nothing, and a sum let their number alone decide); END by the
 		# global token
+		# Our own policy reads the advantage head (stage 2a; config.adv_gain, model.CustomFeatures.adv_gain_weight: 0, the
+		# model as before, every term below x 0): its prediction detached, gain logits a unit (soft policy iteration's
+		# pi x exp(A / beta)). Each table: its entries' part (MOVE's and TRAVEL's entry term, + the type's named weight at
+		# Nullkiller2's own choice), clipped to +-ADV_CLIP and centered on its mean under our own table, onto the learned
+		# logits (so onto the type's score through best_legal too); each type's score: its type term, clipped. Before the
+		# follow mixture: the log-probabilities the games sample from stay exact
+		adv = state.adv = self.advantage(state, known)
+		adv_gain = self.features.adv_gain_weight()
+		adv_types = {name: adv[name].detach() for name in ("adv_type", "adv_named", "adv_move", "adv_travel")}
 		scores, legal_types = [], []
 		for action in c.ActionType:
 			named = label_weight * (label_action == int(action)).to(state.glob.dtype)  # [B]: Nullkiller2's own choice is of this type
 			if action == A_.END:
-				scores.append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named)
+				own_end = adv_types["adv_type"][:, action] + adv_types["adv_named"][:, action] * (label_action == int(action)).to(state.glob.dtype)
+				scores.append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named + adv_gain * own_end.clamp(-ADV_CLIP, ADV_CLIP))
 				legal_types.append((x["g_kind"] == c.DecisionKind.TURN) | (x["g_kind"] == c.DecisionKind.EXCHANGE))
 				continue
 			name, mask_name = HEADS[action]
@@ -1153,9 +1164,17 @@ class CampaignModelV2(nn.Module):
 			if action == A_.CAST:  # (a hero with only those left has no CAST)
 				mask = mask & self.castable
 			table = learned[action] + prior[action]
-			chosen = V.label_table(label_action, label_index, action, table[0].numel()).reshape(table.shape)  # (1 at its entry)
-			out[name] = flat_log_softmax(table + label_weight * chosen.to(table.dtype), mask)
-			scores.append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action], mask) + named)
+			chosen = V.label_table(label_action, label_index, action, table[0].numel()).reshape(table.shape).to(table.dtype)  # (1 at its entry)
+			own = table + label_weight * chosen
+			entries = adv_types["adv_named"][:, action].reshape((b,) + (1,) * (table.dim() - 1)).to(table.dtype) * chosen
+			if action == A_.MOVE or action == A_.TRAVEL:
+				entries = entries + adv_types["adv_move" if action == A_.MOVE else "adv_travel"].to(table.dtype)
+			entries = entries.clamp(-ADV_CLIP, ADV_CLIP)
+			here = flat_log_softmax(own, mask).detach()  # (our own table, for the centering)
+			mean = (torch.where(torch.isfinite(here), here.exp(), torch.zeros_like(here)) * entries).reshape(b, -1).sum(dim=1)
+			read = adv_gain * (entries - mean.reshape((b,) + (1,) * (table.dim() - 1)))
+			out[name] = flat_log_softmax(own + read, mask)
+			scores.append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action] + read, mask) + named + adv_gain * adv_types["adv_type"][:, action].clamp(-ADV_CLIP, ADV_CLIP))
 			legal_types.append(mask.reshape(b, -1).any(dim=-1))
 		out["type_logp"] = masked_log_softmax(torch.stack(scores, dim=-1), torch.stack(legal_types, dim=-1))
 		self.follow(out, label_action, label_index, torch.stack(legal_types, dim=-1))
