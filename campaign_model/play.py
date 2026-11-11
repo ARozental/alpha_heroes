@@ -39,12 +39,14 @@ class GameInfo:
 
 def nk2_settings(config, seed=None):
 	"""Schema 19's switch as a game's environment (a tuple of pairs, for play's settings): Nullkiller2's view as the
-	model's inputs (config.nk2_inputs); a training game (its seed given) goes without it at config.nk2_input_dropout,
+	model's inputs (config.nk2_inputs) with its gather advice (ALPHA_MAP_GATHER_ADVICE); a training game (its seed given) goes without it at config.nk2_input_dropout,
 	drawn from its seed (the same game the same way on every machine)."""
 	import random
 
 	on = config.nk2_inputs and (seed is None or random.Random(int(seed) * 7919 + 19).random() >= config.nk2_input_dropout)
-	return (("ALPHA_MAP_NK2_INPUTS", "1" if on else "0"),)
+	# (with its view as inputs its gather advice too, whatever nk2_gather_weight: without it its visit again of a town
+	# matches none of our entries, and its army gathering never reaches the inputs)
+	return (("ALPHA_MAP_NK2_INPUTS", "1"), ("ALPHA_MAP_GATHER_ADVICE", "1")) if on else (("ALPHA_MAP_NK2_INPUTS", "0"),)
 
 
 def window_settings(config):
