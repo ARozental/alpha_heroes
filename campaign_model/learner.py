@@ -100,6 +100,7 @@ COLUMNS = [
 	# 2026-11-10 collapse first: our armies' gold on heroes against all of it (heroes, garrisons, armies no hero leads),
 	# players out of their games, the spread of the value heads' targets
 	"gather_weight", "army_on_heroes", "eliminated", "value_target_std",
+	"night_dropped",  # (config.nk2_night_drop: the share of Nullkiller2's advised labels left out as into the night)
 ]
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
 DROP_BEYOND = 4  # updates' worth of finished games beyond which the oldest are dropped (_take)
@@ -805,6 +806,7 @@ class CampaignLearner:
 			"army_on_heroes": army_on_heroes(games, self.empire),
 			"eliminated": eliminated_share(games),
 			"value_target_std": sums.get("value_target_std", float("nan")),
+			"night_dropped": metrics.get("night_dropped", float("nan")),
 			"label_mean": sums["label_sum"] / max(n, 1),
 			"price_mean": sums["price_sum"] / max(n, 1),
 			"policy_loss": metrics.get("policy", float("nan")),

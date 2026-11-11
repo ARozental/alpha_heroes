@@ -200,3 +200,23 @@ def test_our_towns_night_pays_a_hero_to_guard_an_empty_town(model, monkeypatch):
 	inside = place([7, 10, 0], inside=True)
 	out = (R, R + 3)  # (three tiles east of the town: open ground)
 	assert float(custom_features(guarded, inside).tile_prior[0][out]) < float(custom_features(model, inside).tile_prior[0][out]) - 1.0
+
+
+def test_nullkiller2s_labels_into_the_night_are_dropped(model):
+	"""train.night_dropped (config.nk2_night_drop): a hero of ours in its sheltered town; Nullkiller2's TRAVEL label whose
+	walk stops beside the stronger enemy is priced well below staying and reads near 1 there: dropped; one that stops far
+	out of the enemy's reach, or the same label with the switch's reading above it: kept."""
+	from campaign_model.config import CampaignConfig
+	from campaign_model.records import Decision
+	from campaign_model.tests.test_model import encoded
+	from campaign_model.train import night_dropped
+
+	near, far = ([30, 10, 0], [15, 10, 0]), ([0, 34, 0], [0, 35, 0])
+	x = scene([7, 10, 0], [near, far])
+	decisions = [Decision("RED", 1, int(c.DecisionKind.TURN), 0, 1, int(c.ActionType.END), -1, -1, 0.0, (0.5,) * c.N_VALUE_OFFSETS, 0, encoded(x, 0), advice=(int(c.ActionType.TRAVEL), area(t[0]), -1)) for t in (near, far)]
+	advice = np.array([d.advice for d in decisions], dtype=np.int64)
+	inputs_of = lambda rows: decode_inputs([decisions[r] for r in rows])  # noqa: E731
+	got = night_dropped(model, decisions, advice, np.ones(2, bool), inputs_of, torch.device("cpu"), CampaignConfig(nk2_night_drop=True))
+	assert got.tolist() == [True, False]
+	strict = CampaignConfig(nk2_night_drop=True, nk2_night_drop_reading=1.01)
+	assert not night_dropped(model, decisions, advice, np.ones(2, bool), inputs_of, torch.device("cpu"), strict).any()

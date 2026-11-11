@@ -284,6 +284,17 @@ class CampaignConfig:
 	# with it (CampaignLearner.gather_weight_now: 1 / ramp of it at that one), the start kept in the checkpoint so a restart
 	# goes on; 0: at once (as before). The games ask Nullkiller2 for its GATHER advice from the first (nk2_gather_weight > 0)
 	nk2_gather_ramp: int = 0
+	# Nullkiller2's labels into the night (2026-11-11, train.night_dropped): a label is left out of the teacher's
+	# cross-entropy (weight 0) where the night terms price its entry more than nk2_night_drop_logit below staying (MOVE's
+	# tile_shift, TRAVEL's logits less its prior) and the hero's night there reads nk2_night_drop_reading or more
+	# (tile_night; at a TRAVEL's stop features.night_danger). In self-play its labels sat on such priced entries 6.7% of
+	# the time against our policy's 2.7% (expected, v3003; 4,000 advised turn decisions), and across v2839-v3003 the
+	# weights drifted toward them (P(penalized) on a fixed sample 0.07 -> 0.13, the priors' own effect unchanged); at a
+	# reading of 0.6 our heroes are lost 37% of nights, 77% at 0.9. The share of the advised labels dropped is logged
+	# (night_dropped). False: every label as before
+	nk2_night_drop: bool = False
+	nk2_night_drop_logit: float = 1.0
+	nk2_night_drop_reading: float = 0.6
 	# MULTI inside an exchange's teacher span (train.TEACHER_SPAN_MULTI; the 2026-11-09 audit's M3): every exchange label
 	# pushes down the multi-actions it does not accept (TAKE_BEST into the hero that keeps nothing, TAKE_BEST_FAST, ...).
 	# Outside it (False) none is ever pushed: after a meeting Nullkiller2 advised, our first exchange choice was its

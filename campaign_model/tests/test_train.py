@@ -331,6 +331,10 @@ def test_an_update_with_nk2s_advice_moves_toward_its_choices():
 	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-3), decisions, np.full((16, c.N_VALUE_OFFSETS), 0.5, dtype=np.float32), np.full(16, 0.5, dtype=np.float32), config, decode=decode)
 	assert metrics["teacher_ce"] > 0
 	assert measure() > before
+	assert np.isnan(metrics["night_dropped"])  # (config.nk2_night_drop off: nothing measured)
+	dropping = CampaignConfig(batch_size=8, passes=1, teacher_kl=5.0, target_kl=0.0, nk2_night_drop=True)
+	metrics, _ = ppo_update(model, torch.optim.Adam(model.parameters(), lr=1e-3), decisions, np.full((16, c.N_VALUE_OFFSETS), 0.5, dtype=np.float32), np.full(16, 0.5, dtype=np.float32), dropping, decode=decode)
+	assert 0.0 <= metrics["night_dropped"] <= 1.0  # (random states: a share, its labels read through the same decode)
 
 
 def test_a_step_graph_whose_check_finds_no_memory_is_dropped_and_the_step_goes_eager():
