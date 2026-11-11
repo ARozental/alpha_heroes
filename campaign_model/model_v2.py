@@ -49,6 +49,8 @@ FORESIGHT_HIDDEN = 16
 # formula, -1..1), and the change of each of Φ's parts until our next turn decision (symlog of thousands of gold)
 ACTION_TARGETS = 2 + len(ft.PHI_PARTS)
 HERO_TARGETS = 2  # alive and ours tomorrow (logit), its army's log ratio tomorrow
+FORE_FIGHT = 4  # forecast-out A (bundle 60): a MOVE tile's fight value, P(a fight starts), P(win), the stake lost
+FORE_MOVE = 3 + len(ft.PHI_PARTS)  # forecast-out B / C: P(battle), P(battle) x its score, Φ's total change, each part's
 ARMY_SLOT_KEYS = 32  # (schema 16) ARMY's target slot: the stack's query and each slot's key
 TURN_TARGETS = 1 + R  # Φ's log ratio at the end of our turn, each resource's log ratio tomorrow
 COSINE_BOUND = 0.995  # a choice's cosine scaled by it under the atanh (cosine_logit): each logit within ±3.0
@@ -271,6 +273,7 @@ class AdvantageHead(nn.Module):
 		self.types, self.move, self.travel = zero_weight(dim, len(c.ActionType)), zero_weight(pair_dim, 1), zero_weight(pair_dim, 1)
 		self.named = nn.Parameter(torch.zeros(len(c.ActionType)))
 		self.unnamed = nn.Parameter(torch.zeros(len(c.ActionType)))  # (own games, 2026-11-11: 0 to start)
+		self.fore = FastLinear(FORE_FIGHT + FORE_MOVE)  # (bundle 60: a MOVE tile's forecasts, forecast-out A and B's numbers, onto its entry term)
 
 	def forward(self, state, known):
 		"""{adv_type [B, types], adv_move [B, HO, W, W], adv_travel [B, HO, L, TG, TG], adv_named [B, types], adv_label
@@ -279,7 +282,8 @@ class AdvantageHead(nn.Module):
 		b = glob.shape[0]
 		move = glob.new_zeros(b, HO, W, W)
 		if known.n > 0:
-			move = dense(real_only(self.move(state.move_pairs.detach()).squeeze(-1), known), known.windows, known.n, b)
+			fore = self.fore(state.fore_move) if hasattr(state, "fore_move") else 0.0
+			move = dense(real_only(self.move(state.move_pairs.detach()).squeeze(-1) + fore, known), known.windows, known.n, b)
 		action, index, _ = known.advice.label
 		return {
 			"adv_type": self.types(glob) + self.unnamed.to(glob.dtype).unsqueeze(0) * (action < 0).to(glob.dtype).unsqueeze(1), "adv_move": move, "adv_travel": self.travel(state.travel_pairs.detach()).squeeze(-1).reshape(b, HO, L, TG, TG),
@@ -550,6 +554,14 @@ class CampaignModelV2(nn.Module):
 		# The advantage head (2026-11-11, stage 1: it only learns; config.adv_weight), made last: the other parameters'
 		# initialisation as before
 		self.advantage = AdvantageHead(d, dp)
+		# Forecast-out (bundle 60; the user, 2026-11-11: "do these changes as well ... initializing the weights going out of
+		# the new units at 0"): each forecast about one option fed straight to that option's logit, detached, in the form
+		# the decision uses, 0 where it does not apply; every layer out of them 0 to start (the model as before, bit for
+		# bit), the logits' FastLinear (VIEW_STEP x a plain weight's step). A: a MOVE tile's fight (fore_fight); B: a MOVE
+		# tile's consequences (fore_move); C: a question option's (fore_answer); D: a hero's risk of loss by tomorrow and its
+		# army's log ratio onto its token (fore_hero, as plan_in feeds the plan's); the turn's forecast not read
+		self.fore_fight, self.fore_move, self.fore_answer = FastLinear(FORE_FIGHT), FastLinear(FORE_MOVE), FastLinear(FORE_MOVE)
+		self.fore_hero = zero_weight(HERO_TARGETS, d)
 
 	def prior_corrections(self):
 		"""The parameters that correct a fixed prior (model.CustomFeatures): weight decay pulls them back to it."""
@@ -949,6 +961,7 @@ class CampaignModelV2(nn.Module):
 			# What MOVE reads of them (MOVE_FORESEEN: P(a monster here attacks), P(win), the stake lost), detached: its loss shapes
 			# the predictions, never the policy's
 			foreseen = torch.stack([tiles.softmax(dim=-1)[..., 1], torch.sigmoid(outcome[..., 0]), torch.sigmoid(outcome[..., 1])], dim=-1).detach()
+		state.fs_answer = outputs["fs_answer"]  # (forecast-out C reads it in decide)
 		return {"hidden": hidden, "outputs": outputs, "foreseen": foreseen}
 
 	# ---- think_again ----
@@ -958,6 +971,9 @@ class CampaignModelV2(nn.Module):
 		hidden = foresight["hidden"]
 		state.glob = state.glob + self.again_global(None, torch.cat([state.glob, hidden["turn"], global_known(known)], dim=-1))
 		state.heroes = state.heroes + self.again_hero(None, torch.cat([state.heroes, hidden["hero"], hero_known(x, known)], dim=-1)) * x["h_present"].unsqueeze(-1)
+		# (forecast-out D: each hero's own forecast, detached: its risk of loss by tomorrow, its army's log ratio then)
+		hero_fore = foresight["outputs"]["fs_hero"].detach().float()
+		state.heroes = state.heroes + self.fore_hero(torch.stack([1.0 - torch.sigmoid(hero_fore[..., 0]), hero_fore[..., 1].clamp(-3.0, 1.0)], dim=-1).to(state.heroes.dtype)) * x["h_present"].unsqueeze(-1)
 		state.options = state.options + self.again_option(None, torch.cat([state.options, hidden["answer"]], dim=-1)) * x["option_mask"].unsqueeze(-1)
 		tokens, valid, *_ = self.tokens(state)
 		tokens = self.again_norm(self.again_block(tokens, valid, state.bias))
@@ -996,6 +1012,10 @@ class CampaignModelV2(nn.Module):
 			there = forecast.reshape(b * HO, AREAS, PLAN_VIEWS).index_select(0, known.heroes).gather(1, area.reshape(k, W * W, 1).expand(k, W * W, PLAN_VIEWS)).reshape(k, W, W, PLAN_VIEWS)
 			there = there * (known.window_tiles >= 0).unsqueeze(-1)
 			seen = self.view_mix_out(F.silu(self.view_mix(a.move.to(mixed.dtype)))) + self.view_move(torch.cat([a.move, there], dim=-1)).unsqueeze(-1).to(mixed.dtype)
+			# (forecast-out A and B: each tile's own forecasts, detached, onto its MOVE logit; the advantage head's entry term
+			# reads them too)
+			state.fore_move = torch.cat([fight_forecast(x, known, foresight["foreseen"]), consequence_channels(self.foresight.move_out(foresight["hidden"]["move"]).detach().float())], dim=-1)
+			seen = seen + (self.fore_fight(state.fore_move[..., :FORE_FIGHT]) + self.fore_move(state.fore_move[..., FORE_FIGHT:])).unsqueeze(-1).to(mixed.dtype)
 			state.move_mix = self.move_mix_out(mixed) + self.move_mix_direct(move_known) + seen
 			state.move_pairs = self.move_pair(torch.cat([pairs + self.move_toward(toward(*a.move_dest)), hidden["move"], move_known, mixed], dim=-1))
 		return state
@@ -1143,6 +1163,7 @@ class CampaignModelV2(nn.Module):
 		decision = self.decision(torch.cat([state.glob, about], dim=-1))
 		keys = state.option_keys + self.option_context(state.options)
 		chosen = cosine_logit(decision, keys) + known.option_prior + self.option_weights(known.option_features).squeeze(-1)
+		chosen = chosen + self.fore_answer(consequence_channels(state.fs_answer.detach().float())).to(chosen.dtype)  # (forecast-out C: each option's own forecast)
 		out["option_logp"] = masked_log_softmax(chosen, x["option_mask"])
 		# The action type: each table normalised within itself (the contract's: the AI samples a type, then an entry).
 		# A type is as good as its best option: its score is its bias (priors/action_types.csv), what its domain prior
@@ -1462,6 +1483,39 @@ def migrate_move_inputs(state_dict):
 	if old is None or old.shape[1] != old.shape[0] // 2 + FORESIGHT_HIDDEN + OLD_MOVE_KNOWN:
 		return state_dict
 	return {**state_dict, key: move_pair_columns(old)}
+
+
+def consequence_channels(forecast):
+	"""Forecast-out B / C (bundle 60): an option's consequence forecast [.., ACTION_TARGETS] (the foresight's move or answer
+	head: a battle's logit, its score -1..1, each Φ part's change in symlog thousands), detached by the caller, as
+	[.., FORE_MOVE] with 0 for nothing happening: P(battle), P(battle) x its score, Φ's total change (symlog of the parts'
+	thousands summed), each part's change."""
+	battle = torch.sigmoid(forecast[..., 0])
+	parts = forecast[..., 2:]
+	total = (torch.sign(parts) * (torch.exp(parts.abs()) - 1.0)).sum(dim=-1)
+	return torch.cat([torch.stack([battle, battle * forecast[..., 1], torch.sign(total) * torch.log1p(total.abs())], dim=-1), parts], dim=-1)
+
+
+def fight_forecast(x, known, foreseen):
+	"""Forecast-out A (bundle 60): [K, W, W, FORE_FIGHT] the fight stepping on each window tile starts, 0 where none does
+	(known.tile_fights, the engine's): its value as a squashed share of our Φ, P(win) x what winning takes - the stake
+	lost x what losing takes (model.tile_features' MOVE_RELATIVE shares, log1p(100 x share) / 3 inverted) x P(it starts);
+	P(it starts); P(win); the stake lost. The battle heads (MOVE_FORESEEN, detached) cover the wandering monsters only:
+	elsewhere (a hero, a town, a garrison) P(it starts) is 1 and P(win) the strength ratio's (sigmoid(2 x ours over theirs,
+	log)), the stake lost 1 - P(win)."""
+	gate = known.tile_fights.float()
+	pick = lambda name: x[name].reshape((-1, W, W)).index_select(0, known.windows)  # noqa: E731
+	monster = ((pick("w_creature") >= 0) | ft.bit(pick("w_flags"), c.TILE_GUARDED)).float()
+	rule = torch.sigmoid(2.0 * known.tile_fight_ratio.float())
+	if foreseen is None:
+		foreseen = torch.zeros(gate.shape + (3,), device=gate.device)
+	starts = torch.where(monster > 0, foreseen[..., 0].float(), torch.ones_like(gate)) * gate
+	win = torch.where(monster > 0, foreseen[..., 1].float(), rule) * gate
+	lost = torch.where(monster > 0, foreseen[..., 2].float(), 1.0 - rule) * gate
+	share = lambda squashed: (torch.exp(3.0 * squashed.float().clamp(min=0)) - 1.0) / 100.0  # noqa: E731 (MOVE_RELATIVE's share inverted; exp - 1: ONNX opset 17 has no expm1)
+	stake, taken = share(known.move_relative[..., 2]), share(known.move_relative[..., 3])
+	value = starts * (win * taken - lost * stake)
+	return torch.stack([torch.sign(value) * torch.log1p(100.0 * value.abs()) / 3, starts, win, lost], dim=-1).detach()
 
 
 def fight_features(known):

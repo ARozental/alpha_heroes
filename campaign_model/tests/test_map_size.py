@@ -25,7 +25,7 @@ def golden_model():
 	model = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
 	with torch.no_grad():
 		for name, p in sorted(model.named_parameters()):
-			if name.startswith(("side_tile", "side_global", "time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global")):
+			if name.startswith(("side_tile", "side_global", "time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global", "fore_fight", "fore_move", "fore_answer", "fore_hero")):
 				continue
 			g = torch.Generator().manual_seed(sum(ord(ch) * (i + 1) for i, ch in enumerate(name)) % (2**31))
 			p.copy_(0.05 * torch.randn(p.shape, generator=g))
