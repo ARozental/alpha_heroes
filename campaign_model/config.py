@@ -365,6 +365,12 @@ class CampaignConfig:
 	# stops at once): the updates are held once the fresh value loss's median over the last 7 updates stands this many
 	# times above its calm level (0: off). A restart lifts the hold
 	value_jump_stop: float = 3.0
+	# The guard's memory starts at this version (0: all of progress.csv's). A hold says "stop and look", not that the
+	# change is bad (the user): when the look finds the games sound and the loss's new level theirs (armies on heroes
+	# decide more in a battle: the shares move further in a day, the same critic's loss with them), the restart names
+	# the version it goes on from, and the guard judges again once it has 57 readings from there. Never set at a
+	# deploy to keep the guard quiet through it: only after a hold was looked into
+	value_jump_from: int = 0
 	label_weights: tuple = (1 / 3, 1 / 3, 1 / 3)  # of the shares at VALUE_OFFSETS (labels.py)
 	decision_price: float = 1e-4  # share points per turn decision
 	# Evaluation against Nullkiller2 (evaluate.py): our models in one seat, Nullkiller2 in the others
