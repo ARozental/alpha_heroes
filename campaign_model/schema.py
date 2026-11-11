@@ -213,6 +213,31 @@ INPUTS = (
 	_i("w_extra", (HO,), "0: this slot's window is its own hero's, around it (hero token = the slot); h + 1: one more window of our hero token h, around w_extra_pos"),
 	_i("w_extra_pos", (HO, 3), "x, y, level of the middle tile of a further window (w_extra > 0)"),
 	_i("travel_stop", (HO, L, TG, TG), "where today's walk toward each TRAVEL area's tile stops (VCMI's path there: its last tile reached today): (level x 256 + y) x 256 + x + 1; 0 where TRAVEL is not legal, and in a record from before schema 18"),
+	# Schema 19 (at the end, 0 as none throughout: older records read as none). Nullkiller2's view of the decision, from
+	# the advisor AlphaMapAI asks before the forward (the game's ALPHA_MAP_NK2_INPUTS; none where it did not run): its
+	# candidate tasks as Nullkiller::planPass scored them, each mapped onto our entries; raw values, fixed point where
+	# Nullkiller2's are fractions (the inputs are int32 on the wire)
+	_i("w_arrive_left", (HO, W, W), "movement points left on arriving at the tile on the day it is reached (any day) + 1; 0 where w_turns < 0"),
+	_i("g_phi_past", (), "our empire's value in gold as the model put it out (phi) at the player's first turn decision g_phi_past_days ago; 0 none"),
+	_i("g_phi_past_days", (), "7, or the oldest day there is (1..6); 0 none"),
+	_m("g_nk_present", (), "Nullkiller2's advisor ran at this decision (else every k_* row empty, the threats 0)"),
+	_i("g_nk_tier", (), "the priority tier its plan was made at (PriorityTier: 1 INSTAKILL .. 6 DEFEND); 0 none"),
+	_i("g_nk_count", (), "its candidate tasks with a priority above 0 at that tier"),
+	_i("k_hero", (c.NK,), "the candidate's hero slot of ours + 1; 0 an empty row. A hero's rows together, its best first (the plan tier's priority, then the gather tier's)"),
+	_i("k_dest", (c.NK, 3), "the destination's x, y, level (the chain's node of this hero's that ends its part, as the plan labels take it)"),
+	_i("k_dest_cell", (c.NK,), "window slot x W x W + cell of the destination in a window of this hero + 1; 0 in none"),
+	_i("k_dest_area", (c.NK,), "hero slot x AREAS + the destination's TRAVEL area + 1; 0 off the levels"),
+	_i("k_move", (c.NK,), "the first step today as a MOVE entry (window slot x W x W + cell) + 1: the destination's own entry when legal, else the path's stop today when legal, never another tile of the path; 0 none"),
+	_i("k_travel", (c.NK,), "the TRAVEL entry toward it (hero slot x AREAS + area) + 1: the destination's area when legal, else that of the path's farthest node a day or more away that is legal; 0 none"),
+	_i("k_score", (c.NK, 2), "its priority x 100 at the plan's tier and at EXPLORE_AND_GATHER (rounded, at most 2^31 - 1); 0 not scored"),
+	_i("k_days", (c.NK,), "Nullkiller2's movement cost to it in days x 1000 (EvaluationContext.movementCost)"),
+	_i("k_loss", (c.NK,), "the army it expects to lose, armyLossRatio x 10000"),
+	_i("k_danger", (c.NK,), "enemyHeroDangerRatio x 1000 (an enemy hero's danger there over our strength; at most 10^6)"),
+	_i("k_kind", (c.NK,), "0 visit or capture, 1 attack an enemy hero, 2 attack a town, 3 defend our town, 4 meet our hero, 5 explore, 6 other"),
+	_i("k_settled", (c.NK,), "how many decisions in a row this (hero, destination) has been among the hero's top 3, 0 new"),
+	_i("k_flags", (c.NK,), "1 the destination is the first step (arrives today), 2 our pathfinder does not reach the destination, 4 its path takes a teleporter, 8 a chain of heroes or a composition"),
+	_i("t_nk_threat", (TO, 3), "Nullkiller2's threat to each town of ours (DangerHitMapAnalyzer): has one (0/1), the fastest's turns, the greatest danger over the town's defence x 1000"),
+	_i("h_nk_threat", (HO, 3), "its threat at each hero of ours' tile: has one, the fastest's turns, the greatest danger over the hero's strength x 1000"),
 )
 
 
@@ -240,6 +265,7 @@ OUTPUTS = (
 	_o("resource_worth", (R,), "what one unit of each resource is worth to us (gold): a purchase short of resources trades away what loses the least of it"),
 	_o("artifact_logp", (HO, c.N_ARTIFACT_POSITIONS, c.N_ARTIFACT_TARGETS), "log p(hero, position, target | ARTIFACT)"),
 	_o("multi_logp", (TO, c.N_MULTI), "log p(town or receiving hero, kind | MULTI)"),
+	_o("phi", (), "our empire's value in gold by the model's features (features.empire_value): AlphaMapAI keeps a day's for g_phi_past"),
 	_o("army_slot_logp", (HD, A, HD, c.ARMY_SLOT_CHOICES), "log p(target slot | ARMY's from holder, slot, to holder): the slot the amount goes to, then (ONE alone) the slot all but one go to; normalized over all, renormalized over the amount's (a whole stack's army_slot_mask, a part's empty slots and its own creature's)"),
 )
 
@@ -291,6 +317,7 @@ def empty_inputs(batch=1):
 def random_inputs(batch=1, seed=0):
 	"""Random but consistent inputs for tests: a few heroes and towns, some legal moves and builds, or a question."""
 	rng = np.random.default_rng(seed)
+	extra = np.random.default_rng(seed + 1_000_019)  # (schema 19's own draws: _random_schema_19)
 	x = empty_inputs(batch)
 	for b in range(batch):
 		kind = int(rng.choice([c.DecisionKind.TURN, c.DecisionKind.TURN, c.DecisionKind.EXCHANGE, c.DecisionKind.YES_NO, c.DecisionKind.SELECT]))
@@ -382,4 +409,48 @@ def random_inputs(batch=1, seed=0):
 			if kind == c.DecisionKind.TURN:  # areas a day or more away
 				x["travel_mask"][b, h] = rng.random((c.MAP_LEVELS, c.TRAVEL_GRID, c.TRAVEL_GRID)) < 0.3
 				x["travel_days"][b, h] = np.where(x["travel_mask"][b, h], rng.integers(100, 600, (c.MAP_LEVELS, c.TRAVEL_GRID, c.TRAVEL_GRID)), -1)
+		_random_schema_19(x, b, kind, heroes, extra)
 	return x
+
+
+def _random_schema_19(x, b, kind, heroes, rng):
+	"""Schema 19's inputs for random_inputs' decision b (their own generator: the older inputs' draws stay as they were):
+	the arrival's movement left; at a turn decision Nullkiller2's candidates in each hero's block of rows (first steps on
+	legal entries, the destination in the hero's window or not), its tier, a few threats; our Φ of some days ago."""
+	x["w_arrive_left"][b] = np.where(x["w_turns"][b] >= 0, rng.integers(0, 1600, x["w_turns"][b].shape) + 1, 0)
+	days = int(rng.integers(0, 8))
+	x["g_phi_past_days"][b], x["g_phi_past"][b] = days, rng.integers(20000, 90000) if days else 0
+	if kind != c.DecisionKind.TURN:
+		return
+	x["g_nk_present"][b] = True
+	x["g_nk_tier"][b] = rng.choice([4, 4, 4, 2, 3, 6])
+	areas = c.MAP_LEVELS * c.TRAVEL_GRID * c.TRAVEL_GRID
+	count = 0
+	for h in range(heroes):
+		moves = np.flatnonzero(x["move_mask"][b, h].reshape(-1))
+		travels = np.flatnonzero(x["travel_mask"][b, h].reshape(-1))
+		rows = int(rng.integers(1, c.NK_PER_HERO + 1))
+		scores = np.sort(rng.exponential(2000, rows))[::-1]
+		for r in range(rows):
+			at = h * c.NK_PER_HERO + r
+			cell = int(rng.integers(0, W * W))
+			x["k_hero"][b, at] = h + 1
+			x["k_dest"][b, at] = [rng.integers(0, 36), rng.integers(0, 36), rng.integers(0, 2)]
+			x["k_dest_cell"][b, at] = h * W * W + cell + 1 if rng.random() < 0.8 else 0
+			x["k_dest_area"][b, at] = h * areas + int(rng.integers(0, areas)) + 1
+			x["k_move"][b, at] = h * W * W + int(rng.choice(moves)) + 1 if len(moves) and rng.random() < 0.6 else 0
+			x["k_travel"][b, at] = h * areas + int(rng.choice(travels)) + 1 if len(travels) and rng.random() < 0.5 else 0
+			scored = rng.random() < 0.8
+			x["k_score"][b, at] = [round(scores[r] * 100) if scored else 0, round(scores[r] * rng.uniform(0.5, 1.5) * 100)]
+			count += int(scored)
+			x["k_days"][b, at] = rng.integers(0, 4000)
+			x["k_loss"][b, at] = rng.integers(0, 10001) if rng.random() < 0.4 else 0
+			x["k_danger"][b, at] = rng.integers(0, 3000) if rng.random() < 0.3 else 0
+			x["k_kind"][b, at] = rng.choice([0, 0, 0, 0, 1, 2, 3, 4, 5, 6])
+			x["k_settled"][b, at] = rng.integers(0, 6) if r < 3 else 0
+			x["k_flags"][b, at] = int(rng.integers(0, 16))
+		if rng.random() < 0.2:
+			x["h_nk_threat"][b, h] = [1, rng.integers(0, 4), rng.integers(100, 3000)]
+	x["g_nk_count"][b] = count
+	if rng.random() < 0.2:
+		x["t_nk_threat"][b, 0] = [1, rng.integers(0, 4), rng.integers(100, 3000)]

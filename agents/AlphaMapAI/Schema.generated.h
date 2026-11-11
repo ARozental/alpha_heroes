@@ -7,12 +7,14 @@
 
 namespace MapSchema
 {
-constexpr int SCHEMA_VERSION = 18;
-constexpr const char * CONTRACT_HASH = "646ef7403f93374b";
+constexpr int SCHEMA_VERSION = 19;
+constexpr const char * CONTRACT_HASH = "0d271727879e8b3c";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;
 constexpr int OWN_HEROES = 8;
+constexpr int NK_PER_HERO = 16;
+constexpr int NK = 128;
 constexpr int OTHER_HEROES = 8;
 constexpr int N_HEROES = 16;
 constexpr int OWN_TOWNS = 8;
@@ -330,6 +332,27 @@ enum class In : int
 	w_extra,
 	w_extra_pos,
 	travel_stop,
+	w_arrive_left,
+	g_phi_past,
+	g_phi_past_days,
+	g_nk_present,
+	g_nk_tier,
+	g_nk_count,
+	k_hero,
+	k_dest,
+	k_dest_cell,
+	k_dest_area,
+	k_move,
+	k_travel,
+	k_score,
+	k_days,
+	k_loss,
+	k_danger,
+	k_kind,
+	k_settled,
+	k_flags,
+	t_nk_threat,
+	h_nk_threat,
 	COUNT
 };
 
@@ -482,6 +505,27 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"w_extra", DType::INT64, 1, {8, 1, 1, 1}, 0},
 	TensorSpec{"w_extra_pos", DType::INT64, 2, {8, 3, 1, 1}, 0},
 	TensorSpec{"travel_stop", DType::INT64, 4, {8, 2, 18, 18}, 0},
+	TensorSpec{"w_arrive_left", DType::INT64, 3, {8, 33, 33, 1}, 0},
+	TensorSpec{"g_phi_past", DType::INT64, 0, {1, 1, 1, 1}, 0},
+	TensorSpec{"g_phi_past_days", DType::INT64, 0, {1, 1, 1, 1}, 0},
+	TensorSpec{"g_nk_present", DType::BOOL, 0, {1, 1, 1, 1}, 0},
+	TensorSpec{"g_nk_tier", DType::INT64, 0, {1, 1, 1, 1}, 0},
+	TensorSpec{"g_nk_count", DType::INT64, 0, {1, 1, 1, 1}, 0},
+	TensorSpec{"k_hero", DType::INT64, 1, {128, 1, 1, 1}, 0},
+	TensorSpec{"k_dest", DType::INT64, 2, {128, 3, 1, 1}, 0},
+	TensorSpec{"k_dest_cell", DType::INT64, 1, {128, 1, 1, 1}, 0},
+	TensorSpec{"k_dest_area", DType::INT64, 1, {128, 1, 1, 1}, 0},
+	TensorSpec{"k_move", DType::INT64, 1, {128, 1, 1, 1}, 0},
+	TensorSpec{"k_travel", DType::INT64, 1, {128, 1, 1, 1}, 0},
+	TensorSpec{"k_score", DType::INT64, 2, {128, 2, 1, 1}, 0},
+	TensorSpec{"k_days", DType::INT64, 1, {128, 1, 1, 1}, 0},
+	TensorSpec{"k_loss", DType::INT64, 1, {128, 1, 1, 1}, 0},
+	TensorSpec{"k_danger", DType::INT64, 1, {128, 1, 1, 1}, 0},
+	TensorSpec{"k_kind", DType::INT64, 1, {128, 1, 1, 1}, 0},
+	TensorSpec{"k_settled", DType::INT64, 1, {128, 1, 1, 1}, 0},
+	TensorSpec{"k_flags", DType::INT64, 1, {128, 1, 1, 1}, 0},
+	TensorSpec{"t_nk_threat", DType::INT64, 2, {8, 3, 1, 1}, 0},
+	TensorSpec{"h_nk_threat", DType::INT64, 2, {8, 3, 1, 1}, 0},
 }};
 
 enum class Out : int
@@ -505,6 +549,7 @@ enum class Out : int
 	resource_worth,
 	artifact_logp,
 	multi_logp,
+	phi,
 	army_slot_logp,
 	COUNT
 };
@@ -529,6 +574,7 @@ constexpr std::array<TensorSpec, static_cast<int>(Out::COUNT)> OUTPUTS = {{
 	TensorSpec{"resource_worth", DType::FLOAT32, 1, {7, 1, 1, 1}, 0},
 	TensorSpec{"artifact_logp", DType::FLOAT32, 3, {8, 27, 3, 1}, 0},
 	TensorSpec{"multi_logp", DType::FLOAT32, 2, {8, 11, 1, 1}, 0},
+	TensorSpec{"phi", DType::FLOAT32, 0, {1, 1, 1, 1}, 0},
 	TensorSpec{"army_slot_logp", DType::FLOAT32, 4, {17, 7, 17, 14}, 0},
 }};
 
