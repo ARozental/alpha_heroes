@@ -193,3 +193,20 @@ def test_the_logit_priors_in_shares_of_our_empire(model, monkeypatch):
 	assert not torch.equal(f.travel_logits, gold.travel_logits) or float(gold.travel_logits.abs().max()) == 0
 	monkeypatch.setenv("ALPHA_PRIOR_SHARES", "1")
 	assert CampaignModel(dim=32, cell_dim=16, layers=1).features.prior_shares
+
+
+def test_the_night_calibrated_to_the_heroes_lost(model, monkeypatch):
+	"""night_power (ALPHA_NIGHT_POWER, 1 by default: the reading as it is): P(lost tonight) = reading ** power. At the
+	measured 3.18 a TRAVEL whose walk stops by the enemy from a sheltered town still costs about what a lost battle
+	takes (the reading near 1 stays near 1), and leaving at a middling reading costs far less than the reading says."""
+	monkeypatch.setenv("ALPHA_NIGHT_POWER", "3.18")
+	fitted = CampaignModel(dim=32, cell_dim=16, layers=1).eval()
+	fitted.load_state_dict(model.state_dict())
+	assert model.features.night_power == 1.0 and fitted.features.night_power == 3.18
+	p = torch.tensor([0.0, 0.5, 0.9, 1.0])
+	assert torch.equal(model.features.night_calibrated(p), p)
+	assert torch.allclose(fitted.features.night_calibrated(p), p ** 3.18)
+	near = scene([7, 10, 0], [([30, 10, 0], [15, 10, 0])])  # (the stop beside the enemy: reading ~1)
+	far = scene([7, 10, 0], [([30, 10, 0], [1, 20, 0])])  # (the stop at the edge of its reach: a middling reading)
+	assert night(custom_features(fitted, near), [30, 10, 0]) < -2.0
+	assert night(custom_features(fitted, far), [30, 10, 0]) > night(custom_features(model, far), [30, 10, 0]) + 0.5

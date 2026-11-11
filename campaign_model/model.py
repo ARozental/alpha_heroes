@@ -276,6 +276,7 @@ class CustomFeatures(nn.Module):
 			subtype_score[obj, subtype] = value
 		self.register_buffer("object_score", scores)  # persistent: a checkpoint keeps the priors it was trained from
 		self.prior_shares = os.environ.get("ALPHA_PRIOR_SHARES", "0") == "1"  # (in_shares: a test, off by default)
+		self.night_power = float(os.environ.get("ALPHA_NIGHT_POWER", "1"))  # (night_calibrated: a test, 1 the reading as it is)
 		self.register_buffer("subtype_score", subtype_score)
 		self.register_buffer("class_value", priors.class_values())
 		guards = torch.zeros(c.OBJECT_VOCAB + 1, PRIOR_SUBTYPES + 1, 2)  # a creature bank's guards: strength, hit points
@@ -351,6 +352,14 @@ class CustomFeatures(nn.Module):
 		if not self.prior_shares:
 			return gold
 		return gold * (PRIOR_SHARE_REF / phi.clamp(min=1000.0))
+
+	def night_calibrated(self, p):
+		"""P(lost tonight) from the night's reading p (MOVE's danger, a town's with the hero in it): p ** night_power, the
+		reading's shape against the heroes actually lost (2026-11-10, 3,753 hero-ENDs of 72 Mac games, 363 lost: the
+		reading 0.29 lost 6%, 0.50 10%, 0.70 37%, 0.90 77%; floor + (1 - floor) x p ** 3.18 fits them, log-likelihood
+		-0.213 against the reading's -0.401, 3.12-3.26 on halves; the floor, 0.04, cancels in the night term's
+		difference). 1 (ALPHA_NIGHT_POWER unset): the reading as it is."""
+		return p if self.night_power == 1.0 else p.clamp(min=0.0) ** self.night_power
 
 	def night_weight(self):
 		"""How far P(lost tonight) x what a lost battle takes counts in MOVE's and TRAVEL's logit priors: the expected loss
@@ -1004,8 +1013,8 @@ class CustomFeatures(nn.Module):
 			return ft.value_logit(gain) + rest, ft.value_logit(self.in_shares(gain, phi)) + rest
 		stops, known = ft.travel_stops(x)
 		manned = self.town_strength(x, f.town_power, manned=True)
-		here = ft.night_danger(x, f.hero_strength, manned, x["h_pos"][:, :HO].unsqueeze(2))  # [B, HO, 1]
-		tonight = ft.night_danger(x, f.hero_strength, manned, stops)
+		here = self.night_calibrated(ft.night_danger(x, f.hero_strength, manned, x["h_pos"][:, :HO].unsqueeze(2)))  # [B, HO, 1]
+		tonight = self.night_calibrated(ft.night_danger(x, f.hero_strength, manned, stops))
 		at_stake = f.hero_gold[:, :HO] + f.hero_worth[:, :HO] + (HERO_HIRE_COST - self.hero_base) * self.gain(self.hero_value)
 		night = (here - tonight) * known * (at_stake * self.night_weight()).unsqueeze(-1)
 		return ft.value_logit(gain) + rest, ft.value_logit(self.in_shares(gain + night, phi)) + rest
@@ -1292,6 +1301,7 @@ class CustomFeatures(nn.Module):
 		night = torch.where(in_town.any(dim=-1), (in_town.float() * sheltered[:, None, None, :]).amax(dim=-1), danger)
 		stands_in = ((x["t_pos"][:, :TO].index_select(0, decision) == stand[:, None, :, 0, 0]).all(dim=-1) & own_towns.index_select(0, decision) & open_).float()  # [K, TO]
 		night_here = torch.where(stands_in.amax(dim=-1) > 0, (stands_in * sheltered).amax(dim=-1), here)
+		night, night_here = self.night_calibrated(night), self.night_calibrated(night_here)
 		night_value = (night_here[:, None, None] - night) * ((ours(f.hero_gold) + hero) * self.night_weight())[:, None, None]
 		defend = (on_tile(x["t_pos"][:, :TO], own_towns).float() * f.town_danger.index_select(0, decision)[:, None, None, :]).amax(dim=-1)
 		move_left = pick("w_move_left")
