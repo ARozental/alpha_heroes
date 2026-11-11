@@ -601,6 +601,20 @@ def travel_stops(x):
 	return torch.stack([code % STOP_RADIX, torch.div(code, STOP_RADIX, rounding_mode="floor") % STOP_RADIX, torch.div(code, STOP_RADIX * STOP_RADIX, rounding_mode="floor")], dim=-1), known
 
 
+def left_danger(x, hero_strength, town_strength):
+	"""Our towns' danger once their visiting hero has left [B, OWN_TOWNS] (bundle 60's town guard): town_danger's with the
+	town's own strength and a garrison hero of ours alone defending it."""
+	def defender(index):
+		found = torch.gather(hero_strength, 1, index.clamp(min=0))
+		return torch.where(index >= 0, found, torch.full_like(found, -30.0))
+
+	to = c.OWN_TOWNS
+	defence = log_add(town_strength[:, :to], defender(x["t_garrison_hero"][:, :to]))
+	pos = x["t_pos"][:, :to]
+	near, theirs = reach(enemies(x, hero_strength), pos[..., 0], pos[..., 1], pos[..., 2])  # [B, TO, E]
+	return (near * torch.sigmoid(2 * (theirs - defence.unsqueeze(-1)))).amax(dim=-1) * (x["t_present"][:, :to] & (x["t_owner"][:, :to] == c.OWNER_SELF))
+
+
 def emptied_danger(x, hero_strength):
 	"""Our towns' danger once their upper army has gone into the visitor (MULTI's GATHER) and the visitor with it
 	[B, OWN_TOWNS]: an empty town's (town_danger's with no defence: an empty town's fort does not fight, town_strength).

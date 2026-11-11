@@ -151,6 +151,8 @@ def set_advice_prior(model, config):
 		features.nk_follow.fill_(float(getattr(config, "nk2_follow", 0.0)))
 		if hasattr(features, "adv_gain"):  # (the advantage head read by our own policy: config.adv_gain)
 			features.adv_gain.fill_(float(getattr(config, "adv_gain", 0.0)))
+		if hasattr(features, "town_guard"):  # (bundle 60's town guard: config.town_guard)
+			features.town_guard.fill_(float(getattr(config, "town_guard", 0.0)))
 
 
 def campaign_model_kwargs(config, out, resume=False):

@@ -1022,6 +1022,11 @@ class CampaignModelV2(nn.Module):
 		best, fallback, survival, risk = self.features.nk_prior_weights()
 		advised = lambda name: best * tables[f"prior_{name}"] + fallback * tables[f"prior_{name}_fallback"] + survival * tables[name][..., LOG_SURVIVAL] - risk * tables[name][..., RISK]  # noqa: E731
 		move_prior = move_prior + advised("move").reshape(b, HO, W, W)
+		# The town guard (bundle 60; config.town_guard, 0: off, every term x 0): a hero leaving a threatened town of ours
+		# with too little in it pays what its leaving adds to the town's expected loss, on each of its MOVE and TRAVEL
+		# entries (ours only: the follow mixture's part is Nullkiller2's choice as it is)
+		guard = self.features.town_guard_cost(x, known)  # [B, HO]
+		move_prior = move_prior - guard.gather(1, ft.slot_heroes(x)).reshape(b, HO, 1, 1)
 		learned[A_.MOVE], prior[A_.MOVE] = move + self.act_move(own_heroes).reshape(b, HO).gather(1, ft.slot_heroes(x)).reshape(b, HO, 1, 1), move_prior
 		offers[A_.MOVE] = ft.signed_offer(move_prior, x["move_mask"])  # (below 0 when every move is worse than staying)
 		# Nullkiller2's own choice now (schema 19: views.label), as a prior of nk_label_weight logits on its entry inside the
@@ -1035,7 +1040,7 @@ class CampaignModelV2(nn.Module):
 		out["cast_cell_logp"] = masked_log_softmax(cast_cell.reshape(b, HO, W * W), x["cast_cell_mask"].reshape(b, HO, W * W)).reshape(b, HO, W, W)
 		# TRAVEL: (hero, area) pairs, + the area's prior (its value discounted by the days to it)
 		learned[A_.TRAVEL] = (self.travel_out(state.travel_pairs).squeeze(-1) + state.travel_view.to(state.travel_pairs.dtype) + self.act_travel(own_heroes)).reshape(b, HO, L, TG, TG)
-		prior[A_.TRAVEL] = (known.travel_logits + advised("travel")).reshape(b, HO, L, TG, TG)  # (the network reads travel_prior: without the night)
+		prior[A_.TRAVEL] = (known.travel_logits + advised("travel")).reshape(b, HO, L, TG, TG) - guard.reshape(b, HO, 1, 1, 1)  # (the network reads travel_prior: without the night)
 		offers[A_.TRAVEL] = ft.signed_offer(prior[A_.TRAVEL], x["travel_mask"])
 		# BUILD: the town's query against each building. A purchase short of resources pays the trades it makes (known.
 		# build_trade, recruit_trade: the gold of worth they lose), priced as every change of Φ is (value_logit), in the

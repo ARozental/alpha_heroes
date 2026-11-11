@@ -318,6 +318,12 @@ class CampaignConfig:
 	# fifth to a half of the others' spread (v3154-3157: 0.20-0.60 against 1.09-1.39), so their rows pushed our own policy
 	# with that much less weight. False: pooled, as before (bit for bit); an update with one kind only is pooled either way
 	adv_by_kind: bool = False
+	# The town guard (bundle 60; model.CustomFeatures.town_guard_cost): this many logits a unit of value_logit(the expected
+	# loss a hero adds to a threatened town of ours by leaving it with too little) on that hero's MOVE and TRAVEL entries,
+	# x a learned gain (1/4..2); exactly 0 unless Nullkiller2 sees a threat reaching the town by tomorrow. Our own policy
+	# only (the follow mixture's part is untouched); no masking. 0: off, the model as before, bit for bit. Set at every
+	# start (learner.set_advice_prior); ALPHA_TOWN_GUARD for a paired test
+	town_guard: float = 0.0
 	# Its TRADE advice taught too (False since 2026-11-04: the user's rule, every trade is dumb unless it buys what could not
 	# be bought without it; ~94% of its trades bought nothing that day, and 54% of ours came where it advised one)
 	nk2_trade_advice: bool = False

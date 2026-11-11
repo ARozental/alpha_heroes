@@ -342,9 +342,17 @@ class CustomFeatures(nn.Module):
 		# x a gain (1/4..2)
 		self.adv_gain_shift = zeros()
 		self.register_buffer("adv_gain", torch.zeros(()))
+		# The town guard (bundle 60; e5's finding, 2026-11-11: at follow 0.9 we lost 100 towns in 48 games against 23 at
+		# follow 0, 71 of 80 weak ones emptied by a hero of ours walking out, 50 of those our own policy's choice:
+		# Nullkiller2 parks a hero in a threatened town and ours walks it out). town_guard_cost: town_guard logits a
+		# unit of value_logit(the expected loss its leaving adds) on a visiting hero's MOVE and TRAVEL entries, fixed
+		# (config.town_guard; ALPHA_TOWN_GUARD for a paired test; 0: off, the model as before) x a gain (1/4..2)
+		self.town_guard_shift = zeros()
+		self.register_buffer("town_guard", torch.zeros(()))
 		override = lambda name: float(os.environ[name]) if os.environ.get(name, "") != "" else None  # noqa: E731
 		self.nk_override = (override("ALPHA_NK2_PRIOR"), override("ALPHA_NK2_PRIOR_FALLBACK"), override("ALPHA_NK2_LABEL"), override("ALPHA_NK2_FOLLOW"))
 		self.adv_override = override("ALPHA_ADV_GAIN")
+		self.guard_override = override("ALPHA_TOWN_GUARD")
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -369,7 +377,7 @@ class CustomFeatures(nn.Module):
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
 			self.night_gain,
 			self.nk_gain, self.nk_gain_fallback, self.nk_survival, self.nk_risk, self.nk_label_gain, self.nk_follow_shift,
-			self.adv_gain_shift,
+			self.adv_gain_shift, self.town_guard_shift,
 		]
 
 	# ---- the bounded prior parameters ----
@@ -405,6 +413,25 @@ class CustomFeatures(nn.Module):
 		gain (1/4..2, 1 at the start); 0 with adv_gain at 0, the model as before."""
 		size = self.adv_gain if self.adv_override is None else self.adv_gain.new_tensor(self.adv_override)
 		return size * ft.bounded(self.adv_gain_shift, 0.25, 2.0, 1.0, CORRECTION_STEP)
+
+	def town_guard_cost(self, x, f):
+		"""The town guard's cost [B, OWN_HEROES] (logits, >= 0) on each hero of ours visiting a town of ours: the expected
+		loss its leaving adds (left_danger less town_danger as it stands, at least 0, x the town's stakes: gold) as
+		value_logit prices it, x town_guard x its gain; exactly 0 unless Nullkiller2 sees a threat to the town that
+		reaches it by tomorrow (t_nk_threat: one, its fastest in 0 or 1 turns), and 0 with town_guard at 0."""
+		size = self.town_guard if self.guard_override is None else self.town_guard.new_tensor(self.guard_override)
+		weight = size * ft.bounded(self.town_guard_shift, 0.25, 2.0, 1.0, CORRECTION_STEP)
+		to = c.OWN_TOWNS
+		if "t_nk_threat" in x:
+			threat = x["t_nk_threat"][:, :to]
+			gate = ((threat[..., 0] > 0) & (threat[..., 1] <= 1)).float()
+		else:
+			gate = torch.zeros_like(f.town_danger[:, :to])
+		loss = torch.relu(f.left_danger - f.town_danger[:, :to]) * f.town_stakes[:, :to] * gate  # [B, TO] gold
+		visitor = x["t_visiting"][:, :to]
+		heroes = torch.arange(c.OWN_HEROES, device=visitor.device)
+		cost = (loss.unsqueeze(-1) * (visitor.unsqueeze(-1) == heroes).float()).sum(dim=1)  # [B, HO]
+		return weight * ft.value_logit(cost)
 
 	def nk_follow_logs(self):
 		"""(whether following is on, log rho, log (1 - rho)): the chance our choice is Nullkiller2's own (nk_follow at the
@@ -625,6 +652,7 @@ class CustomFeatures(nn.Module):
 		f.town_value = self.town_value(x)
 		f.town_danger = ft.town_danger(x, f.hero_strength, f.town_strength)
 		f.emptied_danger = ft.emptied_danger(x, f.hero_strength)
+		f.left_danger = ft.left_danger(x, f.hero_strength, f.town_strength)  # (bundle 60's town guard)
 		f.map_worth, f.map_gate, f.map_monster_power = self.map_objects(x)
 		f.object_counts = ft.object_counts(x)
 		f.last_hero, f.last_town = ft.last_actors(x)
@@ -1598,7 +1626,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
