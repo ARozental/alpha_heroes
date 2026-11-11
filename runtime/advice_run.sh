@@ -160,6 +160,17 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # Mac replay of its checkpoint agreeing. army_on_heroes (0.08-0.18 before) is expected to rise: that is GATHER.
 # campaign.nk2_night_drop (b1's 4785d0f) is in the code and off: its trigger is the deep-end reading (b1's
 # measure_a2: P of an entry into a night reading >= 0.6, 0.084 at v3003) passing ~0.10
+# The value valves (2026-11-11, the user's diagnosis; e5's design corrected by b1, b1's 8605deb; deploy 56):
+# campaign.value_valve=true campaign.kl_valve=true. The user: a change that improves the game makes V worse, and the
+# noisy V then moves the policy far more than it would with separate networks. The run's numbers: in the 2026-11-10
+# collapse the fresh value loss went 0.00055 -> 0.0048, the value terms' share of the shared layers' gradient 0.05
+# -> 0.16 (above 0.3 in 21 of 104 updates), the policy's KL an update at its target throughout. So, while the fresh
+# value loss's 7-median stands above its own ~50-update average (r_v > 1): the value terms' gradient into the
+# shared layers x clip(1 / r_v, 0.1, 1) (value_hidden, the heads and the privileged critic at full gradient and
+# their own rate: V re-fits, the trunk is not dragged), and the KL control's target x clip(1 / r_v, 0.25, 1) (the
+# policy moves less an update until V has caught up); each at most x1.25 or /1.25 an update. At r_v <= 1 nothing
+# changes. Logged: valve_r, valve_s, kl_target. Not a paired test's matter (training, not play): the PC's update
+# check replays the recorded step graph with the valve at 0.5 against the eager step. The guard stays the last resort
 # campaign.value_jump_stop is 3 (config.py; the user, 2026-11-10): the campaign's updates are held when its fresh value
 # loss jumps (the median of the last 7 updates at 3 times its calm level); the line "VALUE LOSS JUMP" in the log, the
 # file campaign/held. A restart lifts the hold
@@ -180,5 +191,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_gather_weight=0.1 campaign.nk2_gather_ramp=200 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_gather_weight=0.1 campaign.nk2_gather_ramp=200 campaign.value_valve=true campaign.kl_valve=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
