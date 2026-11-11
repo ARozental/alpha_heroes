@@ -89,6 +89,7 @@ def test_a_further_window_is_read_as_its_heros(model):
 	# (schema 19: a candidate of Nullkiller2's names one entry, so two copies of a window cannot both hold it: this
 	# decision is read without the advisor; its candidates in a further window: test_advice.py)
 	x["g_nk_present"][:] = False
+	x["g_nk_action"][:] = 0  # (its own choice names one entry too)
 	y = tensors(with_further(x, 0, x["h_pos"][:, 0]))
 	with torch.no_grad():
 		known = model.domain_knowledge(y)
