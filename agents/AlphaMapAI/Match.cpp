@@ -5,6 +5,7 @@
 #include "lib/callback/CCallback.h"
 #include "lib/mapObjects/CGHeroInstance.h"
 #include "lib/mapObjects/CGTownInstance.h"
+#include "lib/mapObjects/MiscObjects.h"
 #include "lib/networkPacks/PacksForServer.h"
 
 #include <cmath>
@@ -43,6 +44,42 @@ int nearest(const std::unordered_map<int, Entry> & entries, Key key, Amount amou
 }
 }
 
+// alpha_heroes diagnostic (2026-11-11, logging only; e5's teleport question): Nullkiller2's request to move a hero onto
+// the tile it stands on (in VCMI: visit again what is under it, a human's Space), named by what is there, for the
+// advice summary's unmatched kinds: our town (a GATHER legal or not), another town, a teleporter (its kind, whether an
+// exit other than itself is known to us), a boat, another object (its id), nothing; whether its plan's tile (intended)
+// was set, and the request's path length (1: the tile itself)
+std::string AlphaMapAI::ownTileRequest(const Decision & decision, const CGHeroInstance * hero, const int3 & intended, size_t path) const
+{
+	std::string what = "nothing";
+	if(hero->inBoat())
+		what = "in a boat";
+	for(const auto * obj : cb->getVisitableObjs(hero->visitablePos(), false))
+	{
+		if(obj == hero)
+			continue;
+		if(const auto * town = dynamic_cast<const CGTownInstance *>(obj))
+		{
+			bool gather = false;
+			for(const auto & [index, e] : decision.entries[static_cast<int>(ActionType::MULTI)])
+				gather = gather || (static_cast<MultiKind>(e.a) == MultiKind::GATHER && e.second == hero->id);
+			const bool garrisoned = town->getGarrisonHero() == hero; // (in the garrison: the move takes it out to the visiting slot, ExchangeSwapTownHeroes)
+			what = town->tempOwner != playerID ? "another's town" : garrisoned ? (town->getVisitingHero() ? "our town, garrisoned, a hero visiting" : "our town, garrisoned, none visiting") : gather ? "our town, GATHER legal" : "our town, no GATHER";
+		}
+		else if(const auto * teleport = dynamic_cast<const CGTeleport *>(obj))
+		{
+			bool exit = false;
+			for(const auto & id : cb->getTeleportChannelExits(teleport->channel, playerID))
+				exit = exit || id != obj->id;
+			what = "teleporter " + std::to_string(obj->ID.getNum()) + (exit ? ", an exit known" : ", no exit known");
+		}
+		else
+			what = "object " + std::to_string(obj->ID.getNum());
+		break;
+	}
+	return "MoveHero (own tile: " + what + (intended.isValid() ? "; its plan's tile set" : "; no plan tile") + (path <= 1 ? "; path 1)" : "; path longer)");
+}
+
 bool AlphaMapAI::matchRequest(const Decision & decision, const CPackForServer * pack, Choice & choice, bool & exact, std::string & unmatched, int3 intended) const
 {
 	exact = true;
@@ -67,7 +104,7 @@ bool AlphaMapAI::matchRequest(const Decision & decision, const CPackForServer * 
 		if(!h || (p->path.empty() && !planned))
 			unmatched = "MoveHero (no hero or path)";
 		else if(target == h->visitablePos())
-			unmatched = "MoveHero (into a teleport)"; // (our moves go through teleports as part of a path)
+			unmatched = ownTileRequest(decision, h, intended, p->path.size()); // (alpha_heroes diagnostic, 2026-11-11: named by what is there)
 		else
 		{
 			for(int i = 0; i < OWN_HEROES; ++i)
