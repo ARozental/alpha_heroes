@@ -260,9 +260,12 @@ def gradient_check(model, main, foresight, terms=None, prefix="grad_shared_", wa
 			grads = torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)
 			norms[f"{prefix}{name}"] = float(flat(grads).norm())
 			for label, p in watched:
-				if p is not None and id(p) in index:
-					g = grads[index[id(p)]]
-					norms[f"{prefix}{label}_{name}"] = float(g.sum()) if g is not None else 0.0
+				try:  # (a reading: an error in it is a nan, never the update's end)
+					if p is not None and id(p) in index:
+						g = grads[index[id(p)]]
+						norms[f"{prefix}{label}_{name}"] = float(g.sum()) if g is not None else 0.0
+				except Exception:  # noqa: BLE001
+					norms[f"{prefix}{label}_{name}"] = float("nan")
 	return {
 		"grad_shared_main": float(a.norm()), "grad_shared_foresight": float(b.norm()),
 		"grad_shared_cosine": float(F.cosine_similarity(a, b, dim=0)), "grad_dead_share": dead / max(len(params), 1), **norms,
