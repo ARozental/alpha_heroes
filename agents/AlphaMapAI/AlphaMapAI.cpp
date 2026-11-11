@@ -612,6 +612,13 @@ Choice AlphaMapAI::decide(Decision & decision, const std::optional<Choice> & adv
 				memory[i] = std::llround(std::clamp(next[i], -1.0f, 1.0f) * MEMORY_SCALE);
 		}
 		choice = sample(decision, outputs);
+		if(followAdvice && advice) // (a test's only: the sample drawn all the same, so both arms' draws stay in step)
+		{
+			choice.type = advice->type;
+			choice.index = advice->index;
+			choice.cell = advice->cell;
+			choice.logp = 0;
+		}
 		Record entry;
 		entry.day = cb->getDate(Date::DAY);
 		entry.kind = static_cast<int>(decision.kind);

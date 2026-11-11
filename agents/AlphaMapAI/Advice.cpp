@@ -178,6 +178,7 @@ void AlphaMapAI::initAdvice()
 	adviceProbability = std::stod(adviceEnvironment("ALPHA_MAP_NK2_ADVICE", "0"));
 	adviceFixes = adviceEnvironment("ALPHA_MAP_ADVICE_FIXES", "1") != "0";
 	gatherAdvice = adviceEnvironment("ALPHA_MAP_GATHER_ADVICE", "0") != "0";
+	followAdvice = adviceEnvironment("ALPHA_MAP_FOLLOW_ADVICE", "0") != "0";
 #ifdef ALPHA_MAP_NK2_ADVICE
 	if(adviceProbability <= 0)
 		return;
@@ -200,7 +201,7 @@ void AlphaMapAI::initAdvice()
 	adviceFixes = false;
 #endif
 	advisor = a;
-	logAi->info("AlphaMapAI %s: Nullkiller2's advice at a chance of %.3f a turn decision, meeting fixes %s", playerID.toString(), adviceProbability, adviceFixes ? "on" : "off");
+	logAi->info("AlphaMapAI %s: Nullkiller2's advice at a chance of %.3f a turn decision, meeting fixes %s%s", playerID.toString(), adviceProbability, adviceFixes ? "on" : "off", followAdvice ? ", its advice PLAYED (ALPHA_MAP_FOLLOW_ADVICE)" : "");
 #else
 	if(adviceProbability > 0)
 		logAi->error("AlphaMapAI %s: ALPHA_MAP_NK2_ADVICE asked, but this build has no Nullkiller2: no advice", playerID.toString());

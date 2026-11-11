@@ -240,6 +240,9 @@ class AlphaMapAI : public CAdventureAI
 	struct Advisor;
 	std::shared_ptr<Advisor> advisor;
 	double adviceProbability = 0;
+	// A test's only (ALPHA_MAP_FOLLOW_ADVICE, off unless set; paired_eval's arm, 2026-11-11): each advised decision plays
+	// the matched advice instead of our sampled choice, our own where it has none
+	bool followAdvice = false;
 	int advised = 0;
 	int adviceMatched = 0;
 	int exchangeAdvised = 0;
