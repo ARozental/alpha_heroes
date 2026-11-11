@@ -101,6 +101,7 @@ COLUMNS = [
 	# players out of their games, the spread of the value heads' targets
 	"gather_weight", "army_on_heroes", "eliminated", "value_target_std",
 	"night_dropped",  # (config.nk2_night_drop: the share of Nullkiller2's advised labels left out as into the night)
+	"valve_r", "valve_s", "kl_target",  # (the value valves: r_v after this update's reading, s and the KL target this update used)
 ]
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
 DROP_BEYOND = 4  # updates' worth of finished games beyond which the oldest are dropped (_take)
@@ -112,6 +113,9 @@ DROP_BEYOND = 4  # updates' worth of finished games beyond which the oldest are 
 # level, the evals fell to 0.25) and v2749 (2026-11-10, the second: 14 updates after the deploy, 87 updates and five
 # evals before anybody looked); single readings 2-5 times the level follow every restart and do not fire it
 VALUE_JUMP_WINDOW, VALUE_JUMP_BASELINE, VALUE_JUMP_MEMORY = 7, 50, 300
+# The value valves (config.value_valve, kl_valve; valve_step): r_v's window and its reference's horizon (updates), the
+# floors of the shared layers' share (s) and of the KL target's factor (k), the most either moves an update (times)
+VALVE_WINDOW, VALVE_HORIZON, VALVE_S_MIN, VALVE_K_MIN, VALVE_RATE = 7, 50, 0.1, 0.25, 1.25
 MAX_LABEL_STALENESS = 2  # model versions: older precomputed labels (labeler.py) are recomputed with the current tables
 
 
@@ -182,6 +186,7 @@ class CampaignLearner:
 		self.held, self.held_updates, self.value_readings, self.value_own = None, 0, [], 0
 		self.grad_clips, self.clip_samples = None, []  # (config.grad_clip_by_group) the groups' clips once calibrated, the calibration's steps' norms till then
 		self.gather_ramp_start = None  # (config.nk2_gather_ramp) the version at the ramp's first update
+		self.valve = None  # (config.value_valve, kl_valve) valve_step's state: r_v's reference and window, s and k
 		latest = self.out / "checkpoint_latest.pt"
 		if resume and latest.exists():
 			state = torch.load(latest, map_location=device)
@@ -208,6 +213,7 @@ class CampaignLearner:
 			self.head_residual, self.head_var_slow, self.head_residual_updates = state.get("head_residual"), state.get("head_var_slow"), state.get("head_residual_updates", 0)
 			self.grad_clips, self.clip_samples = state.get("grad_clips"), state.get("clip_samples", [])
 			self.gather_ramp_start = state.get("gather_ramp_start")
+			self.valve = state.get("valve")
 			print(f"campaign: resuming at version {self.version}", flush=True)
 		elif config.init_from:
 			state = torch.load(config.init_from, map_location=device)
@@ -610,6 +616,11 @@ class CampaignLearner:
 		targets, labels, growth = np.concatenate(targets), np.concatenate(labels), np.concatenate(growth)
 		gather_weight = self.gather_weight_now()
 		row["gather_weight"] = gather_weight
+		valve_s, valve_k = self.valve_now()
+		row["valve_s"], row["kl_target"] = valve_s, self.config.target_kl * valve_k
+		if hasattr(self.model, "value_valve"):
+			with self.model_lock:
+				self.model.value_valve.fill_(valve_s)
 		with np.errstate(all="ignore"):
 			spread = np.nanstd(np.where(np.isfinite(targets), targets, np.nan), axis=0)
 		row["value_target_std"] = float(np.nanmean(spread)) if np.isfinite(spread).any() else float("nan")
@@ -630,7 +641,7 @@ class CampaignLearner:
 			row["credit_trust"] = self.credit_check
 			row["credit_gaps"] = gaps
 		if self.worker:  # (the process saves checkpoint_latest.pt, with its optimizer)
-			state, metrics, lr_scale = self.worker.update(decisions, targets, returns, self.labels.weights, {"version": self.version + 1, "nk2_gather_weight": gather_weight, "gather_ramp_start": self.gather_ramp_start, "games_used": self.games_used + len(games), "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool}, advantages, growth, labels, end, foresight)
+			state, metrics, lr_scale = self.worker.update(decisions, targets, returns, self.labels.weights, {"version": self.version + 1, "nk2_gather_weight": gather_weight, "gather_ramp_start": self.gather_ramp_start, "value_valve": valve_s, "target_kl": self.config.target_kl * valve_k, "valve": self.valve, "games_used": self.games_used + len(games), "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool}, advantages, growth, labels, end, foresight)
 			with self.model_lock:
 				self.model.load_state_dict(state)
 				self.lr_scale = lr_scale
@@ -642,7 +653,7 @@ class CampaignLearner:
 			out_of_memory = None
 			with self.model_lock:
 				try:
-					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, replace(self.config, nk2_gather_weight=gather_weight), device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), growth_trust=self.grade_trust().get("G7", 0.0), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None, privileged={name: np.concatenate([part[name] for part in privileged]) for name in privileged[0]} if privileged else None)
+					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, replace(self.config, nk2_gather_weight=gather_weight, target_kl=self.config.target_kl * valve_k), device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), growth_trust=self.grade_trust().get("G7", 0.0), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None, privileged={name: np.concatenate([part[name] for part in privileged]) for name in privileged[0]} if privileged else None)
 				except torch.OutOfMemoryError as error:  # (handled below, once the error's frames, and their tensors, are gone)
 					out_of_memory = str(error)[:200]
 			if out_of_memory is not None:
@@ -807,6 +818,9 @@ class CampaignLearner:
 			"eliminated": eliminated_share(games),
 			"value_target_std": sums.get("value_target_std", float("nan")),
 			"night_dropped": metrics.get("night_dropped", float("nan")),
+			"valve_r": self._valve_reading(metrics.get("value_fresh", float("nan"))),
+			"valve_s": sums.get("valve_s", float("nan")),
+			"kl_target": sums.get("kl_target", float("nan")),
 			"label_mean": sums["label_sum"] / max(n, 1),
 			"price_mean": sums["price_sum"] / max(n, 1),
 			"policy_loss": metrics.get("policy", float("nan")),
@@ -958,7 +972,7 @@ class CampaignLearner:
 
 		state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
 		optimizer = {} if self.worker else {"optimizer": self.optimizer.state_dict()}  # (the process's is in checkpoint_latest.pt)
-		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "gather_ramp_start": self.gather_ramp_start, "model_kwargs": self.kwargs}, path)
+		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "gather_ramp_start": self.gather_ramp_start, "valve": self.valve, "model_kwargs": self.kwargs}, path)
 
 	# ---- the loss shares (config.loss_shares) ----
 
@@ -1012,6 +1026,35 @@ class CampaignLearner:
 			self.gather_ramp_start = self.version
 			print(f"campaign: GATHER's label ramped from version {self.version}: {target} over {ramp} updates", flush=True)
 		return target * min(1.0, (self.version + 1 - self.gather_ramp_start) / ramp)
+
+	def valve_now(self):
+		"""(s, k) for the update to come (config.value_valve, kl_valve; 1 for a valve off): the valves' state, started at the
+		first update with one on from progress.csv's fresh readings (valve_reference), so a deploy during a jump does not
+		take the jump for the level."""
+		if not (getattr(self.config, "value_valve", False) or getattr(self.config, "kl_valve", False)):
+			return 1.0, 1.0
+		if self.valve is None:
+			self.valve = valve_reference(fresh_readings(self.progress, keep=VALVE_HORIZON))
+			if self.valve is not None:
+				print(f"campaign: the value valves from version {self.version}: r_v's reference {self.valve['reference']:.5f} (the median of progress.csv's last {VALVE_HORIZON} fresh readings)", flush=True)
+		if self.valve is None:
+			return 1.0, 1.0
+		return (self.valve["s"] if self.config.value_valve else 1.0), (self.valve["k"] if self.config.kl_valve else 1.0)
+
+	def _valve_reading(self, reading):
+		"""The update's fresh value loss into the valves, r_v after it (nan with the valves off) for the log row."""
+		self._note_valve(reading)
+		return self.valve["r"] if self.valve is not None else float("nan")
+
+	def _note_valve(self, reading):
+		"""An update's fresh value loss into the valves (valve_step); an error is a FAILURE line and the valves open."""
+		if self.valve is None:
+			return
+		try:
+			self.valve = valve_step(self.valve, reading)
+		except Exception as error:
+			print(f"campaign: FAILURE: the value valves failed ({type(error).__name__}: {str(error)[:200]}): open from here", flush=True)
+			self.valve = None
 
 	def _note_gradients(self, metrics):
 		"""After an update: each term's gradient on the shared layers as it entered the loss (grad_shared_*: its norm at
@@ -1406,8 +1449,10 @@ def _update_worker(config, kwargs, device_name, state, requests, results, latest
 	lr_scale = state["lr_scale"]
 	while (request := requests.get()) is not None:
 		decisions, targets, returns, weights, about, advantages, growth, labels, end, foresight = request
+		if hasattr(model, "value_valve"):  # (the learner's value valve for this update)
+			model.value_valve.fill_(about.get("value_valve", 1.0))
 		try:
-			metrics, lr_scale = ppo_update(model, optimizer, decisions, targets, returns, replace(config, nk2_gather_weight=about.get("nk2_gather_weight", config.nk2_gather_weight)), device=device, lr_scale=lr_scale, weights=weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight)
+			metrics, lr_scale = ppo_update(model, optimizer, decisions, targets, returns, replace(config, nk2_gather_weight=about.get("nk2_gather_weight", config.nk2_gather_weight), target_kl=about.get("target_kl", config.target_kl)), device=device, lr_scale=lr_scale, weights=weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight)
 			if device.type == "mps":
 				torch.mps.empty_cache()  # (the battle learner's lesson: MPS keeps blocks of every size it saw)
 			cpu = {key: value.detach().cpu() for key, value in model.state_dict().items()}
@@ -1417,6 +1462,36 @@ def _update_worker(config, kwargs, device_name, state, requests, results, latest
 			results.put(("ok", cpu, metrics, lr_scale))
 		except Exception:
 			results.put(("error", traceback.format_exc(), None, lr_scale))
+
+
+def valve_reference(readings):
+	"""The value valves' state from fresh value-loss readings (progress.csv's: their first update, or a run resumed from a
+	checkpoint without them): r_v's reference the median of the last VALVE_HORIZON, its window the last VALVE_WINDOW, both
+	valves open (s = k = 1); None with no reading."""
+	readings = [float(r) for r in readings if r == r]
+	if not readings:
+		return None
+	return {"reference": float(np.median(readings[-VALVE_HORIZON:])), "window": readings[-VALVE_WINDOW:], "s": 1.0, "k": 1.0, "r": float("nan")}
+
+
+def valve_step(state, reading):
+	"""The value valves after an update's fresh value loss (reading; nan: as they were): r_v = the median of the last
+	VALVE_WINDOW readings over the reference as it stood, then the reference an EMA step toward the reading (a VALVE_HORIZON
+	update horizon: a jump is measured, a level that stays is absorbed); s toward clip(1 / r_v, VALVE_S_MIN, 1) and k
+	toward clip(1 / r_v, VALVE_K_MIN, 1), each at most VALVE_RATE times or over an update (Adam's second moments lag: a
+	valve that snapped open would overshoot)."""
+	if reading != reading:
+		return state
+	state = dict(state)
+	window = (list(state["window"]) + [float(reading)])[-VALVE_WINDOW:]
+	r = float(np.median(window)) / state["reference"] if state["reference"] > 0 else float("nan")
+	if r == r:
+		for key, floor in (("s", VALVE_S_MIN), ("k", VALVE_K_MIN)):
+			target = min(1.0, max(floor, 1.0 / r))
+			state[key] = min(state[key] * VALVE_RATE, max(state[key] / VALVE_RATE, target))
+	state["reference"] += (float(reading) - state["reference"]) / VALVE_HORIZON
+	state.update(window=window, r=r)
+	return state
 
 
 def army_on_heroes(games, empire):

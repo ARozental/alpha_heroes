@@ -176,9 +176,9 @@ def test_an_update_runs_with_the_horizon_credit_and_learns_how_far_to_trust_the_
 		config=config, labels=LabelConfig(), empire=EmpireConfig(), version=1, finished=list(games), lock=threading.Condition(), stats=collections.Counter(),
 		model=model, optimizer=make_optimizer(model, config), device=torch.device("cpu"), worker=None, model_lock=threading.Lock(), lr_scale=1.0,
 		server=SimpleNamespace(set_model=lambda *args: None), teacher=None, teacher_weight=0.0, games_used=0, out=tmp_path, kwargs=kwargs, value_ev=None, credit_evidence={}, credit_check=1.0, head_ev={"Vend": 0.2}, value_pool=None, head_pool={}, progress=tmp_path / "progress.csv", writer=Writer(),
-		features_cpu=model.features, trust_ema=None, grad_clips=None, clip_samples=[], head_residual=None, head_var_slow=None, head_residual_updates=0, held=None, held_updates=0, gather_ramp_start=None, value_readings=[], value_own=0,
+		features_cpu=model.features, trust_ema=None, grad_clips=None, clip_samples=[], head_residual=None, head_var_slow=None, head_residual_updates=0, held=None, held_updates=0, gather_ramp_start=None, valve=None, value_readings=[], value_own=0,
 	)
-	for name in ("_take", "trust", "trust_today", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting", "loss_shares", "loss_weights", "_note_gradients", "gather_weight_now", "_head_scale", "_calibrate_clips", "_judge_value"):
+	for name in ("_take", "trust", "trust_today", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting", "loss_shares", "loss_weights", "_note_gradients", "gather_weight_now", "valve_now", "_note_valve", "_valve_reading", "_head_scale", "_calibrate_clips", "_judge_value"):
 		setattr(learner, name, getattr(CampaignLearner, name).__get__(learner))
 	learner.progress.write_text(",".join(COLUMNS) + "\n")
 	assert learner.trust() == 0.0  # nothing known yet: the credit leans on the real outcome
@@ -315,9 +315,9 @@ def test_an_update_runs_with_the_attributed_credit(tmp_path):
 		config=config, labels=LabelConfig(), empire=EmpireConfig(), version=1, finished=list(games), lock=threading.Condition(), stats=collections.Counter(),
 		model=model, optimizer=make_optimizer(model, config), device=torch.device("cpu"), worker=None, model_lock=threading.Lock(), lr_scale=1.0,
 		server=SimpleNamespace(set_model=lambda *args: None), teacher=None, teacher_weight=0.0, games_used=0, out=tmp_path, kwargs=kwargs, value_ev=None, credit_evidence={}, credit_check=1.0, head_ev={"Vend": 0.2}, value_pool=None, head_pool={}, progress=tmp_path / "progress.csv", writer=Writer(),
-		features_cpu=model.features, trust_ema=None, grad_clips=None, clip_samples=[], head_residual=None, head_var_slow=None, head_residual_updates=0, held=None, held_updates=0, gather_ramp_start=None, value_readings=[], value_own=0,
+		features_cpu=model.features, trust_ema=None, grad_clips=None, clip_samples=[], head_residual=None, head_var_slow=None, head_residual_updates=0, held=None, held_updates=0, gather_ramp_start=None, valve=None, value_readings=[], value_own=0,
 	)
-	for name in ("_take", "trust", "trust_today", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting", "loss_shares", "loss_weights", "_note_gradients", "gather_weight_now", "_head_scale", "_calibrate_clips", "_judge_value"):
+	for name in ("_take", "trust", "trust_today", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting", "loss_shares", "loss_weights", "_note_gradients", "gather_weight_now", "valve_now", "_note_valve", "_valve_reading", "_head_scale", "_calibrate_clips", "_judge_value"):
 		setattr(learner, name, getattr(CampaignLearner, name).__get__(learner))
 	learner.progress.write_text(",".join(COLUMNS) + "\n")
 	assert CampaignLearner.step(learner, epoch=1)
@@ -403,9 +403,9 @@ def test_an_update_runs_with_the_schedule_credits_action_price(tmp_path):
 			config=config, labels=LabelConfig(), empire=EmpireConfig(), version=1, finished=list(games), lock=threading.Condition(), stats=collections.Counter(),
 			model=model, optimizer=make_optimizer(model, config), device=torch.device("cpu"), worker=None, model_lock=threading.Lock(), lr_scale=1.0,
 			server=SimpleNamespace(set_model=lambda *args: None), teacher=None, teacher_weight=0.0, games_used=0, out=out, kwargs=kwargs, value_ev=None, credit_evidence={}, credit_check=1.0, head_ev={"Vend": 0.2}, value_pool=None, head_pool={}, progress=out / "progress.csv", writer=Writer(),
-			features_cpu=model.features, trust_ema=None, grad_clips=None, clip_samples=[], head_residual=None, head_var_slow=None, head_residual_updates=0, held=None, held_updates=0, gather_ramp_start=None, value_readings=[], value_own=0,
+			features_cpu=model.features, trust_ema=None, grad_clips=None, clip_samples=[], head_residual=None, head_var_slow=None, head_residual_updates=0, held=None, held_updates=0, gather_ramp_start=None, valve=None, value_readings=[], value_own=0,
 		)
-		for name in ("_take", "trust", "trust_today", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting", "loss_shares", "loss_weights", "_note_gradients", "gather_weight_now", "_head_scale", "_calibrate_clips", "_judge_value"):
+		for name in ("_take", "trust", "trust_today", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting", "loss_shares", "loss_weights", "_note_gradients", "gather_weight_now", "valve_now", "_note_valve", "_valve_reading", "_head_scale", "_calibrate_clips", "_judge_value"):
 			setattr(learner, name, getattr(CampaignLearner, name).__get__(learner))
 		learner.progress.write_text(",".join(COLUMNS) + "\n")
 		learner_module.ppo_update = spy
@@ -450,3 +450,36 @@ def test_gathers_label_ramps_in_and_the_collapse_readings():
 	assert eliminated_share(games) == 0.0
 	games[0][0].ledgers[3] = {"day": 3, "players": [player(0, True, False), player(1, False, False)]}
 	assert eliminated_share(games) == 0.5 and np.isnan(eliminated_share([]))
+
+
+def test_the_value_valves_close_on_a_jump_and_reopen_as_its_level_is_absorbed(tmp_path):
+	"""learner.valve_step: steady readings leave both valves open; a lasting jump to 3x closes s and k (to ~0.41: the
+	reference absorbs ~2% of it an update meanwhile), at most /1.25 an update; as the reference absorbs the new level both reopen, at most x1.25 an update; a missing reading
+	changes nothing. valve_reference starts from progress.csv's readings (their median), not from the first one; valve_now
+	gives the state's own s and k back (a restart does not snap them to 1) and 1, 1 with the switches off."""
+	import numpy as np
+
+	from campaign_model.learner import VALVE_K_MIN, VALVE_RATE, VALVE_S_MIN, valve_reference, valve_step
+
+	state = valve_reference([0.001] * 60)
+	for _ in range(20):
+		state = valve_step(state, 0.001)
+	assert state["s"] == 1.0 and state["k"] == 1.0 and abs(state["r"] - 1.0) < 1e-9
+	s_seen, k_seen = [], []
+	for _ in range(200):
+		previous = dict(state)
+		state = valve_step(state, 0.003)
+		assert state["s"] >= previous["s"] / VALVE_RATE - 1e-12 and state["s"] <= previous["s"] * VALVE_RATE + 1e-12
+		s_seen.append(state["s"])
+		k_seen.append(state["k"])
+	assert min(s_seen) < 0.45 and min(k_seen) < 0.45 and min(s_seen) >= VALVE_S_MIN and min(k_seen) >= VALVE_K_MIN  # (the 7-median waits 4 readings while the reference absorbs: ~0.41)
+	assert s_seen[-1] > 0.95 and k_seen[-1] > 0.95  # (the new level absorbed: open again)
+	assert valve_step(state, float("nan")) == state
+	progress = tmp_path / "progress.csv"
+	progress.write_text("version,value_loss_fresh\n" + "".join(f"{v},{0.002 if v < 40 else 0.009}\n" for v in range(60)))
+	learner = SimpleNamespace(config=CampaignConfig(value_valve=True, kl_valve=True), progress=progress, version=60, valve=None)
+	assert CampaignLearner.valve_now(learner) == (1.0, 1.0) and learner.valve["reference"] == pytest.approx(0.002)  # (the median of 50: the last 20 at 0.009 do not set it)
+	learner.valve.update(s=0.3, k=0.5)
+	assert CampaignLearner.valve_now(learner) == (0.3, 0.5)
+	off = SimpleNamespace(config=CampaignConfig(), progress=progress, version=60, valve=None)
+	assert CampaignLearner.valve_now(off) == (1.0, 1.0) and off.valve is None and np.isnan(np.nan)
