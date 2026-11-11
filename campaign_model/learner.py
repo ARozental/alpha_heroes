@@ -1427,6 +1427,8 @@ def agrees(decision):
 	"""Our choice is Nullkiller2's advice (Decision.advice): the same type, and the same entry where the type has a table
 	(an end is only its type: ours has no index, -1, the advice's 0)."""
 	action, index = decision.advice[:2]
+	if action < 0:  # (a question's advice, bundle 60's shipyard YES: the option)
+		return decision.action_type < 0 and decision.index == index
 	return decision.action_type == action and (action <= c.ActionType.END or decision.index == index)
 
 

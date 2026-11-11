@@ -261,6 +261,29 @@ int Decision::echoIndex(int type, int index) const
 	return windowHero[index / cells] * cells + index % cells;
 }
 
+bool AlphaMapAI::revisitUseful(const CGHeroInstance * hero) const
+{
+	// (bundle 60, AlphaMapAI.h revisitEntry) what the hero stands on: an entrance with no exit seen, a map shipyard with a
+	// boat to build now; the hero with movement left (a teleport takes some, a shipyard's question none: kept alike)
+	if(!revisitEntry || hero->movementPointsRemaining() == 0)
+		return false;
+	for(const auto * obj : cb->getVisitableObjs(hero->visitablePos(), false))
+	{
+		if(obj == hero)
+			continue;
+		if(unseenExit(obj))
+			return true;
+		if(const auto * yard = dynamic_cast<const IShipyard *>(obj); yard && !dynamic_cast<const CGTownInstance *>(obj) && cb->getPlayerRelations(playerID, obj->getOwner()) != PlayerRelations::ENEMIES)
+		{
+			TResources price;
+			yard->getBoatCost(price);
+			if(yard->shipyardStatus() == IBoatGenerator::GOOD && cb->getResourceAmount().canAfford(price))
+				return true;
+		}
+	}
+	return false;
+}
+
 bool AlphaMapAI::unseenExit(const CGObjectInstance * obj) const
 {
 	// VCMI's pathfinder goes through a teleporter only to an exit the player sees (CPathfinderHelper::
@@ -756,6 +779,8 @@ void AlphaMapAI::encodeWindows(Decision & decision, PathfinderCache & paths)
 					if(node->turns == 0)
 						in.at(In::w_move_left, slot, row, column) = node->moveRemains;
 					in.at(In::w_arrive_left, slot, row, column) = static_cast<int64_t>(node->moveRemains) + 1; // (schema 19: any day's arrival, 0 none)
+					if(canMove && pos == standing && revisitUseful(h)) // (bundle 60: a re-visit, AlphaMapAI.h revisitEntry)
+						in.at(In::move_mask, slot, row, column) = 1;
 					if(canMove && node->turns == 0 && pos != standing && node->action != EPathNodeAction::UNKNOWN
 						&& std::none_of(earlier.begin(), earlier.end(), [&](const int3 & c) { return inside(pos, c); }))
 						in.at(In::move_mask, slot, row, column) = 1;

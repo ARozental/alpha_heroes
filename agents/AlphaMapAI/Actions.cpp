@@ -500,6 +500,12 @@ bool AlphaMapAI::moveHero(ObjectInstanceID heroID, int3 destination)
 	// hero is there, stops moving, or what was at the destination (a pile, a monster) is gone.
 	activeHero = heroID;
 	activeTarget = destination;
+	if(const auto * h = cb->getHero(heroID); h && h->visitablePos() == destination) // (bundle 60: a re-visit, AlphaMapAI.h revisitEntry)
+	{
+		cb->moveHero(h, h->pos, false);
+		waitTillFree();
+		return true;
+	}
 	const auto targetObject = topVisitable(*cb, destination);
 	bool moved = false;
 	for(int step = 0; step < 64 && !stopping; ++step)

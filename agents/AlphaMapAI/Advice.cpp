@@ -311,6 +311,8 @@ void AlphaMapAI::initAdvice()
 	nk2Inputs = adviceEnvironment("ALPHA_MAP_NK2_INPUTS", "0") != "0";
 	nk2Choice = adviceEnvironment("ALPHA_MAP_NK2_CHOICE", "1") != "0"; // (alpha_heroes patch, own games: AlphaMapAI.h)
 	revisitSkip = adviceEnvironment("ALPHA_MAP_REVISIT_SKIP", "1") != "0"; // (alpha_heroes patch, bundle 60: AlphaMapAI.h)
+	boatAdvice = adviceEnvironment("ALPHA_MAP_BOAT_ADVICE", "1") != "0"; // (alpha_heroes patch, bundle 60: AlphaMapAI.h)
+	revisitEntry = adviceEnvironment("ALPHA_MAP_REVISIT", "1") != "0"; // (alpha_heroes patch, bundle 60: AlphaMapAI.h)
 	followAdvice = std::clamp(std::stod(adviceEnvironment("ALPHA_MAP_FOLLOW_ADVICE", "0")), 0.0, 1.0);
 #ifdef ALPHA_MAP_NK2_ADVICE
 	if(adviceProbability <= 0 && !nk2Inputs)
@@ -706,6 +708,16 @@ bool AlphaMapAI::exchangeSettled(const CGHeroInstance * one, const CGHeroInstanc
 #endif
 }
 
+ObjectInstanceID AlphaMapAI::advisorHero() const
+{
+#ifdef ALPHA_MAP_NK2_ADVICE
+	if(advisor)
+		if(const auto hero = advisor->nk2->nullkiller->getActiveHero(); hero.isVerified())
+			return hero->id;
+#endif
+	return ObjectInstanceID();
+}
+
 std::string AlphaMapAI::advisorTask() const
 {
 #ifdef ALPHA_MAP_NK2_ADVICE
@@ -722,7 +734,7 @@ std::string AlphaMapAI::adviceJson() const
 	std::string unmatched;
 	for(const auto & [kind, count] : adviceUnmatched)
 		unmatched += (unmatched.empty() ? "\"" : ", \"") + kind + "\": " + std::to_string(count);
-	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"fallback\": " + std::to_string(adviceFallbacks) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + "}, \"gathers\": " + std::to_string(adviceGathers) + ", \"choice_shown\": " + std::to_string(nk2Choice && nk2Inputs ? 1 : 0) + ", \"revisit_skipped\": " + std::to_string(revisitsSkipped) + ", \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
+	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"fallback\": " + std::to_string(adviceFallbacks) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + "}, \"gathers\": " + std::to_string(adviceGathers) + ", \"choice_shown\": " + std::to_string(nk2Choice && nk2Inputs ? 1 : 0) + ", \"revisit_skipped\": " + std::to_string(revisitsSkipped) + ", \"boats\": " + std::to_string(boatsMatched) + ", \"boat_answers\": " + std::to_string(boatAnswers) + ", \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
 }
 
 // The events of a seated Nullkiller2's memory (AlphaMapAI.h), passed on to the advising one; none of our own uses them

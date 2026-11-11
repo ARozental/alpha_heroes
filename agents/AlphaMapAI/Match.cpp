@@ -105,6 +105,8 @@ bool AlphaMapAI::matchRequest(const Decision & decision, const CPackForServer * 
 		const int3 target = planned ? intended : h && !p->path.empty() ? h->convertToVisitablePos(p->path.back()) : int3(-1, -1, -1);
 		if(!h || (p->path.empty() && !planned))
 			unmatched = "MoveHero (no hero or path)";
+		else if(target == h->visitablePos() && [&] { for(int i = 0; i < OWN_HEROES; ++i) if(decision.heroes[i] == p->hid) { const int entry = decision.moveEntry(i, target); if(entry >= 0) pick(ActionType::MOVE, entry); return entry >= 0; } return false; }())
+			; // (bundle 60: its re-visit is ours where it does something, AlphaMapAI.h revisitEntry)
 		else if(target == h->visitablePos()) // (no entry of ours: Advice.cpp's revisitSkip takes its next request; mapping a Defend
 			// composition's re-visit to our GARRISON_SWAP was tried, 2026-11-11: following it, its next request swapped the hero
 			// back out, which is not ours, and 5-42 failed actions a player in 2 games to day 28 against none)
@@ -128,6 +130,69 @@ bool AlphaMapAI::matchRequest(const Decision & decision, const CPackForServer * 
 			if(choice.type < 0)
 				unmatched = "MoveHero (no move or travel of ours there)";
 		}
+	}
+	else if(const auto * p = dynamic_cast<const BuildBoat *>(pack); p && boatAdvice) // (alpha_heroes patch, bundle 60: AlphaMapAI.h boatAdvice)
+	{
+		const auto * object = cb->getObj(p->objid, false);
+		if(const auto * town = dynamic_cast<const CGTownInstance *>(object))
+		{
+			for(const auto & [index, e] : entries(ActionType::BUILD))
+				if(e.first == town->id && e.a == BuildingID::SHIP)
+					pick(ActionType::BUILD, index);
+			if(choice.type < 0)
+				unmatched = "BuildBoat (a town's: its SHIP not legal for us)";
+			else
+				++boatsMatched;
+		}
+		else if(object)
+		{
+			// The hero that sails (its task's: Nullkiller2's active hero), else ours nearest the shipyard with a move there
+			const int3 yard = object->visitablePos();
+			int slot = -1;
+			const auto active = advisorHero();
+			for(int i = 0; i < OWN_HEROES; ++i)
+				if(decision.heroes[i] != ObjectInstanceID() && decision.heroes[i] == active)
+					slot = i;
+			if(slot < 0)
+			{
+				double best = 1e18;
+				for(int i = 0; i < OWN_HEROES; ++i)
+					if(const auto * h = decision.heroes[i] != ObjectInstanceID() ? cb->getHero(decision.heroes[i]) : nullptr)
+						if(const double d = h->visitablePos().dist2dSQ(yard) + (h->visitablePos().z != yard.z ? 1e9 : 0.0); d < best)
+							best = d, slot = i;
+			}
+			const auto * h = slot >= 0 ? cb->getHero(decision.heroes[slot]) : nullptr;
+			if(!h)
+				unmatched = "BuildBoat (a map shipyard: no hero of ours)";
+			else if(h->visitablePos() == yard && decision.moveEntry(slot, yard) >= 0) // (its re-visit: bundle 60's revisitEntry)
+			{
+				pick(ActionType::MOVE, decision.moveEntry(slot, yard));
+				exact = false;
+			}
+			else if(h->visitablePos() == yard)
+				unmatched = "BuildBoat (a map shipyard: our hero on it, no re-visit legal)";
+			else if(const int entry = decision.moveEntry(slot, yard); entry >= 0)
+			{
+				pick(ActionType::MOVE, entry);
+				exact = false;
+			}
+			else
+			{
+				const auto distance = [&yard](const Entry & e) { return 1.0 + e.tile.dist2dSQ(yard) + (e.tile.z != yard.z ? 1e6 : 0.0); };
+				const auto hero = h->id;
+				pick(ActionType::TRAVEL, nearest(entries(ActionType::TRAVEL), [hero](const Entry & e) { return e.first == hero; }, distance, 1.0, exact));
+				exact = false;
+			}
+			if(choice.type >= 0)
+			{
+				boatAdvised.insert(object->id); // (our question there: YES, showShipyardDialog)
+				++boatsMatched;
+			}
+			else if(unmatched.empty())
+				unmatched = "BuildBoat (a map shipyard: no move or travel of ours there)";
+		}
+		else
+			unmatched = "BuildBoat (no shipyard)";
 	}
 	else if(const auto * p = dynamic_cast<const BuildStructure *>(pack))
 	{

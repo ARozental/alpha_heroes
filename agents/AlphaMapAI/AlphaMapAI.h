@@ -278,6 +278,26 @@ class AlphaMapAI : public CAdventureAI
 	// three heroes in turn; counted in the summary's advice "revisit_skipped"
 	bool revisitSkip = true;
 	int revisitsSkipped = 0;
+	// alpha_heroes patch (bundle 60, the boat part): ALPHA_MAP_BOAT_ADVICE, 1 unless set. Nullkiller2 builds a boat at any
+	// shipyard not an enemy's without going there (BuildBoat: VCMI's server allows it); a human builds one in a town of
+	// theirs (our BUILD's SHIP) or by visiting a map shipyard and saying yes (our question, showShipyardDialog). Its
+	// BuildBoat is matched to those: a town's SHIP; at a map shipyard its hero's MOVE onto it (TRAVEL toward it beyond
+	// today), the shipyard then remembered (boatAdvised) so our question there takes YES as its advice. Counted in the
+	// summary's advice "boats" (matched) and "boat_answers" (questions advised YES)
+	bool boatAdvice = true;
+	// alpha_heroes patch (bundle 60, teleports and boats; the user: what a human can do, the model must be able to do):
+	// ALPHA_MAP_REVISIT, 1 unless set. The centre cell of a hero's own MOVE window (its own tile) is a MOVE's target where
+	// re-visiting what it stands on does something a human does with Space: a teleporter entrance whose exit we have not
+	// seen (going through it: Nullkiller2's Explore probes them, 25 requests in 4 island games), a map shipyard where a
+	// boat can be built now (its question again: 9 of its BuildBoat requests in those games). Carried out as the
+	// re-visit itself (Actions.cpp moveHero); Nullkiller2's own-tile request there is matched to it (Match.cpp)
+	bool revisitEntry = true;
+	bool revisitUseful(const CGHeroInstance * hero) const;
+	mutable std::set<ObjectInstanceID> boatAdvised; // (matchRequest's, a const reading of the request: mutable)
+	mutable int boatsMatched = 0;
+	int boatAnswers = 0;
+	/// the advising Nullkiller2's hero executing its task now (none: an invalid id)
+	ObjectInstanceID advisorHero() const;
 	// A test's only (ALPHA_MAP_FOLLOW_ADVICE, a chance, 0 unless set; "1" plays its every advice): the advised entry played
 	// instead of our sampled one at that chance (paired_eval's follow arms)
 	double followAdvice = 0;

@@ -1284,7 +1284,16 @@ void AlphaMapAI::showShipyardDialog(const IShipyard * obj)
 		in.at(In::o_kind, 1) = static_cast<int>(OptionKind::NO);
 		in.at(In::option_mask, 0) = in.at(In::option_mask, 1) = 1;
 		decision.answers = {1, 0};
-		if(decide(decision).index == 0)
+		// (bundle 60, the boat part: YES advised where Nullkiller2's BuildBoat sent our hero here, Match.cpp)
+		std::optional<Choice> advice;
+		if(boatAdvice && boatAdvised.erase(id))
+		{
+			advice = Choice{};
+			advice->type = -1;
+			advice->index = 0;
+			++boatAnswers;
+		}
+		if(decide(decision, advice).index == 0)
 		{
 			cb->buildBoat(yard);
 			++boatsBuilt;
