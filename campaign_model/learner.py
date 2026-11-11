@@ -111,6 +111,11 @@ COLUMNS = [
 	# how often our choice was its advice, the advantage head's explained variance, players out of their game)
 	"choice_hidden", "teacher_agree_shown", "teacher_agree_hidden", "adv_ev_shown", "adv_ev_hidden", "eliminated_shown", "eliminated_hidden",
 	"adv_raw_sd_shown", "adv_raw_sd_hidden",
+	# (config.adv_gain: the KL the head's term adds to our own policy a decision and the mean |gain x A_hat|, all and apart)
+	"adv_kl", "adv_read", "adv_kl_shown", "adv_kl_hidden", "adv_read_shown", "adv_read_hidden",
+	# (config.schedule_action_price: the mean charge a decision and its share of the 7-day credit's spread; what it is judged
+	# by: our heroes' idle movement, and how often a day's first action is END, apart for the two kinds of games)
+	"action_price_mean", "action_price_share", "idle_movement_shown", "idle_movement_hidden", "end_first", "end_first_shown", "end_first_hidden",
 ]
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
 DROP_BEYOND = 4  # updates' worth of finished games beyond which the oldest are dropped (_take)
@@ -855,7 +860,10 @@ class CampaignLearner:
 			# (config.nk2_choice_games: the games that hid Nullkiller2's own choice, and the rest: how often ours was its
 			# choice there, the advantage head's fit, players out of their game)
 			**choice_readings(games, metrics),
-			**{name: metrics.get(name, float("nan")) for name in ("adv_loss", "adv_ev", "adv_ev_followed", "adv_ev_deviating", "adv_followed", "adv_raw_sd")},
+			**{name: metrics.get(name, float("nan")) for name in ("adv_loss", "adv_ev", "adv_ev_followed", "adv_ev_deviating", "adv_followed", "adv_raw_sd", "adv_kl", "adv_read")},
+			"action_price_mean": metrics.get("schedule_action_price_mean", float("nan")),
+			"action_price_share": metrics.get("schedule_action_price_share", float("nan")),
+			"end_first": reading(end_first, [d for game, _ in games for d in game.decisions]),
 			"label_mean": sums["label_sum"] / max(n, 1),
 			"price_mean": sums["price_sum"] / max(n, 1),
 			"policy_loss": metrics.get("policy", float("nan")),
@@ -971,7 +979,7 @@ class CampaignLearner:
 			"  value ev " + "/".join(f"{row[f'head_ev_v{k}']:+.2f}" for k in c.VALUE_OFFSETS)
 			+ f" (this update {row[f'value_ev_d{c.VALUE_OFFSETS[-1]}']:+.2f}: corr {metrics.get('value_corr', float('nan')):+.2f}, spread {metrics.get('value_spread', float('nan')):.3f} vs {metrics.get('label_spread', float('nan')):.3f}, unexplained {metrics.get('value_unexplained', float('nan')):.2f}{privileged_note})"
 			+ "  growth ev " + "/".join(f"{row[f'head_ev_g{k}']:+.2f}" for k in c.VALUE_OFFSETS) + f"  end ev {row['head_ev_vend']:+.2f} (credit {row['end_credit']:.2f})  trust {row['trust']:.2f} (today {self.trust_today():.2f})"
-			+ f"  kl {row['last_kl']:.4f} (target {metrics.get('kl_target', float('nan')):.4f})" + (f"  teacher kl {row['teacher_kl']:.3f} (weight {row['teacher_weight']:.2f})" if self.teacher is not None else "") + (f"  advice {row['advised']:.0%} of turns and exchanges, ours its {row['teacher_agree']:.0%}, teacher ce {row['teacher_ce']:.3f} (weight {row['teacher_weight']:.2f})" if self.config.nk2_advice > 0 else "") + (f"  its choice hidden in {row['choice_hidden']:.0%} of the games: ours its advice {row['teacher_agree_shown']:.0%} shown, {row['teacher_agree_hidden']:.0%} hidden; the head's ev {row['adv_ev_shown']:+.3f} shown, {row['adv_ev_hidden']:+.3f} hidden, the advantage's sd {row['adv_raw_sd_shown']:.3g} shown, {row['adv_raw_sd_hidden']:.3g} hidden; eliminated {row['eliminated_shown']:.3f} shown, {row['eliminated_hidden']:.3f} hidden" if getattr(self.config, "nk2_choice_games", 1.0) < 1.0 else "") + (f"  advantage head: loss {row['adv_loss']:.4f}, ev {row['adv_ev']:+.3f} (its own choice {row['adv_ev_followed']:+.3f} at {row['adv_followed']:.0%}, leaving it {row['adv_ev_deviating']:+.3f}), the advantage's sd {row['adv_raw_sd']:.3g}" if self.config.adv_weight > 0 else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f} (fraction {(metrics.get('signal_fraction') or {}).get('all', float('nan')):.3f})  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f}" + (f", every hero slot in {metrics['full_windows']} steps" if metrics.get("full_windows") else "") + (", window budget refused" if metrics.get("window_budget_ok") is False else "") + f")  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
+			+ f"  kl {row['last_kl']:.4f} (target {metrics.get('kl_target', float('nan')):.4f})" + (f"  teacher kl {row['teacher_kl']:.3f} (weight {row['teacher_weight']:.2f})" if self.teacher is not None else "") + (f"  advice {row['advised']:.0%} of turns and exchanges, ours its {row['teacher_agree']:.0%}, teacher ce {row['teacher_ce']:.3f} (weight {row['teacher_weight']:.2f})" if self.config.nk2_advice > 0 else "") + (f"  action price {row['action_price_mean']:.2e} a decision ({row['action_price_share']:.2%} of the 7-day credit's spread), a day begun with END {row['end_first']:.3f}" if self.config.schedule_action_price > 0 else "") + (f"  its choice hidden in {row['choice_hidden']:.0%} of the games: ours its advice {row['teacher_agree_shown']:.0%} shown, {row['teacher_agree_hidden']:.0%} hidden; the head's ev {row['adv_ev_shown']:+.3f} shown, {row['adv_ev_hidden']:+.3f} hidden, the advantage's sd {row['adv_raw_sd_shown']:.3g} shown, {row['adv_raw_sd_hidden']:.3g} hidden; idle movement {row['idle_movement_shown']:.3f} shown, {row['idle_movement_hidden']:.3f} hidden; a day begun with END {row['end_first_shown']:.3f} shown, {row['end_first_hidden']:.3f} hidden; eliminated {row['eliminated_shown']:.3f} shown, {row['eliminated_hidden']:.3f} hidden" if getattr(self.config, "nk2_choice_games", 1.0) < 1.0 else "") + (f"  advantage head: loss {row['adv_loss']:.4f}, ev {row['adv_ev']:+.3f} (its own choice {row['adv_ev_followed']:+.3f} at {row['adv_followed']:.0%}, leaving it {row['adv_ev_deviating']:+.3f}), the advantage's sd {row['adv_raw_sd']:.3g}" + (f"; read by our policy at {float(self.model.features.adv_gain_weight()):.3f} a unit: |term| {row['adv_read']:.4f}, its KL {row['adv_kl']:.5f} (shown {row['adv_kl_shown']:.5f}, hidden {row['adv_kl_hidden']:.5f})" if getattr(self.config, "adv_gain", 0.0) > 0 else "") if self.config.adv_weight > 0 else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f} (fraction {(metrics.get('signal_fraction') or {}).get('all', float('nan')):.3f})  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f}" + (f", every hero slot in {metrics['full_windows']} steps" if metrics.get("full_windows") else "") + (", window budget refused" if metrics.get("window_budget_ok") is False else "") + f")  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
 			flush=True,
 		)
 
@@ -1579,8 +1587,30 @@ def choice_readings(games, metrics):
 		out[f"teacher_agree_{name}"] = float(np.mean([agrees(d) for d in advised])) if advised else float("nan")
 		out[f"adv_ev_{name}"] = metrics.get(f"adv_ev_{name}", float("nan"))
 		out[f"adv_raw_sd_{name}"] = metrics.get(f"adv_raw_sd_{name}", float("nan"))
+		out[f"adv_kl_{name}"] = metrics.get(f"adv_kl_{name}", float("nan"))
+		out[f"adv_read_{name}"] = metrics.get(f"adv_read_{name}", float("nan"))
+		ours = [d for game, _ in kinds[hidden] for d in game.decisions]
+		out[f"idle_movement_{name}"] = reading(idle_movement, ours) if ours else float("nan")
+		out[f"end_first_{name}"] = reading(end_first, ours) if ours else float("nan")
 		out[f"eliminated_{name}"] = reading(eliminated_share, kinds[hidden]) if kinds[hidden] else float("nan")
 	return out
+
+
+def idle_movement(decisions):
+	"""failures.py's idle_movement over these decisions alone (of the movement our heroes have in a day, the share left
+	when the turn ends); nan with none."""
+	from .failures import NAMES as names, idle_counts
+
+	counts = {name: [0, 0] for name in names}
+	idle_counts(decisions, counts, 3000)
+	hit, total = counts["idle_movement"]
+	return hit / total if total else float("nan")
+
+
+def end_first(decisions):
+	"""The share of the days' first turn decisions (Decision.today 0) that ended the turn at once; nan with none."""
+	first = [d for d in decisions if d.kind == c.DecisionKind.TURN and d.today == 0 and d.action_type >= 0]
+	return sum(d.action_type == c.ActionType.END for d in first) / len(first) if first else float("nan")
 
 
 def eliminated_share(games):

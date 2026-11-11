@@ -121,3 +121,59 @@ def test_an_update_reads_the_head_apart_for_the_two_kinds_of_games():
 	metrics, _ = ppo_update(model, make_optimizer(model, optimizer_config), decisions, targets, None, optimizer_config, decode=lambda rows: {k: v[rows] for k, v in x.items()}, advantages=advantages, clips=CLIPS, hidden=hidden)
 	for name in ("adv_ev_shown", "adv_ev_hidden", "adv_raw_sd_shown", "adv_raw_sd_hidden"):
 		assert np.isfinite(metrics[name]), name
+
+
+def test_the_learner_logs_every_reading_of_deploy_59(tmp_path, capsys):
+	"""CampaignLearner.step end to end as deploy 59's line runs it (the head at weight 1 and read at gain 1, half the games
+	hiding the choice, the action price at 2e-6): every new column in progress.csv, every part of the update's line."""
+	import collections
+	import csv
+	import dataclasses
+	import threading
+
+	from campaign_model.empire import EmpireConfig
+	from campaign_model.labels import LabelConfig
+	from campaign_model.learner import COLUMNS, CampaignLearner, set_advice_prior
+	from campaign_model.model import build_model
+	from campaign_model.schema import random_inputs
+	from campaign_model.tests.test_labels import snapshot
+	from campaign_model.tests.test_model import encoded
+	from campaign_model.tests.test_train import decisions_for
+	from campaign_model.train import make_optimizer
+
+	torch.manual_seed(6)
+	kwargs = {"dim": 32, "cell_dim": 16, "heads": 4, "layers": 1, "architecture": "v2", "share_target": "change"}
+	model = build_model(kwargs).eval()
+	config = CampaignConfig(decisions_per_update=8, min_games_per_update=2, batch_size=4, passes=1, learner="thread", device="cpu", credit="schedule", share_target="change", model_architecture="v2", noise_every=0, adv_weight=1.0, adv_gain=1.0, nk2_choice_games=0.5, schedule_action_price=2e-6)
+	set_advice_prior(model, config)
+	games = []
+	for g in range(2):
+		x = random_inputs(8, seed=30 + g)
+		decisions = [dataclasses.replace(d, inputs=encoded(x, b), day=1 + b // 3, advice=(d.action_type, d.index, d.cell) if b % 2 else None) for b, d in enumerate(decisions_for(model, x, seed=g))]
+		done = {"RED": {"advice": {"asked": 4, "choice_shown": g}}, "BLUE": {"advice": {"asked": 4, "choice_shown": g}}}
+		games.append((Game(decisions=decisions, ledgers={d: snapshot(d, 1000 + 300 * d, 1000) for d in range(1, 14)}, days=12, done=done), SimpleNamespace(seconds=1.0, map_name="Maps/alpha_random/x")))
+
+	class Writer:
+		def add_scalar(self, *args):
+			pass
+
+		def flush(self):
+			pass
+
+	learner = SimpleNamespace(
+		config=config, labels=LabelConfig(), empire=EmpireConfig(), version=1, finished=list(games), lock=threading.Condition(), stats=collections.Counter(),
+		model=model, optimizer=make_optimizer(model, config), device=torch.device("cpu"), worker=None, model_lock=threading.Lock(), lr_scale=1.0,
+		server=SimpleNamespace(set_model=lambda *args: None), teacher=None, teacher_weight=0.0, games_used=0, out=tmp_path, kwargs=kwargs, value_ev=None, credit_evidence={}, credit_check=1.0, head_ev={"Vend": 0.2}, value_pool=None, head_pool={}, progress=tmp_path / "progress.csv", writer=Writer(),
+		features_cpu=model.features, trust_ema=None, grad_clips=None, clip_samples=[], head_residual=None, head_var_slow=None, head_residual_updates=0, held=None, held_updates=0, gather_ramp_start=None, valve=None, value_readings=[], value_own=0,
+	)
+	for name in ("_take", "trust", "trust_today", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting", "loss_shares", "loss_weights", "_note_gradients", "gather_weight_now", "valve_now", "_note_valve", "_valve_reading", "_head_scale", "_calibrate_clips", "_judge_value"):
+		setattr(learner, name, getattr(CampaignLearner, name).__get__(learner))
+	learner.progress.write_text(",".join(COLUMNS) + "\n")
+	capsys.readouterr()
+	assert CampaignLearner.step(learner, epoch=1)
+	printed = capsys.readouterr().out
+	row = list(csv.DictReader(open(learner.progress)))[-1]
+	for part in ("advantage head: loss", "read by our policy at", "action price", "its choice hidden in 50% of the games", "idle movement", "a day begun with END"):
+		assert part in printed, part
+	assert float(row["choice_hidden"]) == 0.5 and float(row["action_price_mean"]) > 0 and float(row["adv_kl"]) >= 0 and row["adv_read"] not in ("", "nan")
+	assert "FAILURE" not in printed

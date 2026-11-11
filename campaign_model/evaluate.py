@@ -49,6 +49,7 @@ COLUMNS = [
 	# (the split evaluation's: the OWN arm, its choice hidden; the FOLLOW arm, shown, on a subset of OWN's setups)
 	"games_own", "score_own", "score_own_se", "score_own_d28", "eliminated_own", "won_own", "phi_own", "own_vs_previous", "own_vs_previous_se",
 	"games_follow", "score_follow", "score_follow_se", "score_follow_d28", "eliminated_follow", "won_follow", "follow_minus_own", "follow_minus_own_se",
+	"idle_movement_own", "idle_movement_follow",  # (failures.py's idle_movement in each arm: config.schedule_action_price is judged by OWN's)
 ]
 # (a split evaluation's row leaves these empty: they meant every game with Nullkiller2's choice shown)
 SHOWN_ONLY = ("score", "score_se", "vs_previous", "vs_previous_se", "vs_first", "vs_first_se", "score_d28", "score_2p", "score_3p", "score_4p", "share", "phi", "phi_nullkiller", "heroes", "heroes_nullkiller", "eliminated", "won")
@@ -263,6 +264,8 @@ def split_row(played):
 		scores = [r["score"] for r in games]
 		out.update({f"games_{name}": len(games), f"score_{name}": mean(scores), f"score_{name}_se": se(scores), f"score_{name}_d28": mean([r["score_d28"] for r in games]),
 			f"eliminated_{name}": sum(r["eliminated"] for r in games), f"won_{name}": sum(r["won"] for r in games)})
+		idle = [r["failures"]["idle_movement"] for r in games if "failures" in r]
+		out[f"idle_movement_{name}"] = sum(h for h, _ in idle) / sum(t for _, t in idle) if sum(t for _, t in idle) else float("nan")
 	out["phi_own"] = mean([r["phi"] for r in played if r["arm"] == "own"])
 	own = {r["setup"]: r["score"] for r in played if r["arm"] == "own"}
 	diff = [r["score"] - own[r["setup"]] for r in played if r["arm"] == "shown" and r["setup"] in own]

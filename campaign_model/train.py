@@ -1242,6 +1242,7 @@ def ppo_update(
 	adv_before = adv_followed = adv_labelled = None
 	if config.adv_weight > 0 and getattr(model, "adv_outputs", False):
 		adv_before, adv_followed, adv_labelled = torch.zeros(n, device=device), torch.zeros(n, dtype=torch.bool, device=device), torch.zeros(n, dtype=torch.bool, device=device)
+		adv_kl_all, adv_read_all = torch.zeros(n, device=device), torch.zeros(n, device=device)  # (what the head's term does to our own policy: model_v2's decide)
 	gpu_anchor_mb = 0.0
 	with torch.no_grad():
 		chunk = config.prepass_batch or max(1, size // max(1, config.micro_batches))  # (no gradients, but at a whole minibatch it was the update's peak: 5.2 GB)
@@ -1257,6 +1258,8 @@ def ppo_update(
 			if adv_before is not None:
 				predicted, named = advantage_of(out, choice["action"][index], choice["index"][index])
 				adv_before[index], adv_followed[index], adv_labelled[index] = predicted.float(), named, out["adv_label"][:, 0] >= 0
+				if "adv_kl" in out:
+					adv_kl_all[index], adv_read_all[index] = out["adv_kl"].float(), out["adv_read"].float()
 			end_now[index] = torch.sigmoid(out["end_logit"].float())
 			if "growth_logit" in out:
 				growth_now[index] = out["growth_logit"][:, -1].float()
@@ -1396,7 +1399,7 @@ def ppo_update(
 		if config.schedule_action_price > 0 and end is not None and "actions" in end:
 			charged = config.schedule_action_price * torch.from_numpy(np.asarray(end["actions"], dtype=np.float32)).to(device)
 			if int(known.sum()) > 1:
-				schedule_stats.update(schedule_action_price_mean=float(charged[known].mean()), schedule_action_price_std=float(charged[known].std()))
+				schedule_stats.update(schedule_action_price_mean=float(charged[known].mean()), schedule_action_price_std=float(charged[known].std()), schedule_action_price_share=float(charged[known].mean() / advantage[known].std().clamp(min=1e-12)))  # (the mean charge over the 7-day credit's spread)
 			advantage = advantage - charged
 	if end is not None and end["weight"] > 0:  # the policy's credit moves toward the end's as V_end proves itself
 		turn = choices(decisions)["kind"] == c.DecisionKind.TURN
@@ -1427,9 +1430,15 @@ def ppo_update(
 			adv_ev=explained(advantage, adv_before, rows), adv_ev_followed=explained(advantage, adv_before, rows & adv_followed),
 			adv_ev_deviating=explained(advantage, adv_before, rows & adv_labelled & ~adv_followed), adv_followed=float((rows & adv_followed).sum()) / max(1, int(rows.sum())),
 		)
+		# (config.adv_gain: the KL the head's term adds to our own policy a decision, and the mean |gain x A_hat| it moves
+		# the logits by, under our own policy, before the follow mixture)
+		sound = ~unsound & (choice["action"] >= 0)
+		mean_of = lambda values, where: float(values[where].mean()) if int(where.sum()) else float("nan")  # noqa: E731
+		adv_stats.update(adv_kl=mean_of(adv_kl_all, sound), adv_read=mean_of(adv_read_all, sound))
 		if hidden is not None:  # (config.nk2_choice_games: the rows of games that hid Nullkiller2's own choice, and the rest)
 			adv_stats.update(adv_ev_shown=explained(advantage, adv_before, rows & ~hidden_t), adv_ev_hidden=explained(advantage, adv_before, rows & hidden_t))
-		del adv_before, adv_followed, adv_labelled
+			adv_stats.update(adv_kl_shown=mean_of(adv_kl_all, sound & ~hidden_t), adv_kl_hidden=mean_of(adv_kl_all, sound & hidden_t), adv_read_shown=mean_of(adv_read_all, sound & ~hidden_t), adv_read_hidden=mean_of(adv_read_all, sound & hidden_t))
+		del adv_before, adv_followed, adv_labelled, adv_kl_all, adv_read_all
 	credited_f, anchor_safe, shares = credited.float(), anchor.nan_to_num(neginf=0.0), {}
 	noise = {}
 	if measure_noise and growth_real is not None and labels is not None:  # (the loss terms' gradient noise, at the update's start)

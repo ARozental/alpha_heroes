@@ -80,6 +80,8 @@ def test_the_rows_arms_their_pairing_and_the_score_read(tmp_path):
 	first = split_row(1, [0.5, 1.0, 0.0, 1.5], {0: 0.9, 2: 0.4})
 	assert first["score_own"] == pytest.approx(0.75) and first["score_follow"] == pytest.approx(0.65)
 	assert first["follow_minus_own"] == pytest.approx(((0.9 - 0.5) + (0.4 - 0.0)) / 2) and first["eliminated_own"] == 1
+	with_idle = [dict(g, failures={"idle_movement": (1, 4) if g["arm"] == "own" else (3, 4)}) for g in first["per_game"]]
+	assert evaluate.split_row(with_idle)["idle_movement_own"] == pytest.approx(0.25) and evaluate.split_row(with_idle)["idle_movement_follow"] == pytest.approx(0.75)
 	evaluate.log(first, path)
 	second = split_row(2, [0.7, 1.2, 0.1, 1.4], {0: 1.0, 2: 0.5})
 	evaluate.log(second, path)

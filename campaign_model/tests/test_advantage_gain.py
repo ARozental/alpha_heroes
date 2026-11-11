@@ -159,3 +159,29 @@ def test_the_follow_mixture_is_exact_on_top_of_it():
 			assert torch.allclose(mixed[name][b].reshape(-1).exp(), table / p_type[t], atol=1e-5)
 		checked += 1
 	assert checked >= 2
+
+
+def test_the_readings_of_what_the_term_does():
+	"""adv_kl: KL(our own policy with the head's term || without) a decision, the type's and its tables' by the type's
+	chance; adv_read: the mean |term| under it. 0 at gain 0; at gain 1 the KL the outputs with and without show."""
+	model, x = model_and_inputs()
+	base = run(model, x, 0.0)
+	move = torch.zeros_like(base["move_logp"])
+	move.view(move.shape[0], -1)[:, :40] = 1.0
+	planted(model, x, adv_move=move, adv_type=torch.full(base["type_logp"].shape, 0.4))
+	model.adv_outputs = True
+	try:
+		off, on = run(model, x, 0.0), run(model, x, 1.0)
+	finally:
+		model.adv_outputs = False
+	assert float(off["adv_kl"].abs().max()) == 0.0 and float(off["adv_read"].abs().max()) == 0.0
+	p_new = on["type_logp"].exp()
+	expect = torch.where(p_new > 0, p_new * (on["type_logp"] - off["type_logp"]), torch.zeros_like(p_new)).sum(dim=1)
+	for name in TABLES:
+		new, old = on[name].reshape(len(p_new), -1), off[name].reshape(len(p_new), -1)
+		q = torch.where(torch.isfinite(new), new.exp(), torch.zeros_like(new))
+		t = [A_(k) for k in range(len(A_)) if k > 0 and HEADS[A_(k)][0] == name][0]
+		expect = expect + p_new[:, t] * torch.where(q > 0, q * (new - old), torch.zeros_like(q)).sum(dim=1)
+	turns = (p_new > 0).any(dim=1)  # (a question's decision has no action type: nothing read there)
+	assert torch.allclose(on["adv_kl"], expect, atol=1e-5) and float(on["adv_kl"].max()) > 0
+	assert float(on["adv_read"][turns].min()) >= 0.4 - 1e-5 and float(on["adv_read"][~turns].abs().max()) == 0.0

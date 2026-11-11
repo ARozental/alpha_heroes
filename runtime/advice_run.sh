@@ -242,6 +242,18 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # chance (score_follow; follow_minus_own paired on those 16). The old score columns stay empty from then on. Noise:
 # about +-0.15 at 32 games, +-0.2 at 16: read trends over three or more evaluations. Baselines: own ~0.51 (Mac, v3090,
 # job A's follow-0 arm), follow 0.75-0.79 (v3120 0.753, v3138 0.765, job A 0.792).
+# campaign.adv_gain=1 (stage 2a; the user, 16:30, "do 1+2": on now, without waiting for 50 updates of adv_ev; "we care
+# about what we can learn and how fast, not always the total score"): our own policy reads the advantage head,
+# 1 logit a unit of its prediction (the update's advantage in sd units), each table's term clipped to +-3 and centered
+# on its mean under our own table, each type's term clipped to +-3, before the follow mixture (5a04565). With the head
+# at adv_ev ~0.01-0.03 it moves almost nothing today and grows as the head learns (adv_read, adv_kl each update, shown
+# and hidden games apart). What shows it failing: the KL an update jumping; the OWN evaluation falling over three
+# evaluations; adv_ev turning negative after the gain is on (the head chasing its own effect).
+# campaign.schedule_action_price=2e-6 (the user, 2026-11-11: "we want to turn it on"; their size, never above 2e-5;
+# designed 2026-11-09): each decision's 7-day credit less 2e-6 for every action the player makes through that week (the
+# policy's credit only; the heads' labels stay the real outcomes). Judged by our heroes' idle movement in the OWN arm and
+# in the hidden games (idle_movement_hidden). Comes out if idle movement does not fall over a day, or if END becomes
+# the first action of a day more often (end_first, end_first_hidden).
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -250,5 +262,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0.5 campaign.eval_own_games=32 campaign.eval_follow_games=16 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0.5 campaign.eval_own_games=32 campaign.eval_follow_games=16 campaign.adv_gain=1 campaign.schedule_action_price=2e-6 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null

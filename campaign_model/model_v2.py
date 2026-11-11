@@ -1154,6 +1154,9 @@ class CampaignModelV2(nn.Module):
 		adv = state.adv = self.advantage(state, known)
 		adv_gain = self.features.adv_gain_weight()
 		adv_types = {name: adv[name].detach() for name in ("adv_type", "adv_named", "adv_move", "adv_travel")}
+		# (the trainer's readings of what the head's term does to our own policy, before the follow mixture: each type's
+		# scores without it, each table's KL from it and its mean |term| under the policy; adv_outputs only)
+		reading = {"plain": [], "kl": [], "read": []} if self.adv_outputs else None
 		scores, legal_types = [], []
 		for action in c.ActionType:
 			named = label_weight * (label_action == int(action)).to(state.glob.dtype)  # [B]: Nullkiller2's own choice is of this type
@@ -1161,6 +1164,10 @@ class CampaignModelV2(nn.Module):
 				own_end = adv_types["adv_type"][:, action] + adv_types["adv_named"][:, action] * (label_action == int(action)).to(state.glob.dtype)
 				scores.append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named + adv_gain * own_end.clamp(-ADV_CLIP, ADV_CLIP))
 				legal_types.append((x["g_kind"] == c.DecisionKind.TURN) | (x["g_kind"] == c.DecisionKind.EXCHANGE))
+				if reading is not None:
+					reading["plain"].append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named)
+					reading["kl"].append(torch.zeros_like(own_end))
+					reading["read"].append((adv_gain * own_end.clamp(-ADV_CLIP, ADV_CLIP)).abs().detach())
 				continue
 			name, mask_name = HEADS[action]
 			mask = x[mask_name]
@@ -1179,7 +1186,20 @@ class CampaignModelV2(nn.Module):
 			out[name] = flat_log_softmax(own + read, mask)
 			scores.append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action] + read, mask) + named + adv_gain * adv_types["adv_type"][:, action].clamp(-ADV_CLIP, ADV_CLIP))
 			legal_types.append(mask.reshape(b, -1).any(dim=-1))
+			if reading is not None:
+				reading["plain"].append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action], mask) + named)
+				new = out[name].detach().reshape(b, -1)
+				p_new = torch.where(torch.isfinite(new), new.exp(), torch.zeros_like(new))
+				reading["kl"].append(torch.where(p_new > 0, p_new * (new - here.reshape(b, -1)), torch.zeros_like(new)).sum(dim=1))
+				reading["read"].append((adv_gain * adv_types["adv_type"][:, action].clamp(-ADV_CLIP, ADV_CLIP)).abs().detach() + (p_new * read.detach().reshape(b, -1).abs()).sum(dim=1))
 		out["type_logp"] = masked_log_softmax(torch.stack(scores, dim=-1), torch.stack(legal_types, dim=-1))
+		if reading is not None:  # (adv_kl: KL(ours with the term || without) a decision, the type's and its tables' by the type's chance; adv_read: E|term| the logits move by)
+			legal = torch.stack(legal_types, dim=-1)
+			new_types, plain_types = out["type_logp"].detach(), masked_log_softmax(torch.stack(reading["plain"], dim=-1).detach(), legal)
+			p_type = torch.where(torch.isfinite(new_types), new_types.exp(), torch.zeros_like(new_types))
+			type_kl = torch.where(p_type > 0, p_type * (new_types - plain_types), torch.zeros_like(p_type)).sum(dim=1)
+			state.adv["adv_kl"] = type_kl + (p_type * torch.stack(reading["kl"], dim=-1)).sum(dim=1)
+			state.adv["adv_read"] = (p_type * torch.stack(reading["read"], dim=-1)).sum(dim=1)
 		self.follow(out, label_action, label_index, torch.stack(legal_types, dim=-1))
 		self.value(state, known, out)
 		return out
