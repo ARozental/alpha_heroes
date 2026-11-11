@@ -110,3 +110,30 @@ def test_the_night_in_another_town_of_ours_is_its_shelter(model):
 	x["t_present"][0, 1], x["t_owner"][0, 1], x["t_pos"][0, 1], x["t_fort"][0, 1] = True, c.OWNER_SELF, [12, 10, 0], 3
 	x["t_garrison_creature"][0, 1, 0], x["t_garrison_count"][0, 1, 0], x["t_detailed"][0, 1] = 13, 1000, True
 	assert night(custom_features(model, x), [30, 10, 0]) > open_ground + 1.0
+
+
+def test_a_town_shelters_only_a_hero_that_can_be_inside(model):
+	"""features.shelter_open: a town whose visiting place another hero of ours holds is a meeting, not a shelter (the
+	hero stays beside it): the TRAVEL whose walk stops there costs as in the open; the same with a garrison hero there
+	(VCMI fights a visitor outside the walls first). Its own garrison hero is sheltered with a visitor there."""
+	out = ([30, 10, 0], [7, 10, 0])  # (the walk stops on the town)
+
+	def with_town_heroes(visitor=-1, garrison=-1):
+		x = scene([10, 10, 0], [out])
+		x["h_present"][0, 1], x["h_owner"][0, 1], x["h_pos"][0, 1] = True, c.OWNER_SELF, [7, 10, 0]  # (another hero of ours)
+		x["t_visiting"][0, 0], x["t_garrison_hero"][0, 0] = visitor, garrison
+		return night(custom_features(model, x), out[0])
+
+	free, visited, garrisoned = with_town_heroes(), with_town_heroes(visitor=1), with_town_heroes(garrison=1)
+	assert free > visited + 1.0 and free > garrisoned + 1.0, (free, visited, garrisoned)
+	x = scene([7, 10, 0], [([30, 10, 0], [12, 10, 0])])
+	x["t_garrison_hero"][0, 0] = 0  # (our hero is the garrison's; a visitor of ours fights first)
+	x["h_present"][0, 1], x["h_owner"][0, 1], x["h_pos"][0, 1], x["t_visiting"][0, 0] = True, c.OWNER_SELF, [7, 10, 0], 1
+	assert night(custom_features(model, x), [30, 10, 0]) < -2.0  # (it leaves its shelter for the open)
+
+
+def test_a_table_of_moves_offers_less_than_staying_when_every_move_is_worse():
+	"""features.signed_offer: the best legal entry, below 0 when all are; 0 with none legal (offer floors at 0)."""
+	logits = torch.tensor([[[-3.0, -1.0], [5.0, -2.0]], [[1.0, 2.0], [0.0, 0.0]]])
+	legal = torch.tensor([[[True, True], [False, True]], [[False, False], [False, False]]])
+	assert ft.signed_offer(logits, legal).tolist() == [-1.0, 0.0] and ft.offer(logits, legal).tolist() == [0.0, 0.0]

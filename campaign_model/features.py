@@ -94,6 +94,16 @@ def offer(logits, legal):
 	return torch.relu(logits).masked_fill(~legal, 0.0).flatten(1).amax(dim=1)
 
 
+def signed_offer(logits, legal):
+	"""What a table of moves offers against standing still: its best legal entry's prior logit, below 0 when every one
+	is worse than staying (its prior counts the night's danger: model.tile_features, travel_prior), 0 when none is
+	legal. offer's floor at 0 left that to the learned logits, which prefer spending a hero's movement: e5's games of
+	2026-11-10, a hero in a town with 196 movement left took a TRAVEL whose stop was beside it (P 0.50, END 0.40), every
+	TRAVEL as bad, and died there."""
+	best = logits.masked_fill(~legal, -1e4).flatten(1).amax(dim=1)
+	return torch.where(legal.flatten(1).any(dim=1), best, torch.zeros_like(best))
+
+
 def relative_position(delta):
 	"""[..., 8] features of offsets [..., 3] in tiles (x, y, level): direction at 8 and 32 tiles, Chebyshev distance at
 	8, 32 and 128 tiles, the same level. Every distance in tiles: the same on any map size."""
@@ -493,7 +503,8 @@ def sheltered_danger(x, hero_strength, manned, decision, hero, foes):
 	"""Our towns' danger to a hero of ours inside one [K, OWN_TOWNS] (K windows; decision [K] their decisions, hero [K]
 	their heroes' slots 0..OWN_HEROES, foes enemies() of their decisions): town_danger's with this hero in the town, an
 	enemy hero's reach to it x P(it beats the defence: the garrison and the fort, which fights while a hero defends
-	(manned: the model's town strength with it), a hero of ours in its garrison and the visitor, this hero once)."""
+	(manned: the model's town strength with it), a hero of ours in its garrison and the visitor, this hero once); and
+	[K, OWN_TOWNS] whether the hero is inside it or can get in (shelter_open)."""
 	to = c.OWN_TOWNS
 	strength = hero_strength.index_select(0, decision)  # [K, H]
 
@@ -506,7 +517,19 @@ def sheltered_danger(x, hero_strength, manned, decision, hero, foes):
 	defence = log_add(log_add(log_add(manned[:, :to].index_select(0, decision), defender(x["t_visiting"][:, :to])), defender(x["t_garrison_hero"][:, :to])), ours)
 	pos = x["t_pos"][:, :to].index_select(0, decision)
 	near, theirs = reach(foes, pos[..., 0], pos[..., 1], pos[..., 2])  # [K, TO, E]
-	return (near * torch.sigmoid(2 * (theirs - defence.unsqueeze(-1)))).amax(dim=-1)
+	return (near * torch.sigmoid(2 * (theirs - defence.unsqueeze(-1)))).amax(dim=-1), shelter_open(x, decision, hero)
+
+
+def shelter_open(x, decision, hero):
+	"""[K, OWN_TOWNS] whether a hero of ours (hero [K] its slot, of decision [K]) is behind a town's walls there: its
+	garrison hero, or its visitor while no garrison hero is there (VCMI fights the visitor outside the walls first when
+	there is: CGTownInstance::isBattleOutsideTown); or can get in, the visiting place free and no garrison hero (with a
+	visitor there a step onto the town is a meeting, and the hero stays outside, beside it). e5's games of 2026-11-10: a
+	hero at danger 0.94 stepped onto a town twice, a hero of ours inside, ended beside it both times and was killed."""
+	garrison = x["t_garrison_hero"][:, : c.OWN_TOWNS].index_select(0, decision)
+	visitor = x["t_visiting"][:, : c.OWN_TOWNS].index_select(0, decision)
+	me = hero[:, None]
+	return (garrison == me) | ((garrison < 0) & ((visitor < 0) | (visitor == me)))
 
 
 def night_danger(x, hero_strength, manned, pos):
@@ -519,9 +542,10 @@ def night_danger(x, hero_strength, manned, pos):
 	open_ground = (near * torch.sigmoid(2 * (theirs - hero_strength[:, :HO, None, None]))).amax(dim=-1)
 	decision = torch.arange(b, device=pos.device).repeat_interleave(HO)
 	hero = torch.arange(HO, device=pos.device).repeat(b)
-	sheltered = sheltered_danger(x, hero_strength, manned, decision, hero, tuple(t.index_select(0, decision) for t in foes)).reshape(b, HO, -1)  # [B, HO, TO]
+	sheltered, open_ = sheltered_danger(x, hero_strength, manned, decision, hero, tuple(t.index_select(0, decision) for t in foes))
+	sheltered, open_ = sheltered.reshape(b, HO, -1), open_.reshape(b, HO, -1)  # [B, HO, TO]
 	own = x["t_present"][:, : c.OWN_TOWNS] & (x["t_owner"][:, : c.OWN_TOWNS] == c.OWNER_SELF)
-	inside = (pos.unsqueeze(3) == x["t_pos"][:, None, None, : c.OWN_TOWNS]).all(dim=-1) & own[:, None, None, :]  # [B, HO, N, TO]
+	inside = (pos.unsqueeze(3) == x["t_pos"][:, None, None, : c.OWN_TOWNS]).all(dim=-1) & (own[:, None, :] & open_)[:, :, None, :]  # [B, HO, N, TO]
 	return torch.where(inside.any(dim=-1), (inside.float() * sheltered.unsqueeze(2)).amax(dim=-1), open_ground)
 
 

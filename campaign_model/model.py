@@ -1265,10 +1265,10 @@ class CustomFeatures(nn.Module):
 		# its weights were trained on. joint7's heroes killed on the enemy's turn: 2 of 130 in a town; the danger term had
 		# been learned down to 0.37 of its prior, a town as dangerous as open ground, staying in one no shelter
 		own_towns = x["t_present"][:, :TO] & (x["t_owner"][:, :TO] == c.OWNER_SELF)
-		sheltered = ft.sheltered_danger(x, f.hero_strength, self.town_strength(x, f.town_power, manned=True), decision, torch.remainder(heroes, HO), enemies)  # [K, TO]
-		in_town = on_tile(x["t_pos"][:, :TO], own_towns)  # [K, W, W, TO]
+		sheltered, open_ = ft.sheltered_danger(x, f.hero_strength, self.town_strength(x, f.town_power, manned=True), decision, torch.remainder(heroes, HO), enemies)  # [K, TO]
+		in_town = on_tile(x["t_pos"][:, :TO], own_towns) & open_[:, None, None, :]  # [K, W, W, TO] (a town it can be inside: features.shelter_open)
 		night = torch.where(in_town.any(dim=-1), (in_town.float() * sheltered[:, None, None, :]).amax(dim=-1), danger)
-		stands_in = ((x["t_pos"][:, :TO].index_select(0, decision) == stand[:, None, :, 0, 0]).all(dim=-1) & own_towns.index_select(0, decision)).float()  # [K, TO]
+		stands_in = ((x["t_pos"][:, :TO].index_select(0, decision) == stand[:, None, :, 0, 0]).all(dim=-1) & own_towns.index_select(0, decision) & open_).float()  # [K, TO]
 		night_here = torch.where(stands_in.amax(dim=-1) > 0, (stands_in * sheltered).amax(dim=-1), here)
 		night_value = (night_here[:, None, None] - night) * ((ours(f.hero_gold) + hero) * self.night_weight())[:, None, None]
 		defend = (on_tile(x["t_pos"][:, :TO], own_towns).float() * f.town_danger.index_select(0, decision)[:, None, None, :]).amax(dim=-1)
@@ -1967,7 +1967,7 @@ class CampaignModel(nn.Module):
 		travel = self.travel(own_heroes, x["h_pos"][:, :HO], areas, f.area_centres).reshape(b, HO, L, TG, TG) + travel_prior
 		out["travel_logp"] = flat_log_softmax(travel, x["travel_mask"])
 		both = torch.cat([prior.reshape(b, -1), travel_prior.reshape(b, -1)], dim=1), torch.cat([x["move_mask"].reshape(b, -1), x["travel_mask"].reshape(b, -1)], dim=1)
-		return {"move": ft.offer(prior, x["move_mask"]), "travel": ft.offer(travel_prior, x["travel_mask"]), "any": ft.offer(*both)}
+		return {"move": ft.signed_offer(prior, x["move_mask"]), "travel": ft.signed_offer(travel_prior, x["travel_mask"]), "any": ft.offer(*both)}
 
 	def town_actions(self, x, f, out, own_towns, town_levels):
 		b, d = own_towns.shape[0], self.dim

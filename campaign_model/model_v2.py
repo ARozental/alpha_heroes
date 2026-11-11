@@ -766,12 +766,12 @@ class CampaignModelV2(nn.Module):
 			cast_cell = dense(real_only(self.cast_cell_out(state.move_pairs).squeeze(-1), known), known.windows, known.n, b)
 		# (the act-now score of each window slot's hero: its own, or the hero a further window belongs to, schema 17)
 		learned[A_.MOVE], prior[A_.MOVE] = move + self.act_move(own_heroes).reshape(b, HO).gather(1, ft.slot_heroes(x)).reshape(b, HO, 1, 1), move_prior
-		offers[A_.MOVE] = ft.offer(move_prior, x["move_mask"])
+		offers[A_.MOVE] = ft.signed_offer(move_prior, x["move_mask"])  # (below 0 when every move is worse than staying)
 		out["cast_cell_logp"] = masked_log_softmax(cast_cell.reshape(b, HO, W * W), x["cast_cell_mask"].reshape(b, HO, W * W)).reshape(b, HO, W, W)
 		# TRAVEL: (hero, area) pairs, + the area's prior (its value discounted by the days to it)
 		learned[A_.TRAVEL] = (self.travel_out(state.travel_pairs).squeeze(-1) + self.act_travel(own_heroes)).reshape(b, HO, L, TG, TG)
 		prior[A_.TRAVEL] = known.travel_logits.reshape(b, HO, L, TG, TG)  # (the network reads travel_prior: without the night)
-		offers[A_.TRAVEL] = ft.offer(prior[A_.TRAVEL], x["travel_mask"])
+		offers[A_.TRAVEL] = ft.signed_offer(prior[A_.TRAVEL], x["travel_mask"])
 		# BUILD: the town's query against each building. A purchase short of resources pays the trades it makes (known.
 		# build_trade, recruit_trade: the gold of worth they lose), priced as every change of Φ is (value_logit), in the
 		# entry and in its type's offer: the least any legal entry pays, 0 while one needs no trade (within the table
