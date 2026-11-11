@@ -7,8 +7,8 @@
 
 namespace MapSchema
 {
-constexpr int SCHEMA_VERSION = 17;
-constexpr const char * CONTRACT_HASH = "8789fc40ab7d59e8";
+constexpr int SCHEMA_VERSION = 18;
+constexpr const char * CONTRACT_HASH = "646ef7403f93374b";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;
@@ -329,6 +329,7 @@ enum class In : int
 	army_slot_mask,
 	w_extra,
 	w_extra_pos,
+	travel_stop,
 	COUNT
 };
 
@@ -480,6 +481,7 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"army_slot_mask", DType::BOOL, 4, {17, 7, 17, 7}, 0},
 	TensorSpec{"w_extra", DType::INT64, 1, {8, 1, 1, 1}, 0},
 	TensorSpec{"w_extra_pos", DType::INT64, 2, {8, 3, 1, 1}, 0},
+	TensorSpec{"travel_stop", DType::INT64, 4, {8, 2, 18, 18}, 0},
 }};
 
 enum class Out : int

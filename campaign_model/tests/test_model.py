@@ -1,3 +1,4 @@
+import copy
 import math
 import zlib
 
@@ -392,6 +393,44 @@ def test_a_stronger_enemy_hero_makes_its_reach_cost_and_leaving_it_pay(model):
 	east, west = (c.WINDOW_RADIUS, c.WINDOW_RADIUS + 3), (c.WINDOW_RADIUS, c.WINDOW_RADIUS - 6)
 	assert float(calm.abs().max()) < 1e-3
 	assert float(value[east]) < -100 and float(value[west]) > 500  # (6 tiles away is already deep in its reach: closer adds little)
+
+
+def test_a_town_of_ours_shelters_a_hero_from_a_stronger_enemy(model):
+	"""2026-11-10 (joint7's heroes killed on the enemy's turn: 2 of 130 in a town): a stronger enemy hero 6 tiles east;
+	our town 3 tiles west holds 1,000 angels behind a castle. Tonight's danger on its tile (tile_night) is the town's
+	with the hero inside, far below the open tile next to it, and a hero standing in the town pays in MOVE's logit prior
+	to leave it; the network's inputs keep the hero-alone danger (its weights were trained on it): night_gain moves the
+	logit prior and nothing the network reads."""
+	from campaign_model.model import MOVE_FEATURES
+
+	danger_column = MOVE_FEATURES.index("danger")
+
+	def scene(hero_at, enemy=True):
+		x, _ = window_with(-1)
+		x["h_pos"][0, 0] = hero_at
+		if enemy:
+			x["h_present"][0, c.OWN_HEROES], x["h_owner"][0, c.OWN_HEROES] = True, c.OWNER_SELF + 1
+			x["h_pos"][0, c.OWN_HEROES] = [16, 10, 0]
+			x["h_army_creature"][0, c.OWN_HEROES, 0], x["h_army_count"][0, c.OWN_HEROES, 0], x["h_detailed"][0, c.OWN_HEROES] = 13, 500, True  # angels
+		x["t_present"][0, 0], x["t_owner"][0, 0], x["t_pos"][0, 0], x["t_fort"][0, 0] = True, c.OWNER_SELF, [7, 10, 0], 3
+		x["t_garrison_creature"][0, 0, 0], x["t_garrison_count"][0, 0, 0], x["t_detailed"][0, 0] = 13, 1000, True
+		return x
+
+	R = c.WINDOW_RADIUS
+	f = custom_features(model, scene([10, 10, 0]))
+	town, beside = (R, R - 3), (R + 1, R - 3)
+	night, danger = f.tile_night[0], f.move_features[0][..., danger_column]
+	assert float(night[beside]) > 0.5 and float(night[town]) < 0.5 * float(night[beside]), (float(night[town]), float(night[beside]))
+	assert float(danger[town]) == pytest.approx(float(danger[beside]), abs=0.02)  # (the network's danger: the hero's alone)
+	inside, calm = custom_features(model, scene([7, 10, 0])), custom_features(model, scene([7, 10, 0], enemy=False))
+	out = (R, R + 2)  # (two tiles east of the town: toward the enemy, still open ground)
+	assert float(inside.tile_prior[0][out] - calm.tile_prior[0][out]) < -1.0
+	weighted = copy.deepcopy(model)
+	with torch.no_grad():
+		weighted.features.night_gain.fill_(0.1)  # (x e^(CORRECTION_STEP x 0.1): the night counts e times as much)
+	moved = custom_features(weighted, scene([7, 10, 0]))
+	assert torch.equal(moved.move_features, inside.move_features) and torch.equal(moved.cell_features, inside.cell_features)
+	assert float(moved.tile_prior[0][out]) < float(inside.tile_prior[0][out]) - 0.1
 
 
 def test_each_value_head_is_its_own_readout_and_starts_at_its_prior():

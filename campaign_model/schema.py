@@ -212,6 +212,7 @@ INPUTS = (
 	# the tiles one reaches today that its own window does not show (constants.WINDOW_RADIUS)
 	_i("w_extra", (HO,), "0: this slot's window is its own hero's, around it (hero token = the slot); h + 1: one more window of our hero token h, around w_extra_pos"),
 	_i("w_extra_pos", (HO, 3), "x, y, level of the middle tile of a further window (w_extra > 0)"),
+	_i("travel_stop", (HO, L, TG, TG), "where today's walk toward each TRAVEL area's tile stops (VCMI's path there: its last tile reached today): (level x 256 + y) x 256 + x + 1; 0 where TRAVEL is not legal, and in a record from before schema 18"),
 )
 
 

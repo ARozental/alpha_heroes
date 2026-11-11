@@ -1496,8 +1496,8 @@ def test_records_from_before_schema_11_read_with_no_guards_battle_join_or_armed_
 	x["x_heroes"][:, :] = [1, 2]
 	x["multi_mask"][:, 0, 0] = True
 	full = zlib.decompress(encoded(x, 0))
-	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 7
-	lengths = sorted(SHORT_RECORDS)  # (records of schemas 9, 10, 11-12, 13, 14 and 15 widened, and 16: each ends where the next's inputs start)
+	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 8
+	lengths = sorted(SHORT_RECORDS)  # (records of schemas 9, 10, 11-12, 13, 14 and 15 widened, 16 and 17: each ends where the next's inputs start)
 	for n in lengths[:4]:
 		got = decode_inputs([SimpleNamespace(inputs=zlib.compress(full[:n]))])
 		before_11 = ("o_battle", "o_join", "d_guard_count", "a_present", "a_count") if n < lengths[2] else ()

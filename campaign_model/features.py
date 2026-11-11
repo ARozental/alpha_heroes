@@ -489,6 +489,54 @@ def town_danger(x, hero_strength, town_strength):
 	return (near * torch.sigmoid(2 * (theirs - defence.unsqueeze(-1)))).amax(dim=-1) * (x["t_present"][:, :to] & (x["t_owner"][:, :to] == c.OWNER_SELF))
 
 
+def sheltered_danger(x, hero_strength, manned, decision, hero, foes):
+	"""Our towns' danger to a hero of ours inside one [K, OWN_TOWNS] (K windows; decision [K] their decisions, hero [K]
+	their heroes' slots 0..OWN_HEROES, foes enemies() of their decisions): town_danger's with this hero in the town, an
+	enemy hero's reach to it x P(it beats the defence: the garrison and the fort, which fights while a hero defends
+	(manned: the model's town strength with it), a hero of ours in its garrison and the visitor, this hero once)."""
+	to = c.OWN_TOWNS
+	strength = hero_strength.index_select(0, decision)  # [K, H]
+
+	def defender(index):  # [K, TO]: the log strength of another hero of ours there, very low if none
+		index = index.index_select(0, decision)
+		found = torch.gather(strength, 1, index.clamp(min=0))
+		return torch.where((index >= 0) & (index != hero[:, None]), found, torch.full_like(found, -30.0))
+
+	ours = strength.gather(1, hero[:, None])  # [K, 1]
+	defence = log_add(log_add(log_add(manned[:, :to].index_select(0, decision), defender(x["t_visiting"][:, :to])), defender(x["t_garrison_hero"][:, :to])), ours)
+	pos = x["t_pos"][:, :to].index_select(0, decision)
+	near, theirs = reach(foes, pos[..., 0], pos[..., 1], pos[..., 2])  # [K, TO, E]
+	return (near * torch.sigmoid(2 * (theirs - defence.unsqueeze(-1)))).amax(dim=-1)
+
+
+def night_danger(x, hero_strength, manned, pos):
+	"""P(a hero of ours is lost tonight) [B, HO, N] if its day ends at pos [B, HO, N, 3] (x, y, level): the enemy heroes
+	we see, each one's reach there x P(it beats the hero), at the most (MOVE's danger); in a town of ours an enemy must
+	beat the town's defence with the hero inside (sheltered_danger)."""
+	b = pos.shape[0]
+	foes = enemies(x, hero_strength)
+	near, theirs = reach(foes, pos[..., 0], pos[..., 1], pos[..., 2])  # [B, HO, N, E]
+	open_ground = (near * torch.sigmoid(2 * (theirs - hero_strength[:, :HO, None, None]))).amax(dim=-1)
+	decision = torch.arange(b, device=pos.device).repeat_interleave(HO)
+	hero = torch.arange(HO, device=pos.device).repeat(b)
+	sheltered = sheltered_danger(x, hero_strength, manned, decision, hero, tuple(t.index_select(0, decision) for t in foes)).reshape(b, HO, -1)  # [B, HO, TO]
+	own = x["t_present"][:, : c.OWN_TOWNS] & (x["t_owner"][:, : c.OWN_TOWNS] == c.OWNER_SELF)
+	inside = (pos.unsqueeze(3) == x["t_pos"][:, None, None, : c.OWN_TOWNS]).all(dim=-1) & own[:, None, None, :]  # [B, HO, N, TO]
+	return torch.where(inside.any(dim=-1), (inside.float() * sheltered.unsqueeze(2)).amax(dim=-1), open_ground)
+
+
+STOP_RADIX = 256  # (schema 18's travel_stop: (level x 256 + y) x 256 + x + 1)
+
+
+def travel_stops(x):
+	"""Where today's walk toward each TRAVEL area stops ([B, HO, AREAS, 3] x, y, level) and whether that is known ([B, HO,
+	AREAS]: schema 18's travel_stop; none in a record from before, or where TRAVEL is not legal)."""
+	code = x["travel_stop"][:, :HO].reshape(x["travel_stop"].shape[0], HO, -1).long() - 1
+	known = code >= 0
+	code = code.clamp(min=0)
+	return torch.stack([code % STOP_RADIX, torch.div(code, STOP_RADIX, rounding_mode="floor") % STOP_RADIX, torch.div(code, STOP_RADIX * STOP_RADIX, rounding_mode="floor")], dim=-1), known
+
+
 def emptied_danger(x, hero_strength):
 	"""Our towns' danger once their upper army has gone into the visitor (MULTI's GATHER) and the visitor with it
 	[B, OWN_TOWNS]: an empty town's (town_danger's with no defence: an empty town's fort does not fight, town_strength).

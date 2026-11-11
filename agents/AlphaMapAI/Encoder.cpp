@@ -1382,6 +1382,17 @@ void AlphaMapAI::encodeTurnActions(Decision & decision, PathfinderCache & paths)
 			const double day = std::max(1, h->movementPointsLimit(true));
 			const double days = node->turns + std::clamp(1.0 - node->moveRemains / day, 0.0, 1.0);
 			in.values[static_cast<size_t>(In::travel_days)][index] = static_cast<int64_t>(std::lround(100.0 * days));
+			// Where today's walk stops (schema 18): the path's last tile reached today (its nodes run from the target back
+			// to the hero; moveHero walks on while it can pay the next step). The hero spends the night there: the prior
+			// prices that night's danger (features.night_danger)
+			int3 stop = path.nodes.back().coord;
+			for(const auto & step : path.nodes)
+				if(step.turns == 0)
+				{
+					stop = step.coord;
+					break;
+				}
+			in.values[static_cast<size_t>(In::travel_stop)][index] = (static_cast<int64_t>(stop.z) * 256 + stop.y) * 256 + stop.x + 1;
 			Entry entry;
 			entry.first = h->id;
 			entry.tile = target.second;

@@ -280,6 +280,7 @@ class CustomFeatures(nn.Module):
 		zeros = lambda *shape: nn.Parameter(torch.zeros(shape))  # noqa: E731 (every correction starts at its prior)
 		self.object_gain, self.fight_sharpness, self.enemy_value, self.explore_gain, self.hero_value = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.danger_gain, self.garrison_penalty, self.fort_gain = zeros(), zeros(), zeros()
+		self.night_gain = zeros()  # (2026-11-10: tonight's danger in MOVE's and TRAVEL's logit priors; night_weight)
 		self.meeting_gain = zeros()  # (2026-11-05: what meeting a hero of ours or entering a town of ours gains, tile_features)
 		self.multi_weight = zeros()  # (2026-11-05: how far a multi-action's gain to Φ biases it: multi_prior)
 		self.give_all_cost = zeros()  # (2026-11-05: what a GIVE_ALL must gain to be worth making; give_all_cost_weight)
@@ -326,6 +327,7 @@ class CustomFeatures(nn.Module):
 			self.swap_gain, self.swap_slot, self.last_swap,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
+			self.night_gain,
 		]
 
 	# ---- the bounded prior parameters ----
@@ -334,6 +336,11 @@ class CustomFeatures(nn.Module):
 	def gain(raw, low=-MAX_LOG_GAIN, high=MAX_LOG_GAIN):
 		"""A multiplicative correction: exp of a log-gain within [low, high], 1 at the start."""
 		return torch.exp(ft.bounded(raw, low, high, 0.0, CORRECTION_STEP))
+
+	def night_weight(self):
+		"""How far P(lost tonight) x what a lost battle takes counts in MOVE's and TRAVEL's logit priors: 1 at the start,
+		the expected loss in gold, as a pickup's gain counts."""
+		return self.gain(self.night_gain)
 
 	def explore_gold(self):
 		"""What a step revealing a sight of new land is worth (gold)."""
@@ -547,7 +554,7 @@ class CustomFeatures(nn.Module):
 		f.trade_options = ft.trade_options(x, self)
 		f.build_trade, f.recruit_trade, f.recruit_short = ft.purchase_trades(x, self)
 		f.area_centres = ft.centres(x, TG)
-		f.travel_prior = self.travel_prior(x, f)
+		f.travel_prior, f.travel_logits = self.travel_prior(x, f)
 		if windows.shape[0] > 0:
 			f.update(self.tile_features(x, windows, f))
 		f.option_prior, f.option_features = self.option_knowledge(x, f)
@@ -928,10 +935,12 @@ class CustomFeatures(nn.Module):
 		features = torch.cat([battle.unsqueeze(-1) * fight.unsqueeze(1), takes.unsqueeze(-1) * join.unsqueeze(1), battle.unsqueeze(-1), takes.unsqueeze(-1), self.recruit_fit(x)], dim=-1)
 		return prior, features
 
-	def town_strength(self, x, power):
-		"""Each town's log strength [B, T]: its garrison's, plus its fort's while it is defended (FORT_STRENGTH x a gain)."""
+	def town_strength(self, x, power, manned=False):
+		"""Each town's log strength [B, T]: its garrison's, plus its fort's while it is defended (FORT_STRENGTH x a gain):
+		by a garrison, or by a hero that enters it (manned)."""
 		fort = constant(FORT_STRENGTH, power.device)[x["t_fort"].clamp(0, len(FORT_STRENGTH) - 1)]
-		return torch.log1p(power + fort * self.gain(self.fort_gain) * (power > 0))
+		defended = torch.ones_like(power, dtype=torch.bool) if manned else power > 0
+		return torch.log1p(power + fort * self.gain(self.fort_gain) * defended)
 
 	def town_value(self, x):
 		"""What taking each town adds to Φ at least [B, T]: its village hall and its fort level's buildings at cost (by
@@ -952,9 +961,14 @@ class CustomFeatures(nn.Module):
 		return self.object_gold(obj, x["m_subtype"]), gate, count * self.fight_value[vocab_index(creature, c.CREATURE_VOCAB)]
 
 	def travel_prior(self, x, f):
-		"""TRAVEL's prior logits [B, HO, L * TG^2]: each area's value in gold (its objects by class at each class's
-		worth, the land it would reveal), discounted by the days each hero needs to get there (the pathfinder's,
-		travel_days; Nullkiller2's evaluateMovement), as a logit (features.value_logit)."""
+		"""TRAVEL's prior [B, HO, L * TG^2] as the network reads it and as its logits: each area's value in gold (its
+		objects by class at each class's worth, the land it would reveal), discounted by the days each hero needs to get
+		there (the pathfinder's, travel_days; Nullkiller2's evaluateMovement), as a logit (features.value_logit). The
+		logits also count the night (2026-11-10): a TRAVEL walks on until today's movement is spent and the hero spends the
+		night where it stops (schema 18's travel_stop), so what that changes in P(it is lost tonight) x what a lost battle
+		takes counts in gold, undiscounted, as MOVE's night term does (night_weight; features.night_danger: in a town of
+		ours the town's defence with the hero). Of joint7's 18 big heroes killed on the enemy's turn in 12 games against
+		Nullkiller2 (v2728), 16 had ended their day with a TRAVEL, 10 of them out of a town of ours."""
 		contents, hidden = ft.area_contents(x, f.object_counts)
 		value = (contents * self.class_value * self.gain(self.class_gain)).sum(dim=-1) + hidden * self.explore_gold()
 		days = (x["travel_days"][:, :HO].reshape(value.shape[0], HO, -1).float() / 100).clamp(min=0)  # (-1: not legal, masked)
@@ -962,7 +976,17 @@ class CustomFeatures(nn.Module):
 		home, defend, ferry, _, _ = self.pull_weights()
 		pulls = self.travel_pulls(x, f, value.shape[-1])  # [B, HO, A, 3]
 		weights = torch.stack([home, defend, ferry])
-		return ft.value_logit(value.unsqueeze(1) * discount) + (weights * torch.tanh(pulls * discount.unsqueeze(-1) / ft.PULL_SCALE)).sum(dim=-1)
+		rest = (weights * torch.tanh(pulls * discount.unsqueeze(-1) / ft.PULL_SCALE)).sum(dim=-1)
+		gain = value.unsqueeze(1) * discount
+		if "travel_stop" not in x:
+			return ft.value_logit(gain) + rest, ft.value_logit(gain) + rest
+		stops, known = ft.travel_stops(x)
+		manned = self.town_strength(x, f.town_power, manned=True)
+		here = ft.night_danger(x, f.hero_strength, manned, x["h_pos"][:, :HO].unsqueeze(2))  # [B, HO, 1]
+		tonight = ft.night_danger(x, f.hero_strength, manned, stops)
+		at_stake = f.hero_gold[:, :HO] + f.hero_worth[:, :HO] + (HERO_HIRE_COST - self.hero_base) * self.gain(self.hero_value)
+		night = (here - tonight) * known * (at_stake * self.night_weight()).unsqueeze(-1)
+		return ft.value_logit(gain) + rest, ft.value_logit(gain + night) + rest
 
 	def travel_pulls(self, x, f, areas):
 		"""Nullkiller2's plans across days in each hero's TRAVEL areas [B, HO, A, 3] (gold): a main hero's pull to the area of
@@ -1231,8 +1255,22 @@ class CustomFeatures(nn.Module):
 		near_here, theirs_here = ft.reach(enemies, stand[:, 0], stand[:, 1], stand[:, 2])  # [K, 1, 1, E]
 		here = (near_here * torch.sigmoid(2 * (theirs_here - our_strength[:, None, None, None]))).amax(dim=-1)[:, 0, 0]
 		at_stake = (ours(f.hero_gold) + hero) * self.gain(self.danger_gain)
-		value = value + (here[:, None, None] - danger) * at_stake[:, None, None]
+		danger_value = (here[:, None, None] - danger) * at_stake[:, None, None]
+		value = value + danger_value
+		# The night (2026-11-10): what ending the day there instead of where the hero stands changes in P(it is lost
+		# tonight) x what a lost battle takes, in gold like a pickup (night_weight: 1 at the start). In a town of ours the
+		# hero is not alone: an enemy must beat the town's defence with it (features.sheltered_danger), on the town's tile
+		# and where the hero stands in one; elsewhere the danger above. It replaces the danger term in the logit prior
+		# alone (night_value): the network's inputs (the danger feature, the prior as a feature) stay as they were, which
+		# its weights were trained on. joint7's heroes killed on the enemy's turn: 2 of 130 in a town; the danger term had
+		# been learned down to 0.37 of its prior, a town as dangerous as open ground, staying in one no shelter
 		own_towns = x["t_present"][:, :TO] & (x["t_owner"][:, :TO] == c.OWNER_SELF)
+		sheltered = ft.sheltered_danger(x, f.hero_strength, self.town_strength(x, f.town_power, manned=True), decision, torch.remainder(heroes, HO), enemies)  # [K, TO]
+		in_town = on_tile(x["t_pos"][:, :TO], own_towns)  # [K, W, W, TO]
+		night = torch.where(in_town.any(dim=-1), (in_town.float() * sheltered[:, None, None, :]).amax(dim=-1), danger)
+		stands_in = ((x["t_pos"][:, :TO].index_select(0, decision) == stand[:, None, :, 0, 0]).all(dim=-1) & own_towns.index_select(0, decision)).float()  # [K, TO]
+		night_here = torch.where(stands_in.amax(dim=-1) > 0, (stands_in * sheltered).amax(dim=-1), here)
+		night_value = (night_here[:, None, None] - night) * ((ours(f.hero_gold) + hero) * self.night_weight())[:, None, None]
 		defend = (on_tile(x["t_pos"][:, :TO], own_towns).float() * f.town_danger.index_select(0, decision)[:, None, None, :]).amax(dim=-1)
 		move_left = pick("w_move_left")
 		left = (move_left.clamp(min=0).float() / ours(x["h_move_max"]).clamp(min=1).float()[:, None, None]).clamp(max=1) * (move_left >= 0)
@@ -1248,7 +1286,9 @@ class CustomFeatures(nn.Module):
 			) / ft.PULL_SCALE
 		)  # [K, W, W, 3]
 		home_weight, defend_weight, ferry_weight, _, _ = self.pull_weights()
-		prior = ft.value_logit(value) + (torch.stack([home_weight, defend_weight, ferry_weight]) * pulls).sum(dim=-1) - self.safety_weight() * hopeless
+		rest = (torch.stack([home_weight, defend_weight, ferry_weight]) * pulls).sum(dim=-1) - self.safety_weight() * hopeless
+		prior = ft.value_logit(value) + rest  # (the network's input, as before the night term)
+		logits = ft.value_logit(value - danger_value + night_value) + rest  # (the MOVE prior's logits: tile_prior)
 		# model_v2's MOVE features beside MOVE_FEATURES, relative so they keep their meaning on any map and day (the user,
 		# 2026-11-04): hopeless (above); the object as a share of our Φ (log(1 + 100 x share) / 3: 1% 0.23, 10% 0.8); where
 		# a fight starts, what losing it takes (the army, the hero, its replacement) and what winning it takes (the enemy's
@@ -1293,7 +1333,7 @@ class CustomFeatures(nn.Module):
 			dim=-1,
 		)  # CELL_FEATURES
 		return {
-			"tile_value": value, "tile_prior": prior, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight, "tile_fight_ratio": fight_ratio, "tile_fights": fights.float(),
+			"tile_value": value, "tile_prior": logits, "tile_night": night, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight, "tile_fight_ratio": fight_ratio, "tile_fights": fights.float(),
 			"tile_stacks": (monster | guarded).float(),  # (a wandering monster or its zone: model_v2's battle head)
 			"move_strength": ft.strength_view(torch.cat([this_hero, main_army], dim=-1)), "move_relative": relative,  # (model_v2: MOVE_STRENGTH, MOVE_RELATIVE)
 		}
@@ -1457,7 +1497,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
@@ -1923,7 +1963,7 @@ class CampaignModel(nn.Module):
 			move, cast_cell, prior = (dense(v, windows, n, b) for v in (score, self.cast_cell_out(tile).squeeze(-1), f.tile_prior))
 		out["move_logp"] = flat_log_softmax(move, x["move_mask"])
 		out["cast_cell_logp"] = masked_log_softmax(cast_cell.reshape(b, HO, W * W), x["cast_cell_mask"].reshape(b, HO, W * W)).reshape(b, HO, W, W)
-		travel_prior = f.travel_prior.reshape(b, HO, L, TG, TG)
+		travel_prior = f.travel_logits.reshape(b, HO, L, TG, TG)
 		travel = self.travel(own_heroes, x["h_pos"][:, :HO], areas, f.area_centres).reshape(b, HO, L, TG, TG) + travel_prior
 		out["travel_logp"] = flat_log_softmax(travel, x["travel_mask"])
 		both = torch.cat([prior.reshape(b, -1), travel_prior.reshape(b, -1)], dim=1), torch.cat([x["move_mask"].reshape(b, -1), x["travel_mask"].reshape(b, -1)], dim=1)

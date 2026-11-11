@@ -770,7 +770,7 @@ class CampaignModelV2(nn.Module):
 		out["cast_cell_logp"] = masked_log_softmax(cast_cell.reshape(b, HO, W * W), x["cast_cell_mask"].reshape(b, HO, W * W)).reshape(b, HO, W, W)
 		# TRAVEL: (hero, area) pairs, + the area's prior (its value discounted by the days to it)
 		learned[A_.TRAVEL] = (self.travel_out(state.travel_pairs).squeeze(-1) + self.act_travel(own_heroes)).reshape(b, HO, L, TG, TG)
-		prior[A_.TRAVEL] = known.travel_prior.reshape(b, HO, L, TG, TG)
+		prior[A_.TRAVEL] = known.travel_logits.reshape(b, HO, L, TG, TG)  # (the network reads travel_prior: without the night)
 		offers[A_.TRAVEL] = ft.offer(prior[A_.TRAVEL], x["travel_mask"])
 		# BUILD: the town's query against each building. A purchase short of resources pays the trades it makes (known.
 		# build_trade, recruit_trade: the gold of worth they lose), priced as every change of Φ is (value_logit), in the

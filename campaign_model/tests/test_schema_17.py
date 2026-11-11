@@ -211,14 +211,16 @@ def test_an_entrance_with_no_exit_seen_is_worth_the_land_it_shows(model):
 		y["w_flags"][:, 0, row, column] |= c.TILE_VISITABLE | c.TILE_UNSEEN_EXIT
 	seen = {k: v.copy() for k, v in gate.items()}
 	seen["w_flags"][:, 0, row, column] -= c.TILE_UNSEEN_EXIT
+	pool_seen = {k: v.copy() for k, v in pool.items()}  # (the same whirlpool unflagged: the flag adds nothing to it)
+	pool_seen["w_flags"][:, 0, row, column] -= c.TILE_UNSEEN_EXIT
 	with torch.no_grad():
-		known = {name: model.domain_knowledge(tensors(y)) for name, y in (("gate", gate), ("pool", pool), ("seen", seen))}
+		known = {name: model.domain_knowledge(tensors(y)) for name, y in (("gate", gate), ("pool", pool), ("seen", seen), ("pool_seen", pool_seen))}
 	k = window_row(known["gate"], 0, 0)
 	at = lambda name, feature: getattr(known[name], feature)[k, row, column]  # noqa: E731
 	assert float(at("seen", "move_features")[explore]) == 0 and float(at("pool", "move_features")[explore]) == 0
 	assert float(at("gate", "move_features")[explore]) == 1
 	assert float(at("gate", "tile_value")) > float(at("seen", "tile_value")) and float(at("gate", "tile_prior")) > float(at("seen", "tile_prior"))
-	assert torch.equal(known["pool"].tile_value[k, row, column], known["seen"].tile_value[k, row, column]) or float(at("pool", "tile_value")) <= float(at("seen", "tile_value")) + 1e-4
+	assert torch.equal(known["pool"].tile_value[k, row, column], known["pool_seen"].tile_value[k, row, column])  # (2026-11-10: against the gate's it hung on the fixture's random object gains)
 	# TRAVEL: the area of an object so flagged
 	x["g_tiles"][:] = 0  # (no tile counted: no area hidden by its tiles)
 	far = {k_: v.copy() for k_, v in x.items()}

@@ -259,7 +259,7 @@ def _libz():
 # Records made before inputs were added at the end (schema 10: mem; schema 11: the question's guards and armed objects,
 # from o_battle on) end where those start: decoded with zeros there, which each of them reads as none (no memory, no
 # guard, no battle, no armed object)
-TAIL_STARTS = ("mem", "o_battle", "artifact_mask", "multi_mask", "x_take_creature", "army_slot_mask", "w_extra")
+TAIL_STARTS = ("mem", "o_battle", "artifact_mask", "multi_mask", "x_take_creature", "army_slot_mask", "w_extra", "travel_stop")
 _STARTS = {entry[0]: sum(e[-1] for e in IN_LAYOUT[:i]) for i, entry in enumerate(IN_LAYOUT)}
 SHORT_RECORDS = frozenset(_STARTS[name] for name in TAIL_STARTS if name in _STARTS)  # the byte lengths of older records
 MEM_BYTES = IN_BYTES - _STARTS["mem"]  # what a record of schema 9 (before the memory) lacks
