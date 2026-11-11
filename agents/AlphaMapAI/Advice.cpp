@@ -155,9 +155,9 @@ int candidateKind(const NK2AI::EvaluationContext & context)
 		return 1;
 	if(context.conquestValue > 0)
 		return 2;
-	const bool reward = context.goldReward > 0 || context.armyReward > 0 || context.skillReward > 0 || context.strategicalValue > 0 || context.armyGrowth > 0;
-	if(!reward && context.explorePriority > 0)
+	if(context.explorePriority > 0) // (set by ExplorePointEvaluator alone, which also gives every such point a strategical value)
 		return 5;
+	const bool reward = context.goldReward > 0 || context.armyReward > 0 || context.skillReward > 0 || context.strategicalValue > 0 || context.armyGrowth > 0;
 	return reward ? 0 : 6;
 }
 
@@ -251,6 +251,7 @@ void AlphaMapAI::initAdvice()
 	adviceFixes = adviceEnvironment("ALPHA_MAP_ADVICE_FIXES", "1") != "0";
 	gatherAdvice = adviceEnvironment("ALPHA_MAP_GATHER_ADVICE", "0") != "0";
 	nk2Inputs = adviceEnvironment("ALPHA_MAP_NK2_INPUTS", "0") != "0";
+	followAdvice = std::clamp(std::stod(adviceEnvironment("ALPHA_MAP_FOLLOW_ADVICE", "0")), 0.0, 1.0);
 #ifdef ALPHA_MAP_NK2_ADVICE
 	if(adviceProbability <= 0 && !nk2Inputs)
 		return;
@@ -851,4 +852,13 @@ void AlphaMapAI::candidateInputs(Decision & decision)
 		in.at(In::h_nk_threat, h, 2) = fixedPoint(static_cast<double>(node.maximumDanger.danger) / std::max(static_cast<double>(hero->getTotalStrength()), 1.0), 1000.0, 1e6);
 	}
 #endif
+}
+
+void AlphaMapAI::labelInputs(Decision & decision, const std::optional<Choice> & advice)
+{
+	if(!advice || advice->type < 0 || advice->index < 0)
+		return;
+	decision.inputs.at(In::g_nk_action) = advice->type + 1;
+	decision.inputs.at(In::g_nk_index) = advice->index + 1;
+	decision.inputs.at(In::g_nk_cell) = advice->cell + 1; // (-1 none: 0)
 }

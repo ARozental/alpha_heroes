@@ -262,6 +262,12 @@ class AlphaMapAI : public CAdventureAI
 	bool nk2Inputs = false;
 	std::map<std::tuple<int, int, int, int>, int> nkSettled;
 	void candidateInputs(Decision & decision);
+	/// Schema 19's g_nk_action, g_nk_index, g_nk_cell: Nullkiller2's own choice here (its advice, as the record's), 0 none
+	void labelInputs(Decision & decision, const std::optional<Choice> & advice);
+	// A test's only (ALPHA_MAP_FOLLOW_ADVICE, a chance, 0 unless set; "1" plays its every advice): the advised entry played
+	// instead of our sampled one at that chance (paired_eval's follow arms)
+	double followAdvice = 0;
+	std::mt19937 followRng{20261111};
 	// The model's phi (our empire's value in gold) at the player's first turn decision of each day (schema 19's
 	// g_phi_past: a week ago, else the oldest day there is)
 	std::map<int, double> phiByDay;

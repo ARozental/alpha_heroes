@@ -264,7 +264,10 @@ void AlphaMapAI::makeTurn()
 			if(nk2Inputs || adviceDrawn()) // (its view as inputs: its plan at every turn decision, before our forward)
 				advice = advise(decision, plan, accept);
 			if(nk2Inputs)
+			{
 				candidateInputs(decision);
+				labelInputs(decision, advice);
+			}
 			const auto choice = decide(decision, advice, plan, accept);
 			if(choice.type <= static_cast<int>(ActionType::END))
 				break;
@@ -624,6 +627,15 @@ Choice AlphaMapAI::decide(Decision & decision, const std::optional<Choice> & adv
 				memory[i] = std::llround(std::clamp(next[i], -1.0f, 1.0f) * MEMORY_SCALE);
 		}
 		choice = sample(decision, outputs);
+		if(advice && followAdvice > 0 && std::uniform_real_distribution<double>(0.0, 1.0)(followRng) < followAdvice)
+		{
+			// (a test's only, ALPHA_MAP_FOLLOW_ADVICE: its choice played at this chance instead of ours; the sample drawn all
+			// the same and the chance from a generator of its own, so the arms' draws stay in step)
+			choice.type = advice->type;
+			choice.index = advice->index;
+			choice.cell = advice->cell;
+			choice.logp = 0;
+		}
 		Record entry;
 		entry.day = cb->getDate(Date::DAY);
 		entry.kind = static_cast<int>(decision.kind);
@@ -1136,8 +1148,10 @@ void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, Query
 			break;
 		std::optional<Choice> advice;
 		std::vector<std::pair<int, int>> accept;
-		if(adviceDrawn())
+		if(nk2Inputs || adviceDrawn()) // (its view as inputs: its choice at the exchange as well, before our forward)
 			advice = adviseExchange(decision, first, second, accept);
+		if(nk2Inputs)
+			labelInputs(decision, advice);
 		const auto choice = decide(decision, advice, std::nullopt, accept);
 		if(choice.type != static_cast<int>(ActionType::ARMY) && choice.type != static_cast<int>(ActionType::ARTIFACT) && choice.type != static_cast<int>(ActionType::MULTI))
 			break;
