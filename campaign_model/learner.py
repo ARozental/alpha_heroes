@@ -802,8 +802,8 @@ class CampaignLearner:
 			"phi_end": mean(phi),
 			"heroes": mean(heroes),  # the one number for heroes (the user): mean heroes per player still in, over days
 			"gather_weight": sums.get("gather_weight", float("nan")),
-			"army_on_heroes": army_on_heroes(games, self.empire),
-			"eliminated": eliminated_share(games),
+			"army_on_heroes": reading(army_on_heroes, games, self.empire),
+			"eliminated": reading(eliminated_share, games),
 			"value_target_std": sums.get("value_target_std", float("nan")),
 			"label_mean": sums["label_sum"] / max(n, 1),
 			"price_mean": sums["price_sum"] / max(n, 1),
@@ -1415,6 +1415,15 @@ def _update_worker(config, kwargs, device_name, state, requests, results, latest
 			results.put(("ok", cpu, metrics, lr_scale))
 		except Exception:
 			results.put(("error", traceback.format_exc(), None, lr_scale))
+
+
+def reading(function, *args):
+	"""A diagnostic's value for the update's row: nan when it fails (a reading never ends an update)."""
+	try:
+		return function(*args)
+	except Exception as error:  # noqa: BLE001
+		print(f"FAILURE: campaign reading {function.__name__} failed: {error!r}", flush=True)
+		return float("nan")
 
 
 def army_on_heroes(games, empire):

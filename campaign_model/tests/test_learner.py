@@ -450,3 +450,15 @@ def test_gathers_label_ramps_in_and_the_collapse_readings():
 	assert eliminated_share(games) == 0.0
 	games[0][0].ledgers[3] = {"day": 3, "players": [player(0, True, False), player(1, False, False)]}
 	assert eliminated_share(games) == 0.5 and np.isnan(eliminated_share([]))
+
+
+def test_a_reading_that_fails_is_nan():
+	"""learner.reading: the update's diagnostics (army_on_heroes, eliminated_share) give nan on any error, never the
+	update's end (games whose snapshots are not what they expect)."""
+	import math
+
+	from campaign_model.learner import army_on_heroes, eliminated_share, reading
+
+	broken = [(SimpleNamespace(ledgers={1: {"day": 1}}, final=[]), None)]  # (a snapshot without its players)
+	assert math.isnan(reading(army_on_heroes, broken, None)) and math.isnan(reading(eliminated_share, broken))
+	assert reading(lambda a: a + 1, 2) == 3
