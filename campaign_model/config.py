@@ -293,6 +293,16 @@ class CampaignConfig:
 	# reading of 0.6 our heroes are lost 37% of nights, 77% at 0.9. The share of the advised labels dropped is logged
 	# (night_dropped). False: every label as before
 	nk2_night_drop: bool = False
+	# The value valves (2026-11-11; the user: a change that improves the games worsens V for a while, and V's noise then
+	# moves the policy, which shares its layers): r_v, the fresh value loss's median of its last 7 readings over an EMA of
+	# it (50 updates: a jump counts, a new level is absorbed), drives value_valve (the value terms' gradient into the shared
+	# layers x s = clip(1 / r_v, 0.1, 1): V re-fits on its own layer at full rate, the trunk's direction shielded) and
+	# kl_valve (the KL control's target x clip(1 / r_v, 0.25, 1): the policy's movement capped while V re-fits; the values'
+	# group stays outside lr_scale), each moved at most x1.25 an update (learner.valve_step). In the GATHER collapse
+	# (v2736-2839) the value's share of the shared layers' gradient was 0.16 (0.05 calm) and the KL sat at its target. If
+	# loss_shares were on, its balancing would raise the value's weight against value_valve. False: as before
+	value_valve: bool = False
+	kl_valve: bool = False
 	nk2_night_drop_logit: float = 1.0
 	nk2_night_drop_reading: float = 0.6
 	# MULTI inside an exchange's teacher span (train.TEACHER_SPAN_MULTI; the 2026-11-09 audit's M3): every exchange label

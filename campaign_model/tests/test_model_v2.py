@@ -1965,3 +1965,30 @@ def test_a_gather_takes_the_garrison_heros_army_when_one_is_there():
 		x["t_garrison_hero"][0, 0] = -1
 		without = float(m.domain_knowledge(x).emptied_danger[0, 0])
 	assert with_hero == pytest.approx(without) and with_hero > 0.9
+
+
+def test_the_value_valve_scales_only_the_shared_layers_gradient_from_the_value():
+	"""model_v2.value_valve (config.value_valve): the outputs are the same at any valve; the value loss's gradient on the
+	shared layers is the valve times its gradient at 1, value_hidden's and the heads' the same; at 1 the read is the
+	shared states exactly."""
+	torch.manual_seed(3)
+	model = CampaignModelV2(dim=32, cell_dim=8, layers=1).train()
+	x = {k: torch.from_numpy(v) for k, v in rich_inputs(4, 2).items()}
+	grads = {}
+	for valve in (1.0, 0.1):
+		model.zero_grad()
+		model.value_valve.fill_(valve)
+		out = model(x)
+		grads[valve] = (out, {name: p.grad.clone() if p.grad is not None else None for name, p in model.named_parameters()} if out["value_logit"].sum().backward() is None else None)
+	(out1, g1), (out2, g2) = grads[1.0], grads[0.1]
+	assert torch.equal(out1["value_logit"], out2["value_logit"]) and torch.equal(out1["type_logp"], out2["type_logp"])
+	shared = [name for name, g in g1.items() if g is not None and name.startswith(("encode_", "blocks."))]
+	heads = [name for name, g in g1.items() if g is not None and name.startswith(("value_hidden", "value_heads"))]
+	assert shared and heads
+	for name in shared:
+		assert torch.allclose(g2[name], 0.1 * g1[name], atol=1e-6, rtol=1e-4), name
+	for name in heads:
+		assert torch.allclose(g2[name], g1[name], atol=1e-6, rtol=1e-5), name
+	s = torch.randn(5, 7)
+	one = torch.ones(())
+	assert torch.equal(s * one + s.detach() * (1 - one), s)

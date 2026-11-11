@@ -312,6 +312,9 @@ class CampaignModelV2(nn.Module):
 		# graph's recording and the eager step it is checked against (graphs.window_budget), by a caller that counted the
 		# batch's heroes: a batch with more of them would lose some of its heroes' windows
 		self.window_budget = None
+		# (the value terms' gradient into the shared layers x this: CampaignLearner's value valve, config.value_valve; 1, as
+		# before, the forward the same; a buffer set in place, so a recorded graph reads the current one; not saved)
+		self.register_buffer("value_valve", torch.ones(()), persistent=False)
 		dp = d // 2  # (hero, tile) and (hero, area) pairs
 		self.pair_dim = dp
 		# domain_knowledge
@@ -904,7 +907,9 @@ class CampaignModelV2(nn.Module):
 		mine = torch.cat([x["h_present"][:, :HO], x["t_present"][:, :TO]], dim=1).float().unsqueeze(-1)
 		own = torch.cat([state.heroes[:, :HO], state.towns[:, :TO]], dim=1)
 		own_mean = (own * mine).sum(dim=1) / mine.sum(dim=1).clamp(min=1)
-		hidden = self.value_hidden(torch.cat([state.glob, own_mean, state.players[:, 0], known.phi], dim=-1))
+		shared = torch.cat([state.glob, own_mean, state.players[:, 0]], dim=-1)
+		shared = shared * self.value_valve + shared.detach() * (1 - self.value_valve)  # (value_valve: the forward the same, the gradient into the shared layers x it)
+		hidden = self.value_hidden(torch.cat([shared, known.phi], dim=-1))
 		share_prior = -torch.log(x["g_players"].clamp(min=2).float() - 1)
 		# V2, V5, V7: a share from 1 / players, or its logit's change from none (config.share_target)
 		value_logit = self.value_heads(hidden) + (share_prior.unsqueeze(-1) if self.share_target == "share" else 0.0)
