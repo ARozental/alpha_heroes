@@ -312,6 +312,10 @@ class CampaignConfig:
 	# The balancer gave the policy's mostly-noise gradient (noise scale 300-6,000 decisions, at 4,096 a step) its share by
 	# norm, and moved with the trust and the KL control on one ~10-update time constant through 19 restarts in 19.5 hours
 	loss_shares_freeze: int = 0
+	# The value-loss guard (learner.value_jump; the user, 2026-11-10: on a jump of the campaign's value loss the learning
+	# stops at once): the updates are held once the fresh value loss's median over the last 7 updates stands this many
+	# times above its calm level (0: off). A restart lifts the hold
+	value_jump_stop: float = 3.0
 	label_weights: tuple = (1 / 3, 1 / 3, 1 / 3)  # of the shares at VALUE_OFFSETS (labels.py)
 	decision_price: float = 1e-4  # share points per turn decision
 	# Evaluation against Nullkiller2 (evaluate.py): our models in one seat, Nullkiller2 in the others

@@ -94,6 +94,14 @@ COLUMNS = [
 ]
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
 DROP_BEYOND = 4  # updates' worth of finished games beyond which the oldest are dropped (_take)
+# The value-loss guard (config.value_jump_stop; the user, 2026-11-10: a jump of the campaign's value loss is the first
+# sign that something has gone wrong, and the learning must stop at once: it does not say the change is bad). The fresh
+# value loss (value_loss_fresh) of the last VALUE_JUMP_WINDOW updates, its median, against its calm level: the lowest
+# median of VALUE_JUMP_BASELINE readings in a row among the VALUE_JUMP_MEMORY before them. On joint7's 2,837 updates,
+# at 3 times the level, it fires twice: v1137 (2026-11-05, the first GATHER advice: the loss rose to 29 times its
+# level, the evals fell to 0.25) and v2749 (2026-11-10, the second: 14 updates after the deploy, 87 updates and five
+# evals before anybody looked); single readings 2-5 times the level follow every restart and do not fire it
+VALUE_JUMP_WINDOW, VALUE_JUMP_BASELINE, VALUE_JUMP_MEMORY = 7, 50, 300
 MAX_LABEL_STALENESS = 2  # model versions: older precomputed labels (labeler.py) are recomputed with the current tables
 
 
@@ -159,6 +167,9 @@ class CampaignLearner:
 		self.loss_scale, self.teacher_share = None, None  # (config.loss_shares) {"log_norm", "weight"} of the terms; the teacher's share
 		self.trust_ema = None  # (config.trust_memory) trust's slow average, trust() floors it at config.trust_floor
 		self.head_residual, self.head_var_slow, self.head_residual_updates = None, None, 0  # (config.head_scale_by "residual") the heads' running fresh excess, the variances that scale it, the updates since it began
+		# (config.value_jump_stop) the value-loss guard: why the updates are held (None: they run), the updates' games
+		# dropped since, the fresh value loss's readings (progress.csv's on a resume, _judge_value's after), this process's own
+		self.held, self.held_updates, self.value_readings, self.value_own = None, 0, [], 0
 		self.grad_clips, self.clip_samples = None, []  # (config.grad_clip_by_group) the groups' clips once calibrated, the calibration's steps' norms till then
 		latest = self.out / "checkpoint_latest.pt"
 		if resume and latest.exists():
@@ -258,6 +269,8 @@ class CampaignLearner:
 			from battle_model.train import upgrade_csv
 
 			upgrade_csv(self.progress, COLUMNS)
+			self.value_readings = fresh_readings(self.progress)
+		(self.out / "held").unlink(missing_ok=True)  # (the value-loss guard's note of a hold: a restart lifts it)
 		# A new run evaluates its starting model first; a resumed one when eval_minutes have passed since its last eval
 		# (by eval.csv's time: restarts must not keep putting evals off)
 		evals = self.out / "eval.csv"
@@ -464,6 +477,19 @@ class CampaignLearner:
 		"""One update if its games are in (the battle learner calls this between its updates); True if it ran."""
 		games = self._take()
 		if games is None:
+			return False
+		if getattr(self, "held", None) is not None:
+			# The value-loss guard holds the updates (_judge_value): the model stays as it is, served and evaluated as
+			# before, and the games that would have made this update are dropped (their battles went to the battle
+			# learner as they were played). A restart lifts it: somebody has looked
+			with self.lock:
+				for game, _ in games:
+					getattr(self, "label_futures", {}).pop(id(game), None)
+				self.stats["dropped_games"] += len(games)
+			unspool(game for game, _ in games)
+			self.held_updates += 1
+			if self.held_updates % 20 == 1:
+				print(f"campaign: FAILURE: the updates are HELD at version {self.version} ({self.held}); {self.held_updates} updates' games dropped since. A restart lifts the hold", flush=True)
 			return False
 		started, memory = time.time(), [("waited", rss_gb())]
 		unread = [game for game, _ in games if not restore_inputs(game)]  # (strip_inputs: only their spool files had them)
@@ -806,6 +832,7 @@ class CampaignLearner:
 			csv.writer(f).writerow([round(row[k], 6) if isinstance(row[k], float) else row[k] for k in COLUMNS])
 		if row["value_loss_fresh"] == row["value_loss_fresh"]:  # the eval tab's (battle_model/train.py VALUE_LOSS_TAB)
 			self.writer.add_scalar("eval/campaign_value_loss", row["value_loss_fresh"], self.version)
+		self._judge_value(row["value_loss_fresh"])
 		if metrics.get("value_unexplained", float("nan")) == metrics.get("value_unexplained", float("nan")):  # (train.ppo_update: not a column)
 			self.writer.add_scalar("eval/campaign_value_unexplained", metrics["value_unexplained"], self.version)
 		# The privileged critic (config.privileged_critic): its fit beside the critic's, how large its corrections have
@@ -876,6 +903,29 @@ class CampaignLearner:
 			+ f"  kl {row['last_kl']:.4f} (target {metrics.get('kl_target', float('nan')):.4f})" + (f"  teacher kl {row['teacher_kl']:.3f} (weight {row['teacher_weight']:.2f})" if self.teacher is not None else "") + (f"  advice {row['advised']:.0%} of turns and exchanges, ours its {row['teacher_agree']:.0%}, teacher ce {row['teacher_ce']:.3f} (weight {row['teacher_weight']:.2f})" if self.config.nk2_advice > 0 else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f} (fraction {(metrics.get('signal_fraction') or {}).get('all', float('nan')):.3f})  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f}" + (f", every hero slot in {metrics['full_windows']} steps" if metrics.get("full_windows") else "") + (", window budget refused" if metrics.get("window_budget_ok") is False else "") + f")  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
 			flush=True,
 		)
+
+	def _judge_value(self, reading):
+		"""The value-loss guard (config.value_jump_stop, 0: off; the user, 2026-11-10): an update's fresh value loss into
+		the readings; once this process has VALUE_JUMP_WINDOW of its own (a restart's first updates are not judged by the
+		readings from before it: after a rollback those are the abandoned updates'), value_jump of them at or above
+		the factor holds the updates (step) and says so: one FAILURE line, the file `held` beside progress.csv, the
+		TensorBoard series campaign/value_jump every update. An error here is a FAILURE line, never the run's end."""
+		try:
+			factor = float(getattr(self.config, "value_jump_stop", 0.0) or 0.0)
+			if not factor or reading != reading:
+				return
+			self.value_readings = (self.value_readings + [float(reading)])[-(VALUE_JUMP_MEMORY + VALUE_JUMP_WINDOW) :]
+			self.value_own += 1
+			ratio, now, level = value_jump(self.value_readings)
+			if ratio == ratio:
+				self.writer.add_scalar("campaign/value_jump", ratio, self.version)
+			if self.held is not None or self.value_own < VALUE_JUMP_WINDOW or not ratio >= factor:
+				return
+			self.held = f"the fresh value loss of the last {VALUE_JUMP_WINDOW} updates, median {now:.5f}, is {ratio:.1f} times its calm level {level:.5f}; config.value_jump_stop {factor:g}"
+			print(f"campaign: FAILURE: VALUE LOSS JUMP at version {self.version}: {self.held}. The campaign's updates are HELD from here: its model stays as it is, its games are dropped, until a restart", flush=True)
+			(self.out / "held").write_text(f"version {self.version}: {self.held}\n")
+		except Exception as error:
+			print(f"campaign: FAILURE: the value-loss guard failed ({type(error).__name__}: {str(error)[:200]}): this update is not judged", flush=True)
 
 	def save(self, path):
 		with self.model_lock:
@@ -1104,6 +1154,35 @@ def restore_inputs(game):
 		d.inputs = s.inputs
 	game.inputs_stripped = False
 	return True
+
+
+def value_jump(readings, window=VALUE_JUMP_WINDOW, baseline=VALUE_JUMP_BASELINE, memory=VALUE_JUMP_MEMORY):
+	"""How far the fresh value loss stands above its calm level (the value-loss guard): (ratio, now, level), now the
+	median of the last `window` readings, level the lowest median of `baseline` readings in a row among the `memory`
+	before them (the lowest: after a rollback the abandoned updates' readings are still in progress.csv and must not
+	become the level; a median: one game's outcome can make a reading several times its neighbours'). nan with fewer
+	than window + baseline readings or a level that is not above 0."""
+	nan = float("nan")
+	readings = [float(r) for r in readings if r == r]
+	if len(readings) < window + baseline:
+		return nan, nan, nan
+	last, before = readings[-window:], readings[-window - memory : -window]
+	level = min(float(np.median(before[i : i + baseline])) for i in range(len(before) - baseline + 1))
+	now = float(np.median(last))
+	return (now / level if level > 0 else nan), now, level
+
+
+def fresh_readings(progress, keep=VALUE_JUMP_MEMORY + VALUE_JUMP_WINDOW):
+	"""progress.csv's value_loss_fresh readings (the finite ones, the last `keep`): the value-loss guard's memory across
+	a restart. A file that cannot be read is no memory (the guard then waits for its own readings), never an error."""
+	try:
+		with open(progress, newline="") as f:
+			values = [row.get("value_loss_fresh") for row in csv.DictReader(f)]
+		values = [float(v) for v in values if v not in (None, "", "nan")]
+		return [v for v in values if np.isfinite(v)][-keep:]
+	except Exception as error:
+		print(f"campaign: FAILURE: the value-loss guard could not read {progress} ({type(error).__name__}: {str(error)[:120]}): it starts with no memory", flush=True)
+		return []
 
 
 def unspool(games):
