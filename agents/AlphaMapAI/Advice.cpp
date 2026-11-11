@@ -310,6 +310,7 @@ void AlphaMapAI::initAdvice()
 	gatherAdvice = adviceEnvironment("ALPHA_MAP_GATHER_ADVICE", "0") != "0";
 	nk2Inputs = adviceEnvironment("ALPHA_MAP_NK2_INPUTS", "0") != "0";
 	nk2Choice = adviceEnvironment("ALPHA_MAP_NK2_CHOICE", "1") != "0"; // (alpha_heroes patch, own games: AlphaMapAI.h)
+	revisitSkip = adviceEnvironment("ALPHA_MAP_REVISIT_SKIP", "1") != "0"; // (alpha_heroes patch, bundle 60: AlphaMapAI.h)
 	followAdvice = std::clamp(std::stod(adviceEnvironment("ALPHA_MAP_FOLLOW_ADVICE", "0")), 0.0, 1.0);
 #ifdef ALPHA_MAP_NK2_ADVICE
 	if(adviceProbability <= 0 && !nk2Inputs)
@@ -360,6 +361,7 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optiona
 	std::string unmatched = "no request";
 	const auto started = std::chrono::steady_clock::now();
 	bool gathers = false; // (its advice is a town's visit again: our GATHER, nothing accepted beside it)
+	const CGHeroInstance * revisited = nullptr; // (its request a no-op re-visit of our town by this hero: revisitSkip)
 	advisor->client.taken = [&](const CPackForServer & pack)
 	{
 		Choice choice;
@@ -385,27 +387,45 @@ std::optional<Choice> AlphaMapAI::advise(const Decision & decision, std::optiona
 			}
 		if(matchRequest(decision, &pack, choice, exact, unmatched, intended))
 			advice = choice;
+		else if(const auto * move = dynamic_cast<const MoveHero *>(&pack); move && revisitSkip && unmatched.rfind("MoveHero (own tile: our town, no GATHER", 0) == 0)
+			revisited = cb->getHero(move->hid); // (a no-op re-visit: AlphaMapAI.h revisitSkip)
 	};
-	try
+	const auto run = [&]()
 	{
-		// Its makeTurn takes the state's lock itself (shared), which this turn already holds: let go of it meanwhile
-		// (our turn: nothing else changes the state)
-		auto unlock = vstd::makeUnlockSharedGuard(CGameState::mutex);
-		// Its paths, from the state as it is now: our moves since its last advice changed it, and the events that tell
-		// it so go to us. Nullkiller::invalidatePathfinderData is not exported; AIGateway::newObject calls it (and
-		// remembers the object, a hero of ours, as its own turn's start remembers every object it sees)
-		const auto heroes = cb->getHeroesInfo();
-		if(!heroes.empty())
-			advisor->nk2->newObject(heroes.front());
-		advisor->nk2->makeTurn();
-	}
-	catch(const AdviceTaken &)
+		try
+		{
+			// Its makeTurn takes the state's lock itself (shared), which this turn already holds: let go of it meanwhile
+			// (our turn: nothing else changes the state)
+			auto unlock = vstd::makeUnlockSharedGuard(CGameState::mutex);
+			// Its paths, from the state as it is now: our moves since its last advice changed it, and the events that tell
+			// it so go to us. Nullkiller::invalidatePathfinderData is not exported; AIGateway::newObject calls it (and
+			// remembers the object, a hero of ours, as its own turn's start remembers every object it sees)
+			const auto heroes = cb->getHeroesInfo();
+			if(!heroes.empty())
+				advisor->nk2->newObject(heroes.front());
+			advisor->nk2->makeTurn();
+		}
+		catch(const AdviceTaken &)
+		{
+		}
+		catch(const std::exception & e)
+		{
+			unmatched = std::string("an error: ") + e.what();
+		}
+	};
+	run();
+	const std::string first = unmatched;
+	for(int retry = 0; retry < 3 && !advice && revisited; ++retry) // (each re-visiting hero held where it is, its next request)
 	{
+		advisor->nk2->nullkiller->adviceHeld.push_back(revisited);
+		revisited = nullptr;
+		run();
+		if(advice)
+			++revisitsSkipped;
 	}
-	catch(const std::exception & e)
-	{
-		unmatched = std::string("an error: ") + e.what();
-	}
+	if(!advisor->nk2->nullkiller->adviceHeld.empty() && !advice && (unmatched.empty() || unmatched == "no request"))
+		unmatched = first;
+	advisor->nk2->nullkiller->adviceHeld.clear();
 	advisor->client.taken = nullptr;
 #ifdef NK2_KEEPS_PLAN
 	// Its plan, made before any request of this turn of its (keepPlan): our hero slots' targets, and our entries that
@@ -686,6 +706,15 @@ bool AlphaMapAI::exchangeSettled(const CGHeroInstance * one, const CGHeroInstanc
 #endif
 }
 
+std::string AlphaMapAI::advisorTask() const
+{
+#ifdef ALPHA_MAP_NK2_ADVICE
+	if(advisor)
+		return advisor->nk2->nullkiller->executingTask;
+#endif
+	return "";
+}
+
 std::string AlphaMapAI::adviceJson() const
 {
 	if(advised == 0)
@@ -693,7 +722,7 @@ std::string AlphaMapAI::adviceJson() const
 	std::string unmatched;
 	for(const auto & [kind, count] : adviceUnmatched)
 		unmatched += (unmatched.empty() ? "\"" : ", \"") + kind + "\": " + std::to_string(count);
-	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"fallback\": " + std::to_string(adviceFallbacks) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + "}, \"gathers\": " + std::to_string(adviceGathers) + ", \"choice_shown\": " + std::to_string(nk2Choice && nk2Inputs ? 1 : 0) + ", \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
+	return ", \"advice\": {\"asked\": " + std::to_string(advised) + ", \"matched\": " + std::to_string(adviceMatched) + ", \"fallback\": " + std::to_string(adviceFallbacks) + ", \"exchange\": {\"asked\": " + std::to_string(exchangeAdvised) + ", \"matched\": " + std::to_string(exchangeAdviceMatched) + ", \"end\": " + std::to_string(exchangeAdviceEnds) + "}, \"gathers\": " + std::to_string(adviceGathers) + ", \"choice_shown\": " + std::to_string(nk2Choice && nk2Inputs ? 1 : 0) + ", \"revisit_skipped\": " + std::to_string(revisitsSkipped) + ", \"seconds\": " + std::to_string(adviceSeconds) + ", \"unmatched\": {" + unmatched + "}}";
 }
 
 // The events of a seated Nullkiller2's memory (AlphaMapAI.h), passed on to the advising one; none of our own uses them

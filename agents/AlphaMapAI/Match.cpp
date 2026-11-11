@@ -77,7 +77,9 @@ std::string AlphaMapAI::ownTileRequest(const Decision & decision, const CGHeroIn
 			what = "object " + std::to_string(obj->ID.getNum());
 		break;
 	}
-	return "MoveHero (own tile: " + what + (intended.isValid() ? "; its plan's tile set" : "; no plan tile") + (path <= 1 ? "; path 1)" : "; path longer)");
+	const auto described = advisorTask(); // (the goal that issued it, its kind: the description's first word)
+	const std::string task = described.empty() ? "" : "; " + described.substr(0, described.find_first_of(" (:"));
+	return "MoveHero (own tile: " + what + (intended.isValid() ? "; its plan's tile set" : "; no plan tile") + (path <= 1 ? "; path 1" : "; path longer") + task + ")";
 }
 
 bool AlphaMapAI::matchRequest(const Decision & decision, const CPackForServer * pack, Choice & choice, bool & exact, std::string & unmatched, int3 intended) const
@@ -103,8 +105,10 @@ bool AlphaMapAI::matchRequest(const Decision & decision, const CPackForServer * 
 		const int3 target = planned ? intended : h && !p->path.empty() ? h->convertToVisitablePos(p->path.back()) : int3(-1, -1, -1);
 		if(!h || (p->path.empty() && !planned))
 			unmatched = "MoveHero (no hero or path)";
-		else if(target == h->visitablePos())
-			unmatched = ownTileRequest(decision, h, intended, p->path.size()); // (alpha_heroes diagnostic, 2026-11-11: named by what is there)
+		else if(target == h->visitablePos()) // (no entry of ours: Advice.cpp's revisitSkip takes its next request; mapping a Defend
+			// composition's re-visit to our GARRISON_SWAP was tried, 2026-11-11: following it, its next request swapped the hero
+			// back out, which is not ours, and 5-42 failed actions a player in 2 games to day 28 against none)
+			unmatched = ownTileRequest(decision, h, intended, p->path.size()); // (alpha_heroes diagnostic: named by what is there)
 		else
 		{
 			for(int i = 0; i < OWN_HEROES; ++i)

@@ -271,6 +271,13 @@ class AlphaMapAI : public CAdventureAI
 	// views, plan and threats are written as before and its advice is still asked and recorded on the Decision. One
 	// setting a game (play.nk2_settings), shown in the summary as "choice_shown"
 	bool nk2Choice = true;
+	// alpha_heroes patch (2026-11-11, bundle 60, the teleport part): ALPHA_MAP_REVISIT_SKIP, 1 unless set. Nullkiller2's
+	// request to re-visit the town of ours its hero stands in, with nothing for our GATHER there, is a no-op in the game
+	// (a Defend composition holding the hero in the town: 102 of 132 own-tile misses in 8 games to day 28; e5's "into a
+	// teleport" bucket). Its advice is then its next request, the hero held for defence (Nullkiller::adviceHeld), up to
+	// three heroes in turn; counted in the summary's advice "revisit_skipped"
+	bool revisitSkip = true;
+	int revisitsSkipped = 0;
 	// A test's only (ALPHA_MAP_FOLLOW_ADVICE, a chance, 0 unless set; "1" plays its every advice): the advised entry played
 	// instead of our sampled one at that chance (paired_eval's follow arms)
 	double followAdvice = 0;
@@ -303,6 +310,8 @@ class AlphaMapAI : public CAdventureAI
 	bool matchRequest(const Decision & decision, const CPackForServer * pack, Choice & choice, bool & exact, std::string & unmatched, int3 intended = int3(-1, -1, -1)) const;
 	/// alpha_heroes diagnostic (2026-11-11, logging only): an own-tile move request named by what is under the hero (Match.cpp)
 	std::string ownTileRequest(const Decision & decision, const CGHeroInstance * hero, const int3 & intended, size_t path) const;
+	/// alpha_heroes diagnostic: the advising Nullkiller2's executing task (its description; empty without it)
+	std::string advisorTask() const;
 	std::string teacherJson() const;
 	// Our marketplace (the first town of ours with one; its rates count all of them): trades and purchases short of
 	// resources go through it; nullptr with none
