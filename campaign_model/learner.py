@@ -301,7 +301,7 @@ class CampaignLearner:
 			from battle_model.train import upgrade_csv
 
 			upgrade_csv(self.progress, COLUMNS)
-			self.value_readings = fresh_readings(self.progress)
+			self.value_readings = fresh_readings(self.progress, since=int(getattr(config, "value_jump_from", 0) or 0))
 		(self.out / "held").unlink(missing_ok=True)  # (the value-loss guard's note of a hold: a restart lifts it)
 		# A new run evaluates its starting model first; a resumed one when eval_minutes have passed since its last eval
 		# (by eval.csv's time: restarts must not keep putting evals off)
@@ -1270,12 +1270,15 @@ def value_jump(readings, window=VALUE_JUMP_WINDOW, baseline=VALUE_JUMP_BASELINE,
 	return (now / level if level > 0 else nan), now, level
 
 
-def fresh_readings(progress, keep=VALUE_JUMP_MEMORY + VALUE_JUMP_WINDOW):
+def fresh_readings(progress, keep=VALUE_JUMP_MEMORY + VALUE_JUMP_WINDOW, since=0):
 	"""progress.csv's value_loss_fresh readings (the finite ones, the last `keep`): the value-loss guard's memory across
-	a restart. A file that cannot be read is no memory (the guard then waits for its own readings), never an error."""
+	a restart. since (config.value_jump_from): only the rows of that version and later, the guard's memory after a
+	hold somebody looked into and let go on. A file that cannot be read is no memory (the guard then waits for its own
+	readings), never an error."""
 	try:
 		with open(progress, newline="") as f:
-			values = [row.get("value_loss_fresh") for row in csv.DictReader(f)]
+			rows = [row for row in csv.DictReader(f) if not since or float(row.get("version") or 0) >= since]
+		values = [row.get("value_loss_fresh") for row in rows]
 		values = [float(v) for v in values if v not in (None, "", "nan")]
 		return [v for v in values if np.isfinite(v)][-keep:]
 	except Exception as error:

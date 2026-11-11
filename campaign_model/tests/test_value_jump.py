@@ -117,3 +117,19 @@ def test_the_readings_come_back_from_progress_csv(tmp_path, capsys):
 	assert len(readings) == VALUE_JUMP_MEMORY + VALUE_JUMP_WINDOW and set(readings) == {0.0006}
 	assert fresh_readings(path, keep=1000)[:2] == [0.0005, 0.0007]
 	assert fresh_readings(tmp_path / "none.csv") == [] and "could not read" in capsys.readouterr().out
+
+
+def test_the_guard_s_memory_can_start_at_a_version(tmp_path):
+	"""fresh_readings' since (config.value_jump_from): after a hold that was looked into, the readings from before the
+	named version are not the guard's memory; 0 keeps them all."""
+	import csv
+
+	path = tmp_path / "progress.csv"
+	with open(path, "w", newline="") as f:
+		writer = csv.DictWriter(f, fieldnames=["version", "value_loss_fresh"])
+		writer.writeheader()
+		for version in range(100, 140):
+			writer.writerow({"version": version, "value_loss_fresh": 0.0005 if version < 130 else 0.002})
+	assert len(fresh_readings(path)) == 40
+	assert fresh_readings(path, since=130) == [0.002] * 10
+	assert fresh_readings(path, since=500) == []
