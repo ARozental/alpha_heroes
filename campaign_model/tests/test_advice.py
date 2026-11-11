@@ -69,6 +69,25 @@ def shaped(model, x):
 	return x
 
 
+def with_label(x, kinds=("MOVE", "TRAVEL", "END", "BUILD")):
+	"""x with Nullkiller2's own choice at each decision (schema 19's g_nk_action, g_nk_index, g_nk_cell): a legal entry of
+	the type kinds[row % len(kinds)] (END: no entry), none where that type has no legal entry."""
+	x = {name: value.clone() for name, value in x.items()}
+	b = x["g_kind"].shape[0]
+	masks = {"MOVE": "move_mask", "TRAVEL": "travel_mask", "BUILD": "build_mask", "RECRUIT": "recruit_mask"}
+	action, index = torch.zeros(b, dtype=torch.long), torch.zeros(b, dtype=torch.long)
+	for row in range(b):
+		kind = kinds[row % len(kinds)]
+		if kind == "END":
+			action[row] = int(c.ActionType.END) + 1
+			continue
+		legal = torch.nonzero(x[masks[kind]][row].reshape(-1)).reshape(-1)
+		if len(legal):
+			action[row], index[row] = int(c.ActionType[kind]) + 1, int(legal[len(legal) // 2]) + 1
+	x["g_nk_action"], x["g_nk_index"], x["g_nk_cell"] = action, index, torch.zeros(b, dtype=torch.long)
+	return x
+
+
 def test_the_new_parts_add_nothing_until_they_are_turned_on():
 	"""A fresh model (and so an older checkpoint loaded into it: the new parts start as a fresh model has them) gives
 	the same outputs whatever schema 19's inputs hold: every new layer's output starts at 0 and the prior is off."""
@@ -77,16 +96,18 @@ def test_the_new_parts_add_nothing_until_they_are_turned_on():
 	with torch.no_grad():
 		with_rows, without = model(x), model(without_advisor(x))
 		before = model({name: value for name, value in x.items() if name not in NK_INPUTS and name != "w_arrive_left"})
+		labelled = model(with_label(x))
 	same(with_rows, without)
 	same(with_rows, before)
-	assert float(model.features.nk_beta) == 0.0 and float(model.features.nk_beta_fallback) == 0.0
-	assert all(float(w) == 0.0 for w in model.features.nk_prior_weights())
+	same(with_rows, labelled)  # (its own choice among the inputs: nothing until its prior is on and its channel's weights leave 0)
+	assert float(model.features.nk_beta) == 0.0 and float(model.features.nk_beta_fallback) == 0.0 and float(model.features.nk_label) == 0.0
+	assert all(float(w) == 0.0 for w in model.features.nk_prior_weights()) and float(model.features.nk_label_weight()) == 0.0
 
 
 def test_a_checkpoint_from_before_loads_with_the_new_parts_as_a_new_model_starts_them():
 	saved = small(0).state_dict()
 	old = {k: v for k, v in saved.items() if not k.startswith(NEW) and not k.startswith("features.nk_")}
-	assert len(saved) - len(old) == 15 + 6  # (the new layers' tensors; the prior's four gains and two sizes)
+	assert len(saved) - len(old) == 15 + 8  # (the new layers' tensors; the priors' five gains and three sizes)
 	fresh = small(1)
 	own = {k: v.clone() for k, v in fresh.state_dict().items()}
 	fresh.load_state_dict(old)
@@ -156,8 +177,9 @@ def test_every_new_weight_gets_a_gradient():
 				p.normal_(0.0, 0.05)
 		model.features.nk_beta.fill_(2.0)
 		model.features.nk_beta_fallback.fill_(1.0)
+		model.features.nk_label.fill_(2.0)
 	model.train()
-	x = shaped(model, turn_inputs(batch=8, seed=11))
+	x = with_label(shaped(model, turn_inputs(batch=8, seed=11)))
 	tables = V.candidate_tables(x, dest=False)
 	assert float(tables["prior_move_fallback"].sum() + tables["prior_travel_fallback"].sum()) > 0  # (the fallback's gain has entries to act on)
 	out = model(x)
@@ -174,7 +196,7 @@ def test_the_views_are_bounded_and_none_is_constant():
 	"""advice's two tables: VIEWS wide, every channel within -1..1 but the log survival (-4.61..0.01), finite, and none
 	the same at every legal entry of a batch of random decisions."""
 	model = small()
-	x = shaped(model, turn_inputs(batch=8, seed=21))
+	x = with_label(shaped(model, turn_inputs(batch=8, seed=21)), kinds=("MOVE", "TRAVEL"))
 	with torch.no_grad():
 		a = model.domain_knowledge(x).advice
 	survival = 6 + 3 + 3 + 4 + 2 + V.CHANNELS.index("log_survival")
@@ -247,13 +269,13 @@ def test_the_run_s_line_sets_the_prior_at_every_start_and_the_weights_carry_it()
 	from campaign_model.learner import set_advice_prior
 
 	model = small()
-	set_advice_prior(model, CampaignConfig(nk2_prior=2.0, nk2_prior_fallback=1.0))
-	assert float(model.features.nk_beta) == 2.0 and float(model.features.nk_beta_fallback) == 1.0
+	set_advice_prior(model, CampaignConfig(nk2_prior=2.0, nk2_prior_fallback=1.0, nk2_label_prior=4.0))
+	assert float(model.features.nk_beta) == 2.0 and float(model.features.nk_beta_fallback) == 1.0 and float(model.features.nk_label) == 4.0
 	server = small(1)
 	server.load_state_dict(model.state_dict())
-	assert float(server.features.nk_beta) == 2.0 and float(server.features.nk_beta_fallback) == 1.0
+	assert float(server.features.nk_beta) == 2.0 and float(server.features.nk_beta_fallback) == 1.0 and float(server.features.nk_label) == 4.0
 	set_advice_prior(server, CampaignConfig())
-	assert float(server.features.nk_beta) == 0.0 and float(server.features.nk_beta_fallback) == 0.0
+	assert float(server.features.nk_beta) == 0.0 and float(server.features.nk_beta_fallback) == 0.0 and float(server.features.nk_label) == 0.0
 
 
 def test_a_candidate_in_a_further_window_is_read_at_that_window_s_entry():
@@ -291,7 +313,56 @@ def test_a_candidate_in_a_further_window_is_read_at_that_window_s_entry():
 		views = a.move.reshape(-1, cells, VIEWS)
 		assert float(views[further, legal[0], has]) == 1.0 and float(views[further, legal[0], has + 1]) == 0.0  # (a candidate, the decision's best)
 		assert float(views[first, own[0], has]) == 1.0 and float(views[first, own[0], has + 1]) < 0.0
-		assert float(views[first, own[0], VIEWS - 1]) == 1.0  # (its destination: a cell of a computed window)
+		assert float(views[first, own[0], VIEWS - 2]) == 1.0  # (its destination: a cell of a computed window)
 		index, valid = a.move_dest
 		assert bool(valid.reshape(-1, cells)[first, own[0]]) and int(index.reshape(-1, cells)[first, own[0]]) == further * cells + legal[-1]
 		assert float(views[:, :, has].sum(dim=1)[first]) == 1.0  # (one entry of the own window holds a candidate)
+
+
+def test_its_own_choice_as_a_prior_is_followed_as_far_as_the_prior_is_large():
+	"""nk_label: Nullkiller2's own choice gains that many logits inside its table and on its type's score, whatever its
+	type (MOVE, TRAVEL, END, BUILD); at 20 it is our choice (probability above 0.99 at every decision that has one), at
+	0 nothing moves, and a decision without one is as before at any size."""
+	from campaign_model.schema import HEADS
+
+	model = small()
+	x = with_label(turn_inputs(batch=8, seed=31))
+	action, index = x["g_nk_action"] - 1, x["g_nk_index"] - 1
+	assert set(int(a) for a in action if a >= 0) >= {int(c.ActionType.MOVE), int(c.ActionType.TRAVEL), int(c.ActionType.END)}
+
+	def followed(out):  # [B] the log-probability of its choice: its type's, and its entry's in the type's table
+		logp = torch.zeros(len(action))
+		for row in range(len(action)):
+			if action[row] < 0:
+				logp[row] = float("nan")
+				continue
+			logp[row] = out["type_logp"][row, action[row]]
+			if int(action[row]) != int(c.ActionType.END):
+				logp[row] += out[HEADS[c.ActionType(int(action[row]))][0]][row].reshape(-1)[index[row]]
+		return logp
+
+	with torch.no_grad():
+		off = model(x)
+		model.features.nk_label.fill_(3.0)
+		some = model(x)
+		model.features.nk_label.fill_(20.0)
+		full = model(x)
+		none = dict(x)
+		none["g_nk_action"] = torch.zeros_like(x["g_nk_action"])
+		without = model(none)
+	has = action >= 0
+	assert int(has.sum()) >= 6
+	assert bool((followed(some)[has] > followed(off)[has] + 1.0).all())
+	assert bool((followed(full)[has].exp() > 0.99).all())
+	same(off, without, LOGPS)  # (no choice of its to follow: the prior adds nothing at any size)
+	assert float(model.features.nk_label_weight()) == pytest.approx(20.0)
+
+
+def test_the_override_of_a_paired_test_sets_the_label_s_prior(monkeypatch):
+	monkeypatch.setenv("ALPHA_NK2_LABEL", "4")
+	model = small()
+	assert float(model.features.nk_label_weight()) == pytest.approx(4.0)
+	monkeypatch.setenv("ALPHA_NK2_LABEL", "0")
+	model = small()
+	model.features.nk_label.fill_(3.0)
+	assert float(model.features.nk_label_weight()) == 0.0

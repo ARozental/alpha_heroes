@@ -283,6 +283,11 @@ class CampaignConfig:
 	# sizes are chosen by paired tests (campaign_model.paired_eval with ALPHA_NK2_PRIOR, ALPHA_NK2_PRIOR_FALLBACK)
 	nk2_prior: float = 0.0
 	nk2_prior_fallback: float = 0.0
+	# Nullkiller2's own choice at the decision as a prior (schema 19's g_nk_action, g_nk_index; needs nk2_inputs): this
+	# many logits on the entry it would play now, inside its table and on its type's score. 0: off. At a large size our
+	# choice is its choice (b1's follow test: +0.29 +- 0.06 on 144 paired games); the size is chosen by paired tests
+	# (ALPHA_NK2_LABEL), and the model learns where to leave it (the gain on it, 1/4..2, and everything it reads)
+	nk2_label_prior: float = 0.0
 	# Its TRADE advice taught too (False since 2026-11-04: the user's rule, every trade is dumb unless it buys what could not
 	# be bought without it; ~94% of its trades bought nothing that day, and 54% of ours came where it advised one)
 	nk2_trade_advice: bool = False

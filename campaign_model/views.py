@@ -153,7 +153,25 @@ def settled(count):
 
 
 THREAT_VIEWS = 4
-GLOBAL_VIEWS = 8
+GLOBAL_VIEWS = 8 + len(c.ActionType)  # (the plan's presence, tier and size; Nullkiller2's own choice's type)
+
+
+def label(x):
+	"""Nullkiller2's own choice at this decision in our terms (schema 19's g_nk_action, g_nk_index, g_nk_cell: what it
+	would do now, where its first request maps to an entry of ours): (action type [B], the index in that type's table,
+	a targeted spell's tile), each -1 where it has none (no advisor, a request no entry of ours expresses, an input
+	dict from before the fields)."""
+	if "g_nk_action" not in x:
+		none = torch.full((x["g_day"].shape[0],), -1, dtype=torch.long, device=x["g_day"].device)
+		return none, none, none
+	return x["g_nk_action"].long() - 1, x["g_nk_index"].long() - 1, x["g_nk_cell"].long() - 1
+
+
+def label_table(action, index, which, size):
+	"""[B, size] 1 at the entry Nullkiller2's own choice names in the table of action type `which` (label's action and
+	index), 0 elsewhere and for a choice of another type or none."""
+	on = (action == int(which)) & (index >= 0) & (index < size)
+	return torch.zeros(action.shape[0], size, device=action.device).scatter_(1, index.clamp(0, size - 1).unsqueeze(1), on.float().unsqueeze(1))
 
 
 def threat_views(threat):
@@ -168,11 +186,12 @@ def threat_views(threat):
 def global_views(x):
 	"""What Nullkiller2's planner says of the whole decision [B, GLOBAL_VIEWS], each within 0..1 and 0 without the
 	advisor: it ran, the tier its plan was made at (PriorityTier 1..6, one-hot), how many candidates it scored
-	(n / (n + 16))."""
+	(n / (n + 16)), and the type of its own choice now (one-hot over our action types; none: all 0)."""
 	present = x["g_nk_present"].bool()
 	tier = (x["g_nk_tier"].long().unsqueeze(-1) == torch.arange(1, 7, device=present.device)).float()
 	count = x["g_nk_count"].float().clamp(min=0.0)
-	return torch.cat([present.float().unsqueeze(-1), tier, (count / (count + 16.0)).unsqueeze(-1)], dim=-1) * present.float().unsqueeze(-1)
+	chosen = (label(x)[0].unsqueeze(-1) == torch.arange(len(c.ActionType), device=present.device)).float()
+	return torch.cat([torch.cat([present.float().unsqueeze(-1), tier, (count / (count + 16.0)).unsqueeze(-1)], dim=-1) * present.float().unsqueeze(-1), chosen], dim=-1)
 
 
 def absent_rows(b, device):

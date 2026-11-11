@@ -319,8 +319,16 @@ class CustomFeatures(nn.Module):
 		self.nk_gain, self.nk_gain_fallback, self.nk_survival, self.nk_risk = zeros(), zeros(), zeros(), zeros()
 		self.register_buffer("nk_beta", torch.zeros(()))
 		self.register_buffer("nk_beta_fallback", torch.zeros(()))
+		# Nullkiller2's own choice at the decision as a prior (schema 19's g_nk_action, g_nk_index; nk_label_weight):
+		# nk_label logits on the entry it would play now, inside its table and on its type's score (END's too), fixed
+		# (config.nk2_label_prior; ALPHA_NK2_LABEL for a paired test), x a gain (1/4..2). The paired test of
+		# 2026-11-11: a prior on its best candidate's entry (nk_beta 2 and 4) raised our agreement with its choice from
+		# 0.29 to 0.34 and 0.36 and the score by nothing, while playing its choice outright (b1's follow test, 92% of the
+		# decisions) was worth +0.29: what it scores highest is a loose proxy for what it does next
+		self.nk_label_gain = zeros()
+		self.register_buffer("nk_label", torch.zeros(()))
 		override = lambda name: float(os.environ[name]) if os.environ.get(name, "") != "" else None  # noqa: E731
-		self.nk_override = (override("ALPHA_NK2_PRIOR"), override("ALPHA_NK2_PRIOR_FALLBACK"))
+		self.nk_override = (override("ALPHA_NK2_PRIOR"), override("ALPHA_NK2_PRIOR_FALLBACK"), override("ALPHA_NK2_LABEL"))
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -344,7 +352,7 @@ class CustomFeatures(nn.Module):
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
 			self.night_gain,
-			self.nk_gain, self.nk_gain_fallback, self.nk_survival, self.nk_risk,
+			self.nk_gain, self.nk_gain_fallback, self.nk_survival, self.nk_risk, self.nk_label_gain,
 		]
 
 	# ---- the bounded prior parameters ----
@@ -359,7 +367,7 @@ class CustomFeatures(nn.Module):
 		unit of its path's log survival, a unit of its danger on arrival): nk_beta x its gain (1/4..2, 1 at the start),
 		nk_beta_fallback x its gain, and the two direct weights (0..2 from 0.25), which count only while a prior is on.
 		All 0 with both betas at 0: the model as before schema 19."""
-		own, own_fallback = self.nk_override
+		own, own_fallback, _ = self.nk_override
 		beta = self.nk_beta if own is None else self.nk_beta.new_tensor(own)
 		fallback = self.nk_beta_fallback if own_fallback is None else self.nk_beta.new_tensor(own_fallback)
 		on = ((beta + fallback) > 0).to(beta.dtype)
@@ -367,6 +375,13 @@ class CustomFeatures(nn.Module):
 			beta * ft.bounded(self.nk_gain, 0.25, 2.0, 1.0, CORRECTION_STEP), fallback * ft.bounded(self.nk_gain_fallback, 0.25, 2.0, 1.0, CORRECTION_STEP),
 			on * ft.bounded(self.nk_survival, 0.0, 2.0, 0.25, CORRECTION_STEP), on * ft.bounded(self.nk_risk, 0.0, 2.0, 0.25, CORRECTION_STEP),
 		)
+
+	def nk_label_weight(self):
+		"""The logits Nullkiller2's own choice at the decision adds to its entry and to its type's score: nk_label x its
+		gain (1/4..2, 1 at the start); 0 with nk_label at 0, the model as before."""
+		own = self.nk_override[2]
+		size = self.nk_label if own is None else self.nk_label.new_tensor(own)
+		return size * ft.bounded(self.nk_label_gain, 0.25, 2.0, 1.0, CORRECTION_STEP)
 
 	def night_weight(self):
 		"""How far P(lost tonight) x what a lost battle takes counts in MOVE's and TRAVEL's logit priors: the expected loss
@@ -1546,7 +1561,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,

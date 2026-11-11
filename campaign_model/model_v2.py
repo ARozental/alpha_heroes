@@ -56,8 +56,8 @@ DISTANCE_BUCKETS = 12  # the tile readers' distance bias: Chebyshev tiles 0, 1, 
 # layout for both (CampaignModelV2.advice): its value in six views, its value a day of this hero's and of a baseline
 # hero's (3 + 3), the two times as discounts (2 + 2), its prior's gap to this hero's best and to any hero's best (2),
 # Nullkiller2's best candidate through the entry (views.CHANNELS), that candidate's destination: its own value's six
-# views and whether a window of ours shows it (7)
-VIEWS = 6 + 3 + 3 + 4 + 2 + V.F + 7
+# views and whether a window of ours shows it (7), whether the entry is the one Nullkiller2 itself would play now (1)
+VIEWS = 6 + 3 + 3 + 4 + 2 + V.F + 7 + 1  # (the last: this entry is Nullkiller2's own choice now, views.label)
 PLAN_VIEWS = 2  # the plan head's own forecast for the entry's area: its chance, and against the hero's likeliest area
 VIEW_STEP = 10.0  # FastLinear's (model.CORRECTION_STEP's reason)
 LOG_SURVIVAL, RISK = V.CHANNELS.index("log_survival"), V.CHANNELS.index("risk")
@@ -608,6 +608,9 @@ class CampaignModelV2(nn.Module):
 		device = known.phi_total.device
 		nk = x if "k_hero" in x else {**x, **V.absent_rows(b, device)}
 		a = Features(x=nk, tables=V.candidate_tables(nk, dest=False))
+		a.label = V.label(x)  # (Nullkiller2's own choice now: its action type, index and cell, -1 none)
+		chosen_move = V.label_table(a.label[0], a.label[1], c.ActionType.MOVE, HO * W * W).reshape(b, HO, W, W)
+		chosen_travel = V.label_table(a.label[0], a.label[1], c.ActionType.TRAVEL, HO * AREAS).reshape(b, HO, AREAS)
 		phi = known.phi_total.detach()
 		pace = V.daily_gain(phi, nk["g_phi_past"], nk["g_phi_past_days"])
 		none = torch.zeros((), device=device)
@@ -644,6 +647,7 @@ class CampaignModelV2(nn.Module):
 					[
 						V.value_views(value, phi_k, pace_k), V.rate_views(value, own_days, phi_k, pace_k), V.rate_views(value, base_days, phi_k, pace_k), time, gaps,
 						pick(a.tables["move"].reshape(b, HO, W, W, V.F)), V.value_views(dest_value, phi_k, pace_k) * valid.unsqueeze(-1), valid.float().unsqueeze(-1),
+						pick(chosen_move).unsqueeze(-1),
 					],
 					dim=-1,
 				),
@@ -663,7 +667,7 @@ class CampaignModelV2(nn.Module):
 			[
 				V.value_views(gold, phi, pace), V.rate_views(gold, own_days, phi, pace), V.rate_views(gold, base_days, phi, pace), V.discounts(own_days), V.discounts(base_days),
 				torch.stack([V.gap(travel_logits, best_slot.unsqueeze(-1)), V.gap(travel_logits, best_any[:, None, None])], dim=-1),
-				a.tables["travel"], V.value_views(dest_value, phi, pace) * valid.unsqueeze(-1), valid.float().unsqueeze(-1),
+				a.tables["travel"], V.value_views(dest_value, phi, pace) * valid.unsqueeze(-1), valid.float().unsqueeze(-1), chosen_travel.unsqueeze(-1),
 			],
 			dim=-1,
 		)
@@ -980,6 +984,14 @@ class CampaignModelV2(nn.Module):
 		move_prior = move_prior + advised("move").reshape(b, HO, W, W)
 		learned[A_.MOVE], prior[A_.MOVE] = move + self.act_move(own_heroes).reshape(b, HO).gather(1, ft.slot_heroes(x)).reshape(b, HO, 1, 1), move_prior
 		offers[A_.MOVE] = ft.signed_offer(move_prior, x["move_mask"])  # (below 0 when every move is worse than staying)
+		# Nullkiller2's own choice now (schema 19: views.label), as a prior of nk_label_weight logits on its entry inside the
+		# entry's table and on its type's score, END's included (0 until turned on: config.nk2_label_prior); a targeted
+		# spell's tile in its hero's cell table too
+		label_action, label_index, label_cell = known.advice.label
+		label_weight = self.features.nk_label_weight()
+		label_hero = torch.div(label_index.clamp(min=0), c.N_ADVENTURE_SPELLS, rounding_mode="floor").clamp(max=HO - 1)
+		label_cells = V.label_table(torch.where(label_cell >= 0, label_action, torch.full_like(label_action, -1)), label_hero * (W * W) + label_cell.clamp(0, W * W - 1), A_.CAST, HO * W * W)
+		cast_cell = cast_cell + label_weight * label_cells.reshape(b, HO, W, W).to(cast_cell.dtype)
 		out["cast_cell_logp"] = masked_log_softmax(cast_cell.reshape(b, HO, W * W), x["cast_cell_mask"].reshape(b, HO, W * W)).reshape(b, HO, W, W)
 		# TRAVEL: (hero, area) pairs, + the area's prior (its value discounted by the days to it)
 		learned[A_.TRAVEL] = (self.travel_out(state.travel_pairs).squeeze(-1) + state.travel_view.to(state.travel_pairs.dtype) + self.act_travel(own_heroes)).reshape(b, HO, L, TG, TG)
@@ -1095,16 +1107,19 @@ class CampaignModelV2(nn.Module):
 		# global token
 		scores, legal_types = [], []
 		for action in c.ActionType:
+			named = label_weight * (label_action == int(action)).to(state.glob.dtype)  # [B]: Nullkiller2's own choice is of this type
 			if action == A_.END:
-				scores.append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action])
+				scores.append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named)
 				legal_types.append((x["g_kind"] == c.DecisionKind.TURN) | (x["g_kind"] == c.DecisionKind.EXCHANGE))
 				continue
 			name, mask_name = HEADS[action]
 			mask = x[mask_name]
 			if action == A_.CAST:  # (a hero with only those left has no CAST)
 				mask = mask & self.castable
-			out[name] = flat_log_softmax(learned[action] + prior[action], mask)
-			scores.append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action], mask))
+			table = learned[action] + prior[action]
+			chosen = V.label_table(label_action, label_index, action, table[0].numel()).reshape(table.shape)  # (1 at its entry)
+			out[name] = flat_log_softmax(table + label_weight * chosen.to(table.dtype), mask)
+			scores.append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action], mask) + named)
 			legal_types.append(mask.reshape(b, -1).any(dim=-1))
 		out["type_logp"] = masked_log_softmax(torch.stack(scores, dim=-1), torch.stack(legal_types, dim=-1))
 		self.value(state, known, out)
