@@ -288,6 +288,10 @@ class CampaignConfig:
 	# choice is its choice (b1's follow test: +0.29 +- 0.06 on 144 paired games); the size is chosen by paired tests
 	# (ALPHA_NK2_LABEL), and the model learns where to leave it (the gain on it, 1/4..2, and everything it reads)
 	nk2_label_prior: float = 0.0
+	# Nullkiller2's own choice followed at this chance (0..1; needs nk2_inputs; 0: off): the games' policy is
+	# rho x (its choice) + (1 - rho) x (our own policy), exactly (model_v2.CampaignModelV2.follow), rho learnable
+	# around this start. Our policy is trained on what it chose itself; its choice is the model's input everywhere
+	nk2_follow: float = 0.0
 	# Its TRADE advice taught too (False since 2026-11-04: the user's rule, every trade is dumb unless it buys what could not
 	# be bought without it; ~94% of its trades bought nothing that day, and 54% of ours came where it advised one)
 	nk2_trade_advice: bool = False

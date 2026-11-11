@@ -131,6 +131,7 @@ def set_advice_prior(model, config):
 		features.nk_beta.fill_(float(getattr(config, "nk2_prior", 0.0)))
 		features.nk_beta_fallback.fill_(float(getattr(config, "nk2_prior_fallback", 0.0)))
 		features.nk_label.fill_(float(getattr(config, "nk2_label_prior", 0.0)))
+		features.nk_follow.fill_(float(getattr(config, "nk2_follow", 0.0)))
 
 
 def campaign_model_kwargs(config, out, resume=False):
@@ -238,8 +239,8 @@ class CampaignLearner:
 			self.model.load_state_dict(state["model"])
 			print(f"campaign: starting from {config.init_from}", flush=True)
 		set_advice_prior(self.model, config)
-		if getattr(config, "nk2_inputs", False) or config.nk2_prior or config.nk2_prior_fallback or config.nk2_label_prior or not getattr(config, "nk2_teacher", True):
-			print(f"campaign: schema 19: Nullkiller2's view as inputs {'on' if getattr(config, 'nk2_inputs', False) else 'off'} (off in {getattr(config, 'nk2_input_dropout', 0.0):g} of the training games), the prior on its own choice {config.nk2_label_prior:g}, on its best candidate {config.nk2_prior:g} (fallback {config.nk2_prior_fallback:g}), the teacher's loss {'on' if getattr(config, 'nk2_teacher', True) else 'OFF'}", flush=True)
+		if getattr(config, "nk2_inputs", False) or config.nk2_prior or config.nk2_prior_fallback or config.nk2_label_prior or config.nk2_follow or not getattr(config, "nk2_teacher", True):
+			print(f"campaign: schema 19: Nullkiller2's view as inputs {'on' if getattr(config, 'nk2_inputs', False) else 'off'} (off in {getattr(config, 'nk2_input_dropout', 0.0):g} of the training games), its own choice followed at a chance of {config.nk2_follow:g}, the prior on it {config.nk2_label_prior:g}, on its best candidate {config.nk2_prior:g} (fallback {config.nk2_prior_fallback:g}), the teacher's loss {'on' if getattr(config, 'nk2_teacher', True) else 'OFF'}", flush=True)
 		if stale_clips(self.grad_clips, config.grad_clip_since):  # (a recalibration: config.grad_clip_since)
 			print(f"campaign: the gradient clips of v{self.grad_clips.get('version', '?')} measured again (grad_clip_since {config.grad_clip_since})", flush=True)
 			self.grad_clips, self.clip_samples = None, []

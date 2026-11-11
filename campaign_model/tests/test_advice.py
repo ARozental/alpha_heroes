@@ -107,7 +107,7 @@ def test_the_new_parts_add_nothing_until_they_are_turned_on():
 def test_a_checkpoint_from_before_loads_with_the_new_parts_as_a_new_model_starts_them():
 	saved = small(0).state_dict()
 	old = {k: v for k, v in saved.items() if not k.startswith(NEW) and not k.startswith("features.nk_")}
-	assert len(saved) - len(old) == 15 + 8  # (the new layers' tensors; the priors' five gains and three sizes)
+	assert len(saved) - len(old) == 15 + 10  # (the new layers' tensors; the priors' five gains and three sizes, the follow chance and its shift)
 	fresh = small(1)
 	own = {k: v.clone() for k, v in fresh.state_dict().items()}
 	fresh.load_state_dict(old)
@@ -178,6 +178,7 @@ def test_every_new_weight_gets_a_gradient():
 		model.features.nk_beta.fill_(2.0)
 		model.features.nk_beta_fallback.fill_(1.0)
 		model.features.nk_label.fill_(2.0)
+		model.features.nk_follow.fill_(0.5)
 	model.train()
 	x = with_label(shaped(model, turn_inputs(batch=8, seed=11)))
 	tables = V.candidate_tables(x, dest=False)
@@ -269,13 +270,13 @@ def test_the_run_s_line_sets_the_prior_at_every_start_and_the_weights_carry_it()
 	from campaign_model.learner import set_advice_prior
 
 	model = small()
-	set_advice_prior(model, CampaignConfig(nk2_prior=2.0, nk2_prior_fallback=1.0, nk2_label_prior=4.0))
-	assert float(model.features.nk_beta) == 2.0 and float(model.features.nk_beta_fallback) == 1.0 and float(model.features.nk_label) == 4.0
+	set_advice_prior(model, CampaignConfig(nk2_prior=2.0, nk2_prior_fallback=1.0, nk2_label_prior=4.0, nk2_follow=0.75))
+	assert float(model.features.nk_beta) == 2.0 and float(model.features.nk_beta_fallback) == 1.0 and float(model.features.nk_label) == 4.0 and float(model.features.nk_follow) == 0.75
 	server = small(1)
 	server.load_state_dict(model.state_dict())
 	assert float(server.features.nk_beta) == 2.0 and float(server.features.nk_beta_fallback) == 1.0 and float(server.features.nk_label) == 4.0
 	set_advice_prior(server, CampaignConfig())
-	assert float(server.features.nk_beta) == 0.0 and float(server.features.nk_beta_fallback) == 0.0 and float(server.features.nk_label) == 0.0
+	assert float(server.features.nk_beta) == 0.0 and float(server.features.nk_beta_fallback) == 0.0 and float(server.features.nk_label) == 0.0 and float(server.features.nk_follow) == 0.0
 
 
 def test_a_candidate_in_a_further_window_is_read_at_that_window_s_entry():
@@ -366,3 +367,72 @@ def test_the_override_of_a_paired_test_sets_the_label_s_prior(monkeypatch):
 	model = small()
 	model.features.nk_label.fill_(3.0)
 	assert float(model.features.nk_label_weight()) == 0.0
+
+
+def test_following_its_choice_at_a_chance_is_the_exact_mixture_of_it_and_our_own_policy(monkeypatch):
+	"""nk_follow (model_v2's follow): with rho on, the sampled policy is rho x (its choice) + (1 - rho) x (ours) at every
+	decision whose labelled entry is legal: the type's probabilities, the joint of its type and each entry of that
+	type's table, every table still summing to 1; the other tables, a decision without a choice of its and one whose
+	choice is not legal are ours untouched. The chance is learnable (a gradient reaches its shift and our own weights),
+	and a paired test's ALPHA_NK2_FOLLOW overrides the checkpoint's."""
+	from campaign_model.schema import HEADS
+
+	rho = 0.7
+	model = small()
+	torch.manual_seed(3)
+	with torch.no_grad():
+		for name, p in model.named_parameters():
+			if float(p.abs().sum()) == 0.0 and not name.startswith("features."):
+				p.normal_(0.0, 0.05)  # (a trained model's heads: its own policy is not flat)
+	x = with_label(turn_inputs(batch=8, seed=31))
+	illegal = next(row for row in range(8) if int(x["g_nk_action"][row]) - 1 == int(c.ActionType.MOVE))
+	x["g_nk_index"][illegal] = int(torch.nonzero(~x["move_mask"][illegal].reshape(-1))[0]) + 1  # (an entry we cannot play)
+	action, index = x["g_nk_action"] - 1, x["g_nk_index"] - 1
+	with torch.no_grad():
+		own = model(x)
+		model.features.nk_follow.fill_(rho)
+		mixed = model(x)
+	followed = 0
+	for row in range(8):
+		kind = int(action[row])
+		if kind < 0 or row == illegal:
+			for name in LOGPS:
+				assert torch.equal(mixed[name][row], own[name][row]), (row, name)
+			continue
+		followed += 1
+		expected = (1 - rho) * own["type_logp"][row].exp()
+		expected[kind] += rho
+		assert torch.allclose(mixed["type_logp"][row].exp(), expected, atol=1e-5), row
+		for other, (name, _) in HEADS.items():
+			table, before = mixed[name][row].reshape(-1), own[name][row].reshape(-1)
+			if int(other) != kind:
+				assert torch.equal(table, before), (row, name)
+				continue
+			joint = (1 - rho) * (own["type_logp"][row, kind] + before).exp()
+			joint[index[row]] += rho
+			assert torch.allclose((mixed["type_logp"][row, kind] + table).exp(), joint, atol=1e-5), (row, name)
+			assert float(table.exp().sum()) == pytest.approx(1.0, abs=1e-4)
+			assert bool((torch.isfinite(table) == torch.isfinite(before)).all())  # (no illegal entry made playable)
+	assert followed >= 5 and {int(a) for a in action if a >= 0} >= {int(c.ActionType.MOVE), int(c.ActionType.TRAVEL), int(c.ActionType.END), int(c.ActionType.BUILD)}
+	# learnable: the chance's shift and our own policy's weights both get a finite gradient
+	model.train()
+	out = model(x)
+	taken = sum(out["type_logp"][row, int(action[row])] for row in range(8) if int(action[row]) >= 0 and row != illegal)
+	taken.backward()
+	assert float(model.features.nk_follow_shift.grad.abs()) > 0
+	grads = [p.grad for name, p in model.named_parameters() if name.startswith("move_out") and p.grad is not None]
+	assert grads and all(torch.isfinite(g).all() for g in grads) and sum(float(g.abs().sum()) for g in grads) > 0
+	assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+	# the bounds of what it can learn: from 0.9, between 0.31 and 0.96
+	with torch.no_grad():
+		model.features.nk_follow.fill_(0.9)
+		model.features.nk_follow_shift.fill_(100.0)
+		assert float(model.features.nk_follow_logs()[1].exp()) == pytest.approx(0.9607, abs=2e-3)
+		model.features.nk_follow_shift.fill_(-100.0)
+		assert float(model.features.nk_follow_logs()[1].exp()) == pytest.approx(0.309, abs=2e-3)
+	monkeypatch.setenv("ALPHA_NK2_FOLLOW", "0")
+	paired = small()
+	paired.features.nk_follow.fill_(0.9)
+	assert not bool(paired.features.nk_follow_logs()[0])  # (the override wins, at 0 too)
+	monkeypatch.setenv("ALPHA_NK2_FOLLOW", "0.5")
+	assert float(small().features.nk_follow_logs()[1].exp()) == pytest.approx(0.5)

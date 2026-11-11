@@ -1122,8 +1122,44 @@ class CampaignModelV2(nn.Module):
 			scores.append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action], mask) + named)
 			legal_types.append(mask.reshape(b, -1).any(dim=-1))
 		out["type_logp"] = masked_log_softmax(torch.stack(scores, dim=-1), torch.stack(legal_types, dim=-1))
+		self.follow(out, label_action, label_index, torch.stack(legal_types, dim=-1))
 		self.value(state, known, out)
 		return out
+
+	def follow(self, out, action, index, legal):
+		"""Nullkiller2's own choice followed at a chance (model.CustomFeatures.nk_follow_logs: rho; off: nothing changes):
+		the policy the games sample becomes rho x (its choice) + (1 - rho) x (ours), exactly, at every decision whose
+		labelled type is legal and whose labelled entry is legal in that type's table (END: the type alone). In the
+		contract's terms (the AI samples a type, then an entry of its table):
+
+		  P(type)              = (1 - rho) P_own(type) + rho [type is its choice's]
+		  P(entry | its type)  = ((1 - rho) P_own(its type) P_own(entry | its type) + rho [entry is its choice]) / P(its type)
+
+		the other types' tables as they are. A targeted spell's tile and ARMY's target slot stay our own tables'.
+		out: type_logp and the tables' log-probabilities, changed in place; action, index [B]: its choice (views.label);
+		legal [B, types]."""
+		on, log_rho, log_rest = self.features.nk_follow_logs()
+		own_types = out["type_logp"]
+		b = own_types.shape[0]
+		named = action.clamp(0, own_types.shape[1] - 1).unsqueeze(1)  # [B, 1]
+		entry_ok = action == int(c.ActionType.END)
+		for kind, (name, _) in HEADS.items():
+			table = out[name].reshape(b, -1)
+			here = (action == int(kind)) & (index >= 0) & (index < table.shape[1])
+			entry_ok = entry_ok | (here & torch.isfinite(table.gather(1, index.clamp(0, table.shape[1] - 1).unsqueeze(1)).squeeze(1)))
+		valid = on & (action >= 0) & legal.gather(1, named).squeeze(1) & entry_ok  # [B]
+		its_type = (named == torch.arange(own_types.shape[1], device=named.device)) & valid.unsqueeze(1)
+		rest = (log_rest + own_types).to(own_types.dtype)
+		mixed_types = torch.where(its_type, torch.logaddexp(rest, log_rho.to(own_types.dtype)), rest)
+		out["type_logp"] = torch.where(valid.unsqueeze(1), mixed_types, own_types)
+		type_own, type_mixed = own_types.gather(1, named), mixed_types.gather(1, named)  # [B, 1] its type's, ours and mixed
+		for kind, (name, _) in HEADS.items():
+			table = out[name].reshape(b, -1)
+			here = valid & (action == int(kind))
+			joint = rest.new_zeros(()) + log_rest + type_own + table  # log((1 - rho) P_own(type) P_own(entry | type))
+			its_entry = (index.clamp(0, table.shape[1] - 1).unsqueeze(1) == torch.arange(table.shape[1], device=index.device)) & here.unsqueeze(1)
+			mixed = torch.where(its_entry, torch.logaddexp(joint, log_rho.to(table.dtype)), joint) - type_mixed
+			out[name] = torch.where(here.unsqueeze(1), mixed.to(table.dtype), table).reshape(out[name].shape)
 
 	def value(self, state, known, out):
 		"""The value heads as v1's (model.CampaignModel.value): V2, V5, V7 (our share at the end of those days), the
