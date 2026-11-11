@@ -389,3 +389,52 @@ def test_the_games_record_the_gather_label_only_when_the_trainer_teaches_it():
 	assert "ALPHA_MAP_GATHER_ADVICE" not in settings(nk2_advice=0.5) and settings(nk2_advice=0.5)["ALPHA_MAP_NK2_ADVICE"] == "0.5"
 	assert settings(nk2_advice=0.5, nk2_gather_weight=0.1)["ALPHA_MAP_GATHER_ADVICE"] == "1"
 	assert "ALPHA_MAP_GATHER_ADVICE" not in settings(nk2_gather_weight=0.1) and "ALPHA_MAP_NK2_ADVICE" not in settings(nk2_gather_weight=0.1)
+
+
+def test_with_the_teacher_off_its_weight_and_share_are_zero_and_the_others_stand():
+	"""config.nk2_teacher False (the user, 2026-11-11): the teacher's weight and its share of the KL target are 0, with
+	the loss shares and without; the value's and the foresight's weights stay what they were."""
+	learner = learner_with(score=0.285)
+	taught = learner.loss_weights()
+	learner.loss_scale["weight"].update(value=352.6, foresight=3.1)  # (as frozen in the run)
+	learner.config = CampaignConfig(loss_shares=True, nk2_teacher=False)
+	weights = learner.loss_weights()
+	assert taught["teacher"] == 10.7 and weights["teacher"] == 0.0 and weights["kl_teacher"] == 0.0
+	assert weights["value"] == 352.6 and weights["foresight"] == 3.1
+	shares = learner.loss_shares()
+	assert shares["teacher"] == 0.0 and sum(shares.values()) == pytest.approx(1.0) and shares["policy"] == pytest.approx(0.5)
+	plain = learner_with(shares=False, weight=6.4)
+	plain.config = CampaignConfig(loss_shares=False, nk2_teacher=False)
+	assert plain.loss_weights() == {"value": 1.0, "foresight": 1.0, "teacher": 0.0}
+
+
+def test_an_update_at_the_teacher_s_weight_0_moves_the_weights_as_one_without_its_advice():
+	"""The teacher's loss off is its weight 0 (learner.loss_weights with config.nk2_teacher False): the update's weights
+	end where an update of the same decisions without any advice ends, and its cross-entropy is still read."""
+	from campaign_model.model import build_model
+	from campaign_model.tests.test_model import random_inputs
+	from campaign_model.tests.test_train import decisions_for
+	from campaign_model.train import ppo_update
+
+	def run(advised):
+		torch.manual_seed(3)
+		model = build_model({"dim": 32, "cell_dim": 16, "heads": 4, "layers": 1, "architecture": "v2", "share_target": "change"})
+		x = random_inputs(8, seed=11)
+		decisions = decisions_for(model.eval(), x)
+		if advised:
+			for d in decisions:
+				if d.action_type >= 0:
+					d.advice = (d.action_type, d.index, d.cell)
+		n = len(decisions)
+		torch.manual_seed(5)
+		metrics, _ = ppo_update(
+			model, torch.optim.Adam(model.parameters(), lr=1e-4), decisions, np.full((n, c.N_VALUE_OFFSETS), 0.5, np.float32), np.zeros(n, np.float32),
+			CampaignConfig(batch_size=4, passes=1, model_architecture="v2", nk2_teacher=False), decode=lambda rows: {k: v[rows] for k, v in x.items()}, teacher_weight=0.0,
+			loss_weights={"value": 1.0, "foresight": 1.0, "teacher": 0.0, "kl_teacher": 0.0},
+		)
+		return [p.detach().clone() for p in model.parameters()], metrics
+
+	with_advice, metrics = run(True)
+	without, _ = run(False)
+	assert math.isfinite(metrics["teacher_ce"]) and metrics["teacher_ce"] > 0  # (still a reading)
+	assert all(torch.allclose(a, b, atol=1e-7) for a, b in zip(with_advice, without))
