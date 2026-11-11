@@ -280,6 +280,10 @@ class CampaignConfig:
 	# them), so teacher_ce is +0.60 at once at 1.0, +0.31 at 0.5, +0.13 at 0.2, +0.06 at 0.1 (2026-11-05's rule: a jump over
 	# +0.3 means stop). The label's span is both families' (train._teacher_span: the hero's moves pushed down there)
 	nk2_gather_weight: float = 0.0
+	# GATHER's return (2026-11-11): nk2_gather_weight reached in a straight line over this many updates from the first update
+	# with it (CampaignLearner.gather_weight_now: 1 / ramp of it at that one), the start kept in the checkpoint so a restart
+	# goes on; 0: at once (as before). The games ask Nullkiller2 for its GATHER advice from the first (nk2_gather_weight > 0)
+	nk2_gather_ramp: int = 0
 	# MULTI inside an exchange's teacher span (train.TEACHER_SPAN_MULTI; the 2026-11-09 audit's M3): every exchange label
 	# pushes down the multi-actions it does not accept (TAKE_BEST into the hero that keeps nothing, TAKE_BEST_FAST, ...).
 	# Outside it (False) none is ever pushed: after a meeting Nullkiller2 advised, our first exchange choice was its

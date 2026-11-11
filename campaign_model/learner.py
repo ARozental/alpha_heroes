@@ -34,6 +34,7 @@ import threading
 import time
 import traceback
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -95,6 +96,10 @@ COLUMNS = [
 	# v2's foresight losses (foresight.py) and the gradient check: the shared layers' gradient from the PPO losses and the
 	# foresight's, their cosine, the share of parameters no loss reaches
 	*FORESIGHT_COLUMNS, "grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share", *GRADIENT_COLUMNS,
+	# (2026-11-11, GATHER's return) its label's weight this update (config.nk2_gather_ramp), and the readings that saw the
+	# 2026-11-10 collapse first: our armies' gold on heroes against all of it (heroes, garrisons, armies no hero leads),
+	# players out of their games, the spread of the value heads' targets
+	"gather_weight", "army_on_heroes", "eliminated", "value_target_std",
 ]
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
 DROP_BEYOND = 4  # updates' worth of finished games beyond which the oldest are dropped (_take)
@@ -175,6 +180,7 @@ class CampaignLearner:
 		# dropped since, the fresh value loss's readings (progress.csv's on a resume, _judge_value's after), this process's own
 		self.held, self.held_updates, self.value_readings, self.value_own = None, 0, [], 0
 		self.grad_clips, self.clip_samples = None, []  # (config.grad_clip_by_group) the groups' clips once calibrated, the calibration's steps' norms till then
+		self.gather_ramp_start = None  # (config.nk2_gather_ramp) the version at the ramp's first update
 		latest = self.out / "checkpoint_latest.pt"
 		if resume and latest.exists():
 			state = torch.load(latest, map_location=device)
@@ -200,6 +206,7 @@ class CampaignLearner:
 			self.trust_ema = state.get("trust_ema")
 			self.head_residual, self.head_var_slow, self.head_residual_updates = state.get("head_residual"), state.get("head_var_slow"), state.get("head_residual_updates", 0)
 			self.grad_clips, self.clip_samples = state.get("grad_clips"), state.get("clip_samples", [])
+			self.gather_ramp_start = state.get("gather_ramp_start")
 			print(f"campaign: resuming at version {self.version}", flush=True)
 		elif config.init_from:
 			state = torch.load(config.init_from, map_location=device)
@@ -600,6 +607,11 @@ class CampaignLearner:
 		memory.append(("labels", rss_gb()))
 		self._note_head_ev(forecasts)  # (for the next update's grades: these were graded by the trust before them)
 		targets, labels, growth = np.concatenate(targets), np.concatenate(labels), np.concatenate(growth)
+		gather_weight = self.gather_weight_now()
+		row["gather_weight"] = gather_weight
+		with np.errstate(all="ignore"):
+			spread = np.nanstd(np.where(np.isfinite(targets), targets, np.nan), axis=0)
+		row["value_target_std"] = float(np.nanmean(spread)) if np.isfinite(spread).any() else float("nan")
 		returns, advantages = np.concatenate(returns), np.concatenate(advantages)
 		end = {name: np.concatenate(parts) for name, parts in end.items()}
 		if foresight is not None:
@@ -617,7 +629,7 @@ class CampaignLearner:
 			row["credit_trust"] = self.credit_check
 			row["credit_gaps"] = gaps
 		if self.worker:  # (the process saves checkpoint_latest.pt, with its optimizer)
-			state, metrics, lr_scale = self.worker.update(decisions, targets, returns, self.labels.weights, {"version": self.version + 1, "games_used": self.games_used + len(games), "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool}, advantages, growth, labels, end, foresight)
+			state, metrics, lr_scale = self.worker.update(decisions, targets, returns, self.labels.weights, {"version": self.version + 1, "nk2_gather_weight": gather_weight, "gather_ramp_start": self.gather_ramp_start, "games_used": self.games_used + len(games), "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool}, advantages, growth, labels, end, foresight)
 			with self.model_lock:
 				self.model.load_state_dict(state)
 				self.lr_scale = lr_scale
@@ -629,7 +641,7 @@ class CampaignLearner:
 			out_of_memory = None
 			with self.model_lock:
 				try:
-					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, self.config, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), growth_trust=self.grade_trust().get("G7", 0.0), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None, privileged={name: np.concatenate([part[name] for part in privileged]) for name in privileged[0]} if privileged else None)
+					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, replace(self.config, nk2_gather_weight=gather_weight), device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), growth_trust=self.grade_trust().get("G7", 0.0), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None, privileged={name: np.concatenate([part[name] for part in privileged]) for name in privileged[0]} if privileged else None)
 				except torch.OutOfMemoryError as error:  # (handled below, once the error's frames, and their tensors, are gone)
 					out_of_memory = str(error)[:200]
 			if out_of_memory is not None:
@@ -789,6 +801,10 @@ class CampaignLearner:
 			"players": mean([len(game.ledgers[min(game.ledgers)]["players"]) for game, _ in games if game.ledgers]),
 			"phi_end": mean(phi),
 			"heroes": mean(heroes),  # the one number for heroes (the user): mean heroes per player still in, over days
+			"gather_weight": sums.get("gather_weight", float("nan")),
+			"army_on_heroes": army_on_heroes(games, self.empire),
+			"eliminated": eliminated_share(games),
+			"value_target_std": sums.get("value_target_std", float("nan")),
 			"label_mean": sums["label_sum"] / max(n, 1),
 			"price_mean": sums["price_sum"] / max(n, 1),
 			"policy_loss": metrics.get("policy", float("nan")),
@@ -940,7 +956,7 @@ class CampaignLearner:
 
 		state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
 		optimizer = {} if self.worker else {"optimizer": self.optimizer.state_dict()}  # (the process's is in checkpoint_latest.pt)
-		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "model_kwargs": self.kwargs}, path)
+		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "gather_ramp_start": self.gather_ramp_start, "model_kwargs": self.kwargs}, path)
 
 	# ---- the loss shares (config.loss_shares) ----
 
@@ -982,6 +998,18 @@ class CampaignLearner:
 		if len(self.clip_samples) >= self.config.grad_clip_calibration:
 			self.grad_clips = {**calibrated_clips(self.clip_samples, GRAD_GROUPS), "version": self.version}
 			print(f"campaign: the gradient clipped by group from the next update, at the medians of {len(self.clip_samples)} steps' norms: " + "  ".join(f"{name} {self.grad_clips[name]:.4g}" for name in GRAD_GROUPS) + f"; all then x {self.config.grad_clip} / {self.grad_clips['typical']:.4g} (the total's median)", flush=True)
+
+	def gather_weight_now(self):
+		"""GATHER's label weight for the update to come (config.nk2_gather_ramp): nk2_gather_weight x min(1, updates since
+		the ramp's start / its length), the start this version at its first update; nk2_gather_weight itself without a
+		ramp (or with no weight)."""
+		target, ramp = self.config.nk2_gather_weight, getattr(self.config, "nk2_gather_ramp", 0)
+		if ramp <= 0 or target <= 0:
+			return target
+		if self.gather_ramp_start is None:
+			self.gather_ramp_start = self.version
+			print(f"campaign: GATHER's label ramped from version {self.version}: {target} over {ramp} updates", flush=True)
+		return target * min(1.0, (self.version + 1 - self.gather_ramp_start) / ramp)
 
 	def _note_gradients(self, metrics):
 		"""After an update: each term's gradient on the shared layers as it entered the loss (grad_shared_*: its norm at
@@ -1377,7 +1405,7 @@ def _update_worker(config, kwargs, device_name, state, requests, results, latest
 	while (request := requests.get()) is not None:
 		decisions, targets, returns, weights, about, advantages, growth, labels, end, foresight = request
 		try:
-			metrics, lr_scale = ppo_update(model, optimizer, decisions, targets, returns, config, device=device, lr_scale=lr_scale, weights=weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight)
+			metrics, lr_scale = ppo_update(model, optimizer, decisions, targets, returns, replace(config, nk2_gather_weight=about.get("nk2_gather_weight", config.nk2_gather_weight)), device=device, lr_scale=lr_scale, weights=weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight)
 			if device.type == "mps":
 				torch.mps.empty_cache()  # (the battle learner's lesson: MPS keeps blocks of every size it saw)
 			cpu = {key: value.detach().cpu() for key, value in model.state_dict().items()}
@@ -1387,6 +1415,38 @@ def _update_worker(config, kwargs, device_name, state, requests, results, latest
 			results.put(("ok", cpu, metrics, lr_scale))
 		except Exception:
 			results.put(("error", traceback.format_exc(), None, lr_scale))
+
+
+def army_on_heroes(games, empire):
+	"""Our armies' worth on heroes against all of it (on heroes, in towns' garrisons, armies no hero leads: empire.army_worth
+	at cost), over every player still in at each day's snapshot of the games; nan with none. The 2026-11-10 collapse:
+	GATHER put the garrisons on heroes (half and more), which were then killed in the field."""
+	from .empire import STATUS_INGAME, army_worth
+
+	on, total = 0.0, 0.0
+	for game, _ in games:
+		for snapshot in game.ledgers.values():
+			for p in snapshot["players"]:
+				if p.get("status", STATUS_INGAME) != STATUS_INGAME:
+					continue
+				led = sum(army_worth(hero.get("army", []), empire) for hero in p.get("heroes", []))
+				on += led
+				total += led + sum(army_worth(town.get("garrison", []), empire) for town in p.get("towns", [])) + army_worth(p.get("armies", []), empire)
+	return on / total if total > 0 else float("nan")
+
+
+def eliminated_share(games):
+	"""The share of the games' players out of their game by its end (EPlayerStatus LOSER at its last snapshot, the final
+	one if any); nan with none. Self-play's: 0.2% before the 2026-11-10 collapse, 6-8% in it."""
+	from .empire import STATUS_LOST
+
+	out, players = 0, 0
+	for game, _ in games:
+		snapshots = sorted([*game.ledgers.values(), *getattr(game, "final", [])], key=lambda s: (s["day"], bool(s.get("final"))))
+		if snapshots:
+			players += len(snapshots[-1]["players"])
+			out += sum(1 for p in snapshots[-1]["players"] if p.get("status") == STATUS_LOST)
+	return out / players if players else float("nan")
 
 
 class UpdateProcess:
