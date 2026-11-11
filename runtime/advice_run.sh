@@ -123,6 +123,11 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # 9 and 12 -> 7 and 15: no effect at these weights either way, as expected of targets the model has not trained on;
 # the gain, if any, is what it learns there. Watch over three evals: a fall of 0.1 or the guard takes it out;
 # "every hero slot in" in the update lines (over the budget), seconds an update, MOVE's share (type_drift)
+# night_gain no longer learns (2026-11-10 night, b1's 2458a27 + 23d10d1; rides deploy 52, no change of the forward):
+# over 23 updates the teacher's cross-entropy pushed it down in 21 (-0.0054 +- 0.0008) and the policy's credit had no
+# sign (+0.00002 +- 0.00022), so a learnable gain was noise plus Nullkiller2's push, and Nullkiller2's choice is not
+# evidence of our expected loss tonight. It stays at its value (raw -0.004, gain 0.96). A departure from the rule for
+# priors (a learnable correction decayed toward the prior), for this one scalar: push_night_gain_* read nan from here
 # campaign.value_jump_stop is 3 (config.py; the user, 2026-11-10): the campaign's updates are held when its fresh value
 # loss jumps (the median of the last 7 updates at 3 times its calm level); the line "VALUE LOSS JUMP" in the log, the
 # file campaign/held. A restart lifts the hold
