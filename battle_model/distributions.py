@@ -102,6 +102,42 @@ def entropy(out):
 	return h + p_type[:, ActionType.CREATURE_SPELL] * h_creature
 
 
+def _kl(logp, logq):
+	"""KL(p || q) over the last axis from two log-probability tables over the same legal entries (-inf illegal); 0
+	for rows with no legal entry. q's illegal entries where p's are legal are taken as -1e4, never -inf (a gradient
+	through an infinite log stays finite)."""
+	legal = torch.isfinite(logp)
+	p = torch.where(legal, logp, torch.full_like(logp, -1e4)).exp() * legal
+	return (p * torch.where(legal, logp - logq.clamp(min=-1e4), torch.zeros_like(logp))).sum(dim=-1)
+
+
+def _expect_p(logp, values):
+	"""E[values] under exp(logp) (a fixed distribution: no gradient through it) over the last axis."""
+	return (torch.where(torch.isfinite(logp), logp, torch.full_like(logp, -1e4)).exp().detach() * values).sum(dim=-1)
+
+
+def kl(snapshot, out):
+	"""KL(snapshot || out) of the full action distribution [B], exact by the chain rule over the choices as entropy()
+	walks them: the type's, plus each type's arguments' weighted by the snapshot's probability of that type, a
+	sub-choice's by its parent's (aux_value.py: a value phase must leave the policy where it was; the gradient
+	flows through out only)."""
+	p_type = snapshot["logp_type"].exp().detach()
+	k = _kl(snapshot["logp_type"], out["logp_type"])
+	k = k + p_type[:, constant(sorted(HEX_TYPES), p_type.device)].sum(dim=-1) * _kl(snapshot["logp_move_hex"], out["logp_move_hex"])
+	melee = _kl(snapshot["logp_melee_target"], out["logp_melee_target"]) + _expect_p(snapshot["logp_melee_target"], _kl(snapshot["logp_melee_from"], out["logp_melee_from"]))
+	k = k + p_type[:, ActionType.MELEE] * melee
+	k = k + p_type[:, constant(sorted(TARGET_TYPES), p_type.device)].sum(dim=-1) * _kl(snapshot["logp_shoot_target"], out["logp_shoot_target"])
+	second_kind = moved(_SECOND_KIND, out["logp_spell"].device)
+	k2_hex = _kl(snapshot["logp_spell2_hex"], out["logp_spell2_hex"])  # [B, U]
+	k2_unit = _kl(snapshot["logp_spell2_unit"], out["logp_spell2_unit"])
+	k2 = torch.where(second_kind[None, :, None] == TargetKind.HEX, k2_hex[:, None, :], torch.where(second_kind[None, :, None] == TargetKind.UNIT, k2_unit[:, None, :], 0.0))  # [B, S, U]
+	per_spell = _kl(snapshot["logp_spell_unit"], out["logp_spell_unit"]) + _kl(snapshot["logp_spell_hex"], out["logp_spell_hex"]) + _expect_p(snapshot["logp_spell_unit"], k2)
+	k_spell = _kl(snapshot["logp_spell"], out["logp_spell"]) + _expect_p(snapshot["logp_spell"], per_spell)
+	k = k + p_type[:, ActionType.HERO_SPELL] * k_spell
+	k_creature = _kl(snapshot["logp_creature_spell_unit"], out["logp_creature_spell_unit"]) + _kl(snapshot["logp_creature_spell_hex"], out["logp_creature_spell_hex"])
+	return k + p_type[:, ActionType.CREATURE_SPELL] * k_creature
+
+
 def _choose(logp, rng, greedy):
 	logp = np.asarray(logp, dtype=np.float64)
 	legal = np.isfinite(logp)

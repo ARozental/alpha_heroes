@@ -106,6 +106,10 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # label's weight in the teacher's cross-entropy, and the games ask its advice for it (ALPHA_MAP_GATHER_ADVICE). Our
 # model gives the label ~0 (the 2026-11-05 collapse's rule: a small weight of its own); teacher ce +0.06 expected.
 # Watch: emptied towns, eliminations, the type drift
+# OFF AGAIN 2026-11-10 18:30 (e5): the six evals after it 0.475, 0.380, 0.314, 0.345, 0.402, 0.271 (eliminated 15, 21,
+# 23, 22, 19, 28 of 48) against 0.511, 0.491, 0.489 (9, 10, 6) before; the campaign back to v2728's weights
+# (checkpoint_02728.pt, the last eval before it), the games not asked for the advice. The override is gone from the
+# line below: campaign.nk2_gather_weight is 0 (config.py)
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -114,5 +118,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.nk2_gather_weight=0.1 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null

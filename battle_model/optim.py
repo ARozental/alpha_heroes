@@ -122,3 +122,79 @@ def moments_by_name(optimizer, model, saved, saved_names):
 		param_groups.append({**{key: value for key, value in group.items() if key != "params"}, "params": ids})
 	optimizer.load_state_dict({"state": state, "param_groups": param_groups})
 	return fresh, [name for name in saved_names if name not in set(names.values())]
+
+
+class SignalShare:
+	"""The share of an update's gradient that other battles repeat (e5, 2026-11-10: signal_ratio and signal_fraction read
+	pure noise as signal at accumulate 24, an update's 4 steps being 4 passes over the same decisions: Adam's m held 4
+	copies of one gradient, |m|/sqrt(v) 0.31 for noise). At each update's first optimizer step, before any step on its
+	battles, each named group's clipped gradient g against S, a bias-corrected running mean (decay) of the earlier
+	updates' first-step gradients, updated after the reading: (g . S) / |g|^2, raw and with both divided by the
+	optimizer's sqrt(v-hat) (as Adam applies them). Its mean over ~25-50 updates is that share (expected ~0.005 as
+	applied, 2026-11-10). A diagnostic: an error turns it off with one line, never an update's end; S starts again at
+	a restart (not kept in the checkpoints)."""
+
+	def __init__(self, decay=0.98, context=None):
+		"""context: what the gradient's meaning depends on (train.signal_context: the weighting, the credit, the losses'
+		weights); a checkpoint's S made under another context is not loaded (load_state_dict)."""
+		self.decay, self.mean, self.count, self.on, self.loaded, self.context = decay, {}, {}, True, set(), context or {}
+
+	def state_dict(self):
+		return {"decay": self.decay, "mean": dict(self.mean), "count": dict(self.count), "context": dict(self.context)}
+
+	def load_state_dict(self, state):
+		"""A checkpoint's S and counts (a deploy does not blind the reading for ~25 updates). Made under another context
+		(e5, 2026-11-10: a new weighting's gradients set against the old one's average would muddy the before and after
+		for ~100 updates) it is not loaded: the reading starts cold, said once (cold is unbiased from its second update,
+		only noisier at first). A group whose S does not fit the model starts cold too, said at its first reading."""
+		saved = state.get("context", {})
+		if saved != self.context:
+			changed = ", ".join(f"{k} {saved.get(k, '-')} -> {self.context.get(k, '-')}" for k in sorted(set(saved) | set(self.context)) if saved.get(k) != self.context.get(k))
+			print(f"signal_share: the checkpoint's S was made under other settings ({changed[:400]}): it starts cold", flush=True)
+			return
+		self.mean, self.count = dict(state.get("mean", {})), dict(state.get("count", {}))
+		self.loaded = set(self.mean)
+
+	def read(self, optimizer):
+		if not self.on:
+			return {}
+		try:
+			readings, gradients = {}, {}
+			for group in optimizer.param_groups:
+				params = list(group["params"])
+				if not params or all(p.grad is None for p in params):
+					continue
+				name = group.get("name", "all")
+				# (a parameter with no gradient counts as zeros: the group's vector keeps its shape, S its meaning)
+				g = torch.cat([(p.grad.detach().float() if p.grad is not None else torch.zeros_like(p, dtype=torch.float32)).flatten() for p in params])
+				scale = []
+				for p in params:
+					state = optimizer.state.get(p, {})
+					if "exp_avg_sq" not in state or "step" not in state:
+						scale = None
+						break
+					step = float(state["step"])
+					scale.append((state["exp_avg_sq"].float().flatten() / (1 - group["betas"][1] ** step)).sqrt() + group.get("eps", 1e-8))
+				gradients[name] = (g, torch.cat(scale) if scale else None)
+			for name, (g, scale) in gradients.items():
+				mean, count = self.mean.get(name), self.count.get(name, 0)
+				if mean is not None and count and mean.shape == g.shape:
+					s = mean / (1 - self.decay**count)
+					readings[f"signal_share_{name}"] = float((g @ s) / (g @ g).clamp(min=1e-30))
+					if scale is not None:
+						ga, sa = g / scale, s / scale
+						readings[f"signal_share_applied_{name}"] = float((ga @ sa) / (ga @ ga).clamp(min=1e-30))
+				if mean is not None and mean.shape != g.shape and name in self.loaded:
+					print(f"signal_share: the checkpoint's S of {name} does not fit the model ({tuple(mean.shape)} against {tuple(g.shape)}): it starts cold", flush=True)
+				self.loaded.discard(name)
+				if mean is None or mean.shape != g.shape:
+					mean, count = torch.zeros_like(g), 0
+				else:
+					mean = mean.to(g.device)
+				self.mean[name] = self.decay * mean + (1 - self.decay) * g
+				self.count[name] = count + 1
+			return readings
+		except Exception as error:  # noqa: BLE001
+			print(f"signal_share: FAILURE ({type(error).__name__}: {str(error)[:200]}): the reading turned off for the run", flush=True)
+			self.on = False
+			return {}

@@ -62,11 +62,11 @@ from torch.utils.tensorboard import SummaryWriter
 from campaign_model.config import CampaignConfig
 
 from . import generator, play, rules
-from .data import collate, credit_check, make_dataloader, summarize, widened  # noqa: F401 (make_dataloader: the Producer's path)
+from .data import collate, credit_check, length_weight, make_dataloader, summarize, widened  # noqa: F401 (make_dataloader: the Producer's path)
 from .distributions import log_prob
 from .export import export, verify
 from .device import sync, use_fused
-from .optim import calibrated_clips, clip_gradients, clip_settings, moments_by_name, signal_fraction, stale_clips
+from .optim import SignalShare, calibrated_clips, clip_gradients, clip_settings, moments_by_name, signal_fraction, stale_clips
 from .losses import FORESIGHT_PARTS, AdvantageConfig, PPOConfig, foresight_loss, ppo_loss, search_loss, value_excess, weighted_mean
 from .constants import N_ACTION_TYPES, ActionType
 from .model import VALUE_PRIOR_GAIN, VALUE_PRIOR_KINDS, VALUE_PRIOR_STEP, build_model
@@ -116,6 +116,11 @@ class TrainConfig:
 	# the winner's and the loser's) makes an update's decisions as many outcomes (the user, 2026-10-31: "only taking one
 	# example from every battle ... battles are much cheaper than campaigns"), at ~50/k times the battles an update
 	examples_per_battle: int = 0
+	# A battle counts as at most ~this many decisions (data.length_weight: each decision's weight x 1 / (1 + (n - 1) /
+	# scale), n its battle's decisions trained on; e5, 2026-11-10: by decision count an update's gradient rested on ~4
+	# games for the value, ~14 for the policy, long stand-offs holding most of it). 0: off. The planned value 30
+	battle_length_scale: float = 0.0
+	signal_share: bool = True  # the honest signal reading (optim.SignalShare), a diagnostic
 	# Time instead of epochs: stop after run_hours (0: after `epochs`), the linear learning rate following the time;
 	# an eval every eval_minutes (0: every eval_every epochs); the rate ends at lr_final_fraction of learning_rate
 	run_hours: float = 0.0
@@ -188,6 +193,22 @@ class TrainConfig:
 	# learning_rate x this. No teacher or balancer here: the critic's one handicap was the shared rate
 	value_lr_factor: float = 10.0
 	value_lr_kl: bool = False  # the KL control's lr_scale scales the values' group too (False: the policy's KL never moves them)
+	# The value's own phase (aux_value.py; 2026-11-10, Phasic Policy Gradient's auxiliary phase): after each battle update
+	# (in the time the trainer waits for battles), up to aux_steps steps of aux_batch decisions from a replay of the last
+	# aux_replay_age versions' battles (aux_per_battle decisions spread over each, at most aux_replay_decisions), on
+	# value_loss + aux_kl_weight x KL(policy as the phase starts || now), its own Adam, each group at its rate x
+	# aux_lr_factor (the user's cap on the trunk holds), at most aux_seconds; never beside a campaign update
+	# (aux_allowed). Its readings in the next update's row (aux_*). Off: False
+	aux_value: bool = False
+	aux_steps: int = 8
+	aux_batch: int = 512
+	aux_seconds: float = 20.0
+	aux_kl_weight: float = 10.0  # (tests: 3.6e-3 of KL on a fixed batch against 2.4e-2 without, the value's loss as low)
+	aux_kl_max: float = 3e-4  # a phase that moved the policy more on its held-out battles is undone (aux_rejected): ~10 PPO updates' KL
+	aux_lr_factor: float = 1.0
+	aux_replay_decisions: int = 20_000
+	aux_replay_age: int = 8
+	aux_per_battle: int = 5
 	# The trunk's momentum (docs/optimizer_plan.md step 5, the battle's since 2026-11-06): Adam's beta1 for the trunk group
 	# (the priors' and the values' stay 0.9). The battle trunk's gradient read as pure noise a step (signal fraction ~0,
 	# since 8797125 cut accumulate 24 -> 2: 512 decisions a step): at 0.95 each step's direction averages ~20 steps,
@@ -307,6 +328,11 @@ def run_dir(config, new=False):
 	return TRAIN_ROOT / f"{time.strftime('%Y%m%d-%H%M')}-{config.run}"
 
 
+# The share of an update's gradient that other battles repeat, raw and as applied (optim.SignalShare), and the games an
+# update's gradient rests on by its decisions' weights and by their count ((sum)^2 / sum of squares over its games)
+SIGNAL_COLUMNS = (*(f"signal_share_{g}" for g in ("trunk", "priors", "values")), *(f"signal_share_applied_{g}" for g in ("trunk", "priors", "values")), "games_by_weight", "games_by_decisions")
+AUX_COLUMNS = ("aux_steps", "aux_seconds", "aux_value_loss", "aux_kl", "aux_grad_cosine", "aux_trunk_move", "aux_excess_before", "aux_excess_after", "aux_fresh_change", "aux_kl_held_out", "aux_kl_check", "aux_skipped", "aux_rejected", "aux_failed", "aux_replay_decisions")
+
 # Action types whose share of each side's decisions is logged every epoch (actions_<side>/<type> in TensorBoard)
 ACTION_KINDS = ("WAIT", "DEFEND", "MOVE", "MELEE", "SHOOT", "HERO_SPELL", "CREATURE_SPELL", "RETREAT", "SURRENDER")
 
@@ -326,6 +352,9 @@ COLUMNS = [
 	# the values' rate
 	"grad_norm", *(f"grad_norm_{g}" for g in ("trunk", "priors", "values")), *(f"clip_bound_{g}" for g in ("trunk", "priors", "values")),
 	"signal_fraction", *(f"signal_fraction_{g}" for g in ("trunk", "priors", "values")), "value_learning_rate", "clipped_by_group",
+	# The value's own phase after the previous update (config.aux_value; aux_value.AuxValuePhase.run's readings)
+	*AUX_COLUMNS,
+	*SIGNAL_COLUMNS, "value_loss_fresh_weighted", "entropy_weighted",
 ]  # progress.csv. Per side, over its games_per_side battles: mean reward (-1..1 scale), mean raw reward (reward
 # units), win rate, outcome (its name for one battle, else counts like "WIN:3 LOSS:5"), mean advantage std and value
 # error. decisions: all decisions of the epoch; rounds: attack + defence battle rounds, averaged over the games.
@@ -357,6 +386,10 @@ TENSORBOARD_TAGS = {
 	"attack_win_rate": "won/attack", "defence_win_rate": "won/defence",
 	"policy_loss": "loss/policy", "value_loss": "loss/value", "value_loss_fresh": VALUE_LOSS_TAB, "value_loss_fresh_real": VALUE_LOSS_TAB + "_real", "value_loss_fresh_generated": VALUE_LOSS_TAB + "_generated", "entropy": "loss/entropy", "below_floor": "loss/entropy_below_floor",
 	"signal_ratio": "stability/signal_ratio", "weight_change": "stability/weight_change", "approx_kl": "stability/approx_kl", "clip_fraction": "stability/clip_fraction",
+	**{name: f"aux/{name[4:]}" for name in AUX_COLUMNS},  # the value's own phase (config.aux_value)
+	**{name: f"signal/{name}" for name in SIGNAL_COLUMNS},  # optim.SignalShare, games_by_weight
+	"value_loss_fresh_weighted": VALUE_LOSS_TAB + "_weighted",  # (with battle_length_scale's weights; the plain series keeps the old ones)
+	"entropy_weighted": "loss/entropy_weighted",
 	"attack_advantage_std": "advantage_std/attack", "defence_advantage_std": "advantage_std/defence", "attack_advantage_scale": "advantage_scale/attack", "defence_advantage_scale": "advantage_scale/defence",
 	"attack_value_error": "value_error/attack", "defence_value_error": "value_error/defence",
 	"decisions": "battle/decisions", "rounds": "battle/rounds", "seconds": "time/epoch_seconds",
@@ -468,6 +501,53 @@ def signal_ratio(optimizer):
 BATTLE_GROUPS = ("trunk", "priors", "values")
 BATTLE_VALUE_MODULES = ("values.", "value_strength.")
 BATTLE_PRIORS = ("actions.escape_rules", "actions.escape_ahead", "actions.escape_strong", "actions.spell_mastery", "actions.spell_value", "actions.creature_spell_value", "actions.value_gains", "actions.type_head.bias", "actions.type_rules.weight", "actions.type_strength.weight", "actions.spell_head.bias")
+
+
+SIGNAL_CONTEXT = ("battle_length_scale", "game_share", "examples_per_battle", "real_share", "fixed_mix", "league", "league_ais", "opponent", "grad_clip", "grad_clip_by_group", "grad_clip_groups", "grad_clip_since")
+
+
+def signal_context(config):
+	"""What the battle gradient's meaning depends on, for optim.SignalShare's state: the weighting and the battles' mix
+	(SIGNAL_CONTEXT), the clip (the reading is of the clipped gradient) and every field of the reward, the credit and the
+	losses (a field added later joins by itself); a deploy that changes one starts the reading cold."""
+	context = {name: repr(getattr(config, name)) for name in SIGNAL_CONTEXT}
+	for part in ("reward", "advantage", "ppo"):
+		context.update({f"{part}.{f.name}": repr(getattr(getattr(config, part), f.name)) for f in fields(getattr(config, part))})
+	return context
+
+
+class GamesRestedOn:
+	"""games_rested_on as a diagnostic (e5's review, 2026-11-10): an error gives (nan, nan), one "games_rested_on:
+	FAILURE" line, and the reading off for the run; never an update's end."""
+
+	def __init__(self):
+		self.on = True
+
+	def __call__(self, items, length_scale=0.0):
+		if not self.on:
+			return float("nan"), float("nan")
+		try:
+			return games_rested_on(items, length_scale)
+		except Exception as error:  # noqa: BLE001
+			print(f"games_rested_on: FAILURE ({type(error).__name__}: {str(error)[:200]}): the reading off for the run", flush=True)
+			self.on = False
+			return float("nan"), float("nan")
+
+
+def games_rested_on(items, length_scale=0.0):
+	"""(by weight, by decisions): (sum of W_g)^2 / sum of W_g^2 over an update's games, W_g a game's decisions' summed
+	weight as the update weighs them (data's "weight" x length_weight, as supply.assemble) or their count: how many games
+	the update's gradient rests on (e5, 2026-11-10: 33 by weight on a stop's buffer of 98 games, 68 at scale 30)."""
+	by_weight, by_count = Counter(), Counter()
+	for item in items:
+		data = item.get("data")
+		if not data:
+			continue
+		weight = np.asarray(data.get("weight", np.ones(item["decisions"])), dtype=np.float64) * length_weight(item["decisions"], length_scale)
+		by_weight[item["game"]] += float(weight.sum())
+		by_count[item["game"]] += item["decisions"]
+	share = lambda d: (sum(d.values()) ** 2 / sum(v * v for v in d.values())) if d and sum(d.values()) > 0 else float("nan")  # noqa: E731
+	return share(by_weight), share(by_count)
 
 
 def battle_parameter_groups(model):
@@ -1367,6 +1447,30 @@ def train(config, resume=False):
 		last_eval -= time.time() - (out / "eval_total.csv").stat().st_mtime
 	elapsed = lambda: elapsed_before + time.monotonic() - run_started
 	last_campaign = time.monotonic()  # (learner "turns": when the campaign's last update ended)
+	signal_probe = SignalShare(context=signal_context(config)) if config.signal_share else None  # (the honest signal reading: optim.SignalShare)
+	games_reading = GamesRestedOn()
+	if signal_probe is not None and resume and state.get("signal_share"):  # (its S as the last checkpoint left it)
+		signal_probe.load_state_dict(state["signal_share"])
+	replay = aux_phase = None  # (config.aux_value: the value's own phase, aux_value.py)
+	aux_readings = {}
+	if config.aux_value and pool is not None:
+		from .aux_value import AuxValuePhase, ValueReplay, aux_allowed, guarded_run
+
+		replay = ValueReplay(config.aux_replay_decisions, config.aux_replay_age, config.aux_per_battle, seed=first_epoch)
+		groups = battle_parameter_groups(model)
+		aux_phase = AuxValuePhase(groups, {name: battle_group_lr({"name": name}, config) * config.aux_lr_factor for name in groups}, betas=(0.9, config.adam_beta2), kl_max=config.aux_kl_max)
+		if resume and state.get("aux_optimizer"):  # (its Adam as the last checkpoint left it: a restart does not start it cold)
+			aux_phase.load_state_dict(state["aux_optimizer"])
+		pool.replay = replay  # (its memory in the trainer's census)
+
+	def checkpoint_extras():
+		"""What a checkpoint keeps beside the model and the optimizer: the clips' calibration, the value phase's Adam."""
+		return {
+			"grad_clips": grad_clips, "clip_samples": clip_samples,
+			**({"aux_optimizer": aux_phase.state_dict()} if aux_phase is not None else {}),
+			**({"signal_share": signal_probe.state_dict()} if signal_probe is not None else {}),
+		}
+
 	for group in optimizer.param_groups:
 		group["betas"] = (group["betas"][0], config.adam_beta2)
 	try:
@@ -1407,7 +1511,9 @@ def train(config, resume=False):
 			if pool:  # the workers prepared each battle's arrays (supply.prepare): joined, the advantages normalised over the update
 				from .supply import assemble
 
-				batch_all, summaries = assemble(items, advantage_config, device=device if device.type == "cuda" else None)  # (the sparse inputs dense on the GPU: supply.dense_on)
+				batch_all, summaries = assemble(items, advantage_config, device=device if device.type == "cuda" else None, length_scale=config.battle_length_scale)  # (the sparse inputs dense on the GPU: supply.dense_on)
+				if replay is not None and aux_phase is not None:
+					replay.add(items, pool.version)  # (a few decisions of each battle, for the value's own phase)
 				n_examples = int(batch_all["advantage"].shape[0]) if batch_all is not None else 0
 			else:
 				loader, summaries, _ = make_dataloader(records, config.batch_size, True, reward_config, advantage_config)
@@ -1416,7 +1522,7 @@ def train(config, resume=False):
 				n_examples = len(examples)
 
 			weights_before = flat_weights(model)
-			parts_sum, batches = {key: torch.zeros((), device=device) for key in ("policy", "value", "entropy", "below_floor", "approx_kl", "clip_fraction", *(f"foresight_{k}" for k in FORESIGHT_PARTS))}, 0
+			parts_sum, batches = {key: torch.zeros((), device=device) for key in ("policy", "value", "entropy", "entropy_base", "below_floor", "approx_kl", "clip_fraction", *(f"foresight_{k}" for k in FORESIGHT_PARTS))}, 0
 			gradient_check = {}
 			trained = time.time()
 			model.train()
@@ -1442,7 +1548,7 @@ def train(config, resume=False):
 						facts[key][i : i + rows] = value[:rows]
 					del chunk
 				epoch_data["facts"] = facts
-			fresh_value, fresh_by_source = float("nan"), {}
+			fresh_value, fresh_value_weighted, fresh_by_source = float("nan"), float("nan"), {}
 			if epoch_data is not None:
 				# The KL control's anchor: this update's actions under the model as the update starts. Measured against the
 				# policy that played (old_log_prob, about one version back), the previous update's own move counted as
@@ -1457,14 +1563,18 @@ def train(config, resume=False):
 						anchors.append(log_prob(out_rows, rows["action"]))
 						excess.append(value_excess(out_rows, rows["value_labels"], ppo_config))
 					epoch_data["anchor_log_prob"] = torch.cat(anchors)[: len(examples)]
-					fresh_value = float(weighted_mean(torch.cat(excess)[: len(examples)], epoch_data.get("weight")))
+					# (the series with the weights as they were before battle_length_scale: its meaning kept; the weighted apart)
+					base_weight = epoch_data.get("weight_base", epoch_data.get("weight"))
+					fresh_value = float(weighted_mean(torch.cat(excess)[: len(examples)], base_weight))
+					fresh_value_weighted = float(weighted_mean(torch.cat(excess)[: len(examples)], epoch_data.get("weight")))
 					if "real" in epoch_data:  # (by source: the campaign games' battles and the generated ones, 2026-10-31)
-						every, real, w = torch.cat(excess)[: len(examples)], epoch_data["real"] > 0, epoch_data.get("weight")
+						every, real, w = torch.cat(excess)[: len(examples)], epoch_data["real"] > 0, base_weight
 						fresh_by_source = {name: float(weighted_mean(every[m], w[m] if w is not None else None)) if bool(m.any()) else float("nan") for name, m in (("real", real), ("generated", ~real))}
 					del anchors, excess, out_rows
 			sync(device)
 			marks.append(time.time())
 			stopped, update_kl, kl_sum, recent = False, 0.0, 0.0, deque(maxlen=KL_WINDOW)
+			signal_readings = {}
 			step_norms = []  # each optimizer step's gradient norms before the clip, [total, BATTLE_GROUPS'..., their clips bound...] on the device
 			kl_of = lambda out, rows: (lambda d: (d.exp() - 1 - d).mean())(log_prob(out, rows["action"]).detach() - rows["anchor_log_prob"])  # k3: KL(anchor || now)
 			group = max(1, config.accumulate)  # minibatches an optimizer step averages its gradient over
@@ -1494,7 +1604,7 @@ def train(config, resume=False):
 						if config.search_simulations > 0 and "search" in batch:
 							loss, parts = search_loss(out_batch, batch["search"], batch["value_labels"], ppo_config)
 						else:
-							loss, parts = ppo_loss(out_batch, batch["action"], batch["old_log_prob"], batch["advantage"], batch["value_labels"], ppo_config, batch.get("weight"))
+							loss, parts = ppo_loss(out_batch, batch["action"], batch["old_log_prob"], batch["advantage"], batch["value_labels"], ppo_config, batch.get("weight"), batch.get("weight_base"))
 						if "foresight" in batch and "foresight_unit" in out_batch:
 							foresight, foresight_parts = foresight_loss(out_batch, batch["foresight"], ppo_config, batch.get("weight"))
 							loss = loss + foresight
@@ -1514,6 +1624,8 @@ def train(config, resume=False):
 						break
 					total, norms, bound = clip_gradients(optimizer, config.grad_clip, grad_clips if config.grad_clip_by_group else None, BATTLE_GROUPS)
 					step_norms.append(torch.cat([total.reshape(1), norms, bound]))  # (read once, after the update)
+					if steps == 0 and signal_probe is not None:  # (the update's first step: its battles fresh)
+						signal_readings = signal_probe.read(optimizer)
 					optimizer.step()
 					steps += 1
 					# The KL control once a step, one read of the GPU (a float() of each minibatch's waited for it every minibatch)
@@ -1581,9 +1693,11 @@ def train(config, resume=False):
 				"policy_loss": round(mean["policy"], 5),
 				"value_loss": round(mean["value"], 5),
 				"value_loss_fresh": round(fresh_value, 5),
+				"value_loss_fresh_weighted": round(fresh_value_weighted, 5),
 				"value_loss_fresh_real": round(fresh_by_source.get("real", float("nan")), 5),
 				"value_loss_fresh_generated": round(fresh_by_source.get("generated", float("nan")), 5),
-				"entropy": round(mean["entropy"], 4),
+				"entropy": round(mean["entropy_base"], 4),  # (with the base weights: battle_length_scale)
+				"entropy_weighted": round(mean["entropy"], 4),
 				"below_floor": round(mean["below_floor"], 4),
 				"approx_kl": round(mean["approx_kl"], 5),
 				"clip_fraction": round(mean["clip_fraction"], 4),
@@ -1605,7 +1719,11 @@ def train(config, resume=False):
 				**{f"train_{k}": v for k, v in (failure_modes(counts=sum_failure_counts(items)) if pool else failure_modes(records)).items()},  # the same signs of dumb play, in training
 				**{f"foresight_{k}": round(mean[f"foresight_{k}"], 5) for k in FORESIGHT_PARTS},
 				**gradient_check,
+				**{key: (round(value, 6) if isinstance(value, float) else value) for key, value in aux_readings.items()},  # (the phase after the previous update)
+				**{key: round(value, 5) for key, value in signal_readings.items()},
+				**(dict(zip(("games_by_weight", "games_by_decisions"), (round(v, 2) for v in games_reading(items, config.battle_length_scale)))) if pool else {}),
 			}
+			aux_readings = {}
 			for side, name in ((0, "attack"), (1, "defence")):
 				kinds = Counter()
 				if pool:
@@ -1658,6 +1776,11 @@ def train(config, resume=False):
 				campaign.note_epoch(epoch)  # (its updates run in its own thread)
 			if campaign:
 				campaign.check()  # (a background evaluation that failed)
+			if aux_phase is not None and aux_allowed(campaign, config):
+				# The value's own phase (aux_value.py), before the eval's snapshot and the checkpoint: they hold its weights
+				newest = max((e["version"] for e in replay.entries), default=None)
+				aux_readings, aux_phase = guarded_run(aux_phase, model, replay, device, steps=config.aux_steps, batch_size=config.aux_batch, kl_weight=config.aux_kl_weight, seconds=config.aux_seconds, clip=config.grad_clip, ppo_config=ppo_config, held_out_version=newest)
+				aux_readings["aux_replay_decisions"] = replay.decisions()
 			if evals.error:
 				raise evals.error
 			idle = not evals.running()
@@ -1667,7 +1790,7 @@ def train(config, resume=False):
 			eval_pending = eval_pending or bool(due)
 			if eval_pending and idle:
 				eval_pending = False
-				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, {"grad_clips": grad_clips, "clip_samples": clip_samples})  # every evaluated model
+				save_checkpoint(out / f"checkpoint_{epoch:05d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, checkpoint_extras())  # every evaluated model
 				if pool:
 					# Beside training (2026-10-30: the run stood still ~2 minutes an hour for it): the actors go on and the
 					# learner trains while the eval plays copies of the weights as they are now. Its battles are greedy, so
@@ -1678,9 +1801,9 @@ def train(config, resume=False):
 					last_eval = time.monotonic()
 			if campaign and campaign.eval_due():  # against Nullkiller2, beside training (the models pinned: learner.evaluate)
 				campaign.start_eval(epoch)
-			save_checkpoint(latest, model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, {"grad_clips": grad_clips, "clip_samples": clip_samples})
+			save_checkpoint(latest, model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, checkpoint_extras())
 			if config.checkpoint_every and epoch % config.checkpoint_every == 0:
-				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, {"grad_clips": grad_clips, "clip_samples": clip_samples})
+				save_checkpoint(out / f"checkpoint_{epoch:04d}.pt", model, optimizer, epoch, config, elapsed(), lr_scale, value_ev, average, checkpoint_extras())
 		evals.join()  # (the run's end: its last eval's row too)
 	finally:
 		evals.close()  # (stopped: no new eval battle; the ones playing end)

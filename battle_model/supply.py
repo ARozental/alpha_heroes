@@ -46,7 +46,7 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from . import forkserver, generator, play, remote
 from .constants import MAX_UNITS, N_HEXES, N_VALUE_HORIZONS, ActionType
-from .data import SPARSE_INPUTS, Sparse, battle_examples, check_record, collate, compact_record, version_of
+from .data import SPARSE_INPUTS, Sparse, battle_examples, check_record, collate, compact_record, length_weight, version_of
 
 KEPT_RUNS = deque(maxlen=9)  # (the VCMI logs of clean games with actions that changed nothing: the newest 8 a process)
 from .losses import normalize_advantages
@@ -242,11 +242,15 @@ def dense_on(values, device):
 	return out
 
 
-def assemble(items, advantage_config, device=None):
+def assemble(items, advantage_config, device=None, length_scale=0.0):
 	"""One update's batch (as data.collate(widen=False) gives it, the int64 inputs int32) from the battle items taken, the
 	advantages normalised per side and source over the update (data.make_dataloader: the campaign games' battles got 50%
 	larger advantages than the generated ones' when normalised together); and the items' summaries, in order. device:
-	the sparse inputs made dense there (dense_on), not on the CPU; the rest as before (moved by the caller)."""
+	the sparse inputs made dense there (dense_on), not on the CPU; the rest as before (moved by the caller).
+	length_scale (TrainConfig.battle_length_scale): each item's decisions' weight x data.length_weight of its decisions,
+	here, in the trainer, for the whole buffer alike (the items keep their base weight: the value phase's replay, which
+	takes a few decisions of each battle whatever its length, must not count a long one down twice); "weight_base" the
+	weights without it (the series that must keep their meaning: train.py)."""
 	parts = [item["data"] for item in items if item["data"]]
 	if not parts:
 		return None, [item["summary"] for item in items]
@@ -263,6 +267,11 @@ def assemble(items, advantage_config, device=None):
 	groups = torch.cat([torch.full((n,), item["summary"].our_side + 2 * (item["source"] == "real")) for n, item in zip(rows, (i for i in items if i["data"]))])
 	battles = torch.cat([torch.full((n,), i) for i, n in enumerate(rows)])
 	batch["advantage"] = normalize_advantages(batch["advantage"], groups, battles, advantage_config)
+	if "weight" in batch:  # (collate's items always have it)
+		batch["weight_base"] = batch["weight"]
+		if length_scale and length_scale > 0:
+			factors = torch.cat([torch.full((n,), length_weight(n, length_scale)) for n in rows]).to(batch["weight"].device, batch["weight"].dtype)
+			batch["weight"] = batch["weight"] * factors
 	batch["real"] = (groups >= 2).float()  # (each decision's source, for the fresh value loss by source)
 	return batch, [item["summary"] for item in items]
 
@@ -785,6 +794,9 @@ class Supply:
 		with self.pool.lock:
 			buffer = list(self.pool.buffer)
 		parts.append(f"battle buffer {len(buffer)} battles, {sum(b['decisions'] for b in buffer)} decisions, {sum(held_bytes(b.get('data')) for b in buffer) / 2**20:.0f} MB")
+		replay = getattr(self.pool, "replay", None)  # (train.py: config.aux_value's replay, aux_value.ValueReplay)
+		if replay is not None:
+			parts.append(f"value replay {len(replay.entries)} battles, {replay.decisions()} decisions, {replay.bytes / 2**20:.0f} MB")
 		if torch.cuda.is_available():
 			host = torch.cuda.host_memory_stats()
 			parts.append(f"pinned host {host.get('reserved_bytes.current', host.get('allocated_bytes.current', 0)) / 2**30:.2f} GB")

@@ -423,6 +423,15 @@ def example_weight(summary):
 	return min(1.0, max(MIN_WEIGHT, share / FULL_WEIGHT_SHARE))
 
 
+def length_weight(decisions, scale):
+	"""A decision's factor in its battle's weight by the battle's length (TrainConfig.battle_length_scale; 0: none):
+	1 / (1 + (n - 1) / scale), n the decisions trained on of its battle: a battle counts as at most ~scale decisions.
+	A battle is one outcome whose decisions pull together (e5, 2026-11-10: on a stop's buffer a battle's value-gradient
+	energy grew as decisions^1.72, and 6 stand-offs of 150+ decisions, 28% of the update's decisions, held most of it;
+	the 621-decision one alone 43%): by decision count an update's gradient rested on ~4 games (value) and ~14 (policy)."""
+	return 1.0 / (1.0 + (decisions - 1) / scale) if scale and scale > 0 and decisions > 0 else 1.0
+
+
 def lopsided_scale(summary):
 	"""What a battle's advantages are multiplied by (AdvantageConfig.lopsided_scale): both sides' start assets over twice
 	their harmonic mean, 1 / (4 p (1 - p)) for the weaker side's share p. The reward is a share of both sides' assets,
