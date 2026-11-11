@@ -277,7 +277,9 @@ class CustomFeatures(nn.Module):
 		self.register_buffer("object_score", scores)  # persistent: a checkpoint keeps the priors it was trained from
 		self.prior_shares = os.environ.get("ALPHA_PRIOR_SHARES", "0") == "1"  # (in_shares: a test, off by default)
 		self.night_power = float(os.environ.get("ALPHA_NIGHT_POWER", "1"))  # (night_calibrated: a test, 1 the reading as it is)
-		self.town_night = int(os.environ.get("ALPHA_TOWN_NIGHT", "0"))  # (features.town_night in the night term, a test: 0 off, 1 on, 2 with our only town at our Φ)
+		# (features.town_night in the night term: 2, our only town at our Φ, since its paired test of 2026-11-11; ALPHA_TOWN_NIGHT
+		# 0 turns it off for a test, 1 prices that town at its stakes alone)
+		self.town_night = int(os.environ.get("ALPHA_TOWN_NIGHT", "2"))
 		self.register_buffer("subtype_score", subtype_score)
 		self.register_buffer("class_value", priors.class_values())
 		guards = torch.zeros(c.OBJECT_VOCAB + 1, PRIOR_SUBTYPES + 1, 2)  # a creature bank's guards: strength, hit points

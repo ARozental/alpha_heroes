@@ -217,10 +217,11 @@ def test_our_towns_night_pays_a_hero_to_guard_an_empty_town(model, monkeypatch):
 	holds nobody; 100 enemy angels 9 tiles from it, too weak to beat our hero, strong enough for the empty town. Our
 	hero's own night is ~0 anywhere, so before nothing paid it to step in; the town's night does, and costs it to step
 	out of the town once inside (VCMI: a visitor with no garrison hero defends behind the walls, the garrison merged)."""
-	monkeypatch.setenv("ALPHA_TOWN_NIGHT", "2")
-	guarded = CampaignModel(dim=32, cell_dim=16, layers=1).eval()
-	guarded.load_state_dict(model.state_dict())
-	assert model.features.town_night == 0 and guarded.features.town_night == 2
+	monkeypatch.setenv("ALPHA_TOWN_NIGHT", "0")
+	unguarded = CampaignModel(dim=32, cell_dim=16, layers=1).eval()
+	unguarded.load_state_dict(model.state_dict())
+	guarded, model = model, unguarded
+	assert model.features.town_night == 0 and guarded.features.town_night == 2  # (on by default since its paired test)
 
 	def place(hero_at, inside=False):
 		x = scene(hero_at, [])
