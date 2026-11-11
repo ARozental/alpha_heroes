@@ -980,6 +980,8 @@ class CampaignLearner:
 		"""Each term's share of the shared layers' gradient: the teacher's by how good we are (teacher_share), the rest
 		policy : value : foresight 4 : 3 : 1."""
 		teacher = getattr(self, "teacher_share", None) if getattr(self, "teacher_share", None) is not None else min(TEACHER_SHARE_MAX, self.teacher_weight / (1.0 + self.teacher_weight))
+		if not getattr(self.config, "nk2_teacher", True):
+			teacher = 0.0
 		rest = 1.0 - teacher
 		return {"policy": rest * 4 / 8, "value": rest * 3 / 8, "teacher": teacher, "foresight": rest / 8}
 
@@ -987,11 +989,14 @@ class CampaignLearner:
 		"""The terms' weights for the next update (ppo_update's loss_weights and teacher_weight): the loss shares' (their
 		start: as without them, the teacher at its weight), else the teacher's weight alone; kl_teacher the teacher's share
 		against the policy's (the KL target's)."""
+		taught = getattr(self.config, "nk2_teacher", True)  # (False: the teacher's loss off, config.nk2_teacher)
 		if not getattr(self.config, "loss_shares", False):
-			return {"value": 1.0, "foresight": 1.0, "teacher": self.teacher_weight}
+			return {"value": 1.0, "foresight": 1.0, "teacher": self.teacher_weight if taught else 0.0}
 		if getattr(self, "loss_scale", None) is None:
 			self.loss_scale = {"log_norm": {}, "weight": {"value": 1.0, "teacher": self.teacher_weight, "foresight": 1.0}}
 		shares = self.loss_shares()
+		if not taught:  # (the others' weights as they stand: the frozen ones, or the balancer's with the teacher's share 0)
+			return {**self.loss_scale["weight"], "teacher": 0.0, "kl_teacher": 0.0}
 		return {**self.loss_scale["weight"], "kl_teacher": shares["teacher"] / shares["policy"]}
 
 	def _head_scale(self):

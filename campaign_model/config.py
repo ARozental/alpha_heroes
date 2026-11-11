@@ -259,6 +259,15 @@ class CampaignConfig:
 	# while it is much better, small once we are; teacher_kl before the first evaluation). 0: off (the default). Each
 	# advice is ~15-30 ms of a game's CPU
 	nk2_advice: float = 0.0
+	# The teacher's loss (the user, 2026-11-11: "get rid of the teacher"). False: Nullkiller2's advice, where it is asked
+	# for, reaches no weight (its cross-entropy at weight 0 in every update, its share of the gradient 0); its agreement
+	# and cross-entropy are still logged (teacher_agree, teacher_ce), and its plan stays the foresight's label. What it
+	# knows comes in as inputs instead (schema 19's candidates: views.candidate_tables). Measured that day at v3045 on
+	# the eval's 48 setups, three replicates side by side: playing its matched advice 0.813 against our own choice's
+	# 0.520, after 3,000 updates of this loss at 60% of the shared layers' gradient had brought our choice to its
+	# advice at 24% of the decisions; a 51-weight readout of our own known features recovers two thirds of what the
+	# loss put into the policy, the plan head's prediction most of the rest
+	nk2_teacher: bool = True
 	# Its TRADE advice taught too (False since 2026-11-04: the user's rule, every trade is dumb unless it buys what could not
 	# be bought without it; ~94% of its trades bought nothing that day, and 54% of ours came where it advised one)
 	nk2_trade_advice: bool = False
