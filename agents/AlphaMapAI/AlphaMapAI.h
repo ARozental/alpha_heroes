@@ -255,6 +255,16 @@ class AlphaMapAI : public CAdventureAI
 	// Its visit again of a town its hero stands in as our GATHER (ALPHA_MAP_GATHER_ADVICE, off unless set: the trainer's
 	// campaign.nk2_gather_weight teaches the label; Advice.cpp visitAgain), and how many of its advices were
 	bool gatherAdvice = false;
+	// Schema 19: Nullkiller2's view as inputs (ALPHA_MAP_NK2_INPUTS, off unless set; supply.py turns it off in a share of
+	// training games): the advisor plans before every turn decision and candidateInputs writes its candidates, tier and
+	// threats into the decision's k_*, g_nk_*, t_nk_threat, h_nk_threat (g_nk_present 0 without it). nkSettled: each
+	// (hero, destination) in a hero's top 3 at the last such decision, the decisions in a row it has been there
+	bool nk2Inputs = false;
+	std::map<std::tuple<int, int, int, int>, int> nkSettled;
+	void candidateInputs(Decision & decision);
+	// The model's phi (our empire's value in gold) at the player's first turn decision of each day (schema 19's
+	// g_phi_past: a week ago, else the oldest day there is)
+	std::map<int, double> phiByDay;
 	int adviceGathers = 0;
 	int visitAgain(const Decision & decision, const MoveHero & move, const int3 & intended) const;
 	std::atomic<bool> meetingAdvised = false;

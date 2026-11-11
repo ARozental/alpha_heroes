@@ -261,8 +261,10 @@ void AlphaMapAI::makeTurn()
 			std::optional<Choice> advice; // (Nullkiller2's, at this decision's chance: before ours, in the same state)
 			std::optional<PlanTargets> plan; // (and its plan there: labels both, never inputs)
 			std::vector<std::pair<int, int>> accept; // (and our other entries that follow it)
-			if(adviceDrawn())
+			if(nk2Inputs || adviceDrawn()) // (its view as inputs: its plan at every turn decision, before our forward)
 				advice = advise(decision, plan, accept);
+			if(nk2Inputs)
+				candidateInputs(decision);
 			const auto choice = decide(decision, advice, plan, accept);
 			if(choice.type <= static_cast<int>(ActionType::END))
 				break;
@@ -566,6 +568,14 @@ Choice AlphaMapAI::decide(Decision & decision, const std::optional<Choice> & adv
 	try
 	{
 		decision.inputs.values[static_cast<size_t>(In::mem)] = memory;
+		const int today = cb->getDate(Date::DAY);
+		for(int back = 7; back >= 1; --back) // (schema 19: our Φ a week ago as the model put it out, else the oldest day there is)
+			if(const auto found = phiByDay.find(today - back); found != phiByDay.end())
+			{
+				decision.inputs.at(In::g_phi_past) = std::llround(found->second);
+				decision.inputs.at(In::g_phi_past_days) = back;
+				break;
+			}
 		const auto inputs = decision.inputs.wire();
 		std::string reply;
 		uint32_t version = 0;
@@ -600,6 +610,8 @@ Choice AlphaMapAI::decide(Decision & decision, const std::optional<Choice> & adv
 			}
 		}
 		const auto outputs = Outputs::fromWire(reply);
+		if(decision.kind == DecisionKind::TURN && decisionsToday == 0) // (the day's first turn decision: its phi kept for g_phi_past)
+			phiByDay[today] = outputs[Out::phi][0];
 		for(int r = 0; r < N_RESOURCES; ++r) // (what a purchase short of resources trades away the least of: payByTrades)
 			decision.worth[r] = outputs[Out::resource_worth][r];
 		// The memory this decision leaves, for the next one: turn decisions only (the others read it). The imitation

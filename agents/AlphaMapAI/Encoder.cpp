@@ -755,6 +755,7 @@ void AlphaMapAI::encodeWindows(Decision & decision, PathfinderCache & paths)
 					in.at(In::w_turns, slot, row, column) = node->turns;
 					if(node->turns == 0)
 						in.at(In::w_move_left, slot, row, column) = node->moveRemains;
+					in.at(In::w_arrive_left, slot, row, column) = static_cast<int64_t>(node->moveRemains) + 1; // (schema 19: any day's arrival, 0 none)
 					if(canMove && node->turns == 0 && pos != standing && node->action != EPathNodeAction::UNKNOWN
 						&& std::none_of(earlier.begin(), earlier.end(), [&](const int3 & c) { return inside(pos, c); }))
 						in.at(In::move_mask, slot, row, column) = 1;

@@ -13,8 +13,11 @@
 #include "lib/mapping/TerrainTile.h"
 #include "lib/networkPacks/PacksForServer.h"
 #ifdef NK2_KEEPS_PLAN // (our fork's Nullkiller2: Nullkiller.h)
+#include "Analyzers/DangerHitMapAnalyzer.h"
+#include "Engine/PriorityEvaluator.h"
 #include "Goals/Composition.h"
 #include "Goals/ExecuteHeroChain.h"
+#include "lib/mapObjects/CGTownInstance.h"
 #endif
 #endif
 
@@ -119,6 +122,75 @@ PlanTargets planTargets(const Decision & decision, const NK2AI::Goals::TTaskVec 
 	return out;
 }
 
+// ---- Schema 19: Nullkiller2's candidate tasks as inputs (candidateInputs) ----
+
+/// One candidate task of Nullkiller2's in our terms (a row of k_*)
+struct CandidateRow
+{
+	int slot = -1;
+	int3 dest;
+	int destCell = -1;
+	int destArea = -1;
+	int move = -1;
+	int travel = -1;
+	double score[2] = {0, 0};
+	double days = 0;
+	double loss = 0;
+	double danger = 0;
+	int kind = 6;
+	int flags = 0;
+};
+
+constexpr int AREAS = MAP_LEVELS * TRAVEL_GRID * TRAVEL_GRID;
+
+/// k_kind from what Nullkiller2 scores the task by: 0 visit or capture, 1 attack an enemy hero, 2 attack a town, 3 defend
+/// our town, 4 meet our hero, 5 explore, 6 other
+int candidateKind(const NK2AI::EvaluationContext & context)
+{
+	if(context.isDefend)
+		return 3;
+	if(context.isExchange)
+		return 4;
+	if(context.isHero && context.isEnemy)
+		return 1;
+	if(context.conquestValue > 0)
+		return 2;
+	const bool reward = context.goldReward > 0 || context.armyReward > 0 || context.skillReward > 0 || context.strategicalValue > 0 || context.armyGrowth > 0;
+	if(!reward && context.explorePriority > 0)
+		return 5;
+	return reward ? 0 : 6;
+}
+
+/// The cell (window slot x W x W + row x W + column) of `tile` in the first window of our hero token `hero` showing it,
+/// legal or not; -1 none
+int windowCell(const Decision & decision, int hero, const int3 & tile)
+{
+	for(int w = 0; w < OWN_HEROES; ++w)
+	{
+		if(decision.windowHero[w] != hero)
+			continue;
+		const auto & center = decision.centers[w];
+		const int row = tile.y - center.y + WINDOW_RADIUS;
+		const int column = tile.x - center.x + WINDOW_RADIUS;
+		if(tile.z == center.z && row >= 0 && row < WINDOW && column >= 0 && column < WINDOW)
+			return (w * WINDOW + row) * WINDOW + column;
+	}
+	return -1;
+}
+
+/// The TRAVEL area (level x TG x TG + row x TG + column) a tile is in, -1 off the levels; side: an area's tiles a side
+int areaOf(const int3 & tile, int side)
+{
+	if(tile.z < 0 || tile.z >= MAP_LEVELS || tile.x < 0 || tile.y < 0)
+		return -1;
+	return (tile.z * TRAVEL_GRID + std::min(tile.y / side, TRAVEL_GRID - 1)) * TRAVEL_GRID + std::min(tile.x / side, TRAVEL_GRID - 1);
+}
+
+int64_t fixedPoint(double value, double scale, double most = 2147483647.0)
+{
+	return static_cast<int64_t>(std::llround(std::clamp(value * scale, -most, most)));
+}
+
 /// Our MOVE and TRAVEL entries that walk Nullkiller2's plan (more entries that follow it beside its first request:
 /// RECORD_ACCEPT, the teacher's targets): each hero's MOVE to any tile of its own part of a planned hero chain (a short
 /// step along the path or a long one alike), its TRAVEL to an area the path reaches in a day or more
@@ -178,8 +250,9 @@ void AlphaMapAI::initAdvice()
 	adviceProbability = std::stod(adviceEnvironment("ALPHA_MAP_NK2_ADVICE", "0"));
 	adviceFixes = adviceEnvironment("ALPHA_MAP_ADVICE_FIXES", "1") != "0";
 	gatherAdvice = adviceEnvironment("ALPHA_MAP_GATHER_ADVICE", "0") != "0";
+	nk2Inputs = adviceEnvironment("ALPHA_MAP_NK2_INPUTS", "0") != "0";
 #ifdef ALPHA_MAP_NK2_ADVICE
-	if(adviceProbability <= 0)
+	if(adviceProbability <= 0 && !nk2Inputs)
 		return;
 	auto a = std::make_shared<Advisor>();
 	// The game's state, shared, not owned (the client's): Nullkiller2 reads it through its own callback
@@ -200,11 +273,12 @@ void AlphaMapAI::initAdvice()
 	adviceFixes = false;
 #endif
 	advisor = a;
-	logAi->info("AlphaMapAI %s: Nullkiller2's advice at a chance of %.3f a turn decision, meeting fixes %s", playerID.toString(), adviceProbability, adviceFixes ? "on" : "off");
+	logAi->info("AlphaMapAI %s: Nullkiller2's advice at a chance of %.3f a turn decision, meeting fixes %s, its view as inputs %s", playerID.toString(), adviceProbability, adviceFixes ? "on" : "off", nk2Inputs ? "on" : "off");
 #else
-	if(adviceProbability > 0)
-		logAi->error("AlphaMapAI %s: ALPHA_MAP_NK2_ADVICE asked, but this build has no Nullkiller2: no advice", playerID.toString());
+	if(adviceProbability > 0 || nk2Inputs)
+		logAi->error("AlphaMapAI %s: ALPHA_MAP_NK2_ADVICE or ALPHA_MAP_NK2_INPUTS asked, but this build has no Nullkiller2: none", playerID.toString());
 	adviceProbability = 0;
+	nk2Inputs = false;
 #endif
 }
 
@@ -592,4 +666,189 @@ void AlphaMapAI::objectPropertyChanged(const SetObjectProperty * sop)
 void AlphaMapAI::heroCreated(const CGHeroInstance * hero)
 {
 	ALPHA_ADVISE(heroCreated(hero))
+}
+
+// Schema 19 (the user's go-ahead 2026-11-11: Nullkiller2's insight as inputs, its labels no longer a loss): the
+// advisor's view of this decision, from the turn it just planned (advise, before our forward): its candidate tasks
+// (Nullkiller::lastCandidates, scored at its plan's tier) mapped onto our entries, NK_PER_HERO a hero of ours in the
+// hero's block of rows, its best first; the tier; its threats to our towns and heroes (DangerHitMapAnalyzer). A task's
+// first step today is the destination's own MOVE entry when it is legal, else the path's stop today when that is legal:
+// never another tile of the path (2026-11-01: a tile a request taught our model to walk a tile a decision)
+void AlphaMapAI::candidateInputs(Decision & decision)
+{
+#if defined(ALPHA_MAP_NK2_ADVICE) && defined(NK2_KEEPS_PLAN)
+	if(!advisor || !advisor->nk2->nullkiller->lastPlanValid)
+		return;
+	const auto & nk = *advisor->nk2->nullkiller;
+	auto & in = decision.inputs;
+	const int3 size = cb->getMapSize();
+	const int side = 2 * std::max(1, (std::max(size.x, size.y) + MAP_GRID - 1) / MAP_GRID);
+	const auto & travels = decision.entries[static_cast<int>(ActionType::TRAVEL)];
+	const int tier = nk.lastPlanTier;
+	const auto slotOf = [&decision](const CGHeroInstance * hero)
+	{
+		for(int i = 0; hero && i < OWN_HEROES; ++i)
+			if(decision.heroes[i] == hero->id)
+				return i;
+		return -1;
+	};
+	auto evaluator = nk.priorityEvaluators->acquire();
+	std::array<std::vector<CandidateRow>, OWN_HEROES> rows;
+	int count = 0;
+	for(const auto & goal : nk.lastCandidates)
+	{
+		auto * task = goal->asTask();
+		if(!task)
+			continue;
+		if(task->priority > 0)
+			++count;
+		const NK2AI::Goals::ExecuteHeroChain * chain = dynamic_cast<const NK2AI::Goals::ExecuteHeroChain *>(goal.get());
+		bool composed = false;
+		if(!chain)
+			if(const auto * composition = dynamic_cast<const NK2AI::Goals::Composition *>(goal.get()))
+				for(const auto & step : composition->getSubtasks())
+					for(const auto & sub : step)
+						if(!chain)
+						{
+							chain = dynamic_cast<const NK2AI::Goals::ExecuteHeroChain *>(sub.get());
+							composed = true;
+						}
+		if(!chain || chain->getPath().nodes.empty())
+			continue;
+		const auto & nodes = chain->getPath().nodes; // (from the destination back to the start)
+		const CGHeroInstance * hero = task->getHero() ? task->getHero() : nodes.front().targetHero; // (a composition's: none of its own)
+		const int slot = slotOf(hero);
+		if(slot < 0)
+			continue;
+		CandidateRow row;
+		row.slot = slot;
+		size_t own = 0; // the hero's last node in the chain: its destination (planTargets')
+		while(own < nodes.size() && nodes[own].targetHero != hero)
+			++own;
+		if(own == nodes.size())
+			continue;
+		row.dest = nodes[own].coord;
+		row.destCell = windowCell(decision, slot, row.dest);
+		const int area = areaOf(row.dest, side);
+		row.destArea = area < 0 ? -1 : slot * AREAS + area;
+		bool jump = false, heroes = composed;
+		for(size_t k = 0; k + 1 < nodes.size(); ++k)
+		{
+			const auto & a = nodes[k];
+			const auto & b = nodes[k + 1];
+			heroes = heroes || a.targetHero != b.targetHero;
+			if(a.targetHero == b.targetHero) // (a jump within one hero's walk: between two heroes' parts of a chain the tiles differ anyway)
+				jump = jump || a.coord.z != b.coord.z || std::abs(a.coord.x - b.coord.x) > 1 || std::abs(a.coord.y - b.coord.y) > 1;
+		}
+		// The first step today: the destination's own entry, else the path's stop today (its node of this hero's with
+		// turns 0 nearest the destination)
+		if(nodes[own].turns == 0)
+			row.move = decision.moveEntry(slot, row.dest);
+		if(row.move >= 0)
+			row.flags |= 1;
+		else
+			for(size_t k = own; k < nodes.size(); ++k)
+				if(nodes[k].targetHero == hero && nodes[k].turns == 0)
+				{
+					row.move = decision.moveEntry(slot, nodes[k].coord);
+					break;
+				}
+		// TRAVEL toward it: the destination's area, else that of the path's farthest node of this hero's a day or more away
+		for(size_t k = own; k < nodes.size() && row.travel < 0; ++k)
+		{
+			if(nodes[k].targetHero != hero || nodes[k].turns < 1)
+				continue;
+			const int a = areaOf(nodes[k].coord, side);
+			if(a >= 0 && travels.count(slot * AREAS + a))
+				row.travel = slot * AREAS + a;
+		}
+		// Our pathfinder's reach of the destination: its window tile's days, else TRAVEL to its area
+		const bool reached = row.destCell >= 0 ? in.get(In::w_turns, row.destCell / (WINDOW * WINDOW), (row.destCell / WINDOW) % WINDOW, row.destCell % WINDOW) >= 0 : (row.destArea >= 0 && travels.count(row.destArea));
+		row.flags |= (reached ? 0 : 2) | (jump ? 4 : 0) | (heroes ? 8 : 0);
+		const auto context = evaluator->buildEvaluationContext(goal);
+		row.score[0] = task->priority;
+		row.score[1] = tier == NK2AI::PriorityEvaluator::EXPLORE_AND_GATHER ? task->priority : evaluator->evaluate(goal, NK2AI::PriorityEvaluator::EXPLORE_AND_GATHER);
+		row.days = context.movementCost;
+		row.loss = context.armyLossRatio;
+		row.danger = context.enemyHeroDangerRatio;
+		row.kind = candidateKind(context);
+		rows[slot].push_back(row);
+	}
+	in.values[static_cast<size_t>(In::g_nk_present)][0] = 1;
+	in.values[static_cast<size_t>(In::g_nk_tier)][0] = tier;
+	in.values[static_cast<size_t>(In::g_nk_count)][0] = count;
+	std::map<std::tuple<int, int, int, int>, int> settled;
+	for(int slot = 0; slot < OWN_HEROES; ++slot)
+	{
+		auto & mine = rows[slot];
+		std::stable_sort(mine.begin(), mine.end(), [](const CandidateRow & a, const CandidateRow & b) { return a.score[0] != b.score[0] ? a.score[0] > b.score[0] : a.score[1] > b.score[1]; });
+		std::set<std::tuple<int, int, int, int, int>> seen; // (one row a destination and first steps: a task found twice keeps its best)
+		int r = 0;
+		for(const auto & row : mine)
+		{
+			if(r >= NK_PER_HERO || !seen.insert({row.dest.x, row.dest.y, row.dest.z, row.move, row.travel}).second)
+				continue;
+			const int at = slot * NK_PER_HERO + r;
+			int n = 0;
+			if(r < 3) // (the hero's top 3: decisions in a row there, this one's 0 when new)
+			{
+				const auto key = std::make_tuple(decision.heroes[slot].getNum(), row.dest.x, row.dest.y, row.dest.z);
+				const auto before = nkSettled.find(key);
+				n = before == nkSettled.end() ? 0 : before->second + 1;
+				settled[key] = n;
+			}
+			in.at(In::k_hero, at) = slot + 1;
+			for(int k = 0; k < 3; ++k)
+				in.at(In::k_dest, at, k) = k == 0 ? row.dest.x : k == 1 ? row.dest.y : row.dest.z;
+			in.at(In::k_dest_cell, at) = row.destCell + 1;
+			in.at(In::k_dest_area, at) = row.destArea + 1;
+			in.at(In::k_move, at) = row.move + 1;
+			in.at(In::k_travel, at) = row.travel + 1;
+			for(int k = 0; k < 2; ++k)
+				in.at(In::k_score, at, k) = fixedPoint(row.score[k], 100.0);
+			in.at(In::k_days, at) = fixedPoint(row.days, 1000.0);
+			in.at(In::k_loss, at) = fixedPoint(row.loss, 10000.0);
+			in.at(In::k_danger, at) = fixedPoint(row.danger, 1000.0, 1e6);
+			in.at(In::k_kind, at) = row.kind;
+			in.at(In::k_settled, at) = n;
+			in.at(In::k_flags, at) = row.flags;
+			++r;
+		}
+	}
+	nkSettled = std::move(settled);
+	// Its threats (DangerHitMapAnalyzer, as DefenceBehavior reads them): to our towns, against the town's defence (its
+	// garrison hero's strength, else its visitor's, else its garrison's); at our heroes' tiles, against the hero's
+	for(int t = 0; t < OWN_TOWNS; ++t)
+	{
+		const auto * town = dynamic_cast<const CGTownInstance *>(cb->getObj(decision.towns[t], false));
+		if(!town || town->getOwner() != playerID)
+			continue;
+		uint64_t danger = 0;
+		int turns = -1;
+		for(const auto & threat : nk.dangerHitMap->getTownThreats(town))
+		{
+			danger = std::max(danger, threat.danger);
+			if(threat.danger > 0 && (turns < 0 || threat.turn < turns))
+				turns = threat.turn;
+		}
+		if(danger == 0)
+			continue;
+		const double defence = town->getGarrisonHero() ? town->getGarrisonHero()->getTotalStrength() : town->getVisitingHero() ? town->getVisitingHero()->getTotalStrength() : town->getUpperArmy()->getArmyStrength();
+		in.at(In::t_nk_threat, t, 0) = 1;
+		in.at(In::t_nk_threat, t, 1) = turns;
+		in.at(In::t_nk_threat, t, 2) = fixedPoint(static_cast<double>(danger) / std::max(defence, 1.0), 1000.0, 1e6);
+	}
+	for(int h = 0; h < OWN_HEROES; ++h)
+	{
+		const auto * hero = cb->getHero(decision.heroes[h]);
+		if(!hero || hero->getOwner() != playerID)
+			continue;
+		const auto & node = nk.dangerHitMap->getTileThreat(hero->visitablePos());
+		if(node.maximumDanger.danger == 0)
+			continue;
+		in.at(In::h_nk_threat, h, 0) = 1;
+		in.at(In::h_nk_threat, h, 1) = node.fastestDanger.turn;
+		in.at(In::h_nk_threat, h, 2) = fixedPoint(static_cast<double>(node.maximumDanger.danger) / std::max(static_cast<double>(hero->getTotalStrength()), 1.0), 1000.0, 1e6);
+	}
+#endif
 }
