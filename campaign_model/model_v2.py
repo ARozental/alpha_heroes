@@ -279,7 +279,7 @@ class AdvantageHead(nn.Module):
 		action, index, _ = known.advice.label
 		return {
 			"adv_type": self.types(glob), "adv_move": move, "adv_travel": self.travel(state.travel_pairs.detach()).squeeze(-1).reshape(b, HO, L, TG, TG),
-			"adv_named": self.named.to(glob.dtype).unsqueeze(0) + glob.new_zeros(b, 1), "adv_label": torch.stack([action, index], dim=-1).to(glob.dtype),
+			"adv_named": self.named.to(glob.dtype).unsqueeze(0) + glob.new_zeros(b, 1), "adv_label": torch.stack([action, index], dim=-1).float(),  # (float32 whatever the forward's dtype: an index up to 8,712 exactly)
 		}
 
 

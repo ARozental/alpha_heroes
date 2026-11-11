@@ -213,6 +213,16 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # 0.6 (the follow test's arm was near 0.8), teacher_agree near 0.9 where its choice is known, the fresh value loss at
 # a new level (the games change), KL an update about a tenth of before (the mixture moves a tenth as far as our own
 # policy does; the rate's scale is capped at 1, so our own policy is not sped up to make up for it).
+# Deploy 58 (2026-11-11, b1 with e5): campaign.adv_weight=1, the advantage head, stage 1 (model_v2.AdvantageHead,
+# 428baab): it predicts the policy's own advantage of playing (type, entry), from the global token, MOVE's and
+# TRAVEL's pair vectors and whether the entry is Nullkiller2's own choice, every input detached; trained on the
+# update's standardized advantage (sd 1) on the rows the policy credits, in the value group at the critic's rate.
+# THE POLICY READS NONE OF IT: the games play as before (its outputs are the trainer's only, not the contract's).
+# Why: one update's ~14 games give the policy no direction, while a regression averages over every game; at
+# nk2_follow=0.9 a followed row passes our own policy only ~P_own/9 of its gradient.
+# What decides stage 2 (the policy reading it): adv_ev (its explained variance of each update's advantage, predicted
+# before the update's steps: fresh rows) above 0 over 50+ updates; adv_ev_deviating apart (the rows that left
+# Nullkiller2's choice: where reading it could change a choice). Logged in progress.csv and the update's line.
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -221,5 +231,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3107 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
