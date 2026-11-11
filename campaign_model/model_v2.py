@@ -35,7 +35,8 @@ from . import constants as c
 from . import encoders as E
 from . import features as ft
 from . import priors
-from .model import MOVE_FEATURES, QUESTION_FEATURES, CustomFeatures, PairBias, army_slot_outputs, army_slots, dense, flat_log_softmax, stack_power, swap_terms, with_added
+from . import views as V
+from .model import MOVE_FEATURES, QUESTION_FEATURES, CustomFeatures, Features, PairBias, army_slot_outputs, army_slots, dense, flat_log_softmax, stack_power, swap_terms, with_added
 from .schema import HEADS
 
 HO, TO, A, W, HD = c.OWN_HEROES, c.OWN_TOWNS, c.ARMY_SLOTS, c.WINDOW, c.N_HOLDERS
@@ -51,6 +52,16 @@ ARMY_SLOT_KEYS = 32  # (schema 16) ARMY's target slot: the stack's query and eac
 TURN_TARGETS = 1 + R  # Φ's log ratio at the end of our turn, each resource's log ratio tomorrow
 COSINE_BOUND = 0.995  # a choice's cosine scaled by it under the atanh (cosine_logit): each logit within ±3.0
 DISTANCE_BUCKETS = 12  # the tile readers' distance bias: Chebyshev tiles 0, 1, 2, 3-4, 5-7, 8-11, ..., 96+, another level
+# The bounded views of a MOVE tile or a TRAVEL area (schema 19, the user's rules of 2026-11-11: views.py), the same
+# layout for both (CampaignModelV2.advice): its value in six views, its value a day of this hero's and of a baseline
+# hero's (3 + 3), the two times as discounts (2 + 2), its prior's gap to this hero's best and to any hero's best (2),
+# Nullkiller2's best candidate through the entry (views.CHANNELS), that candidate's destination: its own value's six
+# views and whether a window of ours shows it (7)
+VIEWS = 6 + 3 + 3 + 4 + 2 + V.F + 7
+PLAN_VIEWS = 2  # the plan head's own forecast for the entry's area: its chance, and against the hero's likeliest area
+VIEW_STEP = 10.0  # FastLinear's (model.CORRECTION_STEP's reason)
+LOG_SURVIVAL, RISK = V.CHANNELS.index("log_survival"), V.CHANNELS.index("risk")
+assert S == 2 * TG  # (a TRAVEL area: two map cells a side; CampaignModelV2.think_again's area of a window tile)
 
 
 class State:
@@ -286,6 +297,43 @@ class Memory(nn.Module):
 		return (1 - gate) * memory + gate * torch.tanh(self.candidate(both))
 
 
+class FastLinear(nn.Module):
+	"""A linear readout onto a logit, [.., inputs] -> [..]: its weights start at 0 (the readout adds nothing) and move
+	`step` times as far a step as a plain weight. Adam moves a weight about the learning rate a step whatever its
+	gradient's size: at 1e-5 and 64 steps an update a plain weight on a channel within 0..1 moves its logit 0.0006 an
+	update at most, 0.2 a day, so a feature given straight to a logit through one would not be used for weeks (the MOVE
+	fight features of 2026-11-03 were inert at this rate). At 10 times: 2 logits a day under a steady push, and a
+	weight no gradient pushes walks ~0.01 a day. No bias: an entry with every channel 0 gets nothing."""
+
+	def __init__(self, inputs, step=VIEW_STEP):
+		super().__init__()
+		self.weight = nn.Parameter(torch.zeros(inputs))
+		self.step = step
+
+	def forward(self, x):
+		return self.step * (x @ self.weight.to(x.dtype))
+
+
+def zero_weight(inputs, outputs):
+	"""A linear layer without a bias, its weights 0 to begin with: it adds nothing at the start, and never anything
+	where its inputs are all 0 (an entry without a candidate, a decision without the advisor)."""
+	layer = nn.Linear(inputs, outputs, bias=False)
+	nn.init.zeros_(layer.weight)
+	return layer
+
+
+def packed_cells(dest, decision, inverse):
+	"""Window cells named as an input names them (dest [N, ..]: window slot x W x W + cell, -1 none; decision [N]: each
+	row's decision) -> (their indices among the computed windows' cells [K x W x W], which have one): inverse [B x HO]
+	is each window slot's row among the windows computed, -1 not computed (CampaignModelV2.advice)."""
+	cells = W * W
+	slot = torch.div(dest.clamp(min=0), cells, rounding_mode="floor").clamp(max=HO - 1)
+	lead = decision.reshape((-1,) + (1,) * (dest.dim() - 1))
+	row = inverse.index_select(0, (lead * HO + slot).reshape(-1)).reshape(dest.shape)
+	valid = (dest >= 0) & (row >= 0)
+	return torch.where(valid, row * cells + torch.remainder(dest.clamp(min=0), cells), torch.zeros_like(row)), valid
+
+
 class CampaignModelV2(nn.Module):
 	ARCHITECTURE = "v2"
 	plan_outputs = False  # fs_plan too (plan_of): the trainer's model sets it (train.ppo_update); a server's does not
@@ -442,6 +490,28 @@ class CampaignModelV2(nn.Module):
 		# (padding_idx: no gradient), so the small maps' outputs stay as they are whatever the training. Made last, the
 		# other parameters' initialisation as before
 		self.side_tile, self.side_global = side_embedding(dc), side_embedding(d)
+		# Schema 19 (2026-11-11, the user's design: Nullkiller2's knowledge as inputs, never a loss on our choices; advice,
+		# advise). Every part adds nothing to begin with (a checkpoint from before plays as it did: model.ADDED_HEADS),
+		# and nothing ever where the advisor did not run:
+		#   time_reach      the two times to a window tile as discounts, into the hero's reach to it (the pairs, the tile
+		#                   reader's bias)
+		#   view_pair       a MOVE tile's views into its (hero, tile) pair: the foresight's and move_pair's input
+		#   travel_view     a TRAVEL area's views into its (hero, area) pair
+		#   move_toward,    the pair of the destination the entry's best candidate heads for (the same hero's pair with
+		#   travel_toward   that tile, where a window of ours shows it): the first step reads where it leads
+		#   view_mix        the views' second-order effects straight onto MOVE's logit (as move_mix for the known features)
+		#   view_move,      the views and the plan head's forecast straight onto the logit, each channel one fast weight
+		#   view_travel     (FastLinear: 52 weights a table)
+		#   plan_in         each hero's plan: its candidates' destinations' tile vectors and channels, weighted by
+		#                   Nullkiller2's preference among them, onto the hero's token before the heroes attend
+		#   nk_hero, nk_town, nk_global  its threats at our heroes and towns, its plan's tier and size
+		self.time_reach, self.view_pair, self.travel_view = zero_weight(4, dc), zero_weight(VIEWS, dp), zero_weight(VIEWS, dp)
+		self.move_toward, self.travel_toward = zero_weight(dp, dp), zero_weight(dp, dp)
+		self.view_mix = nn.Linear(VIEWS, MIX_HIDDEN)
+		self.view_mix_out = zero_output(nn.Linear(MIX_HIDDEN, 1))
+		self.view_move, self.view_travel = FastLinear(VIEWS + PLAN_VIEWS), FastLinear(VIEWS + PLAN_VIEWS)
+		self.plan_in = zero_weight(dc + V.F, d)
+		self.nk_hero, self.nk_town, self.nk_global = zero_weight(V.THREAT_VIEWS, d), zero_weight(V.THREAT_VIEWS, d), zero_weight(V.GLOBAL_VIEWS, d)
 
 	def prior_corrections(self):
 		"""The parameters that correct a fixed prior (model.CustomFeatures): weight decay pulls them back to it."""
@@ -455,12 +525,13 @@ class CampaignModelV2(nn.Module):
 		state = self.take_sides(state)
 		state = self.join(state, known)
 		state = self.see(state, known)
+		state = self.advise(state, known)
 		state = self.think(state)
 		foresight = self.foresee(state, known)
 		state = self.think_again(state, foresight, known)
 		out = {**self.decide(state, known), **foresight["outputs"], "memory": state.memory_out, "resource_worth": known.resource_worth}
 		if self.plan_outputs:
-			out["fs_plan"] = self.plan_of(state)
+			out["fs_plan"] = state.plan
 		return out
 
 	def forward_steps(self, x, steps):
@@ -516,7 +587,88 @@ class CampaignModelV2(nn.Module):
 			"our_army": armies.sum(dim=1).clamp(min=500.0),
 			"rival_army": rivals.amax(dim=1).clamp(min=500.0),
 		}
+		known.advice = self.advice(x, known)
 		return known
+
+	def advice(self, x, known):
+		"""The bounded views of every MOVE tile and TRAVEL area (VIEWS; views.py) and Nullkiller2's candidates as tables
+		on them (schema 19), computed once for the layers that read them:
+
+		  tables        views.candidate_tables: the candidates' channels at our MOVE and TRAVEL entries, the entries'
+		                destination cells, the priors' preferences, each candidate's weight in its hero's plan
+		  move          [K, W, W, VIEWS] by computed window; move_time [K, W, W, 4] the two times as discounts
+		  travel        [B, HO, AREAS, VIEWS]
+		  move_dest, travel_dest   (the index among the computed windows' cells of the destination the entry's best
+		                candidate heads for, whether a computed window shows it)
+
+		Our own estimates (a tile's value, the priors' logits, Φ) are read detached: the views are readings of them for
+		the learned layers, never a path for the policy's gradient into the priors' corrections. An input dict from
+		before the schema reads as a decision without the advisor (views.absent_rows)."""
+		b = x["g_day"].shape[0]
+		device = known.phi_total.device
+		nk = x if "k_hero" in x else {**x, **V.absent_rows(b, device)}
+		a = Features(x=nk, tables=V.candidate_tables(nk, dest=False))
+		phi = known.phi_total.detach()
+		pace = V.daily_gain(phi, nk["g_phi_past"], nk["g_phi_past_days"])
+		none = torch.zeros((), device=device)
+		# each window slot's row among the windows computed (-1: none, or not a real one)
+		inverse = torch.full((b * HO,), -1, dtype=torch.long, device=device)
+		move_prior = torch.zeros(b, HO, W, W, device=device)
+		if known.n > 0:
+			k = known.windows.shape[0]
+			rows = torch.where(known.real, torch.arange(k, device=device), torch.full((k,), -1, dtype=torch.long, device=device))
+			inverse = inverse.index_copy(0, known.windows[: known.n], rows[: known.n])
+			tile_prior = real_only(known.tile_prior, known).detach()
+			move_prior = dense(tile_prior, known.windows, known.n, b)
+		travel_logits = known.travel_logits.detach().reshape(b, HO, AREAS)
+		# (a hero's best over its windows' tiles and its areas; by window slot: a hero's own slot holds its own)
+		best_slot, best_any = V.hero_bests(move_prior, x["move_mask"], travel_logits, x["travel_mask"].reshape(b, HO, AREAS), ft.slot_heroes(x))
+		value = None
+		if known.n > 0:
+			decision = torch.div(known.windows, HO, rounding_mode="floor")
+			pick = lambda t: t.reshape((-1,) + tuple(t.shape[2:])).index_select(0, known.windows)  # noqa: E731
+			turns = pick(x["w_turns"]).long()
+			# (the movement left on arriving: today's is w_move_left, any day's schema 19's w_arrive_left; before it: none left)
+			later = pick(V.arrive_left(x)) if "w_arrive_left" in x else torch.full_like(turns, -1)
+			left = torch.where(turns == 0, pick(x["w_move_left"]).long(), later)
+			mover = lambda name: x[name][:, :HO].reshape(-1).index_select(0, known.heroes)[:, None, None]  # noqa: E731 (the window's hero's)
+			own_days, base_days = V.own_days(turns, left, mover("h_move"), mover("h_move_max")), V.base_days(turns, left, mover("h_move"), mover("h_move_max"))
+			value = real_only(known.tile_value, known).detach()
+			phi_k, pace_k = phi.index_select(0, decision), pace.index_select(0, decision)
+			index, valid = packed_cells(pick(a.tables["move_dest_cell"].reshape(b, HO, W, W)), decision, inverse)
+			dest_value = value.reshape(-1).index_select(0, index.reshape(-1)).reshape(index.shape) * valid
+			time = torch.cat([V.discounts(own_days), V.discounts(base_days)], dim=-1)
+			gaps = torch.stack([V.gap(tile_prior, pick(best_slot)[:, None, None]), V.gap(tile_prior, best_any.index_select(0, decision)[:, None, None])], dim=-1)
+			a.move = real_only(
+				torch.cat(
+					[
+						V.value_views(value, phi_k, pace_k), V.rate_views(value, own_days, phi_k, pace_k), V.rate_views(value, base_days, phi_k, pace_k), time, gaps,
+						pick(a.tables["move"].reshape(b, HO, W, W, V.F)), V.value_views(dest_value, phi_k, pace_k) * valid.unsqueeze(-1), valid.float().unsqueeze(-1),
+					],
+					dim=-1,
+				),
+				known,
+			)
+			a.move_time, a.move_dest = real_only(time, known), (index, valid)
+		# TRAVEL: the pathfinder's days there (travel_days), and those days at this hero's movement in a baseline hero's
+		days = x["travel_days"][:, :HO].reshape(b, HO, AREAS).float() / 100
+		reached = days >= 0
+		pace_of = (x["h_move_max"][:, :HO].float().clamp(min=1.0) / V.BASE_DAY).unsqueeze(-1)
+		own_days = torch.where(reached, days, torch.full_like(days, V.FAR_DAYS))
+		base_days = torch.where(reached, days * pace_of, torch.full_like(days, V.FAR_DAYS))
+		gold = known.travel_gold.detach().unsqueeze(1).expand(b, HO, AREAS)
+		index, valid = packed_cells(a.tables["travel_dest_cell"], torch.arange(b, device=device), inverse)
+		dest_value = value.reshape(-1).index_select(0, index.reshape(-1)).reshape(index.shape) * valid if value is not None else none.expand(b, HO, AREAS)
+		a.travel = torch.cat(
+			[
+				V.value_views(gold, phi, pace), V.rate_views(gold, own_days, phi, pace), V.rate_views(gold, base_days, phi, pace), V.discounts(own_days), V.discounts(base_days),
+				torch.stack([V.gap(travel_logits, best_slot.unsqueeze(-1)), V.gap(travel_logits, best_any[:, None, None])], dim=-1),
+				a.tables["travel"], V.value_views(dest_value, phi, pace) * valid.unsqueeze(-1), valid.float().unsqueeze(-1),
+			],
+			dim=-1,
+		)
+		a.travel_dest = (index, valid)
+		return a
 
 	# ---- encode: raw inputs only ----
 
@@ -620,6 +772,7 @@ class CampaignModelV2(nn.Module):
 		if known.n > 0:
 			k = known.windows.shape[0]
 			state.window_reach = self.reach(None, reach_features(x, known.windows))  # [K, W, W, dc]
+			state.window_reach = state.window_reach + self.time_reach(known.advice.move_time.to(state.window_reach.dtype))  # (schema 19: the two times as discounts)
 			tiles = known.window_tiles.reshape(k, W * W)
 			index = (known.heroes[:, None] * (L * S * S) + tiles.clamp(min=0)).reshape(-1)
 			inside = ((tiles >= 0) & known.real[:, None]).reshape(-1)
@@ -632,6 +785,31 @@ class CampaignModelV2(nn.Module):
 		state.heroes = state.heroes + self.read_tiles(state.heroes, x["h_pos"], x["h_present"], flat, self.tile_positions, valid, reach, side=known.side)
 		state.towns = state.towns + self.read_tiles(state.towns, x["t_pos"], x["t_present"], flat, self.tile_positions, valid, side=known.side)
 		state.areas = self.area(half.reshape(b, L, 2 * dc, TG * TG).permute(0, 1, 3, 2).reshape(b, AREAS, 2 * dc))
+		return state
+
+	# ---- advise: Nullkiller2's plan onto what it concerns ----
+
+	def advise(self, state, known):
+		"""Nullkiller2's plan onto our tokens before they attend to each other (schema 19; each part adds nothing to begin
+		with, and nothing where the advisor did not run): each hero of ours its plan vector (the map's tile vectors at
+		its candidates' destinations and the candidates' channels, weighted by its preference among them:
+		views.candidate_tables' plan_weight) and its threat there; each town of ours its threat; the global token the
+		plan's tier and size."""
+		x, a = state.x, known.advice
+		nk, tables = a.x, a.tables
+		b, dc = x["g_day"].shape[0], self.cell_dim
+		index, inside = map_index(nk["k_dest"].long(), b, known.side)  # [B, NK]
+		weight = (tables["plan_weight"] * inside).unsqueeze(-1)
+		cells = state.tiles.reshape(b * L * S * S, dc).index_select(0, index.reshape(-1)).reshape(b, c.NK, dc)
+		rows = torch.cat([cells * weight.to(cells.dtype), (tables["channels"] * weight).to(cells.dtype)], dim=-1)  # [B, NK, dc + F]
+		hero = (nk["k_hero"].long() - 1).clamp(0, HO - 1)  # (an empty row's weight is 0)
+		plan = torch.zeros(b, HO, dc + V.F, device=rows.device, dtype=rows.dtype).scatter_add(1, hero.unsqueeze(-1).expand(-1, -1, dc + V.F), rows)
+		ours = (x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)).unsqueeze(-1)
+		heroes = (self.plan_in(plan) + self.nk_hero(V.threat_views(nk["h_nk_threat"]).to(rows.dtype))) * ours
+		state.heroes = state.heroes + F.pad(heroes, (0, 0, 0, H - HO))
+		own_towns = (x["t_present"][:, :TO] & (x["t_owner"][:, :TO] == c.OWNER_SELF)).unsqueeze(-1)
+		state.towns = state.towns + F.pad(self.nk_town(V.threat_views(nk["t_nk_threat"]).to(rows.dtype)) * own_towns, (0, 0, 0, T - TO))
+		state.glob = state.glob + self.nk_global(V.global_views(nk).to(rows.dtype))
 		return state
 
 	# ---- think ----
@@ -697,7 +875,8 @@ class CampaignModelV2(nn.Module):
 		index = known.window_tiles
 		cells = torch.where((index >= 0).unsqueeze(-1), flat.index_select(0, (decision[:, None, None] * (L * S * S) + index.clamp(min=0)).reshape(-1)).reshape(k, W, W, -1), torch.zeros(k, W, W, self.cell_dim, device=flat.device, dtype=flat.dtype))
 		strength = torch.cat([known.move_strength, known.move_relative[..., :1]], dim=-1)  # (the estimates and hopeless)
-		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach) + self.pair_fight(fight_features(known)) + self.pair_strength(strength)
+		views = self.view_pair(known.advice.move.to(cells.dtype))  # (schema 19: the tile's bounded views and Nullkiller2's candidate through it)
+		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach) + self.pair_fight(fight_features(known)) + self.pair_strength(strength) + views
 
 	def foresee(self, state, known):
 		x = state.x
@@ -740,17 +919,41 @@ class CampaignModelV2(nn.Module):
 		tokens = self.again_norm(self.again_block(tokens, valid, state.bias))
 		self.split(state, tokens)
 		state.memory_out = self.memory.write(tokens, valid, state.mem)
+		a, dp = known.advice, self.pair_dim
+		b = x["g_day"].shape[0]
+		pairs = flat = None
 		if known.n > 0:
 			pairs = self.pairs(state, known)  # (with the heroes as they are now)
-			move_known = torch.cat([known.move_features.index_select(-1, self.move_kept), known.move_strength, known.move_relative, foresight["foreseen"]], dim=-1)  # [K, W, W, MOVE_KNOWN]
-			mixed = F.silu(self.move_mix(move_known))
-			state.move_mix = self.move_mix_out(mixed) + self.move_mix_direct(move_known)
-			state.move_pairs = self.move_pair(torch.cat([pairs, hidden["move"], move_known, mixed], dim=-1))
-		b = x["g_day"].shape[0]
+			flat = pairs.reshape(-1, dp)
+		# The pair of the destination an entry's best candidate heads for (schema 19: the same hero's pair with that tile),
+		# where a computed window shows it, else 0
+		toward = lambda index, valid: torch.where(valid.unsqueeze(-1), flat.index_select(0, index.reshape(-1)).reshape(index.shape + (dp,)), torch.zeros((), dtype=flat.dtype, device=flat.device))  # noqa: E731
 		days = x["travel_days"][:, :HO].reshape(b, HO, AREAS)
 		travel_in = torch.cat([E.amount(days.clamp(min=0).float() / 100, "days"), (days >= 0).float().unsqueeze(-1)], dim=-1)
 		travel = self.travel_hero(state.heroes[:, :HO]).unsqueeze(2) + self.travel_area(state.areas).unsqueeze(1) + self.travel_days(None, travel_in)
+		travel = travel + self.travel_view(a.travel.to(travel.dtype))
+		if known.n > 0:
+			travel = travel + self.travel_toward(toward(*a.travel_dest))
 		state.travel_pairs = self.travel_pair(torch.cat([travel, torch.tanh(known.travel_prior.reshape(b, HO, AREAS) / 4).unsqueeze(-1)], dim=-1))
+		# The plan head's own forecast of where Nullkiller2 would send each hero (plan_of; its label stays that plan),
+		# read back detached as two channels of each entry's area: its chance, and against the hero's likeliest area.
+		# What the entries keep of the plan in a game played without the advisor
+		state.plan = self.plan_of(state)
+		chance = state.plan.detach().float().softmax(dim=-1)[..., :AREAS]
+		forecast = torch.stack([chance, chance / chance.amax(dim=-1, keepdim=True).clamp(min=1e-6)], dim=-1)  # [B, HO, AREAS, PLAN_VIEWS]
+		state.travel_view = self.view_travel(torch.cat([a.travel, forecast], dim=-1))  # [B, HO, AREAS]
+		if known.n > 0:
+			k = known.windows.shape[0]
+			move_known = torch.cat([known.move_features.index_select(-1, self.move_kept), known.move_strength, known.move_relative, foresight["foreseen"]], dim=-1)  # [K, W, W, MOVE_KNOWN]
+			mixed = F.silu(self.move_mix(move_known))
+			# each window tile's TRAVEL area (two map cells a side), for its hero's forecast there
+			tiles = known.window_tiles.clamp(min=0)
+			area = (torch.div(tiles, S * S, rounding_mode="floor") * TG + torch.div(torch.remainder(torch.div(tiles, S, rounding_mode="floor"), S), 2, rounding_mode="floor")) * TG + torch.div(torch.remainder(tiles, S), 2, rounding_mode="floor")
+			there = forecast.reshape(b * HO, AREAS, PLAN_VIEWS).index_select(0, known.heroes).gather(1, area.reshape(k, W * W, 1).expand(k, W * W, PLAN_VIEWS)).reshape(k, W, W, PLAN_VIEWS)
+			there = there * (known.window_tiles >= 0).unsqueeze(-1)
+			seen = self.view_mix_out(F.silu(self.view_mix(a.move.to(mixed.dtype)))) + self.view_move(torch.cat([a.move, there], dim=-1)).unsqueeze(-1).to(mixed.dtype)
+			state.move_mix = self.move_mix_out(mixed) + self.move_mix_direct(move_known) + seen
+			state.move_pairs = self.move_pair(torch.cat([pairs + self.move_toward(toward(*a.move_dest)), hidden["move"], move_known, mixed], dim=-1))
 		return state
 
 	# ---- decide: every logit a match, one softmax ----
@@ -768,12 +971,19 @@ class CampaignModelV2(nn.Module):
 			move_prior = dense(real_only(known.tile_prior, known), known.windows, known.n, b)
 			cast_cell = dense(real_only(self.cast_cell_out(state.move_pairs).squeeze(-1), known), known.windows, known.n, b)
 		# (the act-now score of each window slot's hero: its own, or the hero a further window belongs to, schema 17)
+		# Nullkiller2's own preference among its candidates, on the entries they go through (schema 19; nk_prior_weights:
+		# all 0 until a prior is turned on): its best candidate's entry + beta, the others by their priority's ratio to
+		# it, and what it expects to lose on the path and to meet on arrival
+		tables = known.advice.tables
+		best, fallback, survival, risk = self.features.nk_prior_weights()
+		advised = lambda name: best * tables[f"prior_{name}"] + fallback * tables[f"prior_{name}_fallback"] + survival * tables[name][..., LOG_SURVIVAL] - risk * tables[name][..., RISK]  # noqa: E731
+		move_prior = move_prior + advised("move").reshape(b, HO, W, W)
 		learned[A_.MOVE], prior[A_.MOVE] = move + self.act_move(own_heroes).reshape(b, HO).gather(1, ft.slot_heroes(x)).reshape(b, HO, 1, 1), move_prior
 		offers[A_.MOVE] = ft.signed_offer(move_prior, x["move_mask"])  # (below 0 when every move is worse than staying)
 		out["cast_cell_logp"] = masked_log_softmax(cast_cell.reshape(b, HO, W * W), x["cast_cell_mask"].reshape(b, HO, W * W)).reshape(b, HO, W, W)
 		# TRAVEL: (hero, area) pairs, + the area's prior (its value discounted by the days to it)
-		learned[A_.TRAVEL] = (self.travel_out(state.travel_pairs).squeeze(-1) + self.act_travel(own_heroes)).reshape(b, HO, L, TG, TG)
-		prior[A_.TRAVEL] = known.travel_logits.reshape(b, HO, L, TG, TG)  # (the network reads travel_prior: without the night)
+		learned[A_.TRAVEL] = (self.travel_out(state.travel_pairs).squeeze(-1) + state.travel_view.to(state.travel_pairs.dtype) + self.act_travel(own_heroes)).reshape(b, HO, L, TG, TG)
+		prior[A_.TRAVEL] = (known.travel_logits + advised("travel")).reshape(b, HO, L, TG, TG)  # (the network reads travel_prior: without the night)
 		offers[A_.TRAVEL] = ft.signed_offer(prior[A_.TRAVEL], x["travel_mask"])
 		# BUILD: the town's query against each building. A purchase short of resources pays the trades it makes (known.
 		# build_trade, recruit_trade: the gold of worth they lose), priced as every change of Φ is (value_logit), in the

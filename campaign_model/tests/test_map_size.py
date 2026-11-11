@@ -17,12 +17,15 @@ S, L, HO, W = c.MAP_TILES, c.MAP_LEVELS, c.OWN_HEROES, c.WINDOW
 
 def golden_model():
 	"""The model the golden outputs came from (scratchpad make_golden.py, the commit before the blocks): each parameter
-	set by its name, the side embeddings (new since) left at their 0."""
+	set by its name, the side embeddings (new since) left at their 0, and schema 19's parts (new since: 2026-11-11,
+	model_v2.CampaignModelV2.advice) as a new model starts them, their outputs 0. The inputs hold schema 19's rows
+	(schema.random_inputs): the outputs still being the golden ones says those parts add nothing until turned on,
+	with every older weight away from 0."""
 	torch.manual_seed(0)
 	model = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
 	with torch.no_grad():
 		for name, p in sorted(model.named_parameters()):
-			if name.startswith(("side_tile", "side_global")):
+			if name.startswith(("side_tile", "side_global", "time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global")):
 				continue
 			g = torch.Generator().manual_seed(sum(ord(ch) * (i + 1) for i, ch in enumerate(name)) % (2**31))
 			p.copy_(0.05 * torch.randn(p.shape, generator=g))

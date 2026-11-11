@@ -119,6 +119,19 @@ VALVE_WINDOW, VALVE_HORIZON, VALVE_S_MIN, VALVE_K_MIN, VALVE_RATE = 7, 50, 0.1, 
 MAX_LABEL_STALENESS = 2  # model versions: older precomputed labels (labeler.py) are recomputed with the current tables
 
 
+def set_advice_prior(model, config):
+	"""config.nk2_prior and nk2_prior_fallback into the model's buffers (model.CustomFeatures.nk_beta, nk_beta_fallback):
+	the size of Nullkiller2's preference as a prior on MOVE's and TRAVEL's entries. At every start, after the weights
+	are loaded: the run's line decides it, the checkpoints and the inference servers carry it (a model without the
+	buffers, v1: nothing)."""
+	features = getattr(model, "features", None)
+	if features is None or not hasattr(features, "nk_beta"):
+		return
+	with torch.no_grad():
+		features.nk_beta.fill_(float(getattr(config, "nk2_prior", 0.0)))
+		features.nk_beta_fallback.fill_(float(getattr(config, "nk2_prior_fallback", 0.0)))
+
+
 def campaign_model_kwargs(config, out, resume=False):
 	"""What builds the campaign model this run trains: a resumed run's checkpoint says, else the config (model_kwargs);
 	for an inference server made before the learner (battle_model/train.py: one server for both models)."""
@@ -223,6 +236,7 @@ class CampaignLearner:
 			migrate_subtypes(state, self.model)
 			self.model.load_state_dict(state["model"])
 			print(f"campaign: starting from {config.init_from}", flush=True)
+		set_advice_prior(self.model, config)
 		if stale_clips(self.grad_clips, config.grad_clip_since):  # (a recalibration: config.grad_clip_since)
 			print(f"campaign: the gradient clips of v{self.grad_clips.get('version', '?')} measured again (grad_clip_since {config.grad_clip_since})", flush=True)
 			self.grad_clips, self.clip_samples = None, []
@@ -1447,6 +1461,7 @@ def _update_worker(config, kwargs, device_name, state, requests, results, latest
 	optimizer = make_optimizer(model, config)
 	migrate_subtypes(state, model)
 	model.load_state_dict(state["model"])
+	set_advice_prior(model, config)
 	if state.get("optimizer"):
 		optimizer.load_state_dict(state["optimizer"])
 		fit_moments(optimizer, model)
