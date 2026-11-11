@@ -280,7 +280,7 @@ class CustomFeatures(nn.Module):
 		zeros = lambda *shape: nn.Parameter(torch.zeros(shape))  # noqa: E731 (every correction starts at its prior)
 		self.object_gain, self.fight_sharpness, self.enemy_value, self.explore_gain, self.hero_value = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.danger_gain, self.garrison_penalty, self.fort_gain = zeros(), zeros(), zeros()
-		self.night_gain = zeros()  # (2026-11-10: tonight's danger in MOVE's and TRAVEL's logit priors; night_weight)
+		self.night_gain = nn.Parameter(torch.zeros(()), requires_grad=False)  # (2026-11-10: tonight's danger in MOVE's and TRAVEL's logit priors; fixed: night_weight)
 		self.meeting_gain = zeros()  # (2026-11-05: what meeting a hero of ours or entering a town of ours gains, tile_features)
 		self.multi_weight = zeros()  # (2026-11-05: how far a multi-action's gain to Φ biases it: multi_prior)
 		self.give_all_cost = zeros()  # (2026-11-05: what a GIVE_ALL must gain to be worth making; give_all_cost_weight)
@@ -338,8 +338,13 @@ class CustomFeatures(nn.Module):
 		return torch.exp(ft.bounded(raw, low, high, 0.0, CORRECTION_STEP))
 
 	def night_weight(self):
-		"""How far P(lost tonight) x what a lost battle takes counts in MOVE's and TRAVEL's logit priors: 1 at the start,
-		the expected loss in gold, as a pickup's gain counts."""
+		"""How far P(lost tonight) x what a lost battle takes counts in MOVE's and TRAVEL's logit priors: the expected loss
+		in gold, as a pickup's gain counts. Not learned (night_gain does not require a gradient; it stays among the
+		corrections for the checkpoints' and the optimizer's names): from its deploy (2026-11-10) it fell every update,
+		the teacher's cross-entropy pushing it 13 times as hard as the policy's credit (push_night_gain_*). Nullkiller2's
+		choice is evidence of its own follow-through, not of our expected loss tonight (GATHER's pattern), and with the
+		teacher's push cut Adam would carry the policy's small one of a steady sign at about the same rate. What it prices
+		is corrected by measuring P (the reading's calibration against kills), not by a free scalar."""
 		return self.gain(self.night_gain)
 
 	def explore_gold(self):

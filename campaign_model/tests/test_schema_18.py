@@ -160,3 +160,13 @@ def test_the_gradient_check_reads_each_terms_gradient_on_the_watched_corrections
 	out = gradient_check(m, shared + m.features.night_gain, 2 * shared, terms, prefix="grad_raw_", watch=WATCHED)
 	assert out["grad_raw_night_gain_teacher"] == 3 and out["grad_raw_night_gain_policy"] == -2
 	assert out["grad_raw_danger_gain_policy"] == 5 and out["grad_raw_danger_gain_teacher"] == 0 and out["grad_raw_teacher"] > 0
+
+
+def test_the_night_weight_is_not_learned(model):
+	"""night_gain needs no gradient: a loss through MOVE's and TRAVEL's logit priors leaves it without one (the teacher's
+	labels and the policy's credit alike); the night still counts (the prior moves with the danger)."""
+	assert not model.features.night_gain.requires_grad
+	x = scene([7, 10, 0], [([30, 10, 0], [12, 10, 0])])
+	f = model.features({k: torch.from_numpy(v) for k, v in x.items()}, model.windows({k: torch.from_numpy(v) for k, v in x.items()})[0])
+	(f.travel_logits.sum() + f.tile_prior.sum()).backward()
+	assert model.features.night_gain.grad is None and night(custom_features(model, x), [30, 10, 0]) < -2.0
