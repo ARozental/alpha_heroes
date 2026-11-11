@@ -413,6 +413,11 @@ class CampaignConfig:
 	# decisions (2-4 minutes, 24 at once), and 48 of them held the machine for most of 20 minutes an hour
 	eval_games: int = 24
 	eval_parallel: int = 24  # games at once (a VCMI client each, next to the training's)
+	# The split evaluation (the user, 2026-11-11; evaluate.plan): eval_own_games setups played with Nullkiller2's own choice
+	# hidden (our own policy: score_own, what it is judged by), eval_follow_games of them with it shown (score_follow,
+	# paired with OWN on those). 0: every eval_games setup with it shown, as before. The run: 32 and 16 (48 games, as before)
+	eval_own_games: int = 0
+	eval_follow_games: int = 0
 	eval_days: int = 56  # (the score at day 28 is logged too: score_d28)
 	# The campaign model samples, as in training (seeded per game and seat: AlphaMapAI's ALPHA_MAP_SEED_<COLOR>). Greedy
 	# (2026-10-29) was a policy never trained or played: its argmax over the move table is often a neighbouring tile and

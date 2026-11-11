@@ -235,6 +235,13 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # What would show it failing: the follow-off evaluation (the eval's OWN arm) not rising over a day while the hidden
 # games' eliminations stay high; the head's adv_ev falling. The headline evaluation at follow 0.9 says nothing about
 # our own policy.
+# campaign.eval_own_games=32 campaign.eval_follow_games=16 (the user's "ok do it", 2026-11-11): the PC evaluation in two
+# arms, the same 48 games and time: OWN, setups 0-31 with Nullkiller2's own choice hidden (its other inputs on): the
+# score our own policy is judged by (eval.csv score_own; eval_score, TensorBoard eval/campaign, the teacher weight's
+# score read it); FOLLOW, 16 of those (6 / 5 / 5 by players, our seats spread) with it shown at the run's follow
+# chance (score_follow; follow_minus_own paired on those 16). The old score columns stay empty from then on. Noise:
+# about +-0.15 at 32 games, +-0.2 at 16: read trends over three or more evaluations. Baselines: own ~0.51 (Mac, v3090,
+# job A's follow-0 arm), follow 0.75-0.79 (v3120 0.753, v3138 0.765, job A 0.792).
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -243,5 +250,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0.5 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0.5 campaign.eval_own_games=32 campaign.eval_follow_games=16 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null

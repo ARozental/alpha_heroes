@@ -332,7 +332,7 @@ class CampaignLearner:
 			# 56's 13.76)
 			with evals.open(newline="") as f:
 				rows = list(csv.DictReader(f))
-			score = float(rows[-1].get("score") or "nan") if rows else float("nan")
+			score = evaluate.eval_score(rows[-1]) if rows else float("nan")  # (OWN's in a split evaluation)
 			if np.isfinite(score):
 				self.teacher_weight, self.teacher_share = teacher_weight_for(score), teacher_share_for(score)
 				print(f"campaign: the teacher's weight {self.teacher_weight:.2f} (its gradient share {self.teacher_share:.2f} with config.loss_shares) from the last eval's score {score:.3f}", flush=True)
@@ -1162,10 +1162,11 @@ class CampaignLearner:
 			evaluate.log(row, self.out / f"eval_{self.config.eval_size}.csv", None)
 			return row
 		evaluate.log(row, self.out / "eval.csv", self.writer)
-		if self.config.teacher_mix == "score" and (self.teacher is not None or self.config.nk2_advice > 0) and np.isfinite(row.get("score", np.nan)):
-			self.teacher_weight = teacher_weight_for(row["score"])  # (config.teacher_mix: the teacher's share by our strength)
-			self.teacher_share = teacher_share_for(row["score"])  # (config.loss_shares: its share of the gradient)
-			print(f"campaign: the teacher's weight {self.teacher_weight:.2f} (its share of the loss {self.teacher_weight / (1 + self.teacher_weight):.2f}) for an eval score of {row['score']:.3f}", flush=True)
+		score = evaluate.eval_score(row)  # (our own policy's: OWN's in a split evaluation)
+		if self.config.teacher_mix == "score" and (self.teacher is not None or self.config.nk2_advice > 0) and np.isfinite(score):
+			self.teacher_weight = teacher_weight_for(score)  # (config.teacher_mix: the teacher's share by our strength)
+			self.teacher_share = teacher_share_for(score)  # (config.loss_shares: its share of the gradient)
+			print(f"campaign: the teacher's weight {self.teacher_weight:.2f} (its share of the loss {self.teacher_weight / (1 + self.teacher_weight):.2f}) for an eval score of {score:.3f}", flush=True)
 		return row
 
 	def start_eval(self, epoch):
