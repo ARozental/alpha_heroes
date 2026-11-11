@@ -117,6 +117,15 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # campaign.value_jump_stop is 3 (config.py; the user, 2026-11-10): the campaign's updates are held when its fresh value
 # loss jumps (the median of the last 7 updates at 3 times its calm level); the line "VALUE LOSS JUMP" in the log, the
 # file campaign/held. A restart lifts the hold
+# Schema 18, the night's danger (2026-11-10, b1's 7441d1e; e5 deploys; no switch, live with the code): MOVE's and
+# TRAVEL's logit priors pay P(the hero is lost tonight where its day ends) x (army + hero) in gold as a pickup pays,
+# at the tile where today's walk stops (travel_stop, from the game); a town of ours a shelter for a hero that can be
+# inside it; MOVE's and TRAVEL's type offers go below 0 when every move is worse than staying. The network's inputs
+# as before. Why: v2728's heroes were killed on Nullkiller2's turn 18 times in 12 games, 16 of them after a TRAVEL
+# (with GATHER the same deaths took 20-43k of army each: the collapse of 2026-11-10). On 36 paired maps, v2728's
+# weights against Nullkiller2: the eval's score 0.461 -> 0.595 (+0.134 +- 0.041), eliminated 11 -> 4, big losses on
+# the enemy's turn 64 -> 49, land explored not less. Watch: eliminated and score over three evals (0.497, 11 of 48
+# before), features.night_gain (if it sinks as danger_gain did, something teaches the heroes out), idle movement
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
