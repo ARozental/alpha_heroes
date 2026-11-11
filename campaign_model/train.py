@@ -1002,6 +1002,51 @@ def new_advice(advice):
 	return (action == c.ActionType.ARTIFACT) | multi | army
 
 
+def night_dropped(model, decisions, advice, has, inputs_of, device, config):
+	"""[N] bool (config.nk2_night_drop): the advised turn decisions whose label, a MOVE or a TRAVEL, the night terms
+	price more than config.nk2_night_drop_logit below staying with the hero's night there reading
+	config.nk2_night_drop_reading or more: MOVE's tile_shift and tile_night at its tile, TRAVEL's logits less its prior
+	and features.night_danger at its stop (a record without stops: none). The model's hand-made features, no gradient;
+	inputs_of(rows) the rows' inputs."""
+	from . import features as ft
+	from .model_v2 import windows_of
+
+	out = np.zeros(len(decisions), dtype=bool)
+	kinds = np.array([d.kind for d in decisions])
+	rows = np.flatnonzero(has & (kinds == c.DecisionKind.TURN) & np.isin(advice[:, 0], (c.ActionType.MOVE, c.ActionType.TRAVEL)))
+	features, areas = model.features, c.MAP_LEVELS * c.TRAVEL_GRID * c.TRAVEL_GRID
+	for start in range(0, len(rows), 64):
+		part = rows[start : start + 64]
+		x = {k: torch.as_tensor(v).to(device) for k, v in inputs_of(part).items()}
+		with torch.no_grad():
+			windows = model.windows(x)[0] if hasattr(model, "windows") else windows_of(x)[0]
+			f = features(x, windows)
+			shift_travel = (f.travel_logits - f.travel_prior).cpu().numpy()
+			tonight = known = None
+			if "travel_stop" in x:
+				stops, known = ft.travel_stops(x)
+				tonight = ft.night_danger(x, f.hero_strength, features.town_strength(x, f.town_power, manned=True), stops).cpu().numpy()
+				known = known.cpu().numpy()
+			windows = windows.cpu().numpy()
+			shift_move, night_move = (f.tile_shift.cpu().numpy(), f.tile_night.cpu().numpy()) if len(windows) else (None, None)
+		for j, r in enumerate(part):
+			kind, index = int(advice[r, 0]), int(advice[r, 1])
+			if kind == c.ActionType.MOVE:
+				slot, cell = divmod(index, c.WINDOW * c.WINDOW)
+				k = np.flatnonzero(windows == j * c.OWN_HEROES + slot)
+				if shift_move is None or not len(k):
+					continue
+				row, column = divmod(cell, c.WINDOW)
+				shift, reading = float(shift_move[k[0], row, column]), float(night_move[k[0], row, column])
+			else:
+				hero, area = divmod(index, areas)
+				if tonight is None or not known[j, hero, area]:
+					continue
+				shift, reading = float(shift_travel[j, hero, area]), float(tonight[j, hero, area])
+			out[r] = shift < -config.nk2_night_drop_logit and reading >= config.nk2_night_drop_reading
+	return out
+
+
 def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
 	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None, teacher=None, teacher_weight=None,
@@ -1030,6 +1075,8 @@ def ppo_update(
 	their decisions' rows here, -1 none, "present" [N, R] 1 a rival alive in the game, "share_logit" [N] our true share's
 	logit as the day began), or None. Returns (metrics, the KL control's new lr_scale)."""
 	n, started = len(decisions), time.time()
+	given_decode = decode  # (night_dropped's inputs: a caller's own, else the records')
+	night_drop_share = float("nan")  # (config.nk2_night_drop: the share of the advised labels it left out)
 	clock = {"prepass": 0.0, "wait": 0.0, "steps": 0.0, "forward": 0.0, "losses": 0.0, "backward": 0.0, "optimizer": 0.0, "cpu": time.thread_time()}  # where the update's time goes (logged: the PC's step ran at half the GPU's pace, 2026-10-30)
 	# The foresight's labels (foresight.game_labels, v2), each decision's row: its loss joins the minibatch's, a share
 	# per micro-batch as the others'; the shared layers' gradient from it against the PPO losses', on the first one
@@ -1053,6 +1100,11 @@ def ppo_update(
 		# Only where its request was matched (has): a decision where Nullkiller2 asked for what we cannot do (an artifact
 		# swap, a hero dismissed) has no label to weigh its plan's steps against (TEACHER_SPAN), 2026-11-05
 		advised = advice_weights(advice, has, config)
+		if getattr(config, "nk2_night_drop", False):  # (Nullkiller2's labels into the night left out: night_dropped)
+			counted = int((advised > 0).sum())
+			dropped = night_dropped(model, decisions, advice, has, given_decode or (lambda rows: decode_inputs([decisions[r] for r in rows])), device, config) & (advised > 0)
+			advised[dropped] = 0.0
+			night_drop_share = float(dropped.sum()) / max(counted, 1)
 		advice_t = {
 			"advice_action": torch.from_numpy(advice[:, 0]).to(device), "advice_index": torch.from_numpy(advice[:, 1]).to(device), "advice_cell": torch.from_numpy(advice[:, 2]).to(device),
 			"advised": torch.from_numpy(advised).to(device),
@@ -1521,6 +1573,7 @@ def ppo_update(
 		head_weights={name[2:]: tensor.tolist() for name, tensor in head_w.items()} if head_w is not None else None,
 		head_residual=head_residual,  # (config.head_scale_by "residual": the heads' running fresh excess, for the next update)
 		head_var_slow=head_var_slow,
+		night_dropped=night_drop_share,
 	)
 	return metrics, lr_scale
 
