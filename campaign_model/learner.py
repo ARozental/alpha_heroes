@@ -116,6 +116,9 @@ COLUMNS = [
 	# (config.schedule_action_price: the mean charge a decision and its share of the 7-day credit's spread; what it is judged
 	# by: our heroes' idle movement, and how often a day's first action is END, apart for the two kinds of games)
 	"action_price_mean", "action_price_share", "idle_movement_shown", "idle_movement_hidden", "end_first", "end_first_shown", "end_first_hidden",
+	# (each kind of game's advantage as the policy and the head take it: its mean, its spread, its share of sum |A| x credit;
+	# config.adv_by_kind standardizes them apart)
+	"adv_mean_shown", "adv_mean_hidden", "adv_sd_shown", "adv_sd_hidden", "adv_weight_shown", "adv_weight_hidden",
 ]
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
 DROP_BEYOND = 4  # updates' worth of finished games beyond which the oldest are dropped (_take)
@@ -1587,6 +1590,8 @@ def choice_readings(games, metrics):
 		out[f"teacher_agree_{name}"] = float(np.mean([agrees(d) for d in advised])) if advised else float("nan")
 		out[f"adv_ev_{name}"] = metrics.get(f"adv_ev_{name}", float("nan"))
 		out[f"adv_raw_sd_{name}"] = metrics.get(f"adv_raw_sd_{name}", float("nan"))
+		for what in ("mean", "sd", "weight"):
+			out[f"adv_{what}_{name}"] = metrics.get(f"adv_{what}_{name}", float("nan"))
 		out[f"adv_kl_{name}"] = metrics.get(f"adv_kl_{name}", float("nan"))
 		out[f"adv_read_{name}"] = metrics.get(f"adv_read_{name}", float("nan"))
 		ours = [d for game, _ in kinds[hidden] for d in game.decisions]

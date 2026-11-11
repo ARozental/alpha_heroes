@@ -200,3 +200,39 @@ def test_the_follow_chance_never_rises_above_the_run_lines():
 		features.nk_follow_shift.grad = None
 		features.nk_follow_logs()[1].backward()
 		assert float(features.nk_follow_shift.grad.abs()) > 0, raw
+
+
+def test_the_advantage_by_kind_of_game():
+	"""config.adv_by_kind: off, the update is the pooled one bit for bit whatever `hidden` says; on with one kind only, the
+	same; on with both, each kind's advantage has mean 0 and spread 1 as the policy and the head take it."""
+	import copy
+
+	from campaign_model import constants as c
+	from campaign_model.tests.test_advantage_head import CLIPS, setup
+	from campaign_model.train import make_optimizer, ppo_update
+
+	model, x, decisions = setup()
+	n = len(decisions)
+	rng = np.random.default_rng(3)
+	advantages = np.where(np.arange(n) % 2 == 0, 0.2, 2.0).astype(np.float32) * rng.standard_normal(n).astype(np.float32)
+	targets = (0.5 + 0.05 * np.random.default_rng(0).standard_normal((n, c.N_VALUE_OFFSETS))).astype(np.float32)
+
+	def update(by_kind, hidden):
+		m = copy.deepcopy(model)
+		config = CampaignConfig(batch_size=8, passes=1, model_architecture="v2", credit="schedule", share_target="change", adv_weight=1.0, adv_by_kind=by_kind)
+		torch.manual_seed(7)
+		metrics, _ = ppo_update(m, make_optimizer(m, config), decisions, targets, None, config, decode=lambda rows: {k: v[rows] for k, v in x.items()}, advantages=advantages, clips=CLIPS, hidden=hidden)
+		return m, metrics
+
+	pooled, _ = update(False, None)
+	mixed = np.arange(n) % 2 == 0
+	for by_kind, hidden in ((False, mixed), (True, np.zeros(n, dtype=bool)), (True, np.ones(n, dtype=bool))):
+		same, _ = update(by_kind, hidden)
+		for (name, a), (_, b) in zip(pooled.named_parameters(), same.named_parameters()):
+			assert torch.equal(a, b), (by_kind, name)
+	_, metrics = update(False, mixed)
+	assert metrics["adv_sd_hidden"] < 0.5 * metrics["adv_sd_shown"]  # (pooled: the narrow kind narrower)
+	apart, metrics = update(True, mixed)
+	for name in ("shown", "hidden"):
+		assert abs(metrics[f"adv_mean_{name}"]) < 1e-5 and abs(metrics[f"adv_sd_{name}"] - 1.0) < 1e-4, (name, metrics[f"adv_mean_{name}"], metrics[f"adv_sd_{name}"])
+	assert any(not torch.equal(a, b) for (_, a), (_, b) in zip(pooled.named_parameters(), apart.named_parameters()))

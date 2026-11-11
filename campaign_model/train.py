@@ -1420,9 +1420,25 @@ def ppo_update(
 			hidden_t = torch.from_numpy(np.asarray(hidden, dtype=bool)).to(device)
 			for name, rows in (("shown", credited & ~hidden_t), ("hidden", credited & hidden_t)):
 				adv_stats[f"adv_raw_sd_{name}"] = float(advantage[rows].std()) if int(rows.sum()) > 1 else float("nan")
-	if int(credited.sum()) > 1:
+	by_kind = getattr(config, "adv_by_kind", False) and hidden is not None
+	if by_kind:  # (config.adv_by_kind: each kind of game standardized apart; a kind of one row or none as pooled would leave it)
+		hidden_t = torch.from_numpy(np.asarray(hidden, dtype=bool)).to(device)
+		kinds = [rows for rows in (credited & ~hidden_t, credited & hidden_t) if int(rows.sum()) > 1]
+		by_kind = len(kinds) == 2
+	if by_kind:
+		standard = advantage.clone()
+		for rows in kinds:
+			standard = torch.where(rows, (advantage - advantage[rows].mean()) / (advantage[rows].std() + 1e-8), standard)
+		advantage = standard
+	elif int(credited.sum()) > 1:
 		advantage = (advantage - advantage[credited].mean()) / (advantage[credited].std() + 1e-8)
 	advantage = torch.where(credited, advantage, torch.zeros_like(advantage))
+	if hidden is not None:  # (each kind's advantage as the policy and the head take it: its mean and spread, its share of sum |A| x credit)
+		hidden_t = torch.from_numpy(np.asarray(hidden, dtype=bool)).to(device)
+		weight = advantage.abs().sum().clamp(min=1e-12)
+		for name, rows in (("shown", credited & ~hidden_t), ("hidden", credited & hidden_t)):
+			many = int(rows.sum()) > 1
+			adv_stats.update({f"adv_mean_{name}": float(advantage[rows].mean()) if many else float("nan"), f"adv_sd_{name}": float(advantage[rows].std()) if many else float("nan"), f"adv_weight_{name}": float(advantage[rows].abs().sum() / weight)})
 	unsound = ~torch.isfinite(anchor)  # a choice the model calls impossible now (its legality changed): left out
 	if adv_before is not None:  # (the rows its loss takes: credited, sound, a turn's or an exchange's choice)
 		rows = credited & ~unsound & (choice["action"] >= 0)

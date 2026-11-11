@@ -313,6 +313,11 @@ class CampaignConfig:
 	# (1/4..2). 0: off, the model as before, bit for bit. Set into the model at every start (learner.set_advice_prior);
 	# ALPHA_ADV_GAIN for a paired test. Turned on only once adv_ev on fresh rows has held above 0 (stage 1's reading)
 	adv_gain: float = 0.0
+	# The update's advantage standardized within each kind of game (own games and the rest: config.nk2_choice_games), for
+	# the policy term and the advantage head alike, rather than pooled. Pooled, the own games' advantage came out at a
+	# fifth to a half of the others' spread (v3154-3157: 0.20-0.60 against 1.09-1.39), so their rows pushed our own policy
+	# with that much less weight. False: pooled, as before (bit for bit); an update with one kind only is pooled either way
+	adv_by_kind: bool = False
 	# Its TRADE advice taught too (False since 2026-11-04: the user's rule, every trade is dumb unless it buys what could not
 	# be bought without it; ~94% of its trades bought nothing that day, and 54% of ours came where it advised one)
 	nk2_trade_advice: bool = False
