@@ -177,3 +177,26 @@ def test_the_learner_logs_every_reading_of_deploy_59(tmp_path, capsys):
 		assert part in printed, part
 	assert float(row["choice_hidden"]) == 0.5 and float(row["action_price_mean"]) > 0 and float(row["adv_kl"]) >= 0 and row["adv_read"] not in ("", "nan")
 	assert "FAILURE" not in printed
+
+
+def test_the_follow_chance_never_rises_above_the_run_lines():
+	"""The user's cap (2026-11-11, "we can limit it to 90%"): at any positive shift the chance is exactly the start; a
+	negative one lowers it, with a gradient there; at the start the gradient reaches the shift."""
+	torch.manual_seed(3)
+	model = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	features = model.features
+	features.nk_follow.fill_(0.9)
+	for raw in (0.0, 5.0, 1e3):
+		with torch.no_grad():
+			features.nk_follow_shift.fill_(raw)
+		assert abs(float(features.nk_follow_logs()[1].exp()) - 0.9) < 1e-6, raw
+	with torch.no_grad():
+		features.nk_follow_shift.fill_(-50.0)
+	low = float(features.nk_follow_logs()[1].exp())
+	assert 0.25 < low < 0.9
+	for raw in (0.0, -2.0):  # (at the cap and below it; far below, the bound's sigmoid is flat)
+		with torch.no_grad():
+			features.nk_follow_shift.fill_(raw)
+		features.nk_follow_shift.grad = None
+		features.nk_follow_logs()[1].backward()
+		assert float(features.nk_follow_shift.grad.abs()) > 0, raw

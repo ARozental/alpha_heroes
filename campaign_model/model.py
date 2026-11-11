@@ -408,11 +408,16 @@ class CustomFeatures(nn.Module):
 
 	def nk_follow_logs(self):
 		"""(whether following is on, log rho, log (1 - rho)): the chance our choice is Nullkiller2's own (nk_follow at the
-		start, within 0.0001..0.9999; its logit moved by nk_follow_shift, -3..+1)."""
+		start, within 0.0001..0.9999; its logit moved by nk_follow_shift, down by up to 3, never up: the user, 2026-11-11,
+		"we can limit it to 90%", the run line's chance a cap). The shift's -3..+1 range capped at 0: exactly the start at or above
+		it (a checkpoint whose shift had risen loads at the run's chance), its gradient the uncapped shift's everywhere (at
+		the start too, so it can fall; a raw pushed above the cap does nothing and the prior's decay brings it back)."""
 		own = self.nk_override[3]
 		start = self.nk_follow if own is None else self.nk_follow.new_tensor(own)
 		chance = start.clamp(1e-4, 1.0 - 1e-4)
-		logit = torch.log(chance) - torch.log1p(-chance) + ft.bounded(self.nk_follow_shift, -3.0, 1.0, 0.0, CORRECTION_STEP)
+		moved = ft.bounded(self.nk_follow_shift, -3.0, 1.0, 0.0, CORRECTION_STEP)
+		shift = moved - torch.relu(moved).detach()  # (min(moved, 0) in value; the gradient moved's everywhere, so it can fall from the cap)
+		logit = torch.log(chance) - torch.log1p(-chance) + shift
 		return start > 0, torch.nn.functional.logsigmoid(logit), torch.nn.functional.logsigmoid(-logit)
 
 	def night_weight(self):
