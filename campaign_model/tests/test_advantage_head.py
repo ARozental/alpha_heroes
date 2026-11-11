@@ -156,3 +156,63 @@ def test_it_learns_a_planted_advantage():
 	# (each group's own target is constant here, +1 or -1: its explained variance within the group is not a number)
 	assert 0 < metrics["adv_followed"] < 1
 	assert float(model.advantage.named.detach().abs().max()) > 0  # (the named weights carry it)
+
+
+def test_the_learner_logs_its_readings(tmp_path, capsys):
+	"""CampaignLearner.step end to end at adv_weight 1 (deploy 58's line): its readings in progress.csv and the update's
+	log line; at 0 the columns are there and empty."""
+	import collections
+	import csv
+	import dataclasses
+	import threading
+	from types import SimpleNamespace
+
+	import campaign_model.learner as learner_module
+	from campaign_model.empire import EmpireConfig
+	from campaign_model.labels import LabelConfig
+	from campaign_model.learner import COLUMNS, CampaignLearner
+	from campaign_model.model import build_model
+	from campaign_model.records import Game
+	from campaign_model.schema import random_inputs
+	from campaign_model.tests.test_labels import snapshot
+	from campaign_model.tests.test_model import encoded
+
+	for weight in (1.0, 0.0):
+		torch.manual_seed(6)
+		kwargs = {"dim": 32, "cell_dim": 16, "heads": 4, "layers": 1, "architecture": "v2", "share_target": "change"}
+		model = build_model(kwargs).eval()
+		config = CampaignConfig(decisions_per_update=8, min_games_per_update=2, batch_size=4, passes=1, learner="thread", device="cpu", credit="schedule", share_target="change", model_architecture="v2", noise_every=0, adv_weight=weight)
+		games = []
+		for g in range(2):
+			x = random_inputs(8, seed=30 + g)
+			decisions = [dataclasses.replace(d, inputs=encoded(x, b), day=1 + b // 3) for b, d in enumerate(decisions_for(model, x, seed=g))]
+			games.append((Game(decisions=decisions, ledgers={d: snapshot(d, 1000 + 300 * d, 1000) for d in range(1, 14)}, days=12), SimpleNamespace(seconds=1.0, map_name="Maps/alpha_random/x")))
+
+		class Writer:
+			def add_scalar(self, *args):
+				pass
+
+			def flush(self):
+				pass
+
+		out = tmp_path / str(weight)
+		out.mkdir()
+		learner = SimpleNamespace(
+			config=config, labels=LabelConfig(), empire=EmpireConfig(), version=1, finished=list(games), lock=threading.Condition(), stats=collections.Counter(),
+			model=model, optimizer=make_optimizer(model, config), device=torch.device("cpu"), worker=None, model_lock=threading.Lock(), lr_scale=1.0,
+			server=SimpleNamespace(set_model=lambda *args: None), teacher=None, teacher_weight=0.0, games_used=0, out=out, kwargs=kwargs, value_ev=None, credit_evidence={}, credit_check=1.0, head_ev={"Vend": 0.2}, value_pool=None, head_pool={}, progress=out / "progress.csv", writer=Writer(),
+			features_cpu=model.features, trust_ema=None, grad_clips=None, clip_samples=[], head_residual=None, head_var_slow=None, head_residual_updates=0, held=None, held_updates=0, gather_ramp_start=None, valve=None, value_readings=[], value_own=0,
+		)
+		for name in ("_take", "trust", "trust_today", "_save", "_log", "_note_value_ev", "_note_head_ev", "grade_trust", "end_credit", "_refresh_features", "_relabel_waiting", "loss_shares", "loss_weights", "_note_gradients", "gather_weight_now", "valve_now", "_note_valve", "_valve_reading", "_head_scale", "_calibrate_clips", "_judge_value"):
+			setattr(learner, name, getattr(CampaignLearner, name).__get__(learner))
+		learner.progress.write_text(",".join(COLUMNS) + "\n")
+		capsys.readouterr()
+		assert CampaignLearner.step(learner, epoch=1)
+		printed = capsys.readouterr().out
+		row = list(csv.DictReader(open(learner.progress)))[-1]
+		moved = max(float(p.detach().abs().max()) for p in model.advantage.parameters())
+		if weight:
+			assert "advantage head: loss" in printed and float(row["adv_loss"]) > 0 and float(row["adv_raw_sd"]) > 0 and row["adv_ev"] not in ("", "nan") and moved > 0
+		else:
+			assert "advantage head" not in printed and moved == 0.0 and all(row[name] in ("", "nan") for name in ("adv_ev", "adv_raw_sd"))
+	assert learner_module.COLUMNS[-6:] == ["adv_loss", "adv_ev", "adv_ev_followed", "adv_ev_deviating", "adv_followed", "adv_raw_sd"]
