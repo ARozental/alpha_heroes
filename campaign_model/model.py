@@ -309,6 +309,18 @@ class CustomFeatures(nn.Module):
 		self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.multi_split, self.multi_merge, self.multi_garrison = zeros(), zeros(), zeros()
 		self.swap_gain, self.swap_slot, self.last_swap = zeros(), zeros(), zeros()  # (2026-11-08: a swap priced by the power it moves: swap_priors)
+		# Nullkiller2's own preference among its candidate tasks as a prior on MOVE's and TRAVEL's entries (schema 19, the
+		# user's design of 2026-11-11: its knowledge as inputs and a prior, never a loss on our choices; nk_prior_weights).
+		# nk_beta, nk_beta_fallback: the prior's size in logits at its best candidate, fixed (buffers the checkpoint keeps:
+		# 0, the model as before; set from config.nk2_prior, nk2_prior_fallback, chosen by paired tests; ALPHA_NK2_PRIOR,
+		# ALPHA_NK2_PRIOR_FALLBACK override them for such a test). The corrections: each prior's gain (x 1/4..2), and how
+		# far its expected loss of army on the path (ln of the share kept) and its danger on arrival count besides (each
+		# 0.25 a unit to begin with, 0..2: signs fixed, a loss never a reason to go)
+		self.nk_gain, self.nk_gain_fallback, self.nk_survival, self.nk_risk = zeros(), zeros(), zeros(), zeros()
+		self.register_buffer("nk_beta", torch.zeros(()))
+		self.register_buffer("nk_beta_fallback", torch.zeros(()))
+		override = lambda name: float(os.environ[name]) if os.environ.get(name, "") != "" else None  # noqa: E731
+		self.nk_override = (override("ALPHA_NK2_PRIOR"), override("ALPHA_NK2_PRIOR_FALLBACK"))
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -332,6 +344,7 @@ class CustomFeatures(nn.Module):
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
 			self.night_gain,
+			self.nk_gain, self.nk_gain_fallback, self.nk_survival, self.nk_risk,
 		]
 
 	# ---- the bounded prior parameters ----
@@ -340,6 +353,20 @@ class CustomFeatures(nn.Module):
 	def gain(raw, low=-MAX_LOG_GAIN, high=MAX_LOG_GAIN):
 		"""A multiplicative correction: exp of a log-gain within [low, high], 1 at the start."""
 		return torch.exp(ft.bounded(raw, low, high, 0.0, CORRECTION_STEP))
+
+	def nk_prior_weights(self):
+		"""(the logits Nullkiller2's best candidate at the plan's tier adds to its entry, a gather-tier fallback's best, a
+		unit of its path's log survival, a unit of its danger on arrival): nk_beta x its gain (1/4..2, 1 at the start),
+		nk_beta_fallback x its gain, and the two direct weights (0..2 from 0.25), which count only while a prior is on.
+		All 0 with both betas at 0: the model as before schema 19."""
+		own, own_fallback = self.nk_override
+		beta = self.nk_beta if own is None else self.nk_beta.new_tensor(own)
+		fallback = self.nk_beta_fallback if own_fallback is None else self.nk_beta.new_tensor(own_fallback)
+		on = ((beta + fallback) > 0).to(beta.dtype)
+		return (
+			beta * ft.bounded(self.nk_gain, 0.25, 2.0, 1.0, CORRECTION_STEP), fallback * ft.bounded(self.nk_gain_fallback, 0.25, 2.0, 1.0, CORRECTION_STEP),
+			on * ft.bounded(self.nk_survival, 0.0, 2.0, 0.25, CORRECTION_STEP), on * ft.bounded(self.nk_risk, 0.0, 2.0, 0.25, CORRECTION_STEP),
+		)
 
 	def night_weight(self):
 		"""How far P(lost tonight) x what a lost battle takes counts in MOVE's and TRAVEL's logit priors: the expected loss
@@ -564,7 +591,7 @@ class CustomFeatures(nn.Module):
 		f.trade_options = ft.trade_options(x, self)
 		f.build_trade, f.recruit_trade, f.recruit_short = ft.purchase_trades(x, self)
 		f.area_centres = ft.centres(x, TG)
-		f.travel_prior, f.travel_logits = self.travel_prior(x, f)
+		f.travel_prior, f.travel_logits, f.travel_gold = self.travel_prior(x, f)
 		if windows.shape[0] > 0:
 			f.update(self.tile_features(x, windows, f))
 		f.option_prior, f.option_features = self.option_knowledge(x, f)
@@ -971,7 +998,8 @@ class CustomFeatures(nn.Module):
 		return self.object_gold(obj, x["m_subtype"]), gate, count * self.fight_value[vocab_index(creature, c.CREATURE_VOCAB)]
 
 	def travel_prior(self, x, f):
-		"""TRAVEL's prior [B, HO, L * TG^2] as the network reads it and as its logits: each area's value in gold (its
+		"""TRAVEL's prior [B, HO, L * TG^2] as the network reads it and as its logits, and each area's value in gold
+		undiscounted [B, L * TG^2] (model_v2's views): each area's value in gold (its
 		objects by class at each class's worth, the land it would reveal), discounted by the days each hero needs to get
 		there (the pathfinder's, travel_days; Nullkiller2's evaluateMovement), as a logit (features.value_logit). The
 		logits also count the night (2026-11-10): a TRAVEL walks on until today's movement is spent and the hero spends the
@@ -989,7 +1017,7 @@ class CustomFeatures(nn.Module):
 		rest = (weights * torch.tanh(pulls * discount.unsqueeze(-1) / ft.PULL_SCALE)).sum(dim=-1)
 		gain = value.unsqueeze(1) * discount
 		if "travel_stop" not in x:
-			return ft.value_logit(gain) + rest, ft.value_logit(gain) + rest
+			return ft.value_logit(gain) + rest, ft.value_logit(gain) + rest, value
 		stops, known = ft.travel_stops(x)
 		manned = self.town_strength(x, f.town_power, manned=True)
 		here = ft.night_danger(x, f.hero_strength, manned, x["h_pos"][:, :HO].unsqueeze(2))  # [B, HO, 1]
@@ -1002,7 +1030,7 @@ class CustomFeatures(nn.Module):
 			foes = tuple(t.index_select(0, decision) for t in ft.enemies(x, f.hero_strength))
 			towns = ft.town_night(x, f.hero_strength, manned, f.town_strength, f.town_stakes, decision, hero, foes, stops.reshape(b * HO, -1, 3), f.phi_total if self.town_night == 2 else None).reshape(b, HO, -1)
 			night = night + towns * known * self.night_weight()
-		return ft.value_logit(gain) + rest, ft.value_logit(gain + night) + rest
+		return ft.value_logit(gain) + rest, ft.value_logit(gain + night) + rest, value
 
 	def travel_pulls(self, x, f, areas):
 		"""Nullkiller2's plans across days in each hero's TRAVEL areas [B, HO, A, 3] (gold): a main hero's pull to the area of
@@ -1518,7 +1546,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
@@ -1532,6 +1560,8 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"privileged",  # (2026-11-06: the privileged critic, its corrections 0 at the start)
 	"army_slot", "army_stay_q",  # (schema 16: ARMY's target slot, its queries 0 at the start: its priors alone)
 	"side_tile", "side_global",  # (2026-11-08: the map's block side, 0: docs/map_size_plan.md)
+	# (schema 19, 2026-11-11: the bounded views and Nullkiller2's candidates, model_v2.CampaignModelV2.advice: every one's output 0 at the start)
+	"time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global",
 )
 # Training-only parts rebuilt since, by prefix: a checkpoint's weights for them that the loading model lacks, or of
 # another shape, are dropped, the part starting again as a new model has it (2026-11-07: the privileged critic's first

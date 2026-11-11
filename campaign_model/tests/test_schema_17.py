@@ -22,7 +22,7 @@ from campaign_model.tests.test_model import encoded, tensors
 from campaign_model.tests.test_model_v2 import rich_inputs
 
 HO, W, R = c.OWN_HEROES, c.WINDOW, c.WINDOW_RADIUS
-WINDOW_INPUTS = ("w_terrain", "w_road", "w_flags", "w_object", "w_subtype", "w_owner", "w_creature", "w_count", "w_move_left", "w_turns", "move_mask")
+WINDOW_INPUTS = ("w_terrain", "w_road", "w_flags", "w_object", "w_subtype", "w_owner", "w_creature", "w_count", "w_move_left", "w_turns", "move_mask", "w_arrive_left")
 SPARE = 5  # a window slot no hero of random_inputs holds (it makes 1 to 3)
 KNOWN = ("tile_value", "tile_prior", "move_features", "move_strength", "move_relative", "tile_fight_ratio", "tile_fights", "tile_stacks")
 
@@ -86,6 +86,9 @@ def test_a_further_window_is_read_as_its_heros(model):
 	logit is the own window's (the hero's token, its act-now score, its strength, where it stands: each read through
 	the window's hero, not through the slot, whose hero does not exist)."""
 	x = turns(8, seed=3)
+	# (schema 19: a candidate of Nullkiller2's names one entry, so two copies of a window cannot both hold it: this
+	# decision is read without the advisor; its candidates in a further window: test_advice.py)
+	x["g_nk_present"][:] = False
 	y = tensors(with_further(x, 0, x["h_pos"][:, 0]))
 	with torch.no_grad():
 		known = model.domain_knowledge(y)

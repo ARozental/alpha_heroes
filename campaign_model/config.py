@@ -276,6 +276,13 @@ class CampaignConfig:
 	# advice at 24% of the decisions; a 51-weight readout of our own known features recovers two thirds of what the
 	# loss put into the policy, the plan head's prediction most of the rest
 	nk2_teacher: bool = True
+	# Nullkiller2's preference among its candidate tasks as a prior on MOVE's and TRAVEL's entries (schema 19; needs
+	# nk2_inputs in the games): the logits its best candidate at the plan's tier adds to the entry it goes through, and
+	# a gather-tier fallback's best (a hero the plan's tier says nothing about). 0: off, the model as before. Set into
+	# the model's buffers at every start (learner.set_advice_prior), which the checkpoints and the servers carry; the
+	# sizes are chosen by paired tests (campaign_model.paired_eval with ALPHA_NK2_PRIOR, ALPHA_NK2_PRIOR_FALLBACK)
+	nk2_prior: float = 0.0
+	nk2_prior_fallback: float = 0.0
 	# Its TRADE advice taught too (False since 2026-11-04: the user's rule, every trade is dumb unless it buys what could not
 	# be bought without it; ~94% of its trades bought nothing that day, and 54% of ours came where it advised one)
 	nk2_trade_advice: bool = False

@@ -152,6 +152,41 @@ def settled(count):
 	return 1.0 - 1.0 / (1.0 + count.float().clamp(min=0.0))
 
 
+THREAT_VIEWS = 4
+GLOBAL_VIEWS = 8
+
+
+def threat_views(threat):
+	"""Nullkiller2's threat to a town or a hero of ours (schema 19's t_nk_threat, h_nk_threat [.., 3]: has one, the
+	fastest's turns, its danger over our strength x 1000) as [.., THREAT_VIEWS], each within 0..1 and 0 without one:
+	has, the turns as the two discounts, the danger as a risk."""
+	has = (threat[..., 0] > 0).float()
+	soon_later = discounts(threat[..., 1])
+	return torch.stack([has, has * soon_later[..., 0], has * soon_later[..., 1], has * risk(threat[..., 2].float() / DANGER_SCALE)], dim=-1)
+
+
+def global_views(x):
+	"""What Nullkiller2's planner says of the whole decision [B, GLOBAL_VIEWS], each within 0..1 and 0 without the
+	advisor: it ran, the tier its plan was made at (PriorityTier 1..6, one-hot), how many candidates it scored
+	(n / (n + 16))."""
+	present = x["g_nk_present"].bool()
+	tier = (x["g_nk_tier"].long().unsqueeze(-1) == torch.arange(1, 7, device=present.device)).float()
+	count = x["g_nk_count"].float().clamp(min=0.0)
+	return torch.cat([present.float().unsqueeze(-1), tier, (count / (count + 16.0)).unsqueeze(-1)], dim=-1) * present.float().unsqueeze(-1)
+
+
+def absent_rows(b, device):
+	"""Schema 19's inputs of `b` decisions without the advisor and without a history (an input dict from before the
+	schema: a test's, an old exporter's), every one at its "none"."""
+	ints = lambda *shape: torch.zeros((b,) + shape, dtype=torch.long, device=device)  # noqa: E731
+	return {
+		"g_nk_present": torch.zeros(b, dtype=torch.bool, device=device), "g_nk_tier": ints(), "g_nk_count": ints(), "g_phi_past": ints(), "g_phi_past_days": ints(),
+		"k_hero": ints(c.NK), "k_dest": ints(c.NK, 3), "k_dest_cell": ints(c.NK), "k_dest_area": ints(c.NK), "k_move": ints(c.NK), "k_travel": ints(c.NK),
+		"k_score": ints(c.NK, 2), "k_days": ints(c.NK), "k_loss": ints(c.NK), "k_danger": ints(c.NK), "k_kind": ints(c.NK), "k_settled": ints(c.NK), "k_flags": ints(c.NK),
+		"t_nk_threat": ints(c.OWN_TOWNS, 3), "h_nk_threat": ints(c.OWN_HEROES, 3),
+	}
+
+
 def hero_bests(move_value, move_legal, travel_value, travel_legal, slot_heroes):
 	"""(each window slot's hero's best legal value [B, S], any hero's [B]) over MOVE's tiles and TRAVEL's areas, for
 	gap. move_value, move_legal: [B, S, ...] by window slot; travel_value, travel_legal: [B, HO, ...] by hero;
@@ -193,8 +228,9 @@ def _scatter(index, values, size):
 	return table.scatter_add(1, where, values)[:, :size]
 
 
-def candidate_tables(x):
-	"""Nullkiller2's candidate rows (x's k_*, g_nk_present; schema 19: candidate_rows) as dense tables:
+def candidate_tables(x, dest=True):
+	"""Nullkiller2's candidate rows (x's k_*, g_nk_present; schema 19: candidate_rows) as dense tables (dest False: without
+	the `dest` table, which the model does not read):
 
 	  channels            [B, NK, F]            each candidate's channels (CHANNELS)
 	  move, dest          [B, HO, W * W, F]     the channels of the best candidate whose first step (k_move) is the
@@ -235,8 +271,8 @@ def candidate_tables(x):
 	key = torch.where(winning, 3.0 + p_all, torch.where(fallback, 2.0 + g_all, torch.where(shadow, 1.0 + g_all, torch.zeros_like(p_all))))
 	live = torch.where(winning, 1.0 + p_all, torch.where(fallback, 1.0 + g_all, torch.zeros_like(p_all)))  # (0..1: what a prior counts)
 	# Another hero's candidate for the same destination: the best live preference among them
-	dest = r["dest"]
-	same_dest = (dest.unsqueeze(2) == dest.unsqueeze(1)).all(dim=-1) & (hero.unsqueeze(2) != hero.unsqueeze(1)) & valid.unsqueeze(1) & valid.unsqueeze(2)
+	goal = r["dest"]
+	same_dest = (goal.unsqueeze(2) == goal.unsqueeze(1)).all(dim=-1) & (hero.unsqueeze(2) != hero.unsqueeze(1)) & valid.unsqueeze(1) & valid.unsqueeze(2)
 	others = (same_dest.float() * live.unsqueeze(1)).amax(dim=2)
 	kind = (r["kind"].clamp(0, KINDS - 1).unsqueeze(-1) == torch.arange(KINDS, device=hero.device)).float()
 	soon_later = discounts(r["days"])
@@ -263,6 +299,8 @@ def candidate_tables(x):
 	earlier = torch.arange(nk, device=hero.device).unsqueeze(0) < torch.arange(nk, device=hero.device).unsqueeze(1)  # [k, j]: j before k
 	dest_cell = r["dest_cell"]
 	for name, column, size in (("move", r["move"], ho * cells), ("travel", r["travel"], ho * areas), ("dest", dest_cell, ho * cells)):
+		if name == "dest" and not dest:
+			continue
 		through = (column >= 0) & (column < size) & (key > 0)
 		same = (column.unsqueeze(2) == column.unsqueeze(1)) & through.unsqueeze(1) & through.unsqueeze(2)  # [B, k, j]: j goes through k's entry too
 		beaten = same & ((key.unsqueeze(1) > key.unsqueeze(2)) | ((key.unsqueeze(1) == key.unsqueeze(2)) & earlier.unsqueeze(0)))
