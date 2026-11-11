@@ -24,6 +24,7 @@ map size.
 import functools
 from typing import NamedTuple
 import math
+import os
 
 import torch
 from torch import nn
@@ -47,6 +48,10 @@ COARSE = G // 4  # the map encoder's coarsest blocks per side (9)
 # moves ~1e-3 a step: x5 in ~1,600 consistent steps, ~50 minutes of joint1's updates. (In effect a 10x rate on these
 # few scalars; the KL control still bounds every update.)
 CORRECTION_STEP = 10.0
+# MOVE's and TRAVEL's logit priors in shares of our Φ (prior_shares, a test: ALPHA_PRIOR_SHARES=1): gold x this / our Φ,
+# our Φ's median at day 1 (72 Mac games of v2728 against Nullkiller2, 2026-11-10: 51,238, 25-75% 49,274-52,322; day 28
+# 129,535, day 56 226,595), so the first days read as before
+PRIOR_SHARE_REF = 50_000.0
 MAX_LOG_GAIN = math.log(5.0)  # the gains stay within 1/5..5 times their prior
 EXPLORE_GOLD = 600.0  # Nullkiller2's score for an exploring step (600 / its explore priority, 1 at best): a sight of new land
 HERO_HIRE_COST = 2500.0  # game_values.HERO_HIRE_COST: a lost hero's replacement
@@ -270,6 +275,7 @@ class CustomFeatures(nn.Module):
 				raise ValueError(f"object {obj} subtype {subtype}: past PRIOR_SUBTYPES ({PRIOR_SUBTYPES})")
 			subtype_score[obj, subtype] = value
 		self.register_buffer("object_score", scores)  # persistent: a checkpoint keeps the priors it was trained from
+		self.prior_shares = os.environ.get("ALPHA_PRIOR_SHARES", "0") == "1"  # (in_shares: a test, off by default)
 		self.register_buffer("subtype_score", subtype_score)
 		self.register_buffer("class_value", priors.class_values())
 		guards = torch.zeros(c.OBJECT_VOCAB + 1, PRIOR_SUBTYPES + 1, 2)  # a creature bank's guards: strength, hit points
@@ -336,6 +342,15 @@ class CustomFeatures(nn.Module):
 	def gain(raw, low=-MAX_LOG_GAIN, high=MAX_LOG_GAIN):
 		"""A multiplicative correction: exp of a log-gain within [low, high], 1 at the start."""
 		return torch.exp(ft.bounded(raw, low, high, 0.0, CORRECTION_STEP))
+
+	def in_shares(self, gold, phi):
+		"""Gold as MOVE's and TRAVEL's logit priors read it (inside value_logit: pickups, fights, danger, the night): as it
+		is, or with prior_shares (ALPHA_PRIOR_SHARES=1, a paired test) as a share of our Φ times PRIOR_SHARE_REF, the
+		squash's scales in shares of our empire (the user, 2026-11-10: "gold is unbound ... why not just the %"): day 1
+		reads as before, later the same gold counts less as the empire grows, on any map. phi: our Φ, broadcastable."""
+		if not self.prior_shares:
+			return gold
+		return gold * (PRIOR_SHARE_REF / phi.clamp(min=1000.0))
 
 	def night_weight(self):
 		"""How far P(lost tonight) x what a lost battle takes counts in MOVE's and TRAVEL's logit priors: the expected loss
@@ -984,15 +999,16 @@ class CustomFeatures(nn.Module):
 		weights = torch.stack([home, defend, ferry])
 		rest = (weights * torch.tanh(pulls * discount.unsqueeze(-1) / ft.PULL_SCALE)).sum(dim=-1)
 		gain = value.unsqueeze(1) * discount
+		phi = f.phi_total[:, None, None]
 		if "travel_stop" not in x:
-			return ft.value_logit(gain) + rest, ft.value_logit(gain) + rest
+			return ft.value_logit(gain) + rest, ft.value_logit(self.in_shares(gain, phi)) + rest
 		stops, known = ft.travel_stops(x)
 		manned = self.town_strength(x, f.town_power, manned=True)
 		here = ft.night_danger(x, f.hero_strength, manned, x["h_pos"][:, :HO].unsqueeze(2))  # [B, HO, 1]
 		tonight = ft.night_danger(x, f.hero_strength, manned, stops)
 		at_stake = f.hero_gold[:, :HO] + f.hero_worth[:, :HO] + (HERO_HIRE_COST - self.hero_base) * self.gain(self.hero_value)
 		night = (here - tonight) * known * (at_stake * self.night_weight()).unsqueeze(-1)
-		return ft.value_logit(gain) + rest, ft.value_logit(gain + night) + rest
+		return ft.value_logit(gain) + rest, ft.value_logit(self.in_shares(gain + night, phi)) + rest
 
 	def travel_pulls(self, x, f, areas):
 		"""Nullkiller2's plans across days in each hero's TRAVEL areas [B, HO, A, 3] (gold): a main hero's pull to the area of
@@ -1294,7 +1310,8 @@ class CustomFeatures(nn.Module):
 		home_weight, defend_weight, ferry_weight, _, _ = self.pull_weights()
 		rest = (torch.stack([home_weight, defend_weight, ferry_weight]) * pulls).sum(dim=-1) - self.safety_weight() * hopeless
 		prior = ft.value_logit(value) + rest  # (the network's input, as before the night term)
-		logits = ft.value_logit(value - danger_value + night_value) + rest  # (the MOVE prior's logits: tile_prior)
+		ours_phi = f.phi_total.index_select(0, decision)[:, None, None]
+		logits = ft.value_logit(self.in_shares(value - danger_value + night_value, ours_phi)) + rest  # (the MOVE prior's logits: tile_prior)
 		# model_v2's MOVE features beside MOVE_FEATURES, relative so they keep their meaning on any map and day (the user,
 		# 2026-11-04): hopeless (above); the object as a share of our Φ (log(1 + 100 x share) / 3: 1% 0.23, 10% 0.8); where
 		# a fight starts, what losing it takes (the army, the hero, its replacement) and what winning it takes (the enemy's
