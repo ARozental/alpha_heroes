@@ -277,6 +277,7 @@ class CustomFeatures(nn.Module):
 		self.register_buffer("object_score", scores)  # persistent: a checkpoint keeps the priors it was trained from
 		self.prior_shares = os.environ.get("ALPHA_PRIOR_SHARES", "0") == "1"  # (in_shares: a test, off by default)
 		self.night_power = float(os.environ.get("ALPHA_NIGHT_POWER", "1"))  # (night_calibrated: a test, 1 the reading as it is)
+		self.town_night = int(os.environ.get("ALPHA_TOWN_NIGHT", "0"))  # (features.town_night in the night term, a test: 0 off, 1 on, 2 with our only town at our Φ)
 		self.register_buffer("subtype_score", subtype_score)
 		self.register_buffer("class_value", priors.class_values())
 		guards = torch.zeros(c.OBJECT_VOCAB + 1, PRIOR_SUBTYPES + 1, 2)  # a creature bank's guards: strength, hit points
@@ -1017,6 +1018,12 @@ class CustomFeatures(nn.Module):
 		tonight = self.night_calibrated(ft.night_danger(x, f.hero_strength, manned, stops))
 		at_stake = f.hero_gold[:, :HO] + f.hero_worth[:, :HO] + (HERO_HIRE_COST - self.hero_base) * self.gain(self.hero_value)
 		night = (here - tonight) * known * (at_stake * self.night_weight()).unsqueeze(-1)
+		if self.town_night:  # (and our towns' night where the walk stops: features.town_night, ALPHA_TOWN_NIGHT=1)
+			b = x["g_day"].shape[0]
+			decision, hero = torch.arange(b, device=stops.device).repeat_interleave(HO), torch.arange(HO, device=stops.device).repeat(b)
+			foes = tuple(t.index_select(0, decision) for t in ft.enemies(x, f.hero_strength))
+			towns = ft.town_night(x, f.hero_strength, manned, f.town_strength, f.town_stakes, decision, hero, foes, stops.reshape(b * HO, -1, 3), f.phi_total if self.town_night == 2 else None).reshape(b, HO, -1)
+			night = night + towns * known * self.night_weight()
 		return ft.value_logit(gain) + rest, ft.value_logit(self.in_shares(gain + night, phi)) + rest
 
 	def travel_pulls(self, x, f, areas):
@@ -1296,13 +1303,18 @@ class CustomFeatures(nn.Module):
 		# its weights were trained on. joint7's heroes killed on the enemy's turn: 2 of 130 in a town; the danger term had
 		# been learned down to 0.37 of its prior, a town as dangerous as open ground, staying in one no shelter
 		own_towns = x["t_present"][:, :TO] & (x["t_owner"][:, :TO] == c.OWNER_SELF)
-		sheltered, open_ = ft.sheltered_danger(x, f.hero_strength, self.town_strength(x, f.town_power, manned=True), decision, torch.remainder(heroes, HO), enemies)  # [K, TO]
+		manned = self.town_strength(x, f.town_power, manned=True)
+		sheltered, open_ = ft.sheltered_danger(x, f.hero_strength, manned, decision, torch.remainder(heroes, HO), enemies)  # [K, TO]
 		in_town = on_tile(x["t_pos"][:, :TO], own_towns) & open_[:, None, None, :]  # [K, W, W, TO] (a town it can be inside: features.shelter_open)
 		night = torch.where(in_town.any(dim=-1), (in_town.float() * sheltered[:, None, None, :]).amax(dim=-1), danger)
 		stands_in = ((x["t_pos"][:, :TO].index_select(0, decision) == stand[:, None, :, 0, 0]).all(dim=-1) & own_towns.index_select(0, decision) & open_).float()  # [K, TO]
 		night_here = torch.where(stands_in.amax(dim=-1) > 0, (stands_in * sheltered).amax(dim=-1), here)
 		night, night_here = self.night_calibrated(night), self.night_calibrated(night_here)
 		night_value = (night_here[:, None, None] - night) * ((ours(f.hero_gold) + hero) * self.night_weight())[:, None, None]
+		if self.town_night:  # (and our towns' night: features.town_night, ALPHA_TOWN_NIGHT=1)
+			ends = torch.stack([tile_x, tile_y, tile_z], dim=-1).reshape(k, -1, 3)
+			towns = ft.town_night(x, f.hero_strength, manned, f.town_strength, f.town_stakes, decision, torch.remainder(heroes, HO), enemies, ends, f.phi_total if self.town_night == 2 else None)
+			night_value = night_value + towns.reshape(k, W, W) * self.night_weight()
 		defend = (on_tile(x["t_pos"][:, :TO], own_towns).float() * f.town_danger.index_select(0, decision)[:, None, None, :]).amax(dim=-1)
 		move_left = pick("w_move_left")
 		left = (move_left.clamp(min=0).float() / ours(x["h_move_max"]).clamp(min=1).float()[:, None, None]).clamp(max=1) * (move_left >= 0)

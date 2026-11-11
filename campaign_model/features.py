@@ -532,6 +532,46 @@ def shelter_open(x, decision, hero):
 	return (garrison == me) | ((garrison < 0) & ((visitor < 0) | (visitor == me)))
 
 
+def town_night(x, hero_strength, manned, unmanned, stakes, decision, hero, foes, pos, last=None):
+	"""What a hero of ours ending its day at pos [K, N, 3] (K: its decision, decision [K], and slot, hero [K]; foes enemies()
+	of the decisions) changes in our towns' expected loss tonight [K, N] (gold; above 0 it lowers it): over our towns,
+	(P(taken) as they stand - P(taken) after) x town_stakes, P the reach of the enemy heroes we see x P(it beats the
+	defence). The defence: the garrison and the fort (manned while a hero is in: unmanned, the town's own strength, else),
+	our other heroes there, and this one where it ends inside (shelter_open: its garrison hero, or the visitor with none)
+	or stays; leaving a town takes it out of its defence. e5's v2830 trace, 2026-11-11: under the hero's night term 11 of
+	21 eliminations were the last town falling with a garrison of 0-200 gold while our main army stood alive a few tiles
+	away, safe where it was: the hero's term prices its own night, not the town's. last [B] or None: the stake of our only
+	town at least this (e5: an emptied last town's buildings are a few thousand while losing it ends the game: our Φ)."""
+	to = c.OWN_TOWNS
+	strength = hero_strength.index_select(0, decision)
+	visiting, garrisoned = x["t_visiting"][:, :to].index_select(0, decision), x["t_garrison_hero"][:, :to].index_select(0, decision)
+	me = hero[:, None]
+
+	def other(index):  # [K, TO]: another hero of ours there, very low if none
+		found = torch.gather(strength, 1, index.clamp(min=0))
+		return torch.where((index >= 0) & (index != me), found, torch.full_like(found, -30.0))
+
+	others = log_add(other(visiting), other(garrisoned))
+	other_in = ((visiting >= 0) & (visiting != me)) | ((garrisoned >= 0) & (garrisoned != me))
+	m, u = manned[:, :to].index_select(0, decision), unmanned[:, :to].index_select(0, decision)
+	without = log_add(torch.where(other_in, m, u), others)
+	with_me = log_add(log_add(m, others), strength.gather(1, me))
+	tpos = x["t_pos"][:, :to].index_select(0, decision)
+	near, theirs = reach(foes, tpos[..., 0], tpos[..., 1], tpos[..., 2])  # [K, TO, E]
+	taken = lambda defence: (near * torch.sigmoid(2 * (theirs - defence.unsqueeze(-1)))).amax(dim=-1)  # noqa: E731
+	p_with, p_without = taken(with_me), taken(without)
+	inside = (visiting == me) | (garrisoned == me)
+	p_now = torch.where(inside, p_with, p_without)
+	after = (pos.unsqueeze(2) == tpos.unsqueeze(1)).all(dim=-1) & shelter_open(x, decision, hero).unsqueeze(1)  # [K, N, TO]
+	p_after = torch.where(after, p_with.unsqueeze(1), p_without.unsqueeze(1))
+	own = own_towns(x)
+	stake = stakes[:, :to]
+	if last is not None:
+		stake = torch.where(own & (own.sum(dim=1, keepdim=True) == 1), torch.maximum(stake, last[:, None]), stake)
+	stake = (stake * own).index_select(0, decision)
+	return ((p_now.unsqueeze(1) - p_after) * stake.unsqueeze(1)).sum(dim=-1)
+
+
 def night_danger(x, hero_strength, manned, pos):
 	"""P(a hero of ours is lost tonight) [B, HO, N] if its day ends at pos [B, HO, N, 3] (x, y, level): the enemy heroes
 	we see, each one's reach there x P(it beats the hero), at the most (MOVE's danger); in a town of ours an enemy must
