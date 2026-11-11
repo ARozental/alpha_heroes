@@ -341,10 +341,11 @@ class CustomFeatures(nn.Module):
 		"""How far P(lost tonight) x what a lost battle takes counts in MOVE's and TRAVEL's logit priors: the expected loss
 		in gold, as a pickup's gain counts. Not learned (night_gain does not require a gradient; it stays among the
 		corrections for the checkpoints' and the optimizer's names): from its deploy (2026-11-10) it fell every update,
-		the teacher's cross-entropy pushing it 13 times as hard as the policy's credit (push_night_gain_*). Nullkiller2's
-		choice is evidence of its own follow-through, not of our expected loss tonight (GATHER's pattern), and with the
-		teacher's push cut Adam would carry the policy's small one of a steady sign at about the same rate. What it prices
-		is corrected by measuring P (the reading's calibration against kills), not by a free scalar."""
+		driven by the teacher's cross-entropy alone (push_night_gain_*, 23 updates: the teacher's -0.0054 +- 0.0008,
+		below 0 in 21; the policy's credit +0.00002 +- 0.00022, no sign). Reward says nothing about this scalar at this
+		horizon and Nullkiller2's choice is evidence of its own follow-through, not of our expected loss tonight (GATHER's
+		pattern): learnable, it is noise plus a wrong push. What it prices is corrected by measuring P (the reading's
+		calibration against kills), not by a free scalar."""
 		return self.gain(self.night_gain)
 
 	def explore_gold(self):
