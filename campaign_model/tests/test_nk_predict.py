@@ -155,6 +155,8 @@ def test_weight_0_computes_nothing_and_on_it_moves_the_head_alone():
 def test_the_auc():
 	assert N.auc(torch.tensor([0.1, 0.4, 0.35, 0.8], dtype=torch.float64), torch.tensor([0.0, 0.0, 1.0, 1.0])) == pytest.approx(0.75)
 	assert np.isnan(N.auc(torch.tensor([0.1, 0.2], dtype=torch.float64), torch.tensor([1.0, 1.0])))
+	assert N.auc(torch.zeros(7, dtype=torch.float64), torch.tensor([0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0])) == pytest.approx(0.5)  # (ties: the head's start)
+	assert N.auc(torch.tensor([0.0, 1.0, 1.0, 2.0], dtype=torch.float64), torch.tensor([0.0, 1.0, 0.0, 1.0])) == pytest.approx(0.875)
 
 
 def test_the_learner_logs_its_fit(tmp_path, capsys):

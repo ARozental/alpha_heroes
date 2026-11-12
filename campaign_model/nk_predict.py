@@ -154,15 +154,18 @@ def loss(pred, target):
 
 
 def auc(scores, labels):
-	"""The area under the ROC curve of scores [N] for binary labels [N] (Mann-Whitney's, ties averaged); nan with one class."""
-	positives = labels.sum()
-	negatives = labels.numel() - positives
+	"""The area under the ROC curve of scores [N] for binary labels [N] (Mann-Whitney's, tied scores at their mean rank:
+	all scores equal read 1/2); nan with one class."""
+	import numpy as np
+
+	scores, labels = scores.detach().double().cpu().numpy(), labels.detach().cpu().numpy() > 0
+	positives = int(labels.sum())
+	negatives = labels.size - positives
 	if positives == 0 or negatives == 0:
 		return float("nan")
-	order = scores.argsort()
-	ranks = torch.empty_like(scores, dtype=torch.float64)
-	ranks[order] = torch.arange(1, scores.numel() + 1, dtype=torch.float64, device=scores.device)
-	return float((ranks[labels > 0].sum() - positives * (positives + 1) / 2) / (positives * negatives))
+	values, inverse, counts = np.unique(scores, return_inverse=True, return_counts=True)
+	mean_rank = np.cumsum(counts) - (counts - 1) / 2.0  # (each distinct value's mean rank, 1-based)
+	return float((mean_rank[inverse][labels].sum() - positives * (positives + 1) / 2) / (positives * negatives))
 
 
 def readings(pred, target):
