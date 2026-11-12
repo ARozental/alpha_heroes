@@ -212,6 +212,16 @@ class AlphaMapAI : public CAdventureAI
 	// offered again until something changes (dropFutile), else the same no-op could be chosen MAX_DECISIONS_PER_DAY
 	// times. A targeted spell's tile counts: one Dimension Door that failed blocks that tile, not the spell
 	std::set<std::tuple<int, int, int>> futile;
+	// alpha_heroes patch (bundle 60, the loop guard; e5: an ARTIFACT pair alternated 106 times in a game): ALPHA_MAP_LOOP_GUARD,
+	// 1 unless set. The day's states (stateFingerprint) after each of our actions; an action that brings one back is
+	// dropped like a futile one for the rest of the day (loopsToday: futile is cleared by any change, so a cycle of two
+	// changing actions went on); counted in the summary's "loops_cut"
+	bool loopGuard = true;
+	std::set<std::vector<int64_t>> seenToday;
+	std::set<std::tuple<int, int, int>> loopsToday;
+	int loopsCut = 0;
+	std::map<int, int> loopsCutTypes; // (by action type: the summary's "loops_cut_types")
+	std::vector<int64_t> stateFingerprint() const;
 
 	// What a hero is doing, for the questions it raises
 	ObjectInstanceID activeHero;
@@ -298,6 +308,11 @@ class AlphaMapAI : public CAdventureAI
 	// boat can be built now (its question again: 9 of its BuildBoat requests in those games). Carried out as the
 	// re-visit itself (Actions.cpp moveHero); Nullkiller2's own-tile request there is matched to it (Match.cpp)
 	bool revisitEntry = true;
+	// (the centre cell carried out: on a map shipyard the purchase itself, cb->buildBoat with no question, so it cannot
+	// come to nothing; on an entrance the re-visit, a probe: one that finds no way is counted apart from failed actions,
+	// the summary's "probes_no_way")
+	bool probing = false;
+	int probesNoWay = 0;
 	bool revisitUseful(const CGHeroInstance * hero) const;
 	mutable std::set<ObjectInstanceID> boatAdvised; // (matchRequest's, a const reading of the request: mutable)
 	mutable int boatsMatched = 0;

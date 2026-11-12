@@ -8,6 +8,7 @@
 #include "lib/entities/faction/CTown.h"
 #include "lib/mapObjects/CGHeroInstance.h"
 #include "lib/mapObjects/CGTownInstance.h"
+#include "lib/mapObjects/MiscObjects.h"
 #include "lib/networkPacks/ArtifactLocation.h"
 #include "lib/networkPacks/TradeItem.h"
 #include "lib/pathfinder/CGPathNode.h"
@@ -38,11 +39,12 @@ std::vector<int64_t> fingerprint(const CCallback & cb)
 		army(h);
 		// Its artifacts, which and where (their count alone: an EQUIP replacing the worn one, a GIVE from backpack to
 		// backpack read as no effect, then futile, 2026-11-05)
+		// (each artifact by its instance: two spell scrolls are one type and other spells, bundle 60's loop)
 		for(const auto & [position, slot] : h->artifactsWorn)
-			values.insert(values.end(), {position.num, slot.getArt() ? slot.getArt()->getTypeId().getNum() : -1});
+			values.insert(values.end(), {position.num, slot.getArt() ? slot.getArt()->getId().getNum() : -1});
 		values.push_back(static_cast<int64_t>(h->artifactsInBackpack.size()));
 		for(const auto & slot : h->artifactsInBackpack)
-			values.push_back(slot.getArt() ? slot.getArt()->getTypeId().getNum() : -1);
+			values.push_back(slot.getArt() ? slot.getArt()->getId().getNum() : -1);
 	}
 	for(const auto * t : cb.getTownsInfo(true))
 	{
@@ -68,6 +70,11 @@ ObjectInstanceID topVisitable(const CCallback & cb, const int3 & pos)
 	const auto objects = cb.getVisitableObjs(pos, false);
 	return objects.empty() ? ObjectInstanceID() : objects.back()->id;
 }
+}
+
+std::vector<int64_t> AlphaMapAI::stateFingerprint() const
+{
+	return fingerprint(*cb);
 }
 
 bool AlphaMapAI::execute(const Decision & decision, const Choice & choice)
@@ -506,6 +513,15 @@ bool AlphaMapAI::moveHero(ObjectInstanceID heroID, int3 destination)
 	activeTarget = destination;
 	if(const auto * h = cb->getHero(heroID); h && h->visitablePos() == destination) // (bundle 60: a re-visit, AlphaMapAI.h revisitEntry)
 	{
+		for(const auto * obj : cb->getVisitableObjs(destination, false)) // (a map shipyard: the boat bought, no question asked)
+			if(const auto * yard = dynamic_cast<const IShipyard *>(obj); yard && obj != h && !dynamic_cast<const CGTownInstance *>(obj))
+			{
+				cb->buildBoat(yard);
+				++boatsBuilt;
+				waitTillFree();
+				return true;
+			}
+		probing = true; // (an entrance: going through, or finding it leads nowhere)
 		cb->moveHero(h, h->pos, false);
 		waitTillFree();
 		return true;

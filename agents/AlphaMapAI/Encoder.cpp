@@ -420,7 +420,9 @@ Decision AlphaMapAI::encode(DecisionKind kind, ObjectInstanceID exchangeFirst, O
 
 void AlphaMapAI::dropFutile(Decision & decision)
 {
-	for(const auto & [type, index, cell] : futile)
+	std::set<std::tuple<int, int, int>> dropped = futile;
+	dropped.insert(loopsToday.begin(), loopsToday.end()); // (bundle 60's loop guard: AlphaMapAI.h)
+	for(const auto & [type, index, cell] : dropped)
 	{
 		const auto mask = head(static_cast<ActionType>(type)).second;
 		if(mask == In::COUNT)
@@ -1185,15 +1187,33 @@ void AlphaMapAI::encodeArtifacts(Decision & decision, int first, int second)
 			}
 			else if(ArtifactUtils::isSlotBackpack(position))
 			{
+				// Where it is worn (bundle 60, the ARTIFACT loop): a free slot it fits first, else the first it fits (the one
+				// there into the backpack), as the prior reads it (model.artifact_prior). Before, the first it fits whatever
+				// was there: a spell scroll swapped with the scroll worn there, a free misc slot beside it, 53 times in a game.
+				// None that swaps it with its like (the same artifact, a scroll of the same spell): that changes nothing
 				const auto & slots = art->getType()->getPossibleSlots();
 				const auto found = slots.find(ArtBearer::HERO);
+				std::optional<ArtifactPosition> chosen;
 				if(found != slots.end())
+				{
 					for(const auto & wear : found->second)
-						if(ArtifactUtils::isSlotEquipment(wear) && art->canBePutAt(hero, wear, true))
+						if(ArtifactUtils::isSlotEquipment(wear) && !hero->getArt(wear) && art->canBePutAt(hero, wear, true))
 						{
-							add(h, p, ArtifactTarget::EQUIP, Entry{hero->id, {}, p, id.getNum(), wear.num});
+							chosen = wear;
 							break;
 						}
+					if(!chosen)
+						for(const auto & wear : found->second)
+							if(ArtifactUtils::isSlotEquipment(wear) && art->canBePutAt(hero, wear, true))
+							{
+								chosen = wear;
+								break;
+							}
+				}
+				const auto * there = chosen ? hero->getArt(*chosen) : nullptr;
+				const bool alike = there && there->getTypeId() == id && (id != ArtifactID::SPELL_SCROLL || there->getScrollSpellID() == art->getScrollSpellID());
+				if(chosen && !alike)
+					add(h, p, ArtifactTarget::EQUIP, Entry{hero->id, {}, p, id.getNum(), chosen->num});
 			}
 			else if(const auto combinations = ArtifactUtils::assemblyPossibilities(hero, id, true); !combinations.empty())
 				add(h, p, ArtifactTarget::ASSEMBLE, Entry{hero->id, {}, p, id.getNum(), combinations.front()->getId().getNum()});

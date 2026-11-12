@@ -242,6 +242,8 @@ void AlphaMapAI::makeTurn()
 			day = today;
 			decisionsToday = 0;
 			heldToday.clear(); // (bundle 60's re-visit skip: a new day's holds)
+			seenToday.clear(); // (bundle 60's loop guard: a new day's states)
+			loopsToday.clear();
 			futile.clear();
 		}
 		activeHero = ObjectInstanceID(); // the dialogs' context: no hero yet this turn (a question before our first
@@ -274,14 +276,31 @@ void AlphaMapAI::makeTurn()
 			if(choice.type <= static_cast<int>(ActionType::END))
 				break;
 			meetingAdvised = advice && choice.type == advice->type && choice.index == advice->index; // (adviseExchange)
+			if(loopGuard)
+				seenToday.insert(stateFingerprint());
+			probing = false;
 			const bool changed = execute(decision, choice);
-			if(!changed)
+			if(!changed && probing) // (a probe of an unknown entrance that found no way: not a failed action, futile all the same)
+			{
+				++probesNoWay;
+				futile.insert({choice.type, choice.index, choice.cell});
+			}
+			else if(!changed)
 			{
 				noEffect(choice);
 				futile.insert({choice.type, choice.index, choice.cell});
 			}
 			else
+			{
 				futile.clear(); // the state changed: what failed before may work now
+				if(loopGuard && seenToday.count(stateFingerprint())) // (back to a state of today's: a cycle, bundle 60's loop guard)
+				{
+					loopsToday.insert({choice.type, choice.index, choice.cell});
+					++loopsCut;
+				++loopsCutTypes[choice.type];
+				logAi->info("AlphaMapAI %s: action %d entry %d brought back a state of today's: dropped for the day", playerID.toString(), choice.type, choice.index);
+				}
+			}
 			lastChoice = choice;
 			lastChoice.index = decision.echoIndex(choice.type, choice.index);
 			lastChanged = changed ? 1 : 0;
@@ -911,7 +930,7 @@ void AlphaMapAI::sendRecords(bool final)
 			sendToRecordServer(recordSocket, gameKey + ":" + color + ":battle#" + std::to_string(battlesSent++), battleJson);
 		if(final)
 		{
-			const auto done = ", \"traded_purchases\": " + std::to_string(tradedPurchases) + ", \"boats\": " + std::to_string(boatsBuilt) + ", \"skills_bought\": " + std::to_string(skillsBought) + ", \"stacks_merged\": " + std::to_string(stacksMerged) + ", \"multi_actions\": " + std::to_string(multiActions) + ", \"take_mismatches\": " + std::to_string(takeMismatches);
+			const auto done = ", \"traded_purchases\": " + std::to_string(tradedPurchases) + ", \"boats\": " + std::to_string(boatsBuilt) + ", \"loops_cut\": " + std::to_string(loopsCut) + ", \"probes_no_way\": " + std::to_string(probesNoWay) + ", \"loops_cut_types\": {" + [this] { std::string out; for(const auto & [type, n] : loopsCutTypes) out += (out.empty() ? "\"" : ", \"") + std::to_string(type) + "\": " + std::to_string(n); return out; }() + "}" + ", \"skills_bought\": " + std::to_string(skillsBought) + ", \"stacks_merged\": " + std::to_string(stacksMerged) + ", \"multi_actions\": " + std::to_string(multiActions) + ", \"take_mismatches\": " + std::to_string(takeMismatches);
 			const auto summary = "{\"errors\": " + std::to_string(errors) + ", \"failed_actions\": " + std::to_string(failedActions) + done + teacherJson() + adviceJson() + "}";
 			sendToRecordServer(recordSocket, gameKey + ":" + color + ":done", summary);
 		}
@@ -1158,13 +1177,24 @@ void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, Query
 		const auto choice = decide(decision, advice, std::nullopt, accept);
 		if(choice.type != static_cast<int>(ActionType::ARMY) && choice.type != static_cast<int>(ActionType::ARTIFACT) && choice.type != static_cast<int>(ActionType::MULTI))
 			break;
+		if(loopGuard)
+			seenToday.insert(stateFingerprint());
 		if(!execute(decision, choice))
 		{
 			noEffect(choice);
 			futile.insert({choice.type, choice.index, choice.cell});
 		}
 		else
+		{
 			futile.clear();
+			if(loopGuard && seenToday.count(stateFingerprint())) // (bundle 60's loop guard)
+			{
+				loopsToday.insert({choice.type, choice.index, choice.cell});
+				++loopsCut;
+				++loopsCutTypes[choice.type];
+				logAi->info("AlphaMapAI %s: action %d entry %d brought back a state of today's: dropped for the day", playerID.toString(), choice.type, choice.index);
+			}
+		}
 		if(choice.type == static_cast<int>(ActionType::MULTI)) // (GIVE_ALL is the whole exchange: the troop moves after it sent
 			break;                                                  // its troops back, 567 of 870, 2026-11-05)
 	}

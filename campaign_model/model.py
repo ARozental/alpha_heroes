@@ -112,6 +112,7 @@ def game_tables():
 		"creature_faction": torch.full((c.CREATURE_VOCAB + 1,), -1, dtype=torch.long),  # (its faction's id; neutral's its own)
 		"artifact_primary": torch.zeros(c.ARTIFACT_VOCAB + 1, c.N_PRIMARY),  # (what it adds to its hero's primary skills)
 		"artifact_slot": torch.full((c.ARTIFACT_VOCAB + 1,), -1, dtype=torch.long),  # (the first worn slot it fits)
+		"artifact_slots": torch.zeros((c.ARTIFACT_VOCAB + 1, c.N_WORN_SLOTS), dtype=torch.bool),  # (every worn slot it fits: bundle 60)
 		"artifact_combination": torch.full((c.ARTIFACT_VOCAB + 1,), -1, dtype=torch.long),  # (the combination it is a part of)
 		"creature_undead": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_speed": torch.zeros(c.CREATURE_VOCAB + 1),  # (its speed: the army's slowest sets its hero's movement)
@@ -176,6 +177,7 @@ def game_tables():
 				slots = [s for s in row.get("slots", []) if 0 <= s < c.N_WORN_SLOTS]
 				if slots:
 					tables["artifact_slot"][artifact] = slots[0]
+					tables["artifact_slots"][artifact, slots] = True
 				for part in row.get("parts", []):
 					if 0 <= part < c.ARTIFACT_VOCAB:
 						tables["artifact_combination"][part] = artifact
@@ -979,11 +981,16 @@ class CustomFeatures(nn.Module):
 		heroes = torch.arange(HO, device=ids.device).unsqueeze(0)
 		partner = torch.where(heroes == first, second, torch.where(heroes == second, first, torch.full_like(heroes.expand_as(first.expand(-1, HO)), -1)))
 		other = partner.clamp(min=0)
-		slot = self.artifact_slot[index]  # (where it is worn)
-		# (the other wears it only if its slot there is free, else it lands in that hero's backpack, adding nothing: a
+		# Where it is worn (bundle 60, AlphaMapAI's EQUIP and GIVE): a free slot it fits first, else the first it fits. Before,
+		# its first slot whatever was there: a spell scroll swapped with the scroll worn there, a free misc slot beside it
+		fits = self.artifact_slots[index]  # [B, HO, P, N_WORN]
+		empty = (x["h_artifacts"][:, :HO] < 0).unsqueeze(2)  # [B, HO, 1, N_WORN]
+		open_slot = fits & empty
+		slot = torch.where(open_slot.any(dim=-1), open_slot.float().argmax(dim=-1), self.artifact_slot[index])  # [B, HO, P]
+		# (the other wears it only if a slot of its there is free, else it lands in that hero's backpack, adding nothing: a
 		# backpack sword counted as worn either way made giving it back a gain too, 1,049 moves in a game)
-		free = x["h_artifacts"][:, :HO].gather(1, other.unsqueeze(-1).expand(-1, -1, c.N_WORN_SLOTS)).gather(2, slot.clamp(min=0)) < 0
-		wears = (free & (slot >= 0)).float()
+		other_empty = (x["h_artifacts"][:, :HO].gather(1, other.unsqueeze(-1).expand(-1, -1, c.N_WORN_SLOTS)) < 0).unsqueeze(2)
+		wears = (fits & other_empty).any(dim=-1).float()
 		their_skills = primary.gather(1, other.unsqueeze(-1).expand(-1, -1, primary.shape[-1]))  # [B, HO, N_PRIMARY]: the other hero's
 		gained = army.gather(1, other).unsqueeze(-1) * (
 			lead_of(their_skills.unsqueeze(2) + bonus * wears.unsqueeze(-1), spellbook.gather(1, other).unsqueeze(-1)) - lead.gather(1, other).unsqueeze(-1)
