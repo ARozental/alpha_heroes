@@ -307,6 +307,12 @@ class CampaignConfig:
 	# on 192 recorded games a day's share of followed choices predicted the 7-day share change (slope +0.0124 +- 0.0023).
 	# 0: off, nothing computed (the update as before, bit for bit)
 	adv_weight: float = 0.0
+	# Predicting Nullkiller2's planner (nk_predict.py, model_v2.NkPredictHead; stage 1, 2026-11-11, the user: "this is an
+	# auxiliary loss, we can have it if it helps"; the planner to leave serving later): the head's loss at this weight, from
+	# a blind pass of the trunk (the planner's fields absent, the memory at its start) on 1 / NKP_ROWS of each forward's
+	# rows, its own weights alone (value group); its fit on the prepass's rows each update (nkp_*). Nothing reads the head.
+	# 0: no blind pass, nothing computed: the update as before, bit for bit
+	nk_predict_weight: float = 0.0
 	# Our own policy reads the advantage head (stage 2a; model_v2's decide): this many logits a unit of its prediction
 	# (the update's advantage in sd units: soft policy iteration's 1 / beta), its table terms clipped to +-3 and centered
 	# on their mean under our own policy, its type term clipped to +-3, all before the follow mixture; x a learned gain

@@ -291,6 +291,34 @@ class AdvantageHead(nn.Module):
 		}
 
 
+NKP_HIDDEN = 32  # nk_predict's head: its own hidden layer an entry and a hero (the trunk was never shaped for its targets)
+NKP_ROWS = 8  # nk_predict's blind pass: the first 1 / NKP_ROWS of a forward's rows (at least one)
+
+
+class NkPredictHead(nn.Module):
+	"""Nullkiller2's planner predicted from a pass of the trunk that never saw it (nk_predict.py; stage 1, 2026-11-11: it
+	only learns, nothing reads it): each MOVE window cell's and TRAVEL area's outputs (nk_predict.OUT: P(a task through
+	it) as a logit, the task's forms as logits, its plan logit) from the entry's pair vector, and each hero's "no task"
+	plan logit from its token, every input detached, through a small hidden layer of its own."""
+
+	def __init__(self, dim, pair_dim):
+		super().__init__()
+		from .nk_predict import OUT
+
+		self.move, self.travel, self.none = SwiGLU(pair_dim, NKP_HIDDEN, OUT), SwiGLU(pair_dim, NKP_HIDDEN, OUT), SwiGLU(dim, NKP_HIDDEN, 1)
+
+	def forward(self, state, known):
+		"""{nkp_move [B, HO, W, W, OUT], nkp_travel [B, HO, AREAS, OUT], nkp_none [B, HO]}."""
+		from .nk_predict import OUT
+
+		heroes = state.heroes[:, :HO].detach()
+		b = heroes.shape[0]
+		move = heroes.new_zeros(b, HO, W, W, OUT)
+		if known.n > 0:
+			move = dense(real_only(self.move(state.move_pairs.detach()), known), known.windows, known.n, b)
+		return {"nkp_move": move, "nkp_travel": self.travel(state.travel_pairs.detach()), "nkp_none": self.none(heroes).squeeze(-1)}
+
+
 class Memory(nn.Module):
 	"""The model's memory (constants.MEMORY_SLOTS slots of MEMORY_WIDTH, -1..1): what one player's decisions carry
 	forward, the model's own output passed back by AlphaMapAI (x["mem"]; x["mem_float"] when a trainer unrolls it).
@@ -376,6 +404,7 @@ class CampaignModelV2(nn.Module):
 	ARCHITECTURE = "v2"
 	plan_outputs = False  # fs_plan too (plan_of): the trainer's model sets it (train.ppo_update); a server's does not
 	adv_outputs = False  # the advantage head's too (AdvantageHead): the trainer's model sets it with config.adv_weight (train.ppo_update); a server's does not
+	nkp_outputs = False  # nk_predict's blind pass, head and targets too (nk_blind): the trainer's model with config.nk_predict_weight; a server's never
 
 	def load_state_dict(self, state_dict, strict=True, assign=False):
 		"""A checkpoint from before a parameter was added (model.ADDED) loads with it at 0: the model as it was; one from
@@ -562,6 +591,9 @@ class CampaignModelV2(nn.Module):
 		# army's log ratio onto its token (fore_hero, as plan_in feeds the plan's); the turn's forecast not read
 		self.fore_fight, self.fore_move, self.fore_answer = FastLinear(FORE_FIGHT), FastLinear(FORE_MOVE), FastLinear(FORE_MOVE)
 		self.fore_hero = zero_weight(HERO_TARGETS, d)
+		# nk_predict's head (2026-11-11, stage 1: it only learns, config.nk_predict_weight), made last: the other
+		# parameters' initialisation as before
+		self.nkp = NkPredictHead(d, dp)
 
 	def prior_corrections(self):
 		"""The parameters that correct a fixed prior (model.CustomFeatures): weight decay pulls them back to it."""
@@ -584,6 +616,36 @@ class CampaignModelV2(nn.Module):
 			out["fs_plan"] = state.plan
 		if self.adv_outputs:  # (decide's: the trainer's model only, never the contract's)
 			out.update(state.adv)
+		if self.nkp_outputs:  # (the trainer's model only: the blind pass, the head and its targets)
+			out.update(self.nk_blind(x))
+		return out
+
+	def nk_blind(self, x):
+		"""nk_predict's stage 1 on the first 1 / NKP_ROWS of x's rows: the trunk run again on them blind (nk_predict.
+		blind_inputs: the planner's fields absent, the memory at its start; every window slot computed: one shape), with
+		no gradient, then the head (its own weights learn) and the targets from the live rows: {nkp_*, "nkt:<name>"}."""
+		from . import nk_predict
+
+		rows = max(1, x["g_day"].shape[0] // NKP_ROWS)
+		live = {name: value[:rows] for name, value in x.items()}
+		blind = nk_predict.blind_inputs(live)
+		budget = self.window_budget
+		try:
+			self.window_budget = None
+			with torch.no_grad():
+				known = self.domain_knowledge(blind)
+				state = self.encode(blind)
+				state = self.take_sides(state)
+				state = self.join(state, known)
+				state = self.see(state, known)
+				state = self.advise(state, known)
+				state = self.think(state)
+				foresight = self.foresee(state, known)
+				state = self.think_again(state, foresight, known)
+		finally:
+			self.window_budget = budget
+		out = self.nkp(state, known)
+		out.update({f"nkt:{name}": value for name, value in nk_predict.targets(live).items()})
 		return out
 
 	def forward_steps(self, x, steps):

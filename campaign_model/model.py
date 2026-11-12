@@ -1651,6 +1651,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global",
 	"advantage.",  # (2026-11-11: the advantage head, model_v2.AdvantageHead, its weights 0 at the start)
 	"fore_fight", "fore_move", "fore_answer", "fore_hero",  # (bundle 60: forecast-out, each forecast onto its own option's logit, 0 at the start)
+	"nkp.",  # (2026-11-11: nk_predict's head, model_v2.NkPredictHead: a new model's weights, nothing reads it)
 )
 # Training-only parts rebuilt since, by prefix: a checkpoint's weights for them that the loading model lacks, or of
 # another shape, are dropped, the part starting again as a new model has it (2026-11-07: the privileged critic's first

@@ -311,7 +311,7 @@ def candidate_tables(x, dest=True):
 		],
 		dim=-1,
 	) * scored.unsqueeze(-1)
-	out = {"channels": channels}
+	out = {"channels": channels, "key": key, "hero_index": hero_index}  # (key, hero_index: nk_predict's targets)
 	# (a hero the winning tier scored: its plan is that tier's, its other gather-tier candidates at e^-4; a fallback hero: the gather tier's)
 	weight = torch.exp(PLAN_SHARPNESS * torch.where(fallback, g_hero, p_hero)) * scored
 	total = torch.zeros(b, ho + 1, device=hero.device).scatter_add(1, hero_index, weight)
@@ -326,6 +326,7 @@ def candidate_tables(x, dest=True):
 		beaten = same & ((key.unsqueeze(1) > key.unsqueeze(2)) | ((key.unsqueeze(1) == key.unsqueeze(2)) & earlier.unsqueeze(0)))
 		best = through & ~beaten.any(dim=2)
 		index = torch.where(best, column, torch.full_like(column, size))
+		out[f"{name}_index"] = index  # [B, NK]: the entry each row is the best candidate of, size where none (nk_predict)
 		table = _scatter(index, channels * best.unsqueeze(-1), size)
 		mass = _scatter(torch.where(through, column, torch.full_like(column, size)), live * through, size)
 		table = torch.cat([table[..., :-1], (mass / (mass + 1.0)).unsqueeze(-1) * table[..., :1]], dim=-1)

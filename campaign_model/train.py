@@ -371,7 +371,7 @@ def windows_for(rows, heroes, config):
 # (config.value_lr_factor), the trunk's, the embeddings' and the action types' bias at the trunk's momentum
 # (config.trunk_beta1)
 # (the advantage head, model_v2.AdvantageHead: a critic of the actions, at the critic's rate)
-VALUE_MODULES = ("value_hidden", "value_heads", "growth_heads", "end_head", "advantage")
+VALUE_MODULES = ("value_hidden", "value_heads", "growth_heads", "end_head", "advantage", "nkp")
 # (the privileged critic its own group, last: the clips calibrated before it hold no clip for it, and its gradient
 # never moves another group's clip; at the value heads' rate)
 GRAD_GROUPS = ("trunk", "embeddings", "type", "value", "corrections", "privileged")
@@ -643,7 +643,7 @@ def excess_loss(logits, targets):
 
 # A step's metrics, in ppo_update's order: value the heads' loss at their own weights (comparable whatever head_scale
 # does), value_weighted at head_scale's (what the update takes)
-STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl", "teacher_kl", "teacher_ce", "value_weighted", "teacher_outside", "value_privileged", "adv_loss")
+STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl", "teacher_kl", "teacher_ce", "value_weighted", "teacher_outside", "value_privileged", "adv_loss", "nkp_loss")
 # The teacher's outputs its KL reads (teacher_kl), put in each micro-batch as "t:<name>"
 TEACHER_OUTPUTS = ("type_logp", "option_logp") + tuple(output for output, _ in HEADS.values())
 
@@ -849,6 +849,15 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 		answered = credit * (batch["action"] >= 0).float()
 		adv_part = (((predicted.float() - a) ** 2) * answered).sum() / batch["count_credit"]
 		loss = loss + config.adv_weight * adv_part
+	# nk_predict's head (config.nk_predict_weight; stage 1: nothing reads it): its loss on the blind pass's rows (model_v2.
+	# nk_blind: the targets came out with the predictions), a mean there, at the micro-batch's share of the minibatch as
+	# the foresight's; it reaches the head's own weights alone. 0: nothing computed
+	nkp_part = torch.zeros((), device=keep.device)
+	if config.nk_predict_weight > 0 and "nkp_move" in out:
+		from .nk_predict import loss as nk_loss
+
+		nkp_part, _ = nk_loss({k: v for k, v in out.items() if k.startswith("nkp_")}, {k[4:]: v for k, v in out.items() if k.startswith("nkt:")})
+		loss = loss + config.nk_predict_weight * batch["share"] * nkp_part
 	fs_parts = fs_share = None
 	labels = {name[3:]: value for name, value in batch.items() if name.startswith("fs:")}
 	if labels and "fs_turn" in out:
@@ -871,6 +880,7 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 		outside_part,  # teacher_outside: our probability outside what the teacher's label is weighed against
 		privileged_part.detach(),  # value_privileged: the privileged critic's loss, its heads' mean at their own weights
 		adv_part.detach(),  # adv_loss: the advantage head's squared error (0 with config.adv_weight 0)
+		nkp_part.detach(),  # nkp_loss: nk_predict's head's loss on its blind rows (0 with config.nk_predict_weight 0)
 	]).float()
 	if split:  # (each term at weight 1 against the learner's loss shares, the loss_weights it sets: the plan's apart too;
 		# the privileged critic's not among them: it reaches its own weights only)
@@ -882,6 +892,8 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 			terms["foresight"], terms["plan"] = batch["share"] * fs_loss, batch["share"] * fs_config.weight * parts["plan"]
 		if config.adv_weight > 0 and "adv_type" in out:
 			terms["advantage"] = config.adv_weight * adv_part
+		if config.nk_predict_weight > 0 and "nkp_move" in out:
+			terms["nk_predict"] = config.nk_predict_weight * batch["share"] * nkp_part
 		return loss, metrics, fs_parts, fs_share, terms
 	return loss, metrics, fs_parts, fs_share
 
@@ -1193,6 +1205,8 @@ def ppo_update(
 		model.plan_outputs = True
 	if hasattr(model, "adv_outputs"):  # (v2: the advantage head's outputs while it learns, config.adv_weight, in every graph recorded below)
 		model.adv_outputs = config.adv_weight > 0
+	if hasattr(model, "nkp_outputs"):  # (v2: nk_predict's blind pass, head and targets, config.nk_predict_weight, in every graph recorded below; off again at the end)
+		model.nkp_outputs = getattr(config, "nk_predict_weight", 0.0) > 0
 	foresight_config = ForesightConfig(weight=getattr(config, "foresight_weight", ForesightConfig.weight))
 	foresight_sums, foresight_sum, checked = Counter(), None, {}  # (foresight_sum: its parts, PART_NAMES' order, on the device)
 	# On CUDA the bytes as sent go to the device and are cut and converted there (half the copy, none of the CPU's dtype copies)
@@ -1306,6 +1320,7 @@ def ppo_update(
 	# The advantage head's prediction for each choice before this update's steps (config.adv_weight): its explained
 	# variance of the update's advantage is a held-out reading (adv_ev), on the choices that were Nullkiller2's own and
 	# on those that left one it had (adv_ev_followed, adv_ev_deviating)
+	nkp_chunks = [] if getattr(config, "nk_predict_weight", 0.0) > 0 and getattr(model, "nkp_outputs", False) else None  # (nk_predict's fit before the steps)
 	adv_before = adv_followed = adv_labelled = None
 	if config.adv_weight > 0 and getattr(model, "adv_outputs", False):
 		adv_before, adv_followed, adv_labelled = torch.zeros(n, device=device), torch.zeros(n, dtype=torch.bool, device=device), torch.zeros(n, dtype=torch.bool, device=device)
@@ -1327,6 +1342,10 @@ def ppo_update(
 				adv_before[index], adv_followed[index], adv_labelled[index] = predicted.float(), named, out["adv_label"][:, 0] >= 0
 				if "adv_kl" in out:
 					adv_kl_all[index], adv_read_all[index] = out["adv_kl"].float(), out["adv_read"].float()
+			if nkp_chunks is not None and "nkp_move" in out:
+				from .nk_predict import readings as nk_readings
+
+				nkp_chunks.append(nk_readings({k: v for k, v in out.items() if k.startswith("nkp_")}, {k[4:]: v for k, v in out.items() if k.startswith("nkt:")}))
 			end_now[index] = torch.sigmoid(out["end_logit"].float())
 			if "growth_logit" in out:
 				growth_now[index] = out["growth_logit"][:, -1].float()
@@ -1750,6 +1769,12 @@ def ppo_update(
 		head_var_slow=head_var_slow,
 		night_dropped=night_drop_share,
 	)
+	if nkp_chunks:  # (each reading's mean over the prepass's chunks, those with heroes to count: nk_predict.readings)
+		for name in nkp_chunks[0]:
+			values = [chunk[name] for chunk in nkp_chunks if chunk[name] == chunk[name]]
+			metrics[name] = float(np.mean(values)) if values else float("nan")
+	if hasattr(model, "nkp_outputs"):
+		model.nkp_outputs = False  # (the learner's other forwards: no blind pass)
 	return metrics, lr_scale
 
 
