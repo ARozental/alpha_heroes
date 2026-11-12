@@ -267,6 +267,15 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # score flat (+0.010 +- 0.116), eliminated 10 -> 13; at 1 it charged 33% of in-town hero-decisions at 3.4 logits on
 # average, so 0.5 here. Takes it out: our heroes' idle movement in towns rising (idle_movement_*) without towns lost
 # falling.
+# Deploy 60 (2026-11-11, b1 for e5; the user: "the drop vs the trained policy is very big... maybe we can continue this
+# training as of now... I do not know if NK2 at 90% is helping us actually learn"; e5's decision: joint7's weights go
+# on, Nullkiller2's choices off). campaign.nk2_follow=0 (no mixture anywhere), campaign.nk2_choice_games=0 (every
+# training game hides its own choice from the inputs: its candidates, scores, plan and threats stay), the evaluation one
+# arm of 48 with the choice hidden (eval_own_games=48, eval_follow_games=0: score_own goes on from the split evaluations'
+# own arm), campaign.town_guard=0 (built, its evidence was under following), campaign.adv_by_kind=false (one kind of game
+# now). Bundle 60's fixes ship with it: the failed actions (the ARTIFACT loop's root, the fingerprint, the loop guard),
+# boats and the centre-cell re-visit / purchase, forecast-out (zero start), the advice fixes. The comment blocks below
+# from deploys 57-59 describe settings this line has since changed (follow, choice games, the split, the guard).
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -275,5 +284,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0.5 campaign.eval_own_games=32 campaign.eval_follow_games=16 campaign.adv_gain=1 campaign.schedule_action_price=2e-6 campaign.adv_by_kind=true campaign.town_guard=0.5 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=2e-6 campaign.adv_by_kind=false campaign.town_guard=0 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null

@@ -119,6 +119,7 @@ COLUMNS = [
 	# (each kind of game's advantage as the policy and the head take it: its mean, its spread, its share of sum |A| x credit;
 	# config.adv_by_kind standardizes them apart)
 	"adv_mean_shown", "adv_mean_hidden", "adv_sd_shown", "adv_sd_hidden", "adv_weight_shown", "adv_weight_hidden",
+	"loops_cut", "loops_cut_move", "loops_cut_multi", "probes_no_way",  # (bundle 60's loop guard, a game)
 ]
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
 DROP_BEYOND = 4  # updates' worth of finished games beyond which the oldest are dropped (_take)
@@ -897,6 +898,12 @@ class CampaignLearner:
 			"no_effect": sum(1 for d in decisions if d.flags & NO_EFFECT) / max(n, 1),
 			"ai_errors": sum(s.get("errors", 0) for s in done),
 			"failed_actions": sum(s.get("failed_actions", 0) for s in done),
+			# (bundle 60's loop guard: actions dropped for the day for bringing back a state of today's, a game, by type; it
+			# should fall as the policy learns out of the cycles; and probes of an unknown entrance that found no way)
+			"loops_cut": sum(s.get("loops_cut", 0) for s in done) / max(len(games), 1),
+			"loops_cut_move": sum((s.get("loops_cut_types") or {}).get(str(int(c.ActionType.MOVE)), 0) for s in done) / max(len(games), 1),
+			"loops_cut_multi": sum((s.get("loops_cut_types") or {}).get(str(int(c.ActionType.MULTI)), 0) for s in done) / max(len(games), 1),
+			"probes_no_way": sum(s.get("probes_no_way", 0) for s in done) / max(len(games), 1),
 			"game_failures": self.stats["game_failures"],
 			"game_maps": sum(1 for _, info in games if not info.map_name.startswith("Maps/alpha_random/")),
 			"dropped_games": self.stats["dropped_games"],
