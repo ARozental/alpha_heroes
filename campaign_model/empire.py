@@ -42,9 +42,10 @@ The user's rules (2026-10-27), and why each component is priced as it is:
 - Nothing for threats or positions: those are left for the value head to learn (labels start 2 days after a decision).
 A player out of the game is worth 0.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import math
+import os
 
 from game_values import ARMY_MORALE, SPEED_POWER, SPELL_STEP, army_multiplier, capped_mana_value, fractional_level, make_up_morale, movement_factor, resources_value, unled_share
 
@@ -69,7 +70,11 @@ MORALE_CHANCE = (-6, -4, -2, 0, 1, 2, 3)
 
 @dataclass(frozen=True)
 class EmpireConfig:
-	alpha: float = 0.25  # u = ALPHA x a creature's (unupgraded) cost: what a creature for hire is worth
+	# u = ALPHA x a creature's (unupgraded) cost: what a creature for hire is worth. ALPHA_EMPIRE_ALPHA sets it for a run
+	# (the user, 2026-11-12: "going from 0.25 to 0.5 should be fine"; purchases stay neutral: hired cost + u, for hire u):
+	# read when this module is imported, since every default EmpireConfig() is made then, so it is the run's environment
+	# (runtime/advice_run.sh), the same in every process it starts. The evaluation's EVAL_EMPIRE keeps 0.25
+	alpha: float = field(default_factory=lambda: float(os.environ.get("ALPHA_EMPIRE_ALPHA", "") or 0.25))
 	income_days: float = 5.0  # unpriced income is worth this many days of it (the user: "sane for this hyperparameter")
 	hero_base: float = 1500.0  # gold: a fresh hero (its first two skill levels and five primary points), besides its army and artifacts
 	skill_level: float = 2000.0  # each secondary skill level beyond a fresh hero's two
@@ -100,7 +105,7 @@ class EmpireConfig:
 
 # The evaluation's Φ (its scores, evaluate.score): as of 2026-11-04's army multiplier, before the spellbook's factor and
 # the unled share, the army's movement and make-up, so its scores stay comparable across the changes
-EVAL_EMPIRE = EmpireConfig(spell_step=0.0, speed_power=0.0, army_morale=0.0)
+EVAL_EMPIRE = EmpireConfig(alpha=0.25, spell_step=0.0, speed_power=0.0, army_morale=0.0)
 
 
 def _unit(creature_id, config):

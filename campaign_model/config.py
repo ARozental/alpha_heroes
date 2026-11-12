@@ -334,6 +334,12 @@ class CampaignConfig:
 	# only (the follow mixture's part is untouched); no masking. 0: off, the model as before, bit for bit. Set at every
 	# start (learner.set_advice_prior); ALPHA_TOWN_GUARD for a paired test
 	town_guard: float = 0.0
+	# The economy and BUILD (e5 for the user, 2026-11-12; features.economy_features and build_features, model.
+	# CustomFeatures.build_prior): the economy's bounded views into the global token and the value heads, each BUILD
+	# entry's views into a situational part (0 at the start), and BUILD's fixed prior (what a building adds to income and
+	# growth, the unlock share, each faction's own bias). 0: off, the model as before, bit for bit. ALPHA_BUILD_ECONOMY
+	# for a paired test
+	build_economy: float = 0.0
 	# The credit's horizon by segments (bundle 60; e5's design from 6,424 own-policy player-days: the share-change surprise's
 	# spread is 0.050 at 2 days, 0.074 at 5, 0.087 at 7, and what happens in 2 days persists, slope 0.95, so the 7-day
 	# credit is the 2-day one plus 2.4 times its variance added in days 3-7). On: the schedule credit is surprise(0-2) +

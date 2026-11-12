@@ -451,7 +451,7 @@ class CampaignModelV2(nn.Module):
 		self.player = small_embedding(P, d)
 		self.players = E.Tokenizer(2 * d, d)
 		# join
-		self.join_global = E.Tokenizer(d + ft_phi_features() + 3, d, embedded=False)
+		self.join_global = E.Tokenizer(d + ft_phi_features() + 3 + len(ft.ECONOMY), d, embedded=False)  # (the economy's columns last: GROWN_INPUTS)
 		self.join_hero = E.Tokenizer(d + HERO_KNOWN, d, embedded=False)
 		self.join_town = E.Tokenizer(d + TOWN_KNOWN, d, embedded=False)
 		self.join_tiles = nn.Linear(TILE_KNOWN, dc)
@@ -473,7 +473,7 @@ class CampaignModelV2(nn.Module):
 		self.pair_strength = zero_output(nn.Linear(MOVE_STRENGTH + 1, dp))  # (2026-11-04: the four estimates x two sides, hopeless)
 		self.foresight = Foresight(d, dp)
 		# think_again
-		self.again_global = E.Tokenizer(d + FORESIGHT_HIDDEN + ft_phi_features() + 3, d, embedded=False)
+		self.again_global = E.Tokenizer(d + FORESIGHT_HIDDEN + ft_phi_features() + 3 + len(ft.ECONOMY), d, embedded=False)
 		self.again_hero = E.Tokenizer(d + FORESIGHT_HIDDEN + HERO_KNOWN, d, embedded=False)
 		self.again_option = E.Tokenizer(d + FORESIGHT_HIDDEN, d, embedded=False)
 		self.again_block = Block(d, heads)
@@ -547,7 +547,7 @@ class CampaignModelV2(nn.Module):
 		nn.init.zeros_(self.option_weights.weight)
 		self.end_out = zero_output(nn.Linear(d, 1))
 		self.type_bias = nn.Parameter(priors.action_types().clone())
-		self.value_hidden = nn.Sequential(nn.Linear(3 * d + ft_phi_features(), d), nn.GELU())
+		self.value_hidden = nn.Sequential(nn.Linear(3 * d + ft_phi_features() + len(ft.ECONOMY), d), nn.GELU())
 		self.value_heads = zero_output(nn.Linear(d, c.N_VALUE_OFFSETS))
 		self.growth_heads = zero_output(nn.Linear(d, c.N_VALUE_OFFSETS))
 		self.end_head = zero_output(nn.Linear(d, 1))
@@ -596,6 +596,10 @@ class CampaignModelV2(nn.Module):
 		# nk_predict's head (2026-11-11, stage 1: it only learns, config.nk_predict_weight), made last: the other
 		# parameters' initialisation as before
 		self.nkp = NkPredictHead(d, dp)
+		# The economy and BUILD (e5 for the user, 2026-11-12): BUILD's situational part on each entry's bounded views
+		# (features.build_features), its output 0 at the start; made last: the others' initialisation as before
+		self.build_situational = SwiGLU(len(ft.BUILD_ENTRY), 32, 1)
+		zero_output(self.build_situational.down)
 
 	def prior_corrections(self):
 		"""The parameters that correct a fixed prior (model.CustomFeatures): weight decay pulls them back to it."""
@@ -1136,9 +1140,13 @@ class CampaignModelV2(nn.Module):
 		# alone a charge every entry pays cancels: a BUILD with nothing affordable traded for whatever it chose)
 		trade_cost = self.features.trade_cost_weight()
 		build_charge = trade_cost * ft.value_logit(known.build_trade)
-		learned[A_.BUILD] = self.build_scores(own_towns, x) + self.build_bias
-		prior[A_.BUILD] = self.nk2_build(known.build_rewards).squeeze(-1) - build_charge
-		offers[A_.BUILD] = best_legal(-build_charge, x["build_mask"])
+		# + the economy (e5 for the user, 2026-11-12; config.build_economy, 0 with it off): the situational part on each
+		# entry's views, the fixed prior (features.build_prior: its gold by value_logit, each faction's own bias), which
+		# the type's offer takes as MOVE's does
+		build_known = self.features.build_prior(x, known)
+		learned[A_.BUILD] = self.build_scores(own_towns, x) + self.build_bias + self.build_situational(known.build_entry.to(own_towns.dtype)).squeeze(-1)
+		prior[A_.BUILD] = self.nk2_build(known.build_rewards).squeeze(-1) - build_charge + build_known
+		offers[A_.BUILD] = best_legal(build_known - build_charge, x["build_mask"])
 		# RECRUIT: the town and each creature level's token, the amounts; Nullkiller2's prior
 		available = x["t_available"][:, :TO].clamp(min=0).float()
 		gold = x["g_resources"][:, 6].clamp(min=0).float()
@@ -1353,7 +1361,7 @@ class CampaignModelV2(nn.Module):
 		own_mean = (own * mine).sum(dim=1) / mine.sum(dim=1).clamp(min=1)
 		shared = torch.cat([state.glob, own_mean, state.players[:, 0]], dim=-1)
 		shared = shared * self.value_valve + shared.detach() * (1 - self.value_valve)  # (value_valve: the forward the same, the gradient into the shared layers x it)
-		hidden = self.value_hidden(torch.cat([shared, known.phi], dim=-1))
+		hidden = self.value_hidden(torch.cat([shared, known.phi, known.economy.to(shared.dtype)], dim=-1))
 		share_prior = -torch.log(x["g_players"].clamp(min=2).float() - 1)
 		# V2, V5, V7: a share from 1 / players, or its logit's change from none (config.share_target)
 		value_logit = self.value_heads(hidden) + (share_prior.unsqueeze(-1) if self.share_target == "share" else 0.0)
@@ -1391,7 +1399,7 @@ def log_ratio(value, reference):
 
 def global_known(known):
 	"""[B, PHI_FEATURES + 3]: Φ as the value heads see it, Nullkiller2's gold pressure, its pause, its want of a hero."""
-	return torch.cat([known.phi, torch.stack([known.gold_pressure / (1 + known.gold_pressure), known.recruit_pause, known.hire_want], dim=-1)], dim=-1)
+	return torch.cat([known.phi, torch.stack([known.gold_pressure / (1 + known.gold_pressure), known.recruit_pause, known.hire_want], dim=-1), known.economy.to(known.phi.dtype)], dim=-1)
 
 
 HERO_KNOWN = 1 + 3 + 4 + 2 * E.AMOUNT_FEATURES + 1
@@ -1513,7 +1521,7 @@ def migrate_option_head(state_dict):
 	return state
 
 
-GROWN_INPUTS = ("recruit_head.0.weight", "option_weights.weight")  # (2026-11-04: + the visiting hero; + a purchase's fit)
+GROWN_INPUTS = ("recruit_head.0.weight", "option_weights.weight", "join_global.mlp.up.weight", "again_global.mlp.up.weight", "value_hidden.0.weight")  # (2026-11-04: + the visiting hero; + a purchase's fit)
 
 
 def migrate_action_types(state_dict, own):

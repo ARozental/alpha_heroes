@@ -1,0 +1,2 @@
+# Each faction's own building's starting bias for BUILD (model.build_bias_start): faction, building, bias. Empty: the research step (e5's section 8) was skipped for time; every bias starts at 0
+faction,building,bias

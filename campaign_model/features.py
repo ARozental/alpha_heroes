@@ -1112,3 +1112,265 @@ def blocked_by_guards(value, region, zone, monster, steps=c.WINDOW_RADIUS):
 		best = torch.where(region, torch.maximum(best, pool(best)), best)
 	return pool(pool(best) * zone) * monster
 
+
+
+# ---- the economy and what each building adds (e5 for the user, 2026-11-12: production a first-class quantity) ----
+# Each quantity is a tiny pure function _feature_<name> returning a bounded tensor; economy_features and build_features
+# collect them under ECONOMY and BUILD_ENTRY. Gold values are list prices at the shared resource prices (vocab).
+
+ECONOMY = (
+	"gold_over_pool", "pool_unbought", "gold_idle", "flow_balance", "hall_income_used", "production_built",
+	"production_week_3k", "production_week_10k", "production_week_30k", "days_to_growth",
+)
+BUILD_ENTRY = (
+	"income_add", "income_rel", "production_add", "production_rel", "payable", "unlocks", "cost_share", "crowds_out",
+	"upgrade_quality", "upgrade_held", "upgrade_elsewhere", "end_of_week",
+)
+DWELLINGS_BASE = tuple(range(30, 37))  # BuildingID DWELL_LVL_1..7
+DWELLINGS_UP = tuple(range(37, 44))  # DWELL_UP_LVL_1..7
+HALLS = (10, 11, 12, 13)  # village, town, city hall, capitol
+CITADEL, CASTLE_BUILDING = 8, 9
+ECON_NEAR = 45.0  # tiles: a stack about three days from a town, exp(-d / 45) (F3's nearness)
+CAPITOL_INCOME, CITY_HALL_INCOME = 4000.0, 2000.0
+
+
+def _economy_inputs(x, t):
+	"""What the economy's features share: (G gold, I daily gold income, C_pool for hire in our towns, C_week next Monday's
+	growth, B_today our towns' dearest legal builds not yet built today, own [B, TO], faction [B, TO]), each at list price."""
+	to = c.OWN_TOWNS
+	own = own_towns(x)
+	faction = vocab_index(x["t_faction"][:, :to], c.FACTION_VOCAB)
+	creature = x["t_available_creature"][:, :to]
+	cost = t.creature_cost[vocab_index(creature, c.CREATURE_VOCAB)] * (creature >= 0)
+	pool = ((x["t_available"][:, :to].clamp(min=0).float() * cost).sum(dim=-1) * own).sum(dim=-1)
+	week = ((x["t_growth"][:, :to].clamp(min=0).float() * cost).sum(dim=-1) * own).sum(dim=-1)
+	legal = x["build_mask"][:, :to].bool() & own.unsqueeze(-1) & (x["t_built_today"][:, :to] == 0).unsqueeze(-1)
+	dearest = torch.where(legal, t.building_cost[faction], torch.zeros_like(t.building_cost[faction])).amax(dim=-1).sum(dim=-1)
+	gold, income = x["g_resources"][:, 6].clamp(min=0).float(), x["g_income"][:, 6].clamp(min=0).float()
+	return gold, income, pool, week, dearest, own, faction
+
+
+def _feature_gold_over_pool(gold, pool):
+	"""0..1: our gold against it and what our towns have for hire; 1 all gold, 0 none."""
+	return gold / (gold + pool + 1000.0)
+
+
+def _feature_pool_unbought(gold, pool):
+	"""0..1: the share of what is for hire our gold cannot pay for; 0 we can buy it all."""
+	return torch.relu(pool - gold) / (pool + 1000.0)
+
+
+def _feature_gold_idle(gold, pool, dearest):
+	"""0..1: gold left over after buying everything for hire and each town's dearest build; 0 none idle."""
+	return torch.relu(gold - pool - dearest) / (gold + 1000.0)
+
+
+def _feature_flow_balance(income, week):
+	"""0..1: a week's gold income against what a week's growth costs; 1 income far above, 0 no income."""
+	return 7.0 * income / (7.0 * income + week + 1000.0)
+
+
+def _feature_hall_income_used(x, t, own, faction):
+	"""0..1: our halls' income against one capitol and city halls everywhere else; 1 all built."""
+	built = x["t_built"][:, : c.OWN_TOWNS].bool()
+	halls = (t.building_income[faction][..., list(HALLS)] * built[..., list(HALLS)]).sum(dim=-1)
+	cap = CAPITOL_INCOME + CITY_HALL_INCOME * (own.sum(dim=-1).float() - 1).clamp(min=0)
+	return ((halls * own).sum(dim=-1) / cap).clamp(0.0, 1.0)
+
+
+def _dwelling_week(t, faction):
+	"""[B, TO, 7]: a week's list price of each level's base dwelling's growth (growth x cost of its creature)."""
+	creature = t.dwelling_creature[faction][..., list(DWELLINGS_BASE)]
+	index = vocab_index(creature, c.CREATURE_VOCAB)
+	return t.creature_growth[index] * t.creature_cost[index] * (creature >= 0)
+
+
+def _feature_production_built(x, t, own, faction):
+	"""0..1: the week's list price of the base dwellings built, over all the levels our towns' factions have; 1 all built."""
+	built = x["t_built"][:, : c.OWN_TOWNS].bool()[..., list(DWELLINGS_BASE)] | x["t_built"][:, : c.OWN_TOWNS].bool()[..., list(DWELLINGS_UP)]
+	week = _dwelling_week(t, faction)
+	have, could = ((week * built).sum(dim=-1) * own).sum(dim=-1), (week.sum(dim=-1) * own).sum(dim=-1)
+	return have / could.clamp(min=1.0)
+
+
+def _feature_production_week(week, scale):
+	"""0..1: next Monday's growth at list price, half-way at scale."""
+	return week / (week + scale)
+
+
+def _feature_days_to_growth(x):
+	"""0..1: days until the next Monday over 7; 1 it is Monday, 1/7 it is Sunday."""
+	return (7.0 - torch.remainder(x["g_day"].float() - 1.0, 7.0)) / 7.0
+
+
+def economy_features(x, t):
+	"""[B, len(ECONOMY)]: our economy's bounded views (each _feature_ above, ECONOMY's order); 0 with the economy off
+	(t.economy_on: the model as before, bit for bit)."""
+	gold, income, pool, week, dearest, own, faction = _economy_inputs(x, t)
+	return t.economy_on() * torch.stack(
+		[
+			_feature_gold_over_pool(gold, pool), _feature_pool_unbought(gold, pool), _feature_gold_idle(gold, pool, dearest),
+			_feature_flow_balance(income, week), _feature_hall_income_used(x, t, own, faction), _feature_production_built(x, t, own, faction),
+			_feature_production_week(week, 3000.0), _feature_production_week(week, 10000.0), _feature_production_week(week, 30000.0),
+			_feature_days_to_growth(x),
+		],
+		dim=-1,
+	)
+
+
+def _fort_multiplier(built):
+	"""[B, TO]: a town's growth multiplier from its fort line (a citadel +50%, a castle +50% more)."""
+	return 1.0 + 0.5 * (built[..., CITADEL] | built[..., CASTLE_BUILDING]).float() + 0.5 * built[..., CASTLE_BUILDING].float()
+
+
+def _production_added(x, t, faction, built):
+	"""[B, TO, N_BUILDINGS]: the list price a week each building adds to its town's growth: a base dwelling its growth x
+	cost x the fort's multiplier; a citadel and a castle each half the town's built base dwellings' week; a horde its
+	extra growth (half its level's base growth: the engine's number is in the H3 data, not the configs; H3's are 43-67% of
+	base, griffins +3 of 7, imps +8 of 15, dendroids +2 of 3) x cost where that
+	level is built; an upgraded dwelling growth x (its creature's cost less the base's) only."""
+	week = _dwelling_week(t, faction)  # [B, TO, 7]
+	levels = built[..., list(DWELLINGS_BASE)] | built[..., list(DWELLINGS_UP)]
+	added = torch.zeros(built.shape, dtype=week.dtype, device=week.device)
+	added[..., list(DWELLINGS_BASE)] = week * _fort_multiplier(built).unsqueeze(-1)
+	half = 0.5 * (week * levels).sum(dim=-1)
+	added[..., CITADEL], added[..., CASTLE_BUILDING] = half, half
+	level = t.horde_level[faction]  # [B, TO, N_BUILDINGS]
+	at = level.clamp(min=0)
+	horde = 0.5 * torch.gather(week, -1, at) * torch.gather(levels.float(), -1, at) * (level >= 0)
+	added = torch.where(level >= 0, horde, added)
+	up, base = t.dwelling_creature[faction][..., list(DWELLINGS_UP)], t.dwelling_base[faction][..., list(DWELLINGS_UP)]
+	up_i, base_i = vocab_index(up, c.CREATURE_VOCAB), vocab_index(base, c.CREATURE_VOCAB)
+	added[..., list(DWELLINGS_UP)] = t.creature_growth[base_i] * (t.creature_cost[up_i] - t.creature_cost[base_i]).clamp(min=0) * ((up >= 0) & (base >= 0))
+	return added
+
+
+def _feature_income_add(income_added):
+	"""0..1: the daily income a building adds, 3.5 days of it half-way at 3,500; 0 none."""
+	v = 3.5 * income_added
+	return v / (v + 3500.0)
+
+
+def _feature_income_rel(income_added, income):
+	"""0..1: the daily income it adds against our income with it; 0 none."""
+	return income_added / (income.reshape(-1, 1, 1) + income_added + 500.0)
+
+
+def _feature_production_add(production_added):
+	"""0..1: the week's growth it adds at list price, half-way at 2,000; 0 none."""
+	return production_added / (production_added + 2000.0)
+
+
+def _feature_production_rel(production_added, week):
+	"""0..1: the week's growth it adds against next Monday's with it; 0 none."""
+	return production_added / (week.reshape(-1, 1, 1) + production_added + 500.0)
+
+
+def _feature_payable(production_added, gold, income, cost, pool, week):
+	"""0..1: how much of what it adds a week our gold can buy after paying for it and for what is already for hire and due
+	Monday (a week's income in); 0 none, or it adds no growth."""
+	spare = gold.reshape(-1, 1, 1) - cost + 7.0 * income.reshape(-1, 1, 1) - pool.reshape(-1, 1, 1) - week.reshape(-1, 1, 1)
+	return torch.where(production_added > 0, (spare / (production_added + 1.0)).clamp(0.0, 1.0), torch.zeros_like(production_added))
+
+
+def _unlock_value(t, faction, built, own_value):
+	"""[B, TO, N_BUILDINGS] gold: for a building not built, the best own value among the unbuilt buildings it is a missing
+	prerequisite of, each over its count of missing prerequisites (a building two steps from a capitol inherits half)."""
+	requires = t.building_requires[faction]  # [B, TO, N_BUILDINGS (b'), N_BUILDINGS (b)]
+	missing = requires & ~built.unsqueeze(-2) & ~built.unsqueeze(-1)  # (b' not built, needs b, b not built)
+	count = missing.sum(dim=-1, keepdim=True).clamp(min=1).to(own_value.dtype)
+	share = torch.where(missing, (own_value.unsqueeze(-1) / count).expand_as(missing.float()), torch.zeros((), dtype=own_value.dtype, device=own_value.device))
+	return share.amax(dim=-2)
+
+
+def _feature_unlocks(unlock):
+	"""0..1: unlock_value's gold, half-way at 3,500; 0 it opens nothing of worth."""
+	return unlock / (unlock + 3500.0)
+
+
+def _feature_cost_share(cost, gold, worth):
+	"""0..1: its cost against our gold and resources' worth; 1 it takes everything."""
+	return (cost / (gold.reshape(-1, 1, 1) + worth.reshape(-1, 1, 1) + 1000.0)).clamp(0.0, 1.0)
+
+
+def _feature_crowds_out(gold_cost, gold, pool, unbought):
+	"""0..1: the share of what is for hire it leaves us unable to pay for, beyond what we cannot already; 0 none."""
+	left = torch.relu(gold.reshape(-1, 1, 1) - gold_cost)
+	return (torch.relu(pool.reshape(-1, 1, 1) - left) / (pool.reshape(-1, 1, 1) + 1000.0) - unbought.reshape(-1, 1, 1)).clamp(0.0, 1.0)
+
+
+def _feature_upgrade_quality(t, faction):
+	"""[B, TO, 7] 0..1: an upgraded dwelling's creature over its base in fight value, less 1; 0 no better."""
+	up, base = t.dwelling_creature[faction][..., list(DWELLINGS_UP)], t.dwelling_base[faction][..., list(DWELLINGS_UP)]
+	up_v, base_v = t.fight_value[vocab_index(up, c.CREATURE_VOCAB)], t.fight_value[vocab_index(base, c.CREATURE_VOCAB)]
+	return ((up_v - base_v) / base_v.clamp(min=1.0)).clamp(0.0, 1.0) * ((up >= 0) & (base >= 0))
+
+
+def _nearness(a, b):
+	"""[B, N, M] exp(-tile distance / ECON_NEAR) between positions a [B, N, 3] and b [B, M, 3]; x0.25 across levels."""
+	d = torch.maximum((a[:, :, None, 0] - b[:, None, :, 0]).abs(), (a[:, :, None, 1] - b[:, None, :, 1]).abs()).float()
+	return torch.exp(-d / ECON_NEAR) * torch.where(a[:, :, None, 2] == b[:, None, :, 2], 1.0, 0.25)
+
+
+def _feature_upgrade_held(x, t, faction):
+	"""[B, TO, 7] 0..1: what upgrading the base creatures we hold would add (count x the cost difference), each stack by
+	how near it is to the town (heroes' armies, garrisons, those for hire); half-way at 2,000; 0 none of them."""
+	to, ho = c.OWN_TOWNS, HO
+	own_h = (x["h_present"][:, :ho] & (x["h_owner"][:, :ho] == c.OWNER_SELF)).unsqueeze(-1)
+	own_t = own_towns(x).unsqueeze(-1)
+	creature = torch.cat([x["h_army_creature"][:, :ho], x["t_garrison_creature"][:, :to], x["t_available_creature"][:, :to]], dim=1)  # [B, HO + 2 TO, slots]
+	count = torch.cat([x["h_army_count"][:, :ho].float() * own_h, x["t_garrison_count"][:, :to].float() * own_t, x["t_available"][:, :to].clamp(min=0).float() * own_t], dim=1)
+	if creature.shape[-1] != count.shape[-1]:
+		raise ValueError("army slots and levels differ in width")
+	pos = torch.cat([x["h_pos"][:, :ho], x["t_pos"][:, :to], x["t_pos"][:, :to]], dim=1)  # [B, S, 3]
+	near = _nearness(x["t_pos"][:, :to], pos)  # [B, TO, S]
+	up, base = t.dwelling_creature[faction][..., list(DWELLINGS_UP)], t.dwelling_base[faction][..., list(DWELLINGS_UP)]  # [B, TO, 7]
+	delta = (t.creature_cost[vocab_index(up, c.CREATURE_VOCAB)] - t.creature_cost[vocab_index(base, c.CREATURE_VOCAB)]).clamp(min=0) * ((up >= 0) & (base >= 0))
+	match = (creature[:, None, None, :, :] == base[..., None, None]) & (base >= 0)[..., None, None]  # [B, TO, 7, S, slots]
+	held = (match.float() * count[:, None, None]).sum(dim=-1)  # [B, TO, 7, S]
+	h = (held * near[:, :, None, :]).sum(dim=-1) * delta
+	return h / (h + 2000.0)
+
+
+def _feature_upgrade_elsewhere(x, t, faction, built):
+	"""[B, TO, 7] 0..1: the nearness of our nearest other town with the same upgraded dwelling built; 0 none."""
+	to = c.OWN_TOWNS
+	up = t.dwelling_creature[faction][..., list(DWELLINGS_UP)]  # [B, TO, 7]
+	have = built[..., list(DWELLINGS_UP)] & own_towns(x).unsqueeze(-1)  # [B, TO, 7]
+	same = (up[:, :, None, :] == up[:, None, :, :]) & have[:, None, :, :] & (up[:, :, None, :] >= 0)  # [B, TO (here), TO (there), 7]
+	other = ~torch.eye(to, dtype=torch.bool, device=up.device)[None, :, :, None]
+	near = _nearness(x["t_pos"][:, :to], x["t_pos"][:, :to]).unsqueeze(-1)
+	return torch.where(same & other, near.expand_as(same.float()), torch.zeros((), device=up.device)).amax(dim=2)
+
+
+def build_features(x, t, economy):
+	"""(entry [B, TO, N_BUILDINGS, len(BUILD_ENTRY)] each building's bounded views in each town of ours, value [B, TO,
+	N_BUILDINGS, 3] the fixed prior's gold parts: 3.5 days of the income it adds x (1 + pool_unbought), 1.5 x the week's
+	growth it adds x payable, and the unlock share). 0 for towns not ours."""
+	gold, income, pool, week, _, own, faction = _economy_inputs(x, t)
+	built = x["t_built"][:, : c.OWN_TOWNS].bool()
+	cost = t.building_cost[faction]
+	gold_cost = t.building_resources[faction][..., 6]
+	income_added = t.building_income[faction].clamp(min=0)
+	production = _production_added(x, t, faction, built)
+	unbought = economy[:, ECONOMY.index("pool_unbought")]
+	payable = _feature_payable(production, gold, income, cost, pool, week)
+	income_value = 3.5 * income_added * (1.0 + unbought.reshape(-1, 1, 1))
+	production_value = 1.5 * production * payable
+	unlock = _unlock_value(t, faction, built, income_value + production_value)
+	worth = (x["g_resources"].clamp(min=0).float() * t.resource_price).sum(dim=-1)
+	ups = torch.zeros_like(cost).unsqueeze(-1).expand(*cost.shape, 3).clone()
+	ups[..., list(DWELLINGS_UP), 0] = _feature_upgrade_quality(t, faction)
+	ups[..., list(DWELLINGS_UP), 1] = _feature_upgrade_held(x, t, faction)
+	ups[..., list(DWELLINGS_UP), 2] = _feature_upgrade_elsewhere(x, t, faction, built)
+	end_of_week = (1.0 - economy[:, ECONOMY.index("days_to_growth")]).reshape(-1, 1, 1) * (production > 0)
+	entry = torch.stack(
+		[
+			_feature_income_add(income_added), _feature_income_rel(income_added, income), _feature_production_add(production),
+			_feature_production_rel(production, week), payable, _feature_unlocks(unlock), _feature_cost_share(cost, gold, worth),
+			_feature_crowds_out(gold_cost, gold, pool, unbought), ups[..., 0], ups[..., 1], ups[..., 2], end_of_week,
+		],
+		dim=-1,
+	) * own[..., None, None] * t.economy_on()
+	value = torch.stack([income_value, production_value, unlock], dim=-1) * own[..., None, None]
+	return entry, value

@@ -105,6 +105,8 @@ def game_tables():
 		"building_income": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS),
 		"dwelling_creature": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),
 		"dwelling_base": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),
+		"building_requires": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, c.N_BUILDINGS, dtype=torch.bool),  # (building, a building it needs: vocab.building_requires)
+		"horde_level": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),  # (a horde building: the level index it adds growth to)
 		"building_resources": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, len(RESOURCE_PRICES)),
 		"spell_value": torch.zeros(c.N_SPELLS),
 		"creature_luck": torch.zeros(c.CREATURE_VOCAB + 1),
@@ -121,7 +123,7 @@ def game_tables():
 		from .empire import EmpireConfig, _unit, building_value
 		from game_values import resources_value
 
-		from .vocab import NO_LUCK, NO_MORALE, artifact_prices, buildings, creature_cost, creatures, experience_table, feels, raw, spell_levels, town_creatures
+		from .vocab import NO_LUCK, NO_MORALE, artifact_prices, building_requires, buildings, creature_cost, creatures, experience_table, feels, horde_levels, raw, spell_levels, town_creatures
 
 		faction_ids = {row["key"]: row["id"] for row in raw()["factions"]}
 
@@ -160,6 +162,14 @@ def game_tables():
 				for r, name in enumerate(RESOURCE_PRICES):
 					tables["building_resources"][faction, building, r] = float((row.get("cost") or {}).get(name, 0))
 				tables["building_income"][faction, building] = float(resources_value(row.get("produce") or {}) - resources_value(replaced.get("produce") or {}))
+		for (faction, building), needs in building_requires().items():
+			if 0 <= faction < c.FACTION_VOCAB and 0 <= building < c.N_BUILDINGS:
+				for need in needs:
+					if 0 <= need < c.N_BUILDINGS:
+						tables["building_requires"][faction, building, need] = True
+		for (faction, building), level in horde_levels().items():
+			if 0 <= faction < c.FACTION_VOCAB and 0 <= building < c.N_BUILDINGS:
+				tables["horde_level"][faction, building] = level
 		for faction, levels in town_creatures().items():  # dwellings: level 1..7 at DWELLINGS, upgraded at UPGRADED_DWELLINGS
 			for level, forms in enumerate(levels[: c.N_LEVELS]):
 				if 0 <= faction < c.FACTION_VOCAB and forms:
@@ -185,6 +195,22 @@ def game_tables():
 	except (ImportError, FileNotFoundError):
 		pass
 	return tables
+
+
+def build_bias_start():
+	"""[FACTION_VOCAB + 1, N_BUILDINGS]: each faction's own building's starting bias (priors/build_bias.csv: faction,
+	building, bias; 0 where no row)."""
+	import csv
+	from pathlib import Path
+
+	start = torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS)
+	path = Path(__file__).resolve().parent / "priors" / "build_bias.csv"
+	if path.exists():
+		for row in csv.DictReader(line for line in path.open() if not line.startswith("#")):
+			faction, building = int(row["faction"]), int(row["building"])
+			if 0 <= faction < c.FACTION_VOCAB and 0 <= building < c.N_BUILDINGS:
+				start[faction, building] = float(row["bias"])
+	return start
 
 
 def flat_log_softmax(logits, mask):
@@ -351,10 +377,20 @@ class CustomFeatures(nn.Module):
 		# (config.town_guard; ALPHA_TOWN_GUARD for a paired test; 0: off, the model as before) x a gain (1/4..2)
 		self.town_guard_shift = zeros()
 		self.register_buffer("town_guard", torch.zeros(()))
+		# The economy and BUILD (e5 for the user, 2026-11-12; features.economy_features, build_features; config.
+		# build_economy, ALPHA_BUILD_ECONOMY for a paired test; 0: off, the model as before bit for bit): BUILD's fixed
+		# prior build_gain x value_logit(income_gain x the income it adds + production_gain x the growth it adds + the
+		# unlock share), three gains (1/5..5, 1 at the start); each faction's own building's bias around its start
+		# (priors/build_bias.csv, 0 where no row)
+		self.build_income_gain, self.build_production_gain, self.build_prior_gain = zeros(), zeros(), zeros()
+		self.build_faction_bias = nn.Parameter(torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS))
+		self.register_buffer("build_faction_start", build_bias_start(), persistent=False)
+		self.register_buffer("build_economy", torch.zeros(()))
 		override = lambda name: float(os.environ[name]) if os.environ.get(name, "") != "" else None  # noqa: E731
 		self.nk_override = (override("ALPHA_NK2_PRIOR"), override("ALPHA_NK2_PRIOR_FALLBACK"), override("ALPHA_NK2_LABEL"), override("ALPHA_NK2_FOLLOW"))
 		self.adv_override = override("ALPHA_ADV_GAIN")
 		self.guard_override = override("ALPHA_TOWN_GUARD")
+		self.economy_override = override("ALPHA_BUILD_ECONOMY")
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -379,7 +415,7 @@ class CustomFeatures(nn.Module):
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
 			self.night_gain,
 			self.nk_gain, self.nk_gain_fallback, self.nk_survival, self.nk_risk, self.nk_label_gain, self.nk_follow_shift,
-			self.adv_gain_shift, self.town_guard_shift,
+			self.adv_gain_shift, self.town_guard_shift, self.build_income_gain, self.build_production_gain, self.build_prior_gain, self.build_faction_bias,
 		]
 
 	# ---- the bounded prior parameters ----
@@ -434,6 +470,21 @@ class CustomFeatures(nn.Module):
 		heroes = torch.arange(c.OWN_HEROES, device=visitor.device)
 		cost = (loss.unsqueeze(-1) * (visitor.unsqueeze(-1) == heroes).float()).sum(dim=1)  # [B, HO]
 		return weight * ft.value_logit(cost)
+
+	def economy_on(self):
+		"""1.0 where the economy's features and BUILD's new prior are read, else 0.0, as a tensor (config.build_economy;
+		ALPHA_BUILD_ECONOMY): multiplied in, never branched on (a read of the device would break the CUDA step graph)."""
+		size = self.build_economy if self.economy_override is None else self.build_economy.new_tensor(self.economy_override)
+		return (size > 0).to(self.build_economy.dtype)
+
+	def build_prior(self, x, f):
+		"""BUILD's fixed prior [B, TO, N_BUILDINGS] (logits): build_gain x value_logit of the gold its parts (build_features'
+		value) weigh, each part by its gain, + each faction's own building's bias; 0 with the economy off."""
+		gain = lambda raw: self.gain(raw)  # noqa: E731
+		gold = gain(self.build_income_gain) * f.build_value[..., 0] + gain(self.build_production_gain) * f.build_value[..., 1] + f.build_value[..., 2]
+		faction = vocab_index(x["t_faction"][:, :TO], c.FACTION_VOCAB)
+		bias = (self.build_faction_start + self.build_faction_bias)[faction]
+		return (gain(self.build_prior_gain) * ft.value_logit(gold) + bias) * self.economy_on()
 
 	def nk_follow_logs(self):
 		"""(whether following is on, log rho, log (1 - rho)): the chance our choice is Nullkiller2's own (nk_follow at the
@@ -669,6 +720,8 @@ class CustomFeatures(nn.Module):
 		f.hire_want = ft.hire_want(x, f.gold_pressure, f.town_danger, ft.object_classes(x))
 		f.tavern_worth = ft.tavern_worth(x, self)
 		f.hire_gain = ft.hire_gain(x, self, f.tavern_worth)
+		f.economy = ft.economy_features(x, self)
+		f.build_entry, f.build_value = ft.build_features(x, self, f.economy)
 		f.trade_needs = ft.trade_needs(x, self)
 		f.trade_options = ft.trade_options(x, self)
 		f.build_trade, f.recruit_trade, f.recruit_short = ft.purchase_trades(x, self)
@@ -1633,7 +1686,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
@@ -1647,6 +1700,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"privileged",  # (2026-11-06: the privileged critic, its corrections 0 at the start)
 	"army_slot", "army_stay_q",  # (schema 16: ARMY's target slot, its queries 0 at the start: its priors alone)
 	"side_tile", "side_global",  # (2026-11-08: the map's block side, 0: docs/map_size_plan.md)
+	"build_situational",  # (2026-11-12: BUILD's situational part on the economy's entry views, 0 at the start)
 	# (schema 19, 2026-11-11: the bounded views and Nullkiller2's candidates, model_v2.CampaignModelV2.advice: every one's output 0 at the start)
 	"time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global",
 	"advantage.",  # (2026-11-11: the advantage head, model_v2.AdvantageHead, its weights 0 at the start)

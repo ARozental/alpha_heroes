@@ -52,6 +52,25 @@ def buildings():
 
 
 @lru_cache(maxsize=None)
+def building_requires():
+	"""(faction, building id) -> the building ids it needs (its own upgrade's base and its "requires"), VCMI's configs as
+	campaign_model/building_requires.py wrote them to priors/building_requires.json."""
+	from pathlib import Path
+
+	table = json.loads((Path(__file__).resolve().parent / "priors" / "building_requires.json").read_text())["requires"]
+	return {(int(faction), int(building)): tuple(needs) for faction, rows in table.items() for building, needs in rows.items()}
+
+
+@lru_cache(maxsize=None)
+def horde_levels():
+	"""(faction, building id) -> the creature level index a horde building adds growth to (building_requires.py)."""
+	from pathlib import Path
+
+	table = json.loads((Path(__file__).resolve().parent / "priors" / "building_requires.json").read_text())["hordes"]
+	return {(int(faction), int(building)): level for faction, rows in table.items() for building, level in rows.items()}
+
+
+@lru_cache(maxsize=None)
 def town_creatures():
 	"""faction -> creatures[level] = [base, upgrade, ...]."""
 	return {row["faction"]: row["creatures"] for row in raw()["town_creatures"]}
