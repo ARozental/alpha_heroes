@@ -294,6 +294,17 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # the price's count (labels.actions_ahead) holds every action, those cut by the loop guard and those that changed
 # nothing among them. Judged by loops_per_player_day, idle movement and END-first; out or down if a day begins with END
 # more often or BUILD's share keeps falling. Never above 2e-5 (the user, 2026-11-09).
+# Deploy 62 (2026-11-11 23:30, e5's call on the evidence below; the user: "ok, we can continue with Mixed games"):
+# deploy 59's mix of games with deploy 61's code, the campaign checkpoint rolled back to v3205
+# (runtime/saved/campaign_joint7_pre_d60.pt, the Mac-verified 0.672). Why: with every game own-against-own (deploys 60-61)
+# the trunk's signal fraction fell to a quarter (median 0.066 -> 0.018, v3186-3205 against v3207-3226), the value
+# group's to noise (0.083 -> -0.007), KL doubled (0.0042 -> 0.0088: noise moving the policy), RECRUIT a player-day fell
+# 21% in 18 updates (0.91 -> 0.72) and the meeting cycles grew. campaign.nk2_follow=0.9 (the cap holds),
+# campaign.nk2_choice_games=0.5 (half the games show Nullkiller2's own choice), campaign.adv_by_kind=true (hidden rows at a
+# fifth to a half of a shown row's weight: the reason it was built), campaign.town_guard=0.5 (the pair's size, since
+# following is back), the evaluation 48 own (the own score stays the one we judge by), the price 1e-5, the head read at 1,
+# campaign.credit_segments=true (the split check, segments on against off on the same batch, was not in at the deploy:
+# settled at the next one). The user's wish for no Nullkiller2 choices is on hold on this evidence, by their word.
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -302,5 +313,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=false campaign.town_guard=0 campaign.credit_segments=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0.5 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0.5 campaign.credit_segments=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
