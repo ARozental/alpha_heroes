@@ -276,6 +276,17 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # now). Bundle 60's fixes ship with it: the failed actions (the ARTIFACT loop's root, the fingerprint, the loop guard),
 # boats and the centre-cell re-visit / purchase, forecast-out (zero start), the advice fixes. The comment blocks below
 # from deploys 57-59 describe settings this line has since changed (follow, choice games, the split, the guard).
+# campaign.credit_segments=true (deploy 60, e5's decision 2026-11-11; config.credit_segments): the 7-day credit taken
+# by segments. Measured on 6,424 own-policy player-days: the share-change surprise's spread is 0.050 at 2 days, 0.074
+# at 5, 0.087 at 7, and the 7-day surprise's slope on the 2-day one is 0.95 (what happens in 2 days persists), so days
+# 3-7 add 2.4 times the 2-day variance. The credit is surprise(0-2) + k5 x surprise(2-5) + k7 x surprise(5-7); each k
+# moves 0.05 an update, from 0, toward max(0, 1 - 1/F), F each segment's between-action-type spread of gaps over its
+# sampling variance (the learner's evidence, faded 0.9; one update's lag; at most 1). With the k's near 0 the credit is
+# the 2-day one plus the end credit, the user's "noisy but safe" floor. Null bias: on pure noise k ends near 0.07 with
+# 14 types (0.015 with 8). What shows it failing: score_own falling over three evaluations; short-sightedness the
+# 7-day credit did not have (BUILD's share of decisions falling, fights lost rising, idle movement rising); k5 or k7
+# stuck above 0.5 with F under 2 (the estimator fooling itself). Out: campaign.credit_segments=false (the 7-day credit
+# as before, bit for bit).
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -284,5 +295,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=2e-6 campaign.adv_by_kind=false campaign.town_guard=0 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=2e-6 campaign.adv_by_kind=false campaign.town_guard=0 campaign.credit_segments=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null

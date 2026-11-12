@@ -163,5 +163,29 @@ def test_the_learner_step_end_to_end(tmp_path, capsys):
 	assert "credit by segments: k5 0.000 k7 0.000" in printed and "FAILURE" not in printed
 	assert float(row["segment_k5"]) == 0.0 and row["segment_types5"] != "" and float(row["segment_credit_std"]) > 0 and float(row["segment_full_std"]) > 0
 	assert all(isinstance(e, dict) for e in learner.segment_evidence) and any(learner.segment_evidence)
+	for name in ("signal_all", "signal_trunk", "signal_body", "signal_heads", "ratio_body", "ratio_heads", "lr_scale", "kl", "learning_rate"):  # (e5's learning-rate readings)
+		assert row[name] not in ("", "nan"), name
+	assert 0 < float(row["ratio_body"]) <= 1 and 0 < float(row["ratio_heads"]) <= 1
 	saved = torch.load(tmp_path / "checkpoint_latest.pt", weights_only=False)
 	assert saved["segment_k"] == learner.segment_k and len(saved["segment_evidence"]) == 3
+
+
+def test_the_trunk_moments_match_the_groups_signal_fraction_when_pooled():
+	"""train.trunk_moments' two parts pooled by their weights' counts are signal_fraction's trunk reading."""
+	from campaign_model.train import SHARED_PREFIXES, signal_fraction, trunk_moments
+
+	torch.manual_seed(2)
+	model = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	optimizer = make_optimizer(model, CONFIG)
+	for _ in range(3):
+		for p in model.parameters():
+			p.grad = torch.randn_like(p) + 0.5
+		optimizer.step()
+	out = trunk_moments(model, optimizer)
+	trunk = next(g for g in optimizer.param_groups if g["name"] == "trunk")
+	names = {id(p): n for n, p in model.named_parameters()}
+	n_body = sum(p.numel() for p in trunk["params"] if names[id(p)].startswith(SHARED_PREFIXES))
+	n_heads = sum(p.numel() for p in trunk["params"]) - n_body
+	assert n_body > 0 and n_heads > 0
+	pooled = (out["signal_body"] * n_body + out["signal_heads"] * n_heads) / (n_body + n_heads)
+	assert pooled == pytest.approx(signal_fraction(optimizer)["trunk"], rel=1e-4)

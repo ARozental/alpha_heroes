@@ -124,6 +124,10 @@ COLUMNS = [
 	# of gaps over their sampling variance) and the number of types that entered it, the credit's spread with the k's and
 	# the 7-day credit's on the same rows: the noise the k's leave out)
 	"segment_k5", "segment_k7", "segment_f2", "segment_f5", "segment_f7", "segment_types2", "segment_types5", "segment_types7", "segment_credit_std", "segment_full_std",
+	# (e5's learning-rate readings, 2026-11-11: each optimizer group's signal fraction (train.signal_fraction, in
+	# TensorBoard before), the trunk group's shared layers (body) and policy heads apart with their mean |m| / sqrt(v)
+	# (train.trunk_moments), the KL control's lr scale; kl, last_kl and learning_rate are above)
+	*(f"signal_{name}" for name in ("all", *GRAD_GROUPS)), "signal_body", "signal_heads", "ratio_body", "ratio_heads", "lr_scale",
 ]
 SEGMENT_RATE = 0.05  # config.credit_segments: each long segment's k moves this far toward its measured max(0, 1 - 1/F) an update
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
@@ -921,6 +925,9 @@ class CampaignLearner:
 			"grad_norm": metrics.get("grad_norm", float("nan")),
 			"steps": metrics["steps"],
 			"learning_rate": metrics["learning_rate"],
+			**{f"signal_{name}": (metrics.get("signal_fraction") or {}).get(name, float("nan")) for name in ("all", *GRAD_GROUPS)},
+			**{name: metrics.get(name, float("nan")) for name in ("signal_body", "signal_heads", "ratio_body", "ratio_heads")},
+			"lr_scale": self.lr_scale,
 			**{f"value_ev_d{k}": metrics[f"value_ev_d{k}"] for k in c.VALUE_OFFSETS},
 			**{f"head_ev_{kind}{k}": self.head_ev.get(f"{kind.upper()}{k}", float("nan")) for kind in "vg" for k in c.VALUE_OFFSETS},
 			"head_ev_vend": self.head_ev.get("Vend", float("nan")),

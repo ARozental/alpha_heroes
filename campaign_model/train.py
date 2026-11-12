@@ -886,6 +886,39 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 	return loss, metrics, fs_parts, fs_share
 
 
+SHARED_PREFIXES = ("encode_", "blocks.", "unet.", "read_tiles.", "sides.", "tile_sides.", "join_", "stamp_")  # (foresight.gradient_check's shared layers)
+
+
+def trunk_moments(model, optimizer):
+	"""The trunk group's Adam moments read apart for its shared layers (SHARED_PREFIXES: the encoders, blocks, U-Net,
+	tile readers) and the rest of it, the policy heads (e5's learning-rate readings, 2026-11-11): each part's signal
+	fraction (battle_model.optim.signal_fraction's formula) and its mean |m| / sqrt(v), bias-corrected, over the weights
+	that have had a gradient. One read of the device."""
+	names = {id(p): name for name, p in model.named_parameters()}
+	out = {}
+	for group in optimizer.param_groups:
+		if group.get("name") != "trunk" or "betas" not in group:
+			continue
+		beta1, beta2 = group["betas"]
+		parts = {"body": [], "heads": []}
+		for p in group["params"]:
+			state = optimizer.state.get(p, {})
+			if "exp_avg" not in state:
+				continue
+			step = float(state["step"])
+			v = state["exp_avg_sq"].flatten() / (1 - beta2**step)
+			live = v > 0
+			ratio = (state["exp_avg"].flatten()[live] / (1 - beta1**step)).abs() / v[live].sqrt()
+			parts["body" if names.get(id(p), "").startswith(SHARED_PREFIXES) else "heads"].append(ratio)
+		k = (1 - beta1) / (1 + beta1)
+		kept = [part for part in parts if parts[part]]
+		ratios = [torch.cat(parts[part]) for part in kept]
+		values = torch.stack([torch.stack([r.clamp(max=1.0).square().mean(), r.mean()]) for r in ratios]).tolist() if ratios else []
+		for part, (r2, mean) in zip(kept, values):
+			out[f"signal_{part}"], out[f"ratio_{part}"] = (r2 - k) / (1 - k), mean
+	return out
+
+
 def segment_surprises(targets, growth_real, value_all, growth_all, log_phi, share_trust, w, device):
 	"""config.credit_segments: each decision's credit in three segments [n, 3] (0-2, 2-5, 5-7 days), each that window's
 	real change less the heads' forecast for it, the share's (its baseline as the 7-day credit's: share_baseline) and the
@@ -1666,6 +1699,7 @@ def ppo_update(
 		**schedule_stats,
 		signal_ratio=signal_ratio(optimizer),  # (the steps' noise: the user's 2026-10-31 aim of 0.25+, with 4,096-decision steps)
 		signal_fraction=signal_fraction(optimizer),  # (the share of each group's gradient that is signal, at any beta1)
+		**trunk_moments(model, optimizer),  # (the trunk group's shared layers and its policy heads apart)
 		grad_norms=step_norms,  # (each step's: the learner's clip calibration, config.grad_clip_by_group)
 		**{f"grad_norm_{name}": float(np.median([norms[1 + i] for norms in step_norms])) for i, name in enumerate(GRAD_GROUPS) if step_norms},
 		**{f"clip_bound_{name}": float(np.mean([bound[i] for bound in step_bound])) for i, name in enumerate(GRAD_GROUPS) if step_bound},
