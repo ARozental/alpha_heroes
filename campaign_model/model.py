@@ -351,10 +351,18 @@ class CustomFeatures(nn.Module):
 		# (config.town_guard; ALPHA_TOWN_GUARD for a paired test; 0: off, the model as before) x a gain (1/4..2)
 		self.town_guard_shift = zeros()
 		self.register_buffer("town_guard", torch.zeros(()))
+		# The town's holding (F3, e5 for the user, 2026-11-12; town_hold_values): on the entries that add to a town's
+		# holding or take from it (a hero entering it, its recruits, its hires; its visitor leaving), what that change takes
+		# off the town's chance of falling to the nearest strong rival we see x the town's stake, as value_logit prices a
+		# pickup worth that much, x town_hold (config.town_hold; ALPHA_TOWN_HOLD for a paired test; 0: off, the model as
+		# before) x a gain (1/4..2)
+		self.town_hold_shift = zeros()
+		self.register_buffer("town_hold", torch.zeros(()))
 		override = lambda name: float(os.environ[name]) if os.environ.get(name, "") != "" else None  # noqa: E731
 		self.nk_override = (override("ALPHA_NK2_PRIOR"), override("ALPHA_NK2_PRIOR_FALLBACK"), override("ALPHA_NK2_LABEL"), override("ALPHA_NK2_FOLLOW"))
 		self.adv_override = override("ALPHA_ADV_GAIN")
 		self.guard_override = override("ALPHA_TOWN_GUARD")
+		self.hold_override = override("ALPHA_TOWN_HOLD")
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -379,7 +387,7 @@ class CustomFeatures(nn.Module):
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
 			self.night_gain,
 			self.nk_gain, self.nk_gain_fallback, self.nk_survival, self.nk_risk, self.nk_label_gain, self.nk_follow_shift,
-			self.adv_gain_shift, self.town_guard_shift,
+			self.adv_gain_shift, self.town_guard_shift, self.town_hold_shift,
 		]
 
 	# ---- the bounded prior parameters ----
@@ -434,6 +442,77 @@ class CustomFeatures(nn.Module):
 		heroes = torch.arange(c.OWN_HEROES, device=visitor.device)
 		cost = (loss.unsqueeze(-1) * (visitor.unsqueeze(-1) == heroes).float()).sum(dim=1)  # [B, HO]
 		return weight * ft.value_logit(cost)
+
+	def town_hold_weight(self):
+		"""The town's holding's logits a unit of value_logit (town_hold x its gain, 1/4..2); 0 with town_hold at 0."""
+		size = self.town_hold if self.hold_override is None else self.town_hold.new_tensor(self.hold_override)
+		return size * ft.bounded(self.town_hold_shift, 0.25, 2.0, 1.0, CORRECTION_STEP)
+
+	def town_hold_values(self, x, f):
+		"""F3, a town's holding (e5 for the user, 2026-11-12): what each entry that changes the holding of a town of ours
+		saves (gold, signed: x the town's stake; below 0 for what leaving costs), from inputs we already have, no
+		gradient into them. hold(T): the town's log strength as town_danger measures it (its garrison and fort, manned
+		while a hero is in: town_strength) with the heroes inside log-added, each at its fight strength (hero_strength);
+		a rival R we see: its log strength, near T as exp(-d / 45) of the tile distance on T's level (about three days:
+		its speed unknown, kept fuzzy), another level far; P_take the fight forecast's win curve (win_chance at
+		fight_sharpness) at strength(R) over hold(T); the protection of a change (features.hold_protection) the most over
+		R of near x the change in P_take: 0 with no rival near, for a town safe either way and for one lost either way.
+		The town's stake: town_stakes, our last town at least our Φ (town_night's rule: losing it ends the game).
+		  hold_recruit [B, TO]   RECRUIT at T and its RECRUIT_ALL rows: the creatures our gold buys from T's pool now,
+		                         the highest level first, into its garrison
+		  hold_hire [B, TO, N]   HIRE of tavern hero n at T: it and its army in as T's visitor (the fort manned)
+		  hold_leave [B, HO]     every MOVE and TRAVEL of a hero of ours visiting T: it out (below 0)
+		  hold_enter_town [B, HO, TO]  a hero of ours stepping into T (tile_features' MOVE onto T's cell): it in as
+		                         T's visitor, where the visiting place is free (else a meeting outside: 0)
+		and hold_stake [B, TO], hold_phi [B] for the share views."""
+		to = c.OWN_TOWNS
+		with torch.no_grad():
+			own = ft.own_towns(x)
+			stake = f.town_stakes[:, :to]
+			stake = torch.where(own & (own.sum(dim=1, keepdim=True) == 1), torch.maximum(stake, f.phi_total[:, None]), stake) * own
+			sharpness = ft.bounded(self.fight_sharpness, 0.5, 8.0, 4.0, CORRECTION_STEP)
+			strength = f.hero_strength[:, :HO]
+			visiting, garrisoned = x["t_visiting"][:, :to], x["t_garrison_hero"][:, :to]
+
+			def hero_in(index):  # [B, TO]: the log strength of our hero there, very low if none
+				found = torch.gather(strength, 1, index.clamp(0, HO - 1))
+				return torch.where(index >= 0, found, torch.full_like(found, -30.0))
+
+			power = f.town_power[:, :to]
+			manned, unmanned = self.town_strength(x, f.town_power, manned=True)[:, :to], f.town_strength[:, :to]
+			with_garrison_hero = ft.log_add(torch.where(garrisoned >= 0, manned, unmanned), hero_in(garrisoned))
+			hold = ft.log_add(torch.where((garrisoned >= 0) | (visiting >= 0), manned, unmanned), ft.log_add(hero_in(visiting), hero_in(garrisoned)))
+			_, near, theirs = ft.hold_reach(ft.enemies(x, f.hero_strength), x["t_pos"][:, :to])
+			protect = lambda after: ft.hold_protection(near, theirs, hold, after, sharpness) * stake  # noqa: E731
+			# RECRUIT: what our gold buys from the pool now, the highest level first (gold alone: other resources not counted)
+			creature = x["t_available_creature"][:, :to]
+			index = vocab_index(creature, c.CREATURE_VOCAB)
+			available = x["t_available"][:, :to].clamp(min=0).float() * (creature >= 0)
+			cost = self.creature_cost[index].clamp(min=1.0)
+			gold = x["g_resources"][:, 6].clamp(min=0).float()[:, None].expand(-1, to)
+			bought = torch.zeros_like(gold)
+			for level in reversed(range(c.N_LEVELS)):
+				n = torch.minimum(available[..., level], torch.floor(gold / cost[..., level]))
+				gold = gold - n * cost[..., level]
+				bought = bought + n * self.fight_value[index[..., level]]
+			more = torch.cat([power + bought, f.town_power[:, to:]], dim=1)
+			recruited = torch.where((garrisoned >= 0) | (visiting >= 0), self.town_strength(x, more, manned=True)[:, :to], self.town_strength(x, more)[:, :to])
+			hold_recruit = protect(ft.log_add(recruited, ft.log_add(hero_in(visiting), hero_in(garrisoned))))
+			# HIRE: the tavern hero and the army it brings, as T's visitor
+			tavern_c, tavern_n = x["g_tavern_army_creature"], x["g_tavern_army_count"]
+			tavern_power = (tavern_n.clamp(min=0).float() * (tavern_c >= 0) * self.fight_value[vocab_index(tavern_c, c.CREATURE_VOCAB)]).sum(dim=-1)  # [B, N]
+			hired = ft.hero_strength(x["g_tavern_primary"], tavern_power) * (x["g_tavern"] >= 0) + -30.0 * (x["g_tavern"] < 0)  # [B, N]
+			hire_after = ft.log_add(ft.log_add(manned, hero_in(garrisoned))[..., None], hired[:, None, :])  # [B, TO, N]
+			hold_hire = ft.hold_protection(near.unsqueeze(1), theirs.unsqueeze(1), hold.unsqueeze(-1).transpose(1, 2), hire_after.transpose(1, 2), sharpness).transpose(1, 2) * stake[..., None]
+			# Leaving: the visitor out (the garrison hero stays; a garrison hero cannot walk out)
+			leave_town = protect(with_garrison_hero)  # [B, TO] (<= 0)
+			heroes = torch.arange(HO, device=visiting.device)
+			hold_leave = (leave_town.unsqueeze(-1) * (visiting.unsqueeze(-1) == heroes).float()).sum(dim=1)  # [B, HO]
+			# Entering: hero h in as T's visitor where the place is free
+			enter_after = ft.log_add(ft.log_add(manned, hero_in(garrisoned)).unsqueeze(1), strength.unsqueeze(-1))  # [B, HO, TO]
+			enter = ft.hold_protection(near.unsqueeze(1), theirs.unsqueeze(1), hold.unsqueeze(1).expand_as(enter_after), enter_after, sharpness) * stake[:, None, :]
+			hold_enter = enter * (visiting < 0).unsqueeze(1) * (garrisoned.unsqueeze(1) != heroes[None, :, None])
+		return {"hold_recruit": hold_recruit, "hold_hire": hold_hire, "hold_leave": hold_leave, "hold_enter_town": hold_enter, "hold_stake": stake, "hold_phi": f.phi_total.clamp(min=1000.0)}
 
 	def nk_follow_logs(self):
 		"""(whether following is on, log rho, log (1 - rho)): the chance our choice is Nullkiller2's own (nk_follow at the
@@ -669,6 +748,7 @@ class CustomFeatures(nn.Module):
 		f.hire_want = ft.hire_want(x, f.gold_pressure, f.town_danger, ft.object_classes(x))
 		f.tavern_worth = ft.tavern_worth(x, self)
 		f.hire_gain = ft.hire_gain(x, self, f.tavern_worth)
+		f.update(self.town_hold_values(x, f))  # (F3: what each change of a town's holding saves; config.town_hold)
 		f.trade_needs = ft.trade_needs(x, self)
 		f.trade_options = ft.trade_options(x, self)
 		f.build_trade, f.recruit_trade, f.recruit_short = ft.purchase_trades(x, self)
@@ -1472,6 +1552,8 @@ class CustomFeatures(nn.Module):
 			"tile_value": value, "tile_prior": logits, "tile_night": night, "tile_shift": logits - prior, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight, "tile_fight_ratio": fight_ratio, "tile_fights": fights.float(),
 			"tile_stacks": (monster | guarded).float(),  # (a wandering monster or its zone: model_v2's battle head)
 			"move_strength": ft.strength_view(torch.cat([this_hero, main_army], dim=-1)), "move_relative": relative,  # (model_v2: MOVE_STRENGTH, MOVE_RELATIVE)
+			# (F3: a step onto a town of ours, the hero in as its visitor: what that saves, town_hold_values' hold_enter_town)
+			"tile_hold": (on_tile(x["t_pos"][:, :TO], ft.own_towns(x)).float() * f.hold_enter_town.reshape(-1, TO).index_select(0, heroes)[:, None, None, :]).sum(dim=-1),
 		}
 
 
@@ -1633,7 +1715,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.town_hold_shift", "features.town_hold")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
@@ -1647,6 +1729,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"privileged",  # (2026-11-06: the privileged critic, its corrections 0 at the start)
 	"army_slot", "army_stay_q",  # (schema 16: ARMY's target slot, its queries 0 at the start: its priors alone)
 	"side_tile", "side_global",  # (2026-11-08: the map's block side, 0: docs/map_size_plan.md)
+	"town_hold_view",  # (F3, 2026-11-12: the town's holding's share views, 0 at the start)
 	# (schema 19, 2026-11-11: the bounded views and Nullkiller2's candidates, model_v2.CampaignModelV2.advice: every one's output 0 at the start)
 	"time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global",
 	"advantage.",  # (2026-11-11: the advantage head, model_v2.AdvantageHead, its weights 0 at the start)

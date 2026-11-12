@@ -572,6 +572,32 @@ def town_night(x, hero_strength, manned, unmanned, stakes, decision, hero, foes,
 	return ((p_now.unsqueeze(1) - p_after) * stake.unsqueeze(1)).sum(dim=-1)
 
 
+# ---- a town's holding (F3, e5 for the user, 2026-11-12) ----
+
+HOLD_NEAR = (15.0, 45.0)  # tiles: a rival hero about a day and about three days from a town, as fuzzy discounts exp(-d / n) (its speed unknown)
+
+
+def hold_reach(foes, tpos):
+	"""How near each rival hero we see is to our towns, tpos [B, TO, 3]: ([B, TO, E] about a day's, [B, TO, E] about
+	three days', [B, 1, E] its log strength): exp(-d / 15) and exp(-d / 45) of the tile distance on the town's level,
+	0 on another level (far)."""
+	pos, strength, present = foes
+	distance = torch.maximum((tpos[..., None, 0] - pos[:, None, :, 0]).abs(), (tpos[..., None, 1] - pos[:, None, :, 1]).abs()).float()
+	there = (tpos[..., None, 2] == pos[:, None, :, 2]) & present[:, None, :]
+	near1, near3 = (torch.exp(-distance / n) * there for n in HOLD_NEAR)
+	return near1, near3, strength[:, None, :]
+
+
+def hold_protection(near, theirs, before, after, sharpness):
+	"""What a change of a town's holding from before to after (log strengths, the fight forecast's measure: [..., TO])
+	takes off its chance of falling: the most over the rivals (near, theirs [..., TO, E]) of near x [P_take(before) -
+	P_take(after)], P_take the fight forecast's win curve at their strength over the holding. Above 0 when after holds
+	more, below 0 when less; 0 with no rival near, and 0 for a town safe either way or lost either way."""
+	take = lambda hold: win_chance(theirs - hold.unsqueeze(-1), sharpness)  # noqa: E731
+	change = near * (take(before) - take(after))
+	return torch.where(change.abs().amax(dim=-1) == change.amax(dim=-1), change.amax(dim=-1), change.amin(dim=-1))
+
+
 def night_danger(x, hero_strength, manned, pos):
 	"""P(a hero of ours is lost tonight) [B, HO, N] if its day ends at pos [B, HO, N, 3] (x, y, level): the enemy heroes
 	we see, each one's reach there x P(it beats the hero), at the most (MOVE's danger); in a town of ours an enemy must

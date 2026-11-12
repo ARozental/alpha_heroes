@@ -365,6 +365,12 @@ class Memory(nn.Module):
 		return (1 - gate) * memory + gate * torch.tanh(self.candidate(both))
 
 
+def hold_views(gold, phi):
+	"""F3's saved gold [B, ...] as a share of our empire (phi [B]) at views.value_views' two share scales [B, ..., 2]."""
+	share = gold / V._like(phi, gold)
+	return torch.stack([V.soft(share, V.SHARE_HALVES[0]), V.soft(share, V.SHARE_HALVES[1])], dim=-1)
+
+
 class FastLinear(nn.Module):
 	"""A linear readout onto a logit, [.., inputs] -> [..]: its weights start at 0 (the readout adds nothing) and move
 	`step` times as far a step as a plain weight. Adam moves a weight about the learning rate a step whatever its
@@ -596,6 +602,10 @@ class CampaignModelV2(nn.Module):
 		# nk_predict's head (2026-11-11, stage 1: it only learns, config.nk_predict_weight), made last: the other
 		# parameters' initialisation as before
 		self.nkp = NkPredictHead(d, dp)
+		# F3, a town's holding (e5 for the user, 2026-11-12; model.CustomFeatures.town_hold_values): what an entry saves of
+		# a town of ours (signed gold) as a share of our empire at its two scales (views.value_views' share views), one
+		# fast weight a scale onto the logit of every entry that changes a holding; 0 at the start (zeros: no draw)
+		self.town_hold_view = FastLinear(2)
 
 	def prior_corrections(self):
 		"""The parameters that correct a fixed prior (model.CustomFeatures): weight decay pulls them back to it."""
@@ -1115,6 +1125,14 @@ class CampaignModelV2(nn.Module):
 		# entries (ours only: the follow mixture's part is Nullkiller2's choice as it is)
 		guard = self.features.town_guard_cost(x, known)  # [B, HO]
 		move_prior = move_prior - guard.gather(1, ft.slot_heroes(x)).reshape(b, HO, 1, 1)
+		# F3, a town's holding (config.town_hold, 0: off, every term x 0; the views' weights 0 at the start): a step into a
+		# town of ours (its cell) adds the hero to the holding, any step of the town's visitor takes it out; priced as a
+		# pickup worth what it saves (value_logit) x the weight, and as its share of our empire through town_hold_view
+		hold_weight, phi = self.features.town_hold_weight(), known.hold_phi
+		hold_enter = dense(real_only(known.tile_hold, known), known.windows, known.n, b) if known.n > 0 else move_prior.new_zeros(b, HO, W, W)
+		hold_move = hold_enter + known.hold_leave.gather(1, ft.slot_heroes(x)).reshape(b, HO, 1, 1)
+		move_prior = move_prior + hold_weight * ft.value_logit(hold_move)
+		move = move + self.town_hold_view(hold_views(hold_move, phi)).to(move.dtype)
 		learned[A_.MOVE], prior[A_.MOVE] = move + self.act_move(own_heroes).reshape(b, HO).gather(1, ft.slot_heroes(x)).reshape(b, HO, 1, 1), move_prior
 		offers[A_.MOVE] = ft.signed_offer(move_prior, x["move_mask"])  # (below 0 when every move is worse than staying)
 		# Nullkiller2's own choice now (schema 19: views.label), as a prior of nk_label_weight logits on its entry inside the
@@ -1129,6 +1147,9 @@ class CampaignModelV2(nn.Module):
 		# TRAVEL: (hero, area) pairs, + the area's prior (its value discounted by the days to it)
 		learned[A_.TRAVEL] = (self.travel_out(state.travel_pairs).squeeze(-1) + state.travel_view.to(state.travel_pairs.dtype) + self.act_travel(own_heroes)).reshape(b, HO, L, TG, TG)
 		prior[A_.TRAVEL] = (known.travel_logits + advised("travel")).reshape(b, HO, L, TG, TG) - guard.reshape(b, HO, 1, 1, 1)  # (the network reads travel_prior: without the night)
+		hold_travel = known.hold_leave.reshape(b, HO, 1, 1, 1)  # (F3: the town's visitor leaving it)
+		prior[A_.TRAVEL] = prior[A_.TRAVEL] + hold_weight * ft.value_logit(hold_travel)
+		learned[A_.TRAVEL] = learned[A_.TRAVEL] + self.town_hold_view(hold_views(hold_travel, phi)).to(learned[A_.TRAVEL].dtype)
 		offers[A_.TRAVEL] = ft.signed_offer(prior[A_.TRAVEL], x["travel_mask"])
 		# BUILD: the town's query against each building. A purchase short of resources pays the trades it makes (known.
 		# build_trade, recruit_trade: the gold of worth they lose), priced as every change of Φ is (value_logit), in the
@@ -1154,14 +1175,18 @@ class CampaignModelV2(nn.Module):
 		)
 		learned[A_.RECRUIT] = self.recruit_head(recruit_in).reshape(b, TO, c.N_LEVELS, c.N_RECRUIT_AMOUNTS, c.N_RECRUIT_TARGETS)
 		recruit_charge = (trade_cost * ft.value_logit(known.recruit_trade))[..., None, None].expand_as(learned[A_.RECRUIT])
-		prior[A_.RECRUIT] = self.features.recruit_prior(known.town_danger).expand_as(learned[A_.RECRUIT]) - recruit_charge
+		hold_recruit = known.hold_recruit[:, :, None, None, None]  # (F3: what our gold buys there now, into the town's holding)
+		learned[A_.RECRUIT] = learned[A_.RECRUIT] + self.town_hold_view(hold_views(hold_recruit, phi)).to(learned[A_.RECRUIT].dtype)
+		recruit_hold = (hold_weight * ft.value_logit(hold_recruit)).expand_as(learned[A_.RECRUIT])
+		prior[A_.RECRUIT] = self.features.recruit_prior(known.town_danger).expand_as(learned[A_.RECRUIT]) - recruit_charge + recruit_hold
 		_, upgrade_weight, book_weight, pause_weight = self.features.nk2_weights()  # (a skill's: model.CustomFeatures.option_knowledge)
 		home_weight, defend_weight, ferry_weight, hire_weight, _ = self.features.pull_weights()  # (TRADE: trade_cost_weight since 2026-11-04)
-		offers[A_.RECRUIT] = -pause_weight * known.recruit_pause + best_legal(-recruit_charge, x["recruit_mask"])  # (no army bought while saving for a hall: Nullkiller2's habit)
+		offers[A_.RECRUIT] = -pause_weight * known.recruit_pause + best_legal(-recruit_charge + recruit_hold, x["recruit_mask"])  # (no army bought while saving for a hall: Nullkiller2's habit)
 		# HIRE: the town's query against each hero for hire (the same hero space as ours) + what the hire does to Φ
 		worth = torch.cat([scales(known.tavern_worth.clamp(min=0), (1000, 3000, 10000)), torch.tanh(known.hire_gain / 2000).unsqueeze(-1)], dim=-1)
 		learned[A_.HIRE] = torch.einsum("btd,bsd->bts", self.hire_q(own_towns), self.hire_k(state.tavern)) / math.sqrt(d) + self.hire_worth(worth).squeeze(-1).unsqueeze(1)
-		prior[A_.HIRE] = ft.value_logit(known.hire_gain).unsqueeze(1).expand(b, TO, c.N_TAVERN)
+		prior[A_.HIRE] = ft.value_logit(known.hire_gain).unsqueeze(1).expand(b, TO, c.N_TAVERN) + hold_weight * ft.value_logit(known.hold_hire)  # (F3: the hero and its army in as the town's visitor)
+		learned[A_.HIRE] = learned[A_.HIRE] + self.town_hold_view(hold_views(known.hold_hire, phi)).to(learned[A_.HIRE].dtype)
 		offers[A_.HIRE] = best_legal(prior[A_.HIRE], x["hire_mask"]) + hire_weight * known.hire_want
 		# ARMY and UPGRADE: each stack (its holder's token with it) against each holder
 		holders = torch.cat([own_heroes, own_towns, state.other.unsqueeze(1)], dim=1)
@@ -1221,7 +1246,9 @@ class CampaignModelV2(nn.Module):
 		exchange = (kind == c.MultiKind.GIVE_ALL) | (kind == c.MultiKind.TAKE_BEST) | (kind == c.MultiKind.TAKE_BEST_FAST)
 		hero = (kind == c.MultiKind.DROP_SLOW) | (kind == c.MultiKind.DROP_FOREIGN) | (kind == c.MultiKind.SPLIT_SINGLES) | (kind == c.MultiKind.MERGE_ALL)
 		learned[A_.MULTI] = torch.where(exchange, by_receiver, torch.where(hero, by_hero, by_town))
-		prior[A_.MULTI] = known.multi_prior
+		hold_multi = known.hold_recruit.unsqueeze(-1) * ((kind == c.MultiKind.RECRUIT_ALL) | (kind == c.MultiKind.RECRUIT_ALL_HERO)).float()  # (F3: a town's recruit-all rows)
+		learned[A_.MULTI] = learned[A_.MULTI] + self.town_hold_view(hold_views(hold_multi, phi)).to(learned[A_.MULTI].dtype)
+		prior[A_.MULTI] = known.multi_prior + hold_weight * ft.value_logit(hold_multi)
 		offers[A_.MULTI] = best_legal(prior[A_.MULTI], x["multi_mask"])
 		learned[A_.DISMISS] = self.dismiss_out(own_heroes).squeeze(-1)
 		prior[A_.DISMISS] = torch.zeros_like(learned[A_.DISMISS])

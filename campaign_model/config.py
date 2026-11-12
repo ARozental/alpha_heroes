@@ -334,6 +334,13 @@ class CampaignConfig:
 	# only (the follow mixture's part is untouched); no masking. 0: off, the model as before, bit for bit. Set at every
 	# start (learner.set_advice_prior); ALPHA_TOWN_GUARD for a paired test
 	town_guard: float = 0.0
+	# F3, a town's holding (e5 for the user, 2026-11-12; model.CustomFeatures.town_hold_values): this many logits a unit of
+	# value_logit(what an entry saves of a town of ours: the change in its chance of falling to the nearest strong rival
+	# we see x its stake) on the entries that add to its holding (a hero stepping in, its recruits, its hires) or take
+	# from it (its visitor's every MOVE and TRAVEL), x a learned gain (1/4..2); its share of our empire on those entries
+	# through a zero-start fast weight whatever this is. 0: off, the model as before, bit for bit. ALPHA_TOWN_HOLD for a
+	# paired test
+	town_hold: float = 0.0
 	# The credit's horizon by segments (bundle 60; e5's design from 6,424 own-policy player-days: the share-change surprise's
 	# spread is 0.050 at 2 days, 0.074 at 5, 0.087 at 7, and what happens in 2 days persists, slope 0.95, so the 7-day
 	# credit is the 2-day one plus 2.4 times its variance added in days 3-7). On: the schedule credit is surprise(0-2) +
