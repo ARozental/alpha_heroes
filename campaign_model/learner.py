@@ -53,7 +53,7 @@ from .empire import STATUS_INGAME, EmpireConfig, empire_value
 from .failures import NAMES as FAILURES, failure_modes
 from .features import SKILLS
 from .labels import (
-	COLORS, CREDIT_MIN_PLAYERS, GROWTH_CAP, PHI_FLOOR, LabelConfig, actions_ahead, attributed_labels, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
+	COLORS, CREDIT_MEMORY, CREDIT_MIN_PLAYERS, GROWTH_CAP, PHI_FLOOR, LabelConfig, actions_ahead, attributed_labels, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
 	label, ladder_targets, pooled_ev, residual_variances, share_change_labels, share_logit, share_now, tables,
 )
 from .advice import teacher_sets
@@ -62,7 +62,7 @@ from .labeler import Labeler
 from .model import build_model
 from .play import choice_hidden
 from .records import NO_EFFECT, TEACHER, decode_fields, decode_inputs
-from .train import GRAD_GROUPS, HEAD_SCALE_RAMP, _prefetched, fit_moments, load_optimizer, make_optimizer, migrate_subtypes, model_kwargs, ppo_update, segment_shrinkage, usable
+from .train import GRAD_GROUPS, HEAD_SCALE_RAMP, _prefetched, fit_moments, load_optimizer, make_optimizer, migrate_subtypes, model_kwargs, pooled_evidence, ppo_update, segment_shrinkage, usable
 
 TYPES = [a.name.lower() for a in c.ActionType]
 FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answer") for part in ("battle", "score", "parts")) + ("foresight_hero_alive", "foresight_hero_army", "foresight_turn", "foresight_plan", "foresight_move_tiles", "foresight_move_win", "foresight_move_stake")
@@ -129,6 +129,9 @@ COLUMNS = [
 	# of gaps over their sampling variance) and the number of types that entered it, the credit's spread with the k's and
 	# the 7-day credit's on the same rows: the noise the k's leave out)
 	"segment_k5", "segment_k7", "segment_f2", "segment_f5", "segment_f7", "segment_types2", "segment_types5", "segment_types7", "segment_credit_std", "segment_full_std",
+	# (2026-11-12: F stratified by the kind of game, shown or hidden; the same evidence's F with the kinds merged, the
+	# statistic before, for comparison)
+	"segment_f2_pooled", "segment_f5_pooled", "segment_f7_pooled",
 	# (e5's learning-rate readings, 2026-11-11: each optimizer group's signal fraction (train.signal_fraction, in
 	# TensorBoard before), the trunk group's shared layers (body) and policy heads apart with their mean |m| / sqrt(v)
 	# (train.trunk_moments), the KL control's lr scale; kl, last_kl and learning_rate are above)
@@ -752,7 +755,7 @@ class CampaignLearner:
 			row["end_check"] = self.end_check
 		surprises = metrics.pop("segment_surprise", None)
 		if surprises is not None:  # (config.credit_segments: each segment's evidence, and the k's for the next update)
-			row.update(self._note_segments(decisions, surprises, np.concatenate(streams[0])))
+			row.update(self._note_segments(decisions, surprises, np.concatenate(streams[0]), np.concatenate(hidden) if hidden else None))
 		self._relabel_waiting()
 		memory.append(("updated", rss_gb()))
 		self._log(epoch, games, decisions, row, metrics, time.time() - started)
@@ -771,17 +774,25 @@ class CampaignLearner:
 			print(f"campaign gpu memory (GB): allocated {torch.cuda.memory_allocated(self.device) / 2**30:.1f}  reserved {torch.cuda.memory_reserved(self.device) / 2**30:.1f}  card free {free / 2**30:.1f} of {total / 2**30:.1f}", flush=True)
 		return True
 
-	def _note_segments(self, decisions, surprises, players):
+	def _note_segments(self, decisions, surprises, players, hidden=None):
 		"""config.credit_segments: each segment's surprise (ppo_update's, [n, 3]) into its evidence (labels.credit_evidence:
 		by action type, against the player's other decisions, faded); each long segment's k one step of SEGMENT_RATE toward
 		train.segment_shrinkage's max(0, 1 - 1/F), at most 1; the next update's credit uses them (one update's lag). The
-		row's readings: the k's this update used, each segment's F and its types."""
+		row's readings: the k's this update used, each segment's F and its types, and its F with the kinds merged.
+		hidden [n] (each decision's game hid Nullkiller2's own choice), where the update has both kinds: the evidence kept
+		by kind ("hidden/TYPE", "shown/TYPE"), so that F reads the types' spread within each kind and not the gap between
+		the kinds (e5, 2026-11-12); one kind, or none known: as before. The whole evidence fades once an update."""
 		out = {"segment_k5": self.segment_k[0], "segment_k7": self.segment_k[1]}
 		ks = list(self.segment_k)
+		hidden = None if hidden is None or len(hidden) != len(decisions) else np.asarray(hidden, dtype=bool)
+		strata = [("hidden/", hidden), ("shown/", ~hidden)] if hidden is not None and hidden.any() and (~hidden).any() else [("", None)]
 		for j, offset in enumerate(c.VALUE_OFFSETS):
-			self.segment_evidence[j] = credit_evidence(decisions, surprises[:, j], players, self.segment_evidence[j])
+			for i, (prefix, rows) in enumerate(strata):
+				errors = surprises[:, j] if rows is None else np.where(rows, surprises[:, j], np.nan)
+				self.segment_evidence[j] = credit_evidence(decisions, errors, players, self.segment_evidence[j], memory=CREDIT_MEMORY if i == 0 else 1.0, prefix=prefix)
 			k, f, types = segment_shrinkage(self.segment_evidence[j], CREDIT_MIN_PLAYERS)
 			out[f"segment_f{offset}"], out[f"segment_types{offset}"] = f, types
+			out[f"segment_f{offset}_pooled"] = segment_shrinkage(pooled_evidence(self.segment_evidence[j]), CREDIT_MIN_PLAYERS)[1]
 			if j > 0 and np.isfinite(k):
 				ks[j - 1] = min(1.0, ks[j - 1] + SEGMENT_RATE * (k - ks[j - 1]))
 		self.segment_k = (float(ks[0]), float(ks[1]))
@@ -903,7 +914,7 @@ class CampaignLearner:
 			# choice there, the advantage head's fit, players out of their game)
 			**choice_readings(games, metrics),
 			**{name: metrics.get(name, float("nan")) for name in ("adv_loss", "adv_ev", "adv_ev_followed", "adv_ev_deviating", "adv_followed", "adv_raw_sd", "adv_kl", "adv_read")},
-			**{name: sums.get(name, float("nan")) for name in ("segment_k5", "segment_k7", "segment_f2", "segment_f5", "segment_f7", "segment_types2", "segment_types5", "segment_types7")},
+			**{name: sums.get(name, float("nan")) for name in ("segment_k5", "segment_k7", "segment_f2", "segment_f5", "segment_f7", "segment_types2", "segment_types5", "segment_types7", "segment_f2_pooled", "segment_f5_pooled", "segment_f7_pooled")},
 			**{name: metrics.get(name, float("nan")) for name in ("segment_credit_std", "segment_full_std")},
 			**{name: metrics.get(name, float("nan")) for name in ("nkp_loss", "nkp_auc", "nkp_positives", *(f"nkp_ev_{form}" for form in ("preference_all", "preference_hero", "soon", "later", "rank")), "nkp_ce", "nkp_ce_uniform", "nkp_top1_best", "nkp_top1_choice")},
 			"action_price_mean": metrics.get("schedule_action_price_mean", float("nan")),
@@ -1359,12 +1370,17 @@ def value_jump(readings, window=VALUE_JUMP_WINDOW, baseline=VALUE_JUMP_BASELINE,
 
 def fresh_readings(progress, keep=VALUE_JUMP_MEMORY + VALUE_JUMP_WINDOW, since=0):
 	"""progress.csv's value_loss_fresh readings (the finite ones, the last `keep`): the value-loss guard's memory across
-	a restart. since (config.value_jump_from): only the rows of that version and later, the guard's memory after a
-	hold somebody looked into and let go on. A file that cannot be read is no memory (the guard then waits for its own
-	readings), never an error."""
+	a restart. Only the line the run is on: the rows after the last place the version went down in file order (a
+	rollback's: before 2026-11-12 the abandoned line's rows were read as the guard's calm level and held the mixed line at
+	v3261, deploy 68). since (config.value_jump_from): of those, only the rows of that version and later, the guard's
+	memory after a hold somebody looked into and let go on. A file that cannot be read is no memory (the guard then waits
+	for its own readings), never an error."""
 	try:
 		with open(progress, newline="") as f:
-			rows = [row for row in csv.DictReader(f) if not since or float(row.get("version") or 0) >= since]
+			rows = list(csv.DictReader(f))
+		versions = [float(row.get("version") or 0) for row in rows]
+		start = max((i for i in range(1, len(versions)) if versions[i] < versions[i - 1]), default=0)
+		rows = [row for row in rows[start:] if not since or float(row.get("version") or 0) >= since]
 		values = [row.get("value_loss_fresh") for row in rows]
 		values = [float(v) for v in values if v not in (None, "", "nan")]
 		return [v for v in values if np.isfinite(v)][-keep:]

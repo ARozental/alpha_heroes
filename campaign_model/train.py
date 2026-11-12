@@ -955,20 +955,41 @@ def segment_shrinkage(evidence, min_players):
 	degrees: mean 1 whatever the types' sizes), k = max(0, 1 - 1 / F); nan (0 types) with fewer than 2. Before
 	2026-11-12 F was the means' plain variance over the v_t's mean: also 1 on average, but riding on the noisiest type's
 	single draw (about z^2 of one type with 56 game-players against 600 for the rest: what lifted k7 to 0.17 at v3254,
-	e5's 1b). With equal v_t the two are the same."""
-	means, variances = [], []
-	for n, total, squares in (evidence or {}).values():
+	e5's 1b). With equal v_t the two are the same.
+	Stratified by the kind of game (e5, 2026-11-12: the mixed line's shown and hidden games, where a type's surprise
+	differs by kind and pooling them read that difference as the types' spread): an evidence key "kind/TYPE" is that
+	type within that kind; each kind its own weighted centre, F = sum over kinds of sum w_t (m_t - m_wk)^2 over sum of
+	(types_k - 1), min_players within a kind. Keys without a kind are one kind: today's F exactly."""
+	kinds = {}
+	for key, (n, total, squares) in (evidence or {}).items():
 		if n < min_players:
 			continue
 		mean = total / n
-		means.append(mean)
-		variances.append(max(squares / n - mean * mean, 0.0) * n / (n - 1) / n)
-	if len(means) < 2:
-		return float("nan"), float("nan"), len(means)
-	means, weights = np.asarray(means), 1.0 / np.maximum(np.asarray(variances), 1e-12)
-	centre = float((weights * means).sum() / weights.sum())
-	f = float((weights * (means - centre) ** 2).sum() / (len(means) - 1))
-	return max(0.0, 1.0 - 1.0 / f) if f > 0 else 0.0, f, len(means)
+		kinds.setdefault(key.rsplit("/", 1)[0] if "/" in key else "", []).append((mean, max(squares / n - mean * mean, 0.0) * n / (n - 1) / n))
+	spread, degrees, types = 0.0, 0, 0
+	for rows in kinds.values():
+		if len(rows) < 2:
+			continue
+		means, weights = np.array([m for m, _ in rows]), 1.0 / np.maximum(np.array([v for _, v in rows]), 1e-12)
+		centre = float((weights * means).sum() / weights.sum())
+		spread += float((weights * (means - centre) ** 2).sum())
+		degrees += len(rows) - 1
+		types += len(rows)
+	if degrees == 0:
+		return float("nan"), float("nan"), types
+	f = spread / degrees
+	return max(0.0, 1.0 - 1.0 / f) if f > 0 else 0.0, f, types
+
+
+def pooled_evidence(evidence):
+	"""credit_evidence's sums with the kinds of game merged (each type's over every kind): the statistic before the
+	stratification, for the log."""
+	pooled = {}
+	for key, sums in (evidence or {}).items():
+		acc = pooled.setdefault(key.rsplit("/", 1)[-1], [0.0, 0.0, 0.0])
+		for i in range(3):
+			acc[i] += sums[i]
+	return pooled
 
 
 def share_baseline(real_change, predicted, trust):
@@ -1315,7 +1336,7 @@ def ppo_update(
 
 		def nkp_fn(out, batch):
 			part, _ = nk_loss({k: v for k, v in out.items() if k.startswith("nkp_")}, {k[4:]: v for k, v in out.items() if k.startswith("nkt:")})
-			return config.nk_predict_weight * batch["scale"] * part, part.detach().float() * nkp_slot
+			return config.nk_predict_weight * batch["scale"] * part, (batch["scale"] * part).detach().float() * nkp_slot  # (logged at its share of the update, as the other parts are: unweighted, the sum over the head's steps read ~40)
 
 		if graphs is not None and config.step_graphs:
 			# (kept with the model as the main graph is: a local one was recorded and checked again every update, e5's find,

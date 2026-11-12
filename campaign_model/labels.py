@@ -359,7 +359,7 @@ CREDIT_MEMORY = 0.9  # the check's evidence fades this much an update: it weighs
 CREDIT_MIN_PLAYERS = 8.0  # game-players (faded) with decisions of a type before the check judges the type
 
 
-def credit_evidence(decisions, errors, players, evidence=None, memory=CREDIT_MEMORY):
+def credit_evidence(decisions, errors, players, evidence=None, memory=CREDIT_MEMORY, prefix=""):
 	"""The credit check's evidence, {action type: [n, sum, sum of squares]} over game-players of the step's mean error
 	after that type minus after the player's other turn decisions (errors: horizon_advantages' parts, nan where none;
 	players: an id per decision), added to the earlier updates' (evidence) faded by memory.
@@ -368,7 +368,8 @@ def credit_evidence(decisions, errors, players, evidence=None, memory=CREDIT_MEM
 	- Against the player's other decisions: the luck they share cancels, and so does an error common to all of them,
 	  which costs the policy nothing (ppo_update centres the advantages); what is left is the heads pricing what follows
 	  one type differently from the rest, a quick gain's mark.
-	- One update has ~16 game-players; the evidence is kept (~10 updates) to see a small gap."""
+	- One update has ~16 game-players; the evidence is kept (~10 updates) to see a small gap.
+	prefix: put before each type's name ("hidden/" ...): the credit segments keep each kind of game's evidence apart."""
 	evidence = {kind: [memory * v for v in sums] for kind, sums in (evidence or {}).items()}
 	kinds = np.array([d.action_type if d.kind == c.DecisionKind.TURN else -1 for d in decisions])
 	keep = (kinds >= 0) & np.isfinite(errors)
@@ -381,7 +382,7 @@ def credit_evidence(decisions, errors, players, evidence=None, memory=CREDIT_MEM
 				gaps.append(errors[mine & (kinds == kind)].mean() - errors[others].mean())
 		if gaps:
 			gaps = np.array(gaps)
-			sums = evidence.setdefault(c.ActionType(int(kind)).name, [0.0, 0.0, 0.0])
+			sums = evidence.setdefault(prefix + c.ActionType(int(kind)).name, [0.0, 0.0, 0.0])  # (prefix: "kind/" for train.segment_shrinkage's strata)
 			sums[0], sums[1], sums[2] = sums[0] + len(gaps), sums[1] + float(gaps.sum()), sums[2] + float((gaps**2).sum())
 	return evidence
 
