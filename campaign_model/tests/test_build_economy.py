@@ -139,3 +139,51 @@ def test_a_checkpoint_from_before_loads_and_plays_as_it_did():
 	for name, value in base.items():
 		if torch.is_tensor(value) and value.is_floating_point():
 			assert torch.allclose(torch.nan_to_num(value, nan=0.0, posinf=1e9, neginf=-1e9), torch.nan_to_num(out[name], nan=0.0, posinf=1e9, neginf=-1e9), atol=1e-6), name
+
+
+def test_hall_income_counts_each_flag_once_and_the_silo_adds():
+	m = model()
+	x = inputs(2, 4)
+	x["t_present"][0, :] = False
+	x["t_present"][0, 0], x["t_owner"][0, 0], x["t_faction"][0, 0] = True, c.OWNER_SELF, 0
+	x["t_built"][0, 0] = False
+	for b in ft.HALLS:  # (a capitol town holds all four flags: 307 of 307 capitol towns in deploy 67's spool games)
+		x["t_built"][0, 0, b] = True
+	m.features.build_economy.fill_(1.0)
+	own, faction = ft.own_towns(x), ft.vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)
+	assert float(ft._feature_hall_income_used(x, m.features, own, faction)[0]) == 1.0
+	assert all(float(m.features.building_income[f, 15]) > 0 for f in range(9))  # (the silo's resources at their prices)
+
+
+def test_alpha_rides_in_the_weights():
+	from campaign_model.empire import EmpireConfig, building_value
+
+	m = model()
+	t = m.features
+	assert float(t.empire_alpha) == 0.25
+	cost = float(t.creature_unit_cost[12])
+	assert float(t.creature_unit[12]) == 0.25 * cost
+	for alpha in (0.25, 0.5):
+		t.empire_alpha.fill_(alpha)
+		assert float(t.creature_unit[12]) == alpha * cost
+		assert abs(float(t.building_value[0, 31]) - building_value(0, 31, EmpireConfig(alpha=alpha))) < 1e-3
+	fresh = model()
+	state = m.state_dict()
+	fresh.load_state_dict(state)
+	assert float(fresh.features.empire_alpha) == 0.5  # (an inference server loading the learner's weights takes its ALPHA)
+
+
+def test_a_castle_doubles_the_upgraded_and_horde_parts_too():
+	m = model()
+	x = inputs(2, 4)
+	t = m.features
+	faction = torch.zeros(2, TO, dtype=torch.long)
+	plain = torch.zeros(2, TO, NB, dtype=torch.bool)
+	plain[..., 30] = True
+	castle = plain.clone()
+	castle[..., (7, 8, 9)] = True
+	a, b = ft._production_added(x, t, faction, plain), ft._production_added(x, t, faction, castle)
+	assert float(a[0, 0, 37]) > 0 and abs(float(b[0, 0, 37]) - 2 * float(a[0, 0, 37])) < 1e-3
+	horde = [k for k in range(NB) if int(t.horde_level[0, k]) == 0]
+	if horde:
+		assert abs(float(b[0, 0, horde[0]]) - 2 * float(a[0, 0, horde[0]])) < 1e-3 and float(a[0, 0, horde[0]]) > 0

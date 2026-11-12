@@ -1236,21 +1236,23 @@ def _production_added(x, t, faction, built):
 	cost x the fort's multiplier; a citadel and a castle each half the town's built base dwellings' week; a horde its
 	extra growth (half its level's base growth: the engine's number is in the H3 data, not the configs; H3's are 43-67% of
 	base, griffins +3 of 7, imps +8 of 15, dendroids +2 of 3) x cost where that
-	level is built; an upgraded dwelling growth x (its creature's cost less the base's) only."""
+	level is built; an upgraded dwelling growth x (its creature's cost less the base's) only. The fort's multiplier on
+	the three dwellings' parts alike (a castle doubles a level's growth, its upgraded and horde creatures' too)."""
 	week = _dwelling_week(t, faction)  # [B, TO, 7]
+	fort = _fort_multiplier(built).unsqueeze(-1)
 	levels = built[..., list(DWELLINGS_BASE)] | built[..., list(DWELLINGS_UP)]
 	half = 0.5 * (week * levels).sum(dim=-1, keepdim=True)
 	up, base = t.dwelling_creature[faction][..., list(DWELLINGS_UP)], t.dwelling_base[faction][..., list(DWELLINGS_UP)]
 	up_i, base_i = vocab_index(up, c.CREATURE_VOCAB), vocab_index(base, c.CREATURE_VOCAB)
 	upgraded = t.creature_growth[base_i] * (t.creature_cost[up_i] - t.creature_cost[base_i]).clamp(min=0) * ((up >= 0) & (base >= 0))
 	added = (
-		_to_buildings(week * _fort_multiplier(built).unsqueeze(-1), DWELLINGS_BASE, week.device)
+		_to_buildings(week * fort, DWELLINGS_BASE, week.device)
 		+ _to_buildings(torch.cat([half, half], dim=-1), (CITADEL, CASTLE_BUILDING), week.device)
-		+ _to_buildings(upgraded, DWELLINGS_UP, week.device)
+		+ _to_buildings(upgraded * fort, DWELLINGS_UP, week.device)
 	)
 	level = t.horde_level[faction]  # [B, TO, N_BUILDINGS]
 	at = level.clamp(min=0)
-	horde = 0.5 * torch.gather(week, -1, at) * torch.gather(levels.to(week.dtype), -1, at)
+	horde = 0.5 * torch.gather(week, -1, at) * torch.gather(levels.to(week.dtype), -1, at) * fort
 	return torch.where(level >= 0, horde, added)
 
 
@@ -1386,7 +1388,8 @@ def build_features(x, t, economy):
 	) * own[..., None, None] * t.economy_on()
 	# (the fixed prior's unlock part only where the building is a pure prerequisite, its own value 0: a dwelling, a hall
 	# or a castle inherits nothing, e5's rule, after the cascade of each dwelling inheriting the next; the entry's
-	# unlocks feature reports the share for every building)
+	# unlocks feature reports the share for every building). pure is judged after payable: a dwelling whose growth our
+	# gold cannot buy counts as a pure prerequisite, and inherits what it opens, itself 0 by the same payable (e5: acceptable)
 	pure = (income_value + production_value) <= 0
 	value = torch.stack([income_value, production_value, unlock * pure], dim=-1) * own[..., None, None]
 	return entry, value

@@ -173,6 +173,8 @@ def set_advice_prior(model, config):
 			features.town_guard.fill_(float(getattr(config, "town_guard", 0.0)))
 		if hasattr(features, "build_economy"):  # (the economy and BUILD: config.build_economy)
 			features.build_economy.fill_(float(getattr(config, "build_economy", 0.0)))
+		if hasattr(features, "empire_alpha"):  # (ALPHA, the labels' own: the weights carry it to every inference server)
+			features.empire_alpha.fill_(float(EmpireConfig().alpha))
 
 
 def campaign_model_kwargs(config, out, resume=False):
