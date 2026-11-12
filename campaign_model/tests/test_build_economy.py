@@ -190,3 +190,20 @@ def test_a_castle_doubles_the_upgraded_and_horde_parts_too():
 	horde = [k for k in range(NB) if int(t.horde_level[0, k]) == 0]
 	if horde:
 		assert abs(float(b[0, 0, horde[0]]) - 2 * float(a[0, 0, horde[0]])) < 1e-3 and float(a[0, 0, horde[0]]) > 0
+
+
+def test_upgrade_elsewhere_reads_another_town_with_the_upgrade():
+	m = model()
+	x = inputs(2, 4)
+	x["t_present"][0, :] = False
+	for town, pos in ((0, (10, 10, 0)), (1, (20, 10, 0))):
+		x["t_present"][0, town], x["t_owner"][0, town], x["t_faction"][0, town] = True, c.OWNER_SELF, 0
+		x["t_pos"][0, town] = torch.tensor(pos)
+		x["t_built"][0, town] = False
+		x["t_built"][0, town, 30] = True
+	x["t_built"][0, 1, 37] = True  # (the other town has level 1's upgraded dwelling: 10 tiles away)
+	m.features.build_economy.fill_(1.0)
+	entry, _ = ft.build_features(x, m.features, ft.economy_features(x, m.features))
+	k = ft.BUILD_ENTRY.index("upgrade_elsewhere")
+	assert abs(float(entry[0, 0, 37, k]) - float(torch.exp(torch.tensor(-10 / ft.ECON_NEAR)))) < 1e-5, float(entry[0, 0, 37, k])
+	assert float(entry[0, 0, 38, k]) == 0.0  # (no town has level 2's)
