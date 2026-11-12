@@ -1130,6 +1130,9 @@ DWELLINGS_BASE = tuple(range(30, 37))  # BuildingID DWELL_LVL_1..7
 DWELLINGS_UP = tuple(range(37, 44))  # DWELL_UP_LVL_1..7
 HALLS = (10, 11, 12, 13)  # village, town, city hall, capitol
 CITADEL, CASTLE_BUILDING = 8, 9
+# (the same ids as slices: a list index makes a host index tensor every call, which a CUDA graph's capture refuses: deploy
+# 70's first gate, 2026-11-12)
+BASE_SLICE, UP_SLICE, HALL_SLICE = slice(DWELLINGS_BASE[0], DWELLINGS_BASE[-1] + 1), slice(DWELLINGS_UP[0], DWELLINGS_UP[-1] + 1), slice(HALLS[0], HALLS[-1] + 1)
 ECON_NEAR = 45.0  # tiles: a stack about three days from a town, exp(-d / 45) (F3's nearness)
 CAPITOL_INCOME, CITY_HALL_INCOME = 4000.0, 2000.0
 
@@ -1173,21 +1176,21 @@ def _feature_flow_balance(income, week):
 def _feature_hall_income_used(x, t, own, faction):
 	"""0..1: our halls' income against one capitol and city halls everywhere else; 1 all built."""
 	built = x["t_built"][:, : c.OWN_TOWNS].bool()
-	halls = (t.building_income[faction][..., list(HALLS)] * built[..., list(HALLS)]).sum(dim=-1)
+	halls = (t.building_income[faction][..., HALL_SLICE] * built[..., HALL_SLICE]).sum(dim=-1)
 	cap = CAPITOL_INCOME + CITY_HALL_INCOME * (own.sum(dim=-1).float() - 1).clamp(min=0)
 	return ((halls * own).sum(dim=-1) / cap).clamp(0.0, 1.0)
 
 
 def _dwelling_week(t, faction):
 	"""[B, TO, 7]: a week's list price of each level's base dwelling's growth (growth x cost of its creature)."""
-	creature = t.dwelling_creature[faction][..., list(DWELLINGS_BASE)]
+	creature = t.dwelling_creature[faction][..., BASE_SLICE]
 	index = vocab_index(creature, c.CREATURE_VOCAB)
 	return t.creature_growth[index] * t.creature_cost[index] * (creature >= 0)
 
 
 def _feature_production_built(x, t, own, faction):
 	"""0..1: the week's list price of the base dwellings built, over all the levels our towns' factions have; 1 all built."""
-	built = x["t_built"][:, : c.OWN_TOWNS].bool()[..., list(DWELLINGS_BASE)] | x["t_built"][:, : c.OWN_TOWNS].bool()[..., list(DWELLINGS_UP)]
+	built = x["t_built"][:, : c.OWN_TOWNS].bool()[..., BASE_SLICE] | x["t_built"][:, : c.OWN_TOWNS].bool()[..., UP_SLICE]
 	week = _dwelling_week(t, faction)
 	have, could = ((week * built).sum(dim=-1) * own).sum(dim=-1), (week.sum(dim=-1) * own).sum(dim=-1)
 	return have / could.clamp(min=1.0)
@@ -1219,11 +1222,11 @@ def economy_features(x, t):
 
 
 def _to_buildings(values, ids, device):
-	"""values [..., len(ids)] laid onto the building axis [..., N_BUILDINGS] at ids, 0 elsewhere (a product with a one-hot
-	map, not an index assignment: the ONNX export traces it)."""
-	place = torch.zeros(len(ids), c.N_BUILDINGS, device=device)
-	place[torch.arange(len(ids)), torch.tensor(ids)] = 1.0
-	return values @ place.to(values.dtype)
+	"""values [..., len(ids)] laid onto the building axis [..., N_BUILDINGS] at ids (consecutive), 0 elsewhere: a pad, which
+	the ONNX export traces and a CUDA graph captures (no index tensor made on the host: deploy 70's first gate)."""
+	if tuple(ids) != tuple(range(ids[0], ids[0] + len(ids))):
+		raise ValueError(f"_to_buildings takes consecutive ids, not {ids}")
+	return F.pad(values, (ids[0], c.N_BUILDINGS - ids[0] - len(ids)))
 
 
 def _fort_multiplier(built):
@@ -1240,9 +1243,9 @@ def _production_added(x, t, faction, built):
 	the three dwellings' parts alike (a castle doubles a level's growth, its upgraded and horde creatures' too)."""
 	week = _dwelling_week(t, faction)  # [B, TO, 7]
 	fort = _fort_multiplier(built).unsqueeze(-1)
-	levels = built[..., list(DWELLINGS_BASE)] | built[..., list(DWELLINGS_UP)]
+	levels = built[..., BASE_SLICE] | built[..., UP_SLICE]
 	half = 0.5 * (week * levels).sum(dim=-1, keepdim=True)
-	up, base = t.dwelling_creature[faction][..., list(DWELLINGS_UP)], t.dwelling_base[faction][..., list(DWELLINGS_UP)]
+	up, base = t.dwelling_creature[faction][..., UP_SLICE], t.dwelling_base[faction][..., UP_SLICE]
 	up_i, base_i = vocab_index(up, c.CREATURE_VOCAB), vocab_index(base, c.CREATURE_VOCAB)
 	upgraded = t.creature_growth[base_i] * (t.creature_cost[up_i] - t.creature_cost[base_i]).clamp(min=0) * ((up >= 0) & (base >= 0))
 	added = (
@@ -1317,7 +1320,7 @@ def _feature_crowds_out(gold_cost, gold, pool, unbought):
 
 def _feature_upgrade_quality(t, faction):
 	"""[B, TO, 7] 0..1: an upgraded dwelling's creature over its base in fight value, less 1; 0 no better."""
-	up, base = t.dwelling_creature[faction][..., list(DWELLINGS_UP)], t.dwelling_base[faction][..., list(DWELLINGS_UP)]
+	up, base = t.dwelling_creature[faction][..., UP_SLICE], t.dwelling_base[faction][..., UP_SLICE]
 	up_v, base_v = t.fight_value[vocab_index(up, c.CREATURE_VOCAB)], t.fight_value[vocab_index(base, c.CREATURE_VOCAB)]
 	return ((up_v - base_v) / base_v.clamp(min=1.0)).clamp(0.0, 1.0) * ((up >= 0) & (base >= 0))
 
@@ -1340,7 +1343,7 @@ def _feature_upgrade_held(x, t, faction):
 		raise ValueError("army slots and levels differ in width")
 	pos = torch.cat([x["h_pos"][:, :ho], x["t_pos"][:, :to], x["t_pos"][:, :to]], dim=1)  # [B, S, 3]
 	near = _nearness(x["t_pos"][:, :to], pos)  # [B, TO, S]
-	up, base = t.dwelling_creature[faction][..., list(DWELLINGS_UP)], t.dwelling_base[faction][..., list(DWELLINGS_UP)]  # [B, TO, 7]
+	up, base = t.dwelling_creature[faction][..., UP_SLICE], t.dwelling_base[faction][..., UP_SLICE]  # [B, TO, 7]
 	delta = (t.creature_cost[vocab_index(up, c.CREATURE_VOCAB)] - t.creature_cost[vocab_index(base, c.CREATURE_VOCAB)]).clamp(min=0) * ((up >= 0) & (base >= 0))
 	match = (creature[:, None, None, :, :] == base[..., None, None]) & (base >= 0)[..., None, None]  # [B, TO, 7, S, slots]
 	held = (match.float() * count[:, None, None]).sum(dim=-1)  # [B, TO, 7, S]
@@ -1351,8 +1354,8 @@ def _feature_upgrade_held(x, t, faction):
 def _feature_upgrade_elsewhere(x, t, faction, built):
 	"""[B, TO, 7] 0..1: the nearness of our nearest other town with the same upgraded dwelling built; 0 none."""
 	to = c.OWN_TOWNS
-	up = t.dwelling_creature[faction][..., list(DWELLINGS_UP)]  # [B, TO, 7]
-	have = built[..., list(DWELLINGS_UP)] & own_towns(x).unsqueeze(-1)  # [B, TO, 7]
+	up = t.dwelling_creature[faction][..., UP_SLICE]  # [B, TO, 7]
+	have = built[..., UP_SLICE] & own_towns(x).unsqueeze(-1)  # [B, TO, 7]
 	same = (up[:, :, None, :] == up[:, None, :, :]) & have[:, None, :, :] & (up[:, :, None, :] >= 0)  # [B, TO (here), TO (there), 7]
 	other = ~torch.eye(to, dtype=torch.bool, device=up.device)[None, :, :, None]
 	near = _nearness(x["t_pos"][:, :to], x["t_pos"][:, :to]).unsqueeze(-1)

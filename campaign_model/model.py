@@ -501,7 +501,7 @@ class CustomFeatures(nn.Module):
 	def economy_on(self):
 		"""1.0 where the economy's features and BUILD's new prior are read, else 0.0, as a tensor (config.build_economy;
 		ALPHA_BUILD_ECONOMY): multiplied in, never branched on (a read of the device would break the CUDA step graph)."""
-		size = self.build_economy if self.economy_override is None else self.build_economy.new_tensor(self.economy_override)
+		size = self.build_economy if self.economy_override is None else torch.full_like(self.build_economy, float(self.economy_override))
 		return (size > 0).to(self.build_economy.dtype)
 
 	def build_prior(self, x, f):
