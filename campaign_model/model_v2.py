@@ -62,6 +62,7 @@ DISTANCE_BUCKETS = 12  # the tile readers' distance bias: Chebyshev tiles 0, 1, 
 # views and whether a window of ours shows it (7), whether the entry is the one Nullkiller2 itself would play now (1)
 VIEWS = 6 + 3 + 3 + 4 + 2 + V.F + 7 + 1  # (the last: this entry is Nullkiller2's own choice now, views.label)
 PLAN_VIEWS = 2  # the plan head's own forecast for the entry's area: its chance, and against the hero's likeliest area
+OTHER_VIEWS = 3  # F1: this hero's day discounts less the best other hero's of ours (two), another hero of ours there today
 VIEW_STEP = 10.0  # FastLinear's (model.CORRECTION_STEP's reason)
 LOG_SURVIVAL, RISK = V.CHANNELS.index("log_survival"), V.CHANNELS.index("risk")
 assert S == 2 * TG  # (a TRAVEL area: two map cells a side; CampaignModelV2.think_again's area of a window tile)
@@ -382,6 +383,13 @@ class FastLinear(nn.Module):
 		return self.step * (x @ self.weight.to(x.dtype))
 
 
+def other_views(mine, other):
+	"""F1: this hero's days [...] against the best other hero's of ours [...] as [..., OTHER_VIEWS]: each day discount's
+	difference (views.discounts: within -1..1, above 0 where this hero is the nearer) and whether the other gets there
+	today (days below 1)."""
+	return torch.cat([V.discounts(mine) - V.discounts(other), (other < 1).float().unsqueeze(-1)], dim=-1)
+
+
 def zero_weight(inputs, outputs):
 	"""A linear layer without a bias, its weights 0 to begin with: it adds nothing at the start, and never anything
 	where its inputs are all 0 (an entry without a candidate, a decision without the advisor)."""
@@ -575,7 +583,7 @@ class CampaignModelV2(nn.Module):
 		#   plan_in         each hero's plan: its candidates' destinations' tile vectors and channels, weighted by
 		#                   Nullkiller2's preference among them, onto the hero's token before the heroes attend
 		#   nk_hero, nk_town, nk_global  its threats at our heroes and towns, its plan's tier and size
-		self.time_reach, self.view_pair, self.travel_view = zero_weight(4, dc), zero_weight(VIEWS, dp), zero_weight(VIEWS, dp)
+		self.time_reach, self.view_pair, self.travel_view = zero_weight(4, dc), zero_weight(VIEWS + OTHER_VIEWS, dp), zero_weight(VIEWS + OTHER_VIEWS, dp)  # (F1's columns last: GROWN_INPUTS)
 		self.move_toward, self.travel_toward = zero_weight(dp, dp), zero_weight(dp, dp)
 		self.view_mix = nn.Linear(VIEWS, MIX_HIDDEN)
 		self.view_mix_out = zero_output(nn.Linear(MIX_HIDDEN, 1))
@@ -774,6 +782,11 @@ class CampaignModelV2(nn.Module):
 				known,
 			)
 			a.move_time, a.move_dest = real_only(time, known), (index, valid)
+			# F1 (schema 20, e5 for the user, 2026-11-12): our other heroes' time to the tile (w_other_turns: 1 + their fewest
+			# days, 0 none), against this hero's (w_turns), in whole days both: each discount's difference, and whether
+			# another hero of ours reaches it today. A record from before reads none: no other hero anywhere
+			other = pick(x["w_other_turns"]).long() if "w_other_turns" in x else torch.zeros_like(turns)
+			a.move_other = real_only(other_views(torch.where(turns >= 0, turns.float(), torch.full_like(own_days, V.FAR_DAYS)), torch.where(other > 0, (other - 1).float(), torch.full_like(own_days, V.FAR_DAYS))), known)
 		# TRAVEL: the pathfinder's days there (travel_days), and those days at this hero's movement in a baseline hero's
 		days = x["travel_days"][:, :HO].reshape(b, HO, AREAS).float() / 100
 		reached = days >= 0
@@ -792,6 +805,15 @@ class CampaignModelV2(nn.Module):
 			dim=-1,
 		)
 		a.travel_dest = (index, valid)
+		# F1: this hero's days to each area against the best other hero's of ours (travel_days, every hero's already)
+		mine = torch.where(reached, days, torch.full_like(days, V.FAR_DAYS))  # [B, HO, AREAS]
+		if HO > 1:
+			two = mine.topk(2, dim=1, largest=False)
+			first_is_me = two.indices[:, :1] == torch.arange(HO, device=device).reshape(1, HO, 1)
+			best_other = torch.where(first_is_me, two.values[:, 1:2], two.values[:, :1])
+		else:
+			best_other = torch.full_like(mine, V.FAR_DAYS)
+		a.travel_other = other_views(mine, best_other)
 		return a
 
 	# ---- encode: raw inputs only ----
@@ -999,7 +1021,7 @@ class CampaignModelV2(nn.Module):
 		index = known.window_tiles
 		cells = torch.where((index >= 0).unsqueeze(-1), flat.index_select(0, (decision[:, None, None] * (L * S * S) + index.clamp(min=0)).reshape(-1)).reshape(k, W, W, -1), torch.zeros(k, W, W, self.cell_dim, device=flat.device, dtype=flat.dtype))
 		strength = torch.cat([known.move_strength, known.move_relative[..., :1]], dim=-1)  # (the estimates and hopeless)
-		views = self.view_pair(known.advice.move.to(cells.dtype))  # (schema 19: the tile's bounded views and Nullkiller2's candidate through it)
+		views = self.view_pair(torch.cat([known.advice.move, known.advice.move_other], dim=-1).to(cells.dtype))  # (schema 19: the tile's bounded views and Nullkiller2's candidate through it; F1's our other heroes' time)
 		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach) + self.pair_fight(fight_features(known)) + self.pair_strength(strength) + views
 
 	def foresee(self, state, known):
@@ -1059,7 +1081,7 @@ class CampaignModelV2(nn.Module):
 		days = x["travel_days"][:, :HO].reshape(b, HO, AREAS)
 		travel_in = torch.cat([E.amount(days.clamp(min=0).float() / 100, "days"), (days >= 0).float().unsqueeze(-1)], dim=-1)
 		travel = self.travel_hero(state.heroes[:, :HO]).unsqueeze(2) + self.travel_area(state.areas).unsqueeze(1) + self.travel_days(None, travel_in)
-		travel = travel + self.travel_view(a.travel.to(travel.dtype))
+		travel = travel + self.travel_view(torch.cat([a.travel, a.travel_other], dim=-1).to(travel.dtype))
 		if known.n > 0:
 			travel = travel + self.travel_toward(toward(*a.travel_dest))
 		state.travel_pairs = self.travel_pair(torch.cat([travel, torch.tanh(known.travel_prior.reshape(b, HO, AREAS) / 4).unsqueeze(-1)], dim=-1))
@@ -1513,7 +1535,7 @@ def migrate_option_head(state_dict):
 	return state
 
 
-GROWN_INPUTS = ("recruit_head.0.weight", "option_weights.weight")  # (2026-11-04: + the visiting hero; + a purchase's fit)
+GROWN_INPUTS = ("recruit_head.0.weight", "option_weights.weight", "view_pair.weight", "travel_view.weight")  # (2026-11-04: + the visiting hero; + a purchase's fit; F1, 2026-11-12: + our other heroes' time)
 
 
 def migrate_action_types(state_dict, own):

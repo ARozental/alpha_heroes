@@ -871,6 +871,42 @@ void AlphaMapAI::encodeWindows(Decision & decision, PathfinderCache & paths)
 			f.middles.push_back(center);
 			f.left.erase(std::remove_if(f.left.begin(), f.left.end(), [&](const auto & tile) { return inside(tile.second, center); }), f.left.end());
 		}
+	// Our other heroes' time to each window tile (schema 20, F1): 1 + the fewest days (0 today) in which a hero of ours
+	// other than the window's reaches it by its own paths (the pathfinder's turns), 0 where none does. A hero in a
+	// garrison is left out (it walks nowhere until it leaves). Raw days only: the graph turns them into discounts
+	if(!turn)
+		return;
+	std::vector<std::pair<int, std::shared_ptr<const CPathsInfo>>> walkers;
+	for(int hero = 0; hero < OWN_HEROES; ++hero)  // (our heroes only: decision.heroes holds the others after them)
+	{
+		const auto * h = cb->getHero(decision.heroes[hero]);
+		if(h && !h->isGarrisoned())
+			walkers.emplace_back(hero, paths.getPathsInfo(h));
+	}
+	for(int slot = 0; slot < OWN_HEROES; ++slot)
+	{
+		const int hero = decision.windowHero[slot];
+		if(hero < 0)
+			continue;
+		for(int row = 0; row < WINDOW; ++row)
+			for(int column = 0; column < WINDOW; ++column)
+			{
+				const auto pos = decision.windowTile(slot, row, column);
+				if(!cb->isInTheMap(pos) || !cb->isVisible(pos))
+					continue;
+				int fewest = -1;
+				for(const auto & [other, info] : walkers)
+				{
+					if(other == hero)
+						continue;
+					const auto * node = info->getPathInfo(pos);
+					if(node && node->reachable() && (fewest < 0 || node->turns < fewest))
+						fewest = node->turns;
+				}
+				if(fewest >= 0)
+					in.at(In::w_other_turns, slot, row, column) = fewest + 1;
+			}
+	}
 }
 
 void AlphaMapAI::encodeMap(Decision & decision, const std::vector<int3> & ours)

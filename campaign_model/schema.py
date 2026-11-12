@@ -242,6 +242,9 @@ INPUTS = (
 	_i("g_nk_action", (), "its choice's action type + 1; 0 none (no advisor, or its request matched no entry of ours)"),
 	_i("g_nk_index", (), "its choice's index in that type's table + 1; 0 none"),
 	_i("g_nk_cell", (), "its choice's cell (a targeted spell's tile, ARMY's target slot) + 1; 0 none"),
+	# Schema 20 (F1, e5 for the user, 2026-11-12; at the end, 0 as none: older records read as none). Our heroes' time to
+	# the same place
+	_i("w_other_turns", (HO, W, W), "1 + the fewest days (0 today) in which another hero of ours (not the window's, not in a garrison) reaches the window tile by its own paths; 0 where none does"),
 )
 
 
@@ -322,6 +325,7 @@ def random_inputs(batch=1, seed=0):
 	"""Random but consistent inputs for tests: a few heroes and towns, some legal moves and builds, or a question."""
 	rng = np.random.default_rng(seed)
 	extra = np.random.default_rng(seed + 1_000_019)  # (schema 19's own draws: _random_schema_19)
+	others = np.random.default_rng(seed + 1_000_020)  # (schema 20's: _random_schema_20)
 	x = empty_inputs(batch)
 	for b in range(batch):
 		kind = int(rng.choice([c.DecisionKind.TURN, c.DecisionKind.TURN, c.DecisionKind.EXCHANGE, c.DecisionKind.YES_NO, c.DecisionKind.SELECT]))
@@ -414,7 +418,16 @@ def random_inputs(batch=1, seed=0):
 				x["travel_mask"][b, h] = rng.random((c.MAP_LEVELS, c.TRAVEL_GRID, c.TRAVEL_GRID)) < 0.3
 				x["travel_days"][b, h] = np.where(x["travel_mask"][b, h], rng.integers(100, 600, (c.MAP_LEVELS, c.TRAVEL_GRID, c.TRAVEL_GRID)), -1)
 		_random_schema_19(x, b, kind, heroes, extra)
+		_random_schema_20(x, b, kind, others)
 	return x
+
+
+def _random_schema_20(x, b, kind, rng):
+	"""Schema 20's w_other_turns for random_inputs' decision b: at a turn decision with two heroes or more, another hero
+	reaches about half the tiles, in 0-3 days."""
+	if kind != c.DecisionKind.TURN or int(x["h_present"][b, :HO].sum()) < 2:
+		return
+	x["w_other_turns"][b] = np.where(rng.random((HO, W, W)) < 0.5, rng.integers(1, 5, (HO, W, W)), 0)
 
 
 def _random_schema_19(x, b, kind, heroes, rng):
