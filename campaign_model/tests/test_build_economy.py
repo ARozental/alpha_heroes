@@ -129,13 +129,14 @@ def test_a_checkpoint_from_before_loads_and_plays_as_it_did():
 			p = dict(m.named_parameters())[name]
 			p[:, -len(ft.ECONOMY):] = 0.0
 		base = m(x)
-	old = {k: v for k, v in m.state_dict().items() if not k.startswith("build_situational") and k not in ("features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy")}
+	old = {k: v for k, v in m.state_dict().items() if not k.startswith("build_situational") and k not in ("features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy", "features.empire_alpha")}
 	for name in GROWN_INPUTS[2:]:
 		old[name] = old[name][:, : -len(ft.ECONOMY)].clone()
 	fresh = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
 	fresh.load_state_dict(old)
 	with torch.no_grad():
 		out = fresh(x)
+	assert float(fresh.features.empire_alpha) == 0.25  # (not ADDED's 0: deploy-check 2026-11-12, Φ off by 33k)
 	for name, value in base.items():
 		if torch.is_tensor(value) and value.is_floating_point():
 			assert torch.allclose(torch.nan_to_num(value, nan=0.0, posinf=1e9, neginf=-1e9), torch.nan_to_num(out[name], nan=0.0, posinf=1e9, neginf=-1e9), atol=1e-6), name
