@@ -278,6 +278,12 @@ class AlphaMapAI : public CAdventureAI
 	// three heroes in turn; counted in the summary's advice "revisit_skipped"
 	bool revisitSkip = true;
 	int revisitsSkipped = 0;
+	int skipsMovingHeld = 0; // (a skip's next request moving a hero it held: the summary's "skip_moved_held")
+	// The heroes held this day (cleared at our turn's start): a Defend composition's hero stays held at every advice of
+	// our turn, as Nullkiller2 itself keeps it in the garrison it puts it in (ExchangeSwapTownHeroes' lock); held for one
+	// advice only, its next replanning sent it out (the town guard's pair: 34 of 40 weak-town walk-outs its choice)
+	std::set<ObjectInstanceID> heldToday;
+	bool holdDay = true; // (ALPHA_MAP_HOLD_DAY, 1 unless set; 0: a hero held for one advice only)
 	// alpha_heroes patch (bundle 60, the boat part): ALPHA_MAP_BOAT_ADVICE, 1 unless set. Nullkiller2 builds a boat at any
 	// shipyard not an enemy's without going there (BuildBoat: VCMI's server allows it); a human builds one in a town of
 	// theirs (our BUILD's SHIP) or by visiting a map shipyard and saying yes (our question, showShipyardDialog). Its

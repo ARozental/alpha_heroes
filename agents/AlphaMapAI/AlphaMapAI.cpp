@@ -241,6 +241,7 @@ void AlphaMapAI::makeTurn()
 		{
 			day = today;
 			decisionsToday = 0;
+			heldToday.clear(); // (bundle 60's re-visit skip: a new day's holds)
 			futile.clear();
 		}
 		activeHero = ObjectInstanceID(); // the dialogs' context: no hero yet this turn (a question before our first
