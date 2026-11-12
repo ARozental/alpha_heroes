@@ -197,6 +197,10 @@ def test_candidate_tables_without_the_advisor_are_zero_and_batches_do_not_mix():
 	for key, table in t.items():
 		if key.endswith("dest_cell"):
 			assert int(table[1].max()) == -1, key
+		elif key == "hero_index":  # (nk_predict's helpers: "none" where nothing is)
+			assert int(table[1].min()) == HO, key
+		elif key in ("move_index", "travel_index", "dest_index"):
+			assert int(table[1].min()) == HO * (AREAS if key == "travel_index" else CELLS), key
 		else:
 			assert float(table[1].abs().sum()) == 0.0, key
 
