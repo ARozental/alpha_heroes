@@ -125,6 +125,7 @@ COLUMNS = [
 	# the steps: a's AUC and its positives' share, b's explained variance per form, c's cross-entropy against the uniform's,
 	# its top-1 agreement with the hero's best candidate and with Nullkiller2's recorded own choice)
 	"nkp_loss", "nkp_auc", "nkp_positives", *(f"nkp_ev_{form}" for form in ("preference_all", "preference_hero", "soon", "later", "rank")), "nkp_ce", "nkp_ce_uniform", "nkp_top1_best", "nkp_top1_choice",
+	"nkp_steps", "nkp_rows", "nkp_seconds",  # (its own steps this update, their blind rows and seconds: config.nk_predict_every)
 	# (config.credit_segments: the k's this update's credit used, each segment's F (its action types' between-type spread
 	# of gaps over their sampling variance) and the number of types that entered it, the credit's spread with the k's and
 	# the 7-day credit's on the same rows: the noise the k's leave out)
@@ -905,7 +906,7 @@ class CampaignLearner:
 			**{name: metrics.get(name, float("nan")) for name in ("adv_loss", "adv_ev", "adv_ev_followed", "adv_ev_deviating", "adv_followed", "adv_raw_sd", "adv_kl", "adv_read")},
 			**{name: sums.get(name, float("nan")) for name in ("segment_k5", "segment_k7", "segment_f2", "segment_f5", "segment_f7", "segment_types2", "segment_types5", "segment_types7")},
 			**{name: metrics.get(name, float("nan")) for name in ("segment_credit_std", "segment_full_std")},
-			**{name: metrics.get(name, float("nan")) for name in ("nkp_loss", "nkp_auc", "nkp_positives", *(f"nkp_ev_{form}" for form in ("preference_all", "preference_hero", "soon", "later", "rank")), "nkp_ce", "nkp_ce_uniform", "nkp_top1_best", "nkp_top1_choice")},
+			**{name: metrics.get(name, float("nan")) for name in ("nkp_loss", "nkp_auc", "nkp_positives", *(f"nkp_ev_{form}" for form in ("preference_all", "preference_hero", "soon", "later", "rank")), "nkp_ce", "nkp_ce_uniform", "nkp_top1_best", "nkp_top1_choice", "nkp_steps", "nkp_rows", "nkp_seconds")},
 			"action_price_mean": metrics.get("schedule_action_price_mean", float("nan")),
 			"action_price_share": metrics.get("schedule_action_price_share", float("nan")),
 			"end_first": reading(end_first, [d for game, _ in games for d in game.decisions]),

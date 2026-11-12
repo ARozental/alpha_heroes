@@ -173,3 +173,4 @@ def test_the_learner_logs_its_fit(tmp_path, capsys):
 		T.CampaignConfig = saved
 	row = list(csv.DictReader(open(tmp_path / "progress.csv")))[-1]
 	assert float(row["nkp_loss"]) > 0 and row["nkp_ce"] not in ("", "nan") and row["nkp_ce_uniform"] not in ("", "nan")
+	assert float(row["nkp_steps"]) >= 1 and float(row["nkp_rows"]) >= 1 and float(row["nkp_seconds"]) >= 0
