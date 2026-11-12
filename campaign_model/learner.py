@@ -779,13 +779,14 @@ class CampaignLearner:
 		by action type, against the player's other decisions, faded); each long segment's k one step of SEGMENT_RATE toward
 		train.segment_shrinkage's max(0, 1 - 1/F), at most 1; the next update's credit uses them (one update's lag). The
 		row's readings: the k's this update used, each segment's F and its types, and its F with the kinds merged.
-		hidden [n] (each decision's game hid Nullkiller2's own choice), where the update has both kinds: the evidence kept
-		by kind ("hidden/TYPE", "shown/TYPE"), so that F reads the types' spread within each kind and not the gap between
-		the kinds (e5, 2026-11-12); one kind, or none known: as before. The whole evidence fades once an update."""
+		hidden [n] (each decision's game hid Nullkiller2's own choice): the evidence kept by kind ("hidden/TYPE",
+		"shown/TYPE"), so that F reads the types' spread within each kind and not the gap between the kinds (e5,
+		2026-11-12), also when an update has one kind; none known: unprefixed, as before. The whole evidence fades once an
+		update."""
 		out = {"segment_k5": self.segment_k[0], "segment_k7": self.segment_k[1]}
 		ks = list(self.segment_k)
 		hidden = None if hidden is None or len(hidden) != len(decisions) else np.asarray(hidden, dtype=bool)
-		strata = [("hidden/", hidden), ("shown/", ~hidden)] if hidden is not None and hidden.any() and (~hidden).any() else [("", None)]
+		strata = [(prefix, rows) for prefix, rows in (("hidden/", hidden), ("shown/", ~hidden)) if rows.any()] if hidden is not None else [("", None)]  # (e5: by kind whenever the kind is known, one kind too; "" only the checkpoint's old pooled evidence, fading out)
 		for j, offset in enumerate(c.VALUE_OFFSETS):
 			for i, (prefix, rows) in enumerate(strata):
 				errors = surprises[:, j] if rows is None else np.where(rows, surprises[:, j], np.nan)

@@ -59,8 +59,12 @@ def test_the_learner_keeps_each_kinds_evidence_and_fades_it_once():
 	assert {"segment_f2_pooled", "segment_f5_pooled", "segment_f7_pooled"} <= set(out) and np.isfinite(out["segment_f2"])
 	one = CampaignLearner.__new__(CampaignLearner)
 	one.segment_evidence, one.segment_k = [{}, {}, {}], (0.0, 0.0)
-	one._note_segments(decisions, rng.normal(0, 0.1, (n, 3)).astype(np.float32), players, np.ones(n, dtype=bool))  # (one kind only: no prefix)
-	assert all("/" not in k for k in one.segment_evidence[0])
+	one._note_segments(decisions, rng.normal(0, 0.1, (n, 3)).astype(np.float32), players, np.ones(n, dtype=bool))  # (one kind only: still its kind)
+	assert one.segment_evidence[0] and all(k.startswith("hidden/") for k in one.segment_evidence[0])
+	unknown = CampaignLearner.__new__(CampaignLearner)
+	unknown.segment_evidence, unknown.segment_k = [{}, {}, {}], (0.0, 0.0)
+	unknown._note_segments(decisions, rng.normal(0, 0.1, (n, 3)).astype(np.float32), players, None)  # (the kind unknown: unprefixed)
+	assert unknown.segment_evidence[0] and all("/" not in k for k in unknown.segment_evidence[0])
 
 
 def test_the_guards_memory_is_the_line_after_a_rollback(tmp_path):
