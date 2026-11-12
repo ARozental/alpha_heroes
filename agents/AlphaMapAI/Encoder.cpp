@@ -871,6 +871,47 @@ void AlphaMapAI::encodeWindows(Decision & decision, PathfinderCache & paths)
 			f.middles.push_back(center);
 			f.left.erase(std::remove_if(f.left.begin(), f.left.end(), [&](const auto & tile) { return inside(tile.second, center); }), f.left.end());
 		}
+	// Where today's walk toward each window tile a day or more away stops (schema 20): VCMI's path there, back through
+	// theNodeBefore to its last node reached today, as the hero's MOVE entry (in any of its windows: moveEntry). Each
+	// node's stop kept (per window: the nodes are its hero's paths'), so a window costs each node one step back. 0 where
+	// the stop is no legal MOVE entry (the hero's own tile unless its re-visit is legal), and for tiles reached today
+	// (each its own stop)
+	if(!turn)
+		return;
+	for(int slot = 0; slot < OWN_HEROES; ++slot)
+	{
+		const int hero = decision.windowHero[slot];
+		if(hero < 0)
+			continue;
+		const auto * h = cb->getHero(decision.heroes[hero]);
+		if(!h || h->isGarrisoned())
+			continue;
+		const auto info = paths.getPathsInfo(h);
+		std::map<const CGPathNode *, const CGPathNode *> stopOf;
+		for(int row = 0; row < WINDOW; ++row)
+			for(int column = 0; column < WINDOW; ++column)
+			{
+				const auto pos = decision.windowTile(slot, row, column);
+				if(!cb->isInTheMap(pos) || !cb->isVisible(pos))
+					continue;
+				const auto * node = info->getPathInfo(pos);
+				if(!node || !node->reachable() || node->turns < 1)
+					continue;
+				std::vector<const CGPathNode *> walked;
+				const CGPathNode * at = node;
+				while(at && at->turns > 0 && !stopOf.count(at))
+				{
+					walked.push_back(at);
+					at = at->theNodeBefore;
+				}
+				const CGPathNode * stop = !at ? nullptr : at->turns == 0 ? at : stopOf[at];
+				for(const auto * n : walked)
+					stopOf[n] = stop;
+				const int entry = stop ? decision.moveEntry(hero, stop->coord) : -1;
+				if(entry >= 0)
+					in.at(In::w_stop, slot, row, column) = entry + 1;
+			}
+	}
 }
 
 void AlphaMapAI::encodeMap(Decision & decision, const std::vector<int3> & ours)

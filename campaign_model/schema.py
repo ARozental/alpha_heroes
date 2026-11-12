@@ -242,6 +242,8 @@ INPUTS = (
 	_i("g_nk_action", (), "its choice's action type + 1; 0 none (no advisor, or its request matched no entry of ours)"),
 	_i("g_nk_index", (), "its choice's index in that type's table + 1; 0 none"),
 	_i("g_nk_cell", (), "its choice's cell (a targeted spell's tile, ARMY's target slot) + 1; 0 none"),
+	# Schema 20 (at the end, 0 as none: older records read as none). The engine's routing in our own terms
+	_i("w_stop", (HO, W, W), "where the window's hero stands at the end of today walking VCMI's path to this tile (the path's last node reached today), as its MOVE entry (window slot x W x W + cell) + 1; 0 where the tile is reached today (its own stop), unreachable, or the stop is no legal MOVE entry (the hero's own tile unless its re-visit is legal)"),
 )
 
 
@@ -322,6 +324,7 @@ def random_inputs(batch=1, seed=0):
 	"""Random but consistent inputs for tests: a few heroes and towns, some legal moves and builds, or a question."""
 	rng = np.random.default_rng(seed)
 	extra = np.random.default_rng(seed + 1_000_019)  # (schema 19's own draws: _random_schema_19)
+	stops = np.random.default_rng(seed + 1_000_020)  # (schema 20's: _random_schema_20)
 	x = empty_inputs(batch)
 	for b in range(batch):
 		kind = int(rng.choice([c.DecisionKind.TURN, c.DecisionKind.TURN, c.DecisionKind.EXCHANGE, c.DecisionKind.YES_NO, c.DecisionKind.SELECT]))
@@ -414,7 +417,20 @@ def random_inputs(batch=1, seed=0):
 				x["travel_mask"][b, h] = rng.random((c.MAP_LEVELS, c.TRAVEL_GRID, c.TRAVEL_GRID)) < 0.3
 				x["travel_days"][b, h] = np.where(x["travel_mask"][b, h], rng.integers(100, 600, (c.MAP_LEVELS, c.TRAVEL_GRID, c.TRAVEL_GRID)), -1)
 		_random_schema_19(x, b, kind, heroes, extra)
+		_random_schema_20(x, b, kind, stops)
 	return x
+
+
+def _random_schema_20(x, b, kind, rng):
+	"""Schema 20's w_stop for random_inputs' decision b: at a turn decision, most tiles a day or more away stop at a
+	legal MOVE entry of the same window slot."""
+	if kind != c.DecisionKind.TURN:
+		return
+	for h in range(HO):
+		moves = np.flatnonzero(x["move_mask"][b, h].reshape(-1))
+		later = (x["w_turns"][b, h] >= 1) & (rng.random((W, W)) < 0.8)
+		if len(moves):
+			x["w_stop"][b, h] = np.where(later, h * W * W + rng.choice(moves, (W, W)) + 1, 0)
 
 
 def _random_schema_19(x, b, kind, heroes, rng):
