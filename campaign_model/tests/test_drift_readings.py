@@ -8,7 +8,7 @@ NB = c.N_BUILDINGS
 
 
 def turn(color, day, action, index=0):
-	return SimpleNamespace(color=color, day=day, kind=c.DecisionKind.TURN, action_type=action, index=index)
+	return SimpleNamespace(color=color, day=day, kind=c.DecisionKind.TURN, action_type=action, index=index, advice=None, today=0)
 
 
 def test_drift_readings_count_per_player():
@@ -27,3 +27,24 @@ def test_their_columns_are_in_the_progress_rows():
 	for what in ("dwellings_d14", "dwellings_d28", "recruits", "attacked"):
 		for name in ("shown", "hidden"):
 			assert f"{what}_{name}" in L.COLUMNS
+
+
+def test_battles_none_or_malformed_give_numbers():
+	decisions = [turn("RED", 3, c.ActionType.RECRUIT)]
+	for battles in (None, {"RED": None}, {"RED": [{"armies": []}, {"side": 1}, {"side": 1, "heroes": None}, {"side": 1, "heroes": [{}]}, "junk"]}):
+		out = L.drift_readings([(SimpleNamespace(decisions=decisions, battles=battles), None)])
+		assert out["attacked"] == 0.0 and out["recruits"] == 1.0, (battles, out)
+	assert L.drift_readings([(SimpleNamespace(decisions=decisions), None)])["attacked"] == 0.0  # (no battles attribute)
+
+
+def test_a_failing_reading_is_nan_and_never_raises(monkeypatch, capsys):
+	def broken(games):
+		raise ValueError("a broken record")
+
+	monkeypatch.setattr(L, "drift_readings", broken)
+	game = SimpleNamespace(decisions=[turn("RED", 3, c.ActionType.RECRUIT)], battles=None, ledgers={}, final=[], done={})
+	monkeypatch.setattr(L, "choice_hidden", lambda g: True)
+	monkeypatch.setattr(L, "reading", lambda f, *a: float("nan"))
+	out = L.choice_readings([(game, None)], {})
+	assert all(out[f"{what}_hidden"] != out[f"{what}_hidden"] for what in L.DRIFT)
+	assert "the drift readings (hidden) failed (ValueError" in capsys.readouterr().out

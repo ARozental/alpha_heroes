@@ -134,7 +134,7 @@ COLUMNS = [
 	"segment_f2_pooled", "segment_f5_pooled", "segment_f7_pooled",
 	# (e5's drift monitors, 2026-11-12: v3286 had trained BUILD and RECRUIT down, a third of the dwellings and two thirds of
 	# the recruits of v3254, unseen until the third eval; per game-player of each kind of game, choice_readings)
-	*(f"{what}_{name}" for what in ("dwellings_d14", "dwellings_d28", "recruits", "attacked") for name in ("shown", "hidden")),
+	*(f"{what}_{name}" for what in ("dwellings_d14", "dwellings_d28", "recruits", "attacked") for name in ("shown", "hidden")),  # (learner.DRIFT)
 	# (e5's learning-rate readings, 2026-11-11: each optimizer group's signal fraction (train.signal_fraction, in
 	# TensorBoard before), the trunk group's shared layers (body) and policy heads apart with their mean |m| / sqrt(v)
 	# (train.trunk_moments), the KL control's lr scale; kl, last_kl and learning_rate are above)
@@ -1678,9 +1678,17 @@ def choice_readings(games, metrics):
 		out[f"idle_movement_{name}"] = reading(idle_movement, ours) if ours else float("nan")
 		out[f"end_first_{name}"] = reading(end_first, ours) if ours else float("nan")
 		out[f"eliminated_{name}"] = reading(eliminated_share, kinds[hidden]) if kinds[hidden] else float("nan")
-		for what, value in drift_readings(kinds[hidden]).items():
+		try:  # (a diagnostic never ends the run: deploy rule, 2026-11-03's loss_noise crash)
+			drift = drift_readings(kinds[hidden])
+		except Exception as error:
+			print(f"campaign: the drift readings ({name}) failed ({type(error).__name__}: {str(error)[:200]}): nan this update", flush=True)
+			drift = {what: float("nan") for what in DRIFT}
+		for what, value in drift.items():
 			out[f"{what}_{name}"] = value
 	return out
+
+
+DRIFT = ("dwellings_d14", "dwellings_d28", "recruits", "attacked")
 
 
 def drift_readings(games):
@@ -1694,10 +1702,10 @@ def drift_readings(games):
 			builds = [d for d in turns if d.action_type == c.ActionType.BUILD]
 			towns = max(1, len({d.index // c.N_BUILDINGS for d in builds}))
 			dwelling = [d for d in builds if 30 <= d.index % c.N_BUILDINGS <= 43]
-			attacked = sum(1 for b in getattr(game, "battles", {}).get(color, []) if int(b.get("side", 0)) == 1 and all(h is not None for h in (b.get("heroes") or [None, None])[:2]))
+			attacked = sum(1 for b in ((getattr(game, "battles", None) or {}).get(color) or []) if isinstance(b, dict) and int(b.get("side") or 0) == 1 and len(b.get("heroes") or []) >= 2 and all(h is not None for h in b["heroes"][:2]))
 			rows.append((sum(d.day <= 14 for d in dwelling) / towns, sum(d.day <= 28 for d in dwelling) / towns, sum(d.action_type == c.ActionType.RECRUIT for d in turns), attacked))
 	if not rows:
-		return {name: float("nan") for name in ("dwellings_d14", "dwellings_d28", "recruits", "attacked")}
+		return {name: float("nan") for name in DRIFT}
 	mean = np.mean(np.array(rows, dtype=np.float64), axis=0)
 	return {"dwellings_d14": float(mean[0]), "dwellings_d28": float(mean[1]), "recruits": float(mean[2]), "attacked": float(mean[3])}
 
