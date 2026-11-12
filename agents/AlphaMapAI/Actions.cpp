@@ -47,6 +47,10 @@ std::vector<int64_t> fingerprint(const CCallback & cb)
 	for(const auto * t : cb.getTownsInfo(true))
 	{
 		values.push_back(static_cast<int64_t>(t->getBuildings().size()));
+		// Which hero is in its garrison and which visits (bundle 60: a GARRISON_SWAP moves no hero off the tile and, with
+		// no army to merge, no stack either: it read as no effect, then futile)
+		values.push_back(t->getGarrisonHero() ? t->getGarrisonHero()->id.getNum() : -1);
+		values.push_back(t->getVisitingHero() ? t->getVisitingHero()->id.getNum() : -1);
 		army(t);
 		for(const auto & [count, ids] : t->creatures)
 			values.push_back(count);
