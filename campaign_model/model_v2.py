@@ -337,6 +337,27 @@ def nk_table(outputs):
 	return torch.stack([values.get(name, zero) for name in V.CHANNELS], dim=-1)
 
 
+def channels_only(a, which):
+	"""The parts diagnostic's live advice: "all" as is; "table" the planner's V.F channels alone (what follows them, the
+	destination's views, valid and the own choice, 0); "five" only has, preference_all, preference_hero, soon and later
+	of them (the ceiling of a head with today's targets)."""
+	if which == "all":
+		return a
+	keep = torch.ones(V.F, dtype=torch.bool)
+	if which == "five":
+		keep = torch.tensor([name in ("has", "preference_all", "preference_hero", "soon", "later") for name in V.CHANNELS])
+	out = Features(a)
+	for name, start in (("move", "move_slice"), ("travel", "travel_slice")):
+		if name not in a:
+			continue
+		views = a[name]
+		mask = torch.ones(views.shape[-1], dtype=views.dtype, device=views.device)
+		mask[a[start] + V.F :] = 0
+		mask[a[start] : a[start] + V.F] = keep.to(views.dtype)
+		out[name] = views * mask
+	return out
+
+
 def with_table(views, start, table):
 	"""views [..., VIEWS] with its planner slice [start, start + views.F) replaced by table."""
 	return torch.cat([views[..., :start], table.to(views.dtype), views[..., start + V.F :]], dim=-1)
@@ -433,6 +454,7 @@ class CampaignModelV2(nn.Module):
 	# the late terms the live planner's: a diagnostic's ceiling), "predicted" (the trunk blind, the late terms the head's
 	# table: no planner needed at serving). A constant of the process: the graphs record one path
 	nk_read = "live"  # (each model's own from ALPHA_NK_READ when it is built: __init__)
+	nk_parts, nk_channels = frozenset(), "all"  # (the "parts" diagnostic's: advice_for)
 
 	def load_state_dict(self, state_dict, strict=True, assign=False):
 		"""A checkpoint from before a parameter was added (model.ADDED) loads with it at 0: the model as it was; one from
@@ -639,6 +661,8 @@ class CampaignModelV2(nn.Module):
 		known = self.domain_knowledge(x)
 		if self.nk_read == "late":  # (a diagnostic's ceiling: the live planner's views in the late terms alone)
 			known.late = self.advice(live, known)
+		if self.nk_read == "parts":  # (the decomposition diagnostic: advice_for)
+			known.live = channels_only(self.advice(live, known), self.nk_channels)
 		state = self.encode(x)
 		state = self.take_sides(state)
 		state = self.join(state, known)
@@ -968,8 +992,9 @@ class CampaignModelV2(nn.Module):
 		its candidates' destinations and the candidates' channels, weighted by its preference among them:
 		views.candidate_tables' plan_weight) and its threat there; each town of ours its threat; the global token the
 		plan's tier and size."""
-		x, a = state.x, known.advice
+		x, a = state.x, self.advice_for(known, "plan")
 		nk, tables = a.x, a.tables
+		threats = self.advice_for(known, "threat").x  # (the threat and tier layers' inputs: the same as the plan's but in the parts diagnostic)
 		b, dc = x["g_day"].shape[0], self.cell_dim
 		index, inside = map_index(nk["k_dest"].long(), b, known.side)  # [B, NK]
 		weight = (tables["plan_weight"] * inside).unsqueeze(-1)
@@ -978,11 +1003,11 @@ class CampaignModelV2(nn.Module):
 		hero = (nk["k_hero"].long() - 1).clamp(0, HO - 1)  # (an empty row's weight is 0)
 		plan = torch.zeros(b, HO, dc + V.F, device=rows.device, dtype=rows.dtype).scatter_add(1, hero.unsqueeze(-1).expand(-1, -1, dc + V.F), rows)
 		ours = (x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)).unsqueeze(-1)
-		heroes = (self.plan_in(plan) + self.nk_hero(V.threat_views(nk["h_nk_threat"]).to(rows.dtype))) * ours
+		heroes = (self.plan_in(plan) + self.nk_hero(V.threat_views(threats["h_nk_threat"]).to(rows.dtype))) * ours
 		state.heroes = state.heroes + F.pad(heroes, (0, 0, 0, H - HO))
 		own_towns = (x["t_present"][:, :TO] & (x["t_owner"][:, :TO] == c.OWNER_SELF)).unsqueeze(-1)
-		state.towns = state.towns + F.pad(self.nk_town(V.threat_views(nk["t_nk_threat"]).to(rows.dtype)) * own_towns, (0, 0, 0, T - TO))
-		state.glob = state.glob + self.nk_global(V.global_views(nk).to(rows.dtype))
+		state.towns = state.towns + F.pad(self.nk_town(V.threat_views(threats["t_nk_threat"]).to(rows.dtype)) * own_towns, (0, 0, 0, T - TO))
+		state.glob = state.glob + self.nk_global(V.global_views(threats).to(rows.dtype))
 		return state
 
 	# ---- think ----
@@ -1048,7 +1073,7 @@ class CampaignModelV2(nn.Module):
 		index = known.window_tiles
 		cells = torch.where((index >= 0).unsqueeze(-1), flat.index_select(0, (decision[:, None, None] * (L * S * S) + index.clamp(min=0)).reshape(-1)).reshape(k, W, W, -1), torch.zeros(k, W, W, self.cell_dim, device=flat.device, dtype=flat.dtype))
 		strength = torch.cat([known.move_strength, known.move_relative[..., :1]], dim=-1)  # (the estimates and hopeless)
-		views = self.view_pair(known.advice.move.to(cells.dtype))  # (schema 19: the tile's bounded views and Nullkiller2's candidate through it)
+		views = self.view_pair(self.advice_for(known, "pairs").move.to(cells.dtype))  # (schema 19: the tile's bounded views and Nullkiller2's candidate through it)
 		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach) + self.pair_fight(fight_features(known)) + self.pair_strength(strength) + views
 
 	def foresee(self, state, known):
@@ -1108,9 +1133,9 @@ class CampaignModelV2(nn.Module):
 		days = x["travel_days"][:, :HO].reshape(b, HO, AREAS)
 		travel_in = torch.cat([E.amount(days.clamp(min=0).float() / 100, "days"), (days >= 0).float().unsqueeze(-1)], dim=-1)
 		travel = self.travel_hero(state.heroes[:, :HO]).unsqueeze(2) + self.travel_area(state.areas).unsqueeze(1) + self.travel_days(None, travel_in)
-		travel = travel + self.travel_view(a.travel.to(travel.dtype))
+		travel = travel + self.travel_view(self.advice_for(known, "pairs").travel.to(travel.dtype))
 		if known.n > 0:
-			travel = travel + self.travel_toward(toward(*a.travel_dest))
+			travel = travel + self.travel_toward(toward(*self.advice_for(known, "toward").travel_dest))
 		state.travel_pairs = self.travel_pair(torch.cat([travel, torch.tanh(known.travel_prior.reshape(b, HO, AREAS) / 4).unsqueeze(-1)], dim=-1))
 		# The plan head's own forecast of where Nullkiller2 would send each hero (plan_of; its label stays that plan),
 		# read back detached as two channels of each entry's area: its chance, and against the hero's likeliest area.
@@ -1130,11 +1155,11 @@ class CampaignModelV2(nn.Module):
 			# (forecast-out A and B: each tile's own forecasts, detached, onto its MOVE logit; the advantage head's entry term
 			# reads them too)
 			state.fore_move = torch.cat([fight_forecast(x, known, foresight["foreseen"]), consequence_channels(self.foresight.move_out(foresight["hidden"]["move"]).detach().float())], dim=-1)
-			state.move_pairs = self.move_pair(torch.cat([pairs + self.move_toward(toward(*a.move_dest)), hidden["move"], move_known, mixed], dim=-1))
+			state.move_pairs = self.move_pair(torch.cat([pairs + self.move_toward(toward(*self.advice_for(known, "toward").move_dest)), hidden["move"], move_known, mixed], dim=-1))
 		# The two late terms, purely additive on the MOVE and TRAVEL logits, after the pairs (nk_predict stage 2: the head
 		# reads the pairs, its table feeds these): the advice they read by nk_read ("live" and "blind": the forward's own;
 		# "late": the live planner's on the blind trunk; "predicted": the head's table in the planner's slice)
-		late = known.advice
+		late = self.advice_for(known, "late")
 		if self.nk_read == "late":
 			late = known.late
 		elif self.nk_read == "predicted":
@@ -1145,6 +1170,15 @@ class CampaignModelV2(nn.Module):
 			seen = seen + (self.fore_fight(state.fore_move[..., :FORE_FIGHT]) + self.fore_move(state.fore_move[..., FORE_FIGHT:])).unsqueeze(-1).to(mixed.dtype)
 			state.move_mix = self.move_mix_out(mixed) + self.move_mix_direct(move_known) + seen
 		return state
+
+	def advice_for(self, known, part):
+		"""The advice a consumer part reads: the forward's own, but in the "parts" diagnostic (nk_read "parts", harness
+		only, never served) the live planner's (filtered by nk_channels) for the parts nk_parts names: "plan" (plan_in),
+		"threat" (nk_hero, nk_town, nk_global), "pairs" (view_pair, travel_view), "toward" (move_toward, travel_toward),
+		"late" (the two late terms)."""
+		if self.nk_read == "parts" and part in self.nk_parts:
+			return known.live
+		return known.advice
 
 	def predicted_advice(self, state, known):
 		"""nk_predict stage 2: the forward's advice (the blind inputs') with the planner's slice of MOVE's and TRAVEL's
