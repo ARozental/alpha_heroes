@@ -898,6 +898,9 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 	return loss, metrics, fs_parts, fs_share
 
 
+NKP_PREPASS = 8  # nk_predict's fit (config.nk_predict_weight): read on the prepass's first this many chunks
+
+
 SHARED_PREFIXES = ("encode_", "blocks.", "unet.", "read_tiles.", "sides.", "tile_sides.", "join_", "stamp_")  # (foresight.gradient_check's shared layers)
 
 
@@ -1195,7 +1198,7 @@ def ppo_update(
 	n, started = len(decisions), time.time()
 	given_decode = decode  # (night_dropped's inputs: a caller's own, else the records')
 	night_drop_share = float("nan")  # (config.nk2_night_drop: the share of the advised labels it left out)
-	clock = {"prepass": 0.0, "wait": 0.0, "steps": 0.0, "forward": 0.0, "losses": 0.0, "backward": 0.0, "optimizer": 0.0, "cpu": time.thread_time()}  # where the update's time goes (logged: the PC's step ran at half the GPU's pace, 2026-10-30)
+	clock = {"prepass": 0.0, "wait": 0.0, "steps": 0.0, "forward": 0.0, "losses": 0.0, "backward": 0.0, "optimizer": 0.0, "nkp": 0.0, "cpu": time.thread_time()}  # where the update's time goes (logged: the PC's step ran at half the GPU's pace, 2026-10-30)
 	# The foresight's labels (foresight.game_labels, v2), each decision's row: its loss joins the minibatch's, a share
 	# per micro-batch as the others'; the shared layers' gradient from it against the PPO losses', on the first one
 	from .foresight import PART_NAMES, WATCHED, ForesightConfig, gradient_check
@@ -1205,8 +1208,8 @@ def ppo_update(
 		model.plan_outputs = True
 	if hasattr(model, "adv_outputs"):  # (v2: the advantage head's outputs while it learns, config.adv_weight, in every graph recorded below)
 		model.adv_outputs = config.adv_weight > 0
-	if hasattr(model, "nkp_outputs"):  # (v2: nk_predict's blind pass, head and targets, config.nk_predict_weight, in every graph recorded below; off again at the end)
-		model.nkp_outputs = getattr(config, "nk_predict_weight", 0.0) > 0
+	if hasattr(model, "nkp_outputs"):  # (nk_predict runs as its own step below, never inside the model's forward: the main graphs as before)
+		model.nkp_outputs = False
 	foresight_config = ForesightConfig(weight=getattr(config, "foresight_weight", ForesightConfig.weight))
 	foresight_sums, foresight_sum, checked = Counter(), None, {}  # (foresight_sum: its parts, PART_NAMES' order, on the device)
 	# On CUDA the bytes as sent go to the device and are cut and converted there (half the copy, none of the CPU's dtype copies)
@@ -1290,6 +1293,26 @@ def ppo_update(
 	privileged_module = getattr(model, "privileged", None)  # (its loss only where a batch has rivals: config.privileged_critic)
 	if graphs is not None and config.step_graphs:
 		steps_graph = model.__dict__.setdefault("_step_graph" if unroll == 1 else f"_step_graph_{unroll}", StepGraph(model, lambda out, batch: micro_loss(out, batch, config, foresight_config, privileged=privileged_module)[:3], forward))
+	# nk_predict (config.nk_predict_weight): its own step on every nk_predict_every'th micro-batch, the blind pass on the
+	# micro-batch's first rows (model_v2.nk_blind), its loss reaching the head alone; recorded as a graph of its own where
+	# the main step is (StepGraph), else eager. Its loss in STEP_PARTS' nkp_loss
+	nkp_on = getattr(config, "nk_predict_weight", 0.0) > 0 and hasattr(model, "nk_blind")
+	nkp_every = max(1, int(getattr(config, "nk_predict_every", 4)))
+	nkp_graph = nkp_fn = None
+	nkp_rows = nkp_steps = micro_count = 0
+	if nkp_on:
+		from .model_v2 import NKP_ROWS
+		from .nk_predict import loss as nk_loss
+
+		nkp_slot = torch.zeros(len(STEP_PARTS), device=device)
+		nkp_slot[STEP_PARTS.index("nkp_loss")] = 1.0
+
+		def nkp_fn(out, batch):
+			part, _ = nk_loss({k: v for k, v in out.items() if k.startswith("nkp_")}, {k[4:]: v for k, v in out.items() if k.startswith("nkt:")})
+			return config.nk_predict_weight * batch["scale"] * part, part.detach().float() * nkp_slot
+
+		if graphs is not None and config.step_graphs:
+			nkp_graph = StepGraph(model, nkp_fn, model.nk_blind)
 	# The wire's conversion recorded in the graphs (config.convert_in_graphs): they take the decoded batches as sent
 	# ({"wire": [N, IN_BYTES]}) and prepare them inside; everything else here converts them itself (model_inputs)
 	prepare = (lambda raw: convert(raw["wire"])) if convert is not None and graphs is not None and config.convert_in_graphs else None
@@ -1320,7 +1343,7 @@ def ppo_update(
 	# The advantage head's prediction for each choice before this update's steps (config.adv_weight): its explained
 	# variance of the update's advantage is a held-out reading (adv_ev), on the choices that were Nullkiller2's own and
 	# on those that left one it had (adv_ev_followed, adv_ev_deviating)
-	nkp_chunks = [] if getattr(config, "nk_predict_weight", 0.0) > 0 and getattr(model, "nkp_outputs", False) else None  # (nk_predict's fit before the steps)
+	nkp_chunks = [] if nkp_on else None  # (nk_predict's fit before the steps, on the first NKP_PREPASS chunks)
 	adv_before = adv_followed = adv_labelled = None
 	if config.adv_weight > 0 and getattr(model, "adv_outputs", False):
 		adv_before, adv_followed, adv_labelled = torch.zeros(n, device=device), torch.zeros(n, dtype=torch.bool, device=device), torch.zeros(n, dtype=torch.bool, device=device)
@@ -1342,10 +1365,12 @@ def ppo_update(
 				adv_before[index], adv_followed[index], adv_labelled[index] = predicted.float(), named, out["adv_label"][:, 0] >= 0
 				if "adv_kl" in out:
 					adv_kl_all[index], adv_read_all[index] = out["adv_kl"].float(), out["adv_read"].float()
-			if nkp_chunks is not None and "nkp_move" in out:
+			if nkp_chunks is not None and len(nkp_chunks) < NKP_PREPASS:
 				from .nk_predict import readings as nk_readings
 
-				nkp_chunks.append(nk_readings({k: v for k, v in out.items() if k.startswith("nkp_")}, {k[4:]: v for k, v in out.items() if k.startswith("nkt:")}))
+				blind = model.nk_blind(model_inputs(raw))  # (eager, no gradient: the prepass)
+				nkp_chunks.append(nk_readings({k: v for k, v in blind.items() if k.startswith("nkp_")}, {k[4:]: v for k, v in blind.items() if k.startswith("nkt:")}))
+				del blind
 			end_now[index] = torch.sigmoid(out["end_logit"].float())
 			if "growth_logit" in out:
 				growth_now[index] = out["growth_logit"][:, -1].float()
@@ -1676,6 +1701,21 @@ def ppo_update(
 					foresight_sum = fs_parts * share if foresight_sum is None else foresight_sum + fs_parts * share
 					foresight_sums["steps_seen"] += share
 				parts.append(metrics)  # (summed on the device: one sync a step, not six a micro-batch)
+				if nkp_on and micro_count % nkp_every == 0:  # (nk_predict's own step: its gradient into the head's .grad, the minibatch's step takes it)
+					mark = time.perf_counter()
+					nkp_batch = {"scale": shares.setdefault(("nkp", share), torch.full((), share * nkp_every, device=device))}
+					done = nkp_graph.run(raw, nkp_batch, budget, prepare) if nkp_graph is not None and not eager else None
+					if done is None:
+						nkp_loss_now, nkp_vector = nkp_fn(model.nk_blind(model_inputs(raw)), nkp_batch)
+						nkp_loss_now.backward()
+						del nkp_loss_now
+					else:
+						(nkp_vector,) = done
+					parts.append(nkp_vector)
+					nkp_steps += 1
+					nkp_rows += max(1, len(part) // NKP_ROWS)
+					clock["nkp"] += time.perf_counter() - mark
+				micro_count += 1
 			mark = time.perf_counter()
 			grad_norm, group_norms, bound = clip_gradients(optimizer, config.grad_clip, clips, GRAD_GROUPS)
 			optimizer.step()
@@ -1769,6 +1809,8 @@ def ppo_update(
 		head_var_slow=head_var_slow,
 		night_dropped=night_drop_share,
 	)
+	if nkp_on:
+		metrics.update(nkp_rows=nkp_rows, nkp_steps=nkp_steps, nkp_seconds=clock.get("nkp", 0.0))
 	if nkp_chunks:  # (each reading's mean over the prepass's chunks, those with heroes to count: nk_predict.readings)
 		for name in nkp_chunks[0]:
 			values = [chunk[name] for chunk in nkp_chunks if chunk[name] == chunk[name]]

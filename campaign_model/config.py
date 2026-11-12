@@ -313,6 +313,10 @@ class CampaignConfig:
 	# rows, its own weights alone (value group); its fit on the prepass's rows each update (nkp_*). Nothing reads the head.
 	# 0: no blind pass, nothing computed: the update as before, bit for bit
 	nk_predict_weight: float = 0.0
+	# nk_predict's step on every this-many'th micro-batch only (deploy 63's PC check: the blind pass on every micro-batch
+	# made the update 1.41 times as long): its own recorded step (the blind pass on the micro-batch's first 1 / NKP_ROWS
+	# rows, the head's loss and backward), the main step untouched; its fit read on the prepass's first NKP_PREPASS chunks
+	nk_predict_every: int = 4
 	# Our own policy reads the advantage head (stage 2a; model_v2's decide): this many logits a unit of its prediction
 	# (the update's advantage in sd units: soft policy iteration's 1 / beta), its table terms clipped to +-3 and centered
 	# on their mean under our own policy, its type term clipped to +-3, all before the follow mixture; x a learned gain
