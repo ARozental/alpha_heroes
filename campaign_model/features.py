@@ -1393,3 +1393,68 @@ def build_features(x, t, economy):
 	pure = (income_value + production_value) <= 0
 	value = torch.stack([income_value, production_value, unlock * pure], dim=-1) * own[..., None, None]
 	return entry, value
+
+
+# ---- exposure tonight (e5 for the user, 2026-11-12: the value heads' inputs; our heroes caught on the enemy's turn
+# read night danger 0.73 at the median where the control read 0.00, AUC 0.79, while the MOVE prior priced the night at a
+# fifth of its other terms' span). Inputs only, no prior and no loss; 0 with the economy off (t.economy_on).
+
+DANGER = ("exposure_heroes", "exposure_empire", "exposure_main", "army_outside", "town_exposure", "town_exposure_stake")
+
+
+def _hero_stakes(f, t):
+	"""[B, HO] gold: what each hero of ours loses in a lost battle, as the night prior prices it (its army, its own worth,
+	its replacement's cost over a fresh hero's)."""
+	return f.hero_gold[:, :HO] + f.hero_worth[:, :HO] + (HERO_GOLD_COST - t.hero_base) * t.gain(t.hero_value)
+
+
+def _feature_exposure_heroes(danger, stake):
+	"""0..1: our heroes' stakes at risk tonight against all their stakes; 0 none at risk."""
+	return (danger * stake).sum(dim=-1) / (stake.sum(dim=-1) + 1000.0)
+
+
+def _feature_exposure_empire(danger, stake, phi_total):
+	"""0..1: our heroes' stakes at risk tonight against our Φ; 0 none at risk."""
+	return ((danger * stake).sum(dim=-1) / (phi_total.clamp(min=0) + 1000.0)).clamp(0.0, 1.0)
+
+
+def _feature_exposure_main(danger, strength, ours):
+	"""0..1: tonight's danger at our strongest hero's tile; 0 none (or no hero)."""
+	main = torch.where(ours, strength, torch.full_like(strength, -1e9)).argmax(dim=-1, keepdim=True)
+	return torch.gather(danger * ours, -1, main).squeeze(-1)
+
+
+def _feature_army_outside(gold, outside):
+	"""0..1: the share of our heroes' armies (gold) standing outside our towns; 0 all inside, or no army."""
+	return (gold * outside).sum(dim=-1) / gold.sum(dim=-1).clamp(min=1.0)
+
+
+def _feature_town_exposure(town_danger, own):
+	"""0..1: the largest danger to a town of ours; 0 none."""
+	return (town_danger * own).amax(dim=-1)
+
+
+def _feature_town_exposure_stake(town_danger, stakes, own, phi_total):
+	"""0..1: our towns' worth at risk against our Φ; 0 none at risk."""
+	return ((town_danger * stakes * own).sum(dim=-1) / (phi_total.clamp(min=0) + 1000.0)).clamp(0.0, 1.0)
+
+
+def danger_features(x, t, f):
+	"""[B, len(DANGER)]: how exposed our heroes and towns are tonight (each _feature_ above, DANGER's order), from what the
+	features already compute: night_danger at each hero's own tile, the night prior's stakes, town_danger; 0 with the
+	economy off (t.economy_on: the model as before, bit for bit)."""
+	ours = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
+	manned = t.town_strength(x, f.town_power, manned=True)
+	danger = night_danger(x, f.hero_strength, manned, x["h_pos"][:, :HO].unsqueeze(2)).squeeze(-1) * ours  # [B, HO]
+	stake = _hero_stakes(f, t) * ours
+	own = own_towns(x)
+	in_town = ((x["h_pos"][:, :HO].unsqueeze(2) == x["t_pos"][:, None, : c.OWN_TOWNS]).all(dim=-1) & own.bool().unsqueeze(1)).any(dim=-1)  # [B, HO]
+	gold = f.hero_gold[:, :HO] * ours
+	town = f.town_danger[:, : c.OWN_TOWNS]
+	return t.economy_on() * torch.stack(
+		[
+			_feature_exposure_heroes(danger, stake), _feature_exposure_empire(danger, stake, f.phi_total), _feature_exposure_main(danger, f.hero_strength[:, :HO], ours),
+			_feature_army_outside(gold, (~in_town).float()), _feature_town_exposure(town, own), _feature_town_exposure_stake(town, f.town_stakes, own, f.phi_total),
+		],
+		dim=-1,
+	)

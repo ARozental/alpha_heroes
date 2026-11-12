@@ -7,7 +7,7 @@ import torch
 
 from campaign_model import constants as c
 from campaign_model import features as ft
-from campaign_model.features import ECONOMY
+from campaign_model.features import DANGER, ECONOMY
 from campaign_model.model_v2 import GROWN_INPUTS, CampaignModelV2, distance_buckets, map_index, window_tile_index
 from campaign_model.tests.test_model import tensors
 from campaign_model.tests.test_model_v2 import rich_inputs
@@ -30,13 +30,14 @@ def golden_model():
 				continue
 			g = torch.Generator().manual_seed(sum(ord(ch) * (i + 1) for i, ch in enumerate(name)) % (2**31))
 			if name in GROWN_INPUTS[2:]:  # (the economy's columns, 2026-11-12: the old ones drawn as before, the new at 0, as a checkpoint migrates)
-				old = 0.05 * torch.randn(p.shape[0], p.shape[1] - len(ECONOMY), generator=g)
-				p.copy_(torch.cat([old, torch.zeros(p.shape[0], len(ECONOMY))], dim=1))
+				old = 0.05 * torch.randn(p.shape[0], p.shape[1] - NEW_COLUMNS, generator=g)
+				p.copy_(torch.cat([old, torch.zeros(p.shape[0], NEW_COLUMNS)], dim=1))
 				continue
 			p.copy_(0.05 * torch.randn(p.shape, generator=g))
 	return model
 
 
+NEW_COLUMNS = len(ECONOMY) + len(DANGER)  # (the grown layers' columns since 12881e9: the economy's and exposure's)
 # Outputs behind the layers the economy widened (model_v2.GROWN_INPUTS[2:], 2026-11-12): the same numbers with zero
 # columns added, summed by the BLAS in another order at this test's small widths (2.4e-7 at most); the live checkpoint's
 # outputs on 600 spool decisions stayed bit for bit

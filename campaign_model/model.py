@@ -749,6 +749,7 @@ class CustomFeatures(nn.Module):
 		f.hire_gain = ft.hire_gain(x, self, f.tavern_worth)
 		f.economy = ft.economy_features(x, self)
 		f.build_entry, f.build_value = ft.build_features(x, self, f.economy)
+		f.danger = ft.danger_features(x, self, f)
 		f.trade_needs = ft.trade_needs(x, self)
 		f.trade_options = ft.trade_options(x, self)
 		f.build_trade, f.recruit_trade, f.recruit_short = ft.purchase_trades(x, self)

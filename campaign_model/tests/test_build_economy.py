@@ -9,6 +9,7 @@ from campaign_model.model_v2 import GROWN_INPUTS, CampaignModelV2
 from campaign_model.tests.test_model_v2 import rich_inputs
 
 TO, NB = c.OWN_TOWNS, c.N_BUILDINGS
+NEW_COLUMNS = len(ft.ECONOMY) + len(ft.DANGER)  # (the grown layers' columns: the economy's and exposure's)
 T = lambda *v: torch.tensor([float(a) for a in v])  # noqa: E731
 
 
@@ -108,14 +109,15 @@ def test_off_changes_nothing_whatever_the_features_hold():
 	x = inputs()
 	with torch.no_grad():
 		base = m(x)
-	real_e, real_b = ft.economy_features, ft.build_features
+	real_e, real_b, real_d = ft.economy_features, ft.build_features, ft.danger_features
 	try:
 		ft.economy_features = lambda x_, t: torch.rand(x_["g_day"].shape[0], len(ft.ECONOMY)) * t.economy_on()
 		ft.build_features = lambda x_, t, e: (torch.rand(x_["g_day"].shape[0], TO, NB, len(ft.BUILD_ENTRY)) * t.economy_on(), torch.rand(x_["g_day"].shape[0], TO, NB, 3) * 1e5)
+		ft.danger_features = lambda x_, t, f: torch.rand(x_["g_day"].shape[0], len(ft.DANGER)) * t.economy_on()
 		with torch.no_grad():
 			out = m(x)
 	finally:
-		ft.economy_features, ft.build_features = real_e, real_b
+		ft.economy_features, ft.build_features, ft.danger_features = real_e, real_b, real_d
 	for name, value in base.items():
 		if torch.is_tensor(value) and value.is_floating_point():
 			assert torch.equal(torch.nan_to_num(value, nan=0.0, posinf=1e9, neginf=-1e9), torch.nan_to_num(out[name], nan=0.0, posinf=1e9, neginf=-1e9)), name
@@ -127,11 +129,11 @@ def test_a_checkpoint_from_before_loads_and_plays_as_it_did():
 	with torch.no_grad():
 		for name in GROWN_INPUTS[2:]:  # (a trained model's: its old columns as they are, the economy's at 0)
 			p = dict(m.named_parameters())[name]
-			p[:, -len(ft.ECONOMY):] = 0.0
+			p[:, -NEW_COLUMNS:] = 0.0
 		base = m(x)
 	old = {k: v for k, v in m.state_dict().items() if not k.startswith("build_situational") and k not in ("features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy", "features.empire_alpha")}
 	for name in GROWN_INPUTS[2:]:
-		old[name] = old[name][:, : -len(ft.ECONOMY)].clone()
+		old[name] = old[name][:, : -NEW_COLUMNS].clone()
 	fresh = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
 	fresh.load_state_dict(old)
 	with torch.no_grad():

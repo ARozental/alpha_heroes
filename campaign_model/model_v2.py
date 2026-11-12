@@ -451,7 +451,7 @@ class CampaignModelV2(nn.Module):
 		self.player = small_embedding(P, d)
 		self.players = E.Tokenizer(2 * d, d)
 		# join
-		self.join_global = E.Tokenizer(d + ft_phi_features() + 3 + len(ft.ECONOMY), d, embedded=False)  # (the economy's columns last: GROWN_INPUTS)
+		self.join_global = E.Tokenizer(d + ft_phi_features() + 3 + len(ft.ECONOMY) + len(ft.DANGER), d, embedded=False)  # (the economy's and exposure's columns last: GROWN_INPUTS)
 		self.join_hero = E.Tokenizer(d + HERO_KNOWN, d, embedded=False)
 		self.join_town = E.Tokenizer(d + TOWN_KNOWN, d, embedded=False)
 		self.join_tiles = nn.Linear(TILE_KNOWN, dc)
@@ -473,7 +473,7 @@ class CampaignModelV2(nn.Module):
 		self.pair_strength = zero_output(nn.Linear(MOVE_STRENGTH + 1, dp))  # (2026-11-04: the four estimates x two sides, hopeless)
 		self.foresight = Foresight(d, dp)
 		# think_again
-		self.again_global = E.Tokenizer(d + FORESIGHT_HIDDEN + ft_phi_features() + 3 + len(ft.ECONOMY), d, embedded=False)
+		self.again_global = E.Tokenizer(d + FORESIGHT_HIDDEN + ft_phi_features() + 3 + len(ft.ECONOMY) + len(ft.DANGER), d, embedded=False)
 		self.again_hero = E.Tokenizer(d + FORESIGHT_HIDDEN + HERO_KNOWN, d, embedded=False)
 		self.again_option = E.Tokenizer(d + FORESIGHT_HIDDEN, d, embedded=False)
 		self.again_block = Block(d, heads)
@@ -547,7 +547,7 @@ class CampaignModelV2(nn.Module):
 		nn.init.zeros_(self.option_weights.weight)
 		self.end_out = zero_output(nn.Linear(d, 1))
 		self.type_bias = nn.Parameter(priors.action_types().clone())
-		self.value_hidden = nn.Sequential(nn.Linear(3 * d + ft_phi_features() + len(ft.ECONOMY), d), nn.GELU())
+		self.value_hidden = nn.Sequential(nn.Linear(3 * d + ft_phi_features() + len(ft.ECONOMY) + len(ft.DANGER), d), nn.GELU())
 		self.value_heads = zero_output(nn.Linear(d, c.N_VALUE_OFFSETS))
 		self.growth_heads = zero_output(nn.Linear(d, c.N_VALUE_OFFSETS))
 		self.end_head = zero_output(nn.Linear(d, 1))
@@ -1361,7 +1361,7 @@ class CampaignModelV2(nn.Module):
 		own_mean = (own * mine).sum(dim=1) / mine.sum(dim=1).clamp(min=1)
 		shared = torch.cat([state.glob, own_mean, state.players[:, 0]], dim=-1)
 		shared = shared * self.value_valve + shared.detach() * (1 - self.value_valve)  # (value_valve: the forward the same, the gradient into the shared layers x it)
-		hidden = self.value_hidden(torch.cat([shared, known.phi, known.economy.to(shared.dtype)], dim=-1))
+		hidden = self.value_hidden(torch.cat([shared, known.phi, known.economy.to(shared.dtype), known.danger.to(shared.dtype)], dim=-1))
 		share_prior = -torch.log(x["g_players"].clamp(min=2).float() - 1)
 		# V2, V5, V7: a share from 1 / players, or its logit's change from none (config.share_target)
 		value_logit = self.value_heads(hidden) + (share_prior.unsqueeze(-1) if self.share_target == "share" else 0.0)
@@ -1399,7 +1399,7 @@ def log_ratio(value, reference):
 
 def global_known(known):
 	"""[B, PHI_FEATURES + 3]: Φ as the value heads see it, Nullkiller2's gold pressure, its pause, its want of a hero."""
-	return torch.cat([known.phi, torch.stack([known.gold_pressure / (1 + known.gold_pressure), known.recruit_pause, known.hire_want], dim=-1), known.economy.to(known.phi.dtype)], dim=-1)
+	return torch.cat([known.phi, torch.stack([known.gold_pressure / (1 + known.gold_pressure), known.recruit_pause, known.hire_want], dim=-1), known.economy.to(known.phi.dtype), known.danger.to(known.phi.dtype)], dim=-1)
 
 
 HERO_KNOWN = 1 + 3 + 4 + 2 * E.AMOUNT_FEATURES + 1
