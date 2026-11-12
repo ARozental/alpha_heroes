@@ -1,4 +1,4 @@
 [submodule "vcmi"]
 	path = vcmi
-	url = git@github.com:ARozental/vcmi.git
+	url = https://github.com/ARozental/vcmi.git
 	branch = alpha_heroes
