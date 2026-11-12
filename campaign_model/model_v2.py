@@ -432,7 +432,7 @@ class CampaignModelV2(nn.Module):
 	# bit), "blind" (the planner's fields absent, the memory kept: a game without the advisor), "late" (the trunk blind,
 	# the late terms the live planner's: a diagnostic's ceiling), "predicted" (the trunk blind, the late terms the head's
 	# table: no planner needed at serving). A constant of the process: the graphs record one path
-	nk_read = os.environ.get("ALPHA_NK_READ", "live")
+	nk_read = "live"  # (each model's own from ALPHA_NK_READ when it is built: __init__)
 
 	def load_state_dict(self, state_dict, strict=True, assign=False):
 		"""A checkpoint from before a parameter was added (model.ADDED) loads with it at 0: the model as it was; one from
@@ -622,6 +622,7 @@ class CampaignModelV2(nn.Module):
 		# nk_predict's head (2026-11-11, stage 1: it only learns, config.nk_predict_weight), made last: the other
 		# parameters' initialisation as before
 		self.nkp = NkPredictHead(d, dp)
+		self.nk_read = os.environ.get("ALPHA_NK_READ", "live")  # (read when the model is built: a server's after its process's environment is set)
 
 	def prior_corrections(self):
 		"""The parameters that correct a fixed prior (model.CustomFeatures): weight decay pulls them back to it."""
