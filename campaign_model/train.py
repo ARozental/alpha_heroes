@@ -950,8 +950,12 @@ def segment_surprises(targets, growth_real, value_all, growth_all, log_phi, shar
 
 def segment_shrinkage(evidence, min_players):
 	"""(k, F, types) of a segment from its credit_evidence: each action type's mean gap m_t over the game-players and its
-	sampling variance v_t = var_t / n, over the types with min_players; F = the m_t's variance over the v_t's mean (the
-	between-type spread against what sampling alone would make), k = max(0, 1 - 1 / F); nan (0 types) with fewer than 2."""
+	sampling variance v_t = var_t / n, over the types with min_players; F = the types' precision-weighted spread of means
+	sum w_t (m_t - m_w)^2 / (types - 1), w_t = 1 / v_t and m_w their weighted mean (with no real gaps chi-square over its
+	degrees: mean 1 whatever the types' sizes), k = max(0, 1 - 1 / F); nan (0 types) with fewer than 2. Before
+	2026-11-12 F was the means' plain variance over the v_t's mean: also 1 on average, but riding on the noisiest type's
+	single draw (about z^2 of one type with 56 game-players against 600 for the rest: what lifted k7 to 0.17 at v3254,
+	e5's 1b). With equal v_t the two are the same."""
 	means, variances = [], []
 	for n, total, squares in (evidence or {}).values():
 		if n < min_players:
@@ -961,7 +965,9 @@ def segment_shrinkage(evidence, min_players):
 		variances.append(max(squares / n - mean * mean, 0.0) * n / (n - 1) / n)
 	if len(means) < 2:
 		return float("nan"), float("nan"), len(means)
-	f = float(np.var(means, ddof=1) / max(np.mean(variances), 1e-12))
+	means, weights = np.asarray(means), 1.0 / np.maximum(np.asarray(variances), 1e-12)
+	centre = float((weights * means).sum() / weights.sum())
+	f = float((weights * (means - centre) ** 2).sum() / (len(means) - 1))
 	return max(0.0, 1.0 - 1.0 / f) if f > 0 else 0.0, f, len(means)
 
 
