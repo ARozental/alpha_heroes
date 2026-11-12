@@ -886,6 +886,37 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 	return loss, metrics, fs_parts, fs_share
 
 
+def segment_surprises(targets, growth_real, value_all, growth_all, log_phi, share_trust, w, device):
+	"""config.credit_segments: each decision's credit in three segments [n, 3] (0-2, 2-5, 5-7 days), each that window's
+	real change less the heads' forecast for it, the share's (its baseline as the 7-day credit's: share_baseline) and the
+	growth's (the log of our value) mixed by the share's weight w as the credit mixes them; nan where unknown. Their sum
+	is the 7-day credit."""
+	real = torch.from_numpy(np.asarray(targets, dtype=np.float32)).to(device) * 2 * SHARE_CHANGE_CAP - SHARE_CHANGE_CAP  # [n, K]
+	predicted = torch.sigmoid(value_all) * 2 * SHARE_CHANGE_CAP - SHARE_CHANGE_CAP
+	share = torch.stack([real[:, k] - share_baseline(real[:, k], predicted[:, k], share_trust) for k in range(real.shape[1])], dim=1)
+	grown = torch.from_numpy(np.asarray(growth_real, dtype=np.float32)).to(device)
+	growth = (grown - log_phi.unsqueeze(1)).clamp(-GROWTH_CAP, GROWTH_CAP) - (torch.sigmoid(growth_all) * 2 * GROWTH_CAP - GROWTH_CAP)
+	cumulative = w.unsqueeze(1) * share + (1 - w.unsqueeze(1)) * growth  # [n, K]: the credit to day 2, 5, 7
+	return torch.cat([cumulative[:, :1], cumulative[:, 1:] - cumulative[:, :-1]], dim=1)
+
+
+def segment_shrinkage(evidence, min_players):
+	"""(k, F, types) of a segment from its credit_evidence: each action type's mean gap m_t over the game-players and its
+	sampling variance v_t = var_t / n, over the types with min_players; F = the m_t's variance over the v_t's mean (the
+	between-type spread against what sampling alone would make), k = max(0, 1 - 1 / F); nan (0 types) with fewer than 2."""
+	means, variances = [], []
+	for n, total, squares in (evidence or {}).values():
+		if n < min_players:
+			continue
+		mean = total / n
+		means.append(mean)
+		variances.append(max(squares / n - mean * mean, 0.0) * n / (n - 1) / n)
+	if len(means) < 2:
+		return float("nan"), float("nan"), len(means)
+	f = float(np.var(means, ddof=1) / max(np.mean(variances), 1e-12))
+	return max(0.0, 1.0 - 1.0 / f) if f > 0 else 0.0, f, len(means)
+
+
 def share_baseline(real_change, predicted, trust):
 	"""The schedule credit's baseline for the share's real change: the V7 change head's prediction as far as it is
 	trusted (0..1: its explained variance's, CampaignLearner.trust), the batch's mean change for the rest. joint7's head
@@ -1091,7 +1122,7 @@ def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
 	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None, teacher=None, teacher_weight=None,
 	share_trust=1.0, head_scale=None, teacher_sets=None, loss_weights=None, streams=None, clips=None, privileged=None,
-	growth_trust=1.0, hidden=None,
+	growth_trust=1.0, hidden=None, segment_k=None,
 ):
 	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
 	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
@@ -1220,6 +1251,9 @@ def ppo_update(
 	model.eval()
 	anchor, end_now, prior = torch.empty(n, device=device), torch.empty(n, device=device), torch.empty(n, device=device)
 	growth_now, log_phi = torch.zeros(n, device=device), torch.zeros(n, device=device)  # (G7's logit, our log value: the attributed credit's)
+	segments = getattr(config, "credit_segments", False) and config.credit == "schedule" and growth is not None
+	if segments:  # (config.credit_segments: every offset's heads, V2 V5 V7 and G2 G5 G7)
+		value_all, growth_all = torch.zeros(n, c.N_VALUE_OFFSETS, device=device), torch.zeros(n, c.N_VALUE_OFFSETS, device=device)
 	side = torch.full((n,), 36.0, device=device)  # (each decision's map side: the schedule credit's share weight)
 	value_now = torch.zeros(n, device=device)  # (V7's logit: the schedule credit's share forecast)
 	# The same pass measures the value loss on these decisions before the update learns from them (the user, 2026-10-29:
@@ -1264,6 +1298,8 @@ def ppo_update(
 			if "growth_logit" in out:
 				growth_now[index] = out["growth_logit"][:, -1].float()
 				value_now[index] = out["value_logit"][:, -1].float()
+				if segments:
+					growth_all[index], value_all[index] = out["growth_logit"].float(), out["value_logit"].float()
 				log_phi[index] = out["phi"].float().clamp(min=PHI_FLOOR).log()
 			players = input_on_device(raw["wire"], "g_players") if prepare is not None else raw["g_players"]
 			side[index] = (input_on_device(raw["wire"], "g_map") if prepare is not None else raw["g_map"])[:, :2].amax(dim=1).float()
@@ -1359,7 +1395,7 @@ def ppo_update(
 		known = torch.isfinite(advantage)
 		if int(known.sum()) > 1:
 			attributed_stats = {"attributed_taken_share": float((taken[known] > 0).float().mean()), "attributed_taken_mean": float(taken[known].mean()), "attributed_own_std": float(own[known].std()), "attributed_taken_std": float(taken[known].std())}
-	schedule_stats = {}
+	schedule_stats, schedule_stats_segments, segment_rows = {}, {}, None
 	if config.credit == "schedule" and growth_real is not None:  # (config.credit: the share's weight grows by the day)
 		real7 = torch.from_numpy(np.asarray(growth_real, dtype=np.float32)[:, -1]).to(device)
 		grow = (real7 - log_phi).clamp(-GROWTH_CAP, GROWTH_CAP) - (torch.sigmoid(growth_now) * 2 * GROWTH_CAP - GROWTH_CAP)
@@ -1390,9 +1426,18 @@ def ppo_update(
 		# 	change = step_credit(change, share_forecast, step, day, share_step_trust, classes, price, config.outcome_share_min)
 		w = share_weight(day, side, config)
 		advantage = w * change + (1 - w) * grow  # (nan where a label is unknown: no credit)
+		if segments:  # (config.credit_segments: the 7-day credit by segments, the long ones at the learner's measured k)
+			full = advantage
+			pieces = segment_surprises(targets, growth_real, value_all, growth_all, log_phi, share_trust, w, device)  # [n, 3]
+			k5, k7 = segment_k if segment_k is not None else (0.0, 0.0)
+			advantage = torch.where(torch.isfinite(full), pieces[:, 0], full) + sum(torch.where(torch.isfinite(pieces[:, j]), weight * pieces[:, j], torch.zeros_like(pieces[:, j])) for j, weight in ((1, k5), (2, k7)) if weight > 0)
+			segment_rows = pieces
+			both = torch.isfinite(full) & torch.isfinite(advantage)
+			if int(both.sum()) > 1:
+				schedule_stats_segments = {"segment_credit_std": float(advantage[both].std()), "segment_full_std": float(full[both].std())}
 		known = torch.isfinite(advantage)
 		if int(known.sum()) > 1:
-			schedule_stats = {"schedule_share_weight": float(w[known].mean()), "schedule_share_std": float(change[known].std()), "schedule_growth_std": float(grow[known].std()), "schedule_share_trust": float(share_trust), "schedule_growth_trust": float(growth_trust), **step_stats}
+			schedule_stats = {**(schedule_stats_segments if segments else {}), "schedule_share_weight": float(w[known].mean()), "schedule_share_std": float(change[known].std()), "schedule_growth_std": float(grow[known].std()), "schedule_share_trust": float(share_trust), "schedule_growth_trust": float(growth_trust), **step_stats}
 		# The actions' price (config.schedule_action_price; the user, 2026-11-09): the 7-day outcome less a tiny amount for
 		# each action the player makes from this decision on through that week (labels.actions_ahead, the learner's
 		# end["actions"]), so that of two ways to the same outcome the one with fewer actions is the better
@@ -1642,6 +1687,7 @@ def ppo_update(
 		value_unexplained=value_unexplained,
 		**privileged_stats,  # (config.privileged_critic: its fit, its corrections' size, the rivals a decision had)
 		**adv_stats,  # (config.adv_weight: the advantage head's held-out fit, the advantage's own spread)
+		**({"segment_surprise": segment_rows.cpu().numpy()} if segment_rows is not None else {}),  # (config.credit_segments: for the learner's evidence)
 		learning_rate=config.learning_rate * lr_scale,
 		credited=int(credited.sum()),
 		gpu_mb=gpu_mb,

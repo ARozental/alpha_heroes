@@ -53,7 +53,7 @@ from .empire import STATUS_INGAME, EmpireConfig, empire_value
 from .failures import NAMES as FAILURES, failure_modes
 from .features import SKILLS
 from .labels import (
-	COLORS, GROWTH_CAP, PHI_FLOOR, LabelConfig, actions_ahead, attributed_labels, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
+	COLORS, CREDIT_MIN_PLAYERS, GROWTH_CAP, PHI_FLOOR, LabelConfig, actions_ahead, attributed_labels, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
 	label, ladder_targets, pooled_ev, residual_variances, share_change_labels, share_logit, share_now, tables,
 )
 from .advice import teacher_sets
@@ -62,7 +62,7 @@ from .labeler import Labeler
 from .model import build_model
 from .play import choice_hidden
 from .records import NO_EFFECT, TEACHER, decode_fields, decode_inputs
-from .train import GRAD_GROUPS, HEAD_SCALE_RAMP, _prefetched, fit_moments, load_optimizer, make_optimizer, migrate_subtypes, model_kwargs, ppo_update, usable
+from .train import GRAD_GROUPS, HEAD_SCALE_RAMP, _prefetched, fit_moments, load_optimizer, make_optimizer, migrate_subtypes, model_kwargs, ppo_update, segment_shrinkage, usable
 
 TYPES = [a.name.lower() for a in c.ActionType]
 FORESIGHT_COLUMNS = tuple(f"foresight_{head}_{part}" for head in ("move", "answer") for part in ("battle", "score", "parts")) + ("foresight_hero_alive", "foresight_hero_army", "foresight_turn", "foresight_plan", "foresight_move_tiles", "foresight_move_win", "foresight_move_stake")
@@ -120,7 +120,12 @@ COLUMNS = [
 	# config.adv_by_kind standardizes them apart)
 	"adv_mean_shown", "adv_mean_hidden", "adv_sd_shown", "adv_sd_hidden", "adv_weight_shown", "adv_weight_hidden",
 	"loops_cut", "loops_cut_move", "loops_cut_multi", "probes_no_way",  # (bundle 60's loop guard, a game)
+	# (config.credit_segments: the k's this update's credit used, each segment's F (its action types' between-type spread
+	# of gaps over their sampling variance) and the number of types that entered it, the credit's spread with the k's and
+	# the 7-day credit's on the same rows: the noise the k's leave out)
+	"segment_k5", "segment_k7", "segment_f2", "segment_f5", "segment_f7", "segment_types2", "segment_types5", "segment_types7", "segment_credit_std", "segment_full_std",
 ]
+SEGMENT_RATE = 0.05  # config.credit_segments: each long segment's k moves this far toward its measured max(0, 1 - 1/F) an update
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
 DROP_BEYOND = 4  # updates' worth of finished games beyond which the oldest are dropped (_take)
 # The value-loss guard (config.value_jump_stop; the user, 2026-11-10: a jump of the campaign's value loss is the first
@@ -212,6 +217,8 @@ class CampaignLearner:
 		self.credit_check = 1.0  # and its verdict, how far the step's estimate may be trusted (labels.credit_trust)
 		self.end_evidence = {}  # the same for V_end's steps, the end credit's (campaign_end_credit/*)
 		self.end_check = 1.0  # and its verdict (end_credit: config.end_credit_check)
+		self.segment_evidence = [{}, {}, {}]  # (config.credit_segments: credit_evidence of each segment's surprise, 0-2 2-5 5-7 days)
+		self.segment_k = (0.0, 0.0)  # (and the 2-5 and 5-7 segments' weights in the credit, from 0: the 2-day credit)
 		self.head_ev = {}  # each head's explained variance at the day starts, smoothed: how far it grades the next (grade_trust)
 		self.value_pool, self.head_pool = None, {}  # their parts (labels.pooled_ev): the residual variance and the variance, smoothed apart
 		self.head_var, self.head_scale_updates = None, 0  # (config.head_scale) the heads' running target variances, the updates since it began
@@ -242,6 +249,7 @@ class CampaignLearner:
 			self.credit_check = credit_trust(credit_gaps(self.credit_evidence))
 			self.end_evidence = state.get("end_evidence", {})
 			self.end_check = credit_trust(credit_gaps(self.end_evidence))
+			self.segment_evidence, self.segment_k = state.get("segment_evidence", [{}, {}, {}]), tuple(state.get("segment_k", (0.0, 0.0)))
 			self.head_ev = state.get("head_ev", {})
 			self.value_pool, self.head_pool = state.get("value_pool"), state.get("head_pool", {})
 			self.head_var, self.head_scale_updates = state.get("head_var"), state.get("head_scale_updates", 0)
@@ -695,7 +703,7 @@ class CampaignLearner:
 			out_of_memory = None
 			with self.model_lock:
 				try:
-					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, replace(self.config, nk2_gather_weight=gather_weight, target_kl=self.config.target_kl * valve_k), device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), growth_trust=self.grade_trust().get("G7", 0.0), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None, privileged={name: np.concatenate([part[name] for part in privileged]) for name in privileged[0]} if privileged else None, hidden=np.concatenate(hidden) if hidden else None)
+					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, replace(self.config, nk2_gather_weight=gather_weight, target_kl=self.config.target_kl * valve_k), device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), growth_trust=self.grade_trust().get("G7", 0.0), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None, privileged={name: np.concatenate([part[name] for part in privileged]) for name in privileged[0]} if privileged else None, hidden=np.concatenate(hidden) if hidden else None, segment_k=self.segment_k if getattr(self.config, "credit_segments", False) else None)
 				except torch.OutOfMemoryError as error:  # (handled below, once the error's frames, and their tensors, are gone)
 					out_of_memory = str(error)[:200]
 			if out_of_memory is not None:
@@ -733,6 +741,9 @@ class CampaignLearner:
 			row["end_credit_gaps"] = credit_gaps(self.end_evidence)
 			self.end_check = credit_trust(row["end_credit_gaps"])  # (for the next update's end credit: end_credit)
 			row["end_check"] = self.end_check
+		surprises = metrics.pop("segment_surprise", None)
+		if surprises is not None:  # (config.credit_segments: each segment's evidence, and the k's for the next update)
+			row.update(self._note_segments(decisions, surprises, np.concatenate(streams[0])))
 		self._relabel_waiting()
 		memory.append(("updated", rss_gb()))
 		self._log(epoch, games, decisions, row, metrics, time.time() - started)
@@ -750,6 +761,22 @@ class CampaignLearner:
 			free, total = torch.cuda.mem_get_info(self.device)
 			print(f"campaign gpu memory (GB): allocated {torch.cuda.memory_allocated(self.device) / 2**30:.1f}  reserved {torch.cuda.memory_reserved(self.device) / 2**30:.1f}  card free {free / 2**30:.1f} of {total / 2**30:.1f}", flush=True)
 		return True
+
+	def _note_segments(self, decisions, surprises, players):
+		"""config.credit_segments: each segment's surprise (ppo_update's, [n, 3]) into its evidence (labels.credit_evidence:
+		by action type, against the player's other decisions, faded); each long segment's k one step of SEGMENT_RATE toward
+		train.segment_shrinkage's max(0, 1 - 1/F), at most 1; the next update's credit uses them (one update's lag). The
+		row's readings: the k's this update used, each segment's F and its types."""
+		out = {"segment_k5": self.segment_k[0], "segment_k7": self.segment_k[1]}
+		ks = list(self.segment_k)
+		for j, offset in enumerate(c.VALUE_OFFSETS):
+			self.segment_evidence[j] = credit_evidence(decisions, surprises[:, j], players, self.segment_evidence[j])
+			k, f, types = segment_shrinkage(self.segment_evidence[j], CREDIT_MIN_PLAYERS)
+			out[f"segment_f{offset}"], out[f"segment_types{offset}"] = f, types
+			if j > 0 and np.isfinite(k):
+				ks[j - 1] = min(1.0, ks[j - 1] + SEGMENT_RATE * (k - ks[j - 1]))
+		self.segment_k = (float(ks[0]), float(ks[1]))
+		return out
 
 	def _relabel_waiting(self):
 		"""The games still waiting whose labels came from tables MAX_LABEL_STALENESS versions back or more: labelled again
@@ -867,6 +894,8 @@ class CampaignLearner:
 			# choice there, the advantage head's fit, players out of their game)
 			**choice_readings(games, metrics),
 			**{name: metrics.get(name, float("nan")) for name in ("adv_loss", "adv_ev", "adv_ev_followed", "adv_ev_deviating", "adv_followed", "adv_raw_sd", "adv_kl", "adv_read")},
+			**{name: sums.get(name, float("nan")) for name in ("segment_k5", "segment_k7", "segment_f2", "segment_f5", "segment_f7", "segment_types2", "segment_types5", "segment_types7")},
+			**{name: metrics.get(name, float("nan")) for name in ("segment_credit_std", "segment_full_std")},
 			"action_price_mean": metrics.get("schedule_action_price_mean", float("nan")),
 			"action_price_share": metrics.get("schedule_action_price_share", float("nan")),
 			"end_first": reading(end_first, [d for game, _ in games for d in game.decisions]),
@@ -991,7 +1020,7 @@ class CampaignLearner:
 			"  value ev " + "/".join(f"{row[f'head_ev_v{k}']:+.2f}" for k in c.VALUE_OFFSETS)
 			+ f" (this update {row[f'value_ev_d{c.VALUE_OFFSETS[-1]}']:+.2f}: corr {metrics.get('value_corr', float('nan')):+.2f}, spread {metrics.get('value_spread', float('nan')):.3f} vs {metrics.get('label_spread', float('nan')):.3f}, unexplained {metrics.get('value_unexplained', float('nan')):.2f}{privileged_note})"
 			+ "  growth ev " + "/".join(f"{row[f'head_ev_g{k}']:+.2f}" for k in c.VALUE_OFFSETS) + f"  end ev {row['head_ev_vend']:+.2f} (credit {row['end_credit']:.2f})  trust {row['trust']:.2f} (today {self.trust_today():.2f})"
-			+ f"  kl {row['last_kl']:.4f} (target {metrics.get('kl_target', float('nan')):.4f})" + (f"  teacher kl {row['teacher_kl']:.3f} (weight {row['teacher_weight']:.2f})" if self.teacher is not None else "") + (f"  advice {row['advised']:.0%} of turns and exchanges, ours its {row['teacher_agree']:.0%}, teacher ce {row['teacher_ce']:.3f} (weight {row['teacher_weight']:.2f})" if self.config.nk2_advice > 0 else "") + (f"  action price {row['action_price_mean']:.2e} a decision ({row['action_price_share']:.2%} of the 7-day credit's spread), a day begun with END {row['end_first']:.3f}" if self.config.schedule_action_price > 0 else "") + (f"  its choice hidden in {row['choice_hidden']:.0%} of the games: ours its advice {row['teacher_agree_shown']:.0%} shown, {row['teacher_agree_hidden']:.0%} hidden; the head's ev {row['adv_ev_shown']:+.3f} shown, {row['adv_ev_hidden']:+.3f} hidden, the advantage's sd {row['adv_raw_sd_shown']:.3g} shown, {row['adv_raw_sd_hidden']:.3g} hidden; idle movement {row['idle_movement_shown']:.3f} shown, {row['idle_movement_hidden']:.3f} hidden; a day begun with END {row['end_first_shown']:.3f} shown, {row['end_first_hidden']:.3f} hidden; eliminated {row['eliminated_shown']:.3f} shown, {row['eliminated_hidden']:.3f} hidden" if getattr(self.config, "nk2_choice_games", 1.0) < 1.0 else "") + (f"  advantage head: loss {row['adv_loss']:.4f}, ev {row['adv_ev']:+.3f} (its own choice {row['adv_ev_followed']:+.3f} at {row['adv_followed']:.0%}, leaving it {row['adv_ev_deviating']:+.3f}), the advantage's sd {row['adv_raw_sd']:.3g}" + (f"; read by our policy at {float(self.model.features.adv_gain_weight().detach()):.3f} a unit: |term| {row['adv_read']:.4f}, its KL {row['adv_kl']:.5f} (shown {row['adv_kl_shown']:.5f}, hidden {row['adv_kl_hidden']:.5f})" if getattr(self.config, "adv_gain", 0.0) > 0 else "") if self.config.adv_weight > 0 else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f} (fraction {(metrics.get('signal_fraction') or {}).get('all', float('nan')):.3f})  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f}" + (f", every hero slot in {metrics['full_windows']} steps" if metrics.get("full_windows") else "") + (", window budget refused" if metrics.get("window_budget_ok") is False else "") + f")  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
+			+ f"  kl {row['last_kl']:.4f} (target {metrics.get('kl_target', float('nan')):.4f})" + (f"  teacher kl {row['teacher_kl']:.3f} (weight {row['teacher_weight']:.2f})" if self.teacher is not None else "") + (f"  advice {row['advised']:.0%} of turns and exchanges, ours its {row['teacher_agree']:.0%}, teacher ce {row['teacher_ce']:.3f} (weight {row['teacher_weight']:.2f})" if self.config.nk2_advice > 0 else "") + (f"  action price {row['action_price_mean']:.2e} a decision ({row['action_price_share']:.2%} of the 7-day credit's spread), a day begun with END {row['end_first']:.3f}" if self.config.schedule_action_price > 0 else "") + (f"  credit by segments: k5 {row['segment_k5']:.3f} k7 {row['segment_k7']:.3f}, F {row['segment_f2']:.2f}/{row['segment_f5']:.2f}/{row['segment_f7']:.2f} over {row['segment_types2']}/{row['segment_types5']}/{row['segment_types7']} types (0-2/2-5/5-7 days), the credit's sd {row['segment_credit_std']:.4f} against the 7-day credit's {row['segment_full_std']:.4f}" if getattr(self.config, "credit_segments", False) else "") + (f"  its choice hidden in {row['choice_hidden']:.0%} of the games: ours its advice {row['teacher_agree_shown']:.0%} shown, {row['teacher_agree_hidden']:.0%} hidden; the head's ev {row['adv_ev_shown']:+.3f} shown, {row['adv_ev_hidden']:+.3f} hidden, the advantage's sd {row['adv_raw_sd_shown']:.3g} shown, {row['adv_raw_sd_hidden']:.3g} hidden; idle movement {row['idle_movement_shown']:.3f} shown, {row['idle_movement_hidden']:.3f} hidden; a day begun with END {row['end_first_shown']:.3f} shown, {row['end_first_hidden']:.3f} hidden; eliminated {row['eliminated_shown']:.3f} shown, {row['eliminated_hidden']:.3f} hidden" if getattr(self.config, "nk2_choice_games", 1.0) < 1.0 else "") + (f"  advantage head: loss {row['adv_loss']:.4f}, ev {row['adv_ev']:+.3f} (its own choice {row['adv_ev_followed']:+.3f} at {row['adv_followed']:.0%}, leaving it {row['adv_ev_deviating']:+.3f}), the advantage's sd {row['adv_raw_sd']:.3g}" + (f"; read by our policy at {float(self.model.features.adv_gain_weight().detach()):.3f} a unit: |term| {row['adv_read']:.4f}, its KL {row['adv_kl']:.5f} (shown {row['adv_kl_shown']:.5f}, hidden {row['adv_kl_hidden']:.5f})" if getattr(self.config, "adv_gain", 0.0) > 0 else "") if self.config.adv_weight > 0 else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f} (fraction {(metrics.get('signal_fraction') or {}).get('all', float('nan')):.3f})  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f}" + (f", every hero slot in {metrics['full_windows']} steps" if metrics.get("full_windows") else "") + (", window budget refused" if metrics.get("window_budget_ok") is False else "") + f")  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
 			flush=True,
 		)
 
@@ -1027,7 +1056,7 @@ class CampaignLearner:
 
 		state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
 		optimizer = {} if self.worker else {"optimizer": self.optimizer.state_dict()}  # (the process's is in checkpoint_latest.pt)
-		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "gather_ramp_start": self.gather_ramp_start, "valve": self.valve, "model_kwargs": self.kwargs}, path)
+		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "segment_evidence": getattr(self, "segment_evidence", [{}, {}, {}]), "segment_k": getattr(self, "segment_k", (0.0, 0.0)), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "gather_ramp_start": self.gather_ramp_start, "valve": self.valve, "model_kwargs": self.kwargs}, path)
 
 	# ---- the loss shares (config.loss_shares) ----
 

@@ -324,6 +324,17 @@ class CampaignConfig:
 	# only (the follow mixture's part is untouched); no masking. 0: off, the model as before, bit for bit. Set at every
 	# start (learner.set_advice_prior); ALPHA_TOWN_GUARD for a paired test
 	town_guard: float = 0.0
+	# The credit's horizon by segments (bundle 60; e5's design from 6,424 own-policy player-days: the share-change surprise's
+	# spread is 0.050 at 2 days, 0.074 at 5, 0.087 at 7, and what happens in 2 days persists, slope 0.95, so the 7-day
+	# credit is the 2-day one plus 2.4 times its variance added in days 3-7). On: the schedule credit is surprise(0-2) +
+	# k5 x surprise(2-5) + k7 x surprise(5-7), each segment that window's real change (share and growth alike) less the
+	# heads' forecast for it (V2; V5 - V2; V7 - V5); k = each long segment's measured signal fraction, an empirical-Bayes
+	# shrinkage (learner: credit_evidence over the recent updates, faded, of each segment's surprise after each action type
+	# against the player's other decisions; F the between-type variance of those gaps over their sampling variance, over
+	# the types with enough players; k toward max(0, 1 - 1/F) by 0.05 an update, from 0, at most 1). It sees only what
+	# depends on the action TYPE, so it errs low (the conservative side). With k near 0 the credit is the 2-day one plus
+	# the end credit: the user's "noisy but safe" floor. False: the 7-day credit as before, bit for bit
+	credit_segments: bool = False
 	# Its TRADE advice taught too (False since 2026-11-04: the user's rule, every trade is dumb unless it buys what could not
 	# be bought without it; ~94% of its trades bought nothing that day, and 54% of ours came where it advised one)
 	nk2_trade_advice: bool = False
