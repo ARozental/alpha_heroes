@@ -167,7 +167,11 @@ bool AlphaMapAI::execute(const Decision & decision, const Choice & choice)
 			const SlotID to(choice.cell >= 0 ? choice.cell % ARMY_SLOTS : e.b);
 			const int count = source->getStackCount(from);
 			if(!to.validSlot() || count <= 0)
+			{
+				logAi->warn("AlphaMapAI %s: ARMY from %d slot %d to %d slot %d (cell %d, amount %d): nothing there (count %d)", playerID.toString(), e.first.getNum(), e.a, e.second.getNum(), to.getNum(), choice.cell, e.c, count);
 				break;
+			}
+			logAi->debug("AlphaMapAI %s: ARMY from %d slot %d (%d) to %d slot %d (%d of %d there), cell %d, amount %d", playerID.toString(), e.first.getNum(), e.a, count, e.second.getNum(), to.getNum(), target->getStackCount(to), target->stacksCount(), choice.cell, e.c);
 			if(stays)
 			{
 				if(count > 1)
@@ -547,10 +551,18 @@ bool AlphaMapAI::moveHero(ObjectInstanceID heroID, int3 destination)
 		const auto paths = cache.getPathsInfo(h);
 		CGPath path;
 		if(!paths->getPath(path, destination) || path.nodes.size() < 2)
+		{
+			if(step == 0) // (diagnostic, bundle 60's pair: a MOVE the mask allowed that went nowhere)
+				logAi->warn("AlphaMapAI %s: MOVE of hero %d at %s to %s: no path now (%d nodes)", playerID.toString(), heroID.getNum(), start.toString(), destination.toString(), static_cast<int>(path.nodes.size()));
 			break;
+		}
 		const auto & next = path.nodes[path.nodes.size() - 2];
 		if(next.turns != 0)
+		{
+			if(step == 0)
+				logAi->warn("AlphaMapAI %s: MOVE of hero %d at %s to %s: its first step %s is %d turns away (movement %d)", playerID.toString(), heroID.getNum(), start.toString(), destination.toString(), next.coord.toString(), static_cast<int>(next.turns), h->movementPointsRemaining());
 			break;
+		}
 		if(next.isTeleportAction())
 		{
 			intendedExit = next.coord;
@@ -573,7 +585,11 @@ bool AlphaMapAI::moveHero(ObjectInstanceID heroID, int3 destination)
 					break;
 			}
 			if(batch.empty())
+			{
+				if(step == 0)
+					logAi->warn("AlphaMapAI %s: MOVE of hero %d at %s to %s: no step to send (first %s, layer %d, %d nodes)", playerID.toString(), heroID.getNum(), start.toString(), destination.toString(), next.coord.toString(), static_cast<int>(next.layer.num), static_cast<int>(path.nodes.size()));
 				break;
+			}
 			cb->moveHero(h, batch, transit);
 		}
 		waitTillFree();
@@ -582,7 +598,11 @@ bool AlphaMapAI::moveHero(ObjectInstanceID heroID, int3 destination)
 		if(!h)
 			return true;
 		if(h->visitablePos() == start)
+		{
+			if(step == 0) // (sent, and the server left the hero where it stood: a refused move, or a fight that changed nothing)
+				logAi->warn("AlphaMapAI %s: MOVE of hero %d at %s to %s: sent, the hero still there (path of %d nodes, first %s, movement %d)", playerID.toString(), heroID.getNum(), start.toString(), destination.toString(), static_cast<int>(path.nodes.size()), next.coord.toString(), h->movementPointsRemaining());
 			break;
+		}
 		moved = true;
 		if(targetObject != ObjectInstanceID() && topVisitable(*cb, destination) != targetObject)
 			break; // picked up, beaten or flagged: the move was for it
