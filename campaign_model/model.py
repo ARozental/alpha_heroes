@@ -107,6 +107,7 @@ def game_tables():
 		"dwelling_base": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),
 		"building_requires": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, c.N_BUILDINGS, dtype=torch.bool),  # (building, a building it needs: vocab.building_requires)
 		"horde_level": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),  # (a horde building: the level index it adds growth to)
+		"building_family": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, c.N_BUILDINGS, dtype=torch.bool),  # (two buildings of one upgrade chain: vocab's "upgrade", transitively)
 		"building_resources": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, len(RESOURCE_PRICES)),
 		"spell_value": torch.zeros(c.N_SPELLS),
 		"creature_luck": torch.zeros(c.CREATURE_VOCAB + 1),
@@ -167,6 +168,15 @@ def game_tables():
 				for need in needs:
 					if 0 <= need < c.N_BUILDINGS:
 						tables["building_requires"][faction, building, need] = True
+		def root(faction, building, seen=()):
+			base = rows_by.get((faction, building), {}).get("upgrade", -1)
+			return building if base is None or base < 0 or base in seen else root(faction, base, seen + (building,))
+
+		rows_by = buildings()
+		for (faction, building) in rows_by:
+			for (other_faction, other) in rows_by:
+				if other_faction == faction and 0 <= faction < c.FACTION_VOCAB and 0 <= building < c.N_BUILDINGS and 0 <= other < c.N_BUILDINGS:
+					tables["building_family"][faction, building, other] = root(faction, building) == root(faction, other)
 		for (faction, building), level in horde_levels().items():
 			if 0 <= faction < c.FACTION_VOCAB and 0 <= building < c.N_BUILDINGS:
 				tables["horde_level"][faction, building] = level

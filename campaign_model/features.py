@@ -1218,6 +1218,14 @@ def economy_features(x, t):
 	)
 
 
+def _to_buildings(values, ids, device):
+	"""values [..., len(ids)] laid onto the building axis [..., N_BUILDINGS] at ids, 0 elsewhere (a product with a one-hot
+	map, not an index assignment: the ONNX export traces it)."""
+	place = torch.zeros(len(ids), c.N_BUILDINGS, device=device)
+	place[torch.arange(len(ids)), torch.tensor(ids)] = 1.0
+	return values @ place.to(values.dtype)
+
+
 def _fort_multiplier(built):
 	"""[B, TO]: a town's growth multiplier from its fort line (a citadel +50%, a castle +50% more)."""
 	return 1.0 + 0.5 * (built[..., CITADEL] | built[..., CASTLE_BUILDING]).float() + 0.5 * built[..., CASTLE_BUILDING].float()
@@ -1231,18 +1239,19 @@ def _production_added(x, t, faction, built):
 	level is built; an upgraded dwelling growth x (its creature's cost less the base's) only."""
 	week = _dwelling_week(t, faction)  # [B, TO, 7]
 	levels = built[..., list(DWELLINGS_BASE)] | built[..., list(DWELLINGS_UP)]
-	added = torch.zeros(built.shape, dtype=week.dtype, device=week.device)
-	added[..., list(DWELLINGS_BASE)] = week * _fort_multiplier(built).unsqueeze(-1)
-	half = 0.5 * (week * levels).sum(dim=-1)
-	added[..., CITADEL], added[..., CASTLE_BUILDING] = half, half
-	level = t.horde_level[faction]  # [B, TO, N_BUILDINGS]
-	at = level.clamp(min=0)
-	horde = 0.5 * torch.gather(week, -1, at) * torch.gather(levels.float(), -1, at) * (level >= 0)
-	added = torch.where(level >= 0, horde, added)
+	half = 0.5 * (week * levels).sum(dim=-1, keepdim=True)
 	up, base = t.dwelling_creature[faction][..., list(DWELLINGS_UP)], t.dwelling_base[faction][..., list(DWELLINGS_UP)]
 	up_i, base_i = vocab_index(up, c.CREATURE_VOCAB), vocab_index(base, c.CREATURE_VOCAB)
-	added[..., list(DWELLINGS_UP)] = t.creature_growth[base_i] * (t.creature_cost[up_i] - t.creature_cost[base_i]).clamp(min=0) * ((up >= 0) & (base >= 0))
-	return added
+	upgraded = t.creature_growth[base_i] * (t.creature_cost[up_i] - t.creature_cost[base_i]).clamp(min=0) * ((up >= 0) & (base >= 0))
+	added = (
+		_to_buildings(week * _fort_multiplier(built).unsqueeze(-1), DWELLINGS_BASE, week.device)
+		+ _to_buildings(torch.cat([half, half], dim=-1), (CITADEL, CASTLE_BUILDING), week.device)
+		+ _to_buildings(upgraded, DWELLINGS_UP, week.device)
+	)
+	level = t.horde_level[faction]  # [B, TO, N_BUILDINGS]
+	at = level.clamp(min=0)
+	horde = 0.5 * torch.gather(week, -1, at) * torch.gather(levels.to(week.dtype), -1, at)
+	return torch.where(level >= 0, horde, added)
 
 
 def _feature_income_add(income_added):
@@ -1275,10 +1284,15 @@ def _feature_payable(production_added, gold, income, cost, pool, week):
 
 def _unlock_value(t, faction, built, own_value):
 	"""[B, TO, N_BUILDINGS] gold: for a building not built, the best own value among the unbuilt buildings it is a missing
-	prerequisite of, each over its count of missing prerequisites (a building two steps from a capitol inherits half)."""
-	requires = t.building_requires[faction]  # [B, TO, N_BUILDINGS (b'), N_BUILDINGS (b)]
-	missing = requires & ~built.unsqueeze(-2) & ~built.unsqueeze(-1)  # (b' not built, needs b, b not built)
+	prerequisite of, each over its count of missing prerequisites (a building two steps from a capitol inherits half).
+	Not within its own upgrade chain (vocab's "upgrade", transitively: a dwelling and its upgraded form, fort -> citadel ->
+	castle, the halls, the mage guilds, a horde and its upgrade): an upgrade is no reason to build its base sooner, and
+	passing it down lifted a top dwelling above a capitol (e5's choice (a)); other buildings' values pass (blacksmith ->
+	L4, castle -> capitol, fort -> L1)."""
+	requires = t.building_requires[faction] & ~t.building_family[faction]  # [B, TO, N_BUILDINGS (b'), N_BUILDINGS (b)]
+	missing = t.building_requires[faction] & ~built.unsqueeze(-2) & ~built.unsqueeze(-1)  # (b' not built, needs b, b not built: counted over all it needs)
 	count = missing.sum(dim=-1, keepdim=True).clamp(min=1).to(own_value.dtype)
+	missing = missing & requires  # (passed down along prerequisites that are not its own upgrade)
 	share = torch.where(missing, (own_value.unsqueeze(-1) / count).expand_as(missing.float()), torch.zeros((), dtype=own_value.dtype, device=own_value.device))
 	return share.amax(dim=-2)
 
@@ -1346,7 +1360,8 @@ def _feature_upgrade_elsewhere(x, t, faction, built):
 def build_features(x, t, economy):
 	"""(entry [B, TO, N_BUILDINGS, len(BUILD_ENTRY)] each building's bounded views in each town of ours, value [B, TO,
 	N_BUILDINGS, 3] the fixed prior's gold parts: 3.5 days of the income it adds x (1 + pool_unbought), 1.5 x the week's
-	growth it adds x payable, and the unlock share). 0 for towns not ours."""
+	growth it adds x payable, and the unlock share where the building's own value is 0 (a pure prerequisite: blacksmith,
+	marketplace, tavern, mage guild 1, a fort yielding nothing itself)). 0 for towns not ours."""
 	gold, income, pool, week, _, own, faction = _economy_inputs(x, t)
 	built = x["t_built"][:, : c.OWN_TOWNS].bool()
 	cost = t.building_cost[faction]
@@ -1359,18 +1374,19 @@ def build_features(x, t, economy):
 	production_value = 1.5 * production * payable
 	unlock = _unlock_value(t, faction, built, income_value + production_value)
 	worth = (x["g_resources"].clamp(min=0).float() * t.resource_price).sum(dim=-1)
-	ups = torch.zeros_like(cost).unsqueeze(-1).expand(*cost.shape, 3).clone()
-	ups[..., list(DWELLINGS_UP), 0] = _feature_upgrade_quality(t, faction)
-	ups[..., list(DWELLINGS_UP), 1] = _feature_upgrade_held(x, t, faction)
-	ups[..., list(DWELLINGS_UP), 2] = _feature_upgrade_elsewhere(x, t, faction, built)
+	ups = [_to_buildings(view, DWELLINGS_UP, cost.device) for view in (_feature_upgrade_quality(t, faction), _feature_upgrade_held(x, t, faction), _feature_upgrade_elsewhere(x, t, faction, built))]
 	end_of_week = (1.0 - economy[:, ECONOMY.index("days_to_growth")]).reshape(-1, 1, 1) * (production > 0)
 	entry = torch.stack(
 		[
 			_feature_income_add(income_added), _feature_income_rel(income_added, income), _feature_production_add(production),
 			_feature_production_rel(production, week), payable, _feature_unlocks(unlock), _feature_cost_share(cost, gold, worth),
-			_feature_crowds_out(gold_cost, gold, pool, unbought), ups[..., 0], ups[..., 1], ups[..., 2], end_of_week,
+			_feature_crowds_out(gold_cost, gold, pool, unbought), ups[0], ups[1], ups[2], end_of_week,
 		],
 		dim=-1,
 	) * own[..., None, None] * t.economy_on()
-	value = torch.stack([income_value, production_value, unlock], dim=-1) * own[..., None, None]
+	# (the fixed prior's unlock part only where the building is a pure prerequisite, its own value 0: a dwelling, a hall
+	# or a castle inherits nothing, e5's rule, after the cascade of each dwelling inheriting the next; the entry's
+	# unlocks feature reports the share for every building)
+	pure = (income_value + production_value) <= 0
+	value = torch.stack([income_value, production_value, unlock * pure], dim=-1) * own[..., None, None]
 	return entry, value
