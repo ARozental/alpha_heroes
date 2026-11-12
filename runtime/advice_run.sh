@@ -84,6 +84,11 @@
 # for the logit if we are ahead and maybe something that scales nicely with how much we are ahead": priors.escape_ahead)
 cd "$HOME/projects/alpha_heroes"
 export MALLOC_ARENA_MAX=2
+# ALPHA (empire.py: u = ALPHA x a creature's unupgraded cost, what one for hire is worth): 0.5 from deploy 70 (the user,
+# 2026-11-12: "going from 0.25 to 0.5 should be fine"). Read when campaign_model.empire is imported, so in every process
+# this script starts (the learner, its label workers, the PC's inference servers); the learner writes it into the weights
+# (features.empire_alpha), which carry it to the Mac's servers. The evaluation's scores keep 0.25 (empire.EVAL_EMPIRE)
+export ALPHA_EMPIRE_ALPHA=0.5
 # (no expandable CUDA segments here: the learner's step graph failed to record with them, "device not ready"; the
 # joint run's shapes are padded, fixed, so it does not fragment as imitation did)
 rm -f runtime/train/*-joint7/drain  # (runtime/drain_restart.sh's: a start always plays)
@@ -332,6 +337,11 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # first version the abandoned line never reached: the guard starts with no memory and judges ~57 readings on.
 # Deploy 69 (2026-11-12, e5): campaign.value_jump_from=3255. The value-loss guard reads the line the run is on (the rows
 # after the last version drop: fresh_readings), so 3255, the mixed line's first version, gives it the line's own rows.
+# Deploy 70 (2026-11-12, e5): back to v3254 (start_d67) with the economy and exposure (build-econ + exposure: config.
+# build_economy=1, ALPHA 0.5 above) and nk_predict off (0: nothing of it runs). Arm Q, v3254 with exactly this, played
+# 3 eliminated in 48 against 11-16 in every v3254 arm. value_jump_from=3254, the resume version: the reward changes with
+# ALPHA, so the guard starts on this line's rows alone. The drift monitors (progress.csv dwellings_d14/d28, recruits,
+# attacked, shown and hidden) watch BUILD and RECRUIT eroding, as they did from v3254 to v3286.
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -340,5 +350,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3255 campaign.adv_weight=1 campaign.nk2_choice_games=0.5 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=true campaign.nk_predict_weight=0.1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3254 campaign.adv_weight=1 campaign.nk2_choice_games=0.5 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=true campaign.nk_predict_weight=0 campaign.build_economy=1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
