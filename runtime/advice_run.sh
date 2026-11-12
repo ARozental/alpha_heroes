@@ -305,6 +305,18 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # following is back), the evaluation 48 own (the own score stays the one we judge by), the price 1e-5, the head read at 1,
 # campaign.credit_segments=true (the split check, segments on against off on the same batch, was not in at the deploy:
 # settled at the next one). The user's wish for no Nullkiller2 choices is on hold on this evidence, by their word.
+# Deploy 63 (2026-11-12, e5's conditional go, the user: "Make the changes and do it, I want to have it all in the model
+# that trains for the night"): nk_predict, stage 1 (config.nk_predict_weight; nk_predict.py): a head predicting
+# Nullkiller2's planner from a blind pass of the trunk (the planner's fields absent, the memory at its start) on an eighth
+# of each forward's rows; nothing reads it; its fit each update (progress.csv nkp_*). campaign.nk_predict_weight=0.1: at 1
+# its gradient tripled the value group's norm (26.8 -> 80.6, the group's clip then shrinking the value heads' step); at 0.1
+# +3%, and Adam takes its gradient's scale out of its own steps.
+# The line back to all own games (deploy 61's) and the checkpoint forward to runtime/saved/campaign_joint7_pre_d62.pt
+# (v3229, deploy 61's last): on the Mac's 48 pinned setups, own play, the same harness, v3226 scored 0.820 against v3205's
+# 0.672 (paired +0.148 +- 0.067) and the v3229 replay confirmed it (e5's rule, fixed before the replay: the pooled two
+# above v3205 by more than 1.5 paired se, or v3229 at 0.75 or above). Deploy 62's rollback had gone on proxies (signal
+# fraction, RECRUIT a player-day); the play measured says the all-own games were learning. campaign.nk2_follow=0,
+# nk2_choice_games=0, adv_by_kind=false, town_guard=0; the evaluation 48 own; the price 1e-5; the segments on.
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -313,5 +325,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0.5 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0.5 campaign.credit_segments=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=false campaign.town_guard=0 campaign.credit_segments=true campaign.nk_predict_weight=0.1 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
