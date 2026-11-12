@@ -221,7 +221,7 @@ class AlphaMapAI : public CAdventureAI
 	std::set<std::tuple<int, int, int>> loopsToday;
 	int loopsCut = 0;
 	std::map<int, int> loopsCutTypes; // (by action type: the summary's "loops_cut_types")
-	std::vector<int64_t> stateFingerprint() const;
+	std::vector<int64_t> stateFingerprint(ObjectInstanceID other = ObjectInstanceID()) const; // (other: the dialog's other army)
 
 	// What a hero is doing, for the questions it raises
 	ObjectInstanceID activeHero;

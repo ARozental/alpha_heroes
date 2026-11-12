@@ -20,8 +20,9 @@ using namespace MapSchema;
 namespace
 {
 /// A cheap fingerprint of what our actions change: resources, heroes (where, movement, mana, armies) and towns (what is
-/// built, garrisons, creatures for hire). An action that leaves it unchanged did nothing.
-std::vector<int64_t> fingerprint(const CCallback & cb)
+/// built, garrisons, creatures for hire), and the dialog's other army when there is one (other: a garrison's, bundle
+/// 60's pair: a HALF split within it read as no effect). An action that leaves it unchanged did nothing.
+std::vector<int64_t> fingerprint(const CCallback & cb, ObjectInstanceID other = ObjectInstanceID())
 {
 	std::vector<int64_t> values;
 	const auto resources = cb.getResourceAmount();
@@ -57,6 +58,11 @@ std::vector<int64_t> fingerprint(const CCallback & cb)
 		for(const auto & [count, ids] : t->creatures)
 			values.push_back(count);
 	}
+	if(const auto * a = other.hasValue() ? dynamic_cast<const CArmedInstance *>(cb.getObj(other, false)) : nullptr)
+	{
+		values.push_back(other.getNum());
+		army(a);
+	}
 	return values;
 }
 
@@ -72,15 +78,16 @@ ObjectInstanceID topVisitable(const CCallback & cb, const int3 & pos)
 }
 }
 
-std::vector<int64_t> AlphaMapAI::stateFingerprint() const
+std::vector<int64_t> AlphaMapAI::stateFingerprint(ObjectInstanceID other) const
 {
-	return fingerprint(*cb);
+	return fingerprint(*cb, other);
 }
 
 bool AlphaMapAI::execute(const Decision & decision, const Choice & choice)
 {
 	const auto type = static_cast<ActionType>(choice.type);
-	const auto before = fingerprint(*cb);
+	const auto other = decision.holders[OTHER_ARMY];
+	const auto before = fingerprint(*cb, other);
 	if(type == ActionType::MOVE)
 	{
 		// (window slot, tile): the slot's hero is its own, or in a slot no hero holds the hero whose further window it
@@ -95,7 +102,7 @@ bool AlphaMapAI::execute(const Decision & decision, const Choice & choice)
 			return false;
 		}
 		moveHero(decision.heroes[hero], decision.windowTile(window, cell / WINDOW, cell % WINDOW));
-		return fingerprint(*cb) != before;
+		return fingerprint(*cb, other) != before;
 	}
 	const auto & entries = decision.entries[choice.type];
 	const auto found = entries.find(choice.index);
@@ -224,7 +231,7 @@ bool AlphaMapAI::execute(const Decision & decision, const Choice & choice)
 			logAi->error("AlphaMapAI %s: action type %d is not carried out", playerID.toString(), choice.type);
 			return false;
 	}
-	return fingerprint(*cb) != before;
+	return fingerprint(*cb, other) != before;
 }
 
 void AlphaMapAI::executeMulti(const Entry & e)

@@ -277,7 +277,7 @@ void AlphaMapAI::makeTurn()
 				break;
 			meetingAdvised = advice && choice.type == advice->type && choice.index == advice->index; // (adviseExchange)
 			if(loopGuard)
-				seenToday.insert(stateFingerprint());
+				seenToday.insert(stateFingerprint(decision.holders[OTHER_ARMY]));
 			probing = false;
 			const bool changed = execute(decision, choice);
 			if(!changed && probing) // (a probe of an unknown entrance that found no way: not a failed action, futile all the same)
@@ -293,7 +293,7 @@ void AlphaMapAI::makeTurn()
 			else
 			{
 				futile.clear(); // the state changed: what failed before may work now
-				if(loopGuard && seenToday.count(stateFingerprint())) // (back to a state of today's: a cycle, bundle 60's loop guard)
+				if(loopGuard && seenToday.count(stateFingerprint(decision.holders[OTHER_ARMY]))) // (back to a state of today's: a cycle, bundle 60's loop guard)
 				{
 					loopsToday.insert({choice.type, choice.index, choice.cell});
 					++loopsCut;
@@ -1178,7 +1178,7 @@ void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, Query
 		if(choice.type != static_cast<int>(ActionType::ARMY) && choice.type != static_cast<int>(ActionType::ARTIFACT) && choice.type != static_cast<int>(ActionType::MULTI))
 			break;
 		if(loopGuard)
-			seenToday.insert(stateFingerprint());
+			seenToday.insert(stateFingerprint(decision.holders[OTHER_ARMY]));
 		if(!execute(decision, choice))
 		{
 			noEffect(choice);
@@ -1187,7 +1187,7 @@ void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, Query
 		else
 		{
 			futile.clear();
-			if(loopGuard && seenToday.count(stateFingerprint())) // (bundle 60's loop guard)
+			if(loopGuard && seenToday.count(stateFingerprint(decision.holders[OTHER_ARMY]))) // (bundle 60's loop guard)
 			{
 				loopsToday.insert({choice.type, choice.index, choice.cell});
 				++loopsCut;
