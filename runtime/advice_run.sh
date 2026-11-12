@@ -287,6 +287,13 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # 7-day credit did not have (BUILD's share of decisions falling, fights lost rising, idle movement rising); k5 or k7
 # stuck above 0.5 with F under 2 (the estimator fooling itself). Out: campaign.credit_segments=false (the 7-day credit
 # as before, bit for bit).
+# campaign.schedule_action_price=1e-5 (deploy 61; the user, 2026-11-11 evening, "maybe 1e-5"; was 2e-6), against the
+# meeting cycles' drift: the loop guard's cuts rose from 0.16 to 0.44 a player-day and the meeting MOVE's chance at the
+# cut states from 0.25 to 0.35 in 29 updates (v3176 -> v3205; neither the advantage head nor a prior's gain). No fixed
+# negative credit on cut decisions (the user: "worthless stuff should/can be slowly removed by the small action cost");
+# the price's count (labels.actions_ahead) holds every action, those cut by the loop guard and those that changed
+# nothing among them. Judged by loops_per_player_day, idle movement and END-first; out or down if a day begins with END
+# more often or BUILD's share keeps falling. Never above 2e-5 (the user, 2026-11-09).
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -295,5 +302,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=2e-6 campaign.adv_by_kind=false campaign.town_guard=0 campaign.credit_segments=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=false campaign.town_guard=0 campaign.credit_segments=true trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
