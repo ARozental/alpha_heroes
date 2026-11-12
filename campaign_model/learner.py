@@ -169,6 +169,9 @@ def set_advice_prior(model, config):
 			features.adv_gain.fill_(float(getattr(config, "adv_gain", 0.0)))
 		if hasattr(features, "town_guard"):  # (bundle 60's town guard: config.town_guard)
 			features.town_guard.fill_(float(getattr(config, "town_guard", 0.0)))
+	if hasattr(model, "nk_read"):  # (nk_predict stage 2: config.nk_read, on this model and on the servers this process starts)
+		model.nk_read = getattr(config, "nk_read", "live")
+		os.environ["ALPHA_NK_READ"] = model.nk_read
 
 
 def campaign_model_kwargs(config, out, resume=False):

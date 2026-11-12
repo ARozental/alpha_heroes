@@ -1208,8 +1208,12 @@ def ppo_update(
 		model.plan_outputs = True
 	if hasattr(model, "adv_outputs"):  # (v2: the advantage head's outputs while it learns, config.adv_weight, in every graph recorded below)
 		model.adv_outputs = config.adv_weight > 0
-	if hasattr(model, "nkp_outputs"):  # (nk_predict runs as its own step below, never inside the model's forward: the main graphs as before)
-		model.nkp_outputs = False
+	# nk_predict: stage 1 runs as its own step below, never inside the model's forward (the main graphs as before); stage 2
+	# (nk_read "predicted": the head runs in the forward, its table read by the late terms) has its outputs and targets
+	# from the main pass on every row, its loss in micro_loss's
+	predicted_read = getattr(model, "nk_read", "live") == "predicted" and getattr(config, "nk_predict_weight", 0.0) > 0
+	if hasattr(model, "nkp_outputs"):
+		model.nkp_outputs = predicted_read
 	foresight_config = ForesightConfig(weight=getattr(config, "foresight_weight", ForesightConfig.weight))
 	foresight_sums, foresight_sum, checked = Counter(), None, {}  # (foresight_sum: its parts, PART_NAMES' order, on the device)
 	# On CUDA the bytes as sent go to the device and are cut and converted there (half the copy, none of the CPU's dtype copies)
@@ -1296,7 +1300,7 @@ def ppo_update(
 	# nk_predict (config.nk_predict_weight): its own step on every nk_predict_every'th micro-batch, the blind pass on the
 	# micro-batch's first rows (model_v2.nk_blind), its loss reaching the head alone; recorded as a graph of its own where
 	# the main step is (StepGraph), else eager. Its loss in STEP_PARTS' nkp_loss
-	nkp_on = getattr(config, "nk_predict_weight", 0.0) > 0 and hasattr(model, "nk_blind")
+	nkp_on = getattr(config, "nk_predict_weight", 0.0) > 0 and hasattr(model, "nk_blind") and not predicted_read
 	nkp_every = max(1, int(getattr(config, "nk_predict_every", 4)))
 	nkp_graph = nkp_fn = None
 	nkp_rows = nkp_steps = micro_count = 0
@@ -1345,7 +1349,7 @@ def ppo_update(
 	# The advantage head's prediction for each choice before this update's steps (config.adv_weight): its explained
 	# variance of the update's advantage is a held-out reading (adv_ev), on the choices that were Nullkiller2's own and
 	# on those that left one it had (adv_ev_followed, adv_ev_deviating)
-	nkp_chunks = [] if nkp_on else None  # (nk_predict's fit before the steps, on the first NKP_PREPASS chunks)
+	nkp_chunks = [] if nkp_on or predicted_read else None  # (nk_predict's fit before the steps, on the first NKP_PREPASS chunks)
 	adv_before = adv_followed = adv_labelled = None
 	if config.adv_weight > 0 and getattr(model, "adv_outputs", False):
 		adv_before, adv_followed, adv_labelled = torch.zeros(n, device=device), torch.zeros(n, dtype=torch.bool, device=device), torch.zeros(n, dtype=torch.bool, device=device)
@@ -1370,9 +1374,9 @@ def ppo_update(
 			if nkp_chunks is not None and len(nkp_chunks) < NKP_PREPASS:
 				from .nk_predict import readings as nk_readings
 
-				blind = model.nk_blind(model_inputs(raw))  # (eager, no gradient: the prepass)
+				blind = out if predicted_read else model.nk_blind(model_inputs(raw))  # (stage 2: the main pass's own; else eager, no gradient: the prepass)
 				nkp_chunks.append(nk_readings({k: v for k, v in blind.items() if k.startswith("nkp_")}, {k[4:]: v for k, v in blind.items() if k.startswith("nkt:")}))
-				del blind
+				blind = None
 			end_now[index] = torch.sigmoid(out["end_logit"].float())
 			if "growth_logit" in out:
 				growth_now[index] = out["growth_logit"][:, -1].float()

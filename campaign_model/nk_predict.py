@@ -34,14 +34,16 @@ OUT = 2 + len(FORMS)  # an entry's outputs: has (logit), the forms (logits: sigm
 BLIND = tuple(name for name in SPECS if name.startswith(("k_", "g_nk_"))) + ("t_nk_threat", "h_nk_threat")
 
 
-def blind_inputs(x):
-	"""x with the planner's fields at their fills and the memory at its start (a new dict; x unchanged)."""
+def blind_inputs(x, memory=False):
+	"""x with the planner's fields at their fills and (memory False) the memory at its start (a new dict; x unchanged).
+	memory True keeps the memory: stage 2's blind trunk, a game without the advisor."""
 	out = dict(x)
 	for name in BLIND:
 		if name in out:
 			out[name] = torch.full_like(out[name], SPECS[name].fill)
-	out["mem"] = torch.zeros_like(out["mem"])
-	out.pop("mem_float", None)
+	if not memory:
+		out["mem"] = torch.zeros_like(out["mem"])
+		out.pop("mem_float", None)
 	return out
 
 

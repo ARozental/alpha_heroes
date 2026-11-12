@@ -317,6 +317,11 @@ class CampaignConfig:
 	# made the update 1.41 times as long): its own recorded step (the blind pass on the micro-batch's first 1 / NKP_ROWS
 	# rows, the head's loss and backward), the main step untouched; its fit read on the prepass's first NKP_PREPASS chunks
 	nk_predict_every: int = 4
+	# nk_predict stage 2 (model_v2.nk_read; e5's design, 2026-11-12): "live" (as before), "blind", "late" (diagnostics),
+	# "predicted" (the trunk without the planner, the late terms reading the head's table: no planner at serving; the
+	# head's loss from the main pass, the planner still on in training games for its targets). The learner sets it on its
+	# model and in ALPHA_NK_READ for the servers it starts
+	nk_read: str = "live"
 	# Our own policy reads the advantage head (stage 2a; model_v2's decide): this many logits a unit of its prediction
 	# (the update's advantage in sd units: soft policy iteration's 1 / beta), its table terms clipped to +-3 and centered
 	# on their mean under our own policy, its type term clipped to +-3, all before the follow mixture; x a learned gain

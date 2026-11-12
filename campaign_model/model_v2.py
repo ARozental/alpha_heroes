@@ -22,6 +22,7 @@ built as the user's blocks, in order (CampaignModelV2.forward):
 What the AI reads is unchanged (OUTPUTS); the foresight's predictions (fs_*) are training's only.
 """
 import math
+import os
 
 import torch
 from torch import nn
@@ -309,16 +310,36 @@ class NkPredictHead(nn.Module):
 		for layer in (self.move, self.travel, self.none):  # (outputs 0 to start: P 1/2, the forms 1/2, the plan uniform; the trunk's pair vectors are large)
 			zero_output(layer.down)
 
+	def entries(self, state, known):
+		"""(MOVE's outputs [K, W, W, OUT] by computed window, None without one; TRAVEL's [B, HO, AREAS, OUT]; "no task"
+		[B, HO])."""
+		heroes = state.heroes[:, :HO].detach()
+		move = self.move(state.move_pairs.detach()) if known.n > 0 else None
+		return move, self.travel(state.travel_pairs.detach()), self.none(heroes).squeeze(-1)
+
 	def forward(self, state, known):
 		"""{nkp_move [B, HO, W, W, OUT], nkp_travel [B, HO, AREAS, OUT], nkp_none [B, HO]}."""
 		from .nk_predict import OUT
 
-		heroes = state.heroes[:, :HO].detach()
-		b = heroes.shape[0]
-		move = heroes.new_zeros(b, HO, W, W, OUT)
-		if known.n > 0:
-			move = dense(real_only(self.move(state.move_pairs.detach()), known), known.windows, known.n, b)
-		return {"nkp_move": move, "nkp_travel": self.travel(state.travel_pairs.detach()), "nkp_none": self.none(heroes).squeeze(-1)}
+		move, travel, none = self.entries(state, known)
+		b = travel.shape[0]
+		dense_move = travel.new_zeros(b, HO, W, W, OUT) if move is None else dense(real_only(move, known), known.windows, known.n, b)
+		return {"nkp_move": dense_move, "nkp_travel": travel, "nkp_none": none}
+
+
+def nk_table(outputs):
+	"""The head's outputs [..., OUT] (nk_predict) as the planner's channels [..., views.F]: has = sigmoid(its logit);
+	preference_all, preference_hero = has x (sigmoid(form) - 1); soon, later = has x sigmoid(form); the rest 0."""
+	has = torch.sigmoid(outputs[..., 0].float())
+	forms = torch.sigmoid(outputs[..., 1:5].float())
+	zero = torch.zeros_like(has)
+	values = {"has": has, "preference_all": has * (forms[..., 0] - 1.0), "preference_hero": has * (forms[..., 1] - 1.0), "soon": has * forms[..., 2], "later": has * forms[..., 3]}
+	return torch.stack([values.get(name, zero) for name in V.CHANNELS], dim=-1)
+
+
+def with_table(views, start, table):
+	"""views [..., VIEWS] with its planner slice [start, start + views.F) replaced by table."""
+	return torch.cat([views[..., :start], table.to(views.dtype), views[..., start + V.F :]], dim=-1)
 
 
 class Memory(nn.Module):
@@ -407,6 +428,11 @@ class CampaignModelV2(nn.Module):
 	plan_outputs = False  # fs_plan too (plan_of): the trainer's model sets it (train.ppo_update); a server's does not
 	adv_outputs = False  # the advantage head's too (AdvantageHead): the trainer's model sets it with config.adv_weight (train.ppo_update); a server's does not
 	nkp_outputs = False  # nk_predict's blind pass, head and targets too (nk_blind): the trainer's model with config.nk_predict_weight; a server's never
+	# nk_predict stage 2 (config.nk_read; ALPHA_NK_READ for a server's or a paired eval's): "live" (as before, bit for
+	# bit), "blind" (the planner's fields absent, the memory kept: a game without the advisor), "late" (the trunk blind,
+	# the late terms the live planner's: a diagnostic's ceiling), "predicted" (the trunk blind, the late terms the head's
+	# table: no planner needed at serving). A constant of the process: the graphs record one path
+	nk_read = os.environ.get("ALPHA_NK_READ", "live")
 
 	def load_state_dict(self, state_dict, strict=True, assign=False):
 		"""A checkpoint from before a parameter was added (model.ADDED) loads with it at 0: the model as it was; one from
@@ -604,7 +630,14 @@ class CampaignModelV2(nn.Module):
 	# ---- the whole model ----
 
 	def forward(self, x):
+		live = x
+		if self.nk_read != "live":  # (nk_predict stage 2: the trunk without the planner; the memory kept, as a game without the advisor)
+			from .nk_predict import blind_inputs
+
+			x = blind_inputs(x, memory=True)
 		known = self.domain_knowledge(x)
+		if self.nk_read == "late":  # (a diagnostic's ceiling: the live planner's views in the late terms alone)
+			known.late = self.advice(live, known)
 		state = self.encode(x)
 		state = self.take_sides(state)
 		state = self.join(state, known)
@@ -618,8 +651,17 @@ class CampaignModelV2(nn.Module):
 			out["fs_plan"] = state.plan
 		if self.adv_outputs:  # (decide's: the trainer's model only, never the contract's)
 			out.update(state.adv)
-		if self.nkp_outputs:  # (the trainer's model only: the blind pass, the head and its targets)
-			out.update(self.nk_blind(x))
+		if self.nkp_outputs:  # (the trainer's model only: the head's outputs and its targets from the live rows)
+			if self.nk_read == "predicted":  # (stage 2: the head ran in this pass, on every row)
+				from .nk_predict import targets
+
+				computed = torch.zeros(live["g_day"].shape[0] * HO, dtype=torch.bool, device=live["g_day"].device)
+				if known.n > 0:
+					computed = computed.index_fill(0, known.windows[: known.n], True)
+				out.update(state.nkp)
+				out.update({f"nkt:{name}": value for name, value in targets(live, computed.reshape(-1, HO)).items()})
+			else:
+				out.update(self.nk_blind(live))
 		return out
 
 	def nk_blind(self, x):
@@ -762,10 +804,12 @@ class CampaignModelV2(nn.Module):
 			dest_value = value.reshape(-1).index_select(0, index.reshape(-1)).reshape(index.shape) * valid
 			time = torch.cat([V.discounts(own_days), V.discounts(base_days)], dim=-1)
 			gaps = torch.stack([V.gap(tile_prior, pick(best_slot)[:, None, None]), V.gap(tile_prior, best_any.index_select(0, decision)[:, None, None])], dim=-1)
+			before = [V.value_views(value, phi_k, pace_k), V.rate_views(value, own_days, phi_k, pace_k), V.rate_views(value, base_days, phi_k, pace_k), time, gaps]
+			a.move_slice = sum(t.shape[-1] for t in before)  # (where the planner's channels start: nk_predict stage 2)
 			a.move = real_only(
 				torch.cat(
 					[
-						V.value_views(value, phi_k, pace_k), V.rate_views(value, own_days, phi_k, pace_k), V.rate_views(value, base_days, phi_k, pace_k), time, gaps,
+						*before,
 						pick(a.tables["move"].reshape(b, HO, W, W, V.F)), V.value_views(dest_value, phi_k, pace_k) * valid.unsqueeze(-1), valid.float().unsqueeze(-1),
 						pick(chosen_move).unsqueeze(-1),
 					],
@@ -783,10 +827,14 @@ class CampaignModelV2(nn.Module):
 		gold = known.travel_gold.detach().unsqueeze(1).expand(b, HO, AREAS)
 		index, valid = packed_cells(a.tables["travel_dest_cell"], torch.arange(b, device=device), inverse)
 		dest_value = value.reshape(-1).index_select(0, index.reshape(-1)).reshape(index.shape) * valid if value is not None else none.expand(b, HO, AREAS)
+		before = [
+			V.value_views(gold, phi, pace), V.rate_views(gold, own_days, phi, pace), V.rate_views(gold, base_days, phi, pace), V.discounts(own_days), V.discounts(base_days),
+			torch.stack([V.gap(travel_logits, best_slot.unsqueeze(-1)), V.gap(travel_logits, best_any[:, None, None])], dim=-1),
+		]
+		a.travel_slice = sum(t.shape[-1] for t in before)
 		a.travel = torch.cat(
 			[
-				V.value_views(gold, phi, pace), V.rate_views(gold, own_days, phi, pace), V.rate_views(gold, base_days, phi, pace), V.discounts(own_days), V.discounts(base_days),
-				torch.stack([V.gap(travel_logits, best_slot.unsqueeze(-1)), V.gap(travel_logits, best_any[:, None, None])], dim=-1),
+				*before,
 				a.tables["travel"], V.value_views(dest_value, phi, pace) * valid.unsqueeze(-1), valid.float().unsqueeze(-1), chosen_travel.unsqueeze(-1),
 			],
 			dim=-1,
@@ -1069,7 +1117,6 @@ class CampaignModelV2(nn.Module):
 		state.plan = self.plan_of(state)
 		chance = state.plan.detach().float().softmax(dim=-1)[..., :AREAS]
 		forecast = torch.stack([chance, chance / chance.amax(dim=-1, keepdim=True).clamp(min=1e-6)], dim=-1)  # [B, HO, AREAS, PLAN_VIEWS]
-		state.travel_view = self.view_travel(torch.cat([a.travel, forecast], dim=-1))  # [B, HO, AREAS]
 		if known.n > 0:
 			k = known.windows.shape[0]
 			move_known = torch.cat([known.move_features.index_select(-1, self.move_kept), known.move_strength, known.move_relative, foresight["foreseen"]], dim=-1)  # [K, W, W, MOVE_KNOWN]
@@ -1079,14 +1126,38 @@ class CampaignModelV2(nn.Module):
 			area = (torch.div(tiles, S * S, rounding_mode="floor") * TG + torch.div(torch.remainder(torch.div(tiles, S, rounding_mode="floor"), S), 2, rounding_mode="floor")) * TG + torch.div(torch.remainder(tiles, S), 2, rounding_mode="floor")
 			there = forecast.reshape(b * HO, AREAS, PLAN_VIEWS).index_select(0, known.heroes).gather(1, area.reshape(k, W * W, 1).expand(k, W * W, PLAN_VIEWS)).reshape(k, W, W, PLAN_VIEWS)
 			there = there * (known.window_tiles >= 0).unsqueeze(-1)
-			seen = self.view_mix_out(F.silu(self.view_mix(a.move.to(mixed.dtype)))) + self.view_move(torch.cat([a.move, there], dim=-1)).unsqueeze(-1).to(mixed.dtype)
 			# (forecast-out A and B: each tile's own forecasts, detached, onto its MOVE logit; the advantage head's entry term
 			# reads them too)
 			state.fore_move = torch.cat([fight_forecast(x, known, foresight["foreseen"]), consequence_channels(self.foresight.move_out(foresight["hidden"]["move"]).detach().float())], dim=-1)
+			state.move_pairs = self.move_pair(torch.cat([pairs + self.move_toward(toward(*a.move_dest)), hidden["move"], move_known, mixed], dim=-1))
+		# The two late terms, purely additive on the MOVE and TRAVEL logits, after the pairs (nk_predict stage 2: the head
+		# reads the pairs, its table feeds these): the advice they read by nk_read ("live" and "blind": the forward's own;
+		# "late": the live planner's on the blind trunk; "predicted": the head's table in the planner's slice)
+		late = known.advice
+		if self.nk_read == "late":
+			late = known.late
+		elif self.nk_read == "predicted":
+			late = self.predicted_advice(state, known)
+		state.travel_view = self.view_travel(torch.cat([late.travel, forecast], dim=-1))  # [B, HO, AREAS]
+		if known.n > 0:
+			seen = self.view_mix_out(F.silu(self.view_mix(late.move.to(mixed.dtype)))) + self.view_move(torch.cat([late.move, there], dim=-1)).unsqueeze(-1).to(mixed.dtype)
 			seen = seen + (self.fore_fight(state.fore_move[..., :FORE_FIGHT]) + self.fore_move(state.fore_move[..., FORE_FIGHT:])).unsqueeze(-1).to(mixed.dtype)
 			state.move_mix = self.move_mix_out(mixed) + self.move_mix_direct(move_known) + seen
-			state.move_pairs = self.move_pair(torch.cat([pairs + self.move_toward(toward(*a.move_dest)), hidden["move"], move_known, mixed], dim=-1))
 		return state
+
+	def predicted_advice(self, state, known):
+		"""nk_predict stage 2: the forward's advice (the blind inputs') with the planner's slice of MOVE's and TRAVEL's
+		views (views.CHANNELS, at advice()'s move_slice / travel_slice) replaced by the head's table, detached: has =
+		sigmoid(its logit); preference_all, preference_hero = has x (sigmoid(form) - 1); soon, later = has x sigmoid(form);
+		every other channel 0. The head's outputs kept on the state (state.nkp) for its loss."""
+		move_k, travel, none = self.nkp.entries(state, known)
+		b = travel.shape[0]
+		state.nkp = {"nkp_move": dense(real_only(move_k, known), known.windows, known.n, b) if move_k is not None else travel.new_zeros(b, HO, W, W, travel.shape[-1]), "nkp_travel": travel, "nkp_none": none}
+		a = Features(known.advice)
+		a.travel = with_table(a.travel, a.travel_slice, nk_table(travel.detach()))
+		if move_k is not None:
+			a.move = with_table(a.move, a.move_slice, real_only(nk_table(move_k.detach()), known))
+		return a
 
 	# ---- decide: every logit a match, one softmax ----
 
