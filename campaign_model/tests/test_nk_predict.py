@@ -18,9 +18,13 @@ from campaign_model.train import GRAD_GROUPS, make_optimizer, ppo_update
 HO, W = c.OWN_HEROES, c.WINDOW
 
 
-def model_and_inputs(rows=16, seed=4):
+def model_and_inputs(rows=16, seed=4, planted=True):
 	torch.manual_seed(3)
 	model = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
+	if planted:  # (its outputs start at 0: weights planted, so that what it reads shows)
+		with torch.no_grad():
+			for layer in (model.nkp.move, model.nkp.travel, model.nkp.none):
+				layer.down.weight.normal_(0.0, 0.3)
 	x = {k: torch.from_numpy(v) for k, v in rich_inputs(rows, seed).items()}
 	return model, x
 
@@ -91,8 +95,10 @@ def test_the_targets_of_one_candidate():
 
 
 def test_it_learns_and_its_loss_reaches_the_head_alone():
-	model, x = model_and_inputs(rows=32, seed=6)
+	model, x = model_and_inputs(rows=32, seed=6, planted=False)
 	model.nkp_outputs = True
+	out = model(x)
+	assert all(float(out[k].abs().max()) == 0.0 for k in ("nkp_move", "nkp_travel", "nkp_none"))  # (0 to start: P 1/2, the plan uniform)
 	for p in model.parameters():
 		p.grad = None
 	out = model(x)

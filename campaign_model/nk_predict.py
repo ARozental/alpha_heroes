@@ -45,13 +45,16 @@ def blind_inputs(x):
 	return out
 
 
-def targets(x):
-	"""The head's targets and masks from the live inputs x (no gradient)."""
+def targets(x, computed=None):
+	"""The head's targets and masks from the live inputs x (no gradient); computed [B, HO]: the MOVE window slots the
+	blind pass computed (its window budget), the others' cells left out of every target (None: all)."""
 	with torch.no_grad():
 		t = V.candidate_tables(x, dest=False)
 		b = x["g_day"].shape[0]
 		present = x["g_nk_present"].bool()
 		move_legal = x["move_mask"].bool().reshape(b, HO, CELLS) & present.reshape(b, 1, 1)
+		if computed is not None:
+			move_legal = move_legal & computed.unsqueeze(-1)
 		travel_legal = x["travel_mask"].bool().reshape(b, HO, AREAS) & present.reshape(b, 1, 1)
 		key, hero = t["key"], t["hero_index"]
 		scored = key > 0
@@ -88,7 +91,8 @@ def targets(x):
 		out["plan"] = torch.where(total > 0, plan / total.clamp(min=1e-12), none)
 		out["plan_allowed"], out["plan_heroes"] = allowed, ours
 		out["plan_best"] = torch.where(total.squeeze(-1) > 0, plan.argmax(dim=-1), torch.full_like(total.squeeze(-1), size, dtype=torch.long))
-		out["choice"] = own_choice(x, belongs)
+		choice = own_choice(x, belongs)
+		out["choice"] = torch.where((choice >= 0) & allowed.gather(2, choice.clamp(min=0).unsqueeze(-1)).squeeze(-1), choice, torch.full_like(choice, -1))  # (in a window the blind pass left out: not counted)
 		return out
 
 

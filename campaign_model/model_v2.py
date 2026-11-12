@@ -306,6 +306,8 @@ class NkPredictHead(nn.Module):
 		from .nk_predict import OUT
 
 		self.move, self.travel, self.none = SwiGLU(pair_dim, NKP_HIDDEN, OUT), SwiGLU(pair_dim, NKP_HIDDEN, OUT), SwiGLU(dim, NKP_HIDDEN, 1)
+		for layer in (self.move, self.travel, self.none):  # (outputs 0 to start: P 1/2, the forms 1/2, the plan uniform; the trunk's pair vectors are large)
+			zero_output(layer.down)
 
 	def forward(self, state, known):
 		"""{nkp_move [B, HO, W, W, OUT], nkp_travel [B, HO, AREAS, OUT], nkp_none [B, HO]}."""
@@ -626,12 +628,15 @@ class CampaignModelV2(nn.Module):
 		no gradient, then the head (its own weights learn) and the targets from the live rows: {nkp_*, "nkt:<name>"}."""
 		from . import nk_predict
 
-		rows = max(1, x["g_day"].shape[0] // NKP_ROWS)
+		total = x["g_day"].shape[0]
+		rows = max(1, total // NKP_ROWS)
 		live = {name: value[:rows] for name, value in x.items()}
 		blind = nk_predict.blind_inputs(live)
 		budget = self.window_budget
 		try:
-			self.window_budget = None
+			# (the forward's window budget in proportion to the rows; windows left out are masked out of the targets
+			# below: their entries count for nothing)
+			self.window_budget = None if budget is None else max(1, -(-budget * rows // total))
 			with torch.no_grad():
 				known = self.domain_knowledge(blind)
 				state = self.encode(blind)
@@ -645,7 +650,8 @@ class CampaignModelV2(nn.Module):
 		finally:
 			self.window_budget = budget
 		out = self.nkp(state, known)
-		out.update({f"nkt:{name}": value for name, value in nk_predict.targets(live).items()})
+		computed = torch.zeros(rows * HO, dtype=torch.bool, device=known.windows.device).index_fill(0, known.windows[: known.n], True) if known.n > 0 else torch.zeros(rows * HO, dtype=torch.bool, device=x["g_day"].device)
+		out.update({f"nkt:{name}": value for name, value in nk_predict.targets(live, computed.reshape(rows, HO)).items()})
 		return out
 
 	def forward_steps(self, x, steps):
