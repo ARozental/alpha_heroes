@@ -161,17 +161,35 @@ def test_the_auc():
 	assert N.auc(torch.tensor([0.0, 1.0, 1.0, 2.0], dtype=torch.float64), torch.tensor([0.0, 1.0, 0.0, 1.0])) == pytest.approx(0.875)
 
 
-def test_the_learner_logs_its_fit(tmp_path, capsys):
-	"""CampaignLearner.step at deploy 62's line with the head on: its columns in progress.csv and its part of the update's line."""
+def test_the_learner_logs_its_fit(tmp_path, capsys, monkeypatch):
+	"""CampaignLearner.step at deploy 62's line with the head on: its columns in progress.csv and its part of the update's line.
+	(2026-11-12, deploy 70: at batch_size 4 the blind pass took one row a micro-batch, and with the exposure's random start
+	the head stepped on every 4th micro-batch, one row each: 4 of the update's 16 rows, and with the exposure's random
+	start all four of seed 6's held no target, nkp_loss 0. Here it steps on every micro-batch (nk_predict_every 1, this
+	test's alone), and each head step's rows are read: a step with a target must have a loss above 0, and an update with
+	no target at all fails saying so.)"""
 	import csv
 
 	from campaign_model.tests import test_credit_segments as T
 
+	steps = []
+	real_loss = N.loss
+
+	def watched(pred, target):
+		total, parts = real_loss(pred, target)
+		targets = float(sum(target[f"{name}_legal"].float().sum() for name in ("move", "travel")) + target["plan_heroes"].float().sum())
+		steps.append((targets, float(total.detach())))
+		return total, parts
+
+	monkeypatch.setattr(N, "loss", watched)
 	saved = T.CampaignConfig
 	try:
-		T.CampaignConfig = lambda **kwargs: saved(**{**kwargs, "nk_predict_weight": 1.0, "credit_segments": True})
+		T.CampaignConfig = lambda **kwargs: saved(**{**kwargs, "nk_predict_weight": 1.0, "credit_segments": True, "nk_predict_every": 1})
 		T.test_the_learner_step_end_to_end(tmp_path, capsys)
 	finally:
 		T.CampaignConfig = saved
+	assert steps, "the head took no step in the update"
+	assert any(targets > 0 for targets, _ in steps), f"no head step's rows held a target ({len(steps)} steps): the test's data cannot show the loss"
+	assert all(loss > 0 for targets, loss in steps if targets > 0), steps
 	row = list(csv.DictReader(open(tmp_path / "progress.csv")))[-1]
 	assert float(row["nkp_loss"]) > 0 and row["nkp_ce"] not in ("", "nan") and row["nkp_ce_uniform"] not in ("", "nan")
