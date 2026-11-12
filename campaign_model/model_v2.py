@@ -1144,7 +1144,7 @@ class CampaignModelV2(nn.Module):
 		# entry's views, the fixed prior (features.build_prior: its gold by value_logit, each faction's own bias), which
 		# the type's offer takes as MOVE's does
 		build_known = self.features.build_prior(x, known)
-		learned[A_.BUILD] = self.build_scores(own_towns, x) + self.build_bias + self.build_situational(known.build_entry.to(own_towns.dtype)).squeeze(-1)
+		learned[A_.BUILD] = self.build_scores(own_towns, x) + self.build_bias + self.build_situational(known.build_entry.to(own_towns.dtype)).squeeze(-1) * self.features.economy_on()  # (x the switch: its biases once trained are not 0 on a zero entry)
 		prior[A_.BUILD] = self.nk2_build(known.build_rewards).squeeze(-1) - build_charge + build_known
 		offers[A_.BUILD] = best_legal(build_known - build_charge, x["build_mask"])
 		# RECRUIT: the town and each creature level's token, the amounts; Nullkiller2's prior

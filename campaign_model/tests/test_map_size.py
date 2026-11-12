@@ -7,7 +7,8 @@ import torch
 
 from campaign_model import constants as c
 from campaign_model import features as ft
-from campaign_model.model_v2 import CampaignModelV2, distance_buckets, map_index, window_tile_index
+from campaign_model.features import ECONOMY
+from campaign_model.model_v2 import GROWN_INPUTS, CampaignModelV2, distance_buckets, map_index, window_tile_index
 from campaign_model.tests.test_model import tensors
 from campaign_model.tests.test_model_v2 import rich_inputs
 
@@ -25,11 +26,21 @@ def golden_model():
 	model = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
 	with torch.no_grad():
 		for name, p in sorted(model.named_parameters()):
-			if name.startswith(("side_tile", "side_global", "time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global", "fore_fight", "fore_move", "fore_answer", "fore_hero")):
+			if name.startswith(("side_tile", "side_global", "time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global", "fore_fight", "fore_move", "fore_answer", "fore_hero", "build_situational", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias")):
 				continue
 			g = torch.Generator().manual_seed(sum(ord(ch) * (i + 1) for i, ch in enumerate(name)) % (2**31))
+			if name in GROWN_INPUTS[2:]:  # (the economy's columns, 2026-11-12: the old ones drawn as before, the new at 0, as a checkpoint migrates)
+				old = 0.05 * torch.randn(p.shape[0], p.shape[1] - len(ECONOMY), generator=g)
+				p.copy_(torch.cat([old, torch.zeros(p.shape[0], len(ECONOMY))], dim=1))
+				continue
 			p.copy_(0.05 * torch.randn(p.shape, generator=g))
 	return model
+
+
+# Outputs behind the layers the economy widened (model_v2.GROWN_INPUTS[2:], 2026-11-12): the same numbers with zero
+# columns added, summed by the BLAS in another order at this test's small widths (2.4e-7 at most); the live checkpoint's
+# outputs on 600 spool decisions stayed bit for bit
+WIDENED = ("value_logit", "growth_logit", "memory", "option_logp")
 
 
 def test_a_small_map_gives_the_outputs_it_gave_before_the_blocks():
@@ -44,7 +55,7 @@ def test_a_small_map_gives_the_outputs_it_gave_before_the_blocks():
 		out = golden_model()(tensors(rich_inputs(3, 2)))
 	for name, before in golden.items():
 		now = out[name][:, :1] if name == "fs_move" else out[name]
-		if here:
+		if here and name not in WIDENED:
 			assert torch.equal(now, before), name
 		else:
 			assert torch.equal(torch.isfinite(now), torch.isfinite(before)) and torch.allclose(now, before, rtol=1e-6, atol=1e-6), name
