@@ -423,11 +423,11 @@ def test_following_its_choice_at_a_chance_is_the_exact_mixture_of_it_and_our_own
 	grads = [p.grad for name, p in model.named_parameters() if name.startswith("move_out") and p.grad is not None]
 	assert grads and all(torch.isfinite(g).all() for g in grads) and sum(float(g.abs().sum()) for g in grads) > 0
 	assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
-	# the bounds of what it can learn: from 0.9, between 0.31 and 0.96
+	# the bounds of what it can learn: from 0.9, between 0.31 and 0.9 (bundle 60's cap: the run line's chance at most)
 	with torch.no_grad():
 		model.features.nk_follow.fill_(0.9)
 		model.features.nk_follow_shift.fill_(100.0)
-		assert float(model.features.nk_follow_logs()[1].exp()) == pytest.approx(0.9607, abs=2e-3)
+		assert float(model.features.nk_follow_logs()[1].exp()) == pytest.approx(0.9, abs=1e-6)
 		model.features.nk_follow_shift.fill_(-100.0)
 		assert float(model.features.nk_follow_logs()[1].exp()) == pytest.approx(0.309, abs=2e-3)
 	monkeypatch.setenv("ALPHA_NK2_FOLLOW", "0")
