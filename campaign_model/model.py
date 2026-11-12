@@ -482,7 +482,7 @@ class CustomFeatures(nn.Module):
 			manned, unmanned = self.town_strength(x, f.town_power, manned=True)[:, :to], f.town_strength[:, :to]
 			with_garrison_hero = ft.log_add(torch.where(garrisoned >= 0, manned, unmanned), hero_in(garrisoned))
 			hold = ft.log_add(torch.where((garrisoned >= 0) | (visiting >= 0), manned, unmanned), ft.log_add(hero_in(visiting), hero_in(garrisoned)))
-			_, near, theirs = ft.hold_reach(ft.enemies(x, f.hero_strength), x["t_pos"][:, :to])
+			near, theirs = ft.hold_reach(ft.enemies(x, f.hero_strength), x["t_pos"][:, :to])
 			protect = lambda after: ft.hold_protection(near, theirs, hold, after, sharpness) * stake  # noqa: E731
 			# RECRUIT: what our gold buys from the pool now, the highest level first (gold alone: other resources not counted)
 			creature = x["t_available_creature"][:, :to]

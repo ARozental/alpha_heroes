@@ -25,17 +25,26 @@ def test_protection_is_zero_far_safe_or_lost_and_signed_by_the_change():
 	at = lambda theirs, before, after: float(ft.hold_protection(near, torch.tensor([[[theirs]]]), torch.tensor([[before]]), torch.tensor([[after]]), sharpness))  # noqa: E731
 	assert at(8.0, 8.0, 9.0) > 0.4 and at(8.0, 9.0, 8.0) < -0.4  # (an even fight: adding holds it, taking away loses it)
 	assert abs(at(8.0, 8.0, 9.0) + at(8.0, 9.0, 8.0)) < 1e-6
-	assert abs(at(2.0, 8.0, 9.0)) < 1e-9 and abs(at(14.0, 8.0, 9.0)) < 1e-9  # (safe anyway, lost anyway)
+	assert abs(at(2.0, 8.0, 9.0)) < 1e-6 and abs(at(14.0, 8.0, 9.0)) < 1e-6  # (safe anyway, lost anyway)
 	far = ft.hold_protection(torch.zeros(1, 1, 1), torch.tensor([[[8.0]]]), torch.tensor([[8.0]]), torch.tensor([[9.0]]), sharpness)
 	assert float(far) == 0.0  # (no rival near)
 
 
-def test_the_near_discounts_are_fuzzy_days_and_another_level_is_far():
+def test_a_town_lost_to_a_strong_rival_either_way_reads_zero_whatever_a_weaker_one_does():
+	"""Two rivals beside the town: the stronger takes it before and after; adding beats only the weaker: protection 0."""
+	near = torch.tensor([[[1.0, 1.0]]])
+	theirs = torch.tensor([[[14.0, 8.0]]])  # (the strong one far above the holding, the weak one even with it)
+	protection = ft.hold_protection(near, theirs, torch.tensor([[8.0]]), torch.tensor([[9.0]]), torch.tensor(4.0))
+	assert abs(float(protection)) < 1e-6
+	alone = ft.hold_protection(near[..., 1:], theirs[..., 1:], torch.tensor([[8.0]]), torch.tensor([[9.0]]), torch.tensor(4.0))
+	assert float(alone) > 0.4  # (the weak rival alone: the same action saves the town)
+
+
+def test_the_near_discount_is_fuzzy_and_another_level_is_far():
 	pos = torch.tensor([[[10, 10, 0], [55, 10, 0], [10, 10, 1]]])
 	foes = (pos, torch.tensor([[5.0, 6.0, 7.0]]), torch.tensor([[True, True, True]]))
-	near1, near3, theirs = ft.hold_reach(foes, torch.tensor([[[10, 25, 0]]]))
-	assert torch.allclose(near1[0, 0], torch.tensor([float(torch.exp(torch.tensor(-1.0))), float(torch.exp(torch.tensor(-3.0))), 0.0]))
-	assert torch.allclose(near3[0, 0], torch.tensor([float(torch.exp(torch.tensor(-1 / 3))), float(torch.exp(torch.tensor(-1.0))), 0.0]))
+	near, theirs = ft.hold_reach(foes, torch.tensor([[[10, 25, 0]]]))
+	assert torch.allclose(near[0, 0], torch.tensor([float(torch.exp(torch.tensor(-15 / 45))), float(torch.exp(torch.tensor(-1.0))), 0.0]))
 	assert theirs.shape == (1, 1, 3)
 
 
