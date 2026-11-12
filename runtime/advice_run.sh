@@ -325,6 +325,11 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # games and nothing else, so its effect can be read: campaign.nk2_follow=0.9, campaign.nk2_choice_games=0.5,
 # campaign.adv_by_kind=true (it belongs to the mixture); campaign.town_guard=0 (F3, the town's holding, replaces it later);
 # everything else as deploy 65's line. The start checkpoint is e5's, named after the Mac's replicates.
+# Deploy 68 (2026-11-12, e5): campaign.value_jump_from=3315. The value-loss guard held the campaign at v3261 (fresh loss
+# median 0.00595 against a calm level of 0.00187): its memory was the abandoned all-own line's rows (v3255-3314, read in
+# file order after the rollback), its calm level theirs. The critic's fit had not changed (unexplained 0.86-0.94); the
+# mixed games' targets spread more (0.053-0.081), as deploy 59's mixed line did (fresh loss median 0.0077). 3315 is the
+# first version the abandoned line never reached: the guard starts with no memory and judges ~57 readings on.
 resume=""
 ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
 exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
@@ -333,5 +338,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3107 campaign.adv_weight=1 campaign.nk2_choice_games=0.5 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=true campaign.nk_predict_weight=0.1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=5.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0.9 campaign.nk2_teacher=false campaign.value_jump_from=3315 campaign.adv_weight=1 campaign.nk2_choice_games=0.5 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=true campaign.nk_predict_weight=0.1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
