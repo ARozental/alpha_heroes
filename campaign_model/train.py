@@ -1312,7 +1312,9 @@ def ppo_update(
 			return config.nk_predict_weight * batch["scale"] * part, part.detach().float() * nkp_slot
 
 		if graphs is not None and config.step_graphs:
-			nkp_graph = StepGraph(model, nkp_fn, model.nk_blind)
+			# (kept with the model as the main graph is: a local one was recorded and checked again every update, e5's find,
+			# 2026-11-12. The kept graph keeps its first update's nkp_fn: config.nk_predict_weight is the run line's constant)
+			nkp_graph = model.__dict__.setdefault("_nkp_graph", StepGraph(model, nkp_fn, model.nk_blind))
 	# The wire's conversion recorded in the graphs (config.convert_in_graphs): they take the decoded batches as sent
 	# ({"wire": [N, IN_BYTES]}) and prepare them inside; everything else here converts them itself (model_inputs)
 	prepare = (lambda raw: convert(raw["wire"])) if convert is not None and graphs is not None and config.convert_in_graphs else None
