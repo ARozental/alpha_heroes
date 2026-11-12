@@ -647,6 +647,11 @@ class CampaignModelV2(nn.Module):
 		self.nk_read = os.environ.get("ALPHA_NK_READ", "live")  # (read when the model is built: a server's after its process's environment is set)
 		self.nk_parts = frozenset(p for p in os.environ.get("ALPHA_NK_PARTS", "").split(",") if p)  # (the "parts" diagnostic's, for a paired eval)
 		self.nk_channels = os.environ.get("ALPHA_NK_CHANNELS", "all")
+		if self.nk_read == "gate":  # (the gate's offline head, outside the parameters: a list, so no submodule)
+			gate = torch.load(os.environ["ALPHA_NK_GATE"], map_location="cpu")
+			head = SwiGLU(gate["dim"], gate["hidden"], 1)
+			head.load_state_dict(gate["state"])
+			self._gate_head = [head.eval()]
 
 	def prior_corrections(self):
 		"""The parameters that correct a fixed prior (model.CustomFeatures): weight decay pulls them back to it."""
@@ -1157,7 +1162,11 @@ class CampaignModelV2(nn.Module):
 			# (forecast-out A and B: each tile's own forecasts, detached, onto its MOVE logit; the advantage head's entry term
 			# reads them too)
 			state.fore_move = torch.cat([fight_forecast(x, known, foresight["foreseen"]), consequence_channels(self.foresight.move_out(foresight["hidden"]["move"]).detach().float())], dim=-1)
-			state.move_pairs = self.move_pair(torch.cat([pairs + self.move_toward(toward(*self.advice_for(known, "toward", "move").move_dest)), hidden["move"], move_known, mixed], dim=-1))
+			if self.nk_read == "gate":  # (each legal cell's own pair, gated by the offline head's P(the planner's candidate))
+				toward_move = self.move_toward(pairs) * self.candidate_gate(pairs, x, known).unsqueeze(-1).to(pairs.dtype)
+			else:
+				toward_move = self.move_toward(toward(*self.advice_for(known, "toward", "move").move_dest))
+			state.move_pairs = self.move_pair(torch.cat([pairs + toward_move, hidden["move"], move_known, mixed], dim=-1))
 		# The two late terms, purely additive on the MOVE and TRAVEL logits, after the pairs (nk_predict stage 2: the head
 		# reads the pairs, its table feeds these): the advice they read by nk_read ("live" and "blind": the forward's own;
 		# "late": the live planner's on the blind trunk; "predicted": the head's table in the planner's slice)
@@ -1183,6 +1192,16 @@ class CampaignModelV2(nn.Module):
 		if self.nk_read == "parts" and (part in self.nk_parts or (side is not None and f"{part}_{side}" in self.nk_parts)):
 			return known.live
 		return known.advice
+
+	def candidate_gate(self, pairs, x, known):
+		"""The "gate" diagnostic (e5, 2026-11-12; harness and paired evals only, never trained): P(a legal MOVE cell is its
+		best candidate's own destination) [K, W, W] from an offline head on the blind pre-pairs (ALPHA_NK_GATE: a SwiGLU's
+		state dict, hidden 32, kept outside the parameters), 0 on illegal cells and padding windows."""
+		head = self._gate_head[0].to(pairs.device)
+		self._gate_head[0] = head
+		legal = x["move_mask"].bool().reshape(-1, W, W).index_select(0, known.windows) & known.real.reshape(-1, 1, 1)
+		with torch.no_grad():
+			return torch.sigmoid(head(pairs.float()).squeeze(-1)) * legal
 
 	def predicted_advice(self, state, known):
 		"""nk_predict stage 2: the forward's advice (the blind inputs') with the planner's slice of MOVE's and TRAVEL's
