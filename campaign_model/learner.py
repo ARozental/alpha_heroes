@@ -119,7 +119,8 @@ COLUMNS = [
 	# (each kind of game's advantage as the policy and the head take it: its mean, its spread, its share of sum |A| x credit;
 	# config.adv_by_kind standardizes them apart)
 	"adv_mean_shown", "adv_mean_hidden", "adv_sd_shown", "adv_sd_hidden", "adv_weight_shown", "adv_weight_hidden",
-	"loops_cut", "loops_cut_move", "loops_cut_multi", "probes_no_way",  # (bundle 60's loop guard, a game)
+	"loops_cut", "loops_cut_move", "loops_cut_multi", "probes_no_way",  # (bundle 60's loop guard, a game: summed over its players)
+	"loops_per_player_day",
 	# (config.credit_segments: the k's this update's credit used, each segment's F (its action types' between-type spread
 	# of gaps over their sampling variance) and the number of types that entered it, the credit's spread with the k's and
 	# the 7-day credit's on the same rows: the noise the k's leave out)
@@ -940,6 +941,9 @@ class CampaignLearner:
 			"loops_cut_move": sum((s.get("loops_cut_types") or {}).get(str(int(c.ActionType.MOVE)), 0) for s in done) / max(len(games), 1),
 			"loops_cut_multi": sum((s.get("loops_cut_types") or {}).get(str(int(c.ActionType.MULTI)), 0) for s in done) / max(len(games), 1),
 			"probes_no_way": sum(s.get("probes_no_way", 0) for s in done) / max(len(games), 1),
+			# (e5, 2026-11-11: loops_cut is the sum over a game's players, a mean over the update's games; this one is per
+			# player-day, comparable across player counts and game lengths: the cuts over the players' days played)
+			"loops_per_player_day": sum(s.get("loops_cut", 0) for s in done) / max(sum(len(game.ledgers[min(game.ledgers)]["players"]) * (max(game.ledgers) - 1) for game, _ in games if game.ledgers), 1),
 			"game_failures": self.stats["game_failures"],
 			"game_maps": sum(1 for _, info in games if not info.map_name.startswith("Maps/alpha_random/")),
 			"dropped_games": self.stats["dropped_games"],

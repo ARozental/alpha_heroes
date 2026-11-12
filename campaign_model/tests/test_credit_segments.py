@@ -163,6 +163,7 @@ def test_the_learner_step_end_to_end(tmp_path, capsys):
 	assert "credit by segments: k5 0.000 k7 0.000" in printed and "FAILURE" not in printed
 	assert float(row["segment_k5"]) == 0.0 and row["segment_types5"] != "" and float(row["segment_credit_std"]) > 0 and float(row["segment_full_std"]) > 0
 	assert all(isinstance(e, dict) for e in learner.segment_evidence) and any(learner.segment_evidence)
+	assert float(row["loops_per_player_day"]) == 0.0  # (no loops in these games; the column there)
 	for name in ("signal_all", "signal_trunk", "signal_body", "signal_heads", "ratio_body", "ratio_heads", "lr_scale", "kl", "learning_rate"):  # (e5's learning-rate readings)
 		assert row[name] not in ("", "nan"), name
 	assert 0 < float(row["ratio_body"]) <= 1 and 0 < float(row["ratio_heads"]) <= 1
