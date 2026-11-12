@@ -49,7 +49,8 @@ def test_the_near_discount_is_fuzzy_and_another_level_is_far():
 
 
 def test_the_values_are_finite_bounded_and_signed():
-	model, x = model_and_inputs()
+	model, _ = model_and_inputs()
+	x = scenario()  # (rich_inputs alone have no town fight: every value 0)
 	values = captured_values(model, x)
 	stake = values["hold_stake"]
 	for name in HOLD:
@@ -58,6 +59,61 @@ def test_the_values_are_finite_bounded_and_signed():
 	assert (values["hold_recruit"] >= -1e-6).all() and (values["hold_hire"] >= -1e-6).all() and (values["hold_enter_town"] >= -1e-6).all()
 	assert (values["hold_recruit"].abs() <= stake + 1e-3).all() and (values["hold_hire"].abs() <= stake[..., None] + 1e-3).all()
 	assert (values["hold_enter_town"].abs() <= stake[:, None, :] + 1e-3).all()
+
+
+def scenario():
+	"""rich_inputs' decision 0 made a town fight: our town 0 at (20, 20, 0) with 20 creatures and none of ours in it, 50 of
+	the same for hire and gold for all; our town 1 on the other level; a rival hero of 40 of them five tiles from town 0.
+	Before, the rival takes town 0 (P ~0.94); with the recruits in, it does not (P ~0.1)."""
+	x = {k: torch.from_numpy(v.copy()) for k, v in rich_inputs(2, 4).items()}
+	creature = 67
+	for town, pos in ((0, (20, 20, 0)), (1, (20, 20, 1))):
+		x["t_present"][0, town], x["t_owner"][0, town], x["t_pos"][0, town] = True, c.OWNER_SELF, torch.tensor(pos)
+		x["t_fort"][0, town], x["t_visiting"][0, town], x["t_garrison_hero"][0, town] = 0, -1, -1
+		x["t_garrison_creature"][0, town] = -1
+		x["t_garrison_count"][0, town] = 0
+		x["t_garrison_creature"][0, town, 0], x["t_garrison_count"][0, town, 0], x["t_detailed"][0, town] = creature, 20, True
+		x["t_available"][0, town] = 0
+		x["t_available_creature"][0, town] = -1
+		x["t_available"][0, town, 0], x["t_available_creature"][0, town, 0] = 50, creature
+		x["recruit_mask"][0, town, 0] = True
+	x["t_visiting"][0, :] = -1
+	x["t_garrison_hero"][0, :] = -1
+	x["g_resources"][0, 6] = 1_000_000
+	rival = HO
+	x["h_present"][0, rival], x["h_owner"][0, rival], x["h_pos"][0, rival], x["h_detailed"][0, rival] = True, c.OWNER_SELF + 1, torch.tensor((25, 20, 0)), True
+	x["h_primary"][0, rival] = 0
+	x["h_army_creature"][0, rival] = -1
+	x["h_army_count"][0, rival] = 0
+	x["h_army_creature"][0, rival, 0], x["h_army_count"][0, rival, 0] = creature, 40
+	for other in range(HO + 1, x["h_present"].shape[1]):
+		x["h_present"][0, other] = False
+	return x
+
+
+def test_in_a_town_fight_recruits_save_the_town_and_another_level_is_far():
+	model, _ = model_and_inputs()
+	values = captured_values(model, scenario())
+	stake = values["hold_stake"][0]
+	assert float(values["hold_recruit"][0, 0]) > 0.5 * float(stake[0]) > 0, (values["hold_recruit"][0, :2], stake[:2])
+	assert abs(float(values["hold_recruit"][0, 1])) < 1e-6  # (town 1: the rival on another level)
+
+
+def test_a_visitor_leaving_a_threatened_town_costs_and_another_entering_saves():
+	model, _ = model_and_inputs()
+	x = scenario()
+	x["h_present"][0, 0], x["h_owner"][0, 0], x["h_pos"][0, 0] = True, c.OWNER_SELF, torch.tensor((20, 20, 0))
+	x["h_army_creature"][0, 0] = -1
+	x["h_army_count"][0, 0] = 0
+	x["h_army_creature"][0, 0, 0], x["h_army_count"][0, 0, 0] = 67, 50
+	x["t_visiting"][0, 0] = 0
+	values = captured_values(model, x)
+	assert float(values["hold_leave"][0, 0]) < -0.3 * float(values["hold_stake"][0, 0]), values["hold_leave"][0]
+	assert float(values["hold_leave"][0, 1:].abs().max()) == 0.0
+	x["t_visiting"][0, 0] = -1  # (the hero beside it, the visiting place free: stepping in saves the town)
+	x["h_pos"][0, 0] = torch.tensor((21, 20, 0))
+	values = captured_values(model, x)
+	assert float(values["hold_enter_town"][0, 0, 0]) > 0.3 * float(values["hold_stake"][0, 0]), values["hold_enter_town"][0, 0]
 
 
 def captured_values(model, x):
@@ -99,7 +155,8 @@ def test_off_at_size_zero_whatever_the_values():
 def test_on_it_raises_what_saves_a_town_and_lowers_leaving_it():
 	"""At town_hold 1: a planted saving on town 0's recruits lifts its RECRUIT entries against another town's; a planted
 	cost on hero 0's leaving lowers all its MOVE and TRAVEL entries alike."""
-	model, x = model_and_inputs()
+	model, _ = model_and_inputs()
+	x = scenario()  # (two towns of ours with legal recruits)
 	real = model.features.town_hold_values
 
 	def planted(x_, f_):
@@ -110,20 +167,22 @@ def test_on_it_raises_what_saves_a_town_and_lowers_leaving_it():
 		out["hold_leave"][:, 0] = -4000.0
 		return out
 
+	plain = {k: torch.from_numpy(v) for k, v in rich_inputs(6, 4).items()}  # (MOVE and TRAVEL: decisions with several heroes moving)
 	with torch.no_grad():
 		model.features.town_hold_values = planted
-		base = model(x)
+		base, base_plain = model(x), model(plain)
 		model.features.town_hold.fill_(1.0)
-		out = model(x)
+		out, out_plain = model(x), model(plain)
 	expect = float(ft.value_logit(torch.tensor(4000.0)))
 	shift = (out["recruit_logp"] - base["recruit_logp"]).flatten(2)  # [B, TO, entries]: town 0's entries up by expect against the others'
 	rows = [r for r in range(shift.shape[0]) if torch.isfinite(shift[r, 0]).any() and torch.isfinite(shift[r, 1:]).any()]
+	assert rows, "no decision with legal recruits in town 0 and another"
 	for r in rows:
 		up, rest = shift[r, 0][torch.isfinite(shift[r, 0])], shift[r, 1:][torch.isfinite(shift[r, 1:])]
 		assert abs(float(up.mean() - rest.mean()) - expect) < 0.05 and float(up.std(unbiased=False)) < 1e-3, (float(up.mean() - rest.mean()), expect)
 	for name, sign in (("move_logp", -1), ("travel_logp", -1)):
-		b = next(r for r in range(x["g_day"].shape[0]) if torch.isfinite(base[name][r, 0]).sum() >= 1 and torch.isfinite(base[name][r, 1:]).sum() >= 1)
-		a0, a1 = base[name][b].reshape(HO, -1), out[name][b].reshape(HO, -1)
+		b = next(r for r in range(plain["g_day"].shape[0]) if torch.isfinite(base_plain[name][r, 0]).sum() >= 1 and torch.isfinite(base_plain[name][r, 1:]).sum() >= 1)
+		a0, a1 = base_plain[name][b].reshape(HO, -1), out_plain[name][b].reshape(HO, -1)
 		hero0, others = torch.isfinite(a0[0]), torch.isfinite(a0[1:])
 		shift0, shift1 = a1[0][hero0] - a0[0][hero0], a1[1:][others] - a0[1:][others]
 		assert torch.allclose(shift0, shift0[0].expand_as(shift0), atol=1e-4), name
