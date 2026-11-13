@@ -1491,6 +1491,8 @@ def ppo_update(
 			by_residual = head_weights(head_var_slow, float(head_scale.get("ramp", 1.0)), config.growth_weight, residuals=head_residual)
 			share = float(head_scale.get("residual_ramp", 1.0))
 			weights = {name: [(1 - share) * a + share * b for a, b in zip(values, by_residual[name])] for name, values in weights.items()}
+		if head_scale.get("frozen"):  # (config.head_scale_freeze: the weights as they were at that version, whatever the batch)
+			weights = {name: list(values) for name, values in head_scale["frozen"].items()}
 		head_w = {f"w:{name}": torch.tensor(values, dtype=torch.float32, device=device) for name, values in weights.items() if name in measured}
 	gpu_mb = 0.0
 	end_step_error = None

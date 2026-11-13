@@ -157,6 +157,16 @@ VALVE_WINDOW, VALVE_HORIZON, VALVE_S_MIN, VALVE_K_MIN, VALVE_RATE = 7, 50, 0.1, 
 MAX_LABEL_STALENESS = 2  # model versions: older precomputed labels (labeler.py) are recomputed with the current tables
 
 
+def value_shared_now(config, version):
+	"""config.value_shared's scale on the value terms' gradient into the shared layers for the update from `version`: 1
+	before value_shared_from or with value_shared at 1, else max(value_shared, 1.25 ** -(version - value_shared_from + 1)):
+	the version's alone, no state, so a restart mid-ramp continues it."""
+	shared, start = float(getattr(config, "value_shared", 1.0)), int(getattr(config, "value_shared_from", 0))
+	if shared >= 1.0 or version < start:
+		return 1.0
+	return max(shared, 1.25 ** -(version - start + 1))
+
+
 def set_advice_prior(model, config):
 	"""config.nk2_prior and nk2_prior_fallback into the model's buffers (model.CustomFeatures.nk_beta, nk_beta_fallback):
 	the size of Nullkiller2's preference as a prior on MOVE's and TRAVEL's entries. At every start, after the weights
@@ -244,12 +254,15 @@ class CampaignLearner:
 		self.loss_scale, self.teacher_share = None, None  # (config.loss_shares) {"log_norm", "weight"} of the terms; the teacher's share
 		self.trust_ema = None  # (config.trust_memory) trust's slow average, trust() floors it at config.trust_floor
 		self.head_residual, self.head_var_slow, self.head_residual_updates = None, None, 0  # (config.head_scale_by "residual") the heads' running fresh excess, the variances that scale it, the updates since it began
+		self.head_weights_frozen = None  # (config.head_scale_freeze: the value heads' weights held, once that version is reached)
 		# (config.value_jump_stop) the value-loss guard: why the updates are held (None: they run), the updates' games
 		# dropped since, the fresh value loss's readings (progress.csv's on a resume, _judge_value's after), this process's own
 		self.held, self.held_updates, self.value_readings, self.value_own = None, 0, [], 0
 		self.grad_clips, self.clip_samples = None, []  # (config.grad_clip_by_group) the groups' clips once calibrated, the calibration's steps' norms till then
 		self.gather_ramp_start = None  # (config.nk2_gather_ramp) the version at the ramp's first update
 		self.valve = None  # (config.value_valve, kl_valve) valve_step's state: r_v's reference and window, s and k
+		if getattr(config, "value_shared", 1.0) < 1.0 and getattr(config, "value_valve", False):
+			raise ValueError("config.value_shared and config.value_valve both set the value terms' gradient into the shared layers: choose one")
 		latest = self.out / "checkpoint_latest.pt"
 		if resume and latest.exists():
 			state = torch.load(latest, map_location=device)
@@ -275,6 +288,7 @@ class CampaignLearner:
 			self.loss_scale, self.teacher_share = state.get("loss_scale"), state.get("teacher_share")
 			self.trust_ema = state.get("trust_ema")
 			self.head_residual, self.head_var_slow, self.head_residual_updates = state.get("head_residual"), state.get("head_var_slow"), state.get("head_residual_updates", 0)
+			self.head_weights_frozen = state.get("head_weights_frozen")
 			self.grad_clips, self.clip_samples = state.get("grad_clips"), state.get("clip_samples", [])
 			self.gather_ramp_start = state.get("gather_ramp_start")
 			self.valve = state.get("valve")
@@ -326,6 +340,9 @@ class CampaignLearner:
 
 		from battle_model import remote
 
+		shared, freeze = getattr(config, "value_shared", 1.0), getattr(config, "loss_shares_freeze", 0)
+		if shared < 1.0 and getattr(config, "loss_shares", False) and not (freeze and self.version >= freeze):
+			raise ValueError(f"config.value_shared {shared} with the loss shares not frozen (loss_shares_freeze {freeze}, version {self.version}): their balancing would raise the value's weight against it")
 		port = battle.config.remote_port  # (workers on other machines: remote.py)
 		self.own_server = server is None
 		self.server = server or InferenceServer(battle_play.SOCKET_DIR / f"campaign-{os.getpid()}.sock", device=inference_device(config.inference_device), family="campaign", model_kwargs=self.kwargs, threads=config.inference_threads, processes=config.inference_processes, tcp_port=port + remote.CAMPAIGN_PORT if port else 0)
@@ -746,6 +763,10 @@ class CampaignLearner:
 				self._calibrate_clips(metrics)
 				if metrics.get("head_residual") is not None:  # (config.head_scale_by "residual": for the next update; its ramp goes on)
 					self.head_residual, self.head_var_slow, self.head_residual_updates = metrics["head_residual"], metrics["head_var_slow"], self.head_residual_updates + 1
+				freeze = getattr(self.config, "head_scale_freeze", 0)
+				if freeze and self.version >= freeze and getattr(self, "head_weights_frozen", None) is None and metrics.get("head_weights"):
+					self.head_weights_frozen = metrics["head_weights"]  # (config.head_scale_freeze: the weights this update used, from now on)
+					print(f"campaign: the value heads' weights held from v{self.version} (config.head_scale_freeze {freeze}): " + "  ".join(f"{name} " + "/".join(f"{w:.2f}" for w in values) for name, values in self.head_weights_frozen.items()), flush=True)
 				if metrics.get("head_var") is not None:  # (config.head_scale: for the next update; the ramp goes on)
 					self.head_var, self.head_scale_updates = metrics["head_var"], getattr(self, "head_scale_updates", 0) + 1
 					weights = metrics.get("head_weights") or {}
@@ -1091,7 +1112,7 @@ class CampaignLearner:
 
 		state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
 		optimizer = {} if self.worker else {"optimizer": self.optimizer.state_dict()}  # (the process's is in checkpoint_latest.pt)
-		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "segment_evidence": getattr(self, "segment_evidence", [{}, {}, {}]), "segment_k": getattr(self, "segment_k", (0.0, 0.0)), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "gather_ramp_start": self.gather_ramp_start, "valve": self.valve, "model_kwargs": self.kwargs}, path)
+		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "segment_evidence": getattr(self, "segment_evidence", [{}, {}, {}]), "segment_k": getattr(self, "segment_k", (0.0, 0.0)), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "head_weights_frozen": getattr(self, "head_weights_frozen", None), "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "gather_ramp_start": self.gather_ramp_start, "valve": self.valve, "model_kwargs": self.kwargs}, path)
 
 	# ---- the loss shares (config.loss_shares) ----
 
@@ -1123,6 +1144,8 @@ class CampaignLearner:
 		head_scale_by "residual" also their running fresh excess, the slow variances that scale it, and how far the
 		residual weights have ramped in (HEAD_SCALE_RAMP updates from the first)."""
 		scale = {"var": getattr(self, "head_var", None), "ramp": min(1.0, getattr(self, "head_scale_updates", 0) / HEAD_SCALE_RAMP)}
+		if getattr(self, "head_weights_frozen", None) is not None:  # (config.head_scale_freeze: the weights held)
+			scale["frozen"] = self.head_weights_frozen
 		if self.config.head_scale_by == "residual":
 			scale.update(residual=self.head_residual, var_slow=self.head_var_slow, residual_ramp=min(1.0, self.head_residual_updates / HEAD_SCALE_RAMP))
 		return scale
@@ -1154,16 +1177,18 @@ class CampaignLearner:
 	def valve_now(self):
 		"""(s, k) for the update to come (config.value_valve, kl_valve; 1 for a valve off): the valves' state, started at the
 		first update with one on from progress.csv's fresh readings (valve_reference), so a deploy during a jump does not
-		take the jump for the level."""
+		take the jump for the level. With the value valve's controller off, s is config.value_shared's fixed scale
+		(value_shared_now: 1 at value_shared 1)."""
+		shared = value_shared_now(self.config, self.version)
 		if not (getattr(self.config, "value_valve", False) or getattr(self.config, "kl_valve", False)):
-			return 1.0, 1.0
+			return shared, 1.0
 		if self.valve is None:
 			self.valve = valve_reference(fresh_readings(self.progress, keep=VALVE_HORIZON))
 			if self.valve is not None:
 				print(f"campaign: the value valves from version {self.version}: r_v's reference {self.valve['reference']:.5f} (the median of progress.csv's last {VALVE_HORIZON} fresh readings)", flush=True)
 		if self.valve is None:
-			return 1.0, 1.0
-		return (self.valve["s"] if self.config.value_valve else 1.0), (self.valve["k"] if self.config.kl_valve else 1.0)
+			return shared, 1.0
+		return (self.valve["s"] if self.config.value_valve else shared), (self.valve["k"] if self.config.kl_valve else 1.0)
 
 	def _valve_reading(self, reading):
 		"""The update's fresh value loss into the valves, r_v after it (nan with the valves off) for the log row."""

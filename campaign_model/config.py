@@ -229,6 +229,9 @@ class CampaignConfig:
 	# less), ramped in over HEAD_SCALE_RAMP updates from the variance's weights; "variance", 1 / its targets' running
 	# variance (swung with the batch's label spread: the share weights 6 to 9.8 update to update)
 	head_scale_by: str = "residual"
+	# The value heads' weights held from this version on (0: off), as loss_shares_freeze holds the terms' (the user,
+	# 2026-11-13: no automatic weight moving on V): the weights the update at that version used, kept in the checkpoint
+	head_scale_freeze: int = 0
 	# The privileged critic (2026-11-06, the user's call on AlphaStar's lesson; model_v2.PrivilegedCritic, the user's
 	# design of 2026-11-07): the share heads' and V_end's logits corrected from the other players' own critic states
 	# (max-pooled) and our true share now, training only, learned on top of the critic (its inputs detached: the
@@ -395,6 +398,14 @@ class CampaignConfig:
 	# loss_shares were on, its balancing would raise the value's weight against value_valve. False: as before
 	value_valve: bool = False
 	kl_valve: bool = False
+	# The value terms' gradient into the shared layers at a fixed scale (e5 for the user, 2026-11-13: "a V loss on the last
+	# hidden state, weaker than now"): from version value_shared_from on, the model's value_valve is max(value_shared,
+	# 1.25 ** -(version - value_shared_from + 1)) (learner.value_shared_now: a function of the version alone, so a restart
+	# mid-ramp continues it): 0.8 at its first update, value_shared from the 7th at 0.25. The value heads' own layer
+	# (value_hidden and the read-outs) learns at its full rate on the real outcomes. 1.0: as before, bit for bit. Not with
+	# value_valve (a config error at the start)
+	value_shared: float = 1.0
+	value_shared_from: int = 0
 	nk2_night_drop_logit: float = 1.0
 	nk2_night_drop_reading: float = 0.6
 	# MULTI inside an exchange's teacher span (train.TEACHER_SPAN_MULTI; the 2026-11-09 audit's M3): every exchange label
