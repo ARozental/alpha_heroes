@@ -186,7 +186,7 @@ def end_steps(game, ahead=c.VALUE_OFFSETS[-1]):
 	return step, week
 
 
-def end_advantages(values, step, week, real, price, turn, decision_price, outcome):
+def end_advantages(values, step, week, real, price, turn, decision_price, outcome, week_only=False):
 	"""The end head's credit [N]: how much better than expected each decision did for the player's share at the game's
 	end. values: V_end at each decision (the model as the update starts: train.ppo_update); step, week: end_steps'
 	indices into the same rows; real: end_labels'; price: label's (the turn decisions still to come that day).
@@ -195,12 +195,15 @@ def end_advantages(values, step, week, real, price, turn, decision_price, outcom
 	  week  V_end at the player's first turn decision 7 days on (the real end where there is none) - V_end here, the
 	        day's price: a week of what then happened, so td's blind spots within a week are corrected
 	advantage = (1 - outcome) td + outcome week; td alone where the week's is unknown, nan where neither is (a game
-	stopped by the time limit: the end of it). No real end beyond a week: the whole game's luck would drown the step
-	(what V_end learns from the real end, the credit gets through it)."""
+	stopped by the time limit: the end of it); week_only (config.end_week_share 1): the week alone, nan where it is
+	unknown. No real end beyond a week: the whole game's luck would drown the step (what V_end learns from the real end,
+	the credit gets through it)."""
 	there = np.where(step >= 0, values[np.maximum(step, 0)], real)
 	td = there - values - np.where(turn, decision_price, 0.0)
 	later = np.where(week >= 0, values[np.maximum(week, 0)], real)
 	weekly = later - values - price
+	if week_only:
+		return weekly.astype(np.float32)
 	return np.where(np.isfinite(weekly), (1 - outcome) * td + outcome * weekly, td).astype(np.float32)
 
 

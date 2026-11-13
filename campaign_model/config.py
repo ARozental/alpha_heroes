@@ -187,6 +187,12 @@ class CampaignConfig:
 	# the 7-day credit alone; as it learns, the credit moves to the end (the user: "maybe moving to use it late during
 	# training"). 0: V_end is trained and logged only
 	end_credit_max: float = 1.0
+	# The end credit's week share fixed (e5 for the user, 2026-11-13, deploy 75): below 0 (-1) as before, end_credit's
+	# 1 - (1 - outcome_share_min) x the trust in V_end; 0..1 that share at every update. Only the credit's mix: the value
+	# heads' and V_end's grades stay outcome_share_min's (ladder_targets, end_targets). At 1, the week alone: a row whose
+	# week is unknown (the last week of a game stopped by the time limit: no real end) gets no end credit, not the one-step
+	# part (its 7-day credit stands; with neither it is not credited); learner columns end_week_share, end_credit_none
+	end_week_share: float = -1.0  # (above 1 reads as 1)
 	# The end credit's own check (b1, 2026-10-31): V_end's step estimate of the end is checked by action type as the 7-day
 	# one is (labels.credit_trust over learner.end_evidence); as it fails, the end credit's step part gives way to its week
 	# part, as the 7-day credit's step gives way to the week's outcome. Its steps were off by type as the 7-day ones (travel

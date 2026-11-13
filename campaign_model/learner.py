@@ -139,6 +139,9 @@ COLUMNS = [
 	# TensorBoard before), the trunk group's shared layers (body) and policy heads apart with their mean |m| / sqrt(v)
 	# (train.trunk_moments), the KL control's lr scale; kl, last_kl and learning_rate are above)
 	*(f"signal_{name}" for name in ("all", *GRAD_GROUPS)), "signal_body", "signal_heads", "ratio_body", "ratio_heads", "lr_scale",
+	# (config.end_week_share, deploy 75: the end credit's week share this update used, and the share of the update's rows
+	# with no end credit)
+	"end_week_share", "end_credit_none",
 ]
 SEGMENT_RATE = 0.05  # config.credit_segments: each long segment's k moves this far toward its measured max(0, 1 - 1/F) an update
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
@@ -720,6 +723,7 @@ class CampaignLearner:
 		end["outcome"], end["weight"] = outcome, weight if self.config.credit == "horizon" else (self.config.attributed_end_weight if weight > 0 else 0.0) if self.config.credit in ("attributed", "schedule") else 0.0
 		attributed = {name: np.concatenate(parts) for name, parts in attributed.items()} if self.config.credit == "attributed" else None
 		row["end_credit"] = end["weight"]
+		row["end_week_share"] = outcome
 		if errors:  # the credit check: the step's estimate against what then happened, by action type (labels.credit_evidence)
 			self.credit_evidence = credit_evidence(decisions, np.concatenate(errors), np.concatenate(players), self.credit_evidence)
 			gaps = credit_gaps(self.credit_evidence)
@@ -902,7 +906,10 @@ class CampaignLearner:
 		trust in V_end, and 1 - (1 - outcome_share_min) x that trust (labels.end_advantages)."""
 		trust = self.grade_trust().get("Vend", 0.0)
 		step = min(trust, getattr(self, "end_check", 1.0)) if self.config.end_credit_check else trust  # (its check moves the credit from V_end's steps to its weeks)
-		return self.config.end_credit_max * trust, 1 - (1 - self.config.outcome_share_min) * step
+		share = 1 - (1 - self.config.outcome_share_min) * step
+		if getattr(self.config, "end_week_share", -1.0) >= 0:  # (fixed: config.end_week_share)
+			share = min(1.0, float(self.config.end_week_share))
+		return self.config.end_credit_max * trust, share
 
 	def _log(self, epoch, games, decisions, sums, metrics, seconds):
 		n = len(decisions)
@@ -925,6 +932,8 @@ class CampaignLearner:
 			"trust": sums["trust"],
 			"credit_trust": sums.get("credit_trust", float("nan")),
 			"end_credit": sums["end_credit"],
+			"end_week_share": sums.get("end_week_share", float("nan")),
+			"end_credit_none": metrics.get("end_credit_none", float("nan")),
 			"unsound": metrics["unsound"],
 			"credited": metrics.get("credited", n),
 			"days": mean([max(game.ledgers) - 1 for game, _ in games if game.ledgers]),
