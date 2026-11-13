@@ -281,6 +281,11 @@ class GlobalEncoder(nn.Module):
 		self.owned = ArmyEncoder(dim)
 		self.dwellings = ArmyEncoder(dim)
 		self.token = Tokenizer(self.NUMBERS, dim)
+		# (schema 20, B2) our days without a town / 7 (0 while we own one), read through weights that start at 0: the
+		# token as before until training finds a use
+		self.no_town_days = nn.Linear(1, dim)
+		nn.init.zeros_(self.no_town_days.weight)
+		nn.init.zeros_(self.no_town_days.bias)
 
 	def forward(self, x):
 		from .features import object_pair
@@ -311,7 +316,7 @@ class GlobalEncoder(nn.Module):
 			],
 			dim=-1,
 		)
-		return self.token(embedded, numbers)
+		return self.token(embedded, numbers) + self.no_town_days(x["g_days_no_town"].clamp(0, 7).float().unsqueeze(-1) / 7)
 
 
 class OptionTables(NamedTuple):

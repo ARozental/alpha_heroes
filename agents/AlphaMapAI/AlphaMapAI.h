@@ -456,7 +456,7 @@ private:
 	void encodeWindows(Decision & decision, PathfinderCache & paths);
 	/// A teleporter's entrance none of whose exits we have seen (TILE_UNSEEN_EXIT, OBJECT_UNSEEN_EXIT)
 	bool unseenExit(const CGObjectInstance * obj) const;
-	/// A visit by this hero that would give nothing, by what we know (TILE_VISITED_BY_HERO and m_visitors with wasVisited)
+	/// A visit by this hero that would give nothing, by what we know (B1b: TILE_EMPTY_FOR_HERO, m_empty)
 	bool emptyVisit(const CGObjectInstance * obj, const CGHeroInstance * h) const;
 	/// An object whose every visit reveals the land around it, none of it hidden from us any more (emptyVisit)
 	bool revealSpent(const CRewardableObject * obj) const;

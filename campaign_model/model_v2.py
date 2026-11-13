@@ -444,7 +444,7 @@ class CampaignModelV2(nn.Module):
 		self.encode_tiles = E.TileEncoder(dc)
 		self.encode_options = E.OptionEncoder(d)
 		self.encode_other = E.ArmyEncoder(d)
-		self.reach = E.Tokenizer(5 + E.AMOUNT_FEATURES + 1, dc, embedded=False)  # a hero's reach to its window's tiles
+		self.reach = E.Tokenizer(5 + E.AMOUNT_FEATURES + 2, dc, embedded=False)  # a hero's reach to its window's tiles (B1b's column last: GROWN_INPUTS)
 		self.travel_days = E.Tokenizer(E.AMOUNT_FEATURES + 1, dp, embedded=False)  # its days to each TRAVEL area
 		# take_sides
 		self.sides, self.tile_sides = Sides(d), Sides(dc)
@@ -1521,7 +1521,7 @@ def migrate_option_head(state_dict):
 	return state
 
 
-GROWN_INPUTS = ("recruit_head.0.weight", "option_weights.weight", "join_global.mlp.up.weight", "again_global.mlp.up.weight", "value_hidden.0.weight")  # (2026-11-04: + the visiting hero; + a purchase's fit)
+GROWN_INPUTS = ("recruit_head.0.weight", "option_weights.weight", "join_global.mlp.up.weight", "again_global.mlp.up.weight", "value_hidden.0.weight", "reach.mlp.up.weight")  # (B1b, 2026-11-13: reach's TILE_EMPTY_FOR_HERO column)  # (2026-11-04: + the visiting hero; + a purchase's fit)
 
 
 def migrate_action_types(state_dict, own):
@@ -1604,11 +1604,13 @@ def fight_features(known):
 
 
 def reach_features(x, windows):
-	"""[K, W, W, 11] a hero's reach to each tile of its window: the days (-1 never .. 3+, one-hot), the movement left on
-	reaching it today, whether this hero visited its object."""
+	"""[K, W, W, 12] a hero's reach to each tile of its window: the days (-1 never .. 3+, one-hot), the movement left on
+	reaching it today, whether this hero visited its object, and (B1b, last: a checkpoint from before reads it at 0) whether
+	its visit by this hero would give nothing (TILE_EMPTY_FOR_HERO)."""
 	pick = lambda name: x[name].reshape((-1, W, W)).index_select(0, windows)  # noqa: E731
 	turns = pick("w_turns")
-	return torch.cat([E.level(turns, -1, 3), E.amount(pick("w_move_left").clamp(min=0), "movement"), ft.bit(pick("w_flags"), c.TILE_VISITED_BY_HERO).float().unsqueeze(-1)], dim=-1)
+	flags = pick("w_flags")
+	return torch.cat([E.level(turns, -1, 3), E.amount(pick("w_move_left").clamp(min=0), "movement"), ft.bit(flags, c.TILE_VISITED_BY_HERO).float().unsqueeze(-1), ft.bit(flags, c.TILE_EMPTY_FOR_HERO).float().unsqueeze(-1)], dim=-1)
 
 
 def side_embedding(dim):

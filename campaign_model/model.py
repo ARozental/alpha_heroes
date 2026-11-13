@@ -1320,12 +1320,12 @@ class CustomFeatures(nn.Module):
 			return (here.float() * values.index_select(0, decision)[:, None, None, :]).amax(dim=-1)
 
 		# What taking the tile's object is worth: only an object's entrance we may take (not a hero or a wandering
-		# monster, not ours, not visited by us or by this hero: VCMI's wasVisited, and from B1 a visit by this hero that
-		# would give nothing, by what we know: AlphaMapAI::emptyVisit)
+		# monster, not ours, not visited by us or by this hero: VCMI's own flags, what we know; nor one whose visit by this
+		# hero would give nothing, by what we know: B1b's TILE_EMPTY_FOR_HERO, AlphaMapAI::emptyVisit)
 		obj, subtype, owner = pick("w_object"), pick("w_subtype"), pick("w_owner")
 		gate = (
 			ft.bit(flags, c.TILE_VISITABLE) & (obj >= 0) & (obj != ft.OBJ_HERO) & (obj != ft.OBJ_MONSTER) & (owner != c.OWNER_SELF)
-			& ~ft.bit(flags, c.TILE_VISITED_BY_PLAYER) & ~ft.bit(flags, c.TILE_VISITED_BY_HERO)
+			& ~ft.bit(flags, c.TILE_VISITED_BY_PLAYER) & ~ft.bit(flags, c.TILE_VISITED_BY_HERO) & ~ft.bit(flags, c.TILE_EMPTY_FOR_HERO)
 		)
 		# Who we would fight there: wandering monsters, an enemy hero, a town not ours, a creature bank's guards
 		heroes_here = on_tile(x["h_pos"], x["h_present"] & (x["h_owner"] != c.OWNER_SELF))
@@ -1736,6 +1736,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"advantage.",  # (2026-11-11: the advantage head, model_v2.AdvantageHead, its weights 0 at the start)
 	"fore_fight", "fore_move", "fore_answer", "fore_hero",  # (bundle 60: forecast-out, each forecast onto its own option's logit, 0 at the start)
 	"nkp.",  # (2026-11-11: nk_predict's head, model_v2.NkPredictHead: a new model's weights, nothing reads it)
+	"encode_global.no_town_days",  # (schema 20, B2: the global token's read of our days without a town, 0 at the start)
 )
 # Training-only parts rebuilt since, by prefix: a checkpoint's weights for them that the loading model lacks, or of
 # another shape, are dropped, the part starting again as a new model has it (2026-11-07: the privileged critic's first

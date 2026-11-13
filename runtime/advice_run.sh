@@ -347,6 +347,12 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # 0.70-0.80 for 50 updates. Back to v3295 with every training game our own: campaign.nk2_choice_games=0 and
 # campaign.nk2_follow=0, as lines 60-65 had; the code a49b192's as it is (deploy 71's bound failed its paired test, not
 # deployed). The recorded mixed continuation from v3295 is the control.
+# Deploy 76 (2026-11-13, e5 for the user: "put this fix in ... maybe you can represent it as a new input"): B1b, schema
+# 20. A visit by a hero that would give nothing, by what we know, has its own bit (TILE_EMPTY_FOR_HERO, m_empty;
+# AlphaMapAI::emptyVisit, its rules by ALPHA_MAP_EMPTY_VISITS: all unless set); the MOVE prior's gate closes on it, the
+# learned layers read it only through reach's zero-start column. Line 72's 75 games had 1,037 such visits; the joint
+# run's B1 arms 21 of off's 457 in 96 games. With it schema 20's g_days_no_town (B2's input, read at 0; its behaviour
+# not deployed) and config.type_evidence (the credit by type, a reading). No setting changes; line 75's weights continued.
 # Deploy 75 (2026-11-13, e5 for the user): the end credit's week share fixed at 1, the week alone
 # (campaign.end_week_share=1.0, a39f68b): R2 found V_end reading g_last_* (what the previous decision was), so its one-step
 # part paid ARMY +0.015 at the next decision for the input alone (t 14.7; its td gap +0.012), and R1's blend with the week

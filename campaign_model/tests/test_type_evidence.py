@@ -47,14 +47,14 @@ def test_the_learner_keeps_faded_evidence_by_type_and_logs_it(capsys):
 	rng = np.random.default_rng(0)
 	types = [c.ActionType.ARMY if i % 4 == 0 else c.ActionType.MOVE for i in range(n)]
 	decisions = [SimpleNamespace(action_type=int(t), kind=c.DecisionKind.TURN) for t in types]
-	players = np.arange(n) % 16
+	players = np.arange(n) % 15  # (each player's decisions mix ARMY with MOVE: a gap needs the player's others)
 	credits = rng.normal(0, 1, (n, 3)).astype(np.float32)
 	credits[::4, 1] += 1.0  # (ARMY paid by the 7-day part)
 	learner = SimpleNamespace(version=7, writer=None)
 	CampaignLearner._note_type_evidence(learner, decisions, credits, players, np.ones(n, dtype=bool))
 	assert set(learner.type_evidence) == set(TYPE_PARTS)
 	n_army, total, _ = learner.type_evidence["seven"]["ARMY"]
-	assert n_army == 16 and total / n_army > 0.5
+	assert n_army == 15 and total / n_army > 0.5  # (15 game-players, each with ARMY and MOVE)
 	assert "campaign credit by type" in capsys.readouterr().out
 	before = learner.type_evidence["seven"]["ARMY"][0]
 	CampaignLearner._note_type_evidence(learner, decisions, credits, players, np.zeros(n, dtype=bool))  # (no hidden game: nothing added, the old faded)

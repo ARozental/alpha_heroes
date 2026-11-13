@@ -7,8 +7,8 @@
 
 namespace MapSchema
 {
-constexpr int SCHEMA_VERSION = 19;
-constexpr const char * CONTRACT_HASH = "581a6655f4bcfee1";
+constexpr int SCHEMA_VERSION = 20;
+constexpr const char * CONTRACT_HASH = "462a7efe6f9d989a";
 constexpr const char * FAMILY = "campaign";
 
 constexpr int N_RESOURCES = 7;
@@ -61,6 +61,7 @@ constexpr int TILE_VISITED_BY_PLAYER = 64;
 constexpr int TILE_VISITED_BY_HERO = 128;
 constexpr int TILE_EXACT_COUNT = 256;
 constexpr int TILE_UNSEEN_EXIT = 512;
+constexpr int TILE_EMPTY_FOR_HERO = 1024;
 constexpr int MAP_OBJECTS = 8192;
 constexpr int ARMED_OBJECTS = 32;
 constexpr int MAP_GRID = 36;
@@ -356,6 +357,8 @@ enum class In : int
 	g_nk_action,
 	g_nk_index,
 	g_nk_cell,
+	g_days_no_town,
+	m_empty,
 	COUNT
 };
 
@@ -532,6 +535,8 @@ constexpr std::array<TensorSpec, static_cast<int>(In::COUNT)> INPUTS = {{
 	TensorSpec{"g_nk_action", DType::INT64, 0, {1, 1, 1, 1}, 0},
 	TensorSpec{"g_nk_index", DType::INT64, 0, {1, 1, 1, 1}, 0},
 	TensorSpec{"g_nk_cell", DType::INT64, 0, {1, 1, 1, 1}, 0},
+	TensorSpec{"g_days_no_town", DType::INT64, 0, {1, 1, 1, 1}, 0},
+	TensorSpec{"m_empty", DType::INT64, 1, {8192, 1, 1, 1}, 0},
 }};
 
 enum class Out : int
