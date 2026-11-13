@@ -1320,7 +1320,8 @@ class CustomFeatures(nn.Module):
 			return (here.float() * values.index_select(0, decision)[:, None, None, :]).amax(dim=-1)
 
 		# What taking the tile's object is worth: only an object's entrance we may take (not a hero or a wandering
-		# monster, not ours, not visited by us or by this hero: VCMI's own flags, what we know)
+		# monster, not ours, not visited by us or by this hero: VCMI's wasVisited, and from B1 a visit by this hero that
+		# would give nothing, by what we know: AlphaMapAI::emptyVisit)
 		obj, subtype, owner = pick("w_object"), pick("w_subtype"), pick("w_owner")
 		gate = (
 			ft.bit(flags, c.TILE_VISITABLE) & (obj >= 0) & (obj != ft.OBJ_HERO) & (obj != ft.OBJ_MONSTER) & (owner != c.OWNER_SELF)
