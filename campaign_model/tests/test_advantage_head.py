@@ -4,6 +4,7 @@ it learns a planted advantage (the choice being Nullkiller2's own) with its held
 import copy
 
 import numpy as np
+import pytest
 import torch
 
 from campaign_model import constants as c
@@ -36,13 +37,18 @@ def setup(n=16, seed=6):
 	return model, x, decisions_for(model.eval(), x)
 
 
-def test_it_is_off_the_contract_and_in_the_value_group():
+def test_it_is_off_the_contract_and_at_the_policys_rate():
 	model, x, _ = setup(4)
 	with torch.no_grad():
 		out = model.eval()(tensors(x))
 	assert not any(name.startswith("adv_") for name in out)  # (a server's model, an export: never set)
+	# (deploy 74: our own policy reads the head, so it learns in the trunk group, at learning_rate x lr_scale under the KL
+	# control, not in the value group at value_lr_factor times that outside it)
 	groups = {name: group for group, members in parameter_groups(model).items() for name, _ in members}
-	assert {groups[name] for name, _ in model.advantage.named_parameters(prefix="advantage")} == {"value"}
+	assert {groups[name] for name, _ in model.advantage.named_parameters(prefix="advantage")} == {"trunk"}
+	config = CampaignConfig(learning_rate=1e-5, value_lr_factor=10.0)
+	rates = {g["name"]: g["lr"] for g in make_optimizer(model, config).param_groups}
+	assert rates["trunk"] == pytest.approx(1e-5) and rates["value"] == pytest.approx(1e-4)
 	model.adv_outputs = True
 	with torch.no_grad():
 		out = model(tensors(x))
@@ -146,7 +152,12 @@ def test_it_learns_a_planted_advantage():
 	from 0 to most of it."""
 	model, x, decisions, advantages, named = planted()
 	assert 4 <= named.sum() <= len(named) - 4, named.sum()
-	config = CampaignConfig(batch_size=8, passes=12, model_architecture="v2", credit="schedule", share_target="change", adv_weight=1.0, learning_rate=1e-7, value_lr_factor=3e5, target_kl=0.0)
+	# (the head alone learns: since deploy 74 it is in the trunk group at the policy's rate, so the rest is frozen here
+	# instead of set at a negligible rate apart from it; the head at the 3e-2 it had as learning_rate 1e-7 x
+	# value_lr_factor 3e5)
+	for name, p in model.named_parameters():
+		p.requires_grad_(name.startswith("advantage."))
+	config = CampaignConfig(batch_size=8, passes=12, model_architecture="v2", credit="schedule", share_target="change", adv_weight=1.0, learning_rate=3e-2, value_lr_factor=1.0, target_kl=0.0)
 	readings = []
 	for _ in range(4):  # (3 minibatches x 12 passes: 144 steps, the readings before steps 0, 36, 72 and 108)
 		metrics = update(model, decisions, x, config, advantages)

@@ -370,8 +370,10 @@ def windows_for(rows, heroes, config):
 # (campaign/grad_norm_<group>), each clipped apart (clip_gradients), the value heads' at their own rate
 # (config.value_lr_factor), the trunk's, the embeddings' and the action types' bias at the trunk's momentum
 # (config.trunk_beta1)
-# (the advantage head, model_v2.AdvantageHead: a critic of the actions, at the critic's rate)
-VALUE_MODULES = ("value_hidden", "value_heads", "growth_heads", "end_head", "advantage", "nkp")
+# (the advantage head, model_v2.AdvantageHead, is not among them since deploy 74, 2026-11-13: our own policy reads it at
+# adv_gain logits a unit, up to ADV_CLIP a term, so it is a part of the acting policy and learns at the policy's rate
+# under the KL control (the trunk group: learning_rate x lr_scale), not at the critic's 10x outside it)
+VALUE_MODULES = ("value_hidden", "value_heads", "growth_heads", "end_head", "nkp")
 # (the privileged critic its own group, last: the clips calibrated before it hold no clip for it, and its gradient
 # never moves another group's clip; at the value heads' rate)
 GRAD_GROUPS = ("trunk", "embeddings", "type", "value", "corrections", "privileged")
@@ -1489,6 +1491,8 @@ def ppo_update(
 			by_residual = head_weights(head_var_slow, float(head_scale.get("ramp", 1.0)), config.growth_weight, residuals=head_residual)
 			share = float(head_scale.get("residual_ramp", 1.0))
 			weights = {name: [(1 - share) * a + share * b for a, b in zip(values, by_residual[name])] for name, values in weights.items()}
+		if head_scale.get("frozen"):  # (config.head_scale_freeze: the weights as they were at that version, whatever the batch)
+			weights = {name: list(values) for name, values in head_scale["frozen"].items()}
 		head_w = {f"w:{name}": torch.tensor(values, dtype=torch.float32, device=device) for name, values in weights.items() if name in measured}
 	gpu_mb = 0.0
 	end_step_error = None
