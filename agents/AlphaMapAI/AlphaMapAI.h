@@ -26,6 +26,7 @@ VCMI_LIB_NAMESPACE_BEGIN
 class CArmedInstance;
 class CGHeroInstance;
 class CGTownInstance;
+class CRewardableObject;
 class PathfinderCache;
 struct MoveHero;
 VCMI_LIB_NAMESPACE_END
@@ -207,6 +208,8 @@ class AlphaMapAI : public CAdventureAI
 	// The teleport channels a hero of ours entered and found to lead nowhere (showTeleportDialog's impassable: a gate
 	// with no other end): their entrances are no unseen exits from then on (unseenExit)
 	std::set<TeleportChannelID> deadChannels;
+	// revealSpent's answers for the decision being encoded (cleared as each is: our fog changes as we move)
+	mutable std::map<ObjectInstanceID, bool> revealChecked;
 	bool done = false;
 	// (action type, table entry, target tile) of the actions that changed nothing since the state last changed: not
 	// offered again until something changes (dropFutile), else the same no-op could be chosen MAX_DECISIONS_PER_DAY
@@ -453,6 +456,10 @@ private:
 	void encodeWindows(Decision & decision, PathfinderCache & paths);
 	/// A teleporter's entrance none of whose exits we have seen (TILE_UNSEEN_EXIT, OBJECT_UNSEEN_EXIT)
 	bool unseenExit(const CGObjectInstance * obj) const;
+	/// A visit by this hero that would give nothing, by what we know (TILE_VISITED_BY_HERO and m_visitors with wasVisited)
+	bool emptyVisit(const CGObjectInstance * obj, const CGHeroInstance * h) const;
+	/// An object whose every visit reveals the land around it, none of it hidden from us any more (emptyVisit)
+	bool revealSpent(const CRewardableObject * obj) const;
 	void encodeMap(Decision & decision, const std::vector<int3> & ours);
 	void encodeTiles(Decision & decision);
 	void encodeTileBlocks(Decision & decision, const std::vector<const CGHeroInstance *> & heroes, int side); // (a map bigger than MAP_TILES a side)

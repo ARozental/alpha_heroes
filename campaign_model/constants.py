@@ -210,7 +210,7 @@ TILE_VISITABLE = 8
 TILE_WATER = 16
 TILE_GUARDED = 32  # in a wandering monster's zone of control
 TILE_VISITED_BY_PLAYER = 64  # its object was visited by us (this week for weekly objects)
-TILE_VISITED_BY_HERO = 128  # its object was visited by this hero
+TILE_VISITED_BY_HERO = 128  # its object was visited by this hero, or a visit by this hero would give nothing by what we know (B1: AlphaMapAI::emptyVisit)
 TILE_EXACT_COUNT = 256  # w_count is the monsters' exact count (the hero's Visions reach them), not VCMI's quantity id
 # (beyond the N_TILE_FLAGS bits the encoders read as numbers: read where it is named)
 TILE_UNSEEN_EXIT = 512  # a teleporter's entrance (a subterranean gate, a monolith, a whirlpool) no exit of which we have seen and that we have not found to lead nowhere: VCMI's pathfinder goes through one only to an exit we see, so nothing past it is a target; stepping on it shows land we know nothing of
