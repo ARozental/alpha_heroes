@@ -136,8 +136,11 @@ so 0 means "as good as the reference", whatever the seat is worth.
 | Wandering monsters (36) | +0.022 ± 0.011 | +0.014 ± 0.014 |
 | **All battles** | **+0.098** | **+0.089** |
 
-<p align="center"><img src="docs/images/siege.jpg" alt="A siege battle: walls, a moat and arrow towers" width="720"/><br/>
-<sub>A siege, one of the generated battle kinds. Screen: Heroes of Might & Magic III HD Edition (Ubisoft).</sub></p>
+<p align="center"><img src="docs/images/battle.jpg" alt="One battle decision as the model sees it: a siege screen where our shooters in the castle's corner choose among five enemy stacks, each numbered with the probability of a shot at it, a dashed line ten hexes from the shooter beyond which a shot does half damage, the damage formula drawn as a chain of ops ending in the shot's logit, and a panel with the action types, the targets' table and the value forecasts at four horizons" width="100%"/><br/>
+<sub>One battle decision, as the model sees it. Our shooters, defending a siege, choose among the enemy stacks; each carries the chance the policy gives a shot at it.<br/>
+The game's damage rules run as ops inside the network: past the dashed line, ten hexes from the shooter, a shot does half damage, and what a shot is expected to destroy is added to its logit beside a learned match.<br/>
+Four value heads forecast the battle's reward: at the end of this round, of the next two, and of the battle.<br/>
+An illustration with example numbers, drawn over a screen from Heroes of Might & Magic III HD Edition (Ubisoft).</sub></p>
 
 - The margin holds in both seats. Defending, it destroys 57% of the attacking army where BattleAI in the same seat
   destroys 48%.
