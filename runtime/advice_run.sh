@@ -347,6 +347,12 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # 0.70-0.80 for 50 updates. Back to v3295 with every training game our own: campaign.nk2_choice_games=0 and
 # campaign.nk2_follow=0, as lines 60-65 had; the code a49b192's as it is (deploy 71's bound failed its paired test, not
 # deployed). The recorded mixed continuation from v3295 is the control.
+# Deploy 74 (2026-11-13, e5 for the user): the value terms' gradient into the shared layers at a fixed scale,
+# campaign.value_shared=0.25 (config.value_shared: through the model's value_valve, max(0.25, 1.25 ** -(version - from +
+# 1)): 0.8 at the first update, 0.25 from the 7th; the value heads' own layer at its full rate on the real outcomes;
+# not with value_valve, and only with the loss shares frozen), from line 73's last version + 3 (the drain's updates); the value heads'
+# weights held from the same version (campaign.head_scale_freeze: no automatic weight moving on V); the advantage head in
+# the trunk group (the policy's rate under the KL control, 7119ddf). Line 73's weights continued.
 # Deploy 73 (2026-11-13, e5): every line since v3254 slid within 30-85 updates. With credit_segments on (deploy 60) the
 # credit is the 0-2 day surprise plus k5 x (2-5 days) plus k7 x (5-7 days), k at 0.02-0.34: days 0-2 charge BUILD and END
 # and pay HIRE and MOVE, days 2-7 pay BUILD and END back, and the shrinkage threw most of the late part away
@@ -362,5 +368,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=6.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3341 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=false campaign.nk_predict_weight=0 campaign.build_economy=1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=6.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3341 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=false campaign.value_shared=0.25 campaign.value_shared_from=3324 campaign.head_scale_freeze=3324 campaign.nk_predict_weight=0 campaign.build_economy=1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
