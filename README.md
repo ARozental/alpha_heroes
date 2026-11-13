@@ -4,7 +4,12 @@
 
 **A learning agent for the full game of Heroes of Might and Magic III,<br/>trained by self-play on one consumer GPU.**
 
-<img src="docs/images/adventure_map.jpg" alt="The Heroes III adventure map: a hero, a town, mines, treasure and guards" width="100%"/>
+<img src="docs/images/hero.jpg" alt="One decision as the agent sees it: the map's entities labelled with their values, the probability of moving the hero to each reachable tile, a Subterranean Gate two days away by road with a small graph of the two map levels, and a panel with the action types, the target's prior plus learned match, and the value forecasts at four horizons" width="100%"/>
+
+<sub>One decision, as the agent sees it. The map's entities become tokens that carry what the game already knows (a price, the odds of a fight).<br/>
+The hero's move is one softmax over every tile it can reach, each scored as a prior plus a learned match. Value heads forecast our share of all empires at four horizons.<br/>
+Distance is counted in days of movement along the engine's own paths, not in tiles: the Subterranean Gate is two days away, and one step beyond it lies another level.<br/>
+An illustration with example numbers, drawn over a screen from Heroes of Might & Magic III HD Edition (Ubisoft).</sub>
 
 Two neural networks play the whole game inside the open-source [VCMI](https://github.com/vcmi/vcmi) engine:<br/>
 one makes every adventure-map decision, the other fights every battle. They train together, in one run.
