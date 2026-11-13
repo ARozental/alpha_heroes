@@ -1495,7 +1495,7 @@ def ppo_update(
 			weights = {name: list(values) for name, values in head_scale["frozen"].items()}
 		head_w = {f"w:{name}": torch.tensor(values, dtype=torch.float32, device=device) for name, values in weights.items() if name in measured}
 	gpu_mb = 0.0
-	end_step_error = None
+	end_step_error, end_credit_none = None, float("nan")
 	attributed_stats = {}
 	if attributed is not None and growth_real is not None:  # (config.credit "attributed": the parts of our log share's change we make)
 		real7 = torch.from_numpy(np.asarray(growth_real, dtype=np.float32)[:, -1]).to(device)
@@ -1558,7 +1558,8 @@ def ppo_update(
 			advantage = advantage - charged
 	if end is not None and end["weight"] > 0:  # the policy's credit moves toward the end's as V_end proves itself
 		turn = choices(decisions)["kind"] == c.DecisionKind.TURN
-		later = end_advantages(end_now.cpu().numpy(), end["step"], end["week"], end["real"], end["price"], turn, config.decision_price, end["outcome"])
+		later = end_advantages(end_now.cpu().numpy(), end["step"], end["week"], end["real"], end["price"], turn, config.decision_price, end["outcome"], week_only=getattr(config, "end_week_share", -1.0) >= 1.0)
+		end_credit_none = float(np.mean(~np.isfinite(later))) if len(later) else float("nan")  # (learner column end_credit_none)
 		# V_end's step estimate of the end against the end itself, for the end credit's check by action type (a diagnostic
 		# in the learner, as the 7-day credit's check: the end credit is two thirds of the advantage, and no check saw it)
 		values = end_now.cpu().numpy()
@@ -1800,6 +1801,7 @@ def ppo_update(
 		value_readout_rms=value_readout_rms(model),
 		head_fresh=head_fresh,
 		end_step_error=end_step_error,
+		end_credit_none=end_credit_none,  # (the share of the rows with no end credit: config.end_week_share)
 		last_kl=update_kl,
 		kl_target=kl_target,
 		# (2026-11-06: the KL barely followed the rate, 2.5x less rate for 1.6x less KL) the first step's KL, before any
