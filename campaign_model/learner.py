@@ -885,8 +885,11 @@ class CampaignLearner:
 		self._log(epoch, games, decisions, row, metrics, time.time() - started)
 		memory.append(("logged", rss_gb()))
 		# The update's freed memory back to the system: glibc kept it, and the trainer climbed from ~4 GB after each
-		# restart to 11-14 GB within ~4 updates (2026-11-01), memory the games here could not have
-		del games, decisions
+		# restart to 11-14 GB within ~4 updates (2026-11-01), memory the games here could not have. Every name holding the
+		# update's games or their arrays goes first (2026-11-14, the heap census: `played` and the loops' last `game` kept
+		# the whole update's restored inputs, ~19.5 KB a decision, alive through the trim, so "trimmed" read the update
+		# itself; it changes that reading and the level between updates, not the peak the supply's memory gate reserves)
+		del games, decisions, played, game, starts, end, foresight, sets, targets, labels, growth, returns, advantages, errors, players, streams, privileged, hidden
 		trim_memory()
 		if self.device.type == "cuda" and hasattr(torch._C, "_host_emptyCache"):
 			torch._C._host_emptyCache()  # (the pinned staging's cached blocks: the trainer held 1.85 GB of such mappings)
