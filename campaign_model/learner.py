@@ -201,6 +201,25 @@ def set_advice_prior(model, config):
 			features.empire_last_town.fill_(1.0 if getattr(config, "no_town_last_town", False) else 0.0)
 
 
+def take_count(finished, config):
+	"""(games, their decisions, whether the cap bound) of the next update from the waiting games in order (oldest first), or
+	None while too few have finished: games until min_games_per_update of them hold decisions_per_update decisions; with
+	config.update_decisions_cap, stopped early once update_games_floor are in and the next game would take the update past
+	the cap (an update the cap bound needs no more games than that; one the cap does not bind waits as before)."""
+	cap, floor = int(getattr(config, "update_decisions_cap", 0)), int(getattr(config, "update_games_floor", 0))
+	n, decisions = 0, 0
+	for game, _ in finished:
+		if n >= config.min_games_per_update and decisions >= config.decisions_per_update:
+			break
+		if cap > 0 and n >= floor and decisions + len(game.decisions) > cap:
+			return n, decisions, True
+		n += 1
+		decisions += len(game.decisions)
+	if n < config.min_games_per_update or decisions < config.decisions_per_update:
+		return None
+	return n, decisions, False
+
+
 def loop_charge_now(config, version):
 	"""config.loop_charge's ramp (the loop charge): the charge at this version, stateless as no_town_now: 0 before
 	loop_charge_from (or with the target at 0), then min(target, loop_charge_step x (version - loop_charge_from + 1))."""
@@ -577,9 +596,8 @@ class CampaignLearner:
 
 	def ready(self):
 		"""Whether an update's games are in (what _take would take)."""
-		config = self.config
 		with self.lock:
-			return len(self.finished) >= config.min_games_per_update and sum(len(g.decisions) for g, _ in self.finished) >= config.decisions_per_update
+			return take_count(self.finished, self.config) is not None
 
 	def _take(self):
 		"""The games of the next update (oldest first), or None while too few have finished. The supply starts games only
@@ -596,15 +614,14 @@ class CampaignLearner:
 				dropped, _ = self.finished.pop(0)
 				getattr(self, "label_futures", {}).pop(id(dropped), None)
 				unspool([dropped])
-			taken, decisions = [], 0
-			for game, info in self.finished:
-				if len(taken) >= config.min_games_per_update and decisions >= config.decisions_per_update:
-					break
-				taken.append((game, info))
-				decisions += len(game.decisions)
-			if len(taken) < config.min_games_per_update or decisions < config.decisions_per_update:
+			count = take_count(self.finished, config)
+			if count is None:
 				return None
-			self.finished = self.finished[len(taken) :]
+			n, decisions, capped = count
+			taken, self.finished = self.finished[:n], self.finished[n:]
+			left = len(self.finished)
+		if getattr(config, "update_decisions_cap", 0) > 0:  # (the cap's line each update)
+			print(f"campaign update size: {n} games, {decisions} decisions, {left} games left waiting; the cap {'bound' if capped else 'did not bind'} (cap {config.update_decisions_cap}, floor {config.update_games_floor})", flush=True)
 		return taken
 
 	def _print_pair_readings(self):

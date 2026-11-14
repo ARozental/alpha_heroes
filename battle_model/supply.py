@@ -131,6 +131,107 @@ def held_bytes(obj, depth=0):
 	return 0
 
 
+def malloc_lines():
+	"""glibc's own count of the heap (Linux; elsewhere none): the main arena's bytes from the system, free inside it and in
+	use (malloc_info's heap 0: its free chunks, fast and rest), and every arena's in use and free and the mmapped chunks
+	(mallinfo2). Free bytes inside an arena are fragmentation (malloc_trim gives back only whole free pages); in-use bytes
+	are live allocations. [line] or []."""
+	import ctypes
+	import re
+	import tempfile
+
+	try:
+		libc = ctypes.CDLL("libc.so.6")
+		info = libc.mallinfo2
+	except (OSError, AttributeError):
+		return []
+
+	class Mallinfo2(ctypes.Structure):
+		_fields_ = [(name, ctypes.c_size_t) for name in ("arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks", "fsmblks", "uordblks", "fordblks", "keepcost")]
+
+	info.restype, info.argtypes = Mallinfo2, []
+	m = info()
+	line = f"trainer heap: all arenas in use {m.uordblks / 2**30:.2f} GB, free {m.fordblks / 2**30:.2f} GB; mmapped {m.hblkhd / 2**30:.2f} GB ({m.hblks} chunks)"
+	libc.fopen.restype, libc.fopen.argtypes = ctypes.c_void_p, [ctypes.c_char_p, ctypes.c_char_p]
+	libc.fclose.restype, libc.fclose.argtypes = ctypes.c_int, [ctypes.c_void_p]
+	libc.malloc_info.restype, libc.malloc_info.argtypes = ctypes.c_int, [ctypes.c_int, ctypes.c_void_p]
+	with tempfile.NamedTemporaryFile(suffix=".xml") as out:
+		stream = libc.fopen(out.name.encode(), b"w")
+		if stream:
+			libc.malloc_info(0, stream)
+			libc.fclose(stream)
+			xml = open(out.name).read()
+			heap = re.search(r'<heap nr="0">(.*?)</heap>', xml, re.S)
+			if heap:
+				free = sum(int(s) for s in re.findall(r'<total type="(?:fast|rest)" count="\d+" size="(\d+)"/>', heap.group(1)))
+				system = re.search(r'<system type="current" size="(\d+)"/>', heap.group(1))
+				if system:
+					current = int(system.group(1))
+					line = f"trainer heap: main arena from the system {current / 2**30:.2f} GB, free in it {free / 2**30:.2f} GB, in use {(current - free) / 2**30:.2f} GB; " + line[len("trainer heap: "):]
+	return [line]
+
+
+def heap_census(objects, top=8):
+	"""(2026-11-14: the trainer held ~2.2 GB more since deploy 77's restart, through deploy 78's; its owner unknown) Two
+	lines: glibc's split of the heap (malloc_lines: fragmentation against live data) and what the gc's objects hold, by
+	who holds it: each object's own size by its type, and the untracked objects it refers to (bytes, str, numpy arrays'
+	data at their base, ...), each counted once, as "<type> in <holder>" (an instance's __dict__ named by its class); CPU
+	tensors' storage once by its pointer. objects: gc.get_objects(); top: how many holders the line names."""
+	import gc
+	import types
+
+	started = time.perf_counter()
+	holder, plain = {}, (dict, list, tuple, set, frozenset, type, types.ModuleType, types.FunctionType, types.FrameType)
+	for o in objects:  # (a dict an instance refers to, its __dict__ among them, named by the instance's class; read, never made)
+		if not isinstance(o, plain):
+			for r in gc.get_referents(o):
+				if type(r) is dict:
+					holder.setdefault(id(r), type(o).__name__)
+	own, held, seen, storages = Counter(), Counter(), set(), set()
+	for o in objects:
+		name = type(o).__name__
+		try:
+			own[name] += 0 if isinstance(o, (torch.UntypedStorage, torch.TypedStorage)) else sys.getsizeof(o)  # (a storage's size is its data: counted under the tensors')
+		except Exception:  # noqa: BLE001
+			pass
+		if isinstance(o, torch.Tensor):
+			try:
+				if o.device.type == "cpu":
+					storage = o.untyped_storage()
+					if storage.data_ptr() not in storages:
+						storages.add(storage.data_ptr())
+						held["tensor storage (cpu)"] += storage.nbytes()
+			except Exception:  # noqa: BLE001 (sparse, meta, ...)
+				pass
+			continue
+		where = holder.get(id(o), name)
+		todo = [(r, 0) for r in gc.get_referents(o)]
+		while todo:
+			r, depth = todo.pop()
+			if gc.is_tracked(r):
+				continue
+			base = r
+			while isinstance(base, np.ndarray) and base.base is not None:
+				base = base.base
+			if id(base) in seen:
+				continue
+			seen.add(id(base))
+			size = base.nbytes if isinstance(base, (np.ndarray, memoryview)) else len(base) if isinstance(base, (bytes, bytearray)) else sys.getsizeof(base)
+			held[f"{type(base).__name__} in {where}"] += size
+			if isinstance(base, (dict, list, tuple)) and depth < 3:  # (an untracked container, CPython's for atomic contents: its arrays and bytes too)
+				todo.extend((x, depth + 1) for x in gc.get_referents(base))
+	top = held.most_common(top)
+	lines = malloc_lines()
+	lines.append(
+		f"trainer heap owners: the objects' own {sum(own.values()) / 2**30:.2f} GB ("
+		+ ", ".join(f"{name} {n / 2**30:.2f}" for name, n in own.most_common(4))
+		+ f"), held by them {sum(held.values()) / 2**30:.2f} GB: "
+		+ ", ".join(f"{name} {n / 2**30:.2f}" for name, n in top)
+		+ f" ({time.perf_counter() - started:.1f}s)"
+	)
+	return "\n".join(lines)
+
+
 def memory_allows(shared=None, playing=None):
 	"""Whether a game may start here: the memory available, less the trainer's way back to its recent peak, over the
 	floor. The trainer's memory swings ~5 GB each campaign update (it frees the update's buffers after it, takes them
@@ -803,8 +904,13 @@ class Supply:
 			parts.append(f"pinned host {host.get('reserved_bytes.current', host.get('allocated_bytes.current', 0)) / 2**30:.2f} GB")
 		if by_type:
 			started = time.perf_counter()
-			counts = Counter(type(o).__name__ for o in gc.get_objects())
+			objects = gc.get_objects()
+			counts = Counter(type(o).__name__ for o in objects)
 			parts.append("objects " + ", ".join(f"{name} {n}" for name, n in counts.most_common(6)) + f" ({time.perf_counter() - started:.1f}s)")
+			try:  # (a diagnostic: its failure a line, never the census's)
+				return "; ".join(parts) + "\n" + heap_census(objects)
+			except Exception as error:  # noqa: BLE001
+				return "; ".join(parts) + f"\ntrainer heap: census failed: {str(error)[:200]}"
 		return "; ".join(parts)
 
 	def workers(self, kind):
