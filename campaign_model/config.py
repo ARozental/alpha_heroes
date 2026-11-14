@@ -207,6 +207,16 @@ class CampaignConfig:
 	# m_visitors gains m_empty; the raw bits stay. Carried in the weights (features.empty_as_visited, the learner's
 	# fill), as ALPHA. False: B1b's inputs as they are, bit for bit
 	empty_as_visited: bool = True
+	# B2's no-town factor for the run (e5 for the user, 2026-11-13): a player's Φ x f while it owns no town, ramped by the
+	# version alone, stateless as value_shared: f = max(no_town_factor, 0.9 ** (version - no_town_from + 1)) from
+	# no_town_from, 1 before (about 22 updates to 0.1), so the value targets take no step; the learner's EmpireConfig for
+	# the labels (its own and the labeler's, a game's from its arrival: at most MAX_LABEL_STALENESS updates old) and the
+	# model's buffer (features.empire_no_town) take the same f each update. 1 (the default): none of it
+	no_town_factor: float = 1.0
+	no_town_from: int = 0
+	# The last town's stake term of B2's prior ((1 - f) x phi more at stake when we own exactly one town; e5: most of every
+	# game, a read input's size on common states): off (the default), the stake as before; its own decision later
+	no_town_last_town: bool = False
 	# The end credit's own check (b1, 2026-10-31): V_end's step estimate of the end is checked by action type as the 7-day
 	# one is (labels.credit_trust over learner.end_evidence); as it fails, the end credit's step part gives way to its week
 	# part, as the 7-day credit's step gives way to the week's outcome. Its steps were off by type as the 7-day ones (travel

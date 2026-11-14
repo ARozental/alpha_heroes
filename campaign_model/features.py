@@ -457,6 +457,8 @@ def empire_value(x, t):
 		],
 		dim=-1,
 	)
+	# (B2: no town of ours, every part x the no-town factor, empire.py's rule; the parts' shares phi_features reads stay)
+	parts = parts * torch.where(own_towns.sum(dim=-1) == 0, t.empire_no_town, torch.ones_like(t.empire_no_town)).unsqueeze(-1)
 	return parts, parts.sum(dim=-1)
 
 
@@ -686,6 +688,24 @@ def expected_loss(ratio, has_enemy):
 def win_chance(ratio, sharpness):
 	"""P(we win) from the log-ratio of the strengths (ours / theirs): 1/2 when even."""
 	return torch.sigmoid(sharpness * ratio)
+
+
+def town_take_chance(x, hero_strength, town_strength, sharpness, areas):
+	"""B2's take-a-town chance [B, HO, areas] (e5's (a), 2026-11-13): for each hero of ours and each TRAVEL area, its
+	best P(win) (win_chance at MOVE's fight sharpness) over the towns not ours there, each at its strength as MOVE's fight
+	reads it (the garrison and its fort, typical counts where unseen; a hero not ours standing in it, the stronger of the
+	two); 0 where the area holds none, and for a slot with no hero."""
+	b = hero_strength.shape[0]
+	theirs = x["t_present"] & (x["t_owner"] != c.OWNER_SELF)  # [B, T]
+	inside = (x["t_pos"].unsqueeze(2) == x["h_pos"].unsqueeze(1)).all(dim=-1) & (x["h_present"] & (x["h_owner"] != c.OWNER_SELF)).unsqueeze(1)  # [B, T, H]
+	defence = torch.maximum(town_strength, (inside.float() * hero_strength.unsqueeze(1)).amax(dim=-1))
+	pairs = x["h_present"][:, :HO].unsqueeze(-1) & theirs.unsqueeze(1)  # [B, HO, T]
+	win = win_chance(hero_strength[:, :HO].unsqueeze(-1) - defence.unsqueeze(1), sharpness) * pairs
+	index = area_index(x, x["t_pos"])
+	index = torch.where(theirs & (index >= 0), index, torch.full_like(index, areas)).repeat_interleave(HO, dim=0)  # [B * HO, T]
+	# (a hero a row, a 2-D scatter as travel_pulls': the TorchScript exporter's 3-D scatter_reduce crashed at random)
+	best = win.new_zeros(b * HO, areas + 1).scatter_reduce(1, index, win.reshape(b * HO, -1), reduce="amax", include_self=True)
+	return best[:, :areas].reshape(b, HO, areas)
 
 
 def fight_return(win, loss, our_army, our_hero, gain):

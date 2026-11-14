@@ -72,11 +72,11 @@ class Labeler:
 		# (the run's forkserver, its preload set: this pool may be what starts it, at a resume's labels of the spooled games)
 		self.pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=forkserver.context())
 
-	def submit(self, game, features):
+	def submit(self, game, features, empire=None):
 		"""A Future of precompute(game) (a records.Game, or its spool file's path) with the features module's weights as
 		they are now (copied: the learner refreshes them in place after each update)."""
 		state = {key: value.detach().clone() for key, value in features.state_dict().items()} if self.foresight else None
-		return self.pool.submit(precompute, game, state, self.labels, self.empire, self.foresight, self.share_target)
+		return self.pool.submit(precompute, game, state, self.labels, self.empire if empire is None else empire, self.foresight, self.share_target)  # (empire: the learner's at this version, B2's ramp)
 
 	def close(self):
 		self.pool.shutdown(wait=False, cancel_futures=True)

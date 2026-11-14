@@ -195,6 +195,19 @@ def set_advice_prior(model, config):
 			features.empty_as_visited.fill_(1.0 if getattr(config, "empty_as_visited", True) else 0.0)
 		if hasattr(features, "empire_alpha"):  # (ALPHA, the labels' own: the weights carry it to every inference server)
 			features.empire_alpha.fill_(float(EmpireConfig().alpha))
+		if hasattr(features, "empire_no_town"):  # (B2's no-town factor, the labels' own, carried the same way; the run's ramp: learner._empire_at)
+			features.empire_no_town.fill_(float(EmpireConfig().no_town_factor))
+		if hasattr(features, "empire_last_town"):  # (config.no_town_last_town: the last town's stake term)
+			features.empire_last_town.fill_(1.0 if getattr(config, "no_town_last_town", False) else 0.0)
+
+
+def no_town_now(config, version):
+	"""config.no_town_factor's ramp (B2): the factor at this version, stateless as value_shared_now: 1 before
+	no_town_from (or with the target at 1), then max(target, 0.9 ** (version - no_town_from + 1))."""
+	target, start = float(getattr(config, "no_town_factor", 1.0)), int(getattr(config, "no_town_from", 0))
+	if target >= 1.0 or version < start:
+		return 1.0
+	return max(target, 0.9 ** (version - start + 1))
 
 
 def campaign_model_kwargs(config, out, resume=False):
@@ -335,6 +348,7 @@ class CampaignLearner:
 		# foresight's labels, computed from decoded inputs on the CPU while the model trains on the GPU (learner "turns")
 		self.features_cpu = copy.deepcopy(self.model.features).cpu()
 		# The labels of each game as it arrives, in processes of their own (labeler.py): the trainer's thread never waits
+		self._ramp_no_town()  # (B2's factor at the resume version: the labels' and the model's)
 		self.labeler = Labeler(self.labels, self.empire, foresight=self.kwargs.get("architecture") == "v2", share_target=config.share_target)
 		if config.credit == "schedule" and config.share_target != "change":
 			raise SystemExit("campaign.credit 'schedule' reads the share heads as changes: it needs campaign.share_target 'change'")
@@ -441,7 +455,7 @@ class CampaignLearner:
 			game.spool_path = str(path)
 			if getattr(self, "labeler", None):
 				game.labels_version = self.version
-				self.label_futures[id(game)] = self.labeler.submit(label_source(game), self.features_cpu)
+				self.label_futures[id(game)] = self.labeler.submit(label_source(game), self.features_cpu, empire=self.empire)
 			strip_inputs(game)
 			self.finished.append((game, info))
 		if paths:
@@ -510,7 +524,7 @@ class CampaignLearner:
 		self._spool_game(game, info)
 		if getattr(self, "labeler", None):
 			game.labels_version = self.version
-			self.label_futures[id(game)] = self.labeler.submit(label_source(game), self.features_cpu)  # (not on the game: it is pickled to the labeler after this returns)
+			self.label_futures[id(game)] = self.labeler.submit(label_source(game), self.features_cpu, empire=self.empire)  # (not on the game: it is pickled to the labeler after this returns)
 		strip_inputs(game)
 		with self.lock:
 			self.finished.append((game, info))
@@ -584,11 +598,24 @@ class CampaignLearner:
 			self.finished = self.finished[len(taken) :]
 		return taken
 
+	def _ramp_no_town(self):
+		"""config.no_town_factor's ramp (B2): self.empire (the labels', the labeler's for each game submitted from now) and
+		the model's buffer at this version's f; nothing while the target is 1 (the EmpireConfig as it was, bit for bit)."""
+		if float(getattr(self.config, "no_town_factor", 1.0)) >= 1.0:
+			return
+		f = no_town_now(self.config, self.version)
+		self.empire = replace(self.empire, no_town_factor=f)
+		for model in (self.model, getattr(self, "features_cpu", None)):
+			features = getattr(model, "features", model)
+			if features is not None and hasattr(features, "empire_no_town"):
+				features.empire_no_town.fill_(f)
+
 	def step(self, epoch):
 		"""One update if its games are in (the battle learner calls this between its updates); True if it ran."""
 		games = self._take()
 		if games is None:
 			return False
+		CampaignLearner._ramp_no_town(self)  # (B2's factor at this version: the update's labels and model, the labeler's next games; the tests' learners are namespaces)
 		if getattr(self, "held", None) is not None:
 			# The value-loss guard holds the updates (_judge_value): the model stays as it is, served and evaluated as
 			# before, and the games that would have made this update are dropped (their battles went to the battle
@@ -880,7 +907,7 @@ class CampaignLearner:
 			waiting = [game for game, _ in self.finished if self.version - getattr(game, "labels_version", self.version) >= MAX_LABEL_STALENESS]
 		for game in waiting:
 			game.labels_version = self.version
-			self.label_futures[id(game)] = self.labeler.submit(label_source(game), self.features_cpu)
+			self.label_futures[id(game)] = self.labeler.submit(label_source(game), self.features_cpu, empire=self.empire)
 
 	def _refresh_features(self):
 		"""The CPU features' weights as the model's are now (call with model_lock held)."""
