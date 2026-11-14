@@ -607,7 +607,13 @@ class CampaignModelV2(nn.Module):
 
 	# ---- the whole model ----
 
+	def read_inputs(self, x):
+		"""The inputs as every reader in the model sees them: B1b's empty bits read as visited (config.empty_as_visited,
+		features.empty_as_visited); once, before any reader, idempotent."""
+		return ft.empty_as_visited(x, self.features.empty_as_visited)
+
 	def forward(self, x):
+		x = self.read_inputs(x)
 		known = self.domain_knowledge(x)
 		state = self.encode(x)
 		state = self.take_sides(state)
@@ -694,6 +700,7 @@ class CampaignModelV2(nn.Module):
 	def domain_knowledge(self, x):
 		"""model.CustomFeatures' facts (Φ, armies, fights, each window tile's value and prior, TRAVEL's prior, the action
 		priors), for the windows of our heroes there, and the references sizes are relative to."""
+		x = self.read_inputs(x)  # (called alone too: tests, nk_blind; idempotent after forward's)
 		windows, n, real = windows_of(x, fixed=self.fixed_windows, budget=self.window_budget)
 		known = self.features(x, windows)
 		known.windows, known.n, known.real = windows, n, real

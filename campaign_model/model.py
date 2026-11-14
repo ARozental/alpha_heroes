@@ -403,6 +403,9 @@ class CustomFeatures(nn.Module):
 		# model takes its process's EmpireConfig (ALPHA_EMPIRE_ALPHA); the learner fills it from its own; a checkpoint from
 		# before has none and keeps the start, 0.25 where nothing is set
 		self.register_buffer("empire_alpha", torch.tensor(float(empire.alpha)))
+		# config.empty_as_visited (B1b's bit read as visited at the model's input: features.empty_as_visited) as a buffer the
+		# weights carry, the learner's fill; 1 to begin with and in a checkpoint from before (ADDED_HEADS: the loading model's)
+		self.register_buffer("empty_as_visited", torch.ones(()))
 		override = lambda name: float(os.environ[name]) if os.environ.get(name, "") != "" else None  # noqa: E731
 		self.nk_override = (override("ALPHA_NK2_PRIOR"), override("ALPHA_NK2_PRIOR_FALLBACK"), override("ALPHA_NK2_LABEL"), override("ALPHA_NK2_FOLLOW"))
 		self.adv_override = override("ALPHA_ADV_GAIN")
@@ -1724,6 +1727,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	# decision state, its keys' context at 0, the options' known features' weights at 0 and the components' own rows:
 	# model_v2.migrate_option_head)
 	"features.empire_alpha",  # (ALPHA: a checkpoint from before keeps the loading model's, its process's EmpireConfig, never 0)
+	"features.empty_as_visited",  # (config.empty_as_visited: a checkpoint from before keeps the loading model's, 1)
 	"foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option", "option_flags",
 	"decision", "option_context", "option_weights", "encode_options.component", "encode_options.primary", "encode_options.resource",
 	"encode_options.numbers", "build_identity", "artifact_q", "artifact_target", "encode_hero.carried", "multi_q", "multi_kind",

@@ -191,6 +191,8 @@ def set_advice_prior(model, config):
 			features.town_guard.fill_(float(getattr(config, "town_guard", 0.0)))
 		if hasattr(features, "build_economy"):  # (the economy and BUILD: config.build_economy)
 			features.build_economy.fill_(float(getattr(config, "build_economy", 0.0)))
+		if hasattr(features, "empty_as_visited"):  # (config.empty_as_visited: the weights carry it to every inference server)
+			features.empty_as_visited.fill_(1.0 if getattr(config, "empty_as_visited", True) else 0.0)
 		if hasattr(features, "empire_alpha"):  # (ALPHA, the labels' own: the weights carry it to every inference server)
 			features.empire_alpha.fill_(float(EmpireConfig().alpha))
 
