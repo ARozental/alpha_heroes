@@ -1200,6 +1200,7 @@ void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, Query
 	}
 	futile.clear();
 	settleExchange(first, second);
+	noteParted(first, second); // (schema 21: the pair as it parted, today; the cap's end as any other)
 	answer(queryID, 0);
 }
 

@@ -245,6 +245,8 @@ INPUTS = (
 	# Schema 20 (2026-11-13; at the end, older records read as 0: a town, no visit known to give nothing)
 	_i("g_days_no_town", (), "days we have owned no town (VCMI's daysWithoutCastle + 1: 1 the day the last fell, 7 the last before the loss); 0 while we own one"),
 	_i("m_empty", (MO,), "bit h: a visit by our hero token h would give nothing, by what we know (AlphaMapAI::emptyVisit, B1b; TILE_EMPTY_FOR_HERO's in the windows)"),
+	# Schema 21 (2026-11-14; at the end, older records read as 0: no exchange of the pair today)
+	_i("x_pair_today", (2,), "an exchange of two heroes of ours: this pair has ended one exchange today (0/1), two or more (0/1); 0 at a turn decision"),
 )
 
 
@@ -326,6 +328,7 @@ def random_inputs(batch=1, seed=0):
 	rng = np.random.default_rng(seed)
 	extra = np.random.default_rng(seed + 1_000_019)  # (schema 19's own draws: _random_schema_19)
 	extra20 = np.random.default_rng(seed + 1_000_020)  # (schema 20's: the older draws stay as they were)
+	extra21 = np.random.default_rng(seed + 1_000_021)  # (schema 21's)
 	x = empty_inputs(batch)
 	for b in range(batch):
 		kind = int(rng.choice([c.DecisionKind.TURN, c.DecisionKind.TURN, c.DecisionKind.EXCHANGE, c.DecisionKind.YES_NO, c.DecisionKind.SELECT]))
@@ -419,7 +422,20 @@ def random_inputs(batch=1, seed=0):
 				x["travel_days"][b, h] = np.where(x["travel_mask"][b, h], rng.integers(100, 600, (c.MAP_LEVELS, c.TRAVEL_GRID, c.TRAVEL_GRID)), -1)
 		_random_schema_19(x, b, kind, heroes, extra)
 		_random_schema_20(x, b, heroes, extra20)
+		_random_schema_21(x, b, kind, extra21)
 	return x
+
+
+def _random_schema_21(x, b, kind, rng):
+	"""Schema 21's inputs for random_inputs' decision b (their own generator): TILE_PAIR_UNCHANGED and TILE_PAIR_TODAY,
+	drawn apart, on a few of the window tiles on the map (the agent sets them on a hero of ours alone; the graphs read
+	them anywhere); at an exchange, x_pair_today one of none / one / two or more."""
+	on_map = (x["w_flags"][b] & c.TILE_ON_MAP) != 0
+	x["w_flags"][b] |= np.where(on_map & (rng.random(on_map.shape) < 0.05), c.TILE_PAIR_UNCHANGED, 0).astype(x["w_flags"].dtype)
+	x["w_flags"][b] |= np.where(on_map & (rng.random(on_map.shape) < 0.05), c.TILE_PAIR_TODAY, 0).astype(x["w_flags"].dtype)
+	if kind == c.DecisionKind.EXCHANGE:
+		ended = int(rng.integers(0, 3))
+		x["x_pair_today"][b] = (int(ended == 1), int(ended >= 2))
 
 
 def _random_schema_20(x, b, heroes, rng):

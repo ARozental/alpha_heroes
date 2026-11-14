@@ -444,7 +444,7 @@ class CampaignModelV2(nn.Module):
 		self.encode_tiles = E.TileEncoder(dc)
 		self.encode_options = E.OptionEncoder(d)
 		self.encode_other = E.ArmyEncoder(d)
-		self.reach = E.Tokenizer(5 + E.AMOUNT_FEATURES + 2, dc, embedded=False)  # a hero's reach to its window's tiles (B1b's column last: GROWN_INPUTS)
+		self.reach = E.Tokenizer(5 + E.AMOUNT_FEATURES + 4, dc, embedded=False)  # a hero's reach to its window's tiles (B1b's column, then schema 21's two, last: GROWN_INPUTS)
 		self.travel_days = E.Tokenizer(E.AMOUNT_FEATURES + 1, dp, embedded=False)  # its days to each TRAVEL area
 		# take_sides
 		self.sides, self.tile_sides = Sides(d), Sides(dc)
@@ -546,6 +546,11 @@ class CampaignModelV2(nn.Module):
 		self.option_weights = nn.Linear(QUESTION_FEATURES, 1, bias=False)
 		nn.init.zeros_(self.option_weights.weight)
 		self.end_out = zero_output(nn.Linear(d, 1))
+		# (schema 21, e5 2026-11-14) at an exchange, what this pair has done today (x_pair_today: one exchange ended, two or
+		# more) onto END's and MULTI's scores alone: whether to close the dialog at once. Not through the global token,
+		# which the value heads read (the g_last_* leak of 2026-11-13). 0 at the start (model.ADDED_HEADS)
+		self.pair_today = nn.Linear(2, 2, bias=False)
+		nn.init.zeros_(self.pair_today.weight)
 		self.type_bias = nn.Parameter(priors.action_types().clone())
 		self.value_hidden = nn.Sequential(nn.Linear(3 * d + ft_phi_features() + len(ft.ECONOMY) + len(ft.DANGER), d), nn.GELU())
 		self.value_heads = zero_output(nn.Linear(d, c.N_VALUE_OFFSETS))
@@ -791,7 +796,7 @@ class CampaignModelV2(nn.Module):
 		pace_of = (x["h_move_max"][:, :HO].float().clamp(min=1.0) / V.BASE_DAY).unsqueeze(-1)
 		own_days = torch.where(reached, days, torch.full_like(days, V.FAR_DAYS))
 		base_days = torch.where(reached, days * pace_of, torch.full_like(days, V.FAR_DAYS))
-		gold = known.travel_gold.detach().unsqueeze(1).expand(b, HO, AREAS)
+		gold = known.travel_gold.detach()  # (each hero's: B2's take-a-town chance)
 		index, valid = packed_cells(a.tables["travel_dest_cell"], torch.arange(b, device=device), inverse)
 		dest_value = value.reshape(-1).index_select(0, index.reshape(-1)).reshape(index.shape) * valid if value is not None else none.expand(b, HO, AREAS)
 		a.travel = torch.cat(
@@ -1267,14 +1272,15 @@ class CampaignModelV2(nn.Module):
 		# scores without it, each table's KL from it and its mean |term| under the policy; adv_outputs only)
 		reading = {"plain": [], "kl": [], "read": []} if self.adv_outputs else None
 		scores, legal_types = [], []
+		pair = self.pair_today(x["x_pair_today"].to(state.glob.dtype))  # [B, 2]: END's and MULTI's (schema 21; 0 at a turn decision)
 		for action in c.ActionType:
 			named = label_weight * (label_action == int(action)).to(state.glob.dtype)  # [B]: Nullkiller2's own choice is of this type
 			if action == A_.END:
 				own_end = adv_types["adv_type"][:, action] + adv_types["adv_named"][:, action] * (label_action == int(action)).to(state.glob.dtype)
-				scores.append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named + adv_gain * own_end.clamp(-ADV_CLIP, ADV_CLIP))
+				scores.append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named + pair[:, 0] + adv_gain * own_end.clamp(-ADV_CLIP, ADV_CLIP))
 				legal_types.append((x["g_kind"] == c.DecisionKind.TURN) | (x["g_kind"] == c.DecisionKind.EXCHANGE))
 				if reading is not None:
-					reading["plain"].append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named)
+					reading["plain"].append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named + pair[:, 0])
 					reading["kl"].append(torch.zeros_like(own_end))
 					reading["read"].append((adv_gain * own_end.clamp(-ADV_CLIP, ADV_CLIP)).abs().detach())
 				continue
@@ -1293,10 +1299,11 @@ class CampaignModelV2(nn.Module):
 			mean = (torch.where(torch.isfinite(here), here.exp(), torch.zeros_like(here)) * entries).reshape(b, -1).sum(dim=1)
 			read = adv_gain * (entries - mean.reshape((b,) + (1,) * (table.dim() - 1)))
 			out[name] = flat_log_softmax(own + read, mask)
-			scores.append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action] + read, mask) + named + adv_gain * adv_types["adv_type"][:, action].clamp(-ADV_CLIP, ADV_CLIP))
+			own_pair = pair[:, 1] if action == A_.MULTI else 0.0
+			scores.append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action] + read, mask) + named + own_pair + adv_gain * adv_types["adv_type"][:, action].clamp(-ADV_CLIP, ADV_CLIP))
 			legal_types.append(mask.reshape(b, -1).any(dim=-1))
 			if reading is not None:
-				reading["plain"].append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action], mask) + named)
+				reading["plain"].append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action], mask) + named + own_pair)
 				new = out[name].detach().reshape(b, -1)
 				p_new = torch.where(torch.isfinite(new), new.exp(), torch.zeros_like(new))
 				reading["kl"].append(torch.where(p_new > 0, p_new * (new - here.reshape(b, -1)), torch.zeros_like(new)).sum(dim=1))
@@ -1611,13 +1618,16 @@ def fight_features(known):
 
 
 def reach_features(x, windows):
-	"""[K, W, W, 12] a hero's reach to each tile of its window: the days (-1 never .. 3+, one-hot), the movement left on
-	reaching it today, whether this hero visited its object, and (B1b, last: a checkpoint from before reads it at 0) whether
-	its visit by this hero would give nothing (TILE_EMPTY_FOR_HERO)."""
+	"""[K, W, W, 14] a hero's reach to each tile of its window: the days (-1 never .. 3+, one-hot), the movement left on
+	reaching it today, whether this hero visited its object, (B1b: a checkpoint from before reads it at 0) whether its
+	visit by this hero would give nothing (TILE_EMPTY_FOR_HERO), and (schema 21, last: read at 0 the same way) on a hero
+	of ours, whether the pair still holds what its last exchange left it (TILE_PAIR_UNCHANGED) and whether that exchange
+	was today (TILE_PAIR_TODAY)."""
 	pick = lambda name: x[name].reshape((-1, W, W)).index_select(0, windows)  # noqa: E731
 	turns = pick("w_turns")
 	flags = pick("w_flags")
-	return torch.cat([E.level(turns, -1, 3), E.amount(pick("w_move_left").clamp(min=0), "movement"), ft.bit(flags, c.TILE_VISITED_BY_HERO).float().unsqueeze(-1), ft.bit(flags, c.TILE_EMPTY_FOR_HERO).float().unsqueeze(-1)], dim=-1)
+	bits = [ft.bit(flags, flag).float().unsqueeze(-1) for flag in (c.TILE_VISITED_BY_HERO, c.TILE_EMPTY_FOR_HERO, c.TILE_PAIR_UNCHANGED, c.TILE_PAIR_TODAY)]
+	return torch.cat([E.level(turns, -1, 3), E.amount(pick("w_move_left").clamp(min=0), "movement"), *bits], dim=-1)
 
 
 def side_embedding(dim):

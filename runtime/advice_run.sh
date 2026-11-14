@@ -347,6 +347,18 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # 0.70-0.80 for 50 updates. Back to v3295 with every training game our own: campaign.nk2_choice_games=0 and
 # campaign.nk2_follow=0, as lines 60-65 had; the code a49b192's as it is (deploy 71's bound failed its paired test, not
 # deployed). The recorded mixed continuation from v3295 is the control.
+# Deploy 77 (2026-11-14, e5): schema 21 (the pair facts, c02e0fd: TILE_PAIR_UNCHANGED / TILE_PAIR_TODAY through two
+# zero-start reach columns, x_pair_today through a zero-start term on END's and MULTI's scores; no rule acts on them, the
+# settled-pairs mark closed by the user's rule that overuse is a learning problem) and B2 (the no-town package, d8326b0:
+# a player's Φ x the factor while it owns no town, the prior's take-a-town term from that rule alone, the last town's
+# stake off), the factor by the config's ramp: campaign.no_town_factor=0.1 from campaign.no_town_from (the first version
+# this line trains: f = 0.9 at its first update, 0.349 at its 10th, 0.1 from its 22nd; set at the go from the line's last
+# version + 3, as deploy 74's value_shared_from; 999999 here keeps f at 1). ALPHA_EMPIRE_NO_TOWN stays unset (its default
+# would put f at 0.1 from the first game). campaign.game_seconds=3000 (2400 killed 25 of 651 training games; 2,900 s holds
+# 97.5%) and campaign.eval_seconds=1200 (600 cut 4-5 eval games a round). Every new weight 0: deploy 76's play bit for bit
+# with a town. Known: the new reach columns' second moments start at 0 under the layer's large step count, so their
+# first hundred or so steps run at a few times the rate; on two 0/1 columns from zero, weights of order 1e-3. Line 76's
+# weights continued.
 # Deploy 76 (2026-11-13, e5 for the user: "put this fix in ... maybe you can represent it as a new input"): B1b, schema
 # 20. A visit by a hero that would give nothing, by what we know, has its own bit (TILE_EMPTY_FOR_HERO, m_empty;
 # AlphaMapAI::emptyVisit, its rules by ALPHA_MAP_EMPTY_VISITS: all unless set); the MOVE prior's gate closes on it, the
@@ -382,5 +394,5 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=6.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3341 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=false campaign.value_shared=0.25 campaign.value_shared_from=3324 campaign.head_scale_freeze=3324 campaign.end_week_share=1.0 campaign.nk_predict_weight=0 campaign.build_economy=1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=6.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3341 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=false campaign.value_shared=0.25 campaign.value_shared_from=3324 campaign.head_scale_freeze=3324 campaign.end_week_share=1.0 campaign.nk_predict_weight=0 campaign.build_economy=1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 campaign.game_seconds=3000 campaign.eval_seconds=1200 campaign.no_town_factor=0.1 campaign.no_town_from=3394 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null

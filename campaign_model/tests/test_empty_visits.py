@@ -47,7 +47,7 @@ def test_reach_features_carry_the_bit_last():
 	x = inputs()
 	x["w_flags"][0, 0, 3, 4] |= c.TILE_EMPTY_FOR_HERO
 	r = reach_features(tensors(x), torch.tensor([0, 1]))
-	assert r.shape[-1] == 12 and float(r[0, 3, 4, -1]) == 1.0 and float(r[..., -1].sum()) == 1.0
+	assert r.shape[-1] == 14 and float(r[0, 3, 4, 11]) == 1.0 and float(r[..., 11].sum()) == 1.0  # (B1b's column the 12th; schema 21's two after it)
 
 
 def test_the_prior_gate_closes_on_the_bit():
@@ -74,7 +74,7 @@ def test_a_checkpoint_from_before_reads_the_bit_through_zero_only_the_prior_chan
 	m = model()
 	state = m.state_dict()
 	old = dict(state)
-	old["reach.mlp.up.weight"] = state["reach.mlp.up.weight"][:, :-1].clone()  # (the reach layer as it was: 11 columns)
+	old["reach.mlp.up.weight"] = state["reach.mlp.up.weight"][:, :-3].clone()  # (the reach layer as it was: 11 columns; schema 20's and 21's after)
 	fresh = model(seed=9)
 	fresh.load_state_dict(old)
 	fresh.features.empty_as_visited.fill_(0.0)

@@ -104,6 +104,7 @@ def test_every_part_learns_after_its_zero_starts_move():
 	x["h_backpack"][:, :2, 0] = 9  # (a carried artifact: encode_hero.carried reads the backpack's)
 	x["tile_flags"][:, 0, 3, 3] = c.TILE_ON_MAP | c.TILE_REVEALED | c.TILE_VISITABLE | c.TILE_UNSEEN_EXIT  # (a gate with no exit seen: encode_tiles.unseen_exit)
 	x["g_days_no_town"][:2] = 3  # (schema 20: days without a town, so encode_global.no_town_days' zero-start read learns)
+	x["x_pair_today"][:2, 0] = 1  # (schema 21: a pair's exchange ended today, so pair_today's zero-start terms learn)
 	optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
 	weights = {}
@@ -1497,7 +1498,7 @@ def test_records_from_before_schema_11_read_with_no_guards_battle_join_or_armed_
 	x["x_heroes"][:, :] = [1, 2]
 	x["multi_mask"][:, 0, 0] = True
 	full = zlib.decompress(encoded(x, 0))
-	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 10  # (schema 20: g_days_no_town starts the newest tail)
+	assert len(full) == IN_BYTES and len(SHORT_RECORDS) == 11  # (schema 21: x_pair_today starts the newest tail)
 	lengths = sorted(SHORT_RECORDS)  # (records of schemas 9, 10, 11-12, 13, 14 and 15 widened, 16 and 17: each ends where the next's inputs start)
 	for n in lengths[:4]:
 		got = decode_inputs([SimpleNamespace(inputs=zlib.compress(full[:n]))])
