@@ -173,6 +173,17 @@ class CampaignConfig:
 	# (0.0725); at 2e-5 3.0%. What one decision moves of it is its own action (0.003% of the spread at 2e-6) or, ending
 	# the day, the day's rest (0.024%; ten times those at 2e-5). A nudge by design: nothing to see within a night
 	schedule_action_price: float = 0.0
+	# The loop charge (the user, 2026-11-14: penalties on exchanges that are strictly useless, "exchanging nothing,
+	# exchanging back"; e5's design): a constant in the advantage's own standardized units, taken from the decisions inside
+	# a loop (labels.loop_rows: a pair of our heroes back, the same day, in a state it was already in, both holdings exactly,
+	# with no battle or question of the player between; every exchange decision but END inside it, and the turn MOVE that
+	# opened a dialog wholly inside it), after the blend, the standardization and adv_by_kind, on those rows alone; never
+	# in a value target, nor in the advantage head's (the policy reads the head: it would count twice). Ramped by version
+	# alone from loop_charge_from: min(loop_charge, loop_charge_step x (version - loop_charge_from + 1)), 0 before. On line
+	# 76's games 22% of our decisions lie inside such loops (16% exchange decisions, 6% meeting MOVEs). 0: none, bit for bit
+	loop_charge: float = 0.0
+	loop_charge_from: int = 0
+	loop_charge_step: float = 0.01
 	outcome_share_min: float = 0.25
 	myopic_weight: float = 0.5
 	trust_full_ev: float = 0.4

@@ -163,6 +163,204 @@ def actions_ahead(game, days=c.VALUE_OFFSETS[-1]):
 	return out
 
 
+# The loop charge's flags (config.loop_charge; the user, 2026-11-14; e5's design): a decision's loop type, 0 none
+LOOP_NONE, LOOP_NULL, LOOP_UNDONE, LOOP_ACROSS = 0, 1, 2, 3
+LOOP_TYPES = ("null dialog", "undone inside one dialog", "across dialogs")
+_GOES_ON = (int(c.ActionType.ARMY), int(c.ActionType.ARTIFACT), int(c.ActionType.MULTI))
+
+
+def loop_flags(steps, state_of, breaks, stats=None):
+	"""The loop types of one player's decisions in order (the core of loop_rows, on plain facts). steps: per decision
+	(kind, action type, day, the exchange's pair of hero ids or None); state_of(i, pair): the pair's state at decision i
+	(both holdings, hashable), None where a hero is gone; breaks: {index: the hero ids of a fight or surrender recorded
+	there (a battle: the first decision after it; a creature question: its own), None where no hero of ours is known}.
+	A dialog: consecutive EXCHANGE decisions of one pair, ended by a decision not ARMY / ARTIFACT / MULTI, by a MULTI or by
+	its 8th (AlphaMapAI::exchange's split), opened by the turn MOVE just before it if there is one. The pair's states: at
+	the dialog's start (its MOVE, else its first decision), before each later decision of it, after it (the next
+	decision). A loop: the pair back the same day in a state it was in, broken ONLY by a fight or surrender of a hero of the
+	pair between the two points, or one no hero is known for (the user, 2026-11-14: "moving and not attacking means that
+	you didn't use the moved artifact ... only an attack (or creatures surrender) can justify a trade and trade back": a
+	step, a visit, a CAST, a third hero met, anything in a town stays inside the loop). Flagged: every exchange decision but
+	END from the state's first index up to the return, and the MOVE of a dialog wholly inside; LOOP_NULL a whole dialog
+	that ends as it began, LOOP_UNDONE a return inside one dialog, LOOP_ACROSS one across dialogs. A closing END alone
+	between two points is no loop. stats (a dict, optional): adds "repeat_dialogs" (a pair's dialogs after its first of the
+	day), "repeat_not_loop" (those with no decision flagged) and "repeat_not_loop_back" (of those, the ones that gave troops
+	back to the hero whose army the pair's previous dialog that day took from: the dodge an inexact return would be).
+	-> int8 [len(steps)]."""
+	n = len(steps)
+	turn, exchange = int(c.DecisionKind.TURN), int(c.DecisionKind.EXCHANGE)
+	dialogs, k = [], 0
+	while k < n:
+		if steps[k][0] != exchange:
+			k += 1
+			continue
+		pair, idx = steps[k][3], []
+		while k < n and steps[k][0] == exchange and steps[k][3] == pair:
+			idx.append(k)
+			k += 1
+			act = steps[k - 1][1]
+			if act not in _GOES_ON or act == int(c.ActionType.MULTI) or len(idx) >= 8:
+				break
+		move = idx[0] - 1 if idx[0] > 0 and steps[idx[0] - 1][0] == turn and steps[idx[0] - 1][1] == int(c.ActionType.MOVE) else -1
+		if pair is not None and k < n:
+			dialogs.append((pair, move, idx, k))
+	out = np.zeros(n, dtype=np.int8)
+	points = sorted(breaks)
+
+	def broken(pair, lo, hi):
+		"""A fight or surrender of either hero of the pair, or one of no known hero, at lo..hi (both ends: a battle recorded
+		at the after point came before its decision; one at the next dialog's MOVE came before that MOVE)."""
+		for i in points[bisect.bisect_left(points, max(lo, 0)) : bisect.bisect_right(points, hi)]:
+			if breaks[i] is None or set(breaks[i]) & set(pair):
+				return True
+		return False
+
+	by_pair = {}
+	for dialog in dialogs:
+		by_pair.setdefault(dialog[0], []).append(dialog)
+	for pair, mine in by_pair.items():
+		visited, day, last = {}, None, -1
+		for _, move, idx, after in mine:
+			start = move if move >= 0 else idx[0]
+			if steps[start][2] != day:
+				visited, day = {}, steps[start][2]
+			if last >= 0 and broken(pair, last, start):
+				visited = {}
+			for point in [start] + idx[1:] + [after]:
+				state = state_of(point, pair)
+				if state is None:
+					continue
+				first = visited.get(state)
+				if first is None:
+					visited[state] = point
+					continue
+				inside = [e for _, _, other, _ in mine for e in other if first <= e < point and steps[e][1] != int(c.ActionType.END)]
+				opened = [m for _, m, _, end in mine if m >= 0 and m >= first and end <= point]
+				if not inside and not opened:
+					continue
+				own = first >= start or first == move
+				kind = (LOOP_NULL if first in (start, idx[0]) and point == after else LOOP_UNDONE) if own else LOOP_ACROSS
+				for e in inside + opened:
+					if out[e] == LOOP_NONE:
+						out[e] = kind
+			last = after
+	for pair, move, idx, after in dialogs:  # (a dialog that ends as it began is a null dialog whole, its undos inside it too)
+		start = move if move >= 0 else idx[0]
+		begun, ended = state_of(start, pair), state_of(after, pair)
+		if begun is not None and begun == ended:
+			for e in idx + ([move] if move >= 0 else []):
+				if steps[e][1] != int(c.ActionType.END):
+					out[e] = LOOP_NULL
+	if stats is not None:
+		for pair, mine in by_pair.items():
+			for (_, pm, pidx, pafter), (_, move, idx, after) in zip(mine, mine[1:]):
+				pstart, start = (pm if pm >= 0 else pidx[0]), (move if move >= 0 else idx[0])
+				if steps[pstart][2] != steps[start][2]:
+					continue
+				stats["repeat_dialogs"] = stats.get("repeat_dialogs", 0) + 1
+				if out[idx + ([move] if move >= 0 else [])].any():
+					continue
+				stats["repeat_not_loop"] = stats.get("repeat_not_loop", 0) + 1
+				states = [state_of(pstart, pair), state_of(pafter, pair), state_of(start, pair), state_of(after, pair)]
+				if any(state is None for state in states):
+					continue
+				count = lambda state, h: sum(v for _, v in state[h][0])  # noqa: E731 (a hero's army: its creatures' total count)
+				gave = [h for h in (0, 1) if count(states[1], h) < count(states[0], h)]
+				if gave and count(states[3], gave[0]) > count(states[2], gave[0]):
+					stats["repeat_not_loop_back"] = stats.get("repeat_not_loop_back", 0) + 1
+	return out
+
+
+def loop_rows(game, stats=None, kinds=None):
+	"""The loop charge's flags of a game's decisions (game.decisions' order; config.loop_charge): each player's
+	loop_flags on its decisions' records, the pairs' states their holdings (armies creature -> count, artifacts worn and in
+	the backpack sorted, schema 21's record). Its breaks: each battle of the player (game.battles' serial: its record
+	count, all_decisions numbering; at the first decision recorded after it) and each creature question (a guard's, a
+	joining or fighting option: d_guard_count, o_battle, o_join), given to the hero of the turn MOVE or TRAVEL just before
+	it (the window's hero, TRAVEL's slot); none known (the turn decision before it neither, or none) breaks every pair's.
+	stats: loop_flags' readings summed; kinds (a list): each player's {index: "attack" | "surrender" | "unattributed"}
+	appended (the recount's). -> int8 [len(game.decisions)], LOOP_* types."""
+	from .records import decode_fields
+
+	out = np.zeros(len(game.decisions), dtype=np.int8)
+	by = {}
+	for i, d in enumerate(game.decisions):
+		by.setdefault(d.color, []).append(i)
+	places = {}
+	for d in getattr(game, "all_decisions", game.decisions):
+		mine = places.setdefault(d.color, {})
+		mine[id(d)] = len(mine)
+	fields = ("x_heroes", "h_present", "h_owner", "h_type", "h_pos", "h_army_creature", "h_army_count", "h_artifacts", "h_backpack", "w_extra", "w_extra_pos", "o_battle", "o_join", "d_guard_count")
+	ho, w = c.OWN_HEROES, c.WINDOW
+	areas = c.MAP_LEVELS * c.TRAVEL_GRID * c.TRAVEL_GRID
+	turn, exchange = int(c.DecisionKind.TURN), int(c.DecisionKind.EXCHANGE)
+	for color, rows in by.items():
+		seq = [game.decisions[i] for i in rows]
+		x = decode_fields(seq, fields)
+		ours = lambda k: x["h_present"][k, :ho] & (x["h_owner"][k, :ho] == c.OWNER_SELF)  # noqa: E731
+
+		def mover(k):
+			"""The hero id of the turn MOVE or TRAVEL last before decision k (questions skipped), None if not one."""
+			j = k - 1
+			while j >= 0 and int(seq[j].kind) not in (turn, exchange):
+				j -= 1
+			if j < 0 or int(seq[j].kind) != turn or int(seq[j].index) < 0:
+				return None
+			a, index = int(seq[j].action_type), int(seq[j].index)
+			if a == c.ActionType.MOVE:
+				slot = index // (w * w)
+				extra = int(x["w_extra"][j, slot]) if slot < x["w_extra"].shape[1] else 0
+				h = min(extra - 1, ho - 1) if extra > 0 else slot
+			elif a == c.ActionType.TRAVEL:
+				h = index // areas
+			else:
+				return None
+			return int(x["h_type"][j, h]) if 0 <= h < ho and ours(j)[h] else None
+
+		ids = []
+		for k, d in enumerate(seq):
+			pair = None
+			if int(d.kind) == exchange:
+				types = tuple(sorted(int(x["h_type"][k, int(t) - 1]) for t in x["x_heroes"][k] if 0 < t <= x["h_type"].shape[1]))
+				pair = types if len(types) == 2 else None
+			ids.append((int(d.kind), int(d.action_type), int(d.day), pair))
+
+		def state_of(k, pair):
+			held = []
+			for t in pair:
+				slot = np.flatnonzero(ours(k) & (x["h_type"][k, :ho] == t))
+				if len(slot) == 0:
+					return None
+				h = int(slot[0])
+				army = {}
+				for cr, v in zip(x["h_army_creature"][k, h].tolist(), x["h_army_count"][k, h].tolist()):
+					if cr >= 0 and v > 0:
+						army[cr] = army.get(cr, 0) + v
+				held.append((tuple(sorted(army.items())), tuple(sorted(int(art) for art in np.concatenate([x["h_artifacts"][k, h].ravel(), x["h_backpack"][k, h].ravel()]) if art >= 0))))
+			return tuple(held)
+
+		breaks, kind_of = {}, {}
+
+		def add(k, kind):
+			hero = mover(k)
+			breaks[k] = None if hero is None or (k in breaks and breaks[k] is None) else frozenset({hero}) | (breaks.get(k) or frozenset())
+			kind_of[k] = kind if hero is not None else "unattributed"
+
+		for k, d in enumerate(seq):
+			if int(d.kind) not in (turn, exchange) and ((x["d_guard_count"][k] > 0).any() or x["o_battle"][k].any() or x["o_join"][k].any()):
+				add(k, "surrender")
+		place = places.get(color, {})
+		where = [place.get(id(d), -1) for d in seq]
+		for battle in getattr(game, "battles", {}).get(color, []):
+			k = bisect.bisect_left(where, int(battle["serial"]))  # (the first decision recorded at or after it)
+			if k < len(seq):
+				add(k, "attack")
+		if kinds is not None:
+			kinds.append(kind_of)
+		out[rows] = loop_flags(ids, state_of, breaks, stats)
+	return out
+
+
 def end_steps(game, ahead=c.VALUE_OFFSETS[-1]):
 	"""Per decision (game.decisions' order): the step's index, the player's next turn decision (that day or later), and
 	the week's, its first turn decision `ahead` days on or later; -1 where there is none (the game's end stands)."""

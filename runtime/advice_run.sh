@@ -347,6 +347,15 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # 0.70-0.80 for 50 updates. Back to v3295 with every training game our own: campaign.nk2_choice_games=0 and
 # campaign.nk2_follow=0, as lines 60-65 had; the code a49b192's as it is (deploy 71's bound failed its paired test, not
 # deployed). The recorded mixed continuation from v3295 is the control.
+# Deploy 78 (2026-11-14, e5 for the user): the loop charge (00e865a, 785c32f; the user: penalties on strictly useless
+# exchanges, "exchanging nothing, exchanging back"; a loop = a pair of our heroes back the same day in holdings it had,
+# broken only by an attack or a surrender of either hero between: "only an attack (or creatures surrender) can justify a
+# trade and trade back"): campaign.loop_charge=0.1 (z-units off the standardized advantage of each exchange decision
+# and dialog-opening MOVE inside a loop; the head's target and every value target untouched), 0.01 a version from
+# campaign.loop_charge_from (set at the go from the line's last version + 6; 999999 here: c 0). inference_processes 12 ->
+# 8 (2026-11-14 09:36: since deploy 77's restart the trainer sat ~2.2 GB higher, a grown heap, and the PC's games starved
+# under the 4.5 GB floor; 8 servers give back 4 x 0.48 GB; the 12 ran at 0.47 cores each, 8 at ~0.7 as on 2026-11-03;
+# back to 12 if the games finished an hour fall). Deploy 77's weights continued.
 # Deploy 77 (2026-11-14, e5): schema 21 (the pair facts, c02e0fd: TILE_PAIR_UNCHANGED / TILE_PAIR_TODAY through two
 # zero-start reach columns, x_pair_today through a zero-start term on END's and MULTI's scores; no rule acts on them, the
 # settled-pairs mark closed by the user's rule that overuse is a learning problem) and B2 (the no-town package, d8326b0:
@@ -393,6 +402,6 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 	--set remote_port=7700 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
-		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=12 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=6.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3341 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=false campaign.value_shared=0.25 campaign.value_shared_from=3324 campaign.head_scale_freeze=3324 campaign.end_week_share=1.0 campaign.nk_predict_weight=0 campaign.build_economy=1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 campaign.game_seconds=3000 campaign.eval_seconds=1200 campaign.no_town_factor=0.1 campaign.no_town_from=3394 \
+		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=8 ahead=2 \
+		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=6.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3341 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=false campaign.value_shared=0.25 campaign.value_shared_from=3324 campaign.head_scale_freeze=3324 campaign.end_week_share=1.0 campaign.nk_predict_weight=0 campaign.build_economy=1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 campaign.game_seconds=3000 campaign.eval_seconds=1200 campaign.no_town_factor=0.1 campaign.no_town_from=3394 campaign.loop_charge=0.1 campaign.loop_charge_step=0.01 campaign.loop_charge_from=3404 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null

@@ -53,7 +53,7 @@ from .empire import STATUS_INGAME, EmpireConfig, empire_value
 from .failures import NAMES as FAILURES, failure_modes
 from .features import SKILLS
 from .labels import (
-	COLORS, CREDIT_MEMORY, CREDIT_MIN_PLAYERS, GROWTH_CAP, PHI_FLOOR, LabelConfig, actions_ahead, attributed_labels, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
+	COLORS, CREDIT_MEMORY, CREDIT_MIN_PLAYERS, GROWTH_CAP, LOOP_TYPES, PHI_FLOOR, LabelConfig, actions_ahead, loop_rows, attributed_labels, credit_evidence, credit_gaps, credit_trust, end_labels, end_steps, end_targets, growth_labels, horizon_advantages,
 	label, ladder_targets, pooled_ev, residual_variances, share_change_labels, share_logit, share_now, tables,
 )
 from .advice import teacher_sets
@@ -199,6 +199,15 @@ def set_advice_prior(model, config):
 			features.empire_no_town.fill_(float(EmpireConfig().no_town_factor))
 		if hasattr(features, "empire_last_town"):  # (config.no_town_last_town: the last town's stake term)
 			features.empire_last_town.fill_(1.0 if getattr(config, "no_town_last_town", False) else 0.0)
+
+
+def loop_charge_now(config, version):
+	"""config.loop_charge's ramp (the loop charge): the charge at this version, stateless as no_town_now: 0 before
+	loop_charge_from (or with the target at 0), then min(target, loop_charge_step x (version - loop_charge_from + 1))."""
+	target, start = float(getattr(config, "loop_charge", 0.0)), int(getattr(config, "loop_charge_from", 0))
+	if target <= 0.0 or version < start:
+		return 0.0
+	return min(target, float(getattr(config, "loop_charge_step", 0.01)) * (version - start + 1))
 
 
 def no_town_now(config, version):
@@ -668,6 +677,9 @@ class CampaignLearner:
 		end = {"targets": [], "real": [], "step": [], "week": [], "price": []}
 		if self.config.schedule_action_price > 0:  # (each decision's actions through its 7-day window: labels.actions_ahead)
 			end["actions"] = []
+		loop_seen = {}  # (config.loop_charge: labels.loop_flags' repeat dialogs, for the log line)
+		if getattr(self.config, "loop_charge", 0.0) > 0:  # (each decision's loop type: labels.loop_rows; the charge itself after the concatenation)
+			end["loops"] = []
 		streams = ([], [])  # each decision's game and player, and its place among the player's records (config.memory_steps)
 		hidden = []  # (each decision's game hid Nullkiller2's own choice: config.nk2_choice_games, play.choice_hidden)
 		for g, game in enumerate(played):
@@ -701,6 +713,8 @@ class CampaignLearner:
 			end["price"].append(price[fresh])
 			if "actions" in end:
 				end["actions"].append(actions_ahead(game)[fresh])
+			if "loops" in end:
+				end["loops"].append(loop_rows(game, stats=loop_seen)[fresh])
 			if privileged is not None:
 				privileged.append(privileged_rivals(game, fresh, len(decisions), self.empire))
 			decisions += [d for d, keep in zip(game.decisions, fresh) if keep]
@@ -762,6 +776,8 @@ class CampaignLearner:
 		row["value_target_std"] = float(np.nanmean(spread)) if np.isfinite(spread).any() else float("nan")
 		returns, advantages = np.concatenate(returns), np.concatenate(advantages)
 		end = {name: np.concatenate(parts) for name, parts in end.items()}
+		if "loops" in end:
+			end["loop_charge"] = loop_charge_now(self.config, self.version)
 		if foresight is not None:
 			foresight = {name: np.concatenate([rows[name] for rows in foresight]) for name in foresight[0]}
 		if sets is not None:
@@ -823,6 +839,11 @@ class CampaignLearner:
 					weights = metrics.get("head_weights") or {}
 					print("campaign value heads' weights (ramp %.2f): " % min(1.0, self.head_scale_updates / HEAD_SCALE_RAMP) + "  ".join(f"{name} " + "/".join(f"{w:.2f}" for w in values) for name, values in weights.items()) + "  target std " + "  ".join(f"{name} " + "/".join(f"{v ** 0.5:.3f}" for v in values) for name, values in self.head_var.items()), flush=True)
 				CampaignLearner._print_pair_readings(self)  # (the tests' learners are namespaces)
+				if "loop_charge" in metrics:  # (config.loop_charge, each update: its size, the rows it takes and what they had)
+					print(f"campaign loop charge: c {metrics['loop_charge']:.3f}; charged {metrics['loop_share']:.3f} of the credited rows ("
+						+ ", ".join(f"{name} {metrics[f'loop_share_{j + 1}']:.3f}" for j, name in enumerate(LOOP_TYPES))
+						+ f"), their mean advantage before the charge {metrics['loop_adv_before']:+.4f}; a pair's same-day repeat dialogs {loop_seen.get('repeat_dialogs', 0)}, "
+						+ f"not loops {loop_seen.get('repeat_not_loop', 0) / max(loop_seen.get('repeat_dialogs', 0), 1):.3f}, of those troops back to the last giver {loop_seen.get('repeat_not_loop_back', 0) / max(loop_seen.get('repeat_not_loop', 0), 1):.3f}", flush=True)
 				self._save(self.out / "checkpoint_latest.pt")
 		unspool(game for game, _ in games)  # (in the checkpoint now: this process's, or the update process's)
 		if self.worker:  # (the process saved its checkpoint with the trust before this update: one update behind)
