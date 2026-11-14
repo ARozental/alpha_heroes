@@ -184,6 +184,13 @@ class CampaignConfig:
 	loop_charge: float = 0.0
 	loop_charge_from: int = 0
 	loop_charge_step: float = 0.01
+	# The update's size cap (e5, 2026-11-14: deploy 77/78's longer games made 20 games 105k-185k decisions, their restored
+	# inputs 2.2-3.9 GB at the update's peak against line 76's ~1.8 GB, and that peak is what the supply's memory gate keeps
+	# free): an update takes its waiting games oldest first as before, and stops once it holds update_games_floor games and
+	# the next one would take it past update_decisions_cap decisions; the games left wait for the next update (learner._take,
+	# take_count). 0: off, the update as before bit for bit
+	update_decisions_cap: int = 0
+	update_games_floor: int = 12
 	outcome_share_min: float = 0.25
 	myopic_weight: float = 0.5
 	trust_full_ev: float = 0.4

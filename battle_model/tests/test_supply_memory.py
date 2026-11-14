@@ -122,9 +122,16 @@ def test_the_runs_forkserver_preloads_what_a_worker_imports(tmp_path):
 	assert result.stdout.strip().splitlines()[-1] == "(True, '1')", result.stdout + result.stderr[-2000:]
 
 
+def owners(line):
+	"""{"<type> in <holder>": GB} from a "trainer heap owners:" line."""
+	held = line.split("held by them", 1)[1].split(": ", 1)[1].rsplit(" (", 1)[0]
+	return {name: float(value) for name, value in (part.rsplit(" ", 1) for part in held.split(", "))}
+
+
 def test_the_heap_census_names_what_holds_the_bytes():
 	"""(2026-11-14: the trainer's ~2.2 GB since deploy 77's restart) supply.heap_census: the arrays' data at their base, the
-	bytes, the CPU tensors' storage, each once, by holder (an instance's __dict__ named by its class)."""
+	bytes, the CPU tensors' storage, each once, by holder (a dict an instance refers to named by its class). In any process
+	(the PC runs it after the whole suite: other tests' objects alive), so at least these bytes, by name."""
 	import gc
 
 	import numpy as np
@@ -137,12 +144,30 @@ def test_the_heap_census_names_what_holds_the_bytes():
 	h.array = np.ones(2**26, dtype=np.uint8)  # 64 MB
 	h.view = h.array[10:]  # (its base: counted once)
 	h.blob = b"x" * 2**26
-	h.inside = {"a": np.ones(2**26, dtype=np.uint8)}  # (an untracked dict: its contents too)
+	h.inside = {"a": np.ones(2**26, dtype=np.uint8)}  # (a dict it refers to: tracked from Python 3.14 on, untracked before)
 	t = torch.ones(2**24, dtype=torch.float32)  # 64 MB of storage
 	keep = [h, t, t[5:]]
-	line = supply.heap_census(gc.get_objects()).splitlines()[-1]
-	assert line.startswith("trainer heap owners: ") and "ndarray in Holder 0.12" in line and "bytes in Holder 0.06" in line and "tensor storage (cpu) 0.06" in line, line
+	line = supply.heap_census(gc.get_objects(), top=200).splitlines()[-1]
+	found = owners(line)
+	assert line.startswith("trainer heap owners: ") and found.get("ndarray in Holder", 0) >= 0.12 and found.get("bytes in Holder", 0) >= 0.06 and found.get("tensor storage (cpu)", 0) >= 0.06, line
 	assert keep
+
+
+def test_the_heap_census_reads_an_instance_dict_made_and_tracked():
+	"""(Python 3.14 keeps every dict tracked; a materialized __dict__, which 3.11 may leave untracked) the holder still named."""
+	import gc
+
+	import numpy as np
+
+	class Owner:
+		pass
+
+	o = Owner()
+	o.data = np.ones(2**26, dtype=np.uint8)
+	o.more = {"x": 1, "y": [1, 2]}  # (a tracked dict among its attributes)
+	vars(o)  # (the __dict__ made)
+	found = owners(supply.heap_census(gc.get_objects(), top=200).splitlines()[-1])
+	assert found.get("ndarray in Owner", 0) >= 0.06, found
 
 
 def test_the_census_line_carries_the_heap_lines_every_types_census():

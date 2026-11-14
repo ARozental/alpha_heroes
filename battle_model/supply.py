@@ -171,12 +171,12 @@ def malloc_lines():
 	return [line]
 
 
-def heap_census(objects):
+def heap_census(objects, top=8):
 	"""(2026-11-14: the trainer held ~2.2 GB more since deploy 77's restart, through deploy 78's; its owner unknown) Two
 	lines: glibc's split of the heap (malloc_lines: fragmentation against live data) and what the gc's objects hold, by
 	who holds it: each object's own size by its type, and the untracked objects it refers to (bytes, str, numpy arrays'
 	data at their base, ...), each counted once, as "<type> in <holder>" (an instance's __dict__ named by its class); CPU
-	tensors' storage once by its pointer. objects: gc.get_objects()."""
+	tensors' storage once by its pointer. objects: gc.get_objects(); top: how many holders the line names."""
 	import gc
 	import types
 
@@ -220,7 +220,7 @@ def heap_census(objects):
 			held[f"{type(base).__name__} in {where}"] += size
 			if isinstance(base, (dict, list, tuple)) and depth < 3:  # (an untracked container, CPython's for atomic contents: its arrays and bytes too)
 				todo.extend((x, depth + 1) for x in gc.get_referents(base))
-	top = held.most_common(8)
+	top = held.most_common(top)
 	lines = malloc_lines()
 	lines.append(
 		f"trainer heap owners: the objects' own {sum(own.values()) / 2**30:.2f} GB ("
