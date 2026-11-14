@@ -1189,7 +1189,7 @@ class CustomFeatures(nn.Module):
 
 	def travel_prior(self, x, f):
 		"""TRAVEL's prior [B, HO, L * TG^2] as the network reads it and as its logits, and each area's value in gold
-		undiscounted [B, L * TG^2] (model_v2's views): each area's value in gold (its
+		undiscounted [B, HO, L * TG^2] (model_v2's views; each hero's: B2's take-a-town term): each area's value in gold (its
 		objects by class at each class's worth, the land it would reveal), discounted by the days each hero needs to get
 		there (the pathfinder's, travel_days; Nullkiller2's evaluateMovement), as a logit (features.value_logit). The
 		logits also count the night (2026-11-10): a TRAVEL walks on until today's movement is spent and the hero spends the
@@ -1199,14 +1199,16 @@ class CustomFeatures(nn.Module):
 		Nullkiller2 (v2728), 16 had ended their day with a TRAVEL, 10 of them out of a town of ours."""
 		contents, hidden = ft.area_contents(x, f.object_counts)
 		value = (contents * self.class_value * self.gain(self.class_gain)).sum(dim=-1) + hidden * self.explore_gold()
-		value = value + contents[..., c.ObjectClass.TOWN] * f.town_take_gain.unsqueeze(-1)  # (B2: a town not ours while we have none)
+		# (B2: taking a town not ours while we have none, each hero's by its best chance of winning one in the area)
+		chance = ft.town_take_chance(x, f.hero_strength, f.town_strength, ft.bounded(self.fight_sharpness, 0.5, 8.0, 4.0, CORRECTION_STEP), value.shape[-1])
+		value = value.unsqueeze(1) + f.town_take_gain[:, None, None] * chance  # [B, HO, A]
 		days = (x["travel_days"][:, :HO].reshape(value.shape[0], HO, -1).float() / 100).clamp(min=0)  # (-1: not legal, masked)
 		discount = ft.movement_discount(days, ft.bounded(self.travel_exponent, 0.7, 2.0, 1.3, CORRECTION_STEP))
 		home, defend, ferry, _, _ = self.pull_weights()
 		pulls = self.travel_pulls(x, f, value.shape[-1])  # [B, HO, A, 3]
 		weights = torch.stack([home, defend, ferry])
 		rest = (weights * torch.tanh(pulls * discount.unsqueeze(-1) / ft.PULL_SCALE)).sum(dim=-1)
-		gain = value.unsqueeze(1) * discount
+		gain = value * discount
 		if "travel_stop" not in x:
 			return ft.value_logit(gain) + rest, ft.value_logit(gain) + rest, value
 		stops, known = ft.travel_stops(x)

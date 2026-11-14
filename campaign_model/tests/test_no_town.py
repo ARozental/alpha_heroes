@@ -15,6 +15,7 @@ import torch
 from campaign_model import constants as c
 from campaign_model import features as ft
 from campaign_model.empire import EVAL_EMPIRE, EmpireConfig, empire_value, shares
+from campaign_model.model import CORRECTION_STEP
 from campaign_model.model_v2 import CampaignModelV2
 from campaign_model.schema import random_inputs
 
@@ -91,15 +92,44 @@ def test_the_prior_terms_come_from_the_rule_and_are_nothing_at_one():
 	assert torch.equal(last.town_stakes[1, 1:], base[1, 1:]) and torch.equal(last.town_stakes[2], base[2])
 
 
+def chances_by_hand(m, x, known):
+	"""town_take_chance one hero, town and area at a time: P(win) at MOVE's sharpness against the town's strength or a
+	rival hero's standing in it, whichever is stronger; the best over the towns not ours in each area."""
+	t = {k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in x.items()}
+	sharpness = ft.bounded(m.features.fight_sharpness, 0.5, 8.0, 4.0, CORRECTION_STEP).detach()
+	areas = c.MAP_LEVELS * c.TRAVEL_GRID * c.TRAVEL_GRID
+	index = ft.area_index(t, t["t_pos"])
+	out = torch.zeros(x["t_pos"].shape[0], c.OWN_HEROES, areas)
+	for b in range(out.shape[0]):
+		for h in range(c.OWN_HEROES):
+			if not x["h_present"][b, h]:
+				continue
+			for town in range(x["t_pos"].shape[1]):
+				if not x["t_present"][b, town] or x["t_owner"][b, town] == c.OWNER_SELF or index[b, town] < 0:
+					continue
+				defence = float(known.town_strength[b, town])
+				for other in range(x["h_pos"].shape[1]):
+					if x["h_present"][b, other] and x["h_owner"][b, other] != c.OWNER_SELF and (x["h_pos"][b, other] == x["t_pos"][b, town]).all():
+						defence = max(defence, float(known.hero_strength[b, other]))
+				win = float(ft.win_chance(known.hero_strength[b, h] - defence, sharpness))
+				out[b, h, index[b, town]] = max(float(out[b, h, index[b, town]]), win)
+	return out
+
+
 def test_taking_a_town_while_townless_raises_its_move_and_travel_prior():
 	m, x = model(), inputs()
+	rival = int(np.flatnonzero(x["t_present"][0] & (x["t_owner"][0] != c.OWNER_SELF))[0])
+	visitor = c.OWN_HEROES  # (a rival hero standing in that town: its strength counts if stronger, as MOVE's fight reads it)
+	x["h_present"][0, visitor], x["h_owner"][0, visitor], x["h_pos"][0, visitor] = True, c.OWNER_SELF + 1, x["t_pos"][0, rival]
+	x["h_army_creature"][0, visitor], x["h_army_count"][0, visitor], x["h_detailed"][0, visitor] = x["t_garrison_creature"][0, rival], x["t_garrison_count"][0, rival] * 2000, True
 	off, on = known_at(m, x, 1.0), known_at(m, x, 0.1)
-	# TRAVEL: an area holding a town not ours gains 9 x phi x its towns, discounted as the rest of its value
-	assert (on.travel_gold[0] >= off.travel_gold[0] - 1e-3).all()
-	contents, _ = ft.area_contents({k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in x.items()}, off.object_counts)
-	towns = contents[0, :, c.ObjectClass.TOWN]
-	assert (towns > 0).any()  # (the inputs' map holds a town not ours: the check is not vacuous)
-	assert torch.allclose(on.travel_gold[0] - off.travel_gold[0], towns * on.town_take_gain[0], rtol=1e-4, atol=1e-2)
+	assert float(on.hero_strength[0, visitor]) > float(on.town_strength[0, rival])  # (the visitor is the defence that counts)
+	# f = 1: every hero's area value the same, the class value alone (as before the per-hero term: bit for bit, the tree's check)
+	assert torch.equal(off.travel_gold, off.travel_gold[:, :1].expand_as(off.travel_gold))
+	# TRAVEL: each hero's area gains 9 x phi x its best chance of taking a town not ours there, discounted as the rest
+	chance = chances_by_hand(m, x, on)
+	assert (chance[0] > 0).any() and (chance[0] < 1).any()  # (not vacuous: towns not ours in reach, chances short of sure)
+	assert torch.allclose(on.travel_gold[0] - off.travel_gold[0], on.town_take_gain[0] * chance[0], rtol=1e-4, atol=1e-2)
 	assert torch.equal(on.travel_gold[1:], off.travel_gold[1:])
 
 

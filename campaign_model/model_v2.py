@@ -791,7 +791,7 @@ class CampaignModelV2(nn.Module):
 		pace_of = (x["h_move_max"][:, :HO].float().clamp(min=1.0) / V.BASE_DAY).unsqueeze(-1)
 		own_days = torch.where(reached, days, torch.full_like(days, V.FAR_DAYS))
 		base_days = torch.where(reached, days * pace_of, torch.full_like(days, V.FAR_DAYS))
-		gold = known.travel_gold.detach().unsqueeze(1).expand(b, HO, AREAS)
+		gold = known.travel_gold.detach()  # (each hero's: B2's take-a-town chance)
 		index, valid = packed_cells(a.tables["travel_dest_cell"], torch.arange(b, device=device), inverse)
 		dest_value = value.reshape(-1).index_select(0, index.reshape(-1)).reshape(index.shape) * valid if value is not None else none.expand(b, HO, AREAS)
 		a.travel = torch.cat(
