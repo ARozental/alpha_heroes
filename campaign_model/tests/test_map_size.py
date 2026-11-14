@@ -26,10 +26,14 @@ def golden_model():
 	model = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
 	with torch.no_grad():
 		for name, p in sorted(model.named_parameters()):
-			if name.startswith(("side_tile", "side_global", "time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global", "fore_fight", "fore_move", "fore_answer", "fore_hero", "build_situational", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias")):
+			if name.startswith(("side_tile", "side_global", "time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global", "fore_fight", "fore_move", "fore_answer", "fore_hero", "build_situational", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "encode_global.no_town_days")):
 				continue
 			g = torch.Generator().manual_seed(sum(ord(ch) * (i + 1) for i, ch in enumerate(name)) % (2**31))
-			if name in GROWN_INPUTS[2:]:  # (the economy's columns, 2026-11-12: the old ones drawn as before, the new at 0, as a checkpoint migrates)
+			if name == "reach.mlp.up.weight":  # (B1b's column, schema 20: the old ones drawn as before, the new at 0, as a checkpoint migrates)
+				old = 0.05 * torch.randn(p.shape[0], p.shape[1] - 1, generator=g)
+				p.copy_(torch.cat([old, torch.zeros(p.shape[0], 1)], dim=1))
+				continue
+			if name in GROWN_INPUTS[2:5]:  # (the economy's columns, 2026-11-12: the old ones drawn as before, the new at 0, as a checkpoint migrates)
 				old = 0.05 * torch.randn(p.shape[0], p.shape[1] - NEW_COLUMNS, generator=g)
 				p.copy_(torch.cat([old, torch.zeros(p.shape[0], NEW_COLUMNS)], dim=1))
 				continue

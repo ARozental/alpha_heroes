@@ -3,6 +3,7 @@
 #include "Armies.h"
 #include "Ledger.h"
 
+#include "lib/CPlayerState.h"
 #include "lib/GameConstants.h"
 #include "lib/IGameSettings.h"
 #include "lib/ResourceSet.h"
@@ -20,6 +21,8 @@
 #include "lib/mapObjects/CGDwelling.h"
 #include "lib/mapObjects/CGHeroInstance.h"
 #include "lib/mapObjects/CGTownInstance.h"
+#include "lib/mapObjects/CQuest.h"
+#include "lib/mapObjects/CRewardableObject.h"
 #include "lib/mapObjects/IMarket.h"
 #include "lib/mapObjects/IOwnableObject.h"
 #include "lib/mapObjects/MiscObjects.h"
@@ -129,6 +132,23 @@ bool unseenExitsShown()
 		return !value || std::string(value) != "0";
 	}();
 	return shown;
+}
+
+// B1b's rules (AlphaMapAI::emptyVisit), each its own bit of ALPHA_MAP_EMPTY_VISITS (all of them unless set; 0 none), so
+// one can be turned off without a build if a diagnosis asks
+constexpr int EMPTY_REWARDABLE = 1; // (a rewardable object, its rule public or the object scouted)
+constexpr int EMPTY_REVEAL = 2; // (the Redwood Observatory, the Pillar of Fire)
+constexpr int EMPTY_SEER = 4; // (a Seer Hut, a Quest Guard)
+constexpr int EMPTY_SHRINE = 8; // (a Shrine not scouted: its public part)
+
+int emptyVisitRules()
+{
+	static const int rules = []
+	{
+		const char * value = std::getenv("ALPHA_MAP_EMPTY_VISITS");
+		return value && *value ? std::atoi(value) : EMPTY_REWARDABLE | EMPTY_REVEAL | EMPTY_SEER | EMPTY_SHRINE;
+	}();
+	return rules;
 }
 
 int distanceSq(const int3 & a, const int3 & b)
@@ -302,6 +322,61 @@ bool AlphaMapAI::unseenExit(const CGObjectInstance * obj) const
 	return true;
 }
 
+bool AlphaMapAI::emptyVisit(const CGObjectInstance * obj, const CGHeroInstance * h) const
+{
+	// alpha_heroes patch (B1b, 2026-11-13; the user: "does that actually happen in games? ... if so we need to fix it"): a
+	// visit by this hero that would give nothing, by what we know, has its own bits (TILE_EMPTY_FOR_HERO, m_empty; VCMI's
+	// TILE_VISITED_BY_HERO and m_visitors stay its own), so the MOVE prior's gate (model.py: objects not visited by us or
+	// this hero) stops pricing it, and the learned layers read it only through zero-start weights. Line 72's 75 games had
+	// 1,037 such visits, 14 a game, up to 13 by one hero to one object: Shrines without a spellbook, Magic Wells at full
+	// mana, Schools under 1000 gold, Seer Huts with the quest unmet, Observatories and Pillars of Fire over land already
+	// shown. Only what a human knows:
+	//  - a Seer Hut (a Quest Guard too): its quest shown to us (by a first visit) and this hero does not meet it
+	//  - the Redwood Observatory, the Pillar of Fire: no tile of the land they reveal still hidden from us (revealSpent; a
+	//    Cover of Darkness opens them again)
+	//  - other rewardable objects with no guards: nothing this hero may take (getAvailableRewards' first visit empty),
+	//    where the rule is public, the hero and the object's type alone (the Library, both Schools, the Magic Well), or we
+	//    scouted the object (the Tree of Knowledge's price, a Shrine's spell: drawn per object); a Shrine not scouted only
+	//    by its public part: no spellbook, or its spells' level beyond what the hero may learn (Wisdom)
+	const int rules = emptyVisitRules();
+	if(!rules || !h)
+		return false;
+	if(const auto * seer = dynamic_cast<const CGSeerHut *>(obj))
+		return (rules & EMPTY_SEER) && seer->getQuest().activeForPlayers.count(playerID) && !seer->checkQuest(h);
+	const auto * rewardable = dynamic_cast<const CRewardableObject *>(obj);
+	if(!rewardable || rewardable->stacksCount() > 0) // (guards: a fight first)
+		return false;
+	const auto id = obj->ID;
+	if(id == Obj::REDWOOD_OBSERVATORY || id == Obj::PILLAR_OF_FIRE)
+		return (rules & EMPTY_REVEAL) && revealSpent(rewardable);
+	if(rewardable->wasScouted(playerID) || id == Obj::LIBRARY_OF_ENLIGHTENMENT || id == Obj::SCHOOL_OF_MAGIC || id == Obj::SCHOOL_OF_WAR || id == Obj::MAGIC_WELL)
+		return (rules & EMPTY_REWARDABLE) && rewardable->getAvailableRewards(h, Rewardable::EEventType::EVENT_FIRST_VISIT).empty();
+	const int level = id == Obj::SHRINE_OF_MAGIC_INCANTATION ? 1 : id == Obj::SHRINE_OF_MAGIC_GESTURE ? 2 : id == Obj::SHRINE_OF_MAGIC_THOUGHT ? 3 : 0;
+	return (rules & EMPTY_SHRINE) && level > 0 && (!h->hasSpellbook() || h->maxSpellLevel() < level);
+}
+
+bool AlphaMapAI::revealSpent(const CRewardableObject * obj) const
+{
+	// (B1) each visit reveals the land within its reward's radius (revealTiles: 20 for both) around the visitor, who
+	// stands on it, as VCMI's grant does (getTilesInRange, its distance); nothing there hidden from us, it shows nothing.
+	// Asked for each hero's window tiles and the map's objects: once per decision (revealChecked)
+	if(const auto known = revealChecked.find(obj->id); known != revealChecked.end())
+		return known->second;
+	int radius = 0;
+	for(const auto & info : obj->configuration.info)
+		if(info.reward.revealTiles)
+			radius = std::max(radius, info.reward.revealTiles->radius);
+	bool spent = false;
+	if(radius > 0) // (not positive: the whole map; not these)
+	{
+		FowTilesType hidden;
+		cb->getTilesInRange(hidden, obj->visitablePos(), radius, ETileVisibility::HIDDEN, playerID);
+		spent = hidden.empty();
+	}
+	revealChecked[obj->id] = spent;
+	return spent;
+}
+
 int Decision::holderOf(ObjectInstanceID id) const
 {
 	if(id == ObjectInstanceID())
@@ -373,6 +448,7 @@ Decision AlphaMapAI::encode(DecisionKind kind, ObjectInstanceID exchangeFirst, O
 		decision.holders[OWN_HEROES + i] = decision.towns[i];
 
 	PathfinderCache paths(cb.get(), PathfinderOptions(*cb));
+	revealChecked.clear();
 	encodeGlobal(decision);
 	encodeTowns(decision);
 	encodeHeroes(decision, paths);
@@ -452,6 +528,10 @@ void AlphaMapAI::encodeGlobal(Decision & decision)
 	in.at(In::g_last_type) = lastChoice.type;
 	in.at(In::g_last_index) = lastChoice.index;
 	in.at(In::g_last_changed) = lastChanged;
+	// (schema 20, B2) the days we have owned no town: VCMI's daysWithoutCastle (0 the day the last fell, + 1 each new day
+	// after, the loss at 7; none while we own one) + 1; 0 while we own one
+	if(const auto * state = cb->getPlayerState(playerID, false); state && state->daysWithoutCastle)
+		in.at(In::g_days_no_town) = static_cast<int>(*state->daysWithoutCastle) + 1;
 	const auto resources = cb->getResourceAmount();
 	for(int r = 0; r < N_RESOURCES; ++r)
 		in.at(In::g_resources, r) = resources[GameResID(r)];
@@ -762,6 +842,7 @@ void AlphaMapAI::encodeWindows(Decision & decision, PathfinderCache & paths)
 					in.at(In::w_owner, slot, row, column) = owner(obj->tempOwner);
 					flags |= obj->wasVisited(playerID) ? TILE_VISITED_BY_PLAYER : 0;
 					flags |= obj->wasVisited(h) ? TILE_VISITED_BY_HERO : 0;
+					flags |= emptyVisit(obj, h) ? TILE_EMPTY_FOR_HERO : 0; // (B1b)
 					flags |= unseenExit(obj) ? TILE_UNSEEN_EXIT : 0;
 					// (a resource pile's amount is not shown to a human either: none)
 					if(obj->ID == Obj::MONSTER)
@@ -956,10 +1037,14 @@ void AlphaMapAI::encodeMap(Decision & decision, const std::vector<int3> & ours)
 		// of a campaign client's CPU, 2026-10-30)
 		flags |= cb->isVisible(pos) && cb->guardingCreaturePosition(pos) != int3(-1, -1, -1) ? OBJECT_GUARDED : 0;
 		flags |= unseenExit(obj) ? OBJECT_UNSEEN_EXIT : 0;
-		int64_t visitors = 0;
+		int64_t visitors = 0, empty = 0;
 		for(int h = 0; h < OWN_HEROES; ++h)
+		{
 			if(heroes[h] && obj->wasVisited(heroes[h]))
 				visitors |= int64_t(1) << h;
+			if(heroes[h] && emptyVisit(obj, heroes[h])) // (B1b)
+				empty |= int64_t(1) << h;
+		}
 		if(obj->ID == Obj::MONSTER)
 			if(const auto * stack = dynamic_cast<const CArmedInstance *>(obj)->getStackPtr(SlotID(0)))
 			{
@@ -973,6 +1058,7 @@ void AlphaMapAI::encodeMap(Decision & decision, const std::vector<int3> & ours)
 			}
 		in.at(In::m_flags, i) = flags;
 		in.at(In::m_visitors, i) = visitors;
+		in.at(In::m_empty, i) = empty;
 	}
 }
 

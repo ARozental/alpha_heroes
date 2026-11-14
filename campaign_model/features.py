@@ -460,6 +460,25 @@ def empire_value(x, t):
 	return parts, parts.sum(dim=-1)
 
 
+def empty_as_visited(x, on):
+	"""config.empty_as_visited (on: a 0-dim tensor, the model's buffer): x with TILE_VISITED_BY_HERO set in w_flags where
+	TILE_EMPTY_FOR_HERO is (a visit by this hero would give nothing, by what we know: B1b, AlphaMapAI::emptyVisit) and
+	m_visitors | m_empty, so every reader of "visited by this hero" reads it; the raw bits stay. Idempotent; in the graph
+	(a torch.where on the buffer: no host sync). Off, or a record before schema 20 (no such bits): x's values as they are."""
+	if "m_empty" not in x or "w_flags" not in x or "m_visitors" not in x:
+		return x
+	use = on > 0
+	flags, visitors, empty = x["w_flags"], x["m_visitors"], x["m_empty"]
+	out = dict(x)
+	# (arithmetic, not bitwise_and / bitwise_or: ONNX opset 17 has neither; a bit added only where it is not set yet)
+	add = use & bit(flags, c.TILE_EMPTY_FOR_HERO) & ~bit(flags, c.TILE_VISITED_BY_HERO)
+	out["w_flags"] = flags + add.to(flags.dtype) * c.TILE_VISITED_BY_HERO
+	powers = 2 ** torch.arange(c.OWN_HEROES, device=visitors.device, dtype=visitors.dtype)
+	heroes = lambda mask: torch.remainder(torch.div(mask.unsqueeze(-1), powers, rounding_mode="floor"), 2) == 1  # noqa: E731
+	out["m_visitors"] = visitors + ((heroes(empty) & ~heroes(visitors)).to(visitors.dtype) * powers).sum(dim=-1) * use.to(visitors.dtype)
+	return out
+
+
 def phi_features(parts, total):
 	"""Φ as the learned layers see it, every feature bounded: x / (x + c) at PHI_SCALES (0..1) and each part's share of
 	the parts' absolute sum (-1..1). Φ comes from the inputs alone: no gradient flows through it, and no weight ever

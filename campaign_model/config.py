@@ -193,6 +193,20 @@ class CampaignConfig:
 	# week is unknown (the last week of a game stopped by the time limit: no real end) gets no end credit, not the one-step
 	# part (its 7-day credit stands; with neither it is not credited); learner columns end_week_share, end_credit_none
 	end_week_share: float = -1.0  # (above 1 reads as 1)
+	# The policy's credit by action type, a reading (e5, 2026-11-13: the live line collected no per-type evidence under the
+	# schedule credit, which is how the end credit's pay to ARMY went unseen): each update adds the blended advantage's,
+	# the 7-day part's and the end part's gap by action type against the same game-player's other turn decisions (the
+	# games that hid Nullkiller2's own choice, as credit_evidence) to an evidence table kept in the checkpoint (learner
+	# type_evidence, faded as credit_evidence); logged, never read by training; an error in it is a FAILURE line and the
+	# update goes on. False: none of it computed
+	type_evidence: bool = True
+	# B1b's bit read as "visited" (e5, 2026-11-13: the pull to an object that gives this hero nothing is in the learned
+	# side, which reads "not visited by this hero"; B1, which set VCMI's bits, cut such arrivals 442 -> 24 in 96 games,
+	# B1b's own bit alone 442 -> 380): at the model's input, in the graph, once before any reader (model_v2's
+	# read_inputs, features.empty_as_visited), w_flags gains TILE_VISITED_BY_HERO where TILE_EMPTY_FOR_HERO is set and
+	# m_visitors gains m_empty; the raw bits stay. Carried in the weights (features.empty_as_visited, the learner's
+	# fill), as ALPHA. False: B1b's inputs as they are, bit for bit
+	empty_as_visited: bool = True
 	# The end credit's own check (b1, 2026-10-31): V_end's step estimate of the end is checked by action type as the 7-day
 	# one is (labels.credit_trust over learner.end_evidence); as it fails, the end credit's step part gives way to its week
 	# part, as the 7-day credit's step gives way to the week's outcome. Its steps were off by type as the 7-day ones (travel

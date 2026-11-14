@@ -242,6 +242,9 @@ INPUTS = (
 	_i("g_nk_action", (), "its choice's action type + 1; 0 none (no advisor, or its request matched no entry of ours)"),
 	_i("g_nk_index", (), "its choice's index in that type's table + 1; 0 none"),
 	_i("g_nk_cell", (), "its choice's cell (a targeted spell's tile, ARMY's target slot) + 1; 0 none"),
+	# Schema 20 (2026-11-13; at the end, older records read as 0: a town, no visit known to give nothing)
+	_i("g_days_no_town", (), "days we have owned no town (VCMI's daysWithoutCastle + 1: 1 the day the last fell, 7 the last before the loss); 0 while we own one"),
+	_i("m_empty", (MO,), "bit h: a visit by our hero token h would give nothing, by what we know (AlphaMapAI::emptyVisit, B1b; TILE_EMPTY_FOR_HERO's in the windows)"),
 )
 
 
@@ -322,6 +325,7 @@ def random_inputs(batch=1, seed=0):
 	"""Random but consistent inputs for tests: a few heroes and towns, some legal moves and builds, or a question."""
 	rng = np.random.default_rng(seed)
 	extra = np.random.default_rng(seed + 1_000_019)  # (schema 19's own draws: _random_schema_19)
+	extra20 = np.random.default_rng(seed + 1_000_020)  # (schema 20's: the older draws stay as they were)
 	x = empty_inputs(batch)
 	for b in range(batch):
 		kind = int(rng.choice([c.DecisionKind.TURN, c.DecisionKind.TURN, c.DecisionKind.EXCHANGE, c.DecisionKind.YES_NO, c.DecisionKind.SELECT]))
@@ -414,7 +418,20 @@ def random_inputs(batch=1, seed=0):
 				x["travel_mask"][b, h] = rng.random((c.MAP_LEVELS, c.TRAVEL_GRID, c.TRAVEL_GRID)) < 0.3
 				x["travel_days"][b, h] = np.where(x["travel_mask"][b, h], rng.integers(100, 600, (c.MAP_LEVELS, c.TRAVEL_GRID, c.TRAVEL_GRID)), -1)
 		_random_schema_19(x, b, kind, heroes, extra)
+		_random_schema_20(x, b, heroes, extra20)
 	return x
+
+
+def _random_schema_20(x, b, heroes, rng):
+	"""Schema 20's inputs for random_inputs' decision b (their own generator): our days without a town (only while no
+	town of ours); a third of the visitable object tiles of our heroes' windows and of the listed objects empty for a
+	hero (TILE_EMPTY_FOR_HERO, m_empty)."""
+	townless = not (x["t_present"][b, : c.OWN_TOWNS] & (x["t_owner"][b, : c.OWN_TOWNS] == c.OWNER_SELF)).any()
+	x["g_days_no_town"][b] = rng.integers(1, 8) if townless else 0
+	objects = (x["w_object"][b] >= 0) & ((x["w_flags"][b] & c.TILE_VISITABLE) != 0)
+	x["w_flags"][b] |= np.where(objects & (rng.random(objects.shape) < 0.33), c.TILE_EMPTY_FOR_HERO, 0).astype(x["w_flags"].dtype)
+	listed = x["m_object"][b] >= 0
+	x["m_empty"][b] = np.where(listed & (rng.random(listed.shape) < 0.33), rng.integers(1, 1 << max(heroes, 1), listed.shape), 0)
 
 
 def _random_schema_19(x, b, kind, heroes, rng):

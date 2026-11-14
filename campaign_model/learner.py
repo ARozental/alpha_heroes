@@ -143,6 +143,8 @@ COLUMNS = [
 	# with no end credit)
 	"end_week_share", "end_credit_none",
 ]
+TYPE_PARTS = ("blend", "seven", "end")  # (config.type_evidence: the policy's credit as blended, its 7-day part, its end part)
+TYPE_SHOWN = ("ARMY", "UPGRADE", "HIRE", "BUILD", "END", "RECRUIT", "MOVE", "TRAVEL", "MULTI")  # (the log line's types, in this order)
 SEGMENT_RATE = 0.05  # config.credit_segments: each long segment's k moves this far toward its measured max(0, 1 - 1/F) an update
 KEEP_FAILED_RUNS = 10  # run folders (logs) of failed games kept for debugging; the rest are deleted
 DROP_BEYOND = 4  # updates' worth of finished games beyond which the oldest are dropped (_take)
@@ -189,6 +191,8 @@ def set_advice_prior(model, config):
 			features.town_guard.fill_(float(getattr(config, "town_guard", 0.0)))
 		if hasattr(features, "build_economy"):  # (the economy and BUILD: config.build_economy)
 			features.build_economy.fill_(float(getattr(config, "build_economy", 0.0)))
+		if hasattr(features, "empty_as_visited"):  # (config.empty_as_visited: the weights carry it to every inference server)
+			features.empty_as_visited.fill_(1.0 if getattr(config, "empty_as_visited", True) else 0.0)
 		if hasattr(features, "empire_alpha"):  # (ALPHA, the labels' own: the weights carry it to every inference server)
 			features.empire_alpha.fill_(float(EmpireConfig().alpha))
 
@@ -251,6 +255,7 @@ class CampaignLearner:
 		self.end_check = 1.0  # and its verdict (end_credit: config.end_credit_check)
 		self.segment_evidence = [{}, {}, {}]  # (config.credit_segments: credit_evidence of each segment's surprise, 0-2 2-5 5-7 days)
 		self.segment_k = (0.0, 0.0)  # (and the 2-5 and 5-7 segments' weights in the credit, from 0: the 2-day credit)
+		self.type_evidence = {part: {} for part in TYPE_PARTS}  # (config.type_evidence: the policy's credit by action type, a reading)
 		self.head_ev = {}  # each head's explained variance at the day starts, smoothed: how far it grades the next (grade_trust)
 		self.value_pool, self.head_pool = None, {}  # their parts (labels.pooled_ev): the residual variance and the variance, smoothed apart
 		self.head_var, self.head_scale_updates = None, 0  # (config.head_scale) the heads' running target variances, the updates since it began
@@ -285,6 +290,7 @@ class CampaignLearner:
 			self.end_evidence = state.get("end_evidence", {})
 			self.end_check = credit_trust(credit_gaps(self.end_evidence))
 			self.segment_evidence, self.segment_k = state.get("segment_evidence", [{}, {}, {}]), tuple(state.get("segment_k", (0.0, 0.0)))
+			self.type_evidence = {part: state.get("type_evidence", {}).get(part, {}) for part in TYPE_PARTS}
 			self.head_ev = state.get("head_ev", {})
 			self.value_pool, self.head_pool = state.get("value_pool"), state.get("head_pool", {})
 			self.head_var, self.head_scale_updates = state.get("head_var"), state.get("head_scale_updates", 0)
@@ -785,6 +791,12 @@ class CampaignLearner:
 			row["end_credit_gaps"] = credit_gaps(self.end_evidence)
 			self.end_check = credit_trust(row["end_credit_gaps"])  # (for the next update's end credit: end_credit)
 			row["end_check"] = self.end_check
+		credits = metrics.pop("type_credit", None)
+		if credits is not None:  # (config.type_evidence: a reading, never the update's end)
+			try:
+				CampaignLearner._note_type_evidence(self, decisions, credits, np.concatenate(streams[0]), np.concatenate(hidden) if hidden else None)  # (the tests' learners are namespaces)
+			except Exception as error:
+				print(f"campaign: FAILURE: the type evidence ({type(error).__name__}: {str(error)[:200]})", flush=True)
 		surprises = metrics.pop("segment_surprise", None)
 		if surprises is not None:  # (config.credit_segments: each segment's evidence, and the k's for the next update)
 			row.update(self._note_segments(decisions, surprises, np.concatenate(streams[0]), np.concatenate(hidden) if hidden else None))
@@ -830,6 +842,33 @@ class CampaignLearner:
 				ks[j - 1] = min(1.0, ks[j - 1] + SEGMENT_RATE * (k - ks[j - 1]))
 		self.segment_k = (float(ks[0]), float(ks[1]))
 		return out
+
+	def _note_type_evidence(self, decisions, credits, players, hidden=None):
+		"""config.type_evidence (e5, 2026-11-13; a reading, nothing trains on it): the policy's credit as ppo_update blended
+		it and its two parts, each standardized (credits [n, 3]: blended, 7-day, end), into labels.credit_evidence by action
+		type against the same game-player's other turn decisions, the games that hid Nullkiller2's own choice (all of them
+		when that is unknown), faded once an update as credit_evidence; then one log line, each part's types with their gap,
+		SE and t (TYPE_SHOWN first), and TensorBoard campaign_type/<part>_<TYPE>_t."""
+		rows = np.ones(len(decisions), dtype=bool) if hidden is None or len(hidden) != len(decisions) else np.asarray(hidden, dtype=bool)
+		if not getattr(self, "type_evidence", None):
+			self.type_evidence = {part: {} for part in TYPE_PARTS}
+		parts = []
+		for j, part in enumerate(TYPE_PARTS):
+			errors = np.where(rows, credits[:, j], np.nan).astype(np.float64)
+			self.type_evidence[part] = credit_evidence(decisions, errors, players, self.type_evidence[part])
+			shown = []
+			for kind in TYPE_SHOWN:
+				n, total, squares = self.type_evidence[part].get(kind, (0.0, 0.0, 0.0))
+				if n < CREDIT_MIN_PLAYERS:
+					continue
+				m = total / n
+				se = float(np.sqrt(max(squares / n - m * m, 0.0) / (n - 1)))
+				t = m / se if se > 0 else 0.0
+				shown.append(f"{kind} {m:+.3f} (t {t:+.1f})")
+				if getattr(self, "writer", None) is not None:
+					self.writer.add_scalar(f"campaign_type/{part}_{kind}_t", t, self.version)
+			parts.append(f"{part}: " + ", ".join(shown))
+		print("campaign credit by type (z-units, hidden games, faded; a reading): " + "; ".join(parts), flush=True)
 
 	def _relabel_waiting(self):
 		"""The games still waiting whose labels came from tables MAX_LABEL_STALENESS versions back or more: labelled again
@@ -1121,7 +1160,7 @@ class CampaignLearner:
 
 		state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
 		optimizer = {} if self.worker else {"optimizer": self.optimizer.state_dict()}  # (the process's is in checkpoint_latest.pt)
-		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "segment_evidence": getattr(self, "segment_evidence", [{}, {}, {}]), "segment_k": getattr(self, "segment_k", (0.0, 0.0)), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "head_weights_frozen": getattr(self, "head_weights_frozen", None), "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "gather_ramp_start": self.gather_ramp_start, "valve": self.valve, "model_kwargs": self.kwargs}, path)
+		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "segment_evidence": getattr(self, "segment_evidence", [{}, {}, {}]), "type_evidence": getattr(self, "type_evidence", {}), "segment_k": getattr(self, "segment_k", (0.0, 0.0)), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "head_weights_frozen": getattr(self, "head_weights_frozen", None), "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "gather_ramp_start": self.gather_ramp_start, "valve": self.valve, "model_kwargs": self.kwargs}, path)
 
 	# ---- the loss shares (config.loss_shares) ----
 

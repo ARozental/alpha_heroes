@@ -1556,10 +1556,22 @@ def ppo_update(
 			if int(known.sum()) > 1:
 				schedule_stats.update(schedule_action_price_mean=float(charged[known].mean()), schedule_action_price_std=float(charged[known].std()), schedule_action_price_share=float(charged[known].mean() / advantage[known].std().clamp(min=1e-12)))  # (the mean charge over the 7-day credit's spread)
 			advantage = advantage - charged
+	type_parts = None  # (config.type_evidence: the 7-day credit as it enters the blend, the end credit, each standardized, the learner's reading)
+	if getattr(config, "type_evidence", False):
+		try:
+			type_parts = [standardized(advantage.detach().cpu().numpy().astype(np.float32)), np.full(len(decisions), np.nan, np.float32)]
+		except Exception as error:  # (a reading: never the update's end)
+			print(f"campaign: FAILURE: the type evidence's credit parts ({type(error).__name__}: {str(error)[:200]})", flush=True)
 	if end is not None and end["weight"] > 0:  # the policy's credit moves toward the end's as V_end proves itself
 		turn = choices(decisions)["kind"] == c.DecisionKind.TURN
 		later = end_advantages(end_now.cpu().numpy(), end["step"], end["week"], end["real"], end["price"], turn, config.decision_price, end["outcome"], week_only=getattr(config, "end_week_share", -1.0) >= 1.0)
 		end_credit_none = float(np.mean(~np.isfinite(later))) if len(later) else float("nan")  # (learner column end_credit_none)
+		if type_parts is not None:
+			try:
+				type_parts[1] = standardized(np.asarray(later, dtype=np.float32))
+			except Exception as error:
+				print(f"campaign: FAILURE: the type evidence's end part ({type(error).__name__}: {str(error)[:200]})", flush=True)
+				type_parts = None
 		# V_end's step estimate of the end against the end itself, for the end credit's check by action type (a diagnostic
 		# in the learner, as the 7-day credit's check: the end credit is two thirds of the advantage, and no check saw it)
 		values = end_now.cpu().numpy()
@@ -1569,6 +1581,12 @@ def ppo_update(
 		else:
 			advantage = torch.from_numpy(blend_credit(advantage.cpu().numpy(), later, end["weight"])).to(device)
 	credited = torch.isfinite(advantage)
+	type_credit = None
+	if type_parts is not None:
+		try:
+			type_credit = np.stack([advantage.detach().cpu().numpy().astype(np.float32), *type_parts], axis=1)  # [n, 3]: blended, 7-day, end
+		except Exception as error:
+			print(f"campaign: FAILURE: the type evidence's blend ({type(error).__name__}: {str(error)[:200]})", flush=True)
 	adv_stats = {}
 	if adv_before is not None:  # (the advantage's spread before it is standardized: its scale in the update's own units)
 		adv_stats["adv_raw_sd"] = float(advantage[credited].std()) if int(credited.sum()) > 1 else float("nan")
@@ -1802,6 +1820,7 @@ def ppo_update(
 		head_fresh=head_fresh,
 		end_step_error=end_step_error,
 		end_credit_none=end_credit_none,  # (the share of the rows with no end credit: config.end_week_share)
+		**({"type_credit": type_credit} if type_credit is not None else {}),  # (config.type_evidence: the learner's reading)
 		last_kl=update_kl,
 		kl_target=kl_target,
 		# (2026-11-06: the KL barely followed the rate, 2.5x less rate for 1.6x less KL) the first step's KL, before any
