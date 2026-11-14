@@ -75,6 +75,11 @@ class EmpireConfig:
 	# read when this module is imported, since every default EmpireConfig() is made then, so it is the run's environment
 	# (runtime/advice_run.sh), the same in every process it starts. The evaluation's EVAL_EMPIRE keeps 0.25
 	alpha: float = field(default_factory=lambda: float(os.environ.get("ALPHA_EMPIRE_ALPHA", "") or 0.25))
+	# A player with no town (B2, the user's design, 2026-11-13: "maybe the total value of a player with no towns is /10"):
+	# its whole Φ x this while it owns no town, every part alike, for every player in the ledger's tables; the model's own
+	# phi the same from our town tokens (features.empire_value, its served buffer empire_no_town). ALPHA_EMPIRE_NO_TOWN sets
+	# it for a run as ALPHA_EMPIRE_ALPHA does (1: as before, bit for bit); the evaluation's EVAL_EMPIRE keeps 1
+	no_town_factor: float = field(default_factory=lambda: float(os.environ.get("ALPHA_EMPIRE_NO_TOWN", "") or 1.0))
 	income_days: float = 5.0  # unpriced income is worth this many days of it (the user: "sane for this hyperparameter")
 	hero_base: float = 1500.0  # gold: a fresh hero (its first two skill levels and five primary points), besides its army and artifacts
 	skill_level: float = 2000.0  # each secondary skill level beyond a fresh hero's two
@@ -105,7 +110,7 @@ class EmpireConfig:
 
 # The evaluation's Φ (its scores, evaluate.score): as of 2026-11-04's army multiplier, before the spellbook's factor and
 # the unled share, the army's movement and make-up, so its scores stay comparable across the changes
-EVAL_EMPIRE = EmpireConfig(alpha=0.25, spell_step=0.0, speed_power=0.0, army_morale=0.0)
+EVAL_EMPIRE = EmpireConfig(alpha=0.25, spell_step=0.0, speed_power=0.0, army_morale=0.0, no_town_factor=1.0)
 
 
 def _unit(creature_id, config):
@@ -254,6 +259,8 @@ def empire_value(player, config=EmpireConfig()):
 		parts["mana"] += capped_mana_value(hero["mana"], hero["power"], hero["spell_cost"])
 	parts["hero_penalty"] = -config.hero_penalty * len(player["heroes"]) ** 2
 	parts["explored"] = config.explored_tile * player.get("explored", 0)
+	if not player["towns"] and config.no_town_factor != 1.0:  # (B2: no town, every part x no_town_factor)
+		parts = {name: value * config.no_town_factor for name, value in parts.items()}
 	parts["total"] = sum(parts.values())
 	return parts
 

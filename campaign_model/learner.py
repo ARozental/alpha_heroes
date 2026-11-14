@@ -195,6 +195,8 @@ def set_advice_prior(model, config):
 			features.empty_as_visited.fill_(1.0 if getattr(config, "empty_as_visited", True) else 0.0)
 		if hasattr(features, "empire_alpha"):  # (ALPHA, the labels' own: the weights carry it to every inference server)
 			features.empire_alpha.fill_(float(EmpireConfig().alpha))
+		if hasattr(features, "empire_no_town"):  # (B2's no-town factor, the labels' own, carried the same way)
+			features.empire_no_town.fill_(float(EmpireConfig().no_town_factor))
 
 
 def campaign_model_kwargs(config, out, resume=False):

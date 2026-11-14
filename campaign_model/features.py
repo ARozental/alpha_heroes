@@ -457,6 +457,8 @@ def empire_value(x, t):
 		],
 		dim=-1,
 	)
+	# (B2: no town of ours, every part x the no-town factor, empire.py's rule; the parts' shares phi_features reads stay)
+	parts = parts * torch.where(own_towns.sum(dim=-1) == 0, t.empire_no_town, torch.ones_like(t.empire_no_town)).unsqueeze(-1)
 	return parts, parts.sum(dim=-1)
 
 

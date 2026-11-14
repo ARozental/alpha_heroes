@@ -403,6 +403,10 @@ class CustomFeatures(nn.Module):
 		# model takes its process's EmpireConfig (ALPHA_EMPIRE_ALPHA); the learner fills it from its own; a checkpoint from
 		# before has none and keeps the start, 0.25 where nothing is set
 		self.register_buffer("empire_alpha", torch.tensor(float(empire.alpha)))
+		# B2's no-town factor (empire.py no_town_factor, ALPHA_EMPIRE_NO_TOWN) the same way, ALPHA's buffer's rules: our phi
+		# x it while we own no town (features.empire_value) and the prior's two terms from it (town_take_gain, the last
+		# town's stake: _no_town_prior); 1, as a checkpoint from before keeps its process's: none of it
+		self.register_buffer("empire_no_town", torch.tensor(float(empire.no_town_factor)))
 		# config.empty_as_visited (B1b's bit read as visited at the model's input: features.empty_as_visited) as a buffer the
 		# weights carry, the learner's fill; 1 to begin with and in a checkpoint from before (ADDED_HEADS: the loading model's)
 		self.register_buffer("empty_as_visited", torch.ones(()))
@@ -747,6 +751,7 @@ class CustomFeatures(nn.Module):
 		f.recruit_pause = ft.recruit_pause(x, f.gold_pressure, f.town_danger)
 		f.build_rewards, f.upgrade_gains, f.spellbook_wanted = ft.build_rewards(x, self), ft.upgrade_gains(x, self), ft.spellbook_wanted(x, f.main)
 		f.reinforcements, f.town_stakes = ft.reinforcements(x, self, f.town_gold), ft.town_stakes(x, self, f.town_gold)
+		f.town_take_gain, f.town_stakes = self._no_town_prior(x, f.phi_total, f.town_stakes)
 		f.hire_want = ft.hire_want(x, f.gold_pressure, f.town_danger, ft.object_classes(x))
 		f.tavern_worth = ft.tavern_worth(x, self)
 		f.hire_gain = ft.hire_gain(x, self, f.tavern_worth)
@@ -1150,6 +1155,17 @@ class CustomFeatures(nn.Module):
 		defended = torch.ones_like(power, dtype=torch.bool) if manned else power > 0
 		return torch.log1p(power + fort * self.gain(self.fort_gain) * defended)
 
+	def _no_town_prior(self, x, phi, stakes):
+		"""B2's prior, from its reward alone (empire.py no_town_factor f; the user, 2026-11-13: "a strong push from an 'I
+		have no towns' to the moves that attack any town"): while we own no town, taking one pays what the rule takes,
+		(1 / f - 1) x our phi now (9 x at 0.1), on top of the town's own value where the prior prices taking a town not ours
+		(MOVE's object_gold, TRAVEL's towns), through the same win chance and discount [B]; losing our last town takes
+		(1 - f) x our phi (0.9 x) besides the town itself, added to its stake [B, TO]. Our own gold only (e5: a rival's
+		last town falling stays with the credit). f = 1: both nothing."""
+		own = ft.own_towns(x).float()
+		count, f, worth = own.sum(dim=-1), self.empire_no_town, phi.clamp(min=0)
+		return (1 / f - 1) * worth * (count == 0), stakes + ((1 - f) * worth * (count == 1)).unsqueeze(-1) * own
+
 	def town_value(self, x):
 		"""What taking each town adds to Φ at least [B, T]: its village hall and its fort level's buildings at cost (by
 		its faction; the rest is unseen), and the village hall's income for income_days."""
@@ -1180,6 +1196,7 @@ class CustomFeatures(nn.Module):
 		Nullkiller2 (v2728), 16 had ended their day with a TRAVEL, 10 of them out of a town of ours."""
 		contents, hidden = ft.area_contents(x, f.object_counts)
 		value = (contents * self.class_value * self.gain(self.class_gain)).sum(dim=-1) + hidden * self.explore_gold()
+		value = value + contents[..., c.ObjectClass.TOWN] * f.town_take_gain.unsqueeze(-1)  # (B2: a town not ours while we have none)
 		days = (x["travel_days"][:, :HO].reshape(value.shape[0], HO, -1).float() / 100).clamp(min=0)  # (-1: not legal, masked)
 		discount = ft.movement_discount(days, ft.bounded(self.travel_exponent, 0.7, 2.0, 1.3, CORRECTION_STEP))
 		home, defend, ferry, _, _ = self.pull_weights()
@@ -1334,7 +1351,7 @@ class CustomFeatures(nn.Module):
 		heroes_here = on_tile(x["h_pos"], x["h_present"] & (x["h_owner"] != c.OWNER_SELF))
 		towns_here = on_tile(x["t_pos"], x["t_present"] & (x["t_owner"] != c.OWNER_SELF))
 		armed_here = on_tile(x["a_pos"], x["a_present"])  # (a garrison not ours: its battle starts there)
-		town_value = of(towns_here, f.town_value)
+		town_value = of(towns_here, f.town_value + f.town_take_gain.unsqueeze(-1))  # (B2: taking one while we have none)
 		object_gold = self.object_gold(obj, subtype, town_value) * gate
 		creature = pick("w_creature")
 		monster = creature >= 0
@@ -1727,6 +1744,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	# decision state, its keys' context at 0, the options' known features' weights at 0 and the components' own rows:
 	# model_v2.migrate_option_head)
 	"features.empire_alpha",  # (ALPHA: a checkpoint from before keeps the loading model's, its process's EmpireConfig, never 0)
+	"features.empire_no_town",  # (B2's no-town factor, as ALPHA: the loading model's, its process's EmpireConfig)
 	"features.empty_as_visited",  # (config.empty_as_visited: a checkpoint from before keeps the loading model's, 1)
 	"foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option", "option_flags",
 	"decision", "option_context", "option_weights", "encode_options.component", "encode_options.primary", "encode_options.resource",
