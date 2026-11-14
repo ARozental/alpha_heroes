@@ -598,6 +598,20 @@ class CampaignLearner:
 			self.finished = self.finished[len(taken) :]
 		return taken
 
+	def _print_pair_readings(self):
+		"""(e5, deploy 77) each update: schema 21's weights as they move from 0 (the two reach columns' norms, pair_today's
+		four: END's and MULTI's for one exchange today and two or more) and B2's factor as the labels use it. After the
+		update, outside any graph; a diagnostic, its error a line, never the update's end."""
+		try:
+			reach, pair = getattr(getattr(self.model, "reach", None), "mlp", None), getattr(self.model, "pair_today", None)
+			if reach is None or pair is None:
+				return
+			cols = reach.up.weight.detach()[:, -2:].float().norm(dim=0).tolist()
+			w = pair.weight.detach().float().tolist()  # [END, MULTI] x [one today, two or more]
+			print(f"campaign schema 21: reach's pair columns |w| unchanged {cols[0]:.2e} today {cols[1]:.2e}; pair_today END {w[0][0]:+.2e}/{w[0][1]:+.2e} MULTI {w[1][0]:+.2e}/{w[1][1]:+.2e}; B2's f {float(getattr(self.empire, 'no_town_factor', 1.0)):.3f}", flush=True)
+		except Exception as error:  # noqa: BLE001
+			print(f"campaign schema 21's readings failed: {error!r}", flush=True)
+
 	def _ramp_no_town(self):
 		"""config.no_town_factor's ramp (B2): self.empire (the labels', the labeler's for each game submitted from now) and
 		the model's buffer at this version's f; nothing while the target is 1 (the EmpireConfig as it was, bit for bit)."""
@@ -808,6 +822,7 @@ class CampaignLearner:
 					self.head_var, self.head_scale_updates = metrics["head_var"], getattr(self, "head_scale_updates", 0) + 1
 					weights = metrics.get("head_weights") or {}
 					print("campaign value heads' weights (ramp %.2f): " % min(1.0, self.head_scale_updates / HEAD_SCALE_RAMP) + "  ".join(f"{name} " + "/".join(f"{w:.2f}" for w in values) for name, values in weights.items()) + "  target std " + "  ".join(f"{name} " + "/".join(f"{v ** 0.5:.3f}" for v in values) for name, values in self.head_var.items()), flush=True)
+				CampaignLearner._print_pair_readings(self)  # (the tests' learners are namespaces)
 				self._save(self.out / "checkpoint_latest.pt")
 		unspool(game for game, _ in games)  # (in the checkpoint now: this process's, or the update process's)
 		if self.worker:  # (the process saved its checkpoint with the trust before this update: one update behind)
