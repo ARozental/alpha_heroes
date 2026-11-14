@@ -705,6 +705,20 @@ def signal_ratio(optimizer):
 NOISE_PHASES = (("days 1-14", 1, 14), ("days 15-35", 15, 35), ("days 36+", 36, 10**6))  # loss_noise's, by the decisions' day
 
 
+def charge_loops(advantage, credited, loops, charge):
+	"""The loop charge (config.loop_charge): the advantage less `charge` on the credited rows inside a loop (loops: each
+	row's labels.LOOP_* type, 0 none), after its standardization, so no centering spreads it onto the other rows; and the
+	readings: the charge, the charged rows' share of the credited ones (and each type's), their mean advantage before it.
+	charge 0: the same tensor's values, bit for bit."""
+	flagged = credited & (loops > 0)
+	n = max(int(credited.sum()), 1)
+	stats = {"loop_charge": float(charge), "loop_share": int(flagged.sum()) / n, "loop_adv_before": float(advantage[flagged].mean()) if int(flagged.sum()) else float("nan")}
+	stats.update({f"loop_share_{t}": int((credited & (loops == t)).sum()) / n for t in (1, 2, 3)})
+	if charge == 0.0:
+		return advantage, stats
+	return advantage - charge * flagged.to(advantage.dtype), stats
+
+
 def standardized(values):
 	"""values [N] less their mean over the finite ones, over their standard deviation; nan stays nan."""
 	known = np.isfinite(values)
@@ -859,6 +873,7 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 	adv_part = torch.zeros((), device=keep.device)
 	if config.adv_weight > 0 and "adv_type" in out:
 		predicted, _ = advantage_of(out, batch["action"], batch["index"])
+		a = batch.get("adv_target", a)  # (config.loop_charge: the head learns the advantage without the charge; the policy reads the head)
 		answered = credit * (batch["action"] >= 0).float()
 		adv_part = (((predicted.float() - a) ** 2) * answered).sum() / batch["count_credit"]
 		loss = loss + config.adv_weight * adv_part
@@ -1618,6 +1633,11 @@ def ppo_update(
 	elif int(credited.sum()) > 1:
 		advantage = (advantage - advantage[credited].mean()) / (advantage[credited].std() + 1e-8)
 	advantage = torch.where(credited, advantage, torch.zeros_like(advantage))
+	adv_target = None  # (config.loop_charge: the advantage head's target stays the uncharged advantage)
+	if end is not None and "loops" in end:
+		adv_target = advantage
+		advantage, loop_stats = charge_loops(advantage, credited, torch.from_numpy(np.asarray(end["loops"], dtype=np.int64)).to(device), float(end.get("loop_charge", 0.0)))
+		adv_stats.update(loop_stats)
 	if hidden is not None:  # (each kind's advantage as the policy and the head take it: its mean and spread, its share of sum |A| x credit)
 		hidden_t = torch.from_numpy(np.asarray(hidden, dtype=bool)).to(device)
 		weight = advantage.abs().sum().clamp(min=1e-12)
@@ -1716,7 +1736,7 @@ def ppo_update(
 				share = len(part) / len(rows)
 				batch = {
 					**{k: choice[k][sub] for k in ("kind", "action", "index", "cell", "old_logp")},
-					"keep": keep, "advantage": advantage[sub], "credited": credited_f[sub], "targets": targets_t[sub], "share_valid": share_valid[sub], "anchor": anchor_safe[sub],
+					"keep": keep, "advantage": advantage[sub], **({"adv_target": adv_target[sub]} if adv_target is not None else {}), "credited": credited_f[sub], "targets": targets_t[sub], "share_valid": share_valid[sub], "anchor": anchor_safe[sub],
 					"count_credit": counts["credit"], "count_keep": counts["keep"], "count_share": counts["share"], "share": shares.setdefault(share, torch.full((), share, device=device)),
 				}
 				if growth is not None:
