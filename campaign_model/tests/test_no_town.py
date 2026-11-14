@@ -83,9 +83,12 @@ def test_the_prior_terms_come_from_the_rule_and_are_nothing_at_one():
 	# no town: taking one pays 9 x our phi now (the rule's x0.1 already in it)
 	assert float(on.town_take_gain[0]) == pytest.approx(9.0 * float(on.phi_total[0].clamp(min=0)), rel=1e-5)
 	assert float(on.town_take_gain[1]) == 0.0 and float(on.town_take_gain[2]) == 0.0
-	# the last town: its stake gains 0.9 x our phi; two towns: as before
-	assert float(on.town_stakes[1, 0]) == pytest.approx(float(base[1, 0]) + 0.9 * float(on.phi_total[1].clamp(min=0)), rel=1e-5)
-	assert torch.equal(on.town_stakes[1, 1:], base[1, 1:]) and torch.equal(on.town_stakes[2], base[2])
+	# the last town's stake term: off by default (config.no_town_last_town), the stakes as before; on, 0.9 x our phi more
+	assert torch.equal(on.town_stakes, base)
+	m.features.empire_last_town.fill_(1.0)
+	last = known_at(m, x, 0.1)
+	assert float(last.town_stakes[1, 0]) == pytest.approx(float(base[1, 0]) + 0.9 * float(last.phi_total[1].clamp(min=0)), rel=1e-5)
+	assert torch.equal(last.town_stakes[1, 1:], base[1, 1:]) and torch.equal(last.town_stakes[2], base[2])
 
 
 def test_taking_a_town_while_townless_raises_its_move_and_travel_prior():
@@ -114,3 +117,43 @@ def test_a_checkpoint_from_before_loads_with_its_process_factor_and_the_days_rea
 	carried.load_state_dict(m.state_dict())
 	assert float(carried.features.empire_no_town) == pytest.approx(0.1)  # (the learner's, carried to an inference server)
 	assert "features.empire_no_town" in state
+
+
+def test_the_factor_ramps_by_version_alone():
+	from campaign_model.config import CampaignConfig
+	from campaign_model.learner import no_town_now
+
+	off = CampaignConfig()
+	assert all(no_town_now(off, v) == 1.0 for v in (0, 3400, 10**6))
+	on = CampaignConfig(no_town_factor=0.1, no_town_from=3400)
+	assert no_town_now(on, 3399) == 1.0 and no_town_now(on, 3400) == pytest.approx(0.9)
+	got = [no_town_now(on, 3400 + k) for k in range(30)]
+	assert all(a >= b for a, b in zip(got, got[1:])) and got[-1] == 0.1 and got[20] > 0.1  # (about 22 updates down to 0.1)
+
+
+def test_the_learner_ramps_its_labels_and_the_model_together():
+	from campaign_model.config import CampaignConfig
+	from campaign_model.learner import CampaignLearner, no_town_now
+
+	m = model()
+	config = CampaignConfig(no_town_factor=0.1, no_town_from=3400)
+	learner = SimpleNamespace(config=config, version=3405, empire=EmpireConfig(), model=m, features_cpu=model().features)
+	CampaignLearner._ramp_no_town(learner)
+	f = no_town_now(config, 3405)
+	assert learner.empire.no_town_factor == pytest.approx(f) and float(m.features.empire_no_town) == pytest.approx(f)
+	assert float(learner.features_cpu.empire_no_town) == pytest.approx(f)
+	untouched = SimpleNamespace(config=CampaignConfig(), version=3405, empire=EmpireConfig(), model=model(), features_cpu=None)
+	CampaignLearner._ramp_no_town(untouched)
+	assert untouched.empire == EmpireConfig()  # (the target at 1: nothing, bit for bit)
+
+
+def test_the_last_town_switch_is_off_by_default_and_filled_from_the_config():
+	from campaign_model.config import CampaignConfig
+	from campaign_model.learner import set_advice_prior
+
+	m = model()
+	assert float(m.features.empire_last_town) == 0.0
+	set_advice_prior(m, CampaignConfig(no_town_last_town=True))
+	assert float(m.features.empire_last_town) == 1.0
+	set_advice_prior(m, CampaignConfig())
+	assert float(m.features.empire_last_town) == 0.0

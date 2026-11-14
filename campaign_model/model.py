@@ -407,6 +407,7 @@ class CustomFeatures(nn.Module):
 		# x it while we own no town (features.empire_value) and the prior's two terms from it (town_take_gain, the last
 		# town's stake: _no_town_prior); 1, as a checkpoint from before keeps its process's: none of it
 		self.register_buffer("empire_no_town", torch.tensor(float(empire.no_town_factor)))
+		self.register_buffer("empire_last_town", torch.zeros(()))  # (config.no_town_last_town: the last town's stake term, 0 = off)
 		# config.empty_as_visited (B1b's bit read as visited at the model's input: features.empty_as_visited) as a buffer the
 		# weights carry, the learner's fill; 1 to begin with and in a checkpoint from before (ADDED_HEADS: the loading model's)
 		self.register_buffer("empty_as_visited", torch.ones(()))
@@ -1160,11 +1161,13 @@ class CustomFeatures(nn.Module):
 		have no towns' to the moves that attack any town"): while we own no town, taking one pays what the rule takes,
 		(1 / f - 1) x our phi now (9 x at 0.1), on top of the town's own value where the prior prices taking a town not ours
 		(MOVE's object_gold, TRAVEL's towns), through the same win chance and discount [B]; losing our last town takes
-		(1 - f) x our phi (0.9 x) besides the town itself, added to its stake [B, TO]. Our own gold only (e5: a rival's
-		last town falling stays with the credit). f = 1: both nothing."""
+		(1 - f) x our phi (0.9 x) besides the town itself, added to its stake [B, TO], only with config.no_town_last_town
+		(features.empire_last_town; off: the stake as before). Our own gold only (e5: a rival's last town falling stays
+		with the credit). f = 1: both nothing."""
 		own = ft.own_towns(x).float()
 		count, f, worth = own.sum(dim=-1), self.empire_no_town, phi.clamp(min=0)
-		return (1 / f - 1) * worth * (count == 0), stakes + ((1 - f) * worth * (count == 1)).unsqueeze(-1) * own
+		last = ((1 - f) * worth * (count == 1) * (self.empire_last_town > 0)).unsqueeze(-1) * own
+		return (1 / f - 1) * worth * (count == 0), stakes + last
 
 	def town_value(self, x):
 		"""What taking each town adds to Φ at least [B, T]: its village hall and its fort level's buildings at cost (by
@@ -1745,6 +1748,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	# model_v2.migrate_option_head)
 	"features.empire_alpha",  # (ALPHA: a checkpoint from before keeps the loading model's, its process's EmpireConfig, never 0)
 	"features.empire_no_town",  # (B2's no-town factor, as ALPHA: the loading model's, its process's EmpireConfig)
+	"features.empire_last_town",  # (config.no_town_last_town: the loading model's, 0)
 	"features.empty_as_visited",  # (config.empty_as_visited: a checkpoint from before keeps the loading model's, 1)
 	"foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option", "option_flags",
 	"decision", "option_context", "option_weights", "encode_options.component", "encode_options.primary", "encode_options.resource",
