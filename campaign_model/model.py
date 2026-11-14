@@ -1741,6 +1741,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"fore_fight", "fore_move", "fore_answer", "fore_hero",  # (bundle 60: forecast-out, each forecast onto its own option's logit, 0 at the start)
 	"nkp.",  # (2026-11-11: nk_predict's head, model_v2.NkPredictHead: a new model's weights, nothing reads it)
 	"encode_global.no_town_days",  # (schema 20, B2: the global token's read of our days without a town, 0 at the start)
+	"pair_today",  # (schema 21: at an exchange, the pair's exchanges today onto END's and MULTI's scores, 0 at the start)
 )
 # Training-only parts rebuilt since, by prefix: a checkpoint's weights for them that the loading model lacks, or of
 # another shape, are dropped, the part starting again as a new model has it (2026-11-07: the privileged critic's first

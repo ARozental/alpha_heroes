@@ -460,6 +460,31 @@ private:
 	bool emptyVisit(const CGObjectInstance * obj, const CGHeroInstance * h) const;
 	/// An object whose every visit reveals the land around it, none of it hidden from us any more (emptyVisit)
 	bool revealSpent(const CRewardableObject * obj) const;
+	/// (schema 21) each pair of our heroes' last exchange (the pair's lower id first): what each held as it ended, its
+	/// day, how many of the pair's exchanges ended that day; written at every exchange's end, the cap's included, kept
+	/// always. Facts for the model (TILE_PAIR_UNCHANGED, TILE_PAIR_TODAY, x_pair_today), no rule acts on them
+	struct HeroHolding
+	{
+		std::map<CreatureID, int> army;
+		std::vector<ArtifactID> artifacts; // (worn and in the backpack, their types sorted)
+		bool operator==(const HeroHolding & other) const { return army == other.army && artifacts == other.artifacts; }
+	};
+	struct PairRecord
+	{
+		HeroHolding first, second;
+		int day = -1;
+		int endedThatDay = 0;
+	};
+	std::map<std::pair<ObjectInstanceID, ObjectInstanceID>, PairRecord> parted;
+	mutable std::shared_mutex partedMutex;
+	/// What a hero holds as the record compares it: its army (creature -> count) and its artifacts (worn and in the
+	/// backpack, their types sorted)
+	static HeroHolding holding(const CGHeroInstance & hero);
+	void noteParted(ObjectInstanceID first, ObjectInstanceID second);
+	/// (schema 21) of two heroes of ours: both still hold what their last exchange left them; that exchange ended today;
+	/// how many of their exchanges ended today (0: none)
+	bool pairUnchanged(const CGHeroInstance * one, const CGHeroInstance * two) const;
+	int pairEndedToday(const CGHeroInstance * one, const CGHeroInstance * two) const;
 	void encodeMap(Decision & decision, const std::vector<int3> & ours);
 	void encodeTiles(Decision & decision);
 	void encodeTileBlocks(Decision & decision, const std::vector<const CGHeroInstance *> & heroes, int side); // (a map bigger than MAP_TILES a side)

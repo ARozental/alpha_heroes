@@ -355,6 +355,56 @@ bool AlphaMapAI::emptyVisit(const CGObjectInstance * obj, const CGHeroInstance *
 	return (rules & EMPTY_SHRINE) && level > 0 && (!h->hasSpellbook() || h->maxSpellLevel() < level);
 }
 
+AlphaMapAI::HeroHolding AlphaMapAI::holding(const CGHeroInstance & hero)
+{
+	AlphaMapAI::HeroHolding held;
+	for(const auto & [slot, stack] : hero.Slots())
+		held.army[stack->getId()] += stack->getCount();
+	for(const auto & [position, slot] : hero.artifactsWorn)
+		if(const auto * art = slot.getArt())
+			held.artifacts.push_back(art->getTypeId());
+	for(const auto & slot : hero.artifactsInBackpack)
+		if(const auto * art = slot.getArt())
+			held.artifacts.push_back(art->getTypeId());
+	std::sort(held.artifacts.begin(), held.artifacts.end());
+	return held;
+}
+
+void AlphaMapAI::noteParted(ObjectInstanceID first, ObjectInstanceID second)
+{
+	// (schema 21) each exchange of two heroes of ours, whatever it did, nothing included: what each held as it ended,
+	// the day, and the pair's count of exchanges ended that day
+	const auto * one = cb->getHero(std::min(first, second));
+	const auto * two = cb->getHero(std::max(first, second));
+	if(!one || !two) // (a garrison's dialog: no pair of heroes)
+		return;
+	const int today = cb->getDate(Date::DAY);
+	std::unique_lock lock(partedMutex);
+	auto & record = parted[{one->id, two->id}];
+	record.endedThatDay = record.day == today ? record.endedThatDay + 1 : 1;
+	record.day = today;
+	record.first = holding(*one);
+	record.second = holding(*two);
+}
+
+bool AlphaMapAI::pairUnchanged(const CGHeroInstance * one, const CGHeroInstance * two) const
+{
+	if(two->id < one->id)
+		std::swap(one, two);
+	std::shared_lock lock(partedMutex);
+	const auto found = parted.find({one->id, two->id});
+	return found != parted.end() && found->second.first == holding(*one) && found->second.second == holding(*two);
+}
+
+int AlphaMapAI::pairEndedToday(const CGHeroInstance * one, const CGHeroInstance * two) const
+{
+	if(two->id < one->id)
+		std::swap(one, two);
+	std::shared_lock lock(partedMutex);
+	const auto found = parted.find({one->id, two->id});
+	return found != parted.end() && found->second.day == cb->getDate(Date::DAY) ? found->second.endedThatDay : 0;
+}
+
 bool AlphaMapAI::revealSpent(const CRewardableObject * obj) const
 {
 	// (B1) each visit reveals the land within its reward's radius (revealTiles: 20 for both) around the visitor, who
@@ -486,6 +536,13 @@ Decision AlphaMapAI::encode(DecisionKind kind, ObjectInstanceID exchangeFirst, O
 		{
 			decision.inputs.at(In::x_heroes, 0) = a + 1;
 			decision.inputs.at(In::x_heroes, 1) = b + 1;
+			if(const auto * one = cb->getHero(exchangeFirst), * two = cb->getHero(exchangeSecond); one && two)
+			{
+				// (schema 21) the exchanges this pair has ended today: one, two or more
+				const int ended = pairEndedToday(one, two);
+				decision.inputs.at(In::x_pair_today, 0) = ended == 1 ? 1 : 0;
+				decision.inputs.at(In::x_pair_today, 1) = ended >= 2 ? 1 : 0;
+			}
 			encodeArtifacts(decision, a, b);
 			encodeMulti(decision, a, b);
 		}
@@ -843,6 +900,12 @@ void AlphaMapAI::encodeWindows(Decision & decision, PathfinderCache & paths)
 					flags |= obj->wasVisited(playerID) ? TILE_VISITED_BY_PLAYER : 0;
 					flags |= obj->wasVisited(h) ? TILE_VISITED_BY_HERO : 0;
 					flags |= emptyVisit(obj, h) ? TILE_EMPTY_FOR_HERO : 0; // (B1b)
+					if(const auto * other = dynamic_cast<const CGHeroInstance *>(obj); other && other != h && other->tempOwner == playerID)
+					{
+						// (schema 21) this pair's last exchange, as facts: both still hold what it left them; it ended today
+						flags |= pairUnchanged(h, other) ? TILE_PAIR_UNCHANGED : 0;
+						flags |= pairEndedToday(h, other) > 0 ? TILE_PAIR_TODAY : 0;
+					}
 					flags |= unseenExit(obj) ? TILE_UNSEEN_EXIT : 0;
 					// (a resource pile's amount is not shown to a human either: none)
 					if(obj->ID == Obj::MONSTER)

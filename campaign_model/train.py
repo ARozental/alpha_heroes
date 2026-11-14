@@ -516,6 +516,8 @@ def fit_moments(optimizer, model):
 	(model_v2.move_pair_columns), any other started fresh (logged)."""
 	from .model_v2 import move_pair_columns
 
+	from .model_v2 import GROWN_INPUTS
+
 	names = {id(p): name for name, p in model.named_parameters()}
 	for group in optimizer.param_groups:
 		for p in group["params"]:
@@ -523,10 +525,17 @@ def fit_moments(optimizer, model):
 			if not state or "exp_avg" not in state or state["exp_avg"].shape == p.shape:
 				continue
 			name = names.get(id(p), "?")
+			old = state["exp_avg"]
 			if name == "move_pair.up.weight" and move_pair_columns(state["exp_avg"], fold=False).shape == p.shape:
 				for key in ("exp_avg", "exp_avg_sq"):
 					state[key] = move_pair_columns(state[key], fold=False)
 				print(f"campaign optimizer: {name}'s moments moved to its inputs now (model_v2.move_pair_columns)", flush=True)
+			elif name in GROWN_INPUTS and old.dim() == 2 and old.shape[0] == p.shape[0] and old.shape[1] < p.shape[1]:
+				# (schema 21: a layer's new input columns, at the end and at 0 as model_v2.pad_new_inputs puts them, with moments
+				# 0 there; its old columns keep theirs (deploy 76's 12th column started its whole layer's moments fresh))
+				for key in ("exp_avg", "exp_avg_sq"):
+					state[key] = torch.cat([state[key], state[key].new_zeros(p.shape[0], p.shape[1] - state[key].shape[1])], dim=1)
+				print(f"campaign optimizer: {name}'s moments padded with 0 for its {p.shape[1] - old.shape[1]} new input columns", flush=True)
 			else:
 				del optimizer.state[p]
 				print(f"campaign optimizer: {name}'s moments did not fit its shape {tuple(p.shape)}: fresh", flush=True)
