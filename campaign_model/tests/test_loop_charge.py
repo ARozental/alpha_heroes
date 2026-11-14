@@ -1,8 +1,8 @@
 """The loop charge (config.loop_charge; the user, 2026-11-14: penalties on exchanges that are strictly useless; e5's
-design; e5's reset rule of 2026-11-14: anything either hero does between the two points breaks it): labels.loop_flags on
-hand-made sequences (a null dialog, give and take back with nothing between; no loop with a step of the receiver, a
-third hero met, a CAST, a battle or question, an unattributed decision between; an undone move inside a dialog that
-goes on, another day = no loop, END never flagged), train.charge_loops after the
+design; the user's reset of 2026-11-14: only an attack or a surrender by a hero of the pair breaks it): labels.loop_flags
+on hand-made sequences (a null dialog, give and take back; still a loop with a step, a CAST, a third hero met or its
+fight between; no loop with the pair's battle or creature question, or one of no known hero; an undone move inside a
+dialog that goes on, another day = no loop, END never flagged; the repeat dialogs' reading), train.charge_loops after the
 standardization on the flagged credited rows alone, the ramp by version, and the learner's update end to end (at 0:
 nothing computed, bit for bit)."""
 import collections
@@ -26,30 +26,26 @@ PAIR = (7, 9)
 
 
 THIRD = 5  # a third hero of ours
-MEET = "meet"  # a turn MOVE of PAIR's first onto its second
 
 
-def flags(events, resets=()):
-	"""events: [(kind, action, the pair's state at the decision (or (state, day)), who)] -> loop_flags: who a turn
-	decision's heroes (a set; None the record cannot say; MEET a MOVE onto the other), an exchange's pair; by default a
-	turn MOVE is MEET, an exchange PAIR's, any other decision acts with no hero. Another pair's states never repeat."""
-	steps, states, actors, meets = [], [], [], []
+def flags(events, breaks=None, stats=None):
+	"""events: [(kind, action, the pair's state at the decision (or (state, day)), an exchange's pair)] -> loop_flags: an
+	exchange PAIR's by default; breaks {index: hero ids, or None for no hero known}. Another pair's states never repeat."""
+	steps, states = [], []
 	for event in events:
 		kind, action, state = event[:3]
-		who = event[3] if len(event) > 3 else (MEET if kind == TURN and action == A.MOVE else PAIR if kind == EXCHANGE else frozenset())
-		state, day = state if isinstance(state, tuple) else (state, 1)
-		pair = (tuple(sorted(who)) if kind == EXCHANGE else None)
+		pair = (event[3] if len(event) > 3 else PAIR) if kind == EXCHANGE else None
+		state, day = state if isinstance(state, tuple) and len(state) == 2 and isinstance(state[1], int) else (state, 1)
 		steps.append((kind, int(action), day, pair))
 		states.append(state)
-		actors.append(frozenset({PAIR[0]}) if who == MEET else None if who is None else frozenset(who))
-		meets.append(PAIR if who == MEET else (who[0], THIRD) if isinstance(who, tuple) and kind == TURN else None)
 	state_of = lambda i, pair: states[i] if pair == PAIR else ("other", i)  # noqa: E731
-	return loop_flags(steps, state_of, set(resets), actors, meets)
+	return loop_flags(steps, state_of, breaks or {}, stats)
 
 
 # give the army, take it back the same day: the two dialogs and the MOVEs that open them
 GIVE = [(TURN, A.MOVE, "s0"), (EXCHANGE, A.ARMY, "s0"), (EXCHANGE, A.END, "s1")]
 BACK = [(TURN, A.MOVE, "s1"), (EXCHANGE, A.ARMY, "s1"), (EXCHANGE, A.END, "s0"), (TURN, A.END, "s0")]
+CHARGED = [0, 1, 4, 5]  # (GIVE + one decision + BACK: the two MOVEs and the two ARMYs)
 
 
 def test_a_null_dialog_flags_its_moves_and_its_meeting_but_never_end():
@@ -59,37 +55,37 @@ def test_a_null_dialog_flags_its_moves_and_its_meeting_but_never_end():
 
 def test_give_and_take_back_with_nothing_between_is_a_loop():
 	assert flags(GIVE + BACK).tolist() == [LOOP_ACROSS, LOOP_ACROSS, LOOP_NONE, LOOP_ACROSS, LOOP_ACROSS, LOOP_NONE, LOOP_NONE]
-	# (between them: a town's or the player's own decision, another hero's step, the other's MOVE onto the first: still one)
-	for between in [(TURN, A.BUILD, "s1"), (TURN, A.MOVE, "s1", {THIRD}), (TURN, A.MOVE, "s1", MEET)]:
-		assert flags(GIVE + [between] + BACK)[[0, 1, 4, 5]].tolist() == [LOOP_ACROSS] * 4, between
 
 
-def test_the_receiver_steps_to_an_empty_tile_and_back_then_returns_the_army_is_no_loop():
-	away = [(TURN, A.MOVE, "s1", {PAIR[1]}), (TURN, A.MOVE, "s1", {PAIR[1]})]
-	assert not flags(GIVE + away + BACK).any()
-	assert not flags(GIVE + away[:1] + BACK).any()  # (one step: the lender's spare movement saved, the army used)
+def test_moving_without_a_fight_stays_inside_the_loop():
+	"""(the user, 2026-11-14: "moving and not attacking means that you didn't use the moved artifact": the receiver's step
+	to an empty tile and back, a CAST, a visit, a town's decision between: still a loop, the step itself never charged)"""
+	away = [(TURN, A.MOVE, "s1"), (TURN, A.MOVE, "s1")]
+	out = flags(GIVE + away + BACK)
+	assert out[[0, 1, 5, 6]].tolist() == [LOOP_ACROSS] * 4 and out[[3, 4]].tolist() == [LOOP_NONE] * 2
+	for between in [(TURN, A.CAST, "s1"), (TURN, A.TRAVEL, "s1"), (TURN, A.RECRUIT, "s1"), (TURN, A.BUILD, "s1")]:
+		assert flags(GIVE + [between] + BACK)[CHARGED].tolist() == [LOOP_ACROSS] * 4, between
 
 
-def test_the_receiver_meets_a_third_hero_between_is_no_loop():
-	third = [(TURN, A.MOVE, "s1", (PAIR[1],)), (EXCHANGE, A.ARMY, "s1", (PAIR[1], THIRD)), (EXCHANGE, A.END, "s1", (PAIR[1], THIRD))]
-	assert not flags(GIVE + third + BACK).any()
-	assert not flags(GIVE + third[1:] + BACK).any()  # (the third's dialog alone, opened by the third's MOVE or none)
+def test_the_receiver_meeting_a_third_hero_between_stays_a_loop():
+	third = [(TURN, A.MOVE, "s1"), (EXCHANGE, A.ARMY, "s1", (PAIR[1], THIRD)), (EXCHANGE, A.END, "s1", (PAIR[1], THIRD))]
+	out = flags(GIVE + third + BACK)
+	assert out[[0, 1, 6, 7]].tolist() == [LOOP_ACROSS] * 4 and not out[[3, 4, 5]].any()
 
 
-def test_a_cast_or_any_act_of_the_pair_between_is_no_loop():
-	for between in [(TURN, A.CAST, "s1", {PAIR[1]}), (TURN, A.TRAVEL, "s1", {PAIR[0]}), (TURN, A.RECRUIT, "s1", {PAIR[1]}), (TURN, A.ARMY, "s1", {PAIR[0], THIRD})]:
-		assert not flags(GIVE + [between] + BACK).any(), between
+def test_an_attack_or_a_surrender_by_the_pair_between_is_no_loop():
+	"""(a battle at the first decision after it, from the receiver's MOVE; a creature question after its MOVE, the
+	surrender case; one at the second dialog's MOVE came before that MOVE)"""
+	step = [(TURN, A.MOVE, "s1")]
+	assert not flags(GIVE + step + BACK, breaks={4: {PAIR[1]}}).any()
+	assert not flags(GIVE + step + [(QUESTION, 0, "s1")] + BACK, breaks={4: {PAIR[1]}}).any()
+	assert not flags(GIVE + BACK, breaks={3: {PAIR[0]}}).any()
 
 
-def test_a_decision_the_record_cannot_attribute_is_no_loop():
-	assert not flags(GIVE + [(TURN, A.ARMY, "s1", None)] + BACK).any()
-
-
-def test_a_battle_or_a_question_between_is_no_loop():
-	"""(the surrender case: the receiver's walk asks the player whether to accept the creatures' offer)"""
-	assert not flags(GIVE + [(TURN, A.BUILD, "s1")] + BACK, resets={3}).any()  # (a battle recorded at the 4th decision)
-	assert not flags(GIVE + [(QUESTION, 0, "s1")] + BACK, resets={3}).any()  # (loop_rows resets at every question)
-	assert not flags(GIVE + BACK, resets={3}).any()  # (one at the second dialog's MOVE: the battle came before it)
+def test_a_fight_of_a_third_hero_between_stays_a_loop_and_one_of_no_known_hero_breaks_it():
+	step = [(TURN, A.MOVE, "s1")]
+	assert flags(GIVE + step + BACK, breaks={4: {THIRD}})[CHARGED].tolist() == [LOOP_ACROSS] * 4
+	assert not flags(GIVE + [(QUESTION, 0, "s1")] + BACK, breaks={3: None}).any()
 
 
 def test_an_undone_move_inside_a_dialog_that_goes_on():
@@ -101,6 +97,17 @@ def test_another_day_is_no_loop_and_a_change_kept_is_none():
 	days = [(TURN, A.MOVE, ("s0", 1)), (EXCHANGE, A.ARMY, ("s0", 1)), (EXCHANGE, A.END, ("s1", 1)), (TURN, A.MOVE, ("s1", 2)), (EXCHANGE, A.ARMY, ("s1", 2)), (EXCHANGE, A.END, ("s0", 2)), (TURN, A.END, ("s0", 2))]
 	assert not flags(days).any()
 	assert not flags(GIVE + [(TURN, A.END, "s1")]).any()
+
+
+def test_the_repeat_dialogs_reading_counts_an_inexact_return_to_the_giver():
+	"""(e5: loops falling while inexact returns rise = the charge dodged): the second dialog gives 5 of the 6 back"""
+	army = lambda a, b: ((((1, a),), ()), (((1, b),), ()))  # noqa: E731 (the pair's two heroes: creature 1, its count)
+	events = [(TURN, A.MOVE, army(10, 0)), (EXCHANGE, A.ARMY, army(10, 0)), (EXCHANGE, A.END, army(4, 6)), (TURN, A.MOVE, army(4, 6)), (EXCHANGE, A.ARMY, army(4, 6)), (EXCHANGE, A.END, army(9, 1)), (TURN, A.END, army(9, 1))]
+	stats = {}
+	assert not flags(events, stats=stats).any()
+	assert stats == {"repeat_dialogs": 1, "repeat_not_loop": 1, "repeat_not_loop_back": 1}
+	stats = {}
+	assert flags(GIVE + BACK, stats=stats).any() and stats == {"repeat_dialogs": 1}
 
 
 def test_the_charge_lands_after_the_standardization_on_flagged_credited_rows_alone():
@@ -184,6 +191,6 @@ def test_an_update_carries_the_flags_and_the_charge_and_at_zero_none(tmp_path, c
 		if charge:
 			counted = sum(len(game.decisions) for game, _ in games)
 			assert len(end["loops"]) == counted and abs(end["loop_charge"] - 0.01) < 1e-12  # (version 1, from 1: one step of 0.01)
-			assert "campaign loop charge: c 0.010" in printed
+			assert "campaign loop charge: c 0.010" in printed and "same-day repeat dialogs" in printed
 		else:
 			assert "loops" not in end and "loop_charge" not in end and "campaign loop charge" not in printed
