@@ -551,6 +551,11 @@ class Games(IterableDataset):
 						self.release_server(slot)
 					self.release(where, conn)
 					trim_memory()
+				if self.kind == "campaign":
+					# (the loader's feeder thread keeps the last item it sent until the next one: a whole game's pickle,
+					# 0.1-0.7 GB, held for as long as the memory gate keeps this worker waiting; e5, 2026-11-14: nine idle
+					# workers held 3.0 GB of PSS on the PC. A small item after each game takes its place; _route ignores it)
+					yield {"kind": "handed"}
 		finally:
 			runner.close()
 
@@ -803,6 +808,7 @@ def _worker_init(_index):
 	signal.signal(signal.SIGTERM, stop)
 	signal.signal(signal.SIGINT, signal.SIG_IGN)  # (the trainer's Ctrl-C is the trainer's to handle)
 	gc.freeze()
+	forkserver.start_trimmer()  # (what the loader's feeder frees after the game's own trim_memory: back every TRIM_EVERY)
 
 
 def trim_memory():

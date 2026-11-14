@@ -70,7 +70,7 @@ class Labeler:
 	def __init__(self, labels=LabelConfig(), empire=EmpireConfig(), foresight=True, workers=LABEL_WORKERS, share_target="share"):
 		self.labels, self.empire, self.foresight, self.share_target = labels, empire, foresight, share_target
 		# (the run's forkserver, its preload set: this pool may be what starts it, at a resume's labels of the spooled games)
-		self.pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=forkserver.context())
+		self.pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=forkserver.context(), initializer=forkserver.start_trimmer)  # (the trimmer: its heap back between games, 2026-11-14)
 
 	def submit(self, game, features, empire=None):
 		"""A Future of precompute(game) (a records.Game, or its spool file's path) with the features module's weights as
