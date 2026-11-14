@@ -101,10 +101,12 @@ def clip_gradients(optimizer, grad_clip, clips=None, names=None):
 	return total, padded(norms), padded(bound)
 
 
-def moments_by_name(optimizer, model, saved, saved_names):
+def moments_by_name(optimizer, model, saved, saved_names, keep=()):
 	"""The saved optimizer state (saved: its state_dict; saved_names: its parameters' names in its numbering) loaded into
 	optimizer by name, whatever its groups now; the groups' hyperparameters stay optimizer's (load_state_dict would
-	take the checkpoint's). Returns (the names that started fresh, the saved names now gone)."""
+	take the checkpoint's). A parameter of another shape now starts fresh, unless its name is in keep: then its saved
+	moments are loaded as they are, for the caller to fit (campaign_model.train.fit_moments: a grown layer's new input
+	columns). Returns (the names that started fresh, the saved names now gone)."""
 	names = {id(p): name for name, p in model.named_parameters()}
 	flat = [i for group in saved["param_groups"] for i in group["params"]]
 	by_name = {name: saved["state"][i] for name, i in zip(saved_names, flat) if i in saved["state"]}
@@ -113,7 +115,7 @@ def moments_by_name(optimizer, model, saved, saved_names):
 		ids = []
 		for p in group["params"]:
 			name = names[id(p)]
-			if name in by_name and by_name[name].get("exp_avg", p).shape == p.shape:
+			if name in by_name and (by_name[name].get("exp_avg", p).shape == p.shape or name in keep):
 				state[index] = by_name[name]
 			elif name not in had or name in by_name:  # (new, or of another shape now: fresh moments)
 				fresh.append(name)

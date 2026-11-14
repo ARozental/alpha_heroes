@@ -137,3 +137,26 @@ def test_a_record_of_schema_20_reads_the_count_as_none():
 	assert not got["x_pair_today"].any()
 	whole = decode_inputs([SimpleNamespace(inputs=zlib.compress(full))])
 	assert whole["x_pair_today"][0].tolist() == [0, 1]
+
+
+def test_a_checkpoints_optimizer_keeps_the_grown_layers_moments_padded():
+	"""load_optimizer end to end (the learner's resume): a saved optimizer whose reach layer had schema 20's 12 columns
+	loads with those columns' moments as saved and the two new ones at 0, not the whole layer fresh."""
+	from campaign_model.train import load_optimizer, make_optimizer
+
+	m = model()
+	opt = make_optimizer(m)
+	p = m.reach.mlp.up.weight
+	for q in m.parameters():
+		opt.state[q]["step"] = torch.tensor(50.0)
+		opt.state[q]["exp_avg"] = torch.full_like(q, 0.25)
+		opt.state[q]["exp_avg_sq"] = torch.full_like(q, 0.5)
+	saved = opt.state_dict()
+	index = [i for group in saved["param_groups"] for i, name in zip(group["params"], group["param_names"]) if name == "reach.mlp.up.weight"][0]
+	for key in ("exp_avg", "exp_avg_sq"):
+		saved["state"][index][key] = saved["state"][index][key][:, :-2].clone()  # (schema 20's 12 columns)
+	fresh = make_optimizer(m)
+	load_optimizer(fresh, m, saved, m.state_dict().keys())
+	got = fresh.state[p]
+	assert got["exp_avg"].shape == p.shape and float(got["exp_avg"][:, :-2].min()) == 0.25 and float(got["exp_avg_sq"][:, :-2].min()) == 0.5
+	assert float(got["exp_avg"][:, -2:].abs().sum()) == 0.0 and float(got["exp_avg_sq"][:, -2:].abs().sum()) == 0.0

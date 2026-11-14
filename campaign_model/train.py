@@ -502,8 +502,10 @@ def load_optimizer(optimizer, model, saved, saved_keys):
 	hire_worth) starts the new ones fresh, one that has lost some (2026-11-04: the question head's option_q,
 	answer_fight, answer_join) drops theirs. The groups' hyperparameters stay the optimizer's, the config's (the
 	checkpoint's would win in load_state_dict: a changed prior_decay or beta1 never applied to a resumed run)."""
+	from .model_v2 import GROWN_INPUTS
+
 	saved_names = saved_parameter_names(saved, model, list(saved_keys))
-	fresh, gone = moments_by_name(optimizer, model, saved, saved_names)
+	fresh, gone = moments_by_name(optimizer, model, saved, saved_names, keep=GROWN_INPUTS)  # (a grown layer's moments kept for fit_moments to pad)
 	fit_moments(optimizer, model)
 	moved = sorted({group.get("name", "?") for group in optimizer.param_groups} - {group.get("name", "?") for group in saved["param_groups"]})
 	if fresh or gone or moved:
