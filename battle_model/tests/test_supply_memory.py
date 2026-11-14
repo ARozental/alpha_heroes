@@ -179,3 +179,77 @@ def test_the_census_line_carries_the_heap_lines_every_types_census():
 	out = supply.Supply.memory_census(self, 4.2, by_type=True).splitlines()
 	assert out[0].startswith("trainer memory: rss 4.20 GB; ") and "objects " in out[0] and out[-1].startswith("trainer heap owners: "), out
 	assert len(supply.Supply.memory_census(self, 4.2).splitlines()) == 1
+
+
+def test_a_campaign_game_is_followed_by_a_small_item_here_and_relayed(tmp_path, monkeypatch):
+	"""(e5, 2026-11-14: the loader's feeder thread keeps the last item it sent, a whole game's pickle, until the next one)
+	Games.__iter__ yields {"kind": "handed"} after each campaign game, played here or relayed, and after a lost one; a
+	battle worker's items are as before; the trainer's _route ignores it."""
+	import threading
+	from types import SimpleNamespace
+
+	class FakeRunner:
+		def __init__(self, *args, **kwargs):
+			self.campaign_socket, self.battle_socket = None, None
+
+		def sample_campaign(self, rng, index, n):
+			return {"key": f"c{n}"}
+
+		def sample_battle(self, rng, index, n):
+			return {"key": f"b{n}"}
+
+		def campaign(self, spec, stop):
+			if spec["key"] == "c2":
+				raise RuntimeError("lost")
+			yield {"kind": "battle", "key": spec["key"]}
+			yield {"kind": "campaign", "key": spec["key"]}
+
+		def battle(self, spec, keep_record=False):
+			yield {"kind": "battle", "key": spec["key"]}
+
+		def close(self):
+			pass
+
+	monkeypatch.setattr(supply, "Runner", FakeRunner)
+	monkeypatch.setattr(supply, "relay", lambda conn, spec: iter([{"kind": "campaign", "key": spec["key"], "relayed": True}]))
+	monkeypatch.setattr(supply, "trim_memory", lambda: None)
+	stop = threading.Event()
+	for kind, where in (("campaign", "here"), ("campaign", "remote"), ("battle", "here")):
+		stop.clear()
+		shared = SimpleNamespace(stop=stop, version=SimpleNamespace(value=0), credit=None)
+		games = supply.Games.__new__(supply.Games)
+		games.kind, games.config, games.run_dir, games.shared, games.link = kind, SimpleNamespace(seed=0, campaign=SimpleNamespace(seed=0)), tmp_path, shared, None
+		games.battle_sockets, games.campaign_sockets = ["b"], []
+		games.permits_left, games.permit, games.take_server, games.release_server = (lambda: True), (lambda: True), (lambda: None), (lambda slot: None)
+		games.place, games.release = (lambda: (where, object() if where == "remote" else None)), (lambda where, conn: None)
+		items = []
+		for item in games:
+			items.append(item)
+			if len(items) >= 7:
+				stop.set()
+		kinds = [i["kind"] for i in items]
+		if kind == "battle":
+			assert kinds == ["battle"] * 7, kinds
+		elif where == "here":
+			assert kinds[:6] == ["battle", "campaign", "handed", "failed", "handed", "battle"], kinds  # (game 1, the lost game 2, game 3)
+		else:
+			assert kinds[:4] == ["campaign", "handed", "campaign", "handed"], kinds
+	routed = SimpleNamespace(stats={}, pool=None, campaign=None)
+	supply.Supply._route(routed, {"kind": "handed"})  # (ignored: no branch, nothing counted)
+
+
+def test_the_pool_workers_start_their_trimmer():
+	"""(2026-11-14) the loaders' workers (supply._worker_init) and the labels' processes (their pool's initializer) start
+	forkserver.start_trimmer: on Linux a daemon thread, elsewhere nothing."""
+	import sys
+
+	from battle_model import forkserver
+	from campaign_model.labeler import Labeler
+
+	thread = forkserver.start_trimmer(seconds=3600)
+	assert (thread is not None and thread.daemon and thread.is_alive()) if sys.platform.startswith("linux") else thread is None
+	labeler = Labeler(workers=1)
+	try:
+		assert labeler.pool._initializer is forkserver.start_trimmer
+	finally:
+		labeler.pool.shutdown()

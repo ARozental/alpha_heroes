@@ -347,6 +347,11 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # 0.70-0.80 for 50 updates. Back to v3295 with every training game our own: campaign.nk2_choice_games=0 and
 # campaign.nk2_follow=0, as lines 60-65 had; the code a49b192's as it is (deploy 71's bound failed its paired test, not
 # deployed). The recorded mixed continuation from v3295 is the control.
+# Deploy 80 (2026-11-14, e5): the loader's workers let go of their last game (battle_model/supply.py: a small "handed" item
+# after each campaign game, so the loader's feeder thread no longer holds the game's pickle, 0.1-0.7 GB, while the worker
+# waits; a malloc_trim thread in each pool worker, the labels' processes too, for what is freed after the game's own
+# trim; e5 measured nine idle workers at 3.0 GB PSS and the PC averaging 4.5 games of 14) and the update's games released
+# before its memory is trimmed (dff7efa). campaign.games stays 14. Deploy 79's weights continued.
 # Deploy 79 (2026-11-14, e5): the trainer's heap census (battle_model/supply.py: "trainer heap:" and "trainer heap owners:"
 # lines every census of types) and the update's size cap: campaign.update_decisions_cap=135000 with a floor of 12 games
 # (campaign.update_games_floor): deploy 77/78's longer games made 20 games 105k-185k decisions, their restored inputs
