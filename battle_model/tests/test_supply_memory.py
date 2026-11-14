@@ -120,3 +120,37 @@ def test_the_runs_forkserver_preloads_what_a_worker_imports(tmp_path):
 	root = Path(__file__).resolve().parents[2]
 	result = subprocess.run([sys.executable, str(script)], cwd=root, env={**__import__("os").environ, "PYTHONPATH": str(root)}, capture_output=True, text=True, timeout=300)
 	assert result.stdout.strip().splitlines()[-1] == "(True, '1')", result.stdout + result.stderr[-2000:]
+
+
+def test_the_heap_census_names_what_holds_the_bytes():
+	"""(2026-11-14: the trainer's ~2.2 GB since deploy 77's restart) supply.heap_census: the arrays' data at their base, the
+	bytes, the CPU tensors' storage, each once, by holder (an instance's __dict__ named by its class)."""
+	import gc
+
+	import numpy as np
+	import torch
+
+	class Holder:
+		pass
+
+	h = Holder()
+	h.array = np.ones(2**26, dtype=np.uint8)  # 64 MB
+	h.view = h.array[10:]  # (its base: counted once)
+	h.blob = b"x" * 2**26
+	h.inside = {"a": np.ones(2**26, dtype=np.uint8)}  # (an untracked dict: its contents too)
+	t = torch.ones(2**24, dtype=torch.float32)  # 64 MB of storage
+	keep = [h, t, t[5:]]
+	line = supply.heap_census(gc.get_objects()).splitlines()[-1]
+	assert line.startswith("trainer heap owners: ") and "ndarray in Holder 0.12" in line and "bytes in Holder 0.06" in line and "tensor storage (cpu) 0.06" in line, line
+	assert keep
+
+
+def test_the_census_line_carries_the_heap_lines_every_types_census():
+	"""Supply.memory_census with by_type: its one line, then the heap's (heap_census; on Linux malloc's split first)."""
+	import threading
+	from types import SimpleNamespace
+
+	self = SimpleNamespace(campaign=None, pool=SimpleNamespace(lock=threading.Lock(), buffer=[{"decisions": 3, "data": None}]))
+	out = supply.Supply.memory_census(self, 4.2, by_type=True).splitlines()
+	assert out[0].startswith("trainer memory: rss 4.20 GB; ") and "objects " in out[0] and out[-1].startswith("trainer heap owners: "), out
+	assert len(supply.Supply.memory_census(self, 4.2).splitlines()) == 1
