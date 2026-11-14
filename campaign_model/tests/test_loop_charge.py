@@ -1,6 +1,8 @@
 """The loop charge (config.loop_charge; the user, 2026-11-14: penalties on exchanges that are strictly useless; e5's
-design): labels.loop_flags on hand-made sequences (a null dialog, give and take back, a battle between = no loop, an
-undone move inside a dialog that goes on, another day = no loop, END never flagged), train.charge_loops after the
+design; e5's reset rule of 2026-11-14: anything either hero does between the two points breaks it): labels.loop_flags on
+hand-made sequences (a null dialog, give and take back with nothing between; no loop with a step of the receiver, a
+third hero met, a CAST, a battle or question, an unattributed decision between; an undone move inside a dialog that
+goes on, another day = no loop, END never flagged), train.charge_loops after the
 standardization on the flagged credited rows alone, the ramp by version, and the learner's update end to end (at 0:
 nothing computed, bit for bit)."""
 import collections
@@ -23,56 +25,82 @@ TURN, EXCHANGE, QUESTION = int(c.DecisionKind.TURN), int(c.DecisionKind.EXCHANGE
 PAIR = (7, 9)
 
 
-def sequence(events, day=1):
-	"""events: [(kind, action, the pair's state at the decision)] -> (steps, state_of): a turn MOVE's and an exchange's
-	pair is PAIR, another turn decision's none."""
-	steps = [(kind, int(action), day if not isinstance(state, tuple) else state[1], PAIR if kind == EXCHANGE else None) for kind, action, state in events]
-	states = [state[0] if isinstance(state, tuple) else state for _, _, state in events]
-	return steps, (lambda i, pair: states[i])
+THIRD = 5  # a third hero of ours
+MEET = "meet"  # a turn MOVE of PAIR's first onto its second
+
+
+def flags(events, resets=()):
+	"""events: [(kind, action, the pair's state at the decision (or (state, day)), who)] -> loop_flags: who a turn
+	decision's heroes (a set; None the record cannot say; MEET a MOVE onto the other), an exchange's pair; by default a
+	turn MOVE is MEET, an exchange PAIR's, any other decision acts with no hero. Another pair's states never repeat."""
+	steps, states, actors, meets = [], [], [], []
+	for event in events:
+		kind, action, state = event[:3]
+		who = event[3] if len(event) > 3 else (MEET if kind == TURN and action == A.MOVE else PAIR if kind == EXCHANGE else frozenset())
+		state, day = state if isinstance(state, tuple) else (state, 1)
+		pair = (tuple(sorted(who)) if kind == EXCHANGE else None)
+		steps.append((kind, int(action), day, pair))
+		states.append(state)
+		actors.append(frozenset({PAIR[0]}) if who == MEET else None if who is None else frozenset(who))
+		meets.append(PAIR if who == MEET else (who[0], THIRD) if isinstance(who, tuple) and kind == TURN else None)
+	state_of = lambda i, pair: states[i] if pair == PAIR else ("other", i)  # noqa: E731
+	return loop_flags(steps, state_of, set(resets), actors, meets)
+
+
+# give the army, take it back the same day: the two dialogs and the MOVEs that open them
+GIVE = [(TURN, A.MOVE, "s0"), (EXCHANGE, A.ARMY, "s0"), (EXCHANGE, A.END, "s1")]
+BACK = [(TURN, A.MOVE, "s1"), (EXCHANGE, A.ARMY, "s1"), (EXCHANGE, A.END, "s0"), (TURN, A.END, "s0")]
 
 
 def test_a_null_dialog_flags_its_moves_and_its_meeting_but_never_end():
-	steps, state_of = sequence([(TURN, A.MOVE, "s0"), (EXCHANGE, A.ARMY, "s0"), (EXCHANGE, A.ARMY, "s1"), (EXCHANGE, A.END, "s0"), (TURN, A.END, "s0")])
-	out = loop_flags(steps, state_of, set())
+	out = flags([(TURN, A.MOVE, "s0"), (EXCHANGE, A.ARMY, "s0"), (EXCHANGE, A.ARMY, "s1"), (EXCHANGE, A.END, "s0"), (TURN, A.END, "s0")])
 	assert out.tolist() == [LOOP_NULL, LOOP_NULL, LOOP_NULL, LOOP_NONE, LOOP_NONE]
 
 
-def test_give_and_take_back_across_two_dialogs():
-	steps, state_of = sequence([
-		(TURN, A.MOVE, "s0"), (EXCHANGE, A.ARMY, "s0"), (EXCHANGE, A.END, "s1"),
-		(TURN, A.MOVE, "s1"), (EXCHANGE, A.ARMY, "s1"), (EXCHANGE, A.END, "s0"), (TURN, A.END, "s0"),
-	])
-	out = loop_flags(steps, state_of, set())
-	assert out.tolist() == [LOOP_ACROSS, LOOP_ACROSS, LOOP_NONE, LOOP_ACROSS, LOOP_ACROSS, LOOP_NONE, LOOP_NONE]
+def test_give_and_take_back_with_nothing_between_is_a_loop():
+	assert flags(GIVE + BACK).tolist() == [LOOP_ACROSS, LOOP_ACROSS, LOOP_NONE, LOOP_ACROSS, LOOP_ACROSS, LOOP_NONE, LOOP_NONE]
+	# (between them: a town's or the player's own decision, another hero's step, the other's MOVE onto the first: still one)
+	for between in [(TURN, A.BUILD, "s1"), (TURN, A.MOVE, "s1", {THIRD}), (TURN, A.MOVE, "s1", MEET)]:
+		assert flags(GIVE + [between] + BACK)[[0, 1, 4, 5]].tolist() == [LOOP_ACROSS] * 4, between
 
 
-def test_a_battle_or_a_question_between_breaks_the_loop():
-	events = [
-		(TURN, A.MOVE, "s0"), (EXCHANGE, A.ARMY, "s0"), (EXCHANGE, A.END, "s1"),
-		(TURN, A.MOVE, "s1"), (TURN, A.MOVE, "s1"), (EXCHANGE, A.ARMY, "s1"), (EXCHANGE, A.END, "s0"), (TURN, A.END, "s0"),
-	]
-	steps, state_of = sequence(events)
-	assert loop_flags(steps, state_of, set())[[0, 1, 4, 5]].tolist() == [LOOP_ACROSS] * 4  # (the first MOVE away and back: still a loop)
-	assert not loop_flags(steps, state_of, {3}).any()  # (a battle recorded at the 4th decision: between the dialogs)
-	question = [(TURN, A.MOVE, "s0"), (EXCHANGE, A.ARMY, "s0"), (EXCHANGE, A.END, "s1"), (QUESTION, 0, "s1"), (TURN, A.MOVE, "s1"), (EXCHANGE, A.ARMY, "s1"), (EXCHANGE, A.END, "s0"), (TURN, A.END, "s0")]
-	steps, state_of = sequence(question)
-	assert not loop_flags(steps, state_of, {3}).any()  # (loop_rows resets at every question)
+def test_the_receiver_steps_to_an_empty_tile_and_back_then_returns_the_army_is_no_loop():
+	away = [(TURN, A.MOVE, "s1", {PAIR[1]}), (TURN, A.MOVE, "s1", {PAIR[1]})]
+	assert not flags(GIVE + away + BACK).any()
+	assert not flags(GIVE + away[:1] + BACK).any()  # (one step: the lender's spare movement saved, the army used)
+
+
+def test_the_receiver_meets_a_third_hero_between_is_no_loop():
+	third = [(TURN, A.MOVE, "s1", (PAIR[1],)), (EXCHANGE, A.ARMY, "s1", (PAIR[1], THIRD)), (EXCHANGE, A.END, "s1", (PAIR[1], THIRD))]
+	assert not flags(GIVE + third + BACK).any()
+	assert not flags(GIVE + third[1:] + BACK).any()  # (the third's dialog alone, opened by the third's MOVE or none)
+
+
+def test_a_cast_or_any_act_of_the_pair_between_is_no_loop():
+	for between in [(TURN, A.CAST, "s1", {PAIR[1]}), (TURN, A.TRAVEL, "s1", {PAIR[0]}), (TURN, A.RECRUIT, "s1", {PAIR[1]}), (TURN, A.ARMY, "s1", {PAIR[0], THIRD})]:
+		assert not flags(GIVE + [between] + BACK).any(), between
+
+
+def test_a_decision_the_record_cannot_attribute_is_no_loop():
+	assert not flags(GIVE + [(TURN, A.ARMY, "s1", None)] + BACK).any()
+
+
+def test_a_battle_or_a_question_between_is_no_loop():
+	"""(the surrender case: the receiver's walk asks the player whether to accept the creatures' offer)"""
+	assert not flags(GIVE + [(TURN, A.BUILD, "s1")] + BACK, resets={3}).any()  # (a battle recorded at the 4th decision)
+	assert not flags(GIVE + [(QUESTION, 0, "s1")] + BACK, resets={3}).any()  # (loop_rows resets at every question)
+	assert not flags(GIVE + BACK, resets={3}).any()  # (one at the second dialog's MOVE: the battle came before it)
 
 
 def test_an_undone_move_inside_a_dialog_that_goes_on():
-	steps, state_of = sequence([(TURN, A.MOVE, "s0"), (EXCHANGE, A.ARMY, "s0"), (EXCHANGE, A.ARMY, "s1"), (EXCHANGE, A.ARMY, "s0"), (EXCHANGE, A.END, "s2"), (TURN, A.END, "s2")])
-	out = loop_flags(steps, state_of, set())
+	out = flags([(TURN, A.MOVE, "s0"), (EXCHANGE, A.ARMY, "s0"), (EXCHANGE, A.ARMY, "s1"), (EXCHANGE, A.ARMY, "s0"), (EXCHANGE, A.END, "s2"), (TURN, A.END, "s2")])
 	assert out.tolist() == [LOOP_NONE, LOOP_UNDONE, LOOP_UNDONE, LOOP_NONE, LOOP_NONE, LOOP_NONE]
 
 
 def test_another_day_is_no_loop_and_a_change_kept_is_none():
-	steps, state_of = sequence([
-		(TURN, A.MOVE, ("s0", 1)), (EXCHANGE, A.ARMY, ("s0", 1)), (EXCHANGE, A.END, ("s1", 1)),
-		(TURN, A.MOVE, ("s1", 2)), (EXCHANGE, A.ARMY, ("s1", 2)), (EXCHANGE, A.END, ("s0", 2)), (TURN, A.END, ("s0", 2)),
-	])
-	assert not loop_flags(steps, state_of, set()).any()
-	steps, state_of = sequence([(TURN, A.MOVE, "s0"), (EXCHANGE, A.ARMY, "s0"), (EXCHANGE, A.END, "s1"), (TURN, A.END, "s1")])
-	assert not loop_flags(steps, state_of, set()).any()
+	days = [(TURN, A.MOVE, ("s0", 1)), (EXCHANGE, A.ARMY, ("s0", 1)), (EXCHANGE, A.END, ("s1", 1)), (TURN, A.MOVE, ("s1", 2)), (EXCHANGE, A.ARMY, ("s1", 2)), (EXCHANGE, A.END, ("s0", 2)), (TURN, A.END, ("s0", 2))]
+	assert not flags(days).any()
+	assert not flags(GIVE + [(TURN, A.END, "s1")]).any()
 
 
 def test_the_charge_lands_after_the_standardization_on_flagged_credited_rows_alone():
