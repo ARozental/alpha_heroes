@@ -157,3 +157,35 @@ def test_a_checkpoint_from_before_loads_todays_values(model):
 	again = CampaignModel(dim=32, cell_dim=16, layers=1).eval()
 	again.load_state_dict(with_added(old, again.state_dict()))
 	assert (float(again.features.phi_hero_base), float(again.features.phi_armyless_share), float(again.features.phi_lead_weight)) == pytest.approx((1500.0, 0.55, 1.0))
+
+
+def test_a_bulk_move_leaves_one_creature_of_the_weakest_stack_when_every_stack_would_go(model):
+	"""features.bulk_kept as CGameHandler::bulkMoveArmy with AlphaMapAI's slot: the least AI value x count, the first of
+	equals in slot order; nothing when a stack stays anyway (no slot for it)."""
+	t = model.features
+	ai = t.creature_ai_value
+	a, b = 42, 44  # (AI values 50 and 159)
+	assert float(ai[a]) == 50.0 and float(ai[b]) == 159.0
+	creatures = torch.tensor([[a, b, -1], [a, b, -1], [a, a, -1], [a, b, -1]])
+	counts = torch.tensor([[5.0, 1.0, 0.0], [2.0, 1.0, 0.0], [3.0, 3.0, 0.0], [5.0, 1.0, 0.0]])
+	moved = torch.tensor([[True, True, False], [True, True, False], [True, True, False], [True, False, False]])
+	kept = ft.bulk_kept(creatures, counts, moved, t)
+	# 250 against 159: the second stack; 100 against 159: the first; equals: the first; the second stack stays: none
+	assert kept.tolist() == [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+
+
+def test_give_all_exact_is_off_by_default_and_set_by_config_or_the_environment(model, monkeypatch):
+	from campaign_model.learner import set_advice_prior
+
+	t = model.features
+	assert float(t.give_all_exact) == 0.0 and float(t.give_all_exact_on()) == 0.0
+	try:
+		set_advice_prior(model, CampaignConfig(give_all_exact=True))
+		assert float(t.give_all_exact_on()) == 1.0
+		set_advice_prior(model, CampaignConfig())
+		assert float(t.give_all_exact_on()) == 0.0
+		monkeypatch.setenv("ALPHA_GIVE_ALL_EXACT", "1")
+		fresh = CampaignModel(dim=32, cell_dim=16, layers=1).eval()
+		assert float(fresh.features.give_all_exact_on()) == 1.0  # (a paired test's arm: the override, whatever the buffer)
+	finally:
+		t.give_all_exact.fill_(0.0)

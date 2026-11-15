@@ -336,6 +336,18 @@ def bulk_moves(into, source):
 	return torch.stack(moved, dim=-1)
 
 
+def bulk_kept(creatures, counts, moved, t):
+	"""What VCMI's bulk move leaves its source when every stack would go (CGameHandler::bulkMoveArmy: a hero is never left
+	without troops; AlphaMapAI's GIVE_ALL names the slot): one creature of the stack of the least power (AI value x count,
+	CStackInstance::getPower; the first of equals in slot order) [..., A] (1.0 there); 0 elsewhere, and where some stack
+	stays anyway. creatures, counts: the source's [..., A]; moved: bulk_moves' [..., A]."""
+	present = (creatures >= 0) & (counts > 0)
+	all_go = ((moved & present) | ~present).all(dim=-1, keepdim=True) & present.any(dim=-1, keepdim=True)
+	power = torch.where(present, counts.float() * t.creature_ai_value[vocab_index(creatures, c.CREATURE_VOCAB)], torch.full_like(counts.float(), float("inf")))
+	weakest = power.argmin(dim=-1, keepdim=True)
+	return ((torch.arange(creatures.shape[-1], device=creatures.device) == weakest) & all_go).float()
+
+
 def led_values(creatures, counts, multiplier, rest, t):
 	"""What armies [..., A] count in Φ led by a hero (gold, [...]): their worth x the hero's multiplier (hero_multipliers)
 	at the lead weight (lead_factor) x its movement (speed_factors), and their make-up's morale (make_up_values, over

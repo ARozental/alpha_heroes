@@ -193,6 +193,8 @@ def set_advice_prior(model, config):
 			features.build_economy.fill_(float(getattr(config, "build_economy", 0.0)))
 		if hasattr(features, "empty_as_visited"):  # (config.empty_as_visited: the weights carry it to every inference server)
 			features.empty_as_visited.fill_(1.0 if getattr(config, "empty_as_visited", True) else 0.0)
+		if hasattr(features, "give_all_exact"):  # (config.give_all_exact: GIVE_ALL's kept creature in its shown gain)
+			features.give_all_exact.fill_(1.0 if getattr(config, "give_all_exact", False) else 0.0)
 		if hasattr(features, "empire_alpha"):  # (ALPHA, the labels' own: the weights carry it to every inference server)
 			features.empire_alpha.fill_(float(EmpireConfig().alpha))
 		if hasattr(features, "empire_no_town"):  # (B2's no-town factor, the labels' own, carried the same way; the run's ramp: learner._empire_at)

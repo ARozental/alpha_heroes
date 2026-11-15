@@ -88,6 +88,7 @@ def game_tables():
 
 	tables = {
 		"fight_value": torch.ones(c.CREATURE_VOCAB + 1),
+		"creature_ai_value": torch.zeros(c.CREATURE_VOCAB + 1),  # (VCMI's AI value: a stack's power, CStackInstance::getPower, is it x its count)
 		"creature_cost": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_unit_cost": torch.zeros(c.CREATURE_VOCAB + 1),  # (its unupgraded form's cost: u at ALPHA 1, features.creature_unit)
 		"creature_health": torch.zeros(c.CREATURE_VOCAB + 1),
@@ -132,6 +133,7 @@ def game_tables():
 		for creature_id, row in creatures().items():
 			if 0 <= creature_id < c.CREATURE_VOCAB:
 				tables["fight_value"][creature_id] = float(max(row.get("fight_value", 1), 1))
+				tables["creature_ai_value"][creature_id] = float(row.get("ai_value", 0))
 				tables["creature_cost"][creature_id] = float(creature_cost(creature_id))
 				tables["creature_unit_cost"][creature_id] = float(_unit(creature_id, EmpireConfig(alpha=1.0)))
 				tables["creature_health"][creature_id] = float(row.get("hit_points", 0))
@@ -423,11 +425,16 @@ class CustomFeatures(nn.Module):
 		# config.empty_as_visited (B1b's bit read as visited at the model's input: features.empty_as_visited) as a buffer the
 		# weights carry, the learner's fill; 1 to begin with and in a checkpoint from before (ADDED_HEADS: the loading model's)
 		self.register_buffer("empty_as_visited", torch.ones(()))
+		# config.give_all_exact (e5 for the user, 2026-11-15): GIVE_ALL's shown gain with the creature VCMI's bulk move leaves
+		# the giver (features.bulk_kept), the learner's fill as the others; ALPHA_GIVE_ALL_EXACT for a paired test; 0: off,
+		# multi_gain as before, bit for bit
+		self.register_buffer("give_all_exact", torch.zeros(()))
 		override = lambda name: float(os.environ[name]) if os.environ.get(name, "") != "" else None  # noqa: E731
 		self.nk_override = (override("ALPHA_NK2_PRIOR"), override("ALPHA_NK2_PRIOR_FALLBACK"), override("ALPHA_NK2_LABEL"), override("ALPHA_NK2_FOLLOW"))
 		self.adv_override = override("ALPHA_ADV_GAIN")
 		self.guard_override = override("ALPHA_TOWN_GUARD")
 		self.economy_override = override("ALPHA_BUILD_ECONOMY")
+		self.give_all_override = override("ALPHA_GIVE_ALL_EXACT")
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -517,6 +524,12 @@ class CustomFeatures(nn.Module):
 	def building_value(self):
 		"""[FACTION_VOCAB + 1, N_BUILDINGS] each building's worth in Φ (empire.building_value at ALPHA)."""
 		return self.building_value_base - self.empire_alpha * self.building_unit_growth
+
+	def give_all_exact_on(self):
+		"""1.0 where GIVE_ALL's shown gain leaves the giver VCMI's kept creature (config.give_all_exact; ALPHA_GIVE_ALL_EXACT),
+		else 0.0, as a tensor: multiplied in, never branched on (economy_on's rule)."""
+		size = self.give_all_exact if self.give_all_override is None else torch.full_like(self.give_all_exact, float(self.give_all_override))
+		return (size > 0).to(self.give_all_exact.dtype)
 
 	def economy_on(self):
 		"""1.0 where the economy's features and BUILD's new prior are read, else 0.0, as a tensor (config.build_economy;
@@ -923,8 +936,10 @@ class CustomFeatures(nn.Module):
 		giver_c, giver_n = pair_c.flip(1), pair_n.flip(1)  # [B, 2, A]: row r's giver's army
 		given = ft.bulk_moves(pair_c, giver_c)  # (GIVE_ALL's bulk move: what fits into row r's receiver)
 		none = torch.full_like(giver_c, -1)
-		joined = ft.led_values(torch.cat([pair_c, torch.where(given, giver_c, none)], dim=-1), torch.cat([pair_n, giver_n * given], dim=-1), f.hero_multiplier.gather(1, p), rest.gather(1, p), self)  # [B, 2]: row r's receiver leading its own and what came
-		left = ft.led_values(torch.where(given, none, giver_c), giver_n * ~given, f.hero_multiplier.gather(1, p.flip(1)), rest.gather(1, p.flip(1)), self)  # (the giver's that did not fit)
+		kept = ft.bulk_kept(giver_c, giver_n, given, self) * self.give_all_exact_on()  # [B, 2, A]: the creature the giver keeps (0: as before)
+		gone = given & ~((kept > 0) & (giver_n <= 1))  # (a kept stack of one stays whole)
+		joined = ft.led_values(torch.cat([pair_c, torch.where(gone, giver_c, none)], dim=-1), torch.cat([pair_n, giver_n * given - kept], dim=-1), f.hero_multiplier.gather(1, p), rest.gather(1, p), self)  # [B, 2]: row r's receiver leading its own and what came
+		left = ft.led_values(torch.where(given & (kept == 0), none, giver_c), giver_n * ~given + kept, f.hero_multiplier.gather(1, p.flip(1)), rest.gather(1, p.flip(1)), self)  # (the giver's that did not fit, and the kept creature)
 		both = (pair >= 0).all(dim=1).float().unsqueeze(-1)
 		apart = led.gather(1, p).sum(dim=1, keepdim=True)  # [B, 1]: the two armies before
 		gains[:, :2, c.MultiKind.GIVE_ALL] = (joined + left - apart) * both
@@ -1765,6 +1780,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"features.phi_hero_base",  # (Φ's hero base, its armyless share and the lead weight, 2026-11-15: as ALPHA, the loading model's)
 	"features.phi_armyless_share",
 	"features.phi_lead_weight",
+	"features.give_all_exact",  # (config.give_all_exact, 2026-11-15: off, the loading model's)
 	"features.empire_last_town",  # (config.no_town_last_town: the loading model's, 0)
 	"features.empty_as_visited",  # (config.empty_as_visited: a checkpoint from before keeps the loading model's, 1)
 	"foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option", "option_flags",

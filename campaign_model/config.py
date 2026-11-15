@@ -225,6 +225,10 @@ class CampaignConfig:
 	# m_visitors gains m_empty; the raw bits stay. Carried in the weights (features.empty_as_visited, the learner's
 	# fill), as ALPHA. False: B1b's inputs as they are, bit for bit
 	empty_as_visited: bool = True
+	# GIVE_ALL's shown gain (model.multi_gain) with the creature VCMI's bulk move leaves the giver when every stack would go
+	# (features.bulk_kept; e5 for the user, 2026-11-15: the give's gain = the true change of Φ). Carried in the weights
+	# (features.give_all_exact, the learner's fill). False: multi_gain as before, bit for bit
+	give_all_exact: bool = False
 	# B2's no-town factor for the run (e5 for the user, 2026-11-13): a player's Φ x f while it owns no town, ramped by the
 	# version alone, stateless as value_shared: f = max(no_town_factor, 0.9 ** (version - no_town_from + 1)) from
 	# no_town_from, 1 before (about 22 updates to 0.1), so the value targets take no step; the learner's EmpireConfig for
