@@ -1207,7 +1207,7 @@ class CampaignModelV2(nn.Module):
 		stay_logits = slot_logits + stay_slot + torch.einsum("bfsk,btuk->bfstu", self.army_stay_q(src), keys) / math.sqrt(ARMY_SLOT_KEYS)
 		army_slot_outputs(out, slots, slot_logits, stay_logits)
 		learned[A_.UPGRADE] = self.upgrade_out(src).squeeze(-1) + self.nk2_upgrade(known.upgrade_gains).squeeze(-1)
-		prior[A_.UPGRADE] = upgrade_weight * (known.upgrade_gains[..., 0] > 0).float()
+		prior[A_.UPGRADE] = upgrade_weight * (known.upgrade_gains[..., 0] > 0).float() + ft.value_logit(ft.unit_rule_upgrades(x, self.features, known)) * self.features.empire_unit_own  # (the upgrade rule's Φ gain: 0 with it off)
 		offers[A_.UPGRADE] = best_legal(prior[A_.UPGRADE], x["upgrade_mask"])
 		# TRADE (from the global token), CAST, BUY, DISMISS (each hero's)
 		needs = torch.stack([known.trade_needs[:, None, :, 0].expand(b, R, R), known.trade_needs[:, :, None, 1].expand(b, R, R)], dim=-1)

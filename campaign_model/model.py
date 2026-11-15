@@ -547,6 +547,7 @@ class CustomFeatures(nn.Module):
 		value) weigh, each part by its gain, + each faction's own building's bias; 0 with the economy off."""
 		gain = lambda raw: self.gain(raw)  # noqa: E731
 		gold = gain(self.build_income_gain) * f.build_value[..., 0] + gain(self.build_production_gain) * f.build_value[..., 1] + f.build_value[..., 2]
+		gold = gold + ft.unit_rule_build(x, self)  # (the upgrade rule's immediate part of a dwelling upgrade: 0 with it off)
 		faction = vocab_index(x["t_faction"][:, :TO], c.FACTION_VOCAB)
 		bias = (self.build_faction_start + self.build_faction_bias)[faction]
 		return (gain(self.build_prior_gain) * ft.value_logit(gold) + bias) * self.economy_on()
