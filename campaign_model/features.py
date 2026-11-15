@@ -829,6 +829,29 @@ def unseen_exits(x):
 	return torch.zeros(b, areas + 1, device=index.device).scatter_reduce(1, index, flagged.float(), reduce="amax", include_self=True)[:, :areas]
 
 
+def move_rate(value, h_move, h_move_max, move_left, turns):
+	"""A tile's value as gold a day [K, W, W] (e5 for the user, 2026-11-15: the gain-per-movement view): value x (the
+	hero's full day's movement / the movement the move costs). The cost today is the movement it spends (h_move -
+	w_move_left), at least MIN_MOVE_COST points; a tile not reached today costs its days x a full day (w_turns x
+	h_move_max); one never reached (w_turns < 0) 0. h_move, h_move_max: the window's hero's [K]."""
+	full = h_move_max.float().clamp(min=1)[:, None, None]
+	today = move_left >= 0
+	cost = torch.where(today, (h_move.float()[:, None, None] - move_left.float()).clamp(min=MIN_MOVE_COST), turns.float().clamp(min=1) * full)
+	return torch.where(today | (turns >= 0), value * full / cost, torch.zeros_like(value))
+
+
+MIN_MOVE_COST = 100.0  # movement points: move_rate's least cost (a step onto a neighbouring tile costs ~100)
+
+
+def rate_views(rate, legal):
+	"""move_rate's two bounded views [K, W, W, 2]: tanh(value_logit(rate) / 4), as the tile's other values; and the
+	rate over the window's best legal tile's (0..1, its negatives at 0; 0 where no legal tile has a positive rate)."""
+	positive = torch.where(legal, rate.clamp(min=0), torch.zeros_like(rate))
+	best = positive.reshape(rate.shape[0], -1).amax(dim=1)[:, None, None]
+	share = torch.where(best > 0, positive / best.clamp(min=1e-6), torch.zeros_like(rate))
+	return torch.stack([torch.tanh(value_logit(rate) / 4), share], dim=-1)
+
+
 def movement_discount(days, exponent):
 	"""NK2's discount of a target's value by the days to reach it (PriorityEvaluator::evaluateMovement): 1 / (0.75 +
 	days^exponent), its exponent 1.3."""

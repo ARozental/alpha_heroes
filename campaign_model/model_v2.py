@@ -471,6 +471,7 @@ class CampaignModelV2(nn.Module):
 		self.pair_hero, self.pair_tile, self.pair_reach = nn.Linear(d, dp), nn.Linear(dc, dp), nn.Linear(dc, dp)
 		self.pair_fight = zero_output(nn.Linear(FIGHT_FEATURES, dp))
 		self.pair_strength = zero_output(nn.Linear(MOVE_STRENGTH + 1, dp))  # (2026-11-04: the four estimates x two sides, hopeless)
+		self.pair_rate = zero_output(nn.Linear(MOVE_RATE, dp))  # (2026-11-15: the tile's value as gold a day, features.rate_views; a checkpoint from before loads it at 0)
 		self.foresight = Foresight(d, dp)
 		# think_again
 		self.again_global = E.Tokenizer(d + FORESIGHT_HIDDEN + ft_phi_features() + 3 + len(ft.ECONOMY) + len(ft.DANGER), d, embedded=False)
@@ -1016,7 +1017,7 @@ class CampaignModelV2(nn.Module):
 		cells = torch.where((index >= 0).unsqueeze(-1), flat.index_select(0, (decision[:, None, None] * (L * S * S) + index.clamp(min=0)).reshape(-1)).reshape(k, W, W, -1), torch.zeros(k, W, W, self.cell_dim, device=flat.device, dtype=flat.dtype))
 		strength = torch.cat([known.move_strength, known.move_relative[..., :1]], dim=-1)  # (the estimates and hopeless)
 		views = self.view_pair(known.advice.move.to(cells.dtype))  # (schema 19: the tile's bounded views and Nullkiller2's candidate through it)
-		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach) + self.pair_fight(fight_features(known)) + self.pair_strength(strength) + views
+		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach) + self.pair_fight(fight_features(known)) + self.pair_strength(strength) + views + self.pair_rate(known.move_rate.to(cells.dtype))
 
 	def foresee(self, state, known):
 		x = state.x
@@ -1485,6 +1486,7 @@ def tile_known(x, features, known):
 #   foreseen  the foresight's P(a monster here attacks), P(we win a battle here), the share of the stake it takes (detached)
 MOVE_KEPT = tuple(i for i, name in enumerate(MOVE_FEATURES) if name not in ("defend", "home", "under_threat", "to_main"))
 MOVE_STRENGTH, MOVE_RELATIVE, MOVE_FORESEEN = 8, 6, 3
+MOVE_RATE = 2  # features.rate_views: the tile's value as gold a day (its value logit), and over the window's best legal tile's (2026-11-15)
 MOVE_KNOWN = len(MOVE_KEPT) + MOVE_STRENGTH + MOVE_RELATIVE + MOVE_FORESEEN
 OLD_MOVE_KNOWN = len(MOVE_FEATURES) + 1  # move_pair's known inputs before 2026-11-04 (MOVE_FEATURES, the prior again)
 MIX_HIDDEN = 16  # the mixer's hidden layer (the user: more than 6)
