@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 import math
 import os
 
-from game_values import ARMY_MORALE, SPEED_POWER, SPELL_STEP, army_multiplier, capped_mana_value, fractional_level, make_up_morale, movement_factor, resources_value, unled_share
+from game_values import ARMY_MORALE, RESOURCE_ORDER, RESOURCE_PRICES, SPEED_POWER, SPELL_STEP, army_multiplier, capped_mana_value, fractional_level, make_up_morale, movement_factor, resources_value, unled_share
 
 from . import vocab
 from .vocab import DWELLING_FIRST, DWELLING_LAST
@@ -118,6 +118,11 @@ class EmpireConfig:
 	# alike, so an upgrade gains ALPHA x the cost difference a creature and a purchase stays neutral; False: ALPHA x its
 	# unupgraded form's, as before. ALPHA_EMPIRE_UNIT_OWN=1 sets it as the others; the evaluation's EVAL_EMPIRE keeps False
 	unit_own_form: bool = field(default_factory=lambda: os.environ.get("ALPHA_EMPIRE_UNIT_OWN", "") not in ("", "0"))
+	# The stockpile discount (the user, 2026-11-15: "some value discount for large stockpiles of anything ... this only
+	# count for the extra above what we can spend"): each resource above its threshold (stock_thresholds) counts at a
+	# marginal value falling from 1 toward stock_floor (stock_value); the mines' income at its flat price. 1: as before. ALPHA_EMPIRE_STOCK_FLOOR as the others (1/3 the target, the learner's ramp:
+	# config.phi_stock_floor); the evaluation's EVAL_EMPIRE keeps 1
+	stock_floor: float = field(default_factory=lambda: float(os.environ.get("ALPHA_EMPIRE_STOCK_FLOOR", "") or 1.0))
 	# A hero's spellbook in what it makes of its army (game_values.spell_factor), and so Φ's unit: an army no hero leads
 	# at game_values.unled_share (0.953 at 0.02), a hero's at that x its multiplier (the user, 2026-11-05: buying an army
 	# slightly negative, neutral once even a starting hero with spell power 3 and knowledge 2 leads it)
@@ -130,7 +135,7 @@ class EmpireConfig:
 
 # The evaluation's Φ (its scores, evaluate.score): as of 2026-11-04's army multiplier, before the spellbook's factor and
 # the unled share, the army's movement and make-up, so its scores stay comparable across the changes
-EVAL_EMPIRE = EmpireConfig(alpha=0.25, spell_step=0.0, speed_power=0.0, army_morale=0.0, no_town_factor=1.0, hero_base=HERO_BASE, armyless_share=ARMYLESS_SHARE, lead_weight=LEAD_WEIGHT, unit_own_form=False)
+EVAL_EMPIRE = EmpireConfig(alpha=0.25, spell_step=0.0, speed_power=0.0, army_morale=0.0, no_town_factor=1.0, hero_base=HERO_BASE, armyless_share=ARMYLESS_SHARE, lead_weight=LEAD_WEIGHT, unit_own_form=False, stock_floor=1.0)
 
 
 def _unit(creature_id, config):
@@ -246,6 +251,75 @@ def led_multiplier(multiplier, config=EmpireConfig()):
 	return multiplier if config.lead_weight == 1.0 else 1.0 + config.lead_weight * (multiplier - 1.0)
 
 
+from functools import lru_cache
+
+_horde_levels = lru_cache(maxsize=None)(lambda: vocab.horde_levels())  # (read once: vocab's reads its file each call)
+STOCK_FLOORS = (30.0, 20.0, 30.0, 20.0, 20.0, 20.0, 10000.0)  # (RESOURCE_ORDER: wood, mercury, ore, sulfur, crystal, gems, gold)
+STOCK_EXCLUDED = (6, 26)  # (the shipyard and the grail: the map decides them, not the town)
+
+
+def stock_value(amount, threshold, floor):
+	"""What a stock counts at in Φ, in its own units: all of it up to the threshold T; above it, T + f x + (1 - f) (T/2)
+	ln(1 + 2x/T), x = the amount over T: the marginal value f + (1 - f) / (1 + 2x/T), 1 at T, halfway to f at x = T/2."""
+	if floor == 1.0 or amount <= threshold:
+		return amount
+	over = amount - threshold
+	return threshold + floor * over + (1 - floor) * (threshold / 2) * math.log1p(2 * over / threshold)
+
+
+def stock_marginal(amount, threshold, floor):
+	"""stock_value's slope at the amount: 1 up to the threshold, then f + (1 - f) / (1 + 2x/T)."""
+	if floor == 1.0 or amount <= threshold:
+		return 1.0
+	return floor + (1 - floor) / (1 + 2 * (amount - threshold) / threshold)
+
+
+def _resource_vector(cost):
+	return [float((cost or {}).get(r, 0)) for r in RESOURCE_ORDER]
+
+
+def week_growth(faction, built):
+	"""{level: creatures a week} of a town's built dwellings: the base growth x the fort line's multiplier (a citadel
+	+50%, a castle +50% more), and half a level's base growth x it again for a horde built (features._production_added's)."""
+	levels = vocab.town_creatures().get(faction, [])
+	fort = 1.0 + 0.5 * (8 in built or 9 in built) + 0.5 * (9 in built)
+	out = {}
+	for level, forms in enumerate(levels[:7]):
+		if forms and (DWELLING_FIRST + level in built or DWELLING_FIRST + 7 + level in built):
+			out[level] = vocab.creatures()[forms[0]].get("growth", 0) * fort
+	for building in built:
+		level = _horde_levels().get((faction, building))
+		if level is not None and level in out:
+			out[level] += 0.5 * vocab.creatures()[levels[level][0]].get("growth", 0) * fort
+	return out
+
+
+def stock_thresholds(player):
+	"""[R] each resource's threshold (RESOURCE_ORDER), the max of three (e5 for the user, 2026-11-15): its floor
+	STOCK_FLOORS; B, the most of it any startable building of any town of ours costs (not built, its required buildings
+	built, the shipyard and the grail left out; the resources and the day's slot not asked); W, what buys a week's
+	growth of every dwelling we own (week_growth's in our towns, at the creature the dwelling sells: its upgraded form
+	where the upgrade is built; our dwellings outside towns, their creature's growth)."""
+	most, week = [0.0] * 7, [0.0] * 7
+	for town in player["towns"]:
+		built, faction = set(town["built"]), town["faction"]
+		for (f, building), row in vocab.buildings().items():
+			if f != faction or building in built or building in STOCK_EXCLUDED or building >= 44:
+				continue
+			if all(n in built for n in vocab.building_requires().get((faction, building), ())):
+				most = [max(d, v) for d, v in zip(most, _resource_vector(row.get("cost")))]
+		levels = vocab.town_creatures().get(faction, [])
+		for level, count in week_growth(faction, built).items():
+			forms = levels[level]
+			creature = forms[1] if len(forms) > 1 and DWELLING_FIRST + 7 + level in built else forms[0]
+			week = [a + count * b for a, b in zip(week, _resource_vector(vocab.creatures()[creature].get("cost")))]
+	for dwelling in player.get("dwellings", []):
+		for creature, _ in dwelling["available"]:
+			if creature >= 0:
+				week = [a + vocab.creatures()[creature].get("growth", 0) * b for a, b in zip(week, _resource_vector(vocab.creatures()[creature].get("cost")))]
+	return [max(f, b, w) for f, b, w in zip(STOCK_FLOORS, most, week)]
+
+
 def hero_base_value(army, config=EmpireConfig()):
 	"""A hero's HERO_BASE at its army's worth (gold): armyless_share of it with none, all of it from armed_army on."""
 	return config.hero_base * (config.armyless_share + (1 - config.armyless_share) * min(1.0, max(army, 0.0) / config.armed_army))
@@ -280,6 +354,9 @@ def empire_value(player, config=EmpireConfig()):
 		army_worth(hero["army"], config) * led_multiplier(hero_multiplier(hero, config), config) * speed_factor(hero["army"], config) for hero in player["heroes"]
 	)
 	parts["income"] = config.income_days * resources_value(player.get("income", [0] * 7))
+	if config.stock_floor != 1.0:  # (the stockpile discount: the stocks above their thresholds; the income at its flat price)
+		held, threshold, price = [max(a, 0) for a in player["resources"]], stock_thresholds(player), [RESOURCE_PRICES[r] for r in RESOURCE_ORDER]
+		parts["resources"] = sum(p * stock_value(a, t, config.stock_floor) for p, a, t in zip(price, held, threshold))
 	prices = vocab.artifact_prices()
 	parts["heroes"] = heroes_value(player["heroes"], config)
 	for hero in player["heroes"]:

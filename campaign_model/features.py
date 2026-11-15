@@ -440,6 +440,113 @@ def tavern_worth(x, t):
 	return (after - before + led + carried) * present
 
 
+STOCK_FLOORS = (30.0, 20.0, 30.0, 20.0, 20.0, 20.0, 10000.0)  # (empire.STOCK_FLOORS: wood, mercury, ore, sulfur, crystal, gems, gold)
+STOCK_EXCLUDED = (6, 26)  # (empire.STOCK_EXCLUDED)
+
+
+def stock_thresholds(x, t):
+	"""empire.stock_thresholds [B, R]: the max of STOCK_FLOORS; the most of each resource any startable building of any town
+	of ours costs (not built, its required buildings built, the faction has it; the shipyard and the grail left out);
+	and what buys a week's growth of every dwelling we own (in our towns: the dwelling's creature, upgraded where its
+	upgrade is built, base growth x the fort line's multiplier, + half for a horde; our dwellings outside towns)."""
+	to = c.OWN_TOWNS
+	own = own_towns(x)
+	built = x["t_built"][:, :to].bool() & own.unsqueeze(-1)  # [B, TO, NB]
+	faction = vocab_index(x["t_faction"][:, :to], c.FACTION_VOCAB)
+	res = t.building_resources[faction]  # [B, TO, NB, R]
+	ids = torch.arange(built.shape[-1], device=built.device)
+	allowed = torch.ones_like(ids, dtype=torch.bool)
+	for b in STOCK_EXCLUDED:
+		allowed = allowed & (ids != b)
+	met = ~(t.building_requires[faction] & ~built.unsqueeze(-2)).any(dim=-1)  # [B, TO, NB]: its requirements built
+	startable = t.building_exists[faction] & ~built & met & own.unsqueeze(-1) & allowed
+	most = torch.where(startable.unsqueeze(-1), res, torch.zeros_like(res)).amax(dim=2).amax(dim=1)  # [B, R]
+	base_c, up_c = t.dwelling_creature[faction][..., BASE_SLICE], t.dwelling_creature[faction][..., UP_SLICE]  # [B, TO, 7]
+	up_built = built[..., UP_SLICE]
+	has = built[..., BASE_SLICE] | up_built
+	fort = _fort_multiplier(built)  # [B, TO]
+	growth = t.creature_growth[vocab_index(base_c, c.CREATURE_VOCAB)] * (base_c >= 0) * has * fort.unsqueeze(-1)  # [B, TO, 7]
+	level = t.horde_level[faction]  # [B, TO, NB]
+	horde = ((level.unsqueeze(-1) == torch.arange(7, device=level.device)) & built.unsqueeze(-1) & (level >= 0).unsqueeze(-1)).float().sum(dim=2)  # [B, TO, 7]
+	growth = growth + 0.5 * growth * horde
+	grown = torch.where(up_built & (up_c >= 0), up_c, base_c)
+	week = (growth.unsqueeze(-1) * t.creature_resources[vocab_index(grown, c.CREATURE_VOCAB)] * (grown >= 0).unsqueeze(-1)).sum(dim=(1, 2))
+	dw_c = x["g_dwelling_creature"]
+	outside = (t.creature_growth[vocab_index(dw_c, c.CREATURE_VOCAB)].unsqueeze(-1) * t.creature_resources[vocab_index(dw_c, c.CREATURE_VOCAB)] * (dw_c >= 0).unsqueeze(-1)).sum(dim=1)
+	floors = torch.tensor(STOCK_FLOORS, device=most.device, dtype=most.dtype)
+	return torch.maximum(torch.maximum(floors, most), week + outside)
+
+
+def stock_value(amount, threshold, floor):
+	"""empire.stock_value elementwise: amount up to the threshold T, above it T + f x + (1 - f) (T/2) ln(1 + 2x/T)."""
+	over = (amount - threshold).clamp(min=0)
+	return torch.where(amount <= threshold, amount, threshold + floor * over + (1 - floor) * (threshold / 2) * torch.log1p(2 * over / threshold.clamp(min=1e-6)))
+
+
+def stock_marginal(amount, threshold, floor):
+	"""empire.stock_marginal elementwise: 1 up to the threshold, f + (1 - f) / (1 + 2x/T) above it."""
+	over = (amount - threshold).clamp(min=0)
+	return torch.where(amount <= threshold, torch.ones_like(amount), floor + (1 - floor) / (1 + 2 * over / threshold.clamp(min=1e-6)))
+
+
+def stock_resources(x, t):
+	"""Φ's resources part [B] under the stockpile discount (empire.empire_value's), the plain sum exactly at phi_stock_floor 1."""
+	held = x["g_resources"].clamp(min=0).float()
+	plain = (held * t.resource_price).sum(dim=-1)
+	discounted = (stock_value(held, stock_thresholds(x, t), t.phi_stock_floor) * t.resource_price).sum(dim=-1)
+	return torch.where(t.phi_stock_floor == 1, plain, discounted)
+
+
+def stock_gain(cost, held, threshold, t):
+	"""A purchase's stockpile part [...] (gold), its resources held at their threshold before it: over what it spends (cost
+	[..., R]; held and threshold broadcast to it), the price less the change of Φ it makes, p (c - (V(a) - V(a - c)));
+	0 while every stock stays at or under its threshold, and at phi_stock_floor 1."""
+	c_ = torch.minimum(cost.clamp(min=0), held)
+	lost = stock_value(held, threshold, t.phi_stock_floor) - stock_value(held - c_, threshold, t.phi_stock_floor)
+	return ((c_ - lost) * t.resource_price).sum(dim=-1)
+
+
+def stock_build_gain(x, t, threshold):
+	"""BUILD's entries' stockpile part [B, TO, NB] (gold): each building's cost (stock_gain)."""
+	faction = vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)
+	held = x["g_resources"].clamp(min=0).float()
+	return stock_gain(t.building_resources[faction], held[:, None, None], threshold[:, None, None], t)
+
+
+def stock_recruit_gain(x, t, threshold):
+	"""RECRUIT's entries' stockpile part [B, TO, LV, AM] (gold): ceil(most x the entry's fraction) creatures, most what is
+	for hire and affordable (the C++ Encoder's). Not in the priors: RECRUIT shows no gold figure to fold it into."""
+	to = c.OWN_TOWNS
+	held = x["g_resources"].clamp(min=0).float()
+	creature = x["t_available_creature"][:, :to]
+	cost = t.creature_resources[vocab_index(creature, c.CREATURE_VOCAB)]  # [B, TO, LV, R]
+	afford = torch.where(cost > 0, torch.floor(held[:, None, None, :] / cost.clamp(min=1e-6)), torch.full_like(cost, 1e9)).amin(dim=-1)
+	most = torch.minimum(x["t_available"][:, :to].clamp(min=0).float(), afford) * (creature >= 0)
+	amount = torch.ceil(most.unsqueeze(-1) * torch.tensor(c.RECRUIT_FRACTIONS, device=most.device, dtype=most.dtype))  # [B, TO, LV, AM]
+	return stock_gain(amount.unsqueeze(-1) * cost.unsqueeze(-2), held[:, None, None, None], threshold[:, None, None, None], t)
+
+
+def stock_upgrade_gain(x, t, threshold):
+	"""UPGRADE's entries' stockpile part [B, HD, A] (gold): the stack x its upgrade's cost difference. Not in the priors:
+	UPGRADE shows no gold figure to fold it into (the upgrade rule's term only with that rule on)."""
+	to = c.OWN_TOWNS
+	held = x["g_resources"].clamp(min=0).float()
+	stack_c = torch.cat([x["h_army_creature"][:, :HO], x["t_garrison_creature"][:, :to], x["x_creature"].unsqueeze(1)], dim=1)
+	stack_n = torch.cat([x["h_army_count"][:, :HO], x["t_garrison_count"][:, :to], x["x_count"].unsqueeze(1)], dim=1).clamp(min=0).float()
+	now = vocab_index(stack_c, c.CREATURE_VOCAB)
+	up = t.creature_upgrade[now]
+	diff = (t.creature_resources[vocab_index(up, c.CREATURE_VOCAB)] - t.creature_resources[now]).clamp(min=0) * ((stack_c >= 0) & (up >= 0)).unsqueeze(-1)
+	return stock_gain(stack_n.unsqueeze(-1) * diff, held[:, None, None], threshold[:, None, None], t)
+
+
+def stock_hire_gain(x, t, threshold):
+	"""A hire's stockpile part [B] (gold): its 2,500 gold (stock_gain)."""
+	held = x["g_resources"].clamp(min=0).float()
+	cost = torch.zeros_like(held)
+	cost[:, 6] = HERO_GOLD_COST
+	return stock_gain(cost, held, threshold, t)
+
+
 def rate_correction(views, t):
 	"""MOVE's tile logits' addend [K, W, W] from the gain-per-movement and IRR views (rate_views'), each view's weight a
 	bounded correction starting at 0 (t.rate_weights, -2..2; e5 for the user, 2026-11-15: beside pair_rate)."""
@@ -480,7 +587,7 @@ def empire_value(x, t):
 	usable_mana = torch.minimum(x["h_mana"][:, :HO].clamp(min=0), 3 * x["h_spell_cost"][:, :HO].clamp(min=0)).float()
 	parts = torch.stack(
 		[
-			(x["g_resources"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
+			stock_resources(x, t),  # (the stockpile discount: the plain sum at its floor 1)
 			((x["t_built"][:, : c.OWN_TOWNS].float() * t.building_value[faction]).sum(dim=-1) * own_towns).sum(dim=-1),
 			t.income_days * (x["g_object_income"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
 			(hero_army * lead_factor(hero_multipliers(x["h_primary"][:, :HO], x["h_artifacts"][:, :HO], t), t) * speed_factors(x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO], t) * own_heroes).sum(dim=-1)

@@ -206,6 +206,7 @@ def set_advice_prior(model, config):
 			features.phi_hero_base.fill_(float(empire.hero_base))
 			features.phi_armyless_share.fill_(float(empire.armyless_share))
 			features.phi_lead_weight.fill_(float(empire.lead_weight))
+			features.phi_stock_floor.fill_(float(empire.stock_floor))
 		if hasattr(features, "empire_last_town"):  # (config.no_town_last_town: the last town's stake term)
 			features.empire_last_town.fill_(1.0 if getattr(config, "no_town_last_town", False) else 0.0)
 
@@ -247,7 +248,7 @@ def no_town_now(config, version):
 	return max(target, 0.9 ** (version - start + 1))
 
 
-PHI_FIELDS = (("phi_hero_base", "hero_base", HERO_BASE), ("phi_armyless_share", "armyless_share", ARMYLESS_SHARE), ("phi_lead_weight", "lead_weight", LEAD_WEIGHT))  # (config's, EmpireConfig's, today's)
+PHI_FIELDS = (("phi_hero_base", "hero_base", HERO_BASE), ("phi_armyless_share", "armyless_share", ARMYLESS_SHARE), ("phi_lead_weight", "lead_weight", LEAD_WEIGHT), ("phi_stock_floor", "stock_floor", 1.0))  # (config's, EmpireConfig's, today's)
 
 
 def phi_now(config, version):
@@ -691,6 +692,7 @@ class CampaignLearner:
 				features.phi_hero_base.fill_(values["hero_base"])
 				features.phi_armyless_share.fill_(values["armyless_share"])
 				features.phi_lead_weight.fill_(values["lead_weight"])
+				features.phi_stock_floor.fill_(values["stock_floor"])
 
 	def _unit_rule(self):
 		"""config.unit_own_form (the user's upgrade rule): self.empire (the labels', the labeler's) and the model's

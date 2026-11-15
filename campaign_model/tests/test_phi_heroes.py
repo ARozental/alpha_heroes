@@ -122,11 +122,11 @@ def test_the_models_lead_weight_and_the_stakes_constants(model):
 
 def test_the_ramp_moves_from_todays_values_to_the_targets_in_equal_steps():
 	config = CampaignConfig(phi_hero_base=825.0, phi_armyless_share=1.0, phi_lead_weight=0.5, phi_from=100, phi_ramp=20)
-	assert phi_now(config, 99) == {"hero_base": 1500.0, "armyless_share": 0.55, "lead_weight": 1.0}
-	assert phi_now(config, 100) == pytest.approx({"hero_base": 1500.0 - 675.0 / 20, "armyless_share": 0.55 + 0.45 / 20, "lead_weight": 1.0 - 0.5 / 20})
-	assert phi_now(config, 109) == pytest.approx({"hero_base": 1162.5, "armyless_share": 0.775, "lead_weight": 0.75})
-	assert phi_now(config, 119) == phi_now(config, 500) == {"hero_base": 825.0, "armyless_share": 1.0, "lead_weight": 0.5}
-	assert phi_now(CampaignConfig(), 10**4) == {"hero_base": 1500.0, "armyless_share": 0.55, "lead_weight": 1.0}
+	assert phi_now(config, 99) == {"hero_base": 1500.0, "armyless_share": 0.55, "lead_weight": 1.0, "stock_floor": 1.0}
+	assert phi_now(config, 100) == pytest.approx({"hero_base": 1500.0 - 675.0 / 20, "armyless_share": 0.55 + 0.45 / 20, "lead_weight": 1.0 - 0.5 / 20, "stock_floor": 1.0})
+	assert phi_now(config, 109) == pytest.approx({"hero_base": 1162.5, "armyless_share": 0.775, "lead_weight": 0.75, "stock_floor": 1.0})
+	assert phi_now(config, 119) == phi_now(config, 500) == {"hero_base": 825.0, "armyless_share": 1.0, "lead_weight": 0.5, "stock_floor": 1.0}
+	assert phi_now(CampaignConfig(), 10**4) == {"hero_base": 1500.0, "armyless_share": 0.55, "lead_weight": 1.0, "stock_floor": 1.0}
 
 
 def test_the_learner_fills_the_labels_and_the_models_buffers_and_at_the_defaults_nothing(model):

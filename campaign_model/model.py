@@ -109,7 +109,8 @@ def game_tables():
 		"dwelling_creature": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),
 		"dwelling_base": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),
 		"building_requires": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, c.N_BUILDINGS, dtype=torch.bool),  # (building, a building it needs: vocab.building_requires)
-		"horde_level": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),  # (a horde building: the level index it adds growth to)
+		"horde_level": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),
+		"building_exists": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, dtype=torch.bool),  # (the faction has it: the stock thresholds' startable)  # (a horde building: the level index it adds growth to)
 		"building_family": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, c.N_BUILDINGS, dtype=torch.bool),  # (two buildings of one upgrade chain: vocab's "upgrade", transitively)
 		"building_resources": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, len(RESOURCE_PRICES)),
 		"spell_value": torch.zeros(c.N_SPELLS),
@@ -161,6 +162,7 @@ def game_tables():
 		rows = buildings()
 		for faction, building in buildings():
 			if 0 <= faction < c.FACTION_VOCAB and 0 <= building < c.N_BUILDINGS:
+				tables["building_exists"][faction, building] = True
 				tables["building_value_base"][faction, building] = building_value(faction, building, EmpireConfig(alpha=0.0))
 				tables["building_unit_growth"][faction, building] = building_value(faction, building, EmpireConfig(alpha=0.0)) - building_value(faction, building, EmpireConfig(alpha=1.0))
 				row = rows[(faction, building)]
@@ -429,6 +431,8 @@ class CustomFeatures(nn.Module):
 		self.register_buffer("phi_lead_weight", torch.tensor(float(empire.lead_weight)))
 		# The upgrade rule (empire.py unit_own_form: u at a creature's own form) the same way: 0 as before, the learner's fill
 		self.register_buffer("empire_unit_own", torch.tensor(1.0 if empire.unit_own_form else 0.0))
+		# The stockpile discount's floor (empire.py stock_floor) the same way: 1, as before; the learner's ramp fills it
+		self.register_buffer("phi_stock_floor", torch.tensor(float(empire.stock_floor)))
 		# config.empty_as_visited (B1b's bit read as visited at the model's input: features.empty_as_visited) as a buffer the
 		# weights carry, the learner's fill; 1 to begin with and in a checkpoint from before (ADDED_HEADS: the loading model's)
 		self.register_buffer("empty_as_visited", torch.ones(()))
@@ -556,6 +560,7 @@ class CustomFeatures(nn.Module):
 		gain = lambda raw: self.gain(raw)  # noqa: E731
 		gold = gain(self.build_income_gain) * f.build_value[..., 0] + gain(self.build_production_gain) * f.build_value[..., 1] + f.build_value[..., 2]
 		gold = gold + ft.unit_rule_build(x, self)  # (the upgrade rule's immediate part of a dwelling upgrade: 0 with it off)
+		gold = gold + ft.stock_build_gain(x, self, f.stock_threshold)  # (the stockpile discount's part, its thresholds before the build: 0 at its floor 1)
 		faction = vocab_index(x["t_faction"][:, :TO], c.FACTION_VOCAB)
 		bias = (self.build_faction_start + self.build_faction_bias)[faction]
 		return (gain(self.build_prior_gain) * ft.value_logit(gold) + bias) * self.economy_on()
@@ -794,7 +799,8 @@ class CustomFeatures(nn.Module):
 		f.town_take_gain, f.town_stakes = self._no_town_prior(x, f.phi_total, f.town_stakes)
 		f.hire_want = ft.hire_want(x, f.gold_pressure, f.town_danger, ft.object_classes(x))
 		f.tavern_worth = ft.tavern_worth(x, self)
-		f.hire_gain = ft.hire_gain(x, self, f.tavern_worth)
+		f.stock_threshold = ft.stock_thresholds(x, self)  # (the stockpile discount's thresholds, empire.stock_thresholds')
+		f.hire_gain = ft.hire_gain(x, self, f.tavern_worth) + ft.stock_hire_gain(x, self, f.stock_threshold).unsqueeze(-1)  # (the stockpile discount's part: 0 at its floor 1)
 		f.economy = ft.economy_features(x, self)
 		f.build_entry, f.build_value = ft.build_features(x, self, f.economy)
 		f.danger = ft.danger_features(x, self, f)
@@ -1802,6 +1808,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"features.phi_lead_weight",
 	"features.give_all_exact",  # (config.give_all_exact, 2026-11-15: off, the loading model's)
 	"features.rate_weights",  # (the MOVE views' corrections, 2026-11-15: 0, the loading model's)
+	"features.phi_stock_floor",  # (the stockpile discount's floor, 2026-11-15: as the phi_ buffers, the loading model's)
 	"features.empire_unit_own",  # (the upgrade rule, config.unit_own_form, 2026-11-15: off, the loading model's)
 	"features.empire_last_town",  # (config.no_town_last_town: the loading model's, 0)
 	"features.empty_as_visited",  # (config.empty_as_visited: a checkpoint from before keeps the loading model's, 1)
