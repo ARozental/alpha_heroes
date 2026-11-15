@@ -21,12 +21,13 @@ def golden_model():
 	set by its name, the side embeddings (new since) left at their 0, and schema 19's parts (new since: 2026-11-11,
 	model_v2.CampaignModelV2.advice) as a new model starts them, their outputs 0. The inputs hold schema 19's rows
 	(schema.random_inputs): the outputs still being the golden ones says those parts add nothing until turned on,
-	with every older weight away from 0."""
+	with every older weight away from 0. Since 2026-11-15 the MOVE views' layer and corrections (pair_rate, rate_weights)
+	and BUILD's stockpile weight start as a new model starts them too (a checkpoint from before loads them so)."""
 	torch.manual_seed(0)
 	model = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
 	with torch.no_grad():
 		for name, p in sorted(model.named_parameters()):
-			if name.startswith(("side_tile", "side_global", "time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global", "fore_fight", "fore_move", "fore_answer", "fore_hero", "build_situational", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "encode_global.no_town_days", "pair_today")):
+			if name.startswith(("side_tile", "side_global", "time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global", "fore_fight", "fore_move", "fore_answer", "fore_hero", "build_situational", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "encode_global.no_town_days", "pair_today", "pair_rate", "features.rate_weights", "features.stock_weight")):
 				continue
 			g = torch.Generator().manual_seed(sum(ord(ch) * (i + 1) for i, ch in enumerate(name)) % (2**31))
 			if name == "reach.mlp.up.weight":  # (B1b's column, schema 20, and schema 21's two: the old ones drawn as before, the new at 0, as a checkpoint migrates)
