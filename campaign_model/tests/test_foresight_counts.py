@@ -53,20 +53,21 @@ def _update(start, x, decisions, foresight, targets, advantages, streams, **sett
 
 
 def test_with_the_minibatchs_counts_the_foresight_gradient_is_one_whatever_the_split():
-	"""(a) the foresight's labels on uneven masks: the minibatch's gradient (the foresight's in it) in 1, 16 or 128
-	micro-batches is one gradient to float rounding with config.foresight_minibatch_counts; without it, 128 parts move it
-	(test_model_v2's 4/2/1 test leaves the foresight out for that reason)."""
-	n = 320  # (sequence_order needs 128 two-step sequences in one minibatch of 256: 8 streams of 40 give 152 to 160)
+	"""(a) the foresight's labels on uneven masks: the minibatch's gradient (the foresight's in it) in 1, 16 or 64
+	micro-batches (two rows each at 32, the fewest memory_steps 2 allows) is one gradient to float rounding with
+	config.foresight_minibatch_counts; without it, 32 parts move it (test_model_v2's 4/2/1 test leaves the foresight out
+	for that reason). 64 rows: at 256 the test held 4.6 GB and at 128 3.5 GB, too much beside a whole suite (its container 7.6 GB)."""
+	n = 96  # (sequence_order needs 32 two-step sequences in one minibatch of 64: 8 streams of 12 give 40 to 48)
 	x, start, decisions, foresight, targets, advantages = _setup(n)
 	streams = (np.repeat(np.arange(8), n // 8), np.tile(np.arange(n // 8), 8))
-	got = {parts: _update(start, x, decisions, foresight, targets, advantages, streams, batch_size=256, micro_batches=parts, foresight_minibatch_counts=True) for parts in (1, 16, 128)}
+	got = {parts: _update(start, x, decisions, foresight, targets, advantages, streams, batch_size=64, micro_batches=parts, foresight_minibatch_counts=True) for parts in (1, 16, 32)}
 	whole, whole_metrics = got[1]
 	assert float(whole.norm()) > 0
-	for parts in (16, 128):
+	for parts in (16, 32):
 		g, metrics = got[parts]
 		assert float((g - whole).norm() / whole.norm()) < 1e-5, parts
 		assert all(abs(metrics[f"foresight_{name}"] - whole_metrics[f"foresight_{name}"]) < 1e-5 for name in ("move_win", "answer_battle", "turn", "move_tiles", "hero_alive")), parts
-	old, _ = _update(start, x, decisions, foresight, targets, advantages, streams, batch_size=256, micro_batches=128, foresight_minibatch_counts=False)
+	old, _ = _update(start, x, decisions, foresight, targets, advantages, streams, batch_size=64, micro_batches=32, foresight_minibatch_counts=False)
 	assert float((old - whole).norm() / whole.norm()) > 1e-3  # (today's per-micro-batch means: the split moves it)
 
 
