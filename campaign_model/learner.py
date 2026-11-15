@@ -569,6 +569,7 @@ class CampaignLearner:
 			"days": game.days, "last_day": max(game.ledgers) if game.ledgers else 0, "end_day": end["day"], "decisions": len(game.decisions),
 			"end": {COLORS[p["color"]]: {"status": p["status"], "towns": len(p["towns"]), "heroes": len(p["heroes"])} for p in end["players"]},
 			"ai": game.done,
+			"host": getattr(info, "host", "") or None,  # (the machine that played it: the PC's games and the worker's apart, 2026-11-14)
 		}
 		with (self.out / "games.jsonl").open("a") as f:
 			f.write(json.dumps(line) + "\n")

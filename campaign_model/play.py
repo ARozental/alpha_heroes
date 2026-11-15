@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import random
+import socket
 import subprocess
 import time
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ class GameInfo:
 	status: str  # how the game ended
 	run_dir: str
 	run_mb: float  # the run directory (logs) on disk
+	host: str = ""  # the machine that played it (socket.gethostname(); "" in a GameInfo from before the field, 2026-11-14)
 
 
 def nk2_settings(config, seed=None):
@@ -222,7 +224,7 @@ class GameRun:
 		self.server.__exit__(None, None, None)
 		run = run_dir_of(self.process.pid)
 		game = collect(messages)
-		return game, GameInfo(self.map_name, "", seconds, self.status, str(run), directory_mb(run))
+		return game, GameInfo(self.map_name, "", seconds, self.status, str(run), directory_mb(run), socket.gethostname())
 
 
 def play(socket_path, map_name, days, seed, max_seconds=170, max_mb=300, battle_ai="BattleAI", game_key="g0", settings=(), niceness=0, temperature=1.0, ours=None, our_battle_ai="AlphaBattleAI", stop=None, neutral_ai="BattleAI", difficulty=None, teacher=False):
