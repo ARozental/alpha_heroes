@@ -440,6 +440,12 @@ def tavern_worth(x, t):
 	return (after - before + led + carried) * present
 
 
+def rate_correction(views, t):
+	"""MOVE's tile logits' addend [K, W, W] from the gain-per-movement and IRR views (rate_views'), each view's weight a
+	bounded correction starting at 0 (t.rate_weights, -2..2; e5 for the user, 2026-11-15: beside pair_rate)."""
+	return (views.float() * bounded(t.rate_weights, -2.0, 2.0, 0.0, t.correction_step)).sum(dim=-1)
+
+
 def hire_gain(x, t, worth):
 	"""What hiring each hero for hire does to our Φ [B, N_TAVERN] (gold): its worth (tavern_worth) less the hire's
 	price and the crowding the extra hero adds (empire.py HERO_PENALTY x heroes^2): + for a week's hero with its army,

@@ -937,6 +937,13 @@ class CampaignLearner:
 			row.update(self._note_segments(decisions, surprises, np.concatenate(streams[0]), np.concatenate(hidden) if hidden else None))
 		self._relabel_waiting()
 		memory.append(("updated", rss_gb()))
+		features = getattr(self.model, "features", None)
+		if features is not None and hasattr(features, "correction_values"):  # (2026-11-15: the new bounded corrections, each update)
+			values = features.correction_values()
+			print("campaign corrections: " + "  ".join(f"{name} {value:+.4f}" for name, value in values.items()), flush=True)
+			if getattr(self, "writer", None) is not None:
+				for name, value in values.items():
+					self.writer.add_scalar(f"campaign_corrections/{name}", value, self.version)
 		self._log(epoch, games, decisions, row, metrics, time.time() - started)
 		memory.append(("logged", rss_gb()))
 		# The update's freed memory back to the system: glibc kept it, and the trainer climbed from ~4 GB after each

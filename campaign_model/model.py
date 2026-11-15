@@ -343,6 +343,9 @@ class CustomFeatures(nn.Module):
 		self.drop_scale, self.drop_sign = zeros(), zeros()  # (2026-11-05: a DROP's gain as a share of its hero's army; drop_weights)
 		self.trade_waste = zeros()  # (2026-11-05: a TRADE that unlocks no purchase; trade_waste_weight)
 		self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight = zeros(), zeros(), zeros(), zeros()
+		# (2026-11-15: the MOVE views' weights, features.rate_correction's)
+		self.rate_weights = zeros(4)
+		self.correction_step = CORRECTION_STEP
 		self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight = (zeros() for _ in range(6))
 		self.travel_exponent, self.end_coupling, self.travel_coupling = zeros(), zeros(), zeros()
 		self.move_discount = zeros()  # (not a prior correction: its 0 is the old score, not a prior; move_discount_power)
@@ -461,7 +464,7 @@ class CustomFeatures(nn.Module):
 			self.swap_gain, self.swap_slot, self.last_swap,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
-			self.night_gain,
+			self.night_gain, self.rate_weights,
 			self.nk_gain, self.nk_gain_fallback, self.nk_survival, self.nk_risk, self.nk_label_gain, self.nk_follow_shift,
 			self.adv_gain_shift, self.town_guard_shift, self.build_income_gain, self.build_production_gain, self.build_prior_gain, self.build_faction_bias,
 		]
@@ -529,6 +532,11 @@ class CustomFeatures(nn.Module):
 	def building_value(self):
 		"""[FACTION_VOCAB + 1, N_BUILDINGS] each building's worth in Φ (empire.building_value at ALPHA)."""
 		return self.building_value_base - self.empire_alpha * self.building_unit_growth
+
+	def correction_values(self):
+		"""{name: value} of the 2026-11-15 bounded corrections (the learner's log line): the MOVE views' weights."""
+		rate = ft.bounded(self.rate_weights, -2.0, 2.0, 0.0, CORRECTION_STEP).tolist()
+		return {f"r{k + 1}_move_view": v for k, v in enumerate(rate)}
 
 	def give_all_exact_on(self):
 		"""1.0 where GIVE_ALL's shown gain leaves the giver VCMI's kept creature (config.give_all_exact; ALPHA_GIVE_ALL_EXACT),
@@ -1793,6 +1801,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"features.phi_armyless_share",
 	"features.phi_lead_weight",
 	"features.give_all_exact",  # (config.give_all_exact, 2026-11-15: off, the loading model's)
+	"features.rate_weights",  # (the MOVE views' corrections, 2026-11-15: 0, the loading model's)
 	"features.empire_unit_own",  # (the upgrade rule, config.unit_own_form, 2026-11-15: off, the loading model's)
 	"features.empire_last_town",  # (config.no_town_last_town: the loading model's, 0)
 	"features.empty_as_visited",  # (config.empty_as_visited: a checkpoint from before keeps the loading model's, 1)
