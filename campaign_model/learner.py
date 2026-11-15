@@ -49,7 +49,7 @@ from battle_model.supply import trim_memory
 
 from . import constants as c
 from . import evaluate
-from .empire import STATUS_INGAME, EmpireConfig, empire_value
+from .empire import ARMYLESS_SHARE, HERO_BASE, LEAD_WEIGHT, STATUS_INGAME, EmpireConfig, empire_value
 from .failures import NAMES as FAILURES, failure_modes
 from .features import SKILLS
 from .labels import (
@@ -193,10 +193,17 @@ def set_advice_prior(model, config):
 			features.build_economy.fill_(float(getattr(config, "build_economy", 0.0)))
 		if hasattr(features, "empty_as_visited"):  # (config.empty_as_visited: the weights carry it to every inference server)
 			features.empty_as_visited.fill_(1.0 if getattr(config, "empty_as_visited", True) else 0.0)
+		if hasattr(features, "give_all_exact"):  # (config.give_all_exact: GIVE_ALL's kept creature in its shown gain)
+			features.give_all_exact.fill_(1.0 if getattr(config, "give_all_exact", False) else 0.0)
 		if hasattr(features, "empire_alpha"):  # (ALPHA, the labels' own: the weights carry it to every inference server)
 			features.empire_alpha.fill_(float(EmpireConfig().alpha))
 		if hasattr(features, "empire_no_town"):  # (B2's no-town factor, the labels' own, carried the same way; the run's ramp: learner._empire_at)
 			features.empire_no_town.fill_(float(EmpireConfig().no_town_factor))
+		if hasattr(features, "phi_hero_base"):  # (Φ's hero base, armyless share, lead weight: the labels' own, carried the same way; the run's ramp: learner._ramp_phi)
+			empire = EmpireConfig()
+			features.phi_hero_base.fill_(float(empire.hero_base))
+			features.phi_armyless_share.fill_(float(empire.armyless_share))
+			features.phi_lead_weight.fill_(float(empire.lead_weight))
 		if hasattr(features, "empire_last_town"):  # (config.no_town_last_town: the last town's stake term)
 			features.empire_last_town.fill_(1.0 if getattr(config, "no_town_last_town", False) else 0.0)
 
@@ -236,6 +243,21 @@ def no_town_now(config, version):
 	if target >= 1.0 or version < start:
 		return 1.0
 	return max(target, 0.9 ** (version - start + 1))
+
+
+PHI_FIELDS = (("phi_hero_base", "hero_base", HERO_BASE), ("phi_armyless_share", "armyless_share", ARMYLESS_SHARE), ("phi_lead_weight", "lead_weight", LEAD_WEIGHT))  # (config's, EmpireConfig's, today's)
+
+
+def phi_now(config, version):
+	"""config.phi_*'s ramp: {EmpireConfig field: value} at this version, each from today's (empire.HERO_BASE,
+	ARMYLESS_SHARE, LEAD_WEIGHT) to its target in phi_ramp equal steps, the first at phi_from; today's before it, and a
+	target at today's value today's exactly. Stateless, as no_town_now."""
+	step = min(1.0, max(0.0, (version - int(getattr(config, "phi_from", 0)) + 1) / max(1, int(getattr(config, "phi_ramp", 20)))))
+	out = {}
+	for name, field_, start in PHI_FIELDS:
+		target = float(getattr(config, name, start))
+		out[field_] = start if target == start else start + (target - start) * step
+	return out
 
 
 def campaign_model_kwargs(config, out, resume=False):
@@ -377,6 +399,7 @@ class CampaignLearner:
 		self.features_cpu = copy.deepcopy(self.model.features).cpu()
 		# The labels of each game as it arrives, in processes of their own (labeler.py): the trainer's thread never waits
 		self._ramp_no_town()  # (B2's factor at the resume version: the labels' and the model's)
+		self._ramp_phi()  # (Φ's hero base, armyless share and lead weight at the resume version, the same way)
 		self.labeler = Labeler(self.labels, self.empire, foresight=self.kwargs.get("architecture") == "v2", share_target=config.share_target)
 		if config.credit == "schedule" and config.share_target != "change":
 			raise SystemExit("campaign.credit 'schedule' reads the share heads as changes: it needs campaign.share_target 'change'")
@@ -651,12 +674,28 @@ class CampaignLearner:
 			if features is not None and hasattr(features, "empire_no_town"):
 				features.empire_no_town.fill_(f)
 
+	def _ramp_phi(self):
+		"""config.phi_*'s ramp: self.empire (the labels', the labeler's for each game submitted from now) and the model's
+		phi_ buffers at this version's values (phi_now); nothing while every target is today's (the EmpireConfig as it
+		was, ALPHA_EMPIRE_* included, bit for bit)."""
+		if all(float(getattr(self.config, name, start)) == start for name, _, start in PHI_FIELDS):
+			return
+		values = phi_now(self.config, self.version)
+		self.empire = replace(self.empire, **values)
+		for model in (self.model, getattr(self, "features_cpu", None)):
+			features = getattr(model, "features", model)
+			if features is not None and hasattr(features, "phi_hero_base"):
+				features.phi_hero_base.fill_(values["hero_base"])
+				features.phi_armyless_share.fill_(values["armyless_share"])
+				features.phi_lead_weight.fill_(values["lead_weight"])
+
 	def step(self, epoch):
 		"""One update if its games are in (the battle learner calls this between its updates); True if it ran."""
 		games = self._take()
 		if games is None:
 			return False
 		CampaignLearner._ramp_no_town(self)  # (B2's factor at this version: the update's labels and model, the labeler's next games; the tests' learners are namespaces)
+		CampaignLearner._ramp_phi(self)  # (Φ's hero base, armyless share and lead weight at this version, the same way)
 		if getattr(self, "held", None) is not None:
 			# The value-loss guard holds the updates (_judge_value): the model stays as it is, served and evaluated as
 			# before, and the games that would have made this update are dropped (their battles went to the battle

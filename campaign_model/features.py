@@ -254,24 +254,25 @@ def main_hero(values, present):
 	return (torch.arange(values.shape[-1], device=values.device) == best) & present
 
 
-def armed_share(army_gold, t):
+def armed_share(army_gold, t, armyless=None):
 	"""empire.hero_base_value's share of HERO_BASE [...] at a hero's army worth (gold at cost + u): armyless_share with
-	none, 1 from armed_army on."""
-	return t.armyless_share + (1 - t.armyless_share) * (army_gold.clamp(min=0) / t.armed_army).clamp(max=1.0)
+	none, 1 from armed_army on. armyless: Φ's (t.phi_armyless_share) where Φ is priced, else the stakes' t.armyless_share."""
+	armyless = t.armyless_share if armyless is None else armyless
+	return armyless + (1 - armyless) * (army_gold.clamp(min=0) / t.armed_army).clamp(max=1.0)
 
 
-def heroes_value(values, present, armed, t):
-	"""empire.heroes_value [B]: each hero's HERO_BASE at its armed_share (armed [B, H]), the strongest hero's skill_value
-	(values [B, H]) in full, the others' at SECONDARY_SHARE."""
+def heroes_value(values, present, armed, t, base=None):
+	"""empire.heroes_value [B]: each hero's HERO_BASE (base: Φ's t.phi_hero_base where Φ is priced, else t.hero_base) at
+	its armed_share (armed [B, H]), the strongest hero's skill_value (values [B, H]) in full, the others' at SECONDARY_SHARE."""
 	weight = torch.where(main_hero(values, present), torch.ones_like(values), torch.full_like(values, t.secondary_share))
-	return (t.hero_base * armed + weight * values).mul(present.float()).sum(dim=-1)
+	return ((t.hero_base if base is None else base) * armed + weight * values).mul(present.float()).sum(dim=-1)
 
 
-def own_armed(x, t):
+def own_armed(x, t, armyless=None):
 	"""Our heroes' armed_share [B, HO] (their armies at cost + u, exact counts: ours)."""
 	creatures = x["h_army_creature"][:, :HO]
 	_, _, gold, _ = army(creatures, x["h_army_count"][:, :HO], torch.ones_like(creatures[..., 0], dtype=torch.bool), t)
-	return armed_share(gold, t)
+	return armed_share(gold, t, armyless)
 
 
 def own_skill_values(x, t):
@@ -335,13 +336,43 @@ def bulk_moves(into, source):
 	return torch.stack(moved, dim=-1)
 
 
+def bulk_kept(creatures, counts, moved, t):
+	"""What VCMI's bulk move leaves its source when every stack would go (CGameHandler::bulkMoveArmy: a hero is never left
+	without troops; AlphaMapAI's GIVE_ALL names the slot): one creature of the stack of the least power (AI value x count,
+	CStackInstance::getPower; the first of equals in slot order) [..., A] (1.0 there); 0 elsewhere, and where some stack
+	stays anyway. creatures, counts: the source's [..., A]; moved: bulk_moves' [..., A]."""
+	present = (creatures >= 0) & (counts > 0)
+	all_go = ((moved & present) | ~present).all(dim=-1, keepdim=True) & present.any(dim=-1, keepdim=True)
+	power = torch.where(present, counts.float() * t.creature_ai_value[vocab_index(creatures, c.CREATURE_VOCAB)], torch.full_like(counts.float(), float("inf")))
+	weakest = power.argmin(dim=-1, keepdim=True)
+	return ((torch.arange(creatures.shape[-1], device=creatures.device) == weakest) & all_go).float()
+
+
 def led_values(creatures, counts, multiplier, rest, t):
 	"""What armies [..., A] count in Φ led by a hero (gold, [...]): their worth x the hero's multiplier (hero_multipliers)
-	x its movement (speed_factors), and their make-up's morale (make_up_values, over rest: the hero's morale without its
-	make-up's). An exchange's or a gather's armies joined: their slots concatenated."""
+	at the lead weight (lead_factor) x its movement (speed_factors), and their make-up's morale (make_up_values, over
+	rest: the hero's morale without its make-up's). An exchange's or a gather's armies joined: their slots concatenated."""
 	index = vocab_index(creatures, c.CREATURE_VOCAB)
 	worth = (counts.clamp(min=0).float() * (t.creature_cost[index] + t.creature_unit[index]) * (creatures >= 0)).sum(dim=-1)
-	return worth * multiplier * speed_factors(creatures, counts, t) + make_up_values(creatures, counts, rest, t)
+	return worth * lead_factor(multiplier, t) * speed_factors(creatures, counts, t) + make_up_values(creatures, counts, rest, t)
+
+
+def lead_factor(multiplier, t):
+	"""empire.led_multiplier: what an army counts at in Φ by its multiplier (hero_multipliers', or unled_share: unled_lead)
+	at the lead weight h (t.phi_lead_weight, the learner's fill): 1 + h x (multiplier - 1); the multiplier itself at 1."""
+	h = t.phi_lead_weight
+	return torch.where(h == 1, multiplier, 1 + h * (multiplier - 1))
+
+
+def unled_lead(t):
+	"""What an army no hero leads counts at in Φ (a garrison's, a mine's): lead_factor of unled_share."""
+	return lead_factor(t.phi_lead_weight.new_tensor(t.unled_share), t)
+
+
+def unled_loss(t):
+	"""unled_lead - 1, what a stack loses into a garrison over its worth: h x (unled_share - 1), the difference taken in
+	double as before (at h = 1 the same float as unled_share - 1.0)."""
+	return t.phi_lead_weight * t.phi_lead_weight.new_tensor(t.unled_share - 1.0)
 
 
 def own_make_up_values(x, t):
@@ -401,9 +432,9 @@ def tavern_worth(x, t):
 	carried = (t.artifact_price[vocab_index(worn, c.ARTIFACT_VOCAB)] * (worn >= 0)).sum(dim=-1)
 	theirs = skill_value(x["g_tavern_primary"], x["g_tavern_skills"], x["g_tavern_exp"], x["g_tavern_spells"], t)  # [B, N_TAVERN]
 	ours, mine = own_skill_values(x, t)
-	armed, theirs_armed = own_armed(x, t), armed_share(army_gold, t)
-	before = heroes_value(ours, mine, armed, t).unsqueeze(-1)
-	after = torch.stack([heroes_value(torch.cat([ours, theirs[:, s : s + 1]], dim=1), torch.cat([mine, torch.ones_like(mine[:, :1])], dim=1), torch.cat([armed, theirs_armed[:, s : s + 1]], dim=1), t) for s in range(theirs.shape[1])], dim=1)
+	armed, theirs_armed = own_armed(x, t, t.phi_armyless_share), armed_share(army_gold, t, t.phi_armyless_share)  # (Φ's own: t.phi_*)
+	before = heroes_value(ours, mine, armed, t, t.phi_hero_base).unsqueeze(-1)
+	after = torch.stack([heroes_value(torch.cat([ours, theirs[:, s : s + 1]], dim=1), torch.cat([mine, torch.ones_like(mine[:, :1])], dim=1), torch.cat([armed, theirs_armed[:, s : s + 1]], dim=1), t, t.phi_hero_base) for s in range(theirs.shape[1])], dim=1)
 	creatures, counts = x["g_tavern_army_creature"], x["g_tavern_army_count"].float()
 	led = led_values(creatures, counts, hero_multipliers(x["g_tavern_primary"], x["g_tavern_artifacts"], t), torch.zeros_like(army_gold), t)  # (its morale: its army's make-up's alone)
 	return (after - before + led + carried) * present
@@ -446,10 +477,10 @@ def empire_value(x, t):
 			(x["g_resources"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
 			((x["t_built"][:, : c.OWN_TOWNS].float() * t.building_value[faction]).sum(dim=-1) * own_towns).sum(dim=-1),
 			t.income_days * (x["g_object_income"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
-			(hero_army * hero_multipliers(x["h_primary"][:, :HO], x["h_artifacts"][:, :HO], t) * speed_factors(x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO], t) * own_heroes).sum(dim=-1)
-			+ t.unled_share * ((garrison * own_towns).sum(dim=-1) + owned),  # (armies no hero leads: game_values.unled_share)
+			(hero_army * lead_factor(hero_multipliers(x["h_primary"][:, :HO], x["h_artifacts"][:, :HO], t), t) * speed_factors(x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO], t) * own_heroes).sum(dim=-1)
+			+ unled_lead(t) * ((garrison * own_towns).sum(dim=-1) + owned),  # (armies no hero leads: game_values.unled_share at the lead weight)
 			((x["t_available"][:, : c.OWN_TOWNS].clamp(min=0).float() * t.creature_unit[vocab_index(available, c.CREATURE_VOCAB)] * (available >= 0)).sum(dim=-1) * own_towns).sum(dim=-1) + dwelling_hire,
-			heroes_value(*own_skill_values(x, t), armed_share(hero_army, t), t) + ((boost_values(x, t) + own_make_up_values(x, t)) * own_heroes).sum(dim=-1),
+			heroes_value(*own_skill_values(x, t), armed_share(hero_army, t, t.phi_armyless_share), t, t.phi_hero_base) + ((boost_values(x, t) + own_make_up_values(x, t)) * own_heroes).sum(dim=-1),
 			((t.artifact_price[vocab_index(artifacts, c.ARTIFACT_VOCAB)] * (artifacts >= 0)).sum(dim=-1) * own_heroes).sum(dim=-1),
 			(2.0 * x["h_primary"][:, :HO, 2].clamp(min=0).float() * usable_mana * own_heroes).sum(dim=-1),  # game_values.capped_mana_value
 			-t.hero_penalty * own_heroes.sum(dim=-1) ** 2,

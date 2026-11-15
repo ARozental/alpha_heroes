@@ -66,6 +66,11 @@ EVAL_EMPIRE_VERSION = 3
 # stack's attack is lucky (double damage), or that its turn brings an extra one (+) or is lost (-)
 LUCK_CHANCE = (0, 0, 0, 0, 1, 2, 3)
 MORALE_CHANCE = (-6, -4, -2, 0, 1, 2, 3)
+# A hero's own base and its share with no army, and the lead weight, as Φ had them before 2026-11-15 (EmpireConfig's
+# hero_base, armyless_share, lead_weight start from them; the model's stakes and hero_worth keep them whatever Φ's are)
+HERO_BASE = 1500.0
+ARMYLESS_SHARE = 0.55
+LEAD_WEIGHT = 1.0
 
 
 @dataclass(frozen=True)
@@ -81,7 +86,10 @@ class EmpireConfig:
 	# it for a run as ALPHA_EMPIRE_ALPHA does (1: as before, bit for bit); the evaluation's EVAL_EMPIRE keeps 1
 	no_town_factor: float = field(default_factory=lambda: float(os.environ.get("ALPHA_EMPIRE_NO_TOWN", "") or 1.0))
 	income_days: float = 5.0  # unpriced income is worth this many days of it (the user: "sane for this hyperparameter")
-	hero_base: float = 1500.0  # gold: a fresh hero (its first two skill levels and five primary points), besides its army and artifacts
+	# gold: a fresh hero (its first two skill levels and five primary points), besides its army and artifacts. ALPHA_EMPIRE_HERO_BASE
+	# sets it for a run as ALPHA_EMPIRE_ALPHA does (e5 for the user, 2026-11-15: 825 the target, the learner's ramp:
+	# config.phi_hero_base); the evaluation's EVAL_EMPIRE keeps HERO_BASE
+	hero_base: float = field(default_factory=lambda: float(os.environ.get("ALPHA_EMPIRE_HERO_BASE", "") or HERO_BASE))
 	skill_level: float = 2000.0  # each secondary skill level beyond a fresh hero's two
 	fresh_skill_levels: float = 2.0
 	primary_point: float = 400.0  # the k-th primary point beyond a fresh hero's five: k x this
@@ -96,8 +104,15 @@ class EmpireConfig:
 	# ... heroes with creatures should stay positive"): armyless_share of it with no army, all of it once the army is
 	# worth armed_army (gold at cost + u, as Φ's army part counts it). The hires of joint7's games (471): +1,943 in Φ at the
 	# median, -366 without their army; at 0.55 an empty hire comes to ~-1,040, one with its usual army (1,938) as before
-	armyless_share: float = 0.55
+	# (ALPHA_EMPIRE_ARMYLESS as ALPHA_EMPIRE_HERO_BASE: 1.0 the target of 2026-11-15, a hero's base whatever its army)
+	armyless_share: float = field(default_factory=lambda: float(os.environ.get("ALPHA_EMPIRE_ARMYLESS", "") or ARMYLESS_SHARE))
 	armed_army: float = 1000.0
+	# How much of what a hero makes of an army counts (e5 for the user, 2026-11-15: "count the hero bonus ... of creatures
+	# value as less"): an army counts at its worth x (1 + lead_weight x (its multiplier - 1)), a hero's (hero_multiplier)
+	# and one no hero leads (unled_share) alike (led_multiplier); 1: the multiplier in full, as before. A starting hero's
+	# multiplier is 1, so a purchase it leads stays neutral at any weight. ALPHA_EMPIRE_LEAD_WEIGHT as the others (0.5 the
+	# target); the evaluation's EVAL_EMPIRE keeps 1
+	lead_weight: float = field(default_factory=lambda: float(os.environ.get("ALPHA_EMPIRE_LEAD_WEIGHT", "") or LEAD_WEIGHT))
 	# A hero's spellbook in what it makes of its army (game_values.spell_factor), and so Φ's unit: an army no hero leads
 	# at game_values.unled_share (0.953 at 0.02), a hero's at that x its multiplier (the user, 2026-11-05: buying an army
 	# slightly negative, neutral once even a starting hero with spell power 3 and knowledge 2 leads it)
@@ -110,7 +125,7 @@ class EmpireConfig:
 
 # The evaluation's Φ (its scores, evaluate.score): as of 2026-11-04's army multiplier, before the spellbook's factor and
 # the unled share, the army's movement and make-up, so its scores stay comparable across the changes
-EVAL_EMPIRE = EmpireConfig(alpha=0.25, spell_step=0.0, speed_power=0.0, army_morale=0.0, no_town_factor=1.0)
+EVAL_EMPIRE = EmpireConfig(alpha=0.25, spell_step=0.0, speed_power=0.0, army_morale=0.0, no_town_factor=1.0, hero_base=HERO_BASE, armyless_share=ARMYLESS_SHARE, lead_weight=LEAD_WEIGHT)
 
 
 def _unit(creature_id, config):
@@ -220,6 +235,12 @@ def hero_multiplier(hero, config=EmpireConfig()):
 	return unled_share(config.spell_step) * multiplier
 
 
+def led_multiplier(multiplier, config=EmpireConfig()):
+	"""What an army counts at in Φ by its multiplier (hero_multiplier's, or unled_share for one no hero leads) at the lead
+	weight: 1 + lead_weight x (multiplier - 1); the multiplier itself at 1."""
+	return multiplier if config.lead_weight == 1.0 else 1.0 + config.lead_weight * (multiplier - 1.0)
+
+
 def hero_base_value(army, config=EmpireConfig()):
 	"""A hero's HERO_BASE at its army's worth (gold): armyless_share of it with none, all of it from armed_army on."""
 	return config.hero_base * (config.armyless_share + (1 - config.armyless_share) * min(1.0, max(army, 0.0) / config.armed_army))
@@ -250,7 +271,9 @@ def empire_value(player, config=EmpireConfig()):
 		parts["for_hire"] += sum(count * _unit(creature, config) for creature, count in town["available"] if creature >= 0)
 	for dwelling in player.get("dwellings", []):
 		parts["for_hire"] += sum(count * _unit(creature, config) for creature, count in dwelling["available"] if creature >= 0)
-	parts["army"] = unled_share(config.spell_step) * army_worth(stacks, config) + sum(army_worth(hero["army"], config) * hero_multiplier(hero, config) * speed_factor(hero["army"], config) for hero in player["heroes"])
+	parts["army"] = led_multiplier(unled_share(config.spell_step), config) * army_worth(stacks, config) + sum(
+		army_worth(hero["army"], config) * led_multiplier(hero_multiplier(hero, config), config) * speed_factor(hero["army"], config) for hero in player["heroes"]
+	)
 	parts["income"] = config.income_days * resources_value(player.get("income", [0] * 7))
 	prices = vocab.artifact_prices()
 	parts["heroes"] = heroes_value(player["heroes"], config)
