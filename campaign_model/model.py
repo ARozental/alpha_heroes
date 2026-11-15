@@ -300,8 +300,13 @@ class CustomFeatures(nn.Module):
 
 		self.spell_step, self.unled_share = empire.spell_step, unled_share(empire.spell_step)  # (a hero's spellbook; armies no hero leads: game_values)
 		self.speed_power, self.army_morale = empire.speed_power, empire.army_morale  # (a hero's army at its movement and its make-up's morale)
-		for name in ("hero_base", "skill_level", "fresh_skill_levels", "primary_point", "primary_base", "level_bonus", "secondary_share", "boost", "armyless_share", "armed_army"):  # (empire.py's heroes)
+		for name in ("skill_level", "fresh_skill_levels", "primary_point", "primary_base", "level_bonus", "secondary_share", "boost", "armed_army"):  # (empire.py's heroes)
 			setattr(self, name, getattr(empire, name))
+		# A hero's own base and its share with no army: the stakes' and hero_worth's, the constants as they were (e5 for the
+		# user, 2026-11-15); Φ's own (empire_value, tavern_worth) in the phi_ buffers below, which the learner ramps
+		from .empire import ARMYLESS_SHARE, HERO_BASE
+
+		self.hero_base, self.armyless_share = HERO_BASE, ARMYLESS_SHARE
 		scores, subtypes = priors.object_values()
 		# Tables of a fixed shape, [object, subtype] (the last column: any other subtype), looked up in one gather: a
 		# checkpoint keeps the priors it was trained from, and an edit of the CSVs still loads it
@@ -408,6 +413,13 @@ class CustomFeatures(nn.Module):
 		# town's stake: _no_town_prior); 1, as a checkpoint from before keeps its process's: none of it
 		self.register_buffer("empire_no_town", torch.tensor(float(empire.no_town_factor)))
 		self.register_buffer("empire_last_town", torch.zeros(()))  # (config.no_town_last_town: the last town's stake term, 0 = off)
+		# Φ's hero base, its share with no army and the lead weight (empire.py's hero_base, armyless_share, lead_weight;
+		# e5 for the user, 2026-11-15) the same way, ALPHA's buffer's rules: the Φ replica (features.empire_value), the
+		# armies' Φ in every gain (features.led_values, unled_lead) and a hire's worth (tavern_worth) read them; the learner
+		# fills them each update (config.phi_*: its ramp); a checkpoint from before keeps its process's, as before by default
+		self.register_buffer("phi_hero_base", torch.tensor(float(empire.hero_base)))
+		self.register_buffer("phi_armyless_share", torch.tensor(float(empire.armyless_share)))
+		self.register_buffer("phi_lead_weight", torch.tensor(float(empire.lead_weight)))
 		# config.empty_as_visited (B1b's bit read as visited at the model's input: features.empty_as_visited) as a buffer the
 		# weights carry, the learner's fill; 1 to begin with and in a checkpoint from before (ADDED_HEADS: the loading model's)
 		self.register_buffer("empty_as_visited", torch.ones(()))
@@ -902,9 +914,9 @@ class CustomFeatures(nn.Module):
 		index = vocab_index(garrison_c, c.CREATURE_VOCAB)
 		gathered_worth = (garrison_n * gathered * (self.creature_cost[index] + self.creature_unit[index]) * (garrison_c >= 0)).sum(dim=-1)  # [B, TO]
 		gains = torch.zeros(b, TO, c.N_MULTI, device=have.device)
-		gains[..., c.MultiKind.RECRUIT_ALL] = worth * (self.unled_share - 1.0)
+		gains[..., c.MultiKind.RECRUIT_ALL] = worth * ft.unled_loss(self)
 		gains[..., c.MultiKind.RECRUIT_ALL_HERO] = (with_recruits - visitor_led - hero_worth) * has
-		gains[..., c.MultiKind.GATHER] = (with_garrison - visitor_led - self.unled_share * gathered_worth) * has - self.gather_loss(f)
+		gains[..., c.MultiKind.GATHER] = (with_garrison - visitor_led - ft.unled_lead(self) * gathered_worth) * has - self.gather_loss(f)
 		pair = x["x_heroes"] - 1  # [B, 2]: the exchange's heroes (tokens + 1; -1 none)
 		p = pair.clamp(min=0)
 		pair_c, pair_n = army_c.gather(1, p.unsqueeze(-1).expand(-1, -1, A)), army_n.gather(1, p.unsqueeze(-1).expand(-1, -1, A))  # [B, 2, A]
@@ -931,7 +943,7 @@ class CustomFeatures(nn.Module):
 		index = vocab_index(keep_c, c.CREATURE_VOCAB)
 		dropped = (army_n.unsqueeze(2) * drop * (self.creature_cost[index] + self.creature_unit[index]) * (keep_c >= 0)).sum(dim=-1)  # [B, HO, 2]: their worth
 		for variant, kind in enumerate((c.MultiKind.DROP_SLOW, c.MultiKind.DROP_FOREIGN)):
-			gains[:, :HO, kind] = kept[:, :, variant] - led + self.unled_share * dropped[:, :, variant] * x["h_drop_kept"][:, :, variant].float()
+			gains[:, :HO, kind] = kept[:, :, variant] - led + ft.unled_lead(self) * dropped[:, :, variant] * x["h_drop_kept"][:, :, variant].float()
 		return gains
 
 	def gather_risk_weight(self):
@@ -1059,7 +1071,7 @@ class CustomFeatures(nn.Module):
 		army = f.hero_gold[:, :HO]
 
 		def lead_of(skills, book):  # what an army counts at in Φ with a hero of these primary skills [.., 4] (features.hero_multipliers')
-			return self.unled_share * ft.army_multiplier(skills[..., 0], skills[..., 1], skills[..., 2], skills[..., 3], book, self.spell_step)
+			return ft.lead_factor(self.unled_share * ft.army_multiplier(skills[..., 0], skills[..., 1], skills[..., 2], skills[..., 3], book, self.spell_step), self)
 
 		lead = lead_of(primary, spellbook)  # [B, HO]
 
@@ -1304,7 +1316,7 @@ class CustomFeatures(nn.Module):
 		with_garrison = ft.led_values(
 			torch.cat([mover_c.unsqueeze(1).expand(-1, TO, -1), garrison_c], dim=-1), torch.cat([mover_n.unsqueeze(1).expand(-1, TO, -1), garrison_n], dim=-1), mover_m[:, None], mover_r[:, None], self
 		)  # [K, TO]
-		gathered = with_garrison - mover_v[:, None] - self.unled_share * f.town_gold[:, :TO].index_select(0, decision) - self.gather_loss(f).index_select(0, decision)
+		gathered = with_garrison - mover_v[:, None] - ft.unled_lead(self) * f.town_gold[:, :TO].index_select(0, decision) - self.gather_loss(f).index_select(0, decision)
 		garrison = gathered.clamp(min=0.0) * flat(f.main.float())[:, None]
 		entered = (on_tile(x["t_pos"][:, :TO], own).float() * garrison[:, None, None, :]).amax(dim=-1)
 		return (met + entered) * self.gain(self.meeting_gain)
@@ -1750,6 +1762,9 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	# model_v2.migrate_option_head)
 	"features.empire_alpha",  # (ALPHA: a checkpoint from before keeps the loading model's, its process's EmpireConfig, never 0)
 	"features.empire_no_town",  # (B2's no-town factor, as ALPHA: the loading model's, its process's EmpireConfig)
+	"features.phi_hero_base",  # (Φ's hero base, its armyless share and the lead weight, 2026-11-15: as ALPHA, the loading model's)
+	"features.phi_armyless_share",
+	"features.phi_lead_weight",
 	"features.empire_last_town",  # (config.no_town_last_town: the loading model's, 0)
 	"features.empty_as_visited",  # (config.empty_as_visited: a checkpoint from before keeps the loading model's, 1)
 	"foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option", "option_flags",

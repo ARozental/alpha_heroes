@@ -232,6 +232,19 @@ class CampaignConfig:
 	# model's buffer (features.empire_no_town) take the same f each update. 1 (the default): none of it
 	no_town_factor: float = 1.0
 	no_town_from: int = 0
+	# Φ's heroes and the armies they lead (e5 for the user, 2026-11-15): a hero's own base (empire.py hero_base: 1500, the
+	# target 825), its share of it with no army (armyless_share: 0.55, the target 1.0: the base whatever its army) and the
+	# lead weight h (lead_weight: 1, the target 0.5: an army at its worth x (1 + h x (its multiplier - 1)), a hero's and
+	# one no hero leads alike, a starting hero's purchase still neutral). Each moves from today's value (empire.HERO_BASE,
+	# ARMYLESS_SHARE, LEAD_WEIGHT) to its target in phi_ramp equal steps from phi_from, stateless as no_town_factor's
+	# (learner.phi_now): the learner's EmpireConfig for the labels (its own and the labeler's) and the model's buffers
+	# (features.phi_*) take each update's. The model's stakes keep today's constants. At today's values (the defaults)
+	# nothing changes, bit for bit
+	phi_hero_base: float = 1500.0
+	phi_armyless_share: float = 0.55
+	phi_lead_weight: float = 1.0
+	phi_from: int = 0
+	phi_ramp: int = 20
 	# The last town's stake term of B2's prior ((1 - f) x phi more at stake when we own exactly one town; e5: most of every
 	# game, a read input's size on common states): off (the default), the stake as before; its own decision later
 	no_town_last_town: bool = False

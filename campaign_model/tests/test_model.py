@@ -32,8 +32,22 @@ def model():
 	return CampaignModel(dim=32, cell_dim=16, layers=1).eval()
 
 
+def phi_values(model, hero_base, armyless, lead):
+	"""The model's Φ buffers (features.phi_*: the learner's fill) at these values, and the ledger's EmpireConfig alike."""
+	from dataclasses import replace
+
+	model.features.phi_hero_base.fill_(hero_base)
+	model.features.phi_armyless_share.fill_(armyless)
+	model.features.phi_lead_weight.fill_(lead)
+	return replace(EmpireConfig(), hero_base=hero_base, armyless_share=armyless, lead_weight=lead)
+
+
+TODAY, TARGETS = (1500.0, 0.55, 1.0), (825.0, 1.0, 0.5)  # (Φ's hero base, armyless share, lead weight: e5 for the user, 2026-11-15)
+
+
 def test_phi_in_the_graph_is_the_ledgers_value(model):
-	"""The model's Φ from its inputs is empire.py's from the ledger, for the same empire."""
+	"""The model's Φ from its inputs is empire.py's from the ledger, for the same empire: today's hero base, armyless
+	share and lead weight, and 2026-11-15's targets."""
 	x = empty_inputs(1)
 	x["g_resources"][0] = [10, 4, 10, 4, 4, 4, 10000]
 	x["g_object_income"][0] = [0, 0, 0, 0, 0, 0, 1000]
@@ -80,16 +94,24 @@ def test_phi_in_the_graph_is_the_ledgers_value(model):
 	config, pikemen = EmpireConfig(), 10 * 75.0
 	without = empire_value(dict(player, heroes=[dict(h, spells=[], battle_luck=0, battle_morale=0) for h in player["heroes"]]))
 	assert expected["heroes"] - without["heroes"] == pytest.approx(config.spell_level * (4 + config.secondary_share) + config.boost * 3 * pikemen)
-	with torch.no_grad():
-		parts, total = ft.empire_value(tensors(x), model.features)
-	assert float(total[0]) == pytest.approx(expected["total"], rel=1e-4)
-	for name, value in zip(("resources", "buildings", "income", "army", "for_hire", "heroes", "artifacts", "mana", "hero_penalty", "explored"), parts[0].tolist()):
-		assert value == pytest.approx(expected[name], rel=1e-4, abs=1e-3), name
+	try:
+		for values in (TODAY, TARGETS):
+			expected = empire_value(player, phi_values(model, *values))
+			with torch.no_grad():
+				parts, total = ft.empire_value(tensors(x), model.features)
+			assert float(total[0]) == pytest.approx(expected["total"], rel=1e-4), values
+			for name, value in zip(("resources", "buildings", "income", "army", "for_hire", "heroes", "artifacts", "mana", "hero_penalty", "explored"), parts[0].tolist()):
+				assert value == pytest.approx(expected[name], rel=1e-4, abs=1e-3), (name, values)
+	finally:
+		phi_values(model, *TODAY)
+	assert empire_value(player, phi_values(model, *TARGETS))["army"] != pytest.approx(empire_value(player)["army"])  # (the weight reaches the army part)
+	phi_values(model, *TODAY)
 
 
 def test_a_hire_in_the_graph_adds_what_empire_value_adds(model):
 	"""features.tavern_worth (before the price and the crowding) is the change of empire.py's value when the hero for
-	hire joins us, with its army, artifacts and skills (weighed against our strongest hero's)."""
+	hire joins us, with its army, artifacts and skills (weighed against our strongest hero's): today's hero base,
+	armyless share and lead weight, and 2026-11-15's targets."""
 	from campaign_model.empire import empire_value as ledger_value
 
 	hero = {"type": 0, "level": 3, "exp": 2500, "mana": 0, "power": 1, "spell_cost": 0, "primary": [2, 2, 1, 1], "skills": [[0, 1], [1, 2]], "army": [[PIKEMAN, 10]], "artifacts": []}
@@ -110,11 +132,16 @@ def test_a_hire_in_the_graph_adds_what_empire_value_adds(model):
 		before = {"color": 0, "status": 0, "resources": [0] * 7, "income": [0] * 7, "explored": 0, "towns": [], "heroes": [hero], "dwellings": [], "armies": []}
 		hired = {"type": 5, "level": 1, "exp": tavern_exp, "mana": 0, "power": 1, "spell_cost": 0, "primary": [1, 2, 1, 1], "skills": tavern_skills, "army": [[PIKEMAN, 12], [HALBERDIER, 4]], "artifacts": [4], "spells": [15], "morale": 1}  # (its morale: its army's make-up's, one faction)
 		after = dict(before, heroes=[hero, hired])
-		with torch.no_grad():
-			worth = ft.tavern_worth(tensors(x), model.features)
-		crowding = ledger_value(after)["hero_penalty"] - ledger_value(before)["hero_penalty"]
-		assert float(worth[0, 0]) == pytest.approx(ledger_value(after)["total"] - ledger_value(before)["total"] - crowding, rel=1e-4)
-		assert float(worth[0, 1]) == 0  # an empty slot
+		try:
+			for values in (TODAY, TARGETS):
+				empire = phi_values(model, *values)
+				with torch.no_grad():
+					worth = ft.tavern_worth(tensors(x), model.features)
+				crowding = ledger_value(after, empire)["hero_penalty"] - ledger_value(before, empire)["hero_penalty"]
+				assert float(worth[0, 0]) == pytest.approx(ledger_value(after, empire)["total"] - ledger_value(before, empire)["total"] - crowding, rel=1e-4), values
+				assert float(worth[0, 1]) == 0  # an empty slot
+		finally:
+			phi_values(model, *TODAY)
 
 
 def window_with(obj, subtype=0, flags=0, owner=c.OWNER_NONE):
