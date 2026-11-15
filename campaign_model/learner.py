@@ -193,6 +193,8 @@ def set_advice_prior(model, config):
 			features.build_economy.fill_(float(getattr(config, "build_economy", 0.0)))
 		if hasattr(features, "empty_as_visited"):  # (config.empty_as_visited: the weights carry it to every inference server)
 			features.empty_as_visited.fill_(1.0 if getattr(config, "empty_as_visited", True) else 0.0)
+		if hasattr(features, "empire_unit_own"):  # (the upgrade rule: the labels' own, carried the same way; learner._unit_rule)
+			features.empire_unit_own.fill_(1.0 if EmpireConfig().unit_own_form else 0.0)
 		if hasattr(features, "give_all_exact"):  # (config.give_all_exact: GIVE_ALL's kept creature in its shown gain)
 			features.give_all_exact.fill_(1.0 if getattr(config, "give_all_exact", False) else 0.0)
 		if hasattr(features, "empire_alpha"):  # (ALPHA, the labels' own: the weights carry it to every inference server)
@@ -400,6 +402,7 @@ class CampaignLearner:
 		# The labels of each game as it arrives, in processes of their own (labeler.py): the trainer's thread never waits
 		self._ramp_no_town()  # (B2's factor at the resume version: the labels' and the model's)
 		self._ramp_phi()  # (Φ's hero base, armyless share and lead weight at the resume version, the same way)
+		self._unit_rule()  # (the upgrade rule, config.unit_own_form)
 		self.labeler = Labeler(self.labels, self.empire, foresight=self.kwargs.get("architecture") == "v2", share_target=config.share_target)
 		if config.credit == "schedule" and config.share_target != "change":
 			raise SystemExit("campaign.credit 'schedule' reads the share heads as changes: it needs campaign.share_target 'change'")
@@ -689,6 +692,17 @@ class CampaignLearner:
 				features.phi_armyless_share.fill_(values["armyless_share"])
 				features.phi_lead_weight.fill_(values["lead_weight"])
 
+	def _unit_rule(self):
+		"""config.unit_own_form (the user's upgrade rule): self.empire (the labels', the labeler's) and the model's
+		empire_unit_own buffer; nothing while it is off (the EmpireConfig as it was, ALPHA_EMPIRE_UNIT_OWN included)."""
+		if not getattr(self.config, "unit_own_form", False):
+			return
+		self.empire = replace(self.empire, unit_own_form=True)
+		for model in (self.model, getattr(self, "features_cpu", None)):
+			features = getattr(model, "features", model)
+			if features is not None and hasattr(features, "empire_unit_own"):
+				features.empire_unit_own.fill_(1.0)
+
 	def step(self, epoch):
 		"""One update if its games are in (the battle learner calls this between its updates); True if it ran."""
 		games = self._take()
@@ -696,6 +710,7 @@ class CampaignLearner:
 			return False
 		CampaignLearner._ramp_no_town(self)  # (B2's factor at this version: the update's labels and model, the labeler's next games; the tests' learners are namespaces)
 		CampaignLearner._ramp_phi(self)  # (Φ's hero base, armyless share and lead weight at this version, the same way)
+		CampaignLearner._unit_rule(self)  # (the upgrade rule, config.unit_own_form)
 		if getattr(self, "held", None) is not None:
 			# The value-loss guard holds the updates (_judge_value): the model stays as it is, served and evaluated as
 			# before, and the games that would have made this update are dropped (their battles went to the battle

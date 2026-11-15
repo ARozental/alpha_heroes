@@ -91,6 +91,7 @@ def game_tables():
 		"creature_ai_value": torch.zeros(c.CREATURE_VOCAB + 1),  # (VCMI's AI value: a stack's power, CStackInstance::getPower, is it x its count)
 		"creature_cost": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_unit_cost": torch.zeros(c.CREATURE_VOCAB + 1),  # (its unupgraded form's cost: u at ALPHA 1, features.creature_unit)
+		"creature_unit_cost_own": torch.zeros(c.CREATURE_VOCAB + 1),  # (its own form's: u at ALPHA 1 under the upgrade rule, empire_unit_own)
 		"creature_health": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_attack": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_defense": torch.zeros(c.CREATURE_VOCAB + 1),
@@ -135,7 +136,8 @@ def game_tables():
 				tables["fight_value"][creature_id] = float(max(row.get("fight_value", 1), 1))
 				tables["creature_ai_value"][creature_id] = float(row.get("ai_value", 0))
 				tables["creature_cost"][creature_id] = float(creature_cost(creature_id))
-				tables["creature_unit_cost"][creature_id] = float(_unit(creature_id, EmpireConfig(alpha=1.0)))
+				tables["creature_unit_cost"][creature_id] = float(_unit(creature_id, EmpireConfig(alpha=1.0, unit_own_form=False)))
+				tables["creature_unit_cost_own"][creature_id] = float(_unit(creature_id, EmpireConfig(alpha=1.0, unit_own_form=True)))
 				tables["creature_health"][creature_id] = float(row.get("hit_points", 0))
 				tables["creature_attack"][creature_id] = float(row.get("attack", 0))
 				tables["creature_defense"][creature_id] = float(row.get("defense", 0))
@@ -422,6 +424,8 @@ class CustomFeatures(nn.Module):
 		self.register_buffer("phi_hero_base", torch.tensor(float(empire.hero_base)))
 		self.register_buffer("phi_armyless_share", torch.tensor(float(empire.armyless_share)))
 		self.register_buffer("phi_lead_weight", torch.tensor(float(empire.lead_weight)))
+		# The upgrade rule (empire.py unit_own_form: u at a creature's own form) the same way: 0 as before, the learner's fill
+		self.register_buffer("empire_unit_own", torch.tensor(1.0 if empire.unit_own_form else 0.0))
 		# config.empty_as_visited (B1b's bit read as visited at the model's input: features.empty_as_visited) as a buffer the
 		# weights carry, the learner's fill; 1 to begin with and in a checkpoint from before (ADDED_HEADS: the loading model's)
 		self.register_buffer("empty_as_visited", torch.ones(()))
@@ -517,8 +521,9 @@ class CustomFeatures(nn.Module):
 
 	@property
 	def creature_unit(self):
-		"""[CREATURE_VOCAB + 1] u: what one creature for hire is worth (ALPHA x its unupgraded form's cost)."""
-		return self.empire_alpha * self.creature_unit_cost
+		"""[CREATURE_VOCAB + 1] u: what one creature for hire is worth (ALPHA x its unupgraded form's cost; its own form's
+		under the upgrade rule, empire_unit_own)."""
+		return self.empire_alpha * torch.where(self.empire_unit_own > 0, self.creature_unit_cost_own, self.creature_unit_cost)
 
 	@property
 	def building_value(self):
@@ -1781,6 +1786,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"features.phi_armyless_share",
 	"features.phi_lead_weight",
 	"features.give_all_exact",  # (config.give_all_exact, 2026-11-15: off, the loading model's)
+	"features.empire_unit_own",  # (the upgrade rule, config.unit_own_form, 2026-11-15: off, the loading model's)
 	"features.empire_last_town",  # (config.no_town_last_town: the loading model's, 0)
 	"features.empty_as_visited",  # (config.empty_as_visited: a checkpoint from before keeps the loading model's, 1)
 	"foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option", "option_flags",
