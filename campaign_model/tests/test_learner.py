@@ -108,6 +108,24 @@ def test_an_update_waits_for_enough_decisions_of_enough_games():
 	assert [info for _, info in take()] == ["a", "b"] and len(learner.finished) == 1  # the oldest first; the rest wait
 
 
+def test_a_games_line_names_the_machine_that_played_it(tmp_path):
+	"""games.jsonl's "host" (2026-11-14: the PC's games and the worker's apart; their keys are alike): GameInfo's, as the
+	machine that played the game set it; null for a GameInfo pickled before the field."""
+	import pickle
+
+	from campaign_model.play import GameInfo
+
+	learner = SimpleNamespace(out=tmp_path, version=7)
+	game = Game(ledgers={1: snapshot(1, 1000, 1000)}, days=3)
+	played = GameInfo("m", "", 12.0, "the game ended", "/run", 1.0, "pc-host")
+	old = GameInfo("m", "", 12.0, "the game ended", "/run", 1.0)
+	del old.__dict__["host"]  # (as one made by the code before the field reads after a pickle)
+	for info in (played, pickle.loads(pickle.dumps(old))):
+		CampaignLearner._log_game(learner, "w1_c0_1", "m", ["red", "blue"], game, info)
+	lines = [json.loads(line) for line in (tmp_path / "games.jsonl").read_text().splitlines()]
+	assert [line["host"] for line in lines] == ["pc-host", None] and lines[0]["version"] == 7
+
+
 def test_maps_with_a_player_left_without_a_town_are_found(tmp_path):
 	import zipfile
 

@@ -1603,6 +1603,69 @@ def test_an_update_over_sequences_trains_the_memorys_writer_and_one_without_leav
 	assert moved[1] == 0 and moved[2] > 0
 
 
+class _KeptGradient(torch.optim.SGD):
+	"""An optimizer that keeps each step's gradient and moves nothing: every minibatch's sum read at the same weights."""
+
+	def __init__(self, params):
+		super().__init__(params, lr=0.0)
+		self.kept = []
+
+	def step(self, closure=None):
+		self.kept.append([p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p) for group in self.param_groups for p in group["params"]])
+
+
+def test_a_minibatch_over_sequences_sums_to_the_same_gradient_in_4_2_or_1_micro_batches():
+	"""config.micro_batches with memory_steps 2 (e5, 2026-11-14, before the drain's micro-batch bench): sequence_order
+	puts the same sequences in each minibatch whatever the split (only their layout, step-major a micro-batch, moves),
+	and each micro-batch's losses are sums over the whole minibatch's counts, so a minibatch's gradient in 4, 2 or 1
+	parts is one gradient, to float rounding. The foresight's labels are left out: foresight_loss's means are each
+	micro-batch's own (masked_mean), so its part is not neutral to the split."""
+	import copy
+
+	torch.manual_seed(5)
+	n = 48
+	x = rich_inputs(n, 9)
+	x["g_kind"][:] = c.DecisionKind.TURN
+	x["mem"][:] = np.random.default_rng(10).integers(-c.MEMORY_SCALE // 2, c.MEMORY_SCALE // 2, x["mem"].shape)
+	streams = (np.repeat(np.arange(4), n // 4), np.tile(np.arange(n // 4), 4))
+	start = CampaignModelV2(dim=32, cell_dim=8, layers=1)
+	with torch.no_grad():  # (a trained model's stand-in: a fresh one's read and heads start at 0)
+		for p in start.parameters():
+			p.add_(0.05 * torch.randn_like(p))
+	decisions = decisions_for(start.eval(), x)
+	targets = np.full((n, c.N_VALUE_OFFSETS), 0.6, dtype=np.float32)
+	targets[n // 3 :, 1:] = np.nan
+	growth = np.full((n, c.N_VALUE_OFFSETS), np.log(50000.0), dtype=np.float32)
+	advantages = np.linspace(-1, 1, n).astype(np.float32)
+	advantages[[2, 17]] = np.nan
+	end = {"targets": np.linspace(0.2, 0.8, n).astype(np.float32), "real": np.full(n, 0.7, dtype=np.float32), "step": np.arange(n) % 9 - 1, "week": np.full(n, -1), "price": np.zeros(n, dtype=np.float32), "weight": 0.5, "outcome": 0.25}
+	kept = {}
+	for parts in (4, 2, 1):
+		m = copy.deepcopy(start)
+		optimizer = _KeptGradient(m.parameters())
+		np.random.seed(3)  # (sequence_order's offsets and shuffle: the same draws whatever the split)
+		torch.manual_seed(0)
+		config = CampaignConfig(batch_size=16, micro_batches=parts, passes=1, memory_steps=2, model_architecture="v2", target_kl=0.0, grad_clip=1e9)
+		metrics, _ = ppo_update(m, optimizer, decisions, targets, None, config, decode=lambda rows: {k: v[rows] for k, v in x.items()}, advantages=advantages, growth=growth, end=end, streams=streams)
+		assert metrics["memory_steps"] == 2 and metrics["steps"] >= 2
+		kept[parts] = (optimizer.kept, metrics)
+	names = [name for name, _ in start.named_parameters()]
+	whole, whole_metrics = kept[4]
+	assert sum(float(g.abs().sum()) for g in whole[0]) > 0 and float(dict(zip(names, whole[0]))["memory.candidate.weight"].abs().sum()) > 0
+	for parts in (2, 1):
+		steps, metrics = kept[parts]
+		assert len(steps) == len(whole)
+		for step, (a_step, b_step) in enumerate(zip(whole, steps)):
+			# To float rounding at the step's scale (sums in another order: 1e-6 of the gradient here). Not each tensor's
+			# own: a gradient that is 0 by construction (memory.key's bias, under its softmax) is rounding alone
+			a_all, b_all = torch.cat([g.reshape(-1) for g in a_step]), torch.cat([g.reshape(-1) for g in b_step])
+			assert float((a_all - b_all).norm() / a_all.norm()) < 1e-5, (parts, step)
+			scale = float(a_all.abs().max())
+			for name, a, b in zip(names, a_step, b_step):
+				assert float((a - b).abs().max()) <= 1e-5 * scale, (parts, step, name, float((a - b).abs().max()), scale)
+		assert all(abs(whole_metrics[k] - metrics[k]) < 1e-5 for k in ("policy", "value", "entropy", "kl")), parts
+
+
 def test_a_worn_artifact_and_a_carried_one_read_alike_until_the_carried_map_learns():
 	"""encoders.HeroEncoder (2026-11-05): the backpack's artifacts pass through `carried` too (at 0): a sword worn and the
 	same sword carried give the same hero vector at first, different ones once it moves; a checkpoint from before loads
