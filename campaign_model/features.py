@@ -540,7 +540,8 @@ def stock_upgrade_gain(x, t, threshold):
 
 
 def stock_hire_gain(x, t, threshold):
-	"""A hire's stockpile part [B] (gold): its 2,500 gold (stock_gain)."""
+	"""A hire's stockpile part [B] (gold): its 2,500 gold (stock_gain). Not in the priors (e5, 2026-11-15: at a late
+	pile it would flip a hire's prior from -2.6 to about +1.7); the reward counts it."""
 	held = x["g_resources"].clamp(min=0).float()
 	cost = torch.zeros_like(held)
 	cost[:, 6] = HERO_GOLD_COST

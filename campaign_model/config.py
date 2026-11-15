@@ -253,8 +253,8 @@ class CampaignConfig:
 	phi_from: int = 0
 	phi_ramp: int = 20
 	# The stockpile discount (the user, 2026-11-15; empire.py stock_floor f): each resource above its threshold counts at a
-	# marginal value falling toward f, the mines at the stock's margin; ramped with the phi_ values from phi_from (1 today,
-	# 1/3 the target), into the labels and the model's buffer; 1: as before, bit for bit
+	# marginal value falling toward f; the income counts at its flat price (not discounted); ramped with the phi_ values
+	# from phi_from (1 today, 1/3 the target), into the labels and the model's buffer; 1: as before, bit for bit
 	phi_stock_floor: float = 1.0
 	# The last town's stake term of B2's prior ((1 - f) x phi more at stake when we own exactly one town; e5: most of every
 	# game, a read input's size on common states): off (the default), the stake as before; its own decision later

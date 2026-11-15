@@ -19,5 +19,5 @@ def test_zero_to_begin_with_and_each_view_at_its_weight():
 		raw = lambda v: math.log(((v + 2) / 4) / (1 - (v + 2) / 4)) / CORRECTION_STEP  # noqa: E731
 		f.rate_weights.copy_(torch.tensor([raw(v) for v in (1.0, -1.0, 0.5, 0.0)]))
 		assert torch.allclose(ft.rate_correction(views, f), views[..., 0] - views[..., 1] + 0.5 * views[..., 2], atol=1e-5)
-	assert list(f.correction_values()) == [f"r{k}_move_view" for k in range(1, 5)]
+	assert list(f.correction_values()) == [f"r{k}_move_view" for k in range(1, 5)] + ["stock_weight"]
 	assert f.correction_values()["r1_move_view"] == pytest.approx(1.0, abs=1e-5)

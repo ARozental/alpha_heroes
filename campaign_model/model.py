@@ -348,6 +348,8 @@ class CustomFeatures(nn.Module):
 		# (2026-11-15: the MOVE views' weights, features.rate_correction's)
 		self.rate_weights = zeros(4)
 		self.correction_step = CORRECTION_STEP
+		# (2026-11-15: how far BUILD's stockpile part counts, its own term in build_prior; stock_build_weight)
+		self.stock_weight = zeros()
 		self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight = (zeros() for _ in range(6))
 		self.travel_exponent, self.end_coupling, self.travel_coupling = zeros(), zeros(), zeros()
 		self.move_discount = zeros()  # (not a prior correction: its 0 is the old score, not a prior; move_discount_power)
@@ -468,7 +470,7 @@ class CustomFeatures(nn.Module):
 			self.swap_gain, self.swap_slot, self.last_swap,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
-			self.night_gain, self.rate_weights,
+			self.night_gain, self.rate_weights, self.stock_weight,
 			self.nk_gain, self.nk_gain_fallback, self.nk_survival, self.nk_risk, self.nk_label_gain, self.nk_follow_shift,
 			self.adv_gain_shift, self.town_guard_shift, self.build_income_gain, self.build_production_gain, self.build_prior_gain, self.build_faction_bias,
 		]
@@ -538,9 +540,15 @@ class CustomFeatures(nn.Module):
 		return self.building_value_base - self.empire_alpha * self.building_unit_growth
 
 	def correction_values(self):
-		"""{name: value} of the 2026-11-15 bounded corrections (the learner's log line): the MOVE views' weights."""
+		"""{name: value} of the 2026-11-15 bounded corrections (the learner's log line): the MOVE views' weights and BUILD's
+		stockpile weight."""
 		rate = ft.bounded(self.rate_weights, -2.0, 2.0, 0.0, CORRECTION_STEP).tolist()
-		return {f"r{k + 1}_move_view": v for k, v in enumerate(rate)}
+		return {**{f"r{k + 1}_move_view": v for k, v in enumerate(rate)}, "stock_weight": float(self.stock_build_weight().detach())}
+
+	def stock_build_weight(self):
+		"""How far BUILD's stockpile part (features.stock_build_gain's value_logit) counts in its prior: a bounded
+		correction within 0..2, 1 at the start (e5, 2026-11-15)."""
+		return ft.bounded(self.stock_weight, 0.0, 2.0, 1.0, CORRECTION_STEP)
 
 	def give_all_exact_on(self):
 		"""1.0 where GIVE_ALL's shown gain leaves the giver VCMI's kept creature (config.give_all_exact; ALPHA_GIVE_ALL_EXACT),
@@ -556,14 +564,17 @@ class CustomFeatures(nn.Module):
 
 	def build_prior(self, x, f):
 		"""BUILD's fixed prior [B, TO, N_BUILDINGS] (logits): build_gain x value_logit of the gold its parts (build_features'
-		value) weigh, each part by its gain, + each faction's own building's bias; 0 with the economy off."""
+		value) weigh, each part by its gain, + each faction's own building's bias, + the stockpile part as its own term
+		(stock_build_weight x value_logit(features.stock_build_gain): 0 at the discount's floor 1); 0 with the economy off.
+		The stockpile part is not folded into the gold figure (e5, 2026-11-15): value_logit is flat where a dwelling's
+		figure already sits (500+), so a folded 2.7k would add under +1 logit, against +2.2 to +3.1 as its own term."""
 		gain = lambda raw: self.gain(raw)  # noqa: E731
 		gold = gain(self.build_income_gain) * f.build_value[..., 0] + gain(self.build_production_gain) * f.build_value[..., 1] + f.build_value[..., 2]
 		gold = gold + ft.unit_rule_build(x, self)  # (the upgrade rule's immediate part of a dwelling upgrade: 0 with it off)
-		gold = gold + ft.stock_build_gain(x, self, f.stock_threshold)  # (the stockpile discount's part, its thresholds before the build: 0 at its floor 1)
+		stock = self.stock_build_weight() * ft.value_logit(ft.stock_build_gain(x, self, f.stock_threshold))  # (the stockpile discount's part, its thresholds before the build: 0 at its floor 1)
 		faction = vocab_index(x["t_faction"][:, :TO], c.FACTION_VOCAB)
 		bias = (self.build_faction_start + self.build_faction_bias)[faction]
-		return (gain(self.build_prior_gain) * ft.value_logit(gold) + bias) * self.economy_on()
+		return (gain(self.build_prior_gain) * ft.value_logit(gold) + bias + stock) * self.economy_on()
 
 	def nk_follow_logs(self):
 		"""(whether following is on, log rho, log (1 - rho)): the chance our choice is Nullkiller2's own (nk_follow at the
@@ -800,7 +811,7 @@ class CustomFeatures(nn.Module):
 		f.hire_want = ft.hire_want(x, f.gold_pressure, f.town_danger, ft.object_classes(x))
 		f.tavern_worth = ft.tavern_worth(x, self)
 		f.stock_threshold = ft.stock_thresholds(x, self)  # (the stockpile discount's thresholds, empire.stock_thresholds')
-		f.hire_gain = ft.hire_gain(x, self, f.tavern_worth) + ft.stock_hire_gain(x, self, f.stock_threshold).unsqueeze(-1)  # (the stockpile discount's part: 0 at its floor 1)
+		f.hire_gain = ft.hire_gain(x, self, f.tavern_worth)  # (the stockpile part not shown (e5, 2026-11-15: at a late pile it would flip a hire from -2.6 to ~+1.7); the reward counts it)
 		f.economy = ft.economy_features(x, self)
 		f.build_entry, f.build_value = ft.build_features(x, self, f.economy)
 		f.danger = ft.danger_features(x, self, f)
@@ -1808,6 +1819,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"features.phi_lead_weight",
 	"features.give_all_exact",  # (config.give_all_exact, 2026-11-15: off, the loading model's)
 	"features.rate_weights",  # (the MOVE views' corrections, 2026-11-15: 0, the loading model's)
+	"features.stock_weight",  # (BUILD's stockpile weight, 2026-11-15: 0 raw = 1, the loading model's)
 	"features.phi_stock_floor",  # (the stockpile discount's floor, 2026-11-15: as the phi_ buffers, the loading model's)
 	"features.empire_unit_own",  # (the upgrade rule, config.unit_own_form, 2026-11-15: off, the loading model's)
 	"features.empire_last_town",  # (config.no_town_last_town: the loading model's, 0)

@@ -172,11 +172,13 @@ def value_shared_now(config, version):
 	return max(shared, 1.25 ** -(version - start + 1))
 
 
-def set_advice_prior(model, config):
+def set_advice_prior(model, config, version=None):
 	"""config.nk2_prior and nk2_prior_fallback into the model's buffers (model.CustomFeatures.nk_beta, nk_beta_fallback):
 	the size of Nullkiller2's preference as a prior on MOVE's and TRAVEL's entries. At every start, after the weights
 	are loaded: the run's line decides it, the checkpoints and the inference servers carry it (a model without the
-	buffers, v1: nothing)."""
+	buffers, v1: nothing). Φ's phi_ buffers and the upgrade rule's: the environment's (EmpireConfig, a paired test's
+	ALPHA_EMPIRE_*), then, with the version, the config's where the run's line sets them (phi_now at that version;
+	config.unit_own_form): one source after every load, the learner's _ramp_phi and _unit_rule's (e5, 2026-11-15)."""
 	features = getattr(model, "features", None)
 	if features is None or not hasattr(features, "nk_beta"):
 		return
@@ -207,6 +209,11 @@ def set_advice_prior(model, config):
 			features.phi_armyless_share.fill_(float(empire.armyless_share))
 			features.phi_lead_weight.fill_(float(empire.lead_weight))
 			features.phi_stock_floor.fill_(float(empire.stock_floor))
+			if version is not None and any(float(getattr(config, name, start)) != start for name, _, start in PHI_FIELDS):
+				for name, field_, _ in PHI_FIELDS:
+					getattr(features, name).fill_(phi_now(config, version)[field_])
+		if version is not None and getattr(config, "unit_own_form", False) and hasattr(features, "empire_unit_own"):
+			features.empire_unit_own.fill_(1.0)
 		if hasattr(features, "empire_last_town"):  # (config.no_town_last_town: the last town's stake term)
 			features.empire_last_town.fill_(1.0 if getattr(config, "no_town_last_town", False) else 0.0)
 
@@ -376,7 +383,7 @@ class CampaignLearner:
 			migrate_subtypes(state, self.model)
 			self.model.load_state_dict(state["model"])
 			print(f"campaign: starting from {config.init_from}", flush=True)
-		set_advice_prior(self.model, config)
+		set_advice_prior(self.model, config, self.version)
 		if getattr(config, "nk2_inputs", False) or config.nk2_prior or config.nk2_prior_fallback or config.nk2_label_prior or config.nk2_follow or not getattr(config, "nk2_teacher", True):
 			print(f"campaign: schema 19: Nullkiller2's view as inputs {'on' if getattr(config, 'nk2_inputs', False) else 'off'} (off in {getattr(config, 'nk2_input_dropout', 0.0):g} of the training games), its own choice followed at a chance of {config.nk2_follow:g}, the prior on it {config.nk2_label_prior:g}, on its best candidate {config.nk2_prior:g} (fallback {config.nk2_prior_fallback:g}), the teacher's loss {'on' if getattr(config, 'nk2_teacher', True) else 'OFF'}", flush=True)
 		if stale_clips(self.grad_clips, config.grad_clip_since):  # (a recalibration: config.grad_clip_since)
@@ -1797,7 +1804,7 @@ def _update_worker(config, kwargs, device_name, state, requests, results, latest
 	optimizer = make_optimizer(model, config)
 	migrate_subtypes(state, model)
 	model.load_state_dict(state["model"])
-	set_advice_prior(model, config)
+	set_advice_prior(model, config, state.get("version"))
 	if state.get("optimizer"):
 		optimizer.load_state_dict(state["optimizer"])
 		fit_moments(optimizer, model)

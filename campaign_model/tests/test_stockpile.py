@@ -130,3 +130,51 @@ def test_the_floor_rides_the_phi_ramp_and_the_evaluation_keeps_1(monkeypatch):
 	assert phi_now(config, 200)["stock_floor"] == pytest.approx(THIRD)
 	monkeypatch.setenv("ALPHA_EMPIRE_STOCK_FLOOR", "0.3333")
 	assert E.EmpireConfig().stock_floor == pytest.approx(0.3333) and E.EVAL_EMPIRE.stock_floor == 1.0
+
+
+def build_priors(t, x):
+	"""BUILD's prior [1, TO, NB] with the economy on, f as the model's forward fills it for build_prior."""
+	from types import SimpleNamespace
+
+	t.build_economy.fill_(1.0)
+	with torch.no_grad():
+		economy = ft.economy_features(x, t)
+		_, value = ft.build_features(x, t, economy)
+		return t.build_prior(x, SimpleNamespace(build_value=value, stock_threshold=ft.stock_thresholds(x, t)))
+
+
+def test_builds_stockpile_part_is_its_own_term_at_its_weight_and_hire_shows_none():
+	"""e5, 2026-11-15: BUILD's prior += stock_weight x value_logit(stock_build_gain), not folded into the gold figure;
+	stock_weight a bounded correction (0..2, 1 to begin with, logged); 0 at f = 1. HIRE's prior shows no stockpile part."""
+	model = CampaignModel(dim=32, cell_dim=16, layers=1).eval()
+	t = model.features
+	assert any(p is t.stock_weight for p in t.corrections())
+	assert t.correction_values()["stock_weight"] == pytest.approx(1.0)
+	x = inputs(player([CAPITOL_OPEN], [40, 20, 40, 20, 20, 20, 90000]))
+	try:
+		plain = build_priors(t, x)
+		t.phi_stock_floor.fill_(THIRD)
+		with torch.no_grad():
+			gain = ft.stock_build_gain(x, t, ft.stock_thresholds(x, t))
+		shown = build_priors(t, x)
+		assert float(gain.max()) > 1000
+		assert torch.allclose(shown - plain, ft.value_logit(gain), atol=1e-5)
+		raw = math.log((1.5 / 2) / (1 - 1.5 / 2)) / model.features.correction_step  # (bounded 0..2 at 1.5)
+		with torch.no_grad():
+			t.stock_weight.fill_(raw)
+		assert t.correction_values()["stock_weight"] == pytest.approx(1.5, abs=1e-5)
+		assert torch.allclose(build_priors(t, x) - plain, 1.5 * ft.value_logit(gain), atol=1e-4)
+		with torch.no_grad():
+			t.stock_weight.zero_()
+		hire = {}
+		for floor in (1.0, THIRD):
+			t.phi_stock_floor.fill_(floor)
+			with torch.no_grad():
+				hire[floor] = ft.hire_gain(x, t, ft.tavern_worth(x, t))
+		assert torch.equal(hire[1.0], hire[THIRD])
+		t.phi_stock_floor.fill_(1.0)
+		with torch.no_grad():
+			assert float(ft.stock_build_gain(x, t, ft.stock_thresholds(x, t)).abs().max()) == 0.0  # (exactly: bit for bit at f = 1)
+	finally:
+		t.phi_stock_floor.fill_(1.0)
+		t.build_economy.fill_(0.0)
