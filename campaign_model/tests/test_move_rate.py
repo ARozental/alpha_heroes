@@ -1,5 +1,6 @@
-"""The gain-per-movement view (2026-11-15, e5 for the user): a MOVE tile's value as gold a day (features.move_rate), its
-two bounded views (features.rate_views) through model_v2's pair_rate, a layer at 0 to begin with."""
+"""The gain-per-movement view (2026-11-15, e5 for the user): a MOVE tile's value as gold a day (features.move_rate) and
+over the hero's capital (its IRR: features.hero_capital), their four bounded views (features.rate_views) through
+model_v2's pair_rate, a layer at 0 to begin with."""
 import numpy as np
 import torch
 
@@ -19,12 +20,31 @@ def test_a_tiles_value_as_gold_a_day():
 	turns = torch.tensor([[[0, 0, 2, 0, -1]]])
 	rate = ft.move_rate(value, h_move, h_max, left, turns)
 	assert torch.allclose(rate, torch.tensor([[[2500.0, 500.0, 250.0, 500.0 * 1500 / ft.MIN_MOVE_COST, 0.0]]]))
-	views = ft.rate_views(rate, torch.tensor([[[True, True, True, True, False]]]))
-	assert views.shape == (1, 1, 5, 2)
+	one = torch.zeros(1, dtype=torch.long)
+	views = ft.rate_views(rate, torch.tensor([[[True, True, True, True, False]]]), torch.tensor([2500.0]), one, 1)
+	assert views.shape == (1, 1, 5, 4)
 	assert torch.allclose(views[..., 0], torch.tanh(ft.value_logit(rate) / 4))
 	assert torch.allclose(views[0, 0, :, 1], torch.tensor([2500 / 7500, 500 / 7500, 250 / 7500, 1.0, 0.0]))
-	# no legal tile with a positive rate: the share is 0 everywhere
-	assert float(ft.rate_views(-rate, torch.ones_like(rate, dtype=torch.bool))[..., 1].abs().max()) == 0.0
+	# no legal tile with a positive rate: the shares are 0 everywhere
+	negative = ft.rate_views(-rate, torch.ones_like(rate, dtype=torch.bool), torch.tensor([2500.0]), one, 1)
+	assert float(negative[..., 1].abs().max()) == 0.0 and float(negative[..., 3].abs().max()) == 0.0
+
+
+def test_the_irr_and_the_best_use_of_any_hero():
+	"""A 500-gold pile a third of the day away: for a hero worth 2,500 an IRR of 0.6, for one worth 40,000 0.0375; a
+	fight returning -3,000 as far for the weak one -3.6. The fourth view is the IRR over the best of the decision's
+	windows (all our heroes'), each decision apart: decision 0 has both heroes, decision 1 the strong one alone."""
+	value = torch.tensor([[[500.0, -3000.0, 800.0]], [[500.0, 0.0, 0.0]], [[500.0, 0.0, 0.0]]])  # [K 3, 1, 3]
+	h_move = torch.full((3,), 1500)
+	left, turns = torch.full((3, 1, 3), 1000), torch.zeros((3, 1, 3), dtype=torch.long)
+	rate = ft.move_rate(value, h_move, h_move, left, turns)
+	legal = torch.tensor([[[True, True, False]], [[True, False, False]], [[True, False, False]]])
+	capital = torch.tensor([2500.0, 40000.0, 40000.0])
+	views = ft.rate_views(rate, legal, capital, torch.tensor([0, 0, 1]), 2)
+	irr = torch.tensor([[0.6, -3.6, 2400 / 2500], [0.0375, 0.0, 0.0], [0.0375, 0.0, 0.0]])
+	assert torch.allclose(views[:, 0, :, 2], torch.tanh(2 * irr))
+	# decision 0's best legal IRR is the weak hero's pile (the 800 pile is not legal); decision 1's the strong one's own
+	assert torch.allclose(views[:, 0, :, 3], torch.tensor([[1.0, 0.0, 0.0], [0.0375 / 0.6, 0.0, 0.0], [1.0, 0.0, 0.0]]))
 
 
 def test_an_old_checkpoint_plays_bit_for_bit_and_the_pair_reads_the_views():
@@ -67,3 +87,9 @@ def test_an_old_checkpoint_plays_bit_for_bit_and_the_pair_reads_the_views():
 		known.move_rate = torch.rand_like(known.move_rate)
 		after = plain(state, known)
 	assert not torch.allclose(before, after)
+	# the capital: the led army and the hero's own worth, never under MIN_CAPITAL, never under the worth
+	x = tensors(rich_inputs(4, 5))
+	capital = ft.hero_capital(x, known, fresh.features)
+	assert capital.shape == known.hero_worth[:, : c.OWN_HEROES].shape
+	assert float(capital.min()) >= ft.MIN_CAPITAL
+	assert bool((capital >= known.hero_worth[:, : c.OWN_HEROES] - 1e-3).all())

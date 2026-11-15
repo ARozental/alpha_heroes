@@ -1468,9 +1468,11 @@ class CustomFeatures(nn.Module):
 		explore = torch.maximum(ft.unexplored_around(flags), (ft.bit(flags, c.TILE_UNSEEN_EXIT) & (obj != ft.OBJ_WHIRLPOOL)).float())
 		# The object is ours only if we win the fight in front of it (a bank's guards, a monster's zone, a town's garrison)
 		value = object_gold * torch.where(fights, win, torch.ones_like(win)) + fight + explore * self.explore_gold() + self.meeting_value(x, f, decision, heroes, on_tile)
-		# The value as gold a day (e5 for the user, 2026-11-15; features.move_rate): before the time discount and the
-		# danger below, model_v2's MOVE pair reads its two views (rate_views) through a layer at 0 to begin with
-		rate = ft.rate_views(ft.move_rate(value, ours(x["h_move"]), ours(x["h_move_max"]), pick("w_move_left"), pick("w_turns")), pick("move_mask").bool())
+		# The value as gold a day (e5 for the user, 2026-11-15; features.move_rate), and over the hero's capital (its IRR:
+		# features.hero_capital): before the time discount and the danger below, model_v2's MOVE pair reads their four
+		# views (rate_views) through a layer at 0 to begin with
+		rate = ft.move_rate(value, ours(x["h_move"]), ours(x["h_move_max"]), pick("w_move_left"), pick("w_turns"))
+		rate = ft.rate_views(rate, pick("move_mask").bool(), ours(ft.hero_capital(x, f, self)), decision, x["h_move"].shape[0])
 		# That gain discounted by the time to reach the tile as Nullkiller2 discounts its targets (PriorityEvaluator::
 		# evaluateMovement, as travel_prior does TRAVEL's areas): by the part of a day's movement it costs, raised to
 		# move_discount_power, 0 at the start (the score as before) and 1 its full discount. Nullkiller2 scores every
@@ -1582,7 +1584,7 @@ class CustomFeatures(nn.Module):
 			"tile_value": value, "tile_prior": logits, "tile_night": night, "tile_shift": logits - prior, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight, "tile_fight_ratio": fight_ratio, "tile_fights": fights.float(),
 			"tile_stacks": (monster | guarded).float(),  # (a wandering monster or its zone: model_v2's battle head)
 			"move_strength": ft.strength_view(torch.cat([this_hero, main_army], dim=-1)), "move_relative": relative,  # (model_v2: MOVE_STRENGTH, MOVE_RELATIVE)
-			"move_rate": rate,  # (model_v2: the MOVE pair's gain-per-movement views, MOVE_RATE)
+			"move_rate": rate,  # (model_v2: the MOVE pair's gain-per-movement and IRR views, MOVE_RATE)
 		}
 
 
@@ -1770,7 +1772,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"nkp.",  # (2026-11-11: nk_predict's head, model_v2.NkPredictHead: a new model's weights, nothing reads it)
 	"encode_global.no_town_days",  # (schema 20, B2: the global token's read of our days without a town, 0 at the start)
 	"pair_today",  # (schema 21: at an exchange, the pair's exchanges today onto END's and MULTI's scores, 0 at the start)
-	"pair_rate",  # (2026-11-15: the tile's value as gold a day, features.move_rate's views, into the MOVE pair; 0 at the start)
+	"pair_rate",  # (2026-11-15: the tile's value as gold a day and the hero's IRR, features.rate_views, into the MOVE pair; 0 at the start)
 )
 # Training-only parts rebuilt since, by prefix: a checkpoint's weights for them that the loading model lacks, or of
 # another shape, are dropped, the part starting again as a new model has it (2026-11-07: the privileged critic's first

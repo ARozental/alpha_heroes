@@ -843,13 +843,35 @@ def move_rate(value, h_move, h_move_max, move_left, turns):
 MIN_MOVE_COST = 100.0  # movement points: move_rate's least cost (a step onto a neighbouring tile costs ~100)
 
 
-def rate_views(rate, legal):
-	"""move_rate's two bounded views [K, W, W, 2]: tanh(value_logit(rate) / 4), as the tile's other values; and the
-	rate over the window's best legal tile's (0..1, its negatives at 0; 0 where no legal tile has a positive rate)."""
+def rate_views(rate, legal, capital, decision, b):
+	"""move_rate's four bounded views [K, W, W, 4]: tanh(value_logit(rate) / 4), as the tile's other values; the rate over
+	the window's best legal tile's (0..1, its negatives at 0; 0 where no legal tile has a positive rate); and the IRR (e5
+	for the user, 2026-11-15: the rate over the hero's capital, hero_capital, the share of its worth it earns a day
+	there, negative for a fight it loses) as tanh(2 x irr), and over the best IRR of every legal tile of every window of
+	the decision (all our heroes': is this the best use of any hero now; 0..1, its negatives at 0). capital: the window's
+	hero's [K]; decision: each window's decision [K], of b."""
+	k = rate.shape[0]
 	positive = torch.where(legal, rate.clamp(min=0), torch.zeros_like(rate))
-	best = positive.reshape(rate.shape[0], -1).amax(dim=1)[:, None, None]
+	best = positive.reshape(k, -1).amax(dim=1)[:, None, None]
 	share = torch.where(best > 0, positive / best.clamp(min=1e-6), torch.zeros_like(rate))
-	return torch.stack([torch.tanh(value_logit(rate) / 4), share], dim=-1)
+	irr = rate / capital[:, None, None]
+	gains = positive / capital[:, None, None]
+	# (each decision's best over its windows: a 2-D scatter, as travel_pulls'; the exporter's 3-D one crashed at random)
+	top = gains.new_zeros(1, b).scatter_reduce(1, decision[None], gains.reshape(k, -1).amax(dim=1)[None], reduce="amax", include_self=True)[0]
+	top = top.index_select(0, decision)[:, None, None]
+	ratio = torch.where(top > 0, gains / top.clamp(min=1e-9), torch.zeros_like(rate))
+	return torch.stack([torch.tanh(value_logit(rate) / 4), share, torch.tanh(2 * irr), ratio], dim=-1)
+
+
+def hero_capital(x, f, t):
+	"""Each hero of ours' capital in Φ [B, HO] (rate_views' IRR): the army it leads as Φ counts it (led_values, its
+	multiplier f.hero_multiplier) and its own worth (f.hero_worth), at least MIN_CAPITAL."""
+	army_c, army_n = x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO].float()
+	rest = x["h_morale"][:, :HO].float() - make_up_morales(army_c, army_n, t)  # (its morale without its army's make-up's)
+	return (led_values(army_c, army_n, f.hero_multiplier, rest, t) + f.hero_worth[:, :HO]).clamp(min=MIN_CAPITAL)
+
+
+MIN_CAPITAL = 1000.0  # gold: hero_capital's floor (a hero with nothing: its IRR stays a number)
 
 
 def movement_discount(days, exponent):
