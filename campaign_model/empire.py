@@ -113,6 +113,11 @@ class EmpireConfig:
 	# multiplier is 1, so a purchase it leads stays neutral at any weight. ALPHA_EMPIRE_LEAD_WEIGHT as the others (0.5 the
 	# target); the evaluation's EVAL_EMPIRE keeps 1
 	lead_weight: float = field(default_factory=lambda: float(os.environ.get("ALPHA_EMPIRE_LEAD_WEIGHT", "") or LEAD_WEIGHT))
+	# u at a creature's own form (the user, 2026-11-15: "for upgrades, they are more valuable so the weekly payoff should
+	# be larger after an upgrade. Also we improve existing un-bought creatures"): ALPHA x its own cost, for hire and hired
+	# alike, so an upgrade gains ALPHA x the cost difference a creature and a purchase stays neutral; False: ALPHA x its
+	# unupgraded form's, as before. ALPHA_EMPIRE_UNIT_OWN=1 sets it as the others; the evaluation's EVAL_EMPIRE keeps False
+	unit_own_form: bool = field(default_factory=lambda: os.environ.get("ALPHA_EMPIRE_UNIT_OWN", "") not in ("", "0"))
 	# A hero's spellbook in what it makes of its army (game_values.spell_factor), and so Φ's unit: an army no hero leads
 	# at game_values.unled_share (0.953 at 0.02), a hero's at that x its multiplier (the user, 2026-11-05: buying an army
 	# slightly negative, neutral once even a starting hero with spell power 3 and knowledge 2 leads it)
@@ -125,12 +130,12 @@ class EmpireConfig:
 
 # The evaluation's Φ (its scores, evaluate.score): as of 2026-11-04's army multiplier, before the spellbook's factor and
 # the unled share, the army's movement and make-up, so its scores stay comparable across the changes
-EVAL_EMPIRE = EmpireConfig(alpha=0.25, spell_step=0.0, speed_power=0.0, army_morale=0.0, no_town_factor=1.0, hero_base=HERO_BASE, armyless_share=ARMYLESS_SHARE, lead_weight=LEAD_WEIGHT)
+EVAL_EMPIRE = EmpireConfig(alpha=0.25, spell_step=0.0, speed_power=0.0, army_morale=0.0, no_town_factor=1.0, hero_base=HERO_BASE, armyless_share=ARMYLESS_SHARE, lead_weight=LEAD_WEIGHT, unit_own_form=False)
 
 
 def _unit(creature_id, config):
-	"""u: what one creature for hire is worth."""
-	return config.alpha * vocab.creature_cost(vocab.base_forms().get(creature_id, creature_id))
+	"""u: what one creature for hire is worth: ALPHA x its unupgraded form's cost (its own form's: unit_own_form)."""
+	return config.alpha * vocab.creature_cost(creature_id if config.unit_own_form else vocab.base_forms().get(creature_id, creature_id))
 
 
 def building_value(faction, building, config=EmpireConfig()):

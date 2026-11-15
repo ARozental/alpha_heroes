@@ -229,6 +229,9 @@ class CampaignConfig:
 	# (features.bulk_kept; e5 for the user, 2026-11-15: the give's gain = the true change of Φ). Carried in the weights
 	# (features.give_all_exact, the learner's fill). False: multi_gain as before, bit for bit
 	give_all_exact: bool = False
+	# The user's upgrade rule (2026-11-15): u at a creature's own form, not its unupgraded one (empire.py unit_own_form), for
+	# the labels (the learner's EmpireConfig, the labeler's) and the model's Φ (features.empire_unit_own). False: as before
+	unit_own_form: bool = False
 	# B2's no-town factor for the run (e5 for the user, 2026-11-13): a player's Φ x f while it owns no town, ramped by the
 	# version alone, stateless as value_shared: f = max(no_town_factor, 0.9 ** (version - no_town_from + 1)) from
 	# no_town_from, 1 before (about 22 updates to 0.1), so the value targets take no step; the learner's EmpireConfig for
