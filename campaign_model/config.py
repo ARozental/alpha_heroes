@@ -255,6 +255,17 @@ class CampaignConfig:
 	# at its sizes (dim 128, cell_dim 16): what runs
 	model_architecture: str = "v2"
 	foresight_weight: float = 0.2  # v2: each foresight head's loss weight (foresight.py; its gradient share is logged)
+	# The foresight's means over the whole minibatch (foresight.foresight_loss's counts; 2026-11-15, e5, the micro-batch
+	# equivalence test and army/fsweight.py): False, each part is a micro-batch's own mean at its share of the rows, so a
+	# label's weight depends on how many labels share its 64 rows (2.6-4.8x inside a minibatch, up to 28x) and a
+	# micro-batch with none drops the part. True: each mask counted over the minibatch (row_counts), the micro-batches
+	# adding up to the minibatch's mean whatever micro_batches is; the sparse parts then at their factors, set to the
+	# share of micro-batches that held one of their labels to keep the weight they trained at (the battle outcome 0.526,
+	# the answers 0.735, the answer's score 0.058; their designed weight, 1, is the user's call)
+	foresight_minibatch_counts: bool = False
+	foresight_outcome_factor: float = 1.0
+	foresight_answer_factor: float = 1.0
+	foresight_answer_score_factor: float = 1.0
 	model_dim: int = 128
 	model_cell_dim: int = 16
 	model_heads: int = 4
