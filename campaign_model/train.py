@@ -890,8 +890,12 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 	labels = {name[3:]: value for name, value in batch.items() if name.startswith("fs:")}
 	if labels and "fs_turn" in out:
 		fs_config = foresight_config or ForesightConfig()
-		fs_loss, parts = foresight_loss(out, labels, fs_config)
-		fs_share = batch["share"] * fs_loss * batch.get("lw:foresight", 1.0)
+		# (config.foresight_minibatch_counts: the minibatch's counts in the batch; each part then sums over this
+		# micro-batch's labels over the minibatch's count, already its share of the minibatch's mean)
+		fs_counts = {name[9:]: value for name, value in batch.items() if name.startswith("count_fs:")} or None
+		fs_loss, parts = foresight_loss(out, labels, fs_config, fs_counts)
+		fs_row_share = batch["share"] if fs_counts is None else 1.0
+		fs_share = fs_row_share * fs_loss * batch.get("lw:foresight", 1.0)
 		loss = loss + fs_share
 		fs_parts = torch.stack([parts[name].detach().float() for name in PART_NAMES])
 	drift = logp.detach() - batch["anchor"]
@@ -917,7 +921,7 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 			"entropy": config.entropy_floor_weight * floor - config.entropy_weight * bonus, "teacher": teacher_part + advice_part,
 		}
 		if fs_share is not None:
-			terms["foresight"], terms["plan"] = batch["share"] * fs_loss, batch["share"] * fs_config.weight * parts["plan"]
+			terms["foresight"], terms["plan"] = fs_row_share * fs_loss, fs_row_share * fs_config.weight * parts["plan"]
 		if config.adv_weight > 0 and "adv_type" in out:
 			terms["advantage"] = config.adv_weight * adv_part
 		if config.nk_predict_weight > 0 and "nkp_move" in out:
@@ -1256,16 +1260,21 @@ def ppo_update(
 	clock = {"prepass": 0.0, "wait": 0.0, "steps": 0.0, "forward": 0.0, "losses": 0.0, "backward": 0.0, "optimizer": 0.0, "nkp": 0.0, "cpu": time.thread_time()}  # where the update's time goes (logged: the PC's step ran at half the GPU's pace, 2026-10-30)
 	# The foresight's labels (foresight.game_labels, v2), each decision's row: its loss joins the minibatch's, a share
 	# per micro-batch as the others'; the shared layers' gradient from it against the PPO losses', on the first one
-	from .foresight import PART_NAMES, WATCHED, ForesightConfig, gradient_check
+	from .foresight import COUNT_NAMES, PART_NAMES, WATCHED, ForesightConfig, gradient_check, row_counts
 
 	foresight_t = {name: torch.from_numpy(value).to(device) for name, value in foresight.items()} if foresight is not None else None
+	# config.foresight_minibatch_counts: each row's count of each foresight mask (the tiles' filled in by the first pass)
+	fs_rows = None
+	if foresight_t is not None and getattr(config, "foresight_minibatch_counts", False):
+		fs_rows = row_counts(foresight_t)
+		fs_rows.update({name: torch.zeros(n, device=device) for name in ("tiles_plain", "tiles_met", "tiles_known")})
 	if foresight_t is not None and hasattr(model, "plan_outputs"):  # (v2: its fs_plan for the plan's loss, in every graph recorded below)
 		model.plan_outputs = True
 	if hasattr(model, "adv_outputs"):  # (v2: the advantage head's outputs while it learns, config.adv_weight, in every graph recorded below)
 		model.adv_outputs = config.adv_weight > 0
 	if hasattr(model, "nkp_outputs"):  # (nk_predict runs as its own step below, never inside the model's forward: the main graphs as before)
 		model.nkp_outputs = False
-	foresight_config = ForesightConfig(weight=getattr(config, "foresight_weight", ForesightConfig.weight))
+	foresight_config = ForesightConfig(weight=getattr(config, "foresight_weight", ForesightConfig.weight), outcome_factor=getattr(config, "foresight_outcome_factor", 1.0), answer_factor=getattr(config, "foresight_answer_factor", 1.0), answer_score_factor=getattr(config, "foresight_answer_score_factor", 1.0))
 	foresight_sums, foresight_sum, checked = Counter(), None, {}  # (foresight_sum: its parts, PART_NAMES' order, on the device)
 	# On CUDA the bytes as sent go to the device and are cut and converted there (half the copy, none of the CPU's dtype copies)
 	convert = inputs_on_device if decode is None and converts_on_device(device) else None
@@ -1428,6 +1437,10 @@ def ppo_update(
 				blind = model.nk_blind(model_inputs(raw))  # (eager, no gradient: the prepass)
 				nkp_chunks.append(nk_readings({k: v for k, v in blind.items() if k.startswith("nkp_")}, {k[4:]: v for k, v in blind.items() if k.startswith("nkt:")}))
 				del blind
+			if fs_rows is not None and "fs_stack_tile" in out:  # (config.foresight_minibatch_counts: move_tiles' masks need the forward's legal tiles and stacks)
+				tiles = row_counts({name: foresight_t[name][index] for name in ("move_mask", "move_offer", "move_battle", "move_at", "move", "answer_mask", "answer_battle", "hero_mask", "hero_alive", "turn_mask")}, out["fs_move_legal"] > 0, out["fs_stack_tile"] > 0)
+				for name in ("tiles_plain", "tiles_met", "tiles_known"):
+					fs_rows[name][index] = tiles[name]
 			end_now[index] = torch.sigmoid(out["end_logit"].float())
 			if "growth_logit" in out:
 				growth_now[index] = out["growth_logit"][:, -1].float()
@@ -1719,6 +1732,8 @@ def ppo_update(
 				counts["growth"] = growth_valid[index].sum(dim=0)
 			if end is not None:
 				counts["end"] = end_valid[index].sum(dim=0)
+			if fs_rows is not None:  # (config.foresight_minibatch_counts: each foresight mask's count over the minibatch)
+				counts.update({f"fs:{name}": fs_rows[name][index].sum() for name in COUNT_NAMES if name in fs_rows})
 			optimizer.zero_grad(set_to_none=False)  # (in place: a recorded step adds into these .grad tensors)
 			parts = []
 			for part in parts_of_rows:
@@ -1752,6 +1767,8 @@ def ppo_update(
 					batch.update({name: value[sub] for name, value in advice_t.items()}, count_advised=counts["advised"], teacher_weight=teacher_weight_t)
 				if foresight_t is not None:
 					batch.update({"fs:" + name: value[sub] for name, value in foresight_t.items()})
+					if fs_rows is not None:
+						batch.update({f"count_fs:{name}": counts[f"fs:{name}"] for name in COUNT_NAMES if f"fs:{name}" in counts})
 				if teacher is not None:  # the teacher's distributions on the same inputs
 					with torch.no_grad():
 						t_out = teacher_graphs.eval(raw, prepare=prepare) if teacher_graphs is not None else teacher(model_inputs(raw))
@@ -1781,7 +1798,8 @@ def ppo_update(
 					loss.backward()
 					clock["backward"] += time.perf_counter() - mark
 				if fs_parts is not None:  # (summed on the device: a float() here waited for the GPU every micro-batch)
-					foresight_sum = fs_parts * share if foresight_sum is None else foresight_sum + fs_parts * share
+					fs_scale = 1.0 if fs_rows is not None else share  # (with the minibatch's counts a micro-batch's parts are already its share of the mean)
+					foresight_sum = fs_parts * fs_scale if foresight_sum is None else foresight_sum + fs_parts * fs_scale
 					foresight_sums["steps_seen"] += share
 				parts.append(metrics)  # (summed on the device: one sync a step, not six a micro-batch)
 				if nkp_on and micro_count % nkp_every == 0:  # (nk_predict's own step: its gradient into the head's .grad, the minibatch's step takes it)
