@@ -1483,6 +1483,26 @@ def _feature_days_to_growth(x):
 	return (7.0 - torch.remainder(x["g_day"].float() - 1.0, 7.0)) / 7.0
 
 
+WEEK_CLASSES = ("dwelling", "upgrade", "growth", "other")  # (BUILD's entries by what they add to the week's growth: week_correction)
+
+
+def week_near(x):
+	"""[B] -1 on a week's first day (Monday: the growth's), 0 on its 4th, +1 on its 7th (Sunday): (4 - 7 d) / 3, d the
+	days until the next growth over 7 (_feature_days_to_growth: 1 on Monday, 1/7 on Sunday); its mean over a week 0, so
+	the term shifts no balance of BUILD against the other types (e5 for the user, 2026-11-15)."""
+	return (4.0 - 7.0 * _feature_days_to_growth(x)) / 3.0
+
+
+def week_correction(x, t, faction):
+	"""BUILD's entries' addend [B, TO, NB] (logits): week_weights[the entry's class] x week_near, the classes
+	t.build_week_class's (a new dwelling, a dwelling's upgrade, a growth building: citadel, castle, a horde; every other
+	building), each weight a bounded correction starting at 0 (-2..2; the user, 2026-11-15: "an input that is how many
+	days we have until the next Sunday ... I want to be able to learn that new creature dwellings are getting the extra
+	value on Sunday easily ... and have a reverse-ish, learnable effect on the other dwelling types")."""
+	weights = bounded(t.week_weights, -2.0, 2.0, 0.0, t.correction_step)
+	return weights[t.build_week_class[faction]] * week_near(x)[:, None, None].to(weights.dtype)
+
+
 def economy_features(x, t):
 	"""[B, len(ECONOMY)]: our economy's bounded views (each _feature_ above, ECONOMY's order); 0 with the economy off
 	(t.economy_on: the model as before, bit for bit)."""

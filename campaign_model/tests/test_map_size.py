@@ -27,7 +27,7 @@ def golden_model():
 	model = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
 	with torch.no_grad():
 		for name, p in sorted(model.named_parameters()):
-			if name.startswith(("side_tile", "side_global", "time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global", "fore_fight", "fore_move", "fore_answer", "fore_hero", "build_situational", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "encode_global.no_town_days", "pair_today", "pair_rate", "features.rate_weights", "features.stock_weight")):
+			if name.startswith(("side_tile", "side_global", "time_reach", "view_pair", "view_mix", "view_move", "view_travel", "travel_view", "move_toward", "travel_toward", "plan_in", "nk_hero", "nk_town", "nk_global", "fore_fight", "fore_move", "fore_answer", "fore_hero", "build_situational", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "encode_global.no_town_days", "pair_today", "pair_rate", "features.rate_weights", "features.stock_weight", "features.week_weights")):
 				continue
 			g = torch.Generator().manual_seed(sum(ord(ch) * (i + 1) for i, ch in enumerate(name)) % (2**31))
 			if name == "reach.mlp.up.weight":  # (B1b's column, schema 20, and schema 21's two: the old ones drawn as before, the new at 0, as a checkpoint migrates)
