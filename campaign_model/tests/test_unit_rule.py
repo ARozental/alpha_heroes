@@ -111,3 +111,56 @@ def test_off_by_default_the_learner_fills_it_and_the_evaluation_never(monkeypatc
 	learner.config = CampaignConfig(unit_own_form=True)
 	CampaignLearner._unit_rule(learner)
 	assert learner.empire.unit_own_form is True and float(model.features.empire_unit_own) == 1.0
+
+
+def _x_one_hero(army_creature, count, gold):
+	x = empty_inputs(1)
+	x["g_resources"][0] = [10, 4, 10, 4, 4, 4, gold]
+	x["t_present"][0, 0], x["t_owner"][0, 0], x["t_faction"][0, 0] = True, c.OWNER_SELF, CASTLE
+	x["t_built"][0, 0, [VILLAGE_HALL, DWELLING_1]] = True
+	x["h_present"][0, 0], x["h_owner"][0, 0], x["h_detailed"][0, 0] = True, c.OWNER_SELF, True
+	x["h_primary"][0, 0] = x["h_primary_base"][0, 0] = [2, 1, 1, 1]
+	x["h_skills"][0, 0, [0, 1]] = [1, 1]
+	x["h_army_creature"][0, 0, 0], x["h_army_count"][0, 0, 0] = army_creature, count
+	return x
+
+
+def test_the_shown_terms_equal_the_replicas_change_the_rule_adds():
+	"""UPGRADE's term (unit_rule_upgrades) and a dwelling upgrade's (unit_rule_build) against the replica's change of Φ with
+	the rule on less with it off; both exactly 0 with it off."""
+	from types import SimpleNamespace
+
+	model = CampaignModel(dim=32, cell_dim=16, layers=1).eval()
+	t = model.features
+	tens = lambda x: {k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in x.items()}  # noqa: E731
+
+	def change(before, after):
+		out = []
+		for rule in (1.0, 0.0):
+			t.empire_unit_own.fill_(rule)
+			with torch.no_grad():
+				out.append(float(ft.empire_value(after, t)[1][0] - ft.empire_value(before, t)[1][0]))
+		return out[0] - out[1]
+
+	try:
+		before = tens(_x_one_hero(PIKEMAN, 20, 10000))
+		after = tens(_x_one_hero(HALBERDIER, 20, 10000 - 20 * int(DIFF)))
+		mult = ft.hero_multipliers(before["h_primary"][:, : c.OWN_HEROES], before["h_artifacts"][:, : c.OWN_HEROES], t)
+		for rule in (0.0, 1.0):
+			t.empire_unit_own.fill_(rule)
+			with torch.no_grad():
+				term = float(ft.unit_rule_upgrades(before, t, SimpleNamespace(hero_multiplier=mult))[0, 0, 0])
+			assert term == (pytest.approx(change(before, after), rel=1e-5) if rule else 0.0)
+		xb, xa = _x_one_hero(PIKEMAN, 20, 10000), _x_one_hero(PIKEMAN, 20, 10000)
+		xb["t_available"][0, 0, 0], xb["t_available_creature"][0, 0, 0] = 14, PIKEMAN
+		xa["t_built"][0, 0, DWELLING_1_UP] = True
+		xa["t_available"][0, 0, 0], xa["t_available_creature"][0, 0, 0] = 14, HALBERDIER
+		before, after = tens(xb), tens(xa)  # (the building's own worth and price apart: both arms of the rule alike)
+		for rule in (0.0, 1.0):
+			t.empire_unit_own.fill_(rule)
+			with torch.no_grad():
+				term = float(ft.unit_rule_build(before, t)[0, 0, DWELLING_1_UP])
+			assert term == (pytest.approx(change(before, after), rel=1e-5) if rule else 0.0)
+		assert change(before, after) == pytest.approx(float(t.empire_alpha) * 14 * DIFF, rel=1e-5)
+	finally:
+		t.empire_unit_own.fill_(0.0)

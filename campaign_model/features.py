@@ -1023,6 +1023,54 @@ def upgrade_gains(x, t):
 	return torch.stack([torch.log1p(gain.clamp(min=0) / 1000), torch.log1p(cost / 1000)], dim=-1)
 
 
+def unit_rule_upgrades(x, t, f):
+	"""The upgrade rule's part of each UPGRADE's Φ gain [B, HD, A] (gold; config.unit_own_form, 0 with it off: u at the own
+	form): the stack's creatures x ALPHA x the cost difference to the upgrade, at its holder's lead factor (a hero's:
+	lead_factor of its multiplier x its army's movement with that stack upgraded, and the make-up's morale and the boosts
+	until the next battle a gold of worth adds; a garrison's and the exchange's other army's: unled_lead), the change of
+	the replica's Φ the rule adds."""
+	creature = torch.cat([x["h_army_creature"][:, :HO], x["t_garrison_creature"][:, : c.OWN_TOWNS], x["x_creature"].unsqueeze(1)], dim=1)
+	count = torch.cat([x["h_army_count"][:, :HO], x["t_garrison_count"][:, : c.OWN_TOWNS], x["x_count"].unsqueeze(1)], dim=1).clamp(min=0).float()
+	now = vocab_index(creature, c.CREATURE_VOCAB)
+	up = t.creature_upgrade[now]
+	better = ((creature >= 0) & (up >= 0)).float()
+	diff = (t.creature_cost[vocab_index(up, c.CREATURE_VOCAB)] - t.creature_cost[now]).clamp(min=0)
+	from .empire import LUCK_CHANCE, MORALE_CHANCE
+
+	army_c, army_n = x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO]
+	slots = army_c.shape[-1]
+	rest = x["h_morale"][:, :HO].float() - make_up_morales(army_c, army_n, t)  # (the hero's morale without its make-up's)
+	luck, morale = x["h_luck"][:, :HO], x["h_morale"][:, :HO]
+	gained_luck = battle_chance(LUCK_CHANCE, luck) - battle_chance(LUCK_CHANCE, luck - x["h_battle_luck"])
+	gained_morale = battle_chance(MORALE_CHANCE, morale) - battle_chance(MORALE_CHANCE, morale - x["h_battle_morale"])
+	per_gold = []  # each stack upgraded alone: Φ a gold of its worth adds (led at the army's movement after it, its make-up's
+	for a in range(slots):  # morale after it, the boosts until the next battle), as led_values, make_up_values, boost_values
+		upgraded = army_c.clone()
+		upgraded[..., a] = torch.where(up[:, :HO, a] >= 0, up[:, :HO, a], army_c[..., a])
+		ui = vocab_index(upgraded[..., a], c.CREATURE_VOCAB)
+		make_up = battle_chance(MORALE_CHANCE, rest + make_up_morales(upgraded, army_n, t)) - battle_chance(MORALE_CHANCE, rest)
+		boosts = t.boost * (gained_luck * t.creature_luck[ui] + gained_morale * t.creature_morale[ui])
+		per_gold.append(lead_factor(f.hero_multiplier, t) * speed_factors(upgraded, army_n, t) + t.army_morale * make_up * t.creature_morale[ui] + boosts)
+	hero_lead = torch.stack(per_gold, dim=-1)  # [B, HO, A]
+	other = unled_lead(t).expand(creature.shape[0], creature.shape[1] - HO, creature.shape[2])
+	lead = torch.cat([hero_lead, other], dim=1)  # [B, HD, A]
+	return count * t.empire_alpha * diff * better * lead * t.empire_unit_own
+
+
+def unit_rule_build(x, t):
+	"""The upgrade rule's immediate part of a dwelling upgrade's BUILD [B, TO, N_BUILDINGS] (gold; 0 with it off): the
+	creatures for hire at that level become their upgrade, each gaining ALPHA x the cost difference in Φ's for-hire part
+	(the user: "we improve existing un-bought creatures"); the weekly part is the production view's."""
+	avail = x["t_available"][:, : c.OWN_TOWNS].clamp(min=0).float()  # [B, TO, LV]
+	creature = x["t_available_creature"][:, : c.OWN_TOWNS]
+	now = vocab_index(creature, c.CREATURE_VOCAB)
+	up = t.creature_upgrade[now]
+	ok = ((creature >= 0) & (up >= 0)).float()
+	gain = avail * t.empire_alpha * (t.creature_cost[vocab_index(up, c.CREATURE_VOCAB)] - t.creature_cost[now]).clamp(min=0) * ok * t.empire_unit_own
+	b, towns = gain.shape[0], gain.shape[1]
+	return torch.cat([gain.new_zeros(b, towns, UP_SLICE.start), gain[..., : UP_SLICE.stop - UP_SLICE.start], gain.new_zeros(b, towns, c.N_BUILDINGS - UP_SLICE.stop)], dim=-1)
+
+
 def spellbook_wanted(x, main):
 	"""[B, HO] Nullkiller2 buys a spellbook for a main hero who has none (in a town with a mage guild, gold permitting:
 	the BUY mask's)."""
