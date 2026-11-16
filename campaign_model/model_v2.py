@@ -1272,6 +1272,12 @@ class CampaignModelV2(nn.Module):
 		# (the trainer's readings of what the head's term does to our own policy, before the follow mixture: each type's
 		# scores without it, each table's KL from it and its mean |term| under the policy; adv_outputs only)
 		reading = {"plain": [], "kl": [], "read": []} if self.adv_outputs else None
+		book_lift = getattr(self.features, "book_lift", None)  # (ALPHA_BOOK_LIFT: an eval arm's only; a construction-time constant, no tensor read)
+		if book_lift:
+			books = x["buy_mask"].bool().reshape(b, HO, c.N_BUY_ITEMS)[..., c.BUY_ARTIFACTS.index(ft.SPELLBOOK)]  # [B, HO]
+			best_other, best_bias = book_rivals(self, learned, x, state, b)
+			learned[A_.BUY] = lift_books(learned[A_.BUY], books, best_other)
+			bias_lift = (best_bias - self.type_bias[A_.BUY]).clamp(min=0) * books.any(dim=-1).to(best_bias.dtype) if book_lift >= 2 else None
 		scores, legal_types = [], []
 		pair = self.pair_today(x["x_pair_today"].to(state.glob.dtype))  # [B, 2]: END's and MULTI's (schema 21; 0 at a turn decision)
 		for action in c.ActionType:
@@ -1301,7 +1307,10 @@ class CampaignModelV2(nn.Module):
 			read = adv_gain * (entries - mean.reshape((b,) + (1,) * (table.dim() - 1)))
 			out[name] = flat_log_softmax(own + read, mask)
 			own_pair = pair[:, 1] if action == A_.MULTI else 0.0
-			scores.append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action] + read, mask) + named + own_pair + adv_gain * adv_types["adv_type"][:, action].clamp(-ADV_CLIP, ADV_CLIP))
+			score = self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action] + read, mask) + named + own_pair + adv_gain * adv_types["adv_type"][:, action].clamp(-ADV_CLIP, ADV_CLIP)
+			if book_lift and action == A_.BUY and bias_lift is not None:
+				score = score + bias_lift
+			scores.append(score)
 			legal_types.append(mask.reshape(b, -1).any(dim=-1))
 			if reading is not None:
 				reading["plain"].append(self.type_bias[action] + offers.get(action, 0.0) + best_legal(learned[action], mask) + named + own_pair)
@@ -1394,6 +1403,34 @@ def log_sum(a, b):
 	"""log(exp(a) + exp(b)), b finite (torch.logaddexp in operators the ONNX export has; a may be -inf: then b)."""
 	top = torch.maximum(a, b)
 	return top + torch.log(torch.exp(a - top) + torch.exp(b - top))
+
+
+def book_rivals(model, learned, x, state, b):
+	"""ALPHA_BOOK_LIFT: [B] each: the best learned part among the decision's legal types other than BUY (a table's best legal
+	entry; END's end_out), and the highest type_bias among them; -1e4 for a type not legal."""
+	A_ = c.ActionType
+	none = torch.full((b,), -1e4, device=state.glob.device, dtype=state.glob.dtype)
+	end_legal = (x["g_kind"] == c.DecisionKind.TURN) | (x["g_kind"] == c.DecisionKind.EXCHANGE)
+	parts = [torch.where(end_legal, model.end_out(state.glob).squeeze(-1), none)]
+	biases = [torch.where(end_legal, model.type_bias[A_.END].expand(b), none)]
+	for action in c.ActionType:
+		if action in (A_.END, A_.BUY):
+			continue
+		mask = x[HEADS[action][1]]
+		if action == A_.CAST:
+			mask = mask & model.castable
+		legal = mask.reshape(b, -1).any(dim=-1)
+		parts.append(torch.where(legal, best_legal(learned[action], mask).to(none.dtype), none))
+		biases.append(torch.where(legal, model.type_bias[action].expand(b).to(none.dtype), none))
+	return torch.stack(parts, dim=-1).amax(dim=-1), torch.stack(biases, dim=-1).amax(dim=-1)
+
+
+def lift_books(learned, books, best):
+	"""ALPHA_BOOK_LIFT (e5, 2026-11-16: an eval arm's switch, never in training): BUY's learned table [B, HO, N_BUY_ITEMS]
+	with each legal spellbook entry (books [B, HO]: the hero has none) given best [B], the best learned part among the
+	decision's other legal types, so its prior (book_weight for a main hero's book) decides; every other entry as it was."""
+	item = torch.arange(c.N_BUY_ITEMS, device=learned.device) == c.BUY_ARTIFACTS.index(ft.SPELLBOOK)
+	return torch.where(books.unsqueeze(-1) & item, best.reshape(-1, 1, 1).to(learned.dtype).expand_as(learned), learned)
 
 
 def best_legal(logits, mask):

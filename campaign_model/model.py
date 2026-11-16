@@ -457,6 +457,11 @@ class CustomFeatures(nn.Module):
 		self.guard_override = override("ALPHA_TOWN_GUARD")
 		self.economy_override = override("ALPHA_BUILD_ECONOMY")
 		self.give_all_override = override("ALPHA_GIVE_ALL_EXACT")
+		# ALPHA_BOOK_LIFT (e5, 2026-11-16: an EVAL arm's switch, never in training): where BUY's spellbook is legal for a hero
+		# (it has none: the mask's rule), the entry takes the best learned part among the decision's other legal types, END's
+		# end_out included (model_v2.lift_books), so its prior decides; 2: BUY's type bias also lifted to the best legal type's
+		# where a book is legal; unset: the branch is never taken, bit for bit
+		self.book_lift = override("ALPHA_BOOK_LIFT")
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
