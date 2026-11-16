@@ -263,6 +263,14 @@ class CampaignConfig:
 	# marginal value falling toward f; the income counts at its flat price (not discounted); ramped with the phi_ values
 	# from phi_from (1 today, 1/3 the target), into the labels and the model's buffer; 1: as before, bit for bit
 	phi_stock_floor: float = 1.0
+	# The stockpile thresholds' gold floor and B's form (the user via e5, 2026-11-16: "We do want it to go down faster";
+	# empire.gold_floor, stock_b_dwelling): the floor ramped from 10,000 (today's) to phi_gold_floor in phi_gold_ramp equal
+	# steps from phi_gold_from (its own ramp: phi_from's targets are long reached), B over the dwellings alone from
+	# phi_gold_from on when phi_stock_b; into the labels and the model's buffers; 10,000 and False: as before, bit for bit
+	phi_gold_floor: float = 10000.0
+	phi_gold_from: int = 0
+	phi_gold_ramp: int = 20
+	phi_stock_b: bool = False
 	# The last town's stake term of B2's prior ((1 - f) x phi more at stake when we own exactly one town; e5: most of every
 	# game, a read input's size on common states): off (the default), the stake as before; its own decision later
 	no_town_last_town: bool = False

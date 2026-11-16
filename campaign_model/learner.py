@@ -212,6 +212,13 @@ def set_advice_prior(model, config, version=None):
 			if version is not None and any(float(getattr(config, name, start)) != start for name, _, start in PHI_FIELDS):
 				for name, field_, _ in PHI_FIELDS:
 					getattr(features, name).fill_(phi_now(config, version)[field_])
+			if hasattr(features, "phi_gold_floor"):  # (the thresholds' gold floor and B's form: the environment's, then the config's ramp)
+				features.phi_gold_floor.fill_(float(empire.gold_floor))
+				features.phi_stock_b.fill_(1.0 if empire.stock_b_dwelling else 0.0)
+				if version is not None and (float(getattr(config, "phi_gold_floor", 10000.0)) != 10000.0 or getattr(config, "phi_stock_b", False)):
+					floor, b_on = gold_now(config, version)
+					features.phi_gold_floor.fill_(floor)
+					features.phi_stock_b.fill_(1.0 if b_on else 0.0)
 		if version is not None and getattr(config, "unit_own_form", False) and hasattr(features, "empire_unit_own"):
 			features.empire_unit_own.fill_(1.0)
 		if hasattr(features, "empire_last_town"):  # (config.no_town_last_town: the last town's stake term)
@@ -256,6 +263,16 @@ def no_town_now(config, version):
 
 
 PHI_FIELDS = (("phi_hero_base", "hero_base", HERO_BASE), ("phi_armyless_share", "armyless_share", ARMYLESS_SHARE), ("phi_lead_weight", "lead_weight", LEAD_WEIGHT), ("phi_stock_floor", "stock_floor", 1.0))  # (config's, EmpireConfig's, today's)
+
+
+def gold_now(config, version):
+	"""config.phi_gold_floor's ramp and phi_stock_b: (gold floor, B over the dwellings) at this version: the floor from
+	10,000 (today's) to the target in phi_gold_ramp equal steps, the first at phi_gold_from; B's form from phi_gold_from on.
+	(10,000, False) before it, and while neither is set. Stateless, as phi_now."""
+	target, start = float(getattr(config, "phi_gold_floor", 10000.0)), int(getattr(config, "phi_gold_from", 0))
+	on = version is not None and version >= start
+	step = min(1.0, max(0.0, (version - start + 1) / max(1, int(getattr(config, "phi_gold_ramp", 20))))) if version is not None else 0.0
+	return 10000.0 + (target - 10000.0) * step, bool(getattr(config, "phi_stock_b", False)) and on
 
 
 def phi_now(config, version):
@@ -688,7 +705,15 @@ class CampaignLearner:
 	def _ramp_phi(self):
 		"""config.phi_*'s ramp: self.empire (the labels', the labeler's for each game submitted from now) and the model's
 		phi_ buffers at this version's values (phi_now); nothing while every target is today's (the EmpireConfig as it
-		was, ALPHA_EMPIRE_* included, bit for bit)."""
+		was, ALPHA_EMPIRE_* included, bit for bit). The gold floor and B's form by their own ramp (gold_now) the same way."""
+		if float(getattr(self.config, "phi_gold_floor", 10000.0)) != 10000.0 or getattr(self.config, "phi_stock_b", False):
+			floor, b_on = gold_now(self.config, self.version)
+			self.empire = replace(self.empire, gold_floor=floor, stock_b_dwelling=b_on)
+			for model in (self.model, getattr(self, "features_cpu", None)):
+				features = getattr(model, "features", model)
+				if features is not None and hasattr(features, "phi_gold_floor"):
+					features.phi_gold_floor.fill_(floor)
+					features.phi_stock_b.fill_(1.0 if b_on else 0.0)
 		if all(float(getattr(self.config, name, start)) == start for name, _, start in PHI_FIELDS):
 			return
 		values = phi_now(self.config, self.version)

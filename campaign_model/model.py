@@ -444,6 +444,10 @@ class CustomFeatures(nn.Module):
 		self.register_buffer("empire_unit_own", torch.tensor(1.0 if empire.unit_own_form else 0.0))
 		# The stockpile discount's floor (empire.py stock_floor) the same way: 1, as before; the learner's ramp fills it
 		self.register_buffer("phi_stock_floor", torch.tensor(float(empire.stock_floor)))
+		# The stockpile thresholds' gold floor and B's form (empire.gold_floor, stock_b_dwelling) the same way: 10,000 and 0
+		# (every building), as before; the learner's ramp fills them (config.phi_gold_floor, phi_stock_b)
+		self.register_buffer("phi_gold_floor", torch.tensor(float(empire.gold_floor)))
+		self.register_buffer("phi_stock_b", torch.tensor(1.0 if empire.stock_b_dwelling else 0.0))
 		# config.empty_as_visited (B1b's bit read as visited at the model's input: features.empty_as_visited) as a buffer the
 		# weights carry, the learner's fill; 1 to begin with and in a checkpoint from before (ADDED_HEADS: the loading model's)
 		self.register_buffer("empty_as_visited", torch.ones(()))
@@ -1835,6 +1839,8 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"features.stock_weight",  # (BUILD's stockpile weight, 2026-11-15: 0 raw = 1, the loading model's)
 	"features.week_weights",  # (BUILD's week weights, 2026-11-15: 0, the loading model's)
 	"features.phi_stock_floor",  # (the stockpile discount's floor, 2026-11-15: as the phi_ buffers, the loading model's)
+	"features.phi_gold_floor",  # (the thresholds' gold floor, 2026-11-16: 10,000, the loading model's)
+	"features.phi_stock_b",  # (B over the dwellings alone, 2026-11-16: off, the loading model's)
 	"features.empire_unit_own",  # (the upgrade rule, config.unit_own_form, 2026-11-15: off, the loading model's)
 	"features.empire_last_town",  # (config.no_town_last_town: the loading model's, 0)
 	"features.empty_as_visited",  # (config.empty_as_visited: a checkpoint from before keeps the loading model's, 1)

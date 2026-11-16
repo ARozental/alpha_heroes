@@ -20,6 +20,7 @@ from game_values import ATTACK_POINTS, ATTACK_STEP, DAMAGE_SPELLS, DEFENSE_POINT
 from game_values import HERO_HIRE_COST as HERO_GOLD_COST
 
 from . import constants as c
+from .vocab import DWELLING_FIRST
 from .schema import HEADS, SPECS
 
 HO, W, G, L, TG = c.OWN_HEROES, c.WINDOW, c.MAP_GRID, c.MAP_LEVELS, c.TRAVEL_GRID
@@ -460,6 +461,8 @@ def stock_thresholds(x, t):
 		allowed = allowed & (ids != b)
 	met = ~(t.building_requires[faction] & ~built.unsqueeze(-2)).any(dim=-1)  # [B, TO, NB]: its requirements built
 	startable = t.building_exists[faction] & ~built & met & own.unsqueeze(-1) & allowed
+	dwellings = (ids >= DWELLING_FIRST) & (ids < DWELLING_FIRST + 14)  # (t.phi_stock_b on: B over the dwellings alone, empire.stock_b_dwelling)
+	startable = startable & (dwellings | ~(t.phi_stock_b > 0))
 	most = torch.where(startable.unsqueeze(-1), res, torch.zeros_like(res)).amax(dim=2).amax(dim=1)  # [B, R]
 	base_c, up_c = t.dwelling_creature[faction][..., BASE_SLICE], t.dwelling_creature[faction][..., UP_SLICE]  # [B, TO, 7]
 	up_built = built[..., UP_SLICE]
@@ -474,6 +477,8 @@ def stock_thresholds(x, t):
 	dw_c = x["g_dwelling_creature"]
 	outside = (t.creature_growth[vocab_index(dw_c, c.CREATURE_VOCAB)].unsqueeze(-1) * t.creature_resources[vocab_index(dw_c, c.CREATURE_VOCAB)] * (dw_c >= 0).unsqueeze(-1)).sum(dim=1)
 	floors = constant(STOCK_FLOORS, most.device, most.dtype)  # (made once per device: a CUDA graph refuses a host copy)
+	gold = torch.arange(floors.shape[0], device=floors.device) == floors.shape[0] - 1
+	floors = torch.where(gold, t.phi_gold_floor.to(floors.dtype), floors)  # (gold's floor: empire.gold_floor, the buffer)
 	return torch.maximum(torch.maximum(floors, most), week + outside)
 
 
