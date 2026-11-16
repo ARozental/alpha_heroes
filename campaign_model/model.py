@@ -457,6 +457,11 @@ class CustomFeatures(nn.Module):
 		self.guard_override = override("ALPHA_TOWN_GUARD")
 		self.economy_override = override("ALPHA_BUILD_ECONOMY")
 		self.give_all_override = override("ALPHA_GIVE_ALL_EXACT")
+		# ALPHA_GARRISON_OUT (e5, 2026-11-16: G, an EVAL arm's switch, never in training): GARRISON_SWAP's start split by
+		# direction. OUT (the town's garrison hero ours, garrisoned, with movement left, and no rival hero at least as strong
+		# within features.DANGER_RANGE of the town) takes this logit as its start instead of multi_priors_16's shared one
+		# (live -4.40); IN, and OUT with such a rival near, unchanged (garrison_out_rows); unset: the branch is never taken
+		self.garrison_out = override("ALPHA_GARRISON_OUT")
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -1110,7 +1115,25 @@ class CustomFeatures(nn.Module):
 		starts = self.multi_priors_16()  # (schema 16: their own starts; one kind at a time, no index tensor: CUDA graphs)
 		for i, kind in enumerate((c.MultiKind.SPLIT_SINGLES, c.MultiKind.MERGE_ALL, c.MultiKind.GARRISON_SWAP)):
 			cost[..., kind] = -starts[i]
+		if self.garrison_out is not None:  # (ALPHA_GARRISON_OUT: an eval arm's only; a construction-time constant, no tensor read)
+			swap = c.MultiKind.GARRISON_SWAP
+			cost[..., swap] = torch.where(self.garrison_out_rows(x, f), torch.full_like(cost[..., swap], -float(self.garrison_out)), cost[..., swap])
 		return prior - cost
+
+	def garrison_out_rows(self, x, f):
+		"""ALPHA_GARRISON_OUT's OUT towns [B, TO]: the town's garrison hero is ours (a hero token of ours, garrisoned) with
+		movement left, and no rival hero at least as strong (f.hero_strength) within features.DANGER_RANGE of the town
+		(Chebyshev, the same level)."""
+		token = x["t_garrison_hero"][:, :TO]
+		idx = token.clamp(0, HO - 1).long()
+		ours = (x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF) & x["h_garrisoned"][:, :HO].bool() & (x["h_move"][:, :HO] > 0))
+		garrisoned = (token >= 0) & (token < HO) & ours.gather(1, idx)
+		mine = f.hero_strength[:, :HO].gather(1, idx)  # [B, TO]
+		rivals = x["h_present"][:, HO:] & (x["h_owner"][:, HO:] != c.OWNER_SELF)  # [B, R]
+		tp, rp = x["t_pos"][:, :TO].unsqueeze(2), x["h_pos"][:, HO:].unsqueeze(1)  # [B, TO, 1, 3], [B, 1, R, 3]
+		distance = torch.maximum((tp[..., 0] - rp[..., 0]).abs(), (tp[..., 1] - rp[..., 1]).abs()).float()
+		near = rivals.unsqueeze(1) & (tp[..., 2] == rp[..., 2]) & (distance <= ft.DANGER_RANGE) & (f.hero_strength[:, HO:].unsqueeze(1) >= mine.unsqueeze(-1))
+		return garrisoned & ~near.any(dim=-1)
 
 	def artifact_prior(self, x, f):
 		"""What each ARTIFACT entry does to Φ, as a prior logit [B, HO, N_ARTIFACT_POSITIONS, N_ARTIFACT_TARGETS]
