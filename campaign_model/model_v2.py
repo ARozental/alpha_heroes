@@ -1174,6 +1174,8 @@ class CampaignModelV2(nn.Module):
 			dim=-1,
 		)
 		learned[A_.RECRUIT] = self.recruit_head(recruit_in).reshape(b, TO, c.N_LEVELS, c.N_RECRUIT_AMOUNTS, c.N_RECRUIT_TARGETS)
+		if getattr(self.features, "recruit_lift", None):  # (ALPHA_RECRUIT_LIFT: an eval arm's only; a construction-time constant, no tensor read)
+			learned[A_.RECRUIT] = lift_recruits(learned[A_.RECRUIT], x["recruit_mask"].bool().reshape(learned[A_.RECRUIT].shape))
 		recruit_charge = (trade_cost * ft.value_logit(known.recruit_trade))[..., None, None].expand_as(learned[A_.RECRUIT])
 		prior[A_.RECRUIT] = self.features.recruit_prior(known.town_danger).expand_as(learned[A_.RECRUIT]) - recruit_charge
 		_, upgrade_weight, book_weight, pause_weight = self.features.nk2_weights()  # (a skill's: model.CustomFeatures.option_knowledge)
@@ -1608,6 +1610,14 @@ def fight_forecast(x, known, foreseen):
 	stake, taken = share(known.move_relative[..., 2]), share(known.move_relative[..., 3])
 	value = starts * (win * taken - lost * stake)
 	return torch.stack([torch.sign(value) * torch.log1p(100.0 * value.abs()) / 3, starts, win, lost], dim=-1).detach()
+
+
+def lift_recruits(learned, mask):
+	"""ALPHA_RECRUIT_LIFT (e5, 2026-11-16: an eval arm's switch, never in training): RECRUIT's learned table [..., N_RECRUIT_TARGETS]
+	with each legal visiting-hero target (1) given its entry's garrison target's (0) learned part, so the prior (recruit_prior:
+	the hero target's recruit_hero x (1 - the town's danger)) decides between the two. Every other entry as it was."""
+	hero = torch.arange(c.N_RECRUIT_TARGETS, device=learned.device) == 1
+	return torch.where(hero & mask, learned[..., :1].expand_as(learned), learned)
 
 
 def fight_features(known):
