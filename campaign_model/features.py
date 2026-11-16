@@ -366,13 +366,13 @@ def lead_factor(multiplier, t):
 
 def unled_lead(t):
 	"""What an army no hero leads counts at in Φ (a garrison's, a mine's): lead_factor of unled_share."""
-	return lead_factor(t.phi_lead_weight.new_tensor(t.unled_share), t)
+	return lead_factor(torch.full_like(t.phi_lead_weight, t.unled_share), t)  # (a fill on the device: a CUDA graph refuses new_tensor's host copy)
 
 
 def unled_loss(t):
 	"""unled_lead - 1, what a stack loses into a garrison over its worth: h x (unled_share - 1), the difference taken in
 	double as before (at h = 1 the same float as unled_share - 1.0)."""
-	return t.phi_lead_weight * t.phi_lead_weight.new_tensor(t.unled_share - 1.0)
+	return t.phi_lead_weight * torch.full_like(t.phi_lead_weight, t.unled_share - 1.0)  # (a fill on the device, as unled_lead)
 
 
 def own_make_up_values(x, t):
@@ -473,7 +473,7 @@ def stock_thresholds(x, t):
 	week = (growth.unsqueeze(-1) * t.creature_resources[vocab_index(grown, c.CREATURE_VOCAB)] * (grown >= 0).unsqueeze(-1)).sum(dim=(1, 2))
 	dw_c = x["g_dwelling_creature"]
 	outside = (t.creature_growth[vocab_index(dw_c, c.CREATURE_VOCAB)].unsqueeze(-1) * t.creature_resources[vocab_index(dw_c, c.CREATURE_VOCAB)] * (dw_c >= 0).unsqueeze(-1)).sum(dim=1)
-	floors = torch.tensor(STOCK_FLOORS, device=most.device, dtype=most.dtype)
+	floors = constant(STOCK_FLOORS, most.device, most.dtype)  # (made once per device: a CUDA graph refuses a host copy)
 	return torch.maximum(torch.maximum(floors, most), week + outside)
 
 
@@ -522,7 +522,7 @@ def stock_recruit_gain(x, t, threshold):
 	cost = t.creature_resources[vocab_index(creature, c.CREATURE_VOCAB)]  # [B, TO, LV, R]
 	afford = torch.where(cost > 0, torch.floor(held[:, None, None, :] / cost.clamp(min=1e-6)), torch.full_like(cost, 1e9)).amin(dim=-1)
 	most = torch.minimum(x["t_available"][:, :to].clamp(min=0).float(), afford) * (creature >= 0)
-	amount = torch.ceil(most.unsqueeze(-1) * torch.tensor(c.RECRUIT_FRACTIONS, device=most.device, dtype=most.dtype))  # [B, TO, LV, AM]
+	amount = torch.ceil(most.unsqueeze(-1) * constant(c.RECRUIT_FRACTIONS, most.device, most.dtype))  # [B, TO, LV, AM]
 	return stock_gain(amount.unsqueeze(-1) * cost.unsqueeze(-2), held[:, None, None, None], threshold[:, None, None, None], t)
 
 
