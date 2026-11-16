@@ -471,6 +471,7 @@ class CampaignModelV2(nn.Module):
 		self.pair_hero, self.pair_tile, self.pair_reach = nn.Linear(d, dp), nn.Linear(dc, dp), nn.Linear(dc, dp)
 		self.pair_fight = zero_output(nn.Linear(FIGHT_FEATURES, dp))
 		self.pair_strength = zero_output(nn.Linear(MOVE_STRENGTH + 1, dp))  # (2026-11-04: the four estimates x two sides, hopeless)
+		self.pair_rate = zero_output(nn.Linear(MOVE_RATE, dp))  # (2026-11-15: the tile's value as gold a day and the hero's IRR, features.rate_views; a checkpoint from before loads it at 0)
 		self.foresight = Foresight(d, dp)
 		# think_again
 		self.again_global = E.Tokenizer(d + FORESIGHT_HIDDEN + ft_phi_features() + 3 + len(ft.ECONOMY) + len(ft.DANGER), d, embedded=False)
@@ -1016,7 +1017,7 @@ class CampaignModelV2(nn.Module):
 		cells = torch.where((index >= 0).unsqueeze(-1), flat.index_select(0, (decision[:, None, None] * (L * S * S) + index.clamp(min=0)).reshape(-1)).reshape(k, W, W, -1), torch.zeros(k, W, W, self.cell_dim, device=flat.device, dtype=flat.dtype))
 		strength = torch.cat([known.move_strength, known.move_relative[..., :1]], dim=-1)  # (the estimates and hopeless)
 		views = self.view_pair(known.advice.move.to(cells.dtype))  # (schema 19: the tile's bounded views and Nullkiller2's candidate through it)
-		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach) + self.pair_fight(fight_features(known)) + self.pair_strength(strength) + views
+		return self.pair_hero(heroes)[:, None, None, :] + self.pair_tile(cells) + self.pair_reach(state.window_reach) + self.pair_fight(fight_features(known)) + self.pair_strength(strength) + views + self.pair_rate(known.move_rate.to(cells.dtype))
 
 	def foresee(self, state, known):
 		x = state.x
@@ -1115,7 +1116,7 @@ class CampaignModelV2(nn.Module):
 		# MOVE and the targeted spell's tile: each window's pairs, + the hero's act-now score, + the tile's prior
 		move = cast_cell = move_prior = torch.full((b, HO, W, W), 0.0, device=state.glob.device)
 		if known.n > 0:
-			move = dense(real_only(self.move_out(state.move_pairs).squeeze(-1) + self.move_fight(fight_features(known)).squeeze(-1) + state.move_mix.squeeze(-1), known), known.windows, known.n, b)
+			move = dense(real_only(self.move_out(state.move_pairs).squeeze(-1) + self.move_fight(fight_features(known)).squeeze(-1) + state.move_mix.squeeze(-1) + ft.rate_correction(known.move_rate, self.features).to(state.move_mix.dtype), known), known.windows, known.n, b)
 			move_prior = dense(real_only(known.tile_prior, known), known.windows, known.n, b)
 			cast_cell = dense(real_only(self.cast_cell_out(state.move_pairs).squeeze(-1), known), known.windows, known.n, b)
 		# (the act-now score of each window slot's hero: its own, or the hero a further window belongs to, schema 17)
@@ -1206,7 +1207,7 @@ class CampaignModelV2(nn.Module):
 		stay_logits = slot_logits + stay_slot + torch.einsum("bfsk,btuk->bfstu", self.army_stay_q(src), keys) / math.sqrt(ARMY_SLOT_KEYS)
 		army_slot_outputs(out, slots, slot_logits, stay_logits)
 		learned[A_.UPGRADE] = self.upgrade_out(src).squeeze(-1) + self.nk2_upgrade(known.upgrade_gains).squeeze(-1)
-		prior[A_.UPGRADE] = upgrade_weight * (known.upgrade_gains[..., 0] > 0).float()
+		prior[A_.UPGRADE] = upgrade_weight * (known.upgrade_gains[..., 0] > 0).float() + ft.value_logit(ft.unit_rule_upgrades(x, self.features, known)) * self.features.empire_unit_own  # (the upgrade rule's Φ gain: 0 with it off)
 		offers[A_.UPGRADE] = best_legal(prior[A_.UPGRADE], x["upgrade_mask"])
 		# TRADE (from the global token), CAST, BUY, DISMISS (each hero's)
 		needs = torch.stack([known.trade_needs[:, None, :, 0].expand(b, R, R), known.trade_needs[:, :, None, 1].expand(b, R, R)], dim=-1)
@@ -1485,6 +1486,7 @@ def tile_known(x, features, known):
 #   foreseen  the foresight's P(a monster here attacks), P(we win a battle here), the share of the stake it takes (detached)
 MOVE_KEPT = tuple(i for i, name in enumerate(MOVE_FEATURES) if name not in ("defend", "home", "under_threat", "to_main"))
 MOVE_STRENGTH, MOVE_RELATIVE, MOVE_FORESEEN = 8, 6, 3
+MOVE_RATE = 4  # features.rate_views: the tile's value as gold a day (its value logit), and over the window's best legal tile's; the hero's IRR there, and over the decision's best (2026-11-15)
 MOVE_KNOWN = len(MOVE_KEPT) + MOVE_STRENGTH + MOVE_RELATIVE + MOVE_FORESEEN
 OLD_MOVE_KNOWN = len(MOVE_FEATURES) + 1  # move_pair's known inputs before 2026-11-04 (MOVE_FEATURES, the prior again)
 MIX_HIDDEN = 16  # the mixer's hidden layer (the user: more than 6)

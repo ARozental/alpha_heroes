@@ -225,6 +225,13 @@ class CampaignConfig:
 	# m_visitors gains m_empty; the raw bits stay. Carried in the weights (features.empty_as_visited, the learner's
 	# fill), as ALPHA. False: B1b's inputs as they are, bit for bit
 	empty_as_visited: bool = True
+	# GIVE_ALL's shown gain (model.multi_gain) with the creature VCMI's bulk move leaves the giver when every stack would go
+	# (features.bulk_kept; e5 for the user, 2026-11-15: the give's gain = the true change of Φ). Carried in the weights
+	# (features.give_all_exact, the learner's fill). False: multi_gain as before, bit for bit
+	give_all_exact: bool = False
+	# The user's upgrade rule (2026-11-15): u at a creature's own form, not its unupgraded one (empire.py unit_own_form), for
+	# the labels (the learner's EmpireConfig, the labeler's) and the model's Φ (features.empire_unit_own). False: as before
+	unit_own_form: bool = False
 	# B2's no-town factor for the run (e5 for the user, 2026-11-13): a player's Φ x f while it owns no town, ramped by the
 	# version alone, stateless as value_shared: f = max(no_town_factor, 0.9 ** (version - no_town_from + 1)) from
 	# no_town_from, 1 before (about 22 updates to 0.1), so the value targets take no step; the learner's EmpireConfig for
@@ -232,6 +239,23 @@ class CampaignConfig:
 	# model's buffer (features.empire_no_town) take the same f each update. 1 (the default): none of it
 	no_town_factor: float = 1.0
 	no_town_from: int = 0
+	# Φ's heroes and the armies they lead (e5 for the user, 2026-11-15): a hero's own base (empire.py hero_base: 1500, the
+	# target 825), its share of it with no army (armyless_share: 0.55, the target 1.0: the base whatever its army) and the
+	# lead weight h (lead_weight: 1, the target 0.5: an army at its worth x (1 + h x (its multiplier - 1)), a hero's and
+	# one no hero leads alike, a starting hero's purchase still neutral). Each moves from today's value (empire.HERO_BASE,
+	# ARMYLESS_SHARE, LEAD_WEIGHT) to its target in phi_ramp equal steps from phi_from, stateless as no_town_factor's
+	# (learner.phi_now): the learner's EmpireConfig for the labels (its own and the labeler's) and the model's buffers
+	# (features.phi_*) take each update's. The model's stakes keep today's constants. At today's values (the defaults)
+	# nothing changes, bit for bit
+	phi_hero_base: float = 1500.0
+	phi_armyless_share: float = 0.55
+	phi_lead_weight: float = 1.0
+	phi_from: int = 0
+	phi_ramp: int = 20
+	# The stockpile discount (the user, 2026-11-15; empire.py stock_floor f): each resource above its threshold counts at a
+	# marginal value falling toward f; the income counts at its flat price (not discounted); ramped with the phi_ values
+	# from phi_from (1 today, 1/3 the target), into the labels and the model's buffer; 1: as before, bit for bit
+	phi_stock_floor: float = 1.0
 	# The last town's stake term of B2's prior ((1 - f) x phi more at stake when we own exactly one town; e5: most of every
 	# game, a read input's size on common states): off (the default), the stake as before; its own decision later
 	no_town_last_town: bool = False
@@ -255,6 +279,17 @@ class CampaignConfig:
 	# at its sizes (dim 128, cell_dim 16): what runs
 	model_architecture: str = "v2"
 	foresight_weight: float = 0.2  # v2: each foresight head's loss weight (foresight.py; its gradient share is logged)
+	# The foresight's means over the whole minibatch (foresight.foresight_loss's counts; 2026-11-15, e5, the micro-batch
+	# equivalence test and army/fsweight.py): False, each part is a micro-batch's own mean at its share of the rows, so a
+	# label's weight depends on how many labels share its 64 rows (2.6-4.8x inside a minibatch, up to 28x) and a
+	# micro-batch with none drops the part. True: each mask counted over the minibatch (row_counts), the micro-batches
+	# adding up to the minibatch's mean whatever micro_batches is; the sparse parts then at their factors, set to the
+	# share of micro-batches that held one of their labels to keep the weight they trained at (the battle outcome 0.526,
+	# the answers 0.735, the answer's score 0.058; their designed weight, 1, is the user's call)
+	foresight_minibatch_counts: bool = False
+	foresight_outcome_factor: float = 1.0
+	foresight_answer_factor: float = 1.0
+	foresight_answer_score_factor: float = 1.0
 	model_dim: int = 128
 	model_cell_dim: int = 16
 	model_heads: int = 4

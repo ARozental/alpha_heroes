@@ -49,7 +49,7 @@ from battle_model.supply import trim_memory
 
 from . import constants as c
 from . import evaluate
-from .empire import STATUS_INGAME, EmpireConfig, empire_value
+from .empire import ARMYLESS_SHARE, HERO_BASE, LEAD_WEIGHT, STATUS_INGAME, EmpireConfig, empire_value
 from .failures import NAMES as FAILURES, failure_modes
 from .features import SKILLS
 from .labels import (
@@ -172,11 +172,13 @@ def value_shared_now(config, version):
 	return max(shared, 1.25 ** -(version - start + 1))
 
 
-def set_advice_prior(model, config):
+def set_advice_prior(model, config, version=None):
 	"""config.nk2_prior and nk2_prior_fallback into the model's buffers (model.CustomFeatures.nk_beta, nk_beta_fallback):
 	the size of Nullkiller2's preference as a prior on MOVE's and TRAVEL's entries. At every start, after the weights
 	are loaded: the run's line decides it, the checkpoints and the inference servers carry it (a model without the
-	buffers, v1: nothing)."""
+	buffers, v1: nothing). Φ's phi_ buffers and the upgrade rule's: the environment's (EmpireConfig, a paired test's
+	ALPHA_EMPIRE_*), then, with the version, the config's where the run's line sets them (phi_now at that version;
+	config.unit_own_form): one source after every load, the learner's _ramp_phi and _unit_rule's (e5, 2026-11-15)."""
 	features = getattr(model, "features", None)
 	if features is None or not hasattr(features, "nk_beta"):
 		return
@@ -193,10 +195,25 @@ def set_advice_prior(model, config):
 			features.build_economy.fill_(float(getattr(config, "build_economy", 0.0)))
 		if hasattr(features, "empty_as_visited"):  # (config.empty_as_visited: the weights carry it to every inference server)
 			features.empty_as_visited.fill_(1.0 if getattr(config, "empty_as_visited", True) else 0.0)
+		if hasattr(features, "empire_unit_own"):  # (the upgrade rule: the labels' own, carried the same way; learner._unit_rule)
+			features.empire_unit_own.fill_(1.0 if EmpireConfig().unit_own_form else 0.0)
+		if hasattr(features, "give_all_exact"):  # (config.give_all_exact: GIVE_ALL's kept creature in its shown gain)
+			features.give_all_exact.fill_(1.0 if getattr(config, "give_all_exact", False) else 0.0)
 		if hasattr(features, "empire_alpha"):  # (ALPHA, the labels' own: the weights carry it to every inference server)
 			features.empire_alpha.fill_(float(EmpireConfig().alpha))
 		if hasattr(features, "empire_no_town"):  # (B2's no-town factor, the labels' own, carried the same way; the run's ramp: learner._empire_at)
 			features.empire_no_town.fill_(float(EmpireConfig().no_town_factor))
+		if hasattr(features, "phi_hero_base"):  # (Φ's hero base, armyless share, lead weight: the labels' own, carried the same way; the run's ramp: learner._ramp_phi)
+			empire = EmpireConfig()
+			features.phi_hero_base.fill_(float(empire.hero_base))
+			features.phi_armyless_share.fill_(float(empire.armyless_share))
+			features.phi_lead_weight.fill_(float(empire.lead_weight))
+			features.phi_stock_floor.fill_(float(empire.stock_floor))
+			if version is not None and any(float(getattr(config, name, start)) != start for name, _, start in PHI_FIELDS):
+				for name, field_, _ in PHI_FIELDS:
+					getattr(features, name).fill_(phi_now(config, version)[field_])
+		if version is not None and getattr(config, "unit_own_form", False) and hasattr(features, "empire_unit_own"):
+			features.empire_unit_own.fill_(1.0)
 		if hasattr(features, "empire_last_town"):  # (config.no_town_last_town: the last town's stake term)
 			features.empire_last_town.fill_(1.0 if getattr(config, "no_town_last_town", False) else 0.0)
 
@@ -236,6 +253,21 @@ def no_town_now(config, version):
 	if target >= 1.0 or version < start:
 		return 1.0
 	return max(target, 0.9 ** (version - start + 1))
+
+
+PHI_FIELDS = (("phi_hero_base", "hero_base", HERO_BASE), ("phi_armyless_share", "armyless_share", ARMYLESS_SHARE), ("phi_lead_weight", "lead_weight", LEAD_WEIGHT), ("phi_stock_floor", "stock_floor", 1.0))  # (config's, EmpireConfig's, today's)
+
+
+def phi_now(config, version):
+	"""config.phi_*'s ramp: {EmpireConfig field: value} at this version, each from today's (empire.HERO_BASE,
+	ARMYLESS_SHARE, LEAD_WEIGHT) to its target in phi_ramp equal steps, the first at phi_from; today's before it, and a
+	target at today's value today's exactly. Stateless, as no_town_now."""
+	step = min(1.0, max(0.0, (version - int(getattr(config, "phi_from", 0)) + 1) / max(1, int(getattr(config, "phi_ramp", 20)))))
+	out = {}
+	for name, field_, start in PHI_FIELDS:
+		target = float(getattr(config, name, start))
+		out[field_] = start if target == start else start + (target - start) * step
+	return out
 
 
 def campaign_model_kwargs(config, out, resume=False):
@@ -351,7 +383,7 @@ class CampaignLearner:
 			migrate_subtypes(state, self.model)
 			self.model.load_state_dict(state["model"])
 			print(f"campaign: starting from {config.init_from}", flush=True)
-		set_advice_prior(self.model, config)
+		set_advice_prior(self.model, config, self.version)
 		if getattr(config, "nk2_inputs", False) or config.nk2_prior or config.nk2_prior_fallback or config.nk2_label_prior or config.nk2_follow or not getattr(config, "nk2_teacher", True):
 			print(f"campaign: schema 19: Nullkiller2's view as inputs {'on' if getattr(config, 'nk2_inputs', False) else 'off'} (off in {getattr(config, 'nk2_input_dropout', 0.0):g} of the training games), its own choice followed at a chance of {config.nk2_follow:g}, the prior on it {config.nk2_label_prior:g}, on its best candidate {config.nk2_prior:g} (fallback {config.nk2_prior_fallback:g}), the teacher's loss {'on' if getattr(config, 'nk2_teacher', True) else 'OFF'}", flush=True)
 		if stale_clips(self.grad_clips, config.grad_clip_since):  # (a recalibration: config.grad_clip_since)
@@ -377,6 +409,8 @@ class CampaignLearner:
 		self.features_cpu = copy.deepcopy(self.model.features).cpu()
 		# The labels of each game as it arrives, in processes of their own (labeler.py): the trainer's thread never waits
 		self._ramp_no_town()  # (B2's factor at the resume version: the labels' and the model's)
+		self._ramp_phi()  # (Φ's hero base, armyless share and lead weight at the resume version, the same way)
+		self._unit_rule()  # (the upgrade rule, config.unit_own_form)
 		self.labeler = Labeler(self.labels, self.empire, foresight=self.kwargs.get("architecture") == "v2", share_target=config.share_target)
 		if config.credit == "schedule" and config.share_target != "change":
 			raise SystemExit("campaign.credit 'schedule' reads the share heads as changes: it needs campaign.share_target 'change'")
@@ -651,12 +685,41 @@ class CampaignLearner:
 			if features is not None and hasattr(features, "empire_no_town"):
 				features.empire_no_town.fill_(f)
 
+	def _ramp_phi(self):
+		"""config.phi_*'s ramp: self.empire (the labels', the labeler's for each game submitted from now) and the model's
+		phi_ buffers at this version's values (phi_now); nothing while every target is today's (the EmpireConfig as it
+		was, ALPHA_EMPIRE_* included, bit for bit)."""
+		if all(float(getattr(self.config, name, start)) == start for name, _, start in PHI_FIELDS):
+			return
+		values = phi_now(self.config, self.version)
+		self.empire = replace(self.empire, **values)
+		for model in (self.model, getattr(self, "features_cpu", None)):
+			features = getattr(model, "features", model)
+			if features is not None and hasattr(features, "phi_hero_base"):
+				features.phi_hero_base.fill_(values["hero_base"])
+				features.phi_armyless_share.fill_(values["armyless_share"])
+				features.phi_lead_weight.fill_(values["lead_weight"])
+				features.phi_stock_floor.fill_(values["stock_floor"])
+
+	def _unit_rule(self):
+		"""config.unit_own_form (the user's upgrade rule): self.empire (the labels', the labeler's) and the model's
+		empire_unit_own buffer; nothing while it is off (the EmpireConfig as it was, ALPHA_EMPIRE_UNIT_OWN included)."""
+		if not getattr(self.config, "unit_own_form", False):
+			return
+		self.empire = replace(self.empire, unit_own_form=True)
+		for model in (self.model, getattr(self, "features_cpu", None)):
+			features = getattr(model, "features", model)
+			if features is not None and hasattr(features, "empire_unit_own"):
+				features.empire_unit_own.fill_(1.0)
+
 	def step(self, epoch):
 		"""One update if its games are in (the battle learner calls this between its updates); True if it ran."""
 		games = self._take()
 		if games is None:
 			return False
 		CampaignLearner._ramp_no_town(self)  # (B2's factor at this version: the update's labels and model, the labeler's next games; the tests' learners are namespaces)
+		CampaignLearner._ramp_phi(self)  # (Φ's hero base, armyless share and lead weight at this version, the same way)
+		CampaignLearner._unit_rule(self)  # (the upgrade rule, config.unit_own_form)
 		if getattr(self, "held", None) is not None:
 			# The value-loss guard holds the updates (_judge_value): the model stays as it is, served and evaluated as
 			# before, and the games that would have made this update are dropped (their battles went to the battle
@@ -883,6 +946,13 @@ class CampaignLearner:
 			row.update(self._note_segments(decisions, surprises, np.concatenate(streams[0]), np.concatenate(hidden) if hidden else None))
 		self._relabel_waiting()
 		memory.append(("updated", rss_gb()))
+		features = getattr(self.model, "features", None)
+		if features is not None and hasattr(features, "correction_values"):  # (2026-11-15: the new bounded corrections, each update)
+			values = features.correction_values()
+			print("campaign corrections: " + "  ".join(f"{name} {value:+.4f}" for name, value in values.items()), flush=True)
+			if getattr(self, "writer", None) is not None:
+				for name, value in values.items():
+					self.writer.add_scalar(f"campaign_corrections/{name}", value, self.version)
 		self._log(epoch, games, decisions, row, metrics, time.time() - started)
 		memory.append(("logged", rss_gb()))
 		# The update's freed memory back to the system: glibc kept it, and the trainer climbed from ~4 GB after each
@@ -1734,7 +1804,7 @@ def _update_worker(config, kwargs, device_name, state, requests, results, latest
 	optimizer = make_optimizer(model, config)
 	migrate_subtypes(state, model)
 	model.load_state_dict(state["model"])
-	set_advice_prior(model, config)
+	set_advice_prior(model, config, state.get("version"))
 	if state.get("optimizer"):
 		optimizer.load_state_dict(state["optimizer"])
 		fit_moments(optimizer, model)

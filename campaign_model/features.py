@@ -254,24 +254,25 @@ def main_hero(values, present):
 	return (torch.arange(values.shape[-1], device=values.device) == best) & present
 
 
-def armed_share(army_gold, t):
+def armed_share(army_gold, t, armyless=None):
 	"""empire.hero_base_value's share of HERO_BASE [...] at a hero's army worth (gold at cost + u): armyless_share with
-	none, 1 from armed_army on."""
-	return t.armyless_share + (1 - t.armyless_share) * (army_gold.clamp(min=0) / t.armed_army).clamp(max=1.0)
+	none, 1 from armed_army on. armyless: Φ's (t.phi_armyless_share) where Φ is priced, else the stakes' t.armyless_share."""
+	armyless = t.armyless_share if armyless is None else armyless
+	return armyless + (1 - armyless) * (army_gold.clamp(min=0) / t.armed_army).clamp(max=1.0)
 
 
-def heroes_value(values, present, armed, t):
-	"""empire.heroes_value [B]: each hero's HERO_BASE at its armed_share (armed [B, H]), the strongest hero's skill_value
-	(values [B, H]) in full, the others' at SECONDARY_SHARE."""
+def heroes_value(values, present, armed, t, base=None):
+	"""empire.heroes_value [B]: each hero's HERO_BASE (base: Φ's t.phi_hero_base where Φ is priced, else t.hero_base) at
+	its armed_share (armed [B, H]), the strongest hero's skill_value (values [B, H]) in full, the others' at SECONDARY_SHARE."""
 	weight = torch.where(main_hero(values, present), torch.ones_like(values), torch.full_like(values, t.secondary_share))
-	return (t.hero_base * armed + weight * values).mul(present.float()).sum(dim=-1)
+	return ((t.hero_base if base is None else base) * armed + weight * values).mul(present.float()).sum(dim=-1)
 
 
-def own_armed(x, t):
+def own_armed(x, t, armyless=None):
 	"""Our heroes' armed_share [B, HO] (their armies at cost + u, exact counts: ours)."""
 	creatures = x["h_army_creature"][:, :HO]
 	_, _, gold, _ = army(creatures, x["h_army_count"][:, :HO], torch.ones_like(creatures[..., 0], dtype=torch.bool), t)
-	return armed_share(gold, t)
+	return armed_share(gold, t, armyless)
 
 
 def own_skill_values(x, t):
@@ -335,13 +336,43 @@ def bulk_moves(into, source):
 	return torch.stack(moved, dim=-1)
 
 
+def bulk_kept(creatures, counts, moved, t):
+	"""What VCMI's bulk move leaves its source when every stack would go (CGameHandler::bulkMoveArmy: a hero is never left
+	without troops; AlphaMapAI's GIVE_ALL names the slot): one creature of the stack of the least power (AI value x count,
+	CStackInstance::getPower; the first of equals in slot order) [..., A] (1.0 there); 0 elsewhere, and where some stack
+	stays anyway. creatures, counts: the source's [..., A]; moved: bulk_moves' [..., A]."""
+	present = (creatures >= 0) & (counts > 0)
+	all_go = ((moved & present) | ~present).all(dim=-1, keepdim=True) & present.any(dim=-1, keepdim=True)
+	power = torch.where(present, counts.float() * t.creature_ai_value[vocab_index(creatures, c.CREATURE_VOCAB)], torch.full_like(counts.float(), float("inf")))
+	weakest = power.argmin(dim=-1, keepdim=True)
+	return ((torch.arange(creatures.shape[-1], device=creatures.device) == weakest) & all_go).float()
+
+
 def led_values(creatures, counts, multiplier, rest, t):
 	"""What armies [..., A] count in Φ led by a hero (gold, [...]): their worth x the hero's multiplier (hero_multipliers)
-	x its movement (speed_factors), and their make-up's morale (make_up_values, over rest: the hero's morale without its
-	make-up's). An exchange's or a gather's armies joined: their slots concatenated."""
+	at the lead weight (lead_factor) x its movement (speed_factors), and their make-up's morale (make_up_values, over
+	rest: the hero's morale without its make-up's). An exchange's or a gather's armies joined: their slots concatenated."""
 	index = vocab_index(creatures, c.CREATURE_VOCAB)
 	worth = (counts.clamp(min=0).float() * (t.creature_cost[index] + t.creature_unit[index]) * (creatures >= 0)).sum(dim=-1)
-	return worth * multiplier * speed_factors(creatures, counts, t) + make_up_values(creatures, counts, rest, t)
+	return worth * lead_factor(multiplier, t) * speed_factors(creatures, counts, t) + make_up_values(creatures, counts, rest, t)
+
+
+def lead_factor(multiplier, t):
+	"""empire.led_multiplier: what an army counts at in Φ by its multiplier (hero_multipliers', or unled_share: unled_lead)
+	at the lead weight h (t.phi_lead_weight, the learner's fill): 1 + h x (multiplier - 1); the multiplier itself at 1."""
+	h = t.phi_lead_weight
+	return torch.where(h == 1, multiplier, 1 + h * (multiplier - 1))
+
+
+def unled_lead(t):
+	"""What an army no hero leads counts at in Φ (a garrison's, a mine's): lead_factor of unled_share."""
+	return lead_factor(torch.full_like(t.phi_lead_weight, t.unled_share), t)  # (a fill on the device: a CUDA graph refuses new_tensor's host copy)
+
+
+def unled_loss(t):
+	"""unled_lead - 1, what a stack loses into a garrison over its worth: h x (unled_share - 1), the difference taken in
+	double as before (at h = 1 the same float as unled_share - 1.0)."""
+	return t.phi_lead_weight * torch.full_like(t.phi_lead_weight, t.unled_share - 1.0)  # (a fill on the device, as unled_lead)
 
 
 def own_make_up_values(x, t):
@@ -401,12 +432,126 @@ def tavern_worth(x, t):
 	carried = (t.artifact_price[vocab_index(worn, c.ARTIFACT_VOCAB)] * (worn >= 0)).sum(dim=-1)
 	theirs = skill_value(x["g_tavern_primary"], x["g_tavern_skills"], x["g_tavern_exp"], x["g_tavern_spells"], t)  # [B, N_TAVERN]
 	ours, mine = own_skill_values(x, t)
-	armed, theirs_armed = own_armed(x, t), armed_share(army_gold, t)
-	before = heroes_value(ours, mine, armed, t).unsqueeze(-1)
-	after = torch.stack([heroes_value(torch.cat([ours, theirs[:, s : s + 1]], dim=1), torch.cat([mine, torch.ones_like(mine[:, :1])], dim=1), torch.cat([armed, theirs_armed[:, s : s + 1]], dim=1), t) for s in range(theirs.shape[1])], dim=1)
+	armed, theirs_armed = own_armed(x, t, t.phi_armyless_share), armed_share(army_gold, t, t.phi_armyless_share)  # (Φ's own: t.phi_*)
+	before = heroes_value(ours, mine, armed, t, t.phi_hero_base).unsqueeze(-1)
+	after = torch.stack([heroes_value(torch.cat([ours, theirs[:, s : s + 1]], dim=1), torch.cat([mine, torch.ones_like(mine[:, :1])], dim=1), torch.cat([armed, theirs_armed[:, s : s + 1]], dim=1), t, t.phi_hero_base) for s in range(theirs.shape[1])], dim=1)
 	creatures, counts = x["g_tavern_army_creature"], x["g_tavern_army_count"].float()
 	led = led_values(creatures, counts, hero_multipliers(x["g_tavern_primary"], x["g_tavern_artifacts"], t), torch.zeros_like(army_gold), t)  # (its morale: its army's make-up's alone)
 	return (after - before + led + carried) * present
+
+
+STOCK_FLOORS = (30.0, 20.0, 30.0, 20.0, 20.0, 20.0, 10000.0)  # (empire.STOCK_FLOORS: wood, mercury, ore, sulfur, crystal, gems, gold)
+STOCK_EXCLUDED = (6, 26)  # (empire.STOCK_EXCLUDED)
+
+
+def stock_thresholds(x, t):
+	"""empire.stock_thresholds [B, R]: the max of STOCK_FLOORS; the most of each resource any startable building of any town
+	of ours costs (not built, its required buildings built, the faction has it; the shipyard and the grail left out);
+	and what buys a week's growth of every dwelling we own (in our towns: the dwelling's creature, upgraded where its
+	upgrade is built, base growth x the fort line's multiplier, + half for a horde; our dwellings outside towns)."""
+	to = c.OWN_TOWNS
+	own = own_towns(x)
+	built = x["t_built"][:, :to].bool() & own.unsqueeze(-1)  # [B, TO, NB]
+	faction = vocab_index(x["t_faction"][:, :to], c.FACTION_VOCAB)
+	res = t.building_resources[faction]  # [B, TO, NB, R]
+	ids = torch.arange(built.shape[-1], device=built.device)
+	allowed = torch.ones_like(ids, dtype=torch.bool)
+	for b in STOCK_EXCLUDED:
+		allowed = allowed & (ids != b)
+	met = ~(t.building_requires[faction] & ~built.unsqueeze(-2)).any(dim=-1)  # [B, TO, NB]: its requirements built
+	startable = t.building_exists[faction] & ~built & met & own.unsqueeze(-1) & allowed
+	most = torch.where(startable.unsqueeze(-1), res, torch.zeros_like(res)).amax(dim=2).amax(dim=1)  # [B, R]
+	base_c, up_c = t.dwelling_creature[faction][..., BASE_SLICE], t.dwelling_creature[faction][..., UP_SLICE]  # [B, TO, 7]
+	up_built = built[..., UP_SLICE]
+	has = built[..., BASE_SLICE] | up_built
+	fort = _fort_multiplier(built)  # [B, TO]
+	growth = t.creature_growth[vocab_index(base_c, c.CREATURE_VOCAB)] * (base_c >= 0) * has * fort.unsqueeze(-1)  # [B, TO, 7]
+	level = t.horde_level[faction]  # [B, TO, NB]
+	horde = ((level.unsqueeze(-1) == torch.arange(7, device=level.device)) & built.unsqueeze(-1) & (level >= 0).unsqueeze(-1)).float().sum(dim=2)  # [B, TO, 7]
+	growth = growth + 0.5 * growth * horde
+	grown = torch.where(up_built & (up_c >= 0), up_c, base_c)
+	week = (growth.unsqueeze(-1) * t.creature_resources[vocab_index(grown, c.CREATURE_VOCAB)] * (grown >= 0).unsqueeze(-1)).sum(dim=(1, 2))
+	dw_c = x["g_dwelling_creature"]
+	outside = (t.creature_growth[vocab_index(dw_c, c.CREATURE_VOCAB)].unsqueeze(-1) * t.creature_resources[vocab_index(dw_c, c.CREATURE_VOCAB)] * (dw_c >= 0).unsqueeze(-1)).sum(dim=1)
+	floors = constant(STOCK_FLOORS, most.device, most.dtype)  # (made once per device: a CUDA graph refuses a host copy)
+	return torch.maximum(torch.maximum(floors, most), week + outside)
+
+
+def stock_value(amount, threshold, floor):
+	"""empire.stock_value elementwise: amount up to the threshold T, above it T + f x + (1 - f) (T/2) ln(1 + 2x/T)."""
+	over = (amount - threshold).clamp(min=0)
+	return torch.where(amount <= threshold, amount, threshold + floor * over + (1 - floor) * (threshold / 2) * torch.log1p(2 * over / threshold.clamp(min=1e-6)))
+
+
+def stock_marginal(amount, threshold, floor):
+	"""empire.stock_marginal elementwise: 1 up to the threshold, f + (1 - f) / (1 + 2x/T) above it."""
+	over = (amount - threshold).clamp(min=0)
+	return torch.where(amount <= threshold, torch.ones_like(amount), floor + (1 - floor) / (1 + 2 * over / threshold.clamp(min=1e-6)))
+
+
+def stock_resources(x, t):
+	"""Φ's resources part [B] under the stockpile discount (empire.empire_value's), the plain sum exactly at phi_stock_floor 1."""
+	held = x["g_resources"].clamp(min=0).float()
+	plain = (held * t.resource_price).sum(dim=-1)
+	discounted = (stock_value(held, stock_thresholds(x, t), t.phi_stock_floor) * t.resource_price).sum(dim=-1)
+	return torch.where(t.phi_stock_floor == 1, plain, discounted)
+
+
+def stock_gain(cost, held, threshold, t):
+	"""A purchase's stockpile part [...] (gold), its resources held at their threshold before it: over what it spends (cost
+	[..., R]; held and threshold broadcast to it), the price less the change of Φ it makes, p (c - (V(a) - V(a - c)));
+	0 while every stock stays at or under its threshold, and at phi_stock_floor 1."""
+	c_ = torch.minimum(cost.clamp(min=0), held)
+	lost = stock_value(held, threshold, t.phi_stock_floor) - stock_value(held - c_, threshold, t.phi_stock_floor)
+	return ((c_ - lost) * t.resource_price).sum(dim=-1)
+
+
+def stock_build_gain(x, t, threshold):
+	"""BUILD's entries' stockpile part [B, TO, NB] (gold): each building's cost (stock_gain)."""
+	faction = vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)
+	held = x["g_resources"].clamp(min=0).float()
+	return stock_gain(t.building_resources[faction], held[:, None, None], threshold[:, None, None], t)
+
+
+def stock_recruit_gain(x, t, threshold):
+	"""RECRUIT's entries' stockpile part [B, TO, LV, AM] (gold): ceil(most x the entry's fraction) creatures, most what is
+	for hire and affordable (the C++ Encoder's). Not in the priors: RECRUIT shows no gold figure to fold it into."""
+	to = c.OWN_TOWNS
+	held = x["g_resources"].clamp(min=0).float()
+	creature = x["t_available_creature"][:, :to]
+	cost = t.creature_resources[vocab_index(creature, c.CREATURE_VOCAB)]  # [B, TO, LV, R]
+	afford = torch.where(cost > 0, torch.floor(held[:, None, None, :] / cost.clamp(min=1e-6)), torch.full_like(cost, 1e9)).amin(dim=-1)
+	most = torch.minimum(x["t_available"][:, :to].clamp(min=0).float(), afford) * (creature >= 0)
+	amount = torch.ceil(most.unsqueeze(-1) * constant(c.RECRUIT_FRACTIONS, most.device, most.dtype))  # [B, TO, LV, AM]
+	return stock_gain(amount.unsqueeze(-1) * cost.unsqueeze(-2), held[:, None, None, None], threshold[:, None, None, None], t)
+
+
+def stock_upgrade_gain(x, t, threshold):
+	"""UPGRADE's entries' stockpile part [B, HD, A] (gold): the stack x its upgrade's cost difference. Not in the priors:
+	UPGRADE shows no gold figure to fold it into (the upgrade rule's term only with that rule on)."""
+	to = c.OWN_TOWNS
+	held = x["g_resources"].clamp(min=0).float()
+	stack_c = torch.cat([x["h_army_creature"][:, :HO], x["t_garrison_creature"][:, :to], x["x_creature"].unsqueeze(1)], dim=1)
+	stack_n = torch.cat([x["h_army_count"][:, :HO], x["t_garrison_count"][:, :to], x["x_count"].unsqueeze(1)], dim=1).clamp(min=0).float()
+	now = vocab_index(stack_c, c.CREATURE_VOCAB)
+	up = t.creature_upgrade[now]
+	diff = (t.creature_resources[vocab_index(up, c.CREATURE_VOCAB)] - t.creature_resources[now]).clamp(min=0) * ((stack_c >= 0) & (up >= 0)).unsqueeze(-1)
+	return stock_gain(stack_n.unsqueeze(-1) * diff, held[:, None, None], threshold[:, None, None], t)
+
+
+def stock_hire_gain(x, t, threshold):
+	"""A hire's stockpile part [B] (gold): its 2,500 gold (stock_gain). Not in the priors (e5, 2026-11-15: at a late
+	pile it would flip a hire's prior from -2.6 to about +1.7); the reward counts it."""
+	held = x["g_resources"].clamp(min=0).float()
+	cost = torch.zeros_like(held)
+	cost[:, 6] = HERO_GOLD_COST
+	return stock_gain(cost, held, threshold, t)
+
+
+def rate_correction(views, t):
+	"""MOVE's tile logits' addend [K, W, W] from the gain-per-movement and IRR views (rate_views'), each view's weight a
+	bounded correction starting at 0 (t.rate_weights, -2..2; e5 for the user, 2026-11-15: beside pair_rate)."""
+	return (views.float() * bounded(t.rate_weights, -2.0, 2.0, 0.0, t.correction_step)).sum(dim=-1)
 
 
 def hire_gain(x, t, worth):
@@ -443,13 +588,13 @@ def empire_value(x, t):
 	usable_mana = torch.minimum(x["h_mana"][:, :HO].clamp(min=0), 3 * x["h_spell_cost"][:, :HO].clamp(min=0)).float()
 	parts = torch.stack(
 		[
-			(x["g_resources"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
+			stock_resources(x, t),  # (the stockpile discount: the plain sum at its floor 1)
 			((x["t_built"][:, : c.OWN_TOWNS].float() * t.building_value[faction]).sum(dim=-1) * own_towns).sum(dim=-1),
 			t.income_days * (x["g_object_income"].clamp(min=0).float() * t.resource_price).sum(dim=-1),
-			(hero_army * hero_multipliers(x["h_primary"][:, :HO], x["h_artifacts"][:, :HO], t) * speed_factors(x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO], t) * own_heroes).sum(dim=-1)
-			+ t.unled_share * ((garrison * own_towns).sum(dim=-1) + owned),  # (armies no hero leads: game_values.unled_share)
+			(hero_army * lead_factor(hero_multipliers(x["h_primary"][:, :HO], x["h_artifacts"][:, :HO], t), t) * speed_factors(x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO], t) * own_heroes).sum(dim=-1)
+			+ unled_lead(t) * ((garrison * own_towns).sum(dim=-1) + owned),  # (armies no hero leads: game_values.unled_share at the lead weight)
 			((x["t_available"][:, : c.OWN_TOWNS].clamp(min=0).float() * t.creature_unit[vocab_index(available, c.CREATURE_VOCAB)] * (available >= 0)).sum(dim=-1) * own_towns).sum(dim=-1) + dwelling_hire,
-			heroes_value(*own_skill_values(x, t), armed_share(hero_army, t), t) + ((boost_values(x, t) + own_make_up_values(x, t)) * own_heroes).sum(dim=-1),
+			heroes_value(*own_skill_values(x, t), armed_share(hero_army, t, t.phi_armyless_share), t, t.phi_hero_base) + ((boost_values(x, t) + own_make_up_values(x, t)) * own_heroes).sum(dim=-1),
 			((t.artifact_price[vocab_index(artifacts, c.ARTIFACT_VOCAB)] * (artifacts >= 0)).sum(dim=-1) * own_heroes).sum(dim=-1),
 			(2.0 * x["h_primary"][:, :HO, 2].clamp(min=0).float() * usable_mana * own_heroes).sum(dim=-1),  # game_values.capped_mana_value
 			-t.hero_penalty * own_heroes.sum(dim=-1) ** 2,
@@ -829,6 +974,51 @@ def unseen_exits(x):
 	return torch.zeros(b, areas + 1, device=index.device).scatter_reduce(1, index, flagged.float(), reduce="amax", include_self=True)[:, :areas]
 
 
+def move_rate(value, h_move, h_move_max, move_left, turns):
+	"""A tile's value as gold a day [K, W, W] (e5 for the user, 2026-11-15: the gain-per-movement view): value x (the
+	hero's full day's movement / the movement the move costs). The cost today is the movement it spends (h_move -
+	w_move_left), at least MIN_MOVE_COST points; a tile not reached today costs its days x a full day (w_turns x
+	h_move_max); one never reached (w_turns < 0) 0. h_move, h_move_max: the window's hero's [K]."""
+	full = h_move_max.float().clamp(min=1)[:, None, None]
+	today = move_left >= 0
+	cost = torch.where(today, (h_move.float()[:, None, None] - move_left.float()).clamp(min=MIN_MOVE_COST), turns.float().clamp(min=1) * full)
+	return torch.where(today | (turns >= 0), value * full / cost, torch.zeros_like(value))
+
+
+MIN_MOVE_COST = 100.0  # movement points: move_rate's least cost (a step onto a neighbouring tile costs ~100)
+
+
+def rate_views(rate, legal, capital, decision, b):
+	"""move_rate's four bounded views [K, W, W, 4]: tanh(value_logit(rate) / 4), as the tile's other values; the rate over
+	the window's best legal tile's (0..1, its negatives at 0; 0 where no legal tile has a positive rate); and the IRR (e5
+	for the user, 2026-11-15: the rate over the hero's capital, hero_capital, the share of its worth it earns a day
+	there, negative for a fight it loses) as tanh(2 x irr), and over the best IRR of every legal tile of every window of
+	the decision (all our heroes': is this the best use of any hero now; 0..1, its negatives at 0). capital: the window's
+	hero's [K]; decision: each window's decision [K], of b."""
+	k = rate.shape[0]
+	positive = torch.where(legal, rate.clamp(min=0), torch.zeros_like(rate))
+	best = positive.reshape(k, -1).amax(dim=1)[:, None, None]
+	share = torch.where(best > 0, positive / best.clamp(min=1e-6), torch.zeros_like(rate))
+	irr = rate / capital[:, None, None]
+	gains = positive / capital[:, None, None]
+	# (each decision's best over its windows: a 2-D scatter, as travel_pulls'; the exporter's 3-D one crashed at random)
+	top = gains.new_zeros(1, b).scatter_reduce(1, decision[None], gains.reshape(k, -1).amax(dim=1)[None], reduce="amax", include_self=True)[0]
+	top = top.index_select(0, decision)[:, None, None]
+	ratio = torch.where(top > 0, gains / top.clamp(min=1e-9), torch.zeros_like(rate))
+	return torch.stack([torch.tanh(value_logit(rate) / 4), share, torch.tanh(2 * irr), ratio], dim=-1)
+
+
+def hero_capital(x, f, t):
+	"""Each hero of ours' capital in Φ [B, HO] (rate_views' IRR): the army it leads as Φ counts it (led_values, its
+	multiplier f.hero_multiplier) and its own worth (f.hero_worth), at least MIN_CAPITAL."""
+	army_c, army_n = x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO].float()
+	rest = x["h_morale"][:, :HO].float() - make_up_morales(army_c, army_n, t)  # (its morale without its army's make-up's)
+	return (led_values(army_c, army_n, f.hero_multiplier, rest, t) + f.hero_worth[:, :HO]).clamp(min=MIN_CAPITAL)
+
+
+MIN_CAPITAL = 1000.0  # gold: hero_capital's floor (a hero with nothing: its IRR stays a number)
+
+
 def movement_discount(days, exponent):
 	"""NK2's discount of a target's value by the days to reach it (PriorityEvaluator::evaluateMovement): 1 / (0.75 +
 	days^exponent), its exponent 1.3."""
@@ -990,6 +1180,54 @@ def upgrade_gains(x, t):
 	gain = count * (t.fight_value[after] - t.fight_value[now]) * better
 	cost = count * (t.creature_cost[after] - t.creature_cost[now]).clamp(min=0) * better
 	return torch.stack([torch.log1p(gain.clamp(min=0) / 1000), torch.log1p(cost / 1000)], dim=-1)
+
+
+def unit_rule_upgrades(x, t, f):
+	"""The upgrade rule's part of each UPGRADE's Φ gain [B, HD, A] (gold; config.unit_own_form, 0 with it off: u at the own
+	form): the stack's creatures x ALPHA x the cost difference to the upgrade, at its holder's lead factor (a hero's:
+	lead_factor of its multiplier x its army's movement with that stack upgraded, and the make-up's morale and the boosts
+	until the next battle a gold of worth adds; a garrison's and the exchange's other army's: unled_lead), the change of
+	the replica's Φ the rule adds."""
+	creature = torch.cat([x["h_army_creature"][:, :HO], x["t_garrison_creature"][:, : c.OWN_TOWNS], x["x_creature"].unsqueeze(1)], dim=1)
+	count = torch.cat([x["h_army_count"][:, :HO], x["t_garrison_count"][:, : c.OWN_TOWNS], x["x_count"].unsqueeze(1)], dim=1).clamp(min=0).float()
+	now = vocab_index(creature, c.CREATURE_VOCAB)
+	up = t.creature_upgrade[now]
+	better = ((creature >= 0) & (up >= 0)).float()
+	diff = (t.creature_cost[vocab_index(up, c.CREATURE_VOCAB)] - t.creature_cost[now]).clamp(min=0)
+	from .empire import LUCK_CHANCE, MORALE_CHANCE
+
+	army_c, army_n = x["h_army_creature"][:, :HO], x["h_army_count"][:, :HO]
+	slots = army_c.shape[-1]
+	rest = x["h_morale"][:, :HO].float() - make_up_morales(army_c, army_n, t)  # (the hero's morale without its make-up's)
+	luck, morale = x["h_luck"][:, :HO], x["h_morale"][:, :HO]
+	gained_luck = battle_chance(LUCK_CHANCE, luck) - battle_chance(LUCK_CHANCE, luck - x["h_battle_luck"])
+	gained_morale = battle_chance(MORALE_CHANCE, morale) - battle_chance(MORALE_CHANCE, morale - x["h_battle_morale"])
+	per_gold = []  # each stack upgraded alone: Φ a gold of its worth adds (led at the army's movement after it, its make-up's
+	for a in range(slots):  # morale after it, the boosts until the next battle), as led_values, make_up_values, boost_values
+		upgraded = army_c.clone()
+		upgraded[..., a] = torch.where(up[:, :HO, a] >= 0, up[:, :HO, a], army_c[..., a])
+		ui = vocab_index(upgraded[..., a], c.CREATURE_VOCAB)
+		make_up = battle_chance(MORALE_CHANCE, rest + make_up_morales(upgraded, army_n, t)) - battle_chance(MORALE_CHANCE, rest)
+		boosts = t.boost * (gained_luck * t.creature_luck[ui] + gained_morale * t.creature_morale[ui])
+		per_gold.append(lead_factor(f.hero_multiplier, t) * speed_factors(upgraded, army_n, t) + t.army_morale * make_up * t.creature_morale[ui] + boosts)
+	hero_lead = torch.stack(per_gold, dim=-1)  # [B, HO, A]
+	other = unled_lead(t).expand(creature.shape[0], creature.shape[1] - HO, creature.shape[2])
+	lead = torch.cat([hero_lead, other], dim=1)  # [B, HD, A]
+	return count * t.empire_alpha * diff * better * lead * t.empire_unit_own
+
+
+def unit_rule_build(x, t):
+	"""The upgrade rule's immediate part of a dwelling upgrade's BUILD [B, TO, N_BUILDINGS] (gold; 0 with it off): the
+	creatures for hire at that level become their upgrade, each gaining ALPHA x the cost difference in Φ's for-hire part
+	(the user: "we improve existing un-bought creatures"); the weekly part is the production view's."""
+	avail = x["t_available"][:, : c.OWN_TOWNS].clamp(min=0).float()  # [B, TO, LV]
+	creature = x["t_available_creature"][:, : c.OWN_TOWNS]
+	now = vocab_index(creature, c.CREATURE_VOCAB)
+	up = t.creature_upgrade[now]
+	ok = ((creature >= 0) & (up >= 0)).float()
+	gain = avail * t.empire_alpha * (t.creature_cost[vocab_index(up, c.CREATURE_VOCAB)] - t.creature_cost[now]).clamp(min=0) * ok * t.empire_unit_own
+	b, towns = gain.shape[0], gain.shape[1]
+	return torch.cat([gain.new_zeros(b, towns, UP_SLICE.start), gain[..., : UP_SLICE.stop - UP_SLICE.start], gain.new_zeros(b, towns, c.N_BUILDINGS - UP_SLICE.stop)], dim=-1)
 
 
 def spellbook_wanted(x, main):
@@ -1243,6 +1481,26 @@ def _feature_production_week(week, scale):
 def _feature_days_to_growth(x):
 	"""0..1: days until the next Monday over 7; 1 it is Monday, 1/7 it is Sunday."""
 	return (7.0 - torch.remainder(x["g_day"].float() - 1.0, 7.0)) / 7.0
+
+
+WEEK_CLASSES = ("dwelling", "upgrade", "growth", "other")  # (BUILD's entries by what they add to the week's growth: week_correction)
+
+
+def week_near(x):
+	"""[B] -1 on a week's first day (Monday: the growth's), 0 on its 4th, +1 on its 7th (Sunday): (4 - 7 d) / 3, d the
+	days until the next growth over 7 (_feature_days_to_growth: 1 on Monday, 1/7 on Sunday); its mean over a week 0, so
+	the term shifts no balance of BUILD against the other types (e5 for the user, 2026-11-15)."""
+	return (4.0 - 7.0 * _feature_days_to_growth(x)) / 3.0
+
+
+def week_correction(x, t, faction):
+	"""BUILD's entries' addend [B, TO, NB] (logits): week_weights[the entry's class] x week_near, the classes
+	t.build_week_class's (a new dwelling, a dwelling's upgrade, a growth building: citadel, castle, a horde; every other
+	building), each weight a bounded correction starting at 0 (-2..2; the user, 2026-11-15: "an input that is how many
+	days we have until the next Sunday ... I want to be able to learn that new creature dwellings are getting the extra
+	value on Sunday easily ... and have a reverse-ish, learnable effect on the other dwelling types")."""
+	weights = bounded(t.week_weights, -2.0, 2.0, 0.0, t.correction_step)
+	return weights[t.build_week_class[faction]] * week_near(x)[:, None, None].to(weights.dtype)
 
 
 def economy_features(x, t):

@@ -81,7 +81,7 @@ def town(m, built=(), gold=50_000, faction=0, available=None):
 	m.features.build_economy.fill_(1.0)
 	economy = ft.economy_features(x, m.features)
 	entry, value = ft.build_features(x, m.features, economy)
-	f = type("F", (), {"build_value": value})()
+	f = type("F", (), {"build_value": value, "stock_threshold": ft.stock_thresholds(x, m.features)})()  # (as domain_knowledge fills them)
 	return m.features.build_prior(x, f)[0, 0], entry[0, 0]
 
 

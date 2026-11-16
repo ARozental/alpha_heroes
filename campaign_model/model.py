@@ -88,8 +88,10 @@ def game_tables():
 
 	tables = {
 		"fight_value": torch.ones(c.CREATURE_VOCAB + 1),
+		"creature_ai_value": torch.zeros(c.CREATURE_VOCAB + 1),  # (VCMI's AI value: a stack's power, CStackInstance::getPower, is it x its count)
 		"creature_cost": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_unit_cost": torch.zeros(c.CREATURE_VOCAB + 1),  # (its unupgraded form's cost: u at ALPHA 1, features.creature_unit)
+		"creature_unit_cost_own": torch.zeros(c.CREATURE_VOCAB + 1),  # (its own form's: u at ALPHA 1 under the upgrade rule, empire_unit_own)
 		"creature_health": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_attack": torch.zeros(c.CREATURE_VOCAB + 1),
 		"creature_defense": torch.zeros(c.CREATURE_VOCAB + 1),
@@ -107,7 +109,8 @@ def game_tables():
 		"dwelling_creature": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),
 		"dwelling_base": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),
 		"building_requires": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, c.N_BUILDINGS, dtype=torch.bool),  # (building, a building it needs: vocab.building_requires)
-		"horde_level": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),  # (a horde building: the level index it adds growth to)
+		"horde_level": torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), -1, dtype=torch.long),
+		"building_exists": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, dtype=torch.bool),  # (the faction has it: the stock thresholds' startable)  # (a horde building: the level index it adds growth to)
 		"building_family": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, c.N_BUILDINGS, dtype=torch.bool),  # (two buildings of one upgrade chain: vocab's "upgrade", transitively)
 		"building_resources": torch.zeros(c.FACTION_VOCAB + 1, c.N_BUILDINGS, len(RESOURCE_PRICES)),
 		"spell_value": torch.zeros(c.N_SPELLS),
@@ -132,8 +135,10 @@ def game_tables():
 		for creature_id, row in creatures().items():
 			if 0 <= creature_id < c.CREATURE_VOCAB:
 				tables["fight_value"][creature_id] = float(max(row.get("fight_value", 1), 1))
+				tables["creature_ai_value"][creature_id] = float(row.get("ai_value", 0))
 				tables["creature_cost"][creature_id] = float(creature_cost(creature_id))
-				tables["creature_unit_cost"][creature_id] = float(_unit(creature_id, EmpireConfig(alpha=1.0)))
+				tables["creature_unit_cost"][creature_id] = float(_unit(creature_id, EmpireConfig(alpha=1.0, unit_own_form=False)))
+				tables["creature_unit_cost_own"][creature_id] = float(_unit(creature_id, EmpireConfig(alpha=1.0, unit_own_form=True)))
 				tables["creature_health"][creature_id] = float(row.get("hit_points", 0))
 				tables["creature_attack"][creature_id] = float(row.get("attack", 0))
 				tables["creature_defense"][creature_id] = float(row.get("defense", 0))
@@ -157,6 +162,7 @@ def game_tables():
 		rows = buildings()
 		for faction, building in buildings():
 			if 0 <= faction < c.FACTION_VOCAB and 0 <= building < c.N_BUILDINGS:
+				tables["building_exists"][faction, building] = True
 				tables["building_value_base"][faction, building] = building_value(faction, building, EmpireConfig(alpha=0.0))
 				tables["building_unit_growth"][faction, building] = building_value(faction, building, EmpireConfig(alpha=0.0)) - building_value(faction, building, EmpireConfig(alpha=1.0))
 				row = rows[(faction, building)]
@@ -300,8 +306,13 @@ class CustomFeatures(nn.Module):
 
 		self.spell_step, self.unled_share = empire.spell_step, unled_share(empire.spell_step)  # (a hero's spellbook; armies no hero leads: game_values)
 		self.speed_power, self.army_morale = empire.speed_power, empire.army_morale  # (a hero's army at its movement and its make-up's morale)
-		for name in ("hero_base", "skill_level", "fresh_skill_levels", "primary_point", "primary_base", "level_bonus", "secondary_share", "boost", "armyless_share", "armed_army"):  # (empire.py's heroes)
+		for name in ("skill_level", "fresh_skill_levels", "primary_point", "primary_base", "level_bonus", "secondary_share", "boost", "armed_army"):  # (empire.py's heroes)
 			setattr(self, name, getattr(empire, name))
+		# A hero's own base and its share with no army: the stakes' and hero_worth's, the constants as they were (e5 for the
+		# user, 2026-11-15); Φ's own (empire_value, tavern_worth) in the phi_ buffers below, which the learner ramps
+		from .empire import ARMYLESS_SHARE, HERO_BASE
+
+		self.hero_base, self.armyless_share = HERO_BASE, ARMYLESS_SHARE
 		scores, subtypes = priors.object_values()
 		# Tables of a fixed shape, [object, subtype] (the last column: any other subtype), looked up in one gather: a
 		# checkpoint keeps the priors it was trained from, and an edit of the CSVs still loads it
@@ -334,6 +345,20 @@ class CustomFeatures(nn.Module):
 		self.drop_scale, self.drop_sign = zeros(), zeros()  # (2026-11-05: a DROP's gain as a share of its hero's army; drop_weights)
 		self.trade_waste = zeros()  # (2026-11-05: a TRADE that unlocks no purchase; trade_waste_weight)
 		self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight = zeros(), zeros(), zeros(), zeros()
+		# (2026-11-15: the MOVE views' weights, features.rate_correction's)
+		self.rate_weights = zeros(4)
+		self.correction_step = CORRECTION_STEP
+		# (2026-11-15: how far BUILD's stockpile part counts, its own term in build_prior; stock_build_weight)
+		self.stock_weight = zeros()
+		# (2026-11-15: BUILD's entries by class x how near the week's growth is, features.week_correction)
+		self.week_weights = zeros(len(ft.WEEK_CLASSES))
+		week_class = torch.full((c.FACTION_VOCAB + 1, c.N_BUILDINGS), ft.WEEK_CLASSES.index("other"), dtype=torch.long)
+		week_class[:, ft.BASE_SLICE] = ft.WEEK_CLASSES.index("dwelling")
+		week_class[:, ft.UP_SLICE] = ft.WEEK_CLASSES.index("upgrade")
+		week_class[:, ft.CITADEL] = ft.WEEK_CLASSES.index("growth")
+		week_class[:, ft.CASTLE_BUILDING] = ft.WEEK_CLASSES.index("growth")
+		week_class[self.horde_level >= 0] = ft.WEEK_CLASSES.index("growth")
+		self.register_buffer("build_week_class", week_class, persistent=False)  # (from the engine's tables, as the others)
 		self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight = (zeros() for _ in range(6))
 		self.travel_exponent, self.end_coupling, self.travel_coupling = zeros(), zeros(), zeros()
 		self.move_discount = zeros()  # (not a prior correction: its 0 is the old score, not a prior; move_discount_power)
@@ -408,14 +433,30 @@ class CustomFeatures(nn.Module):
 		# town's stake: _no_town_prior); 1, as a checkpoint from before keeps its process's: none of it
 		self.register_buffer("empire_no_town", torch.tensor(float(empire.no_town_factor)))
 		self.register_buffer("empire_last_town", torch.zeros(()))  # (config.no_town_last_town: the last town's stake term, 0 = off)
+		# Φ's hero base, its share with no army and the lead weight (empire.py's hero_base, armyless_share, lead_weight;
+		# e5 for the user, 2026-11-15) the same way, ALPHA's buffer's rules: the Φ replica (features.empire_value), the
+		# armies' Φ in every gain (features.led_values, unled_lead) and a hire's worth (tavern_worth) read them; the learner
+		# fills them each update (config.phi_*: its ramp); a checkpoint from before keeps its process's, as before by default
+		self.register_buffer("phi_hero_base", torch.tensor(float(empire.hero_base)))
+		self.register_buffer("phi_armyless_share", torch.tensor(float(empire.armyless_share)))
+		self.register_buffer("phi_lead_weight", torch.tensor(float(empire.lead_weight)))
+		# The upgrade rule (empire.py unit_own_form: u at a creature's own form) the same way: 0 as before, the learner's fill
+		self.register_buffer("empire_unit_own", torch.tensor(1.0 if empire.unit_own_form else 0.0))
+		# The stockpile discount's floor (empire.py stock_floor) the same way: 1, as before; the learner's ramp fills it
+		self.register_buffer("phi_stock_floor", torch.tensor(float(empire.stock_floor)))
 		# config.empty_as_visited (B1b's bit read as visited at the model's input: features.empty_as_visited) as a buffer the
 		# weights carry, the learner's fill; 1 to begin with and in a checkpoint from before (ADDED_HEADS: the loading model's)
 		self.register_buffer("empty_as_visited", torch.ones(()))
+		# config.give_all_exact (e5 for the user, 2026-11-15): GIVE_ALL's shown gain with the creature VCMI's bulk move leaves
+		# the giver (features.bulk_kept), the learner's fill as the others; ALPHA_GIVE_ALL_EXACT for a paired test; 0: off,
+		# multi_gain as before, bit for bit
+		self.register_buffer("give_all_exact", torch.zeros(()))
 		override = lambda name: float(os.environ[name]) if os.environ.get(name, "") != "" else None  # noqa: E731
 		self.nk_override = (override("ALPHA_NK2_PRIOR"), override("ALPHA_NK2_PRIOR_FALLBACK"), override("ALPHA_NK2_LABEL"), override("ALPHA_NK2_FOLLOW"))
 		self.adv_override = override("ALPHA_ADV_GAIN")
 		self.guard_override = override("ALPHA_TOWN_GUARD")
 		self.economy_override = override("ALPHA_BUILD_ECONOMY")
+		self.give_all_override = override("ALPHA_GIVE_ALL_EXACT")
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -438,7 +479,7 @@ class CustomFeatures(nn.Module):
 			self.swap_gain, self.swap_slot, self.last_swap,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
-			self.night_gain,
+			self.night_gain, self.rate_weights, self.stock_weight, self.week_weights,
 			self.nk_gain, self.nk_gain_fallback, self.nk_survival, self.nk_risk, self.nk_label_gain, self.nk_follow_shift,
 			self.adv_gain_shift, self.town_guard_shift, self.build_income_gain, self.build_production_gain, self.build_prior_gain, self.build_faction_bias,
 		]
@@ -498,13 +539,32 @@ class CustomFeatures(nn.Module):
 
 	@property
 	def creature_unit(self):
-		"""[CREATURE_VOCAB + 1] u: what one creature for hire is worth (ALPHA x its unupgraded form's cost)."""
-		return self.empire_alpha * self.creature_unit_cost
+		"""[CREATURE_VOCAB + 1] u: what one creature for hire is worth (ALPHA x its unupgraded form's cost; its own form's
+		under the upgrade rule, empire_unit_own)."""
+		return self.empire_alpha * torch.where(self.empire_unit_own > 0, self.creature_unit_cost_own, self.creature_unit_cost)
 
 	@property
 	def building_value(self):
 		"""[FACTION_VOCAB + 1, N_BUILDINGS] each building's worth in Φ (empire.building_value at ALPHA)."""
 		return self.building_value_base - self.empire_alpha * self.building_unit_growth
+
+	def correction_values(self):
+		"""{name: value} of the 2026-11-15 bounded corrections (the learner's log line): the MOVE views' weights, BUILD's
+		stockpile weight and its four week weights."""
+		rate = ft.bounded(self.rate_weights, -2.0, 2.0, 0.0, CORRECTION_STEP).tolist()
+		week = ft.bounded(self.week_weights, -2.0, 2.0, 0.0, CORRECTION_STEP).tolist()
+		return {**{f"r{k + 1}_move_view": v for k, v in enumerate(rate)}, "stock_weight": float(self.stock_build_weight().detach()), **{f"w{k + 1}_week_{name}": v for k, (name, v) in enumerate(zip(ft.WEEK_CLASSES, week))}}
+
+	def stock_build_weight(self):
+		"""How far BUILD's stockpile part (features.stock_build_gain's value_logit) counts in its prior: a bounded
+		correction within 0..2, 1 at the start (e5, 2026-11-15)."""
+		return ft.bounded(self.stock_weight, 0.0, 2.0, 1.0, CORRECTION_STEP)
+
+	def give_all_exact_on(self):
+		"""1.0 where GIVE_ALL's shown gain leaves the giver VCMI's kept creature (config.give_all_exact; ALPHA_GIVE_ALL_EXACT),
+		else 0.0, as a tensor: multiplied in, never branched on (economy_on's rule)."""
+		size = self.give_all_exact if self.give_all_override is None else torch.full_like(self.give_all_exact, float(self.give_all_override))
+		return (size > 0).to(self.give_all_exact.dtype)
 
 	def economy_on(self):
 		"""1.0 where the economy's features and BUILD's new prior are read, else 0.0, as a tensor (config.build_economy;
@@ -514,12 +574,20 @@ class CustomFeatures(nn.Module):
 
 	def build_prior(self, x, f):
 		"""BUILD's fixed prior [B, TO, N_BUILDINGS] (logits): build_gain x value_logit of the gold its parts (build_features'
-		value) weigh, each part by its gain, + each faction's own building's bias; 0 with the economy off."""
+		value) weigh, each part by its gain, + each faction's own building's bias, + the stockpile part as its own term
+		(stock_build_weight x value_logit(features.stock_build_gain): 0 at the discount's floor 1); 0 with the economy off.
+		The stockpile part is not folded into the gold figure (e5, 2026-11-15): value_logit is flat where a dwelling's
+		figure already sits (500+), so a folded 2.7k would add under +1 logit, against +2.2 to +3.1 as its own term.
+		+ features.week_correction: each entry's class weight (week_weights, 0 at the start) x how near the week's growth
+		is (-1 on Monday .. +1 on Sunday)."""
 		gain = lambda raw: self.gain(raw)  # noqa: E731
 		gold = gain(self.build_income_gain) * f.build_value[..., 0] + gain(self.build_production_gain) * f.build_value[..., 1] + f.build_value[..., 2]
+		gold = gold + ft.unit_rule_build(x, self)  # (the upgrade rule's immediate part of a dwelling upgrade: 0 with it off)
+		stock = self.stock_build_weight() * ft.value_logit(ft.stock_build_gain(x, self, f.stock_threshold))  # (the stockpile discount's part, its thresholds before the build: 0 at its floor 1)
 		faction = vocab_index(x["t_faction"][:, :TO], c.FACTION_VOCAB)
 		bias = (self.build_faction_start + self.build_faction_bias)[faction]
-		return (gain(self.build_prior_gain) * ft.value_logit(gold) + bias) * self.economy_on()
+		week = ft.week_correction(x, self, faction)  # (each class's weight x how near the week's growth is: 0 at the start)
+		return (gain(self.build_prior_gain) * ft.value_logit(gold) + bias + stock + week) * self.economy_on()
 
 	def nk_follow_logs(self):
 		"""(whether following is on, log rho, log (1 - rho)): the chance our choice is Nullkiller2's own (nk_follow at the
@@ -755,7 +823,8 @@ class CustomFeatures(nn.Module):
 		f.town_take_gain, f.town_stakes = self._no_town_prior(x, f.phi_total, f.town_stakes)
 		f.hire_want = ft.hire_want(x, f.gold_pressure, f.town_danger, ft.object_classes(x))
 		f.tavern_worth = ft.tavern_worth(x, self)
-		f.hire_gain = ft.hire_gain(x, self, f.tavern_worth)
+		f.stock_threshold = ft.stock_thresholds(x, self)  # (the stockpile discount's thresholds, empire.stock_thresholds')
+		f.hire_gain = ft.hire_gain(x, self, f.tavern_worth)  # (the stockpile part not shown (e5, 2026-11-15: at a late pile it would flip a hire from -2.6 to ~+1.7); the reward counts it)
 		f.economy = ft.economy_features(x, self)
 		f.build_entry, f.build_value = ft.build_features(x, self, f.economy)
 		f.danger = ft.danger_features(x, self, f)
@@ -902,17 +971,19 @@ class CustomFeatures(nn.Module):
 		index = vocab_index(garrison_c, c.CREATURE_VOCAB)
 		gathered_worth = (garrison_n * gathered * (self.creature_cost[index] + self.creature_unit[index]) * (garrison_c >= 0)).sum(dim=-1)  # [B, TO]
 		gains = torch.zeros(b, TO, c.N_MULTI, device=have.device)
-		gains[..., c.MultiKind.RECRUIT_ALL] = worth * (self.unled_share - 1.0)
+		gains[..., c.MultiKind.RECRUIT_ALL] = worth * ft.unled_loss(self)
 		gains[..., c.MultiKind.RECRUIT_ALL_HERO] = (with_recruits - visitor_led - hero_worth) * has
-		gains[..., c.MultiKind.GATHER] = (with_garrison - visitor_led - self.unled_share * gathered_worth) * has - self.gather_loss(f)
+		gains[..., c.MultiKind.GATHER] = (with_garrison - visitor_led - ft.unled_lead(self) * gathered_worth) * has - self.gather_loss(f)
 		pair = x["x_heroes"] - 1  # [B, 2]: the exchange's heroes (tokens + 1; -1 none)
 		p = pair.clamp(min=0)
 		pair_c, pair_n = army_c.gather(1, p.unsqueeze(-1).expand(-1, -1, A)), army_n.gather(1, p.unsqueeze(-1).expand(-1, -1, A))  # [B, 2, A]
 		giver_c, giver_n = pair_c.flip(1), pair_n.flip(1)  # [B, 2, A]: row r's giver's army
 		given = ft.bulk_moves(pair_c, giver_c)  # (GIVE_ALL's bulk move: what fits into row r's receiver)
 		none = torch.full_like(giver_c, -1)
-		joined = ft.led_values(torch.cat([pair_c, torch.where(given, giver_c, none)], dim=-1), torch.cat([pair_n, giver_n * given], dim=-1), f.hero_multiplier.gather(1, p), rest.gather(1, p), self)  # [B, 2]: row r's receiver leading its own and what came
-		left = ft.led_values(torch.where(given, none, giver_c), giver_n * ~given, f.hero_multiplier.gather(1, p.flip(1)), rest.gather(1, p.flip(1)), self)  # (the giver's that did not fit)
+		kept = ft.bulk_kept(giver_c, giver_n, given, self) * self.give_all_exact_on()  # [B, 2, A]: the creature the giver keeps (0: as before)
+		gone = given & ~((kept > 0) & (giver_n <= 1))  # (a kept stack of one stays whole)
+		joined = ft.led_values(torch.cat([pair_c, torch.where(gone, giver_c, none)], dim=-1), torch.cat([pair_n, giver_n * given - kept], dim=-1), f.hero_multiplier.gather(1, p), rest.gather(1, p), self)  # [B, 2]: row r's receiver leading its own and what came
+		left = ft.led_values(torch.where(given & (kept == 0), none, giver_c), giver_n * ~given + kept, f.hero_multiplier.gather(1, p.flip(1)), rest.gather(1, p.flip(1)), self)  # (the giver's that did not fit, and the kept creature)
 		both = (pair >= 0).all(dim=1).float().unsqueeze(-1)
 		apart = led.gather(1, p).sum(dim=1, keepdim=True)  # [B, 1]: the two armies before
 		gains[:, :2, c.MultiKind.GIVE_ALL] = (joined + left - apart) * both
@@ -931,7 +1002,7 @@ class CustomFeatures(nn.Module):
 		index = vocab_index(keep_c, c.CREATURE_VOCAB)
 		dropped = (army_n.unsqueeze(2) * drop * (self.creature_cost[index] + self.creature_unit[index]) * (keep_c >= 0)).sum(dim=-1)  # [B, HO, 2]: their worth
 		for variant, kind in enumerate((c.MultiKind.DROP_SLOW, c.MultiKind.DROP_FOREIGN)):
-			gains[:, :HO, kind] = kept[:, :, variant] - led + self.unled_share * dropped[:, :, variant] * x["h_drop_kept"][:, :, variant].float()
+			gains[:, :HO, kind] = kept[:, :, variant] - led + ft.unled_lead(self) * dropped[:, :, variant] * x["h_drop_kept"][:, :, variant].float()
 		return gains
 
 	def gather_risk_weight(self):
@@ -1059,7 +1130,7 @@ class CustomFeatures(nn.Module):
 		army = f.hero_gold[:, :HO]
 
 		def lead_of(skills, book):  # what an army counts at in Φ with a hero of these primary skills [.., 4] (features.hero_multipliers')
-			return self.unled_share * ft.army_multiplier(skills[..., 0], skills[..., 1], skills[..., 2], skills[..., 3], book, self.spell_step)
+			return ft.lead_factor(self.unled_share * ft.army_multiplier(skills[..., 0], skills[..., 1], skills[..., 2], skills[..., 3], book, self.spell_step), self)
 
 		lead = lead_of(primary, spellbook)  # [B, HO]
 
@@ -1304,7 +1375,7 @@ class CustomFeatures(nn.Module):
 		with_garrison = ft.led_values(
 			torch.cat([mover_c.unsqueeze(1).expand(-1, TO, -1), garrison_c], dim=-1), torch.cat([mover_n.unsqueeze(1).expand(-1, TO, -1), garrison_n], dim=-1), mover_m[:, None], mover_r[:, None], self
 		)  # [K, TO]
-		gathered = with_garrison - mover_v[:, None] - self.unled_share * f.town_gold[:, :TO].index_select(0, decision) - self.gather_loss(f).index_select(0, decision)
+		gathered = with_garrison - mover_v[:, None] - ft.unled_lead(self) * f.town_gold[:, :TO].index_select(0, decision) - self.gather_loss(f).index_select(0, decision)
 		garrison = gathered.clamp(min=0.0) * flat(f.main.float())[:, None]
 		entered = (on_tile(x["t_pos"][:, :TO], own).float() * garrison[:, None, None, :]).amax(dim=-1)
 		return (met + entered) * self.gain(self.meeting_gain)
@@ -1468,6 +1539,11 @@ class CustomFeatures(nn.Module):
 		explore = torch.maximum(ft.unexplored_around(flags), (ft.bit(flags, c.TILE_UNSEEN_EXIT) & (obj != ft.OBJ_WHIRLPOOL)).float())
 		# The object is ours only if we win the fight in front of it (a bank's guards, a monster's zone, a town's garrison)
 		value = object_gold * torch.where(fights, win, torch.ones_like(win)) + fight + explore * self.explore_gold() + self.meeting_value(x, f, decision, heroes, on_tile)
+		# The value as gold a day (e5 for the user, 2026-11-15; features.move_rate), and over the hero's capital (its IRR:
+		# features.hero_capital): before the time discount and the danger below, model_v2's MOVE pair reads their four
+		# views (rate_views) through a layer at 0 to begin with
+		rate = ft.move_rate(value, ours(x["h_move"]), ours(x["h_move_max"]), pick("w_move_left"), pick("w_turns"))
+		rate = ft.rate_views(rate, pick("move_mask").bool(), ours(ft.hero_capital(x, f, self)), decision, x["h_move"].shape[0])
 		# That gain discounted by the time to reach the tile as Nullkiller2 discounts its targets (PriorityEvaluator::
 		# evaluateMovement, as travel_prior does TRAVEL's areas): by the part of a day's movement it costs, raised to
 		# move_discount_power, 0 at the start (the score as before) and 1 its full discount. Nullkiller2 scores every
@@ -1579,6 +1655,7 @@ class CustomFeatures(nn.Module):
 			"tile_value": value, "tile_prior": logits, "tile_night": night, "tile_shift": logits - prior, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight, "tile_fight_ratio": fight_ratio, "tile_fights": fights.float(),
 			"tile_stacks": (monster | guarded).float(),  # (a wandering monster or its zone: model_v2's battle head)
 			"move_strength": ft.strength_view(torch.cat([this_hero, main_army], dim=-1)), "move_relative": relative,  # (model_v2: MOVE_STRENGTH, MOVE_RELATIVE)
+			"move_rate": rate,  # (model_v2: the MOVE pair's gain-per-movement and IRR views, MOVE_RATE)
 		}
 
 
@@ -1750,6 +1827,15 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	# model_v2.migrate_option_head)
 	"features.empire_alpha",  # (ALPHA: a checkpoint from before keeps the loading model's, its process's EmpireConfig, never 0)
 	"features.empire_no_town",  # (B2's no-town factor, as ALPHA: the loading model's, its process's EmpireConfig)
+	"features.phi_hero_base",  # (Φ's hero base, its armyless share and the lead weight, 2026-11-15: as ALPHA, the loading model's)
+	"features.phi_armyless_share",
+	"features.phi_lead_weight",
+	"features.give_all_exact",  # (config.give_all_exact, 2026-11-15: off, the loading model's)
+	"features.rate_weights",  # (the MOVE views' corrections, 2026-11-15: 0, the loading model's)
+	"features.stock_weight",  # (BUILD's stockpile weight, 2026-11-15: 0 raw = 1, the loading model's)
+	"features.week_weights",  # (BUILD's week weights, 2026-11-15: 0, the loading model's)
+	"features.phi_stock_floor",  # (the stockpile discount's floor, 2026-11-15: as the phi_ buffers, the loading model's)
+	"features.empire_unit_own",  # (the upgrade rule, config.unit_own_form, 2026-11-15: off, the loading model's)
 	"features.empire_last_town",  # (config.no_town_last_town: the loading model's, 0)
 	"features.empty_as_visited",  # (config.empty_as_visited: a checkpoint from before keeps the loading model's, 1)
 	"foresight.plan", "pair_fight", "move_fight", "pair_strength", "move_mix", "foresight.tiles", "foresight.outcome", "trade_option", "option_flags",
@@ -1766,6 +1852,7 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"nkp.",  # (2026-11-11: nk_predict's head, model_v2.NkPredictHead: a new model's weights, nothing reads it)
 	"encode_global.no_town_days",  # (schema 20, B2: the global token's read of our days without a town, 0 at the start)
 	"pair_today",  # (schema 21: at an exchange, the pair's exchanges today onto END's and MULTI's scores, 0 at the start)
+	"pair_rate",  # (2026-11-15: the tile's value as gold a day and the hero's IRR, features.rate_views, into the MOVE pair; 0 at the start)
 )
 # Training-only parts rebuilt since, by prefix: a checkpoint's weights for them that the loading model lacks, or of
 # another shape, are dropped, the part starting again as a new model has it (2026-11-07: the privileged critic's first

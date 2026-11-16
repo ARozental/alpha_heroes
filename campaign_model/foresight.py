@@ -42,6 +42,13 @@ RESOURCE_FLOOR = np.array([5, 5, 5, 5, 5, 5, 1000], dtype=np.float64)  # k of ea
 class ForesightConfig:
 	weight: float = 0.2  # each head's loss weight (its gradient's share of the policy's on the shared layers is logged)
 	huber: float = 1.0
+	# Each sparse part's factor (config.foresight_*_factor; foresight_loss): with the minibatch's label counts
+	# (config.foresight_minibatch_counts) a part's expected weight is its designed one, against the share of micro-batches
+	# that held one of its labels before (army/fsweight.py, line 76's games, 2026-11-15: the battle outcome 0.526, the
+	# answers 0.735, the answer's score 0.058); 1 elsewhere
+	outcome_factor: float = 1.0  # move_score, move_win, move_stake
+	answer_factor: float = 1.0  # answer_battle, answer_parts
+	answer_score_factor: float = 1.0
 
 
 def symlog(x):
@@ -274,22 +281,40 @@ def gradient_check(model, main, foresight, terms=None, prefix="grad_shared_", wa
 
 # ---- the loss ----
 
-def masked_mean(values, mask):
+def masked_mean(values, mask, count=None):
+	"""values' mean over mask; count (a 0-d tensor): the whole minibatch's count of the mask instead of this
+	micro-batch's, so that the micro-batches' sum is the minibatch's mean (foresight_loss's counts)."""
 	mask = mask.float()
-	return (values * mask).sum() / mask.sum().clamp(min=1.0)
+	return (values * mask).sum() / (mask.sum() if count is None else count).clamp(min=1.0)
 
 
-def action_loss(predicted, target, battle, config, rows=None):
+def action_loss(predicted, target, battle, config, rows=None, counts=None, prefix="move"):
 	"""[K, ACTION_TARGETS] predictions against their targets, over the rows where rows [K] is set (all by default): BCE
-	on the battle, Huber on its score where there was one, Huber on the parts' changes; 0 with no row."""
+	on the battle, Huber on its score where there was one, Huber on the parts' changes; 0 with no row. counts: the
+	minibatch's label counts (row_counts' <prefix>_rows, <prefix>_battle, <prefix>_parts), or None."""
 	rows = torch.ones_like(battle) if rows is None else rows
-	fought = masked_mean(F.binary_cross_entropy_with_logits(predicted[:, 0], target[:, 0], reduction="none"), rows)
-	score = masked_mean(F.huber_loss(predicted[:, 1], target[:, 1], reduction="none", delta=config.huber), battle & rows)
-	parts = masked_mean(F.huber_loss(predicted[:, 2:], target[:, 2:], reduction="none", delta=config.huber), rows.unsqueeze(-1).expand(-1, predicted.shape[1] - 2))
+	count = (lambda name: counts[f"{prefix}_{name}"]) if counts is not None else (lambda name: None)  # noqa: E731
+	fought = masked_mean(F.binary_cross_entropy_with_logits(predicted[:, 0], target[:, 0], reduction="none"), rows, count("rows"))
+	score = masked_mean(F.huber_loss(predicted[:, 1], target[:, 1], reduction="none", delta=config.huber), battle & rows, count("battle"))
+	parts = masked_mean(F.huber_loss(predicted[:, 2:], target[:, 2:], reduction="none", delta=config.huber), rows.unsqueeze(-1).expand(-1, predicted.shape[1] - 2), count("parts"))
 	return fought, score, parts
 
 
-def battle_heads_loss(out, labels, every, at):
+def tile_masks(legal, stack, labels, every, at):
+	"""move_tiles' three masks (battle_heads_loss): the legal tiles not chosen with no stack ("plain") [B, HO, W, W], with
+	one ("met"), and the MOVE rows whose chosen tile's answer is known ("known") [B]; and each row's kind there."""
+	move = labels["move_mask"]
+	chosen = torch.zeros_like(legal)
+	chosen[every, at[:, 0], at[:, 1], at[:, 2]] = move  # (a row with no MOVE: its at is 0s, nothing set)
+	rest = legal & ~chosen
+	stack_at = stack[every, at[:, 0], at[:, 1], at[:, 2]]
+	zero = torch.zeros_like(at[:, 0])
+	offer, battle = labels["move_offer"], labels["move_battle"]
+	kind = torch.where(stack_at, torch.where(offer, zero + 2, zero + 1), zero)
+	return rest & ~stack, rest & stack, move & (~stack_at | offer | battle), kind
+
+
+def battle_heads_loss(out, labels, every, at, counts=None):
 	"""The battle heads' losses (model_v2.Foresight.tiles, .outcome; the user, 2026-11-04: heads that mean something, and
 	the engine's answer only, never our own):
 	  move_tiles  what a wandering monster does when a hero steps on it or into its zone, on every legal window tile of a
@@ -299,53 +324,78 @@ def battle_heads_loss(out, labels, every, at):
 	              alike whatever their numbers; the chosen one by what the engine did (a step that met neither a question
 	              nor a battle, a move cut short, left out)
 	  move_win    on a MOVE a battle followed: P(we won it) (BCE)
-	  move_stake  and the share of the hero's stake it took (foresight.stake_lost; BCE against it)"""
+	  move_stake  and the share of the hero's stake it took (foresight.stake_lost; BCE against it)
+	counts: the minibatch's label counts (row_counts'), or None."""
+	count = (lambda name: counts[name]) if counts is not None else (lambda name: None)  # noqa: E731
 	logp = F.log_softmax(out["fs_tiles"].float(), dim=-1)  # [B, HO, W, W, 3]
-	legal, stack = out["fs_move_legal"] > 0, out["fs_stack_tile"] > 0
-	move = labels["move_mask"]
-	chosen = torch.zeros_like(legal)
-	chosen[every, at[:, 0], at[:, 1], at[:, 2]] = move  # (a row with no MOVE: its at is 0s, nothing set)
-	rest = legal & ~chosen
-	plain = masked_mean(-logp[..., 0], rest & ~stack)
-	met = masked_mean(-torch.logsumexp(logp[..., 1:], dim=-1), rest & stack)
-	picked, stack_at = logp[every, at[:, 0], at[:, 1], at[:, 2]], stack[every, at[:, 0], at[:, 1], at[:, 2]]
-	zero = torch.zeros_like(at[:, 0])
-	offer, battle = labels["move_offer"], labels["move_battle"]
-	kind = torch.where(stack_at, torch.where(offer, zero + 2, zero + 1), zero)
-	known = move & (~stack_at | offer | battle)
-	tiles = 0.5 * (plain + met) + masked_mean(-picked.gather(1, kind.unsqueeze(1)).squeeze(1), known)
+	plain_mask, met_mask, known, kind = tile_masks(out["fs_move_legal"] > 0, out["fs_stack_tile"] > 0, labels, every, at)
+	plain = masked_mean(-logp[..., 0], plain_mask, count("tiles_plain"))
+	met = masked_mean(-torch.logsumexp(logp[..., 1:], dim=-1), met_mask, count("tiles_met"))
+	picked = logp[every, at[:, 0], at[:, 1], at[:, 2]]
+	tiles = 0.5 * (plain + met) + masked_mean(-picked.gather(1, kind.unsqueeze(1)).squeeze(1), known, count("tiles_known"))
 	outcome = out["fs_outcome"][every, at[:, 0], at[:, 1], at[:, 2]].float()
-	fought = battle & move
-	won = masked_mean(F.binary_cross_entropy_with_logits(outcome[:, 0], labels["move_win"], reduction="none"), fought)
-	stake = masked_mean(F.binary_cross_entropy_with_logits(outcome[:, 1], labels["move_stake"], reduction="none"), fought)
+	fought = labels["move_battle"] & labels["move_mask"]
+	won = masked_mean(F.binary_cross_entropy_with_logits(outcome[:, 0], labels["move_win"], reduction="none"), fought, count("move_battle"))
+	stake = masked_mean(F.binary_cross_entropy_with_logits(outcome[:, 1], labels["move_stake"], reduction="none"), fought, count("move_battle"))
 	return tiles, won, stake
 
 
 PART_NAMES = ("move_battle", "move_score", "move_parts", "answer_battle", "answer_score", "answer_parts", "hero_alive", "hero_army", "turn", "plan", "move_tiles", "move_win", "move_stake")  # foresight_loss's parts, in this order
+# foresight_loss's masks, each counted over a whole minibatch (row_counts; config.foresight_minibatch_counts)
+COUNT_NAMES = ("move_rows", "move_battle", "move_parts", "answer_rows", "answer_battle", "answer_parts", "hero_mask", "hero_alive", "turn_mask", "plan_mask", "tiles_plain", "tiles_met", "tiles_known")
 
 
-def foresight_loss(out, labels, config=ForesightConfig()):
+def row_counts(labels, legal=None, stack=None):
+	"""Each row's count of each of foresight_loss's masks (COUNT_NAMES) {name: [N] float}, from the labels (game_labels'
+	rows, tensors) and, for move_tiles', the legal tiles and stacks the model's forward gave (fs_move_legal > 0,
+	fs_stack_tile > 0); without them the tiles' counts are left out. A minibatch's count is the sum over its rows."""
+	move, answer = labels["move_mask"].bool(), labels["answer_mask"].bool()
+	targets = labels["move"].shape[-1] - 2
+	out = {
+		"move_rows": move.float(), "move_battle": (labels["move_battle"].bool() & move).float(), "move_parts": move.float() * targets,
+		"answer_rows": answer.float(), "answer_battle": (labels["answer_battle"].bool() & answer).float(), "answer_parts": answer.float() * targets,
+		"hero_mask": labels["hero_mask"].float().sum(-1), "hero_alive": labels["hero_alive"].float().sum(-1), "turn_mask": labels["turn_mask"].float().sum(-1),
+	}
+	if "plan_mask" in labels:
+		out["plan_mask"] = labels["plan_mask"].float().sum(-1)
+	if legal is not None and stack is not None:
+		every = torch.arange(legal.shape[0], device=legal.device)
+		plain, met, known, _ = tile_masks(legal, stack, {k: v.bool() if k in ("move_mask", "move_offer", "move_battle") else v for k, v in labels.items()}, every, labels["move_at"])
+		out.update(tiles_plain=plain.reshape(len(every), -1).float().sum(-1), tiles_met=met.reshape(len(every), -1).float().sum(-1), tiles_known=known.float())
+	return out
+
+
+def foresight_loss(out, labels, config=ForesightConfig(), counts=None):
 	"""(the loss, {part: its value}) of the foresight's predictions (out["fs_*"]) against a batch's labels (game_labels'
-	rows, as tensors on the device)."""
+	rows, as tensors on the device). counts ({COUNT_NAMES' name: 0-d tensor}, config.foresight_minibatch_counts): each
+	mask's count over the whole minibatch, so that each part is its sum over this micro-batch's labels over the
+	minibatch's count and the micro-batches add up to the minibatch's mean (None: each part this micro-batch's own mean,
+	which the caller scales by its share of the rows: a label's weight then depends on how many share its micro-batch,
+	and a micro-batch with none drops the part, army/fsweight.py, 2026-11-15). The sparse parts at config's factors."""
 	# Every part over every row, its mask weighting it (0 with none): no host read of the masks (bool(mask.any()) and
 	# torch.nonzero each waited for the GPU, five times a micro-batch: the trainer's thread could not run ahead of it,
 	# 2026-10-31). The labels of the rows a part does not apply to are zeros, valid indices among them (game_labels)
 	parts, zero = {}, out["fs_turn"].sum() * 0.0
+	count = (lambda name: counts[name]) if counts is not None else (lambda name: None)  # noqa: E731
 	every = torch.arange(out["fs_turn"].shape[0], device=out["fs_turn"].device)
 	at = labels["move_at"]
 	predicted = out["fs_move"][every, at[:, 0], at[:, 1], at[:, 2]]
-	parts["move_battle"], parts["move_score"], parts["move_parts"] = action_loss(predicted, labels["move"], labels["move_battle"], config, labels["move_mask"])
-	parts["move_tiles"], parts["move_win"], parts["move_stake"] = battle_heads_loss(out, labels, every, at)
+	parts["move_battle"], parts["move_score"], parts["move_parts"] = action_loss(predicted, labels["move"], labels["move_battle"], config, labels["move_mask"], counts, "move")
+	parts["move_tiles"], parts["move_win"], parts["move_stake"] = battle_heads_loss(out, labels, every, at, counts)
 	predicted = out["fs_answer"][every, labels["option"]]
-	parts["answer_battle"], parts["answer_score"], parts["answer_parts"] = action_loss(predicted, labels["answer"], labels["answer_battle"], config, labels["answer_mask"])
+	parts["answer_battle"], parts["answer_score"], parts["answer_parts"] = action_loss(predicted, labels["answer"], labels["answer_battle"], config, labels["answer_mask"], counts, "answer")
 	predicted = out["fs_hero"][:, :HO]
-	parts["hero_alive"] = masked_mean(F.binary_cross_entropy_with_logits(predicted[..., 0], labels["hero"][..., 0], reduction="none"), labels["hero_mask"])
-	parts["hero_army"] = masked_mean(F.huber_loss(predicted[..., 1], labels["hero"][..., 1], reduction="none", delta=config.huber), labels["hero_alive"])
-	parts["turn"] = masked_mean(F.huber_loss(out["fs_turn"], labels["turn"], reduction="none", delta=config.huber), labels["turn_mask"])
+	parts["hero_alive"] = masked_mean(F.binary_cross_entropy_with_logits(predicted[..., 0], labels["hero"][..., 0], reduction="none"), labels["hero_mask"], count("hero_mask"))
+	parts["hero_army"] = masked_mean(F.huber_loss(predicted[..., 1], labels["hero"][..., 1], reduction="none", delta=config.huber), labels["hero_alive"], count("hero_alive"))
+	parts["turn"] = masked_mean(F.huber_loss(out["fs_turn"], labels["turn"], reduction="none", delta=config.huber), labels["turn_mask"], count("turn_mask"))
 	parts["plan"] = zero
 	if "fs_plan" in out and "plan" in labels:  # (model_v2.plan_of: the trainer's model only)
 		logits = out["fs_plan"].float()
 		crossed = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels["plan"].reshape(-1), reduction="none").reshape(labels["plan"].shape)
-		parts["plan"] = masked_mean(crossed, labels["plan_mask"])
+		parts["plan"] = masked_mean(crossed, labels["plan_mask"], count("plan_mask"))
+	for names, factor in ((("move_score", "move_win", "move_stake"), config.outcome_factor), (("answer_battle", "answer_parts"), config.answer_factor), (("answer_score",), config.answer_score_factor)):
+		if factor != 1.0:
+			for name in names:
+				parts[name] = parts[name] * factor
 	total = sum(parts.values(), zero)
 	return config.weight * total, parts
