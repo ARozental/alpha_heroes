@@ -466,6 +466,10 @@ class CustomFeatures(nn.Module):
 		# travel_view + act_travel) set to 0 for every hero, so its prior (with the night term) decides the entry and, through
 		# the type score's best legal entry, the type; the type's bias and everything else unchanged; unset: never taken
 		self.travel_lift = override("ALPHA_TRAVEL_LIFT")
+		# ALPHA_EXPLORE_GOLD (e5, 2026-11-16: X, an EVAL arm's switch, never in training): the gold of a full new sight in
+		# MOVE's explore term (tile_features' `explore * explore_gold()`) replaced by this constant; TRAVEL's hidden-land term
+		# keeps explore_gold(); unset: the branch is never taken
+		self.explore_override = override("ALPHA_EXPLORE_GOLD")
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -1565,7 +1569,8 @@ class CustomFeatures(nn.Module):
 		# it, the land around it long revealed). Not a whirlpool's, which takes troops for the passage
 		explore = torch.maximum(ft.unexplored_around(flags), (ft.bit(flags, c.TILE_UNSEEN_EXIT) & (obj != ft.OBJ_WHIRLPOOL)).float())
 		# The object is ours only if we win the fight in front of it (a bank's guards, a monster's zone, a town's garrison)
-		value = object_gold * torch.where(fights, win, torch.ones_like(win)) + fight + explore * self.explore_gold() + self.meeting_value(x, f, decision, heroes, on_tile)
+		explore_gold = self.explore_gold() if self.explore_override is None else torch.full_like(self.explore_gold(), float(self.explore_override))  # (ALPHA_EXPLORE_GOLD: MOVE's term only)
+		value = object_gold * torch.where(fights, win, torch.ones_like(win)) + fight + explore * explore_gold + self.meeting_value(x, f, decision, heroes, on_tile)
 		# The value as gold a day (e5 for the user, 2026-11-15; features.move_rate), and over the hero's capital (its IRR:
 		# features.hero_capital): before the time discount and the danger below, model_v2's MOVE pair reads their four
 		# views (rate_views) through a layer at 0 to begin with
