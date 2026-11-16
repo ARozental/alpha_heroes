@@ -191,6 +191,11 @@ class CampaignConfig:
 	loop_charge: float = 0.0
 	loop_charge_from: int = 0
 	loop_charge_step: float = 0.01
+	# Which flagged rows the charge takes (e5 for the user's objection, 2026-11-16: the 0.10 charge pushed END up at turn
+	# decisions, termdwell's r4): True every flagged row (a loop's exchange decisions but END, and the turn MOVE that opened a
+	# dialog wholly inside it; as before, bit for bit); False the exchange decisions alone, the MOVE still flagged and counted
+	# in the readings (loop_share), never charged
+	loop_charge_moves: bool = True
 	# The update's size cap (e5, 2026-11-14: deploy 77/78's longer games made 20 games 105k-185k decisions, their restored
 	# inputs 2.2-3.9 GB at the update's peak against line 76's ~1.8 GB, and that peak is what the supply's memory gate keeps
 	# free): an update takes its waiting games oldest first as before, and stops once it holds update_games_floor games and

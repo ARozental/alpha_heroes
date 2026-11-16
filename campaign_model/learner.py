@@ -924,7 +924,8 @@ class CampaignLearner:
 					print(f"campaign loop charge: c {metrics['loop_charge']:.3f}; charged {metrics['loop_share']:.3f} of the credited rows ("
 						+ ", ".join(f"{name} {metrics[f'loop_share_{j + 1}']:.3f}" for j, name in enumerate(LOOP_TYPES))
 						+ f"), their mean advantage before the charge {metrics['loop_adv_before']:+.4f}; a pair's same-day repeat dialogs {loop_seen.get('repeat_dialogs', 0)}, "
-						+ f"not loops {loop_seen.get('repeat_not_loop', 0) / max(loop_seen.get('repeat_dialogs', 0), 1):.3f}, of those troops back to the last giver {loop_seen.get('repeat_not_loop_back', 0) / max(loop_seen.get('repeat_not_loop', 0), 1):.3f}", flush=True)
+						+ f"not loops {loop_seen.get('repeat_not_loop', 0) / max(loop_seen.get('repeat_dialogs', 0), 1):.3f}, of those troops back to the last giver {loop_seen.get('repeat_not_loop_back', 0) / max(loop_seen.get('repeat_not_loop', 0), 1):.3f}"
+						+ (f"; charged on exchange decisions alone (loop_charge_moves false): {metrics['loop_charged_share']:.3f}" if "loop_charged_share" in metrics else ""), flush=True)
 				self._save(self.out / "checkpoint_latest.pt")
 		unspool(game for game, _ in games)  # (in the checkpoint now: this process's, or the update process's)
 		if self.worker:  # (the process saved its checkpoint with the trust before this update: one update behind)

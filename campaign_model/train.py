@@ -768,18 +768,24 @@ def signal_ratio(optimizer):
 NOISE_PHASES = (("days 1-14", 1, 14), ("days 15-35", 15, 35), ("days 36+", 36, 10**6))  # loss_noise's, by the decisions' day
 
 
-def charge_loops(advantage, credited, loops, charge):
+def charge_loops(advantage, credited, loops, charge, chargeable=None):
 	"""The loop charge (config.loop_charge): the advantage less `charge` on the credited rows inside a loop (loops: each
 	row's labels.LOOP_* type, 0 none), after its standardization, so no centering spreads it onto the other rows; and the
-	readings: the charge, the charged rows' share of the credited ones (and each type's), their mean advantage before it.
+	readings: the charge, the flagged rows' share of the credited ones (and each type's), their mean advantage before it.
+	chargeable (config.loop_charge_moves False: the exchange decisions' rows): the charge on the flagged rows among them
+	alone, the readings still over every flagged row, and loop_charged_share the charged ones'; None: every flagged row.
 	charge 0: the same tensor's values, bit for bit."""
 	flagged = credited & (loops > 0)
 	n = max(int(credited.sum()), 1)
 	stats = {"loop_charge": float(charge), "loop_share": int(flagged.sum()) / n, "loop_adv_before": float(advantage[flagged].mean()) if int(flagged.sum()) else float("nan")}
 	stats.update({f"loop_share_{t}": int((credited & (loops == t)).sum()) / n for t in (1, 2, 3)})
+	charged = flagged
+	if chargeable is not None:
+		charged = flagged & chargeable
+		stats["loop_charged_share"] = int(charged.sum()) / n
 	if charge == 0.0:
 		return advantage, stats
-	return advantage - charge * flagged.to(advantage.dtype), stats
+	return advantage - charge * charged.to(advantage.dtype), stats
 
 
 def standardized(values):
@@ -1722,7 +1728,8 @@ def ppo_update(
 	adv_target = None  # (config.loop_charge: the advantage head's target stays the uncharged advantage)
 	if end is not None and "loops" in end:
 		adv_target = advantage
-		advantage, loop_stats = charge_loops(advantage, credited, torch.from_numpy(np.asarray(end["loops"], dtype=np.int64)).to(device), float(end.get("loop_charge", 0.0)))
+		chargeable = None if getattr(config, "loop_charge_moves", True) else choice["kind"] == int(c.DecisionKind.EXCHANGE)  # (False: the turn MOVEs flagged, not charged)
+		advantage, loop_stats = charge_loops(advantage, credited, torch.from_numpy(np.asarray(end["loops"], dtype=np.int64)).to(device), float(end.get("loop_charge", 0.0)), chargeable)
 		adv_stats.update(loop_stats)
 	if hidden is not None:  # (each kind's advantage as the policy and the head take it: its mean and spread, its share of sum |A| x credit)
 		hidden_t = torch.from_numpy(np.asarray(hidden, dtype=bool)).to(device)
