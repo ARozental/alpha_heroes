@@ -73,6 +73,13 @@ class CampaignConfig:
 	cuda_graphs: bool = True  # on CUDA: the update's forward and backward replayed from recorded graphs (graphs.py: launches cost under WSL)
 	step_graphs: bool = True  # with cuda_graphs: a micro-batch's forward, loss and backward as one recorded graph (graphs.StepGraph)
 	convert_in_graphs: bool = True  # with cuda_graphs, on CUDA: the wire's conversion (records.inputs_on_device, ~250 small kernels a micro-batch, ~20 ms of the main thread's ~58 under WSL, 2026-11-03) recorded in the update's graphs, which take the bytes as sent; each such graph checked at its first replay, the conversion done outside again if one fails
+	# The window balance (b1 for e5, 2026-11-16): each minibatch's sequences re-dealt among its micro-batches by their
+	# windows (train.balance_order), so that no micro-batch holds more than window_budget a decision while the minibatch
+	# itself does not; such a micro-batch was stepped eagerly over every hero slot, never graphed (35% of v3509's steps,
+	# 54.8 s a step against 18.6). The minibatch's rows and its counts unchanged: its gradient the same up to the order of
+	# summation, given foresight_minibatch_counts (without it the foresight's per-micro-batch means move: refused). False:
+	# the order as dealt, bit for bit
+	window_balance: bool = False
 	window_budget: float = 4.0  # with cuda_graphs: hero windows computed a decision (model_v2.windows_of), of OWN_HEROES slots: the same outputs for a batch with no more windows (it computes every slot otherwise); the PC's games, 2026-11-03: 2.8 heroes a decision, never more than 4; further windows (below) add theirs, ~0.4 a hero in the games looked at: 5.0 with them. 0: every slot
 	# Schema 17 (2026-11-10), the games' side of it (play.window_settings: AlphaMapAI's environment, every game's alike).
 	# further_windows: the windows a hero may have beside its own (ALPHA_MAP_FURTHER_WINDOWS; 0: none, the windows as

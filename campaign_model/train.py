@@ -359,6 +359,39 @@ def sequence_order(stream, position, steps, size, micro_batches):
 	return by[(starts + np.arange(steps).reshape(1, steps, 1)).reshape(-1)]
 
 
+def balance_order(order, windows, steps, size, micro_batches, budget):
+	"""The pass's order with each whole minibatch's sequences re-dealt among its micro_batches micro-batches by their
+	windows (config.window_balance): a micro-batch holds `steps` x per sequences step-major (sequence_order's layout;
+	steps 1: single rows), and its load is what sequence_heroes / batch_heroes measure, steps x its busiest step's
+	windows. Largest sequences first, each to the micro-batch with room whose load it raises least (ties: the first),
+	per sequences a micro-batch; a sequence's rows stay together and in their step order. Deterministic: no draw from
+	the update's random streams. (order, micro-batches over `budget` as dealt, after); minibatches not whole (fewer
+	than size rows, or size not micro_batches x steps x per) are left as dealt."""
+	if micro_batches <= 1 or size % (micro_batches * steps) or len(order) < size:
+		return order, 0, 0
+	per = size // micro_batches // steps
+	order = order.copy()
+	dealt = after = 0
+	for first in range(0, len(order) - len(order) % size, size):
+		block = order[first : first + size].reshape(micro_batches, steps, per)
+		load_of = windows[block].astype(np.int64)  # [micro, steps, per]
+		dealt += int((steps * load_of.sum(axis=2).max(axis=1) > budget).sum())
+		seqs = block.transpose(0, 2, 1).reshape(-1, steps)  # [micro x per, steps]: each sequence's rows
+		seq_w = load_of.transpose(0, 2, 1).reshape(-1, steps)
+		loads = np.zeros((micro_batches, steps), dtype=np.int64)
+		count = np.zeros(micro_batches, dtype=np.int64)
+		out = np.empty((micro_batches, per, steps), dtype=order.dtype)
+		for s in np.argsort(-seq_w.max(axis=1), kind="stable"):
+			room = np.flatnonzero(count < per)
+			m = room[np.argmin((loads[room] + seq_w[s]).max(axis=1))]
+			out[m, count[m]] = seqs[s]
+			loads[m] += seq_w[s]
+			count[m] += 1
+		after += int((steps * loads.max(axis=1) > budget).sum())
+		order[first : first + size] = out.transpose(0, 2, 1).reshape(-1)
+	return order, dealt, after
+
+
 def windows_for(rows, heroes, config):
 	"""The hero windows a step's graph computes for a batch of `rows` decisions holding `heroes` of ours
 	(model_v2.windows_of's budget): config.window_budget a decision, or None (every slot) when the batch has more."""
@@ -1330,6 +1363,13 @@ def ppo_update(
 		print(f"campaign: FAILURE: memory_steps {unroll} does not divide a micro-batch ({size} / {config.micro_batches} rows): each decision alone", flush=True)
 		unroll = 1
 	forward = (lambda inputs: model.forward_steps(inputs, unroll)) if unroll > 1 else model
+	# The window balance (config.window_balance): each row's windows from the prepass (records.heroes_in: windows_of's),
+	# each pass's minibatches re-dealt among their micro-batches by them (balance_order)
+	window_balance = bool(getattr(config, "window_balance", False))
+	if window_balance and foresight is not None and not getattr(config, "foresight_minibatch_counts", False):
+		raise ValueError("config.window_balance needs config.foresight_minibatch_counts: without it the foresight's means are each micro-batch's and a re-deal moves the gradient")
+	row_windows = np.zeros(n, dtype=np.int64) if window_balance else None
+	balance_dealt = balance_after = 0
 	# The KL control's anchor: each decision's choice under the model as the update starts; and V_end there (the end
 	# credit's)
 	graphs = None
@@ -1419,7 +1459,10 @@ def ppo_update(
 		chunk = config.prepass_batch or max(1, size // max(1, config.micro_batches))  # (no gradients, but at a whole minibatch it was the update's peak: 5.2 GB)
 		chunks = [np.arange(i, i + chunk).clip(max=n - 1) for i in range(0, n, chunk)]  # the last one padded: fixed shapes
 		prepass_started = time.perf_counter()
-		for rows, raw, heroes in _prefetched(chunks, decode, device, fed, config.decode_threads, measure=batch_heroes):
+		for rows, raw, heroes in _prefetched(chunks, decode, device, fed, config.decode_threads, measure=heroes_in if window_balance else batch_heroes):
+			if window_balance:  # (each row's windows, kept for the passes; the chunk's total as before)
+				row_windows[rows] = heroes
+				heroes = int(np.asarray(heroes).sum())
 			index = torch.arange(int(rows[0]), int(rows[0]) + len(rows), device=device).clamp(max=n - 1)  # (made there: a copy from pageable memory waited for the GPU)
 			# (fewer windows once a step's graph with them was checked: graphs.StepGraph.budget_ok, none here)
 			budget = windows_for(len(rows), heroes, config) if steps_graph is not None and steps_graph.budget_ok else None
@@ -1711,6 +1754,10 @@ def ppo_update(
 			order = torch.randperm(n).numpy()
 			if n >= size:
 				order = order[: n - n % size]
+		if window_balance:
+			order, dealt, after = balance_order(order, row_windows, unroll, size, config.micro_batches, int(round(size // max(1, config.micro_batches) * config.window_budget)))
+			balance_dealt += dealt
+			balance_after += after
 		# Decoded a micro-batch at a time (a minibatch at once held ~4 of them decoded in pinned memory, a campaign
 		# decision several MB: the PC's learner at 9.5 GB, 2026-10-30); the minibatch's gradient as before
 		minibatches = [order[i : i + size] for i in range(0, len(order), size)]
@@ -1899,6 +1946,7 @@ def ppo_update(
 		optimizer_seconds=clock["optimizer"],
 		cpu_share=(time.thread_time() - clock["cpu"]) / max(time.time() - started, 1e-9),  # of the update's time this thread ran on the CPU
 		full_windows=full_windows,
+		**({"window_over_dealt": balance_dealt, "window_over_balanced": balance_after} if window_balance else {}),  # (config.window_balance: micro-batches over the budget as dealt, after the re-deal)
 		memory_steps=unroll,
 		window_budget_ok=steps_graph.budget_ok if steps_graph is not None else None,
 		**({f"foresight_{name}": value / max(foresight_sums["steps_seen"], 1e-9) for name, value in zip(PART_NAMES, foresight_sum.tolist())} if foresight_sum is not None else {}),
