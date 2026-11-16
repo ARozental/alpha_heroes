@@ -363,10 +363,14 @@ def balance_order(order, windows, steps, size, micro_batches, budget):
 	"""The pass's order with each whole minibatch's sequences re-dealt among its micro_batches micro-batches by their
 	windows (config.window_balance): a micro-batch holds `steps` x per sequences step-major (sequence_order's layout;
 	steps 1: single rows), and its load is what sequence_heroes / batch_heroes measure, steps x its busiest step's
-	windows. Largest sequences first, each to the micro-batch with room whose load it raises least (ties: the first),
-	per sequences a micro-batch; a sequence's rows stay together and in their step order. Deterministic: no draw from
-	the update's random streams. (order, micro-batches over `budget` as dealt, after); minibatches not whole (fewer
-	than size rows, or size not micro_batches x steps x per) are left as dealt."""
+	windows. The aim is the fewest micro-batches over `budget`: while the minibatch's own load fits (steps x its busiest
+	step's total <= micro_batches x budget), largest sequences first, each to the micro-batch with room whose load it
+	raises least (ties: the first), per sequences a micro-batch; when it does not (e5, 2026-11-16: evening an over-full
+	minibatch put EVERY micro-batch over), the heaviest sequences fill the fewest micro-batches k for which the rest
+	fits the others, given up, and the rest are dealt as before among the others. A deal with more micro-batches over
+	than as dealt is not taken (that minibatch stays as dealt). A sequence's rows stay together and in their step order.
+	Deterministic: no draw from the update's random streams. (order, micro-batches over `budget` as dealt, after);
+	minibatches not whole (fewer than size rows, or size not micro_batches x steps x per) are left as dealt."""
 	if micro_batches <= 1 or size % (micro_batches * steps) or len(order) < size:
 		return order, 0, 0
 	per = size // micro_batches // steps
@@ -376,18 +380,44 @@ def balance_order(order, windows, steps, size, micro_batches, budget):
 		block = order[first : first + size].reshape(micro_batches, steps, per)
 		load_of = windows[block].astype(np.int64)  # [micro, steps, per]
 		dealt += int((steps * load_of.sum(axis=2).max(axis=1) > budget).sum())
+		as_dealt = int((steps * load_of.sum(axis=2).max(axis=1) > budget).sum())
 		seqs = block.transpose(0, 2, 1).reshape(-1, steps)  # [micro x per, steps]: each sequence's rows
 		seq_w = load_of.transpose(0, 2, 1).reshape(-1, steps)
-		loads = np.zeros((micro_batches, steps), dtype=np.int64)
-		count = np.zeros(micro_batches, dtype=np.int64)
-		out = np.empty((micro_batches, per, steps), dtype=order.dtype)
-		for s in np.argsort(-seq_w.max(axis=1), kind="stable"):
-			room = np.flatnonzero(count < per)
-			m = room[np.argmin((loads[room] + seq_w[s]).max(axis=1))]
-			out[m, count[m]] = seqs[s]
-			loads[m] += seq_w[s]
-			count[m] += 1
-		after += int((steps * loads.max(axis=1) > budget).sum())
+		heaviest = np.argsort(-seq_w.max(axis=1), kind="stable")
+
+		def deal(k):
+			"""The heaviest k x per sequences fill micro-batches 0..k-1 in turn (given up), the rest dealt greedily among the
+			others; (the micro-batches over the budget, the deal [micro, per, steps])."""
+			loads = np.zeros((micro_batches, steps), dtype=np.int64)
+			count = np.zeros(micro_batches, dtype=np.int64)
+			out = np.empty((micro_batches, per, steps), dtype=order.dtype)
+			for rank, s in enumerate(heaviest):
+				if rank < k * per:
+					m = rank // per
+				else:
+					room = k + np.flatnonzero(count[k:] < per)
+					m = room[np.argmin((loads[room] + seq_w[s]).max(axis=1))]
+				out[m, count[m]] = seqs[s]
+				loads[m] += seq_w[s]
+				count[m] += 1
+			return int((steps * loads.max(axis=1) > budget).sum()), out
+
+		total = seq_w.sum(axis=0)  # [steps]
+		if steps * total.max() <= micro_batches * budget:  # (the minibatch fits: even loads)
+			over, out = deal(0)
+		else:  # (it does not: k given up, from the fewest for which the rest fits on aggregate, while that lowers the count)
+			taken = np.cumsum(seq_w[heaviest], axis=0)  # [sequences, steps]
+			k = next((j for j in range(1, micro_batches) if steps * (total - taken[j * per - 1]).max() <= (micro_batches - j) * budget), micro_batches)
+			over, out = deal(k)
+			while k < micro_batches - 1 and over > k:
+				trial, trial_out = deal(k + 1)
+				if trial > over:
+					break
+				k, over, out = k + 1, trial, trial_out
+		if over > as_dealt:  # (never worse than as dealt)
+			after += as_dealt
+			continue
+		after += over
 		order[first : first + size] = out.transpose(0, 2, 1).reshape(-1)
 	return order, dealt, after
 

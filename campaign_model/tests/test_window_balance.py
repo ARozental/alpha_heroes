@@ -12,7 +12,8 @@ from campaign_model.tests.test_foresight_counts import _setup, _update
 from campaign_model.train import balance_order
 
 
-def test_the_update_is_the_same_up_to_summation_order_and_logs_the_same():
+@pytest.mark.parametrize("budget", [2.25, 1.8])
+def test_the_update_is_the_same_up_to_summation_order_and_logs_the_same(budget):
 	"""(1) memory_steps 2, 16 micro-batches of two two-step sequences, the foresight on uneven masks with the minibatch's
 	counts, a budget of 2.25 windows a decision (9 a micro-batch; its rows hold 1-3) that rich_inputs' decisions overrun as dealt: the
 	minibatch's gradient and every number the update returns (the KL, the clip fraction, the entropy, the loss shares'
@@ -20,10 +21,10 @@ def test_the_update_is_the_same_up_to_summation_order_and_logs_the_same():
 	n = 96
 	x, start, decisions, foresight, targets, advantages = _setup(n)
 	streams = (np.repeat(np.arange(8), n // 8), np.tile(np.arange(n // 8), 8))
-	settings = dict(batch_size=64, micro_batches=16, foresight_minibatch_counts=True, window_budget=2.25)
+	settings = dict(batch_size=64, micro_batches=16, foresight_minibatch_counts=True, window_budget=budget)  # (1.8: the minibatch's own mean over it, the packed deal)
 	plain, mp = _update(start, x, decisions, foresight, targets, advantages, streams, window_balance=False, **settings)
 	dealt, md = _update(start, x, decisions, foresight, targets, advantages, streams, window_balance=True, **settings)
-	assert md["window_over_dealt"] > 0 and md["window_over_balanced"] < md["window_over_dealt"], (md["window_over_dealt"], md["window_over_balanced"])
+	assert md["window_over_dealt"] > 0 and md["window_over_balanced"] <= md["window_over_dealt"], (md["window_over_dealt"], md["window_over_balanced"])
 	assert float(plain.norm()) > 0
 	assert float((dealt - plain).norm() / plain.norm()) < 1e-5
 	differ = []
@@ -92,3 +93,28 @@ def test_the_rows_windows_are_windows_ofs():
 	x = rich_inputs(32, 4)
 	t = {k: torch.from_numpy(v) for k, v in x.items()}
 	assert np.array_equal(heroes_in(x), ft.windows_present(t).reshape(32, -1).sum(dim=1).numpy())
+
+
+def test_an_over_full_minibatch_gives_up_the_fewest_micro_batches_never_more_than_as_dealt():
+	"""e5's cliff (2026-11-16): a minibatch whose own mean is 10% over the budget. Evening its loads would put every
+	micro-batch over; the deal gives up the fewest (k: the heaviest sequences fill k, the rest fit the others), never more
+	over than as dealt, rows, sequences and step order kept."""
+	rng = np.random.default_rng(4)
+	steps, size, micro = 2, 8192, 128
+	per = size // micro // steps
+	order = rng.permutation(size)
+	windows = rng.integers(2, 10, size).astype(np.int64)  # (a late game's: 2-9 windows a decision)
+	mean = windows.mean()
+	budget = int(round(size // micro * mean / 1.1))  # (the minibatch 10% over)
+	new, dealt, after = balance_order(order, windows, steps, size, micro, budget)
+	assert after <= dealt and after < micro, (dealt, after)
+	# the aggregate lower bound: the fewest micro-batches whose heaviest sequences leave the rest fitting the others
+	seq_w = windows[order].reshape(micro, steps, per).transpose(0, 2, 1).reshape(-1, steps)
+	heavy = np.cumsum(seq_w[np.argsort(-seq_w.max(axis=1), kind="stable")], axis=0)
+	total = seq_w.sum(axis=0)
+	k = next(j for j in range(1, micro) if steps * (total - heavy[j * per - 1]).max() <= (micro - j) * budget)
+	assert after <= k + micro // 10, (after, k, dealt)  # (the bound assumes the rest packs exactly to the budget, a per-sequence count a micro-batch; 41 against 32 here, 127 as dealt)
+	assert sorted(new) == sorted(order)
+	a = {tuple(r) for r in order.reshape(micro, steps, per).transpose(0, 2, 1).reshape(-1, steps)}
+	b = {tuple(r) for r in new.reshape(micro, steps, per).transpose(0, 2, 1).reshape(-1, steps)}
+	assert a == b
