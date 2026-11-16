@@ -1147,6 +1147,8 @@ class CampaignModelV2(nn.Module):
 		learned[A_.TRAVEL] = (self.travel_out(state.travel_pairs).squeeze(-1) + state.travel_view.to(state.travel_pairs.dtype) + self.act_travel(own_heroes)).reshape(b, HO, L, TG, TG)
 		prior[A_.TRAVEL] = (known.travel_logits + advised("travel")).reshape(b, HO, L, TG, TG) - guard.reshape(b, HO, 1, 1, 1)  # (the network reads travel_prior: without the night)
 		offers[A_.TRAVEL] = ft.signed_offer(prior[A_.TRAVEL], x["travel_mask"])
+		if getattr(self.features, "travel_lift", None):  # (ALPHA_TRAVEL_LIFT: an eval arm's only; a construction-time constant, no tensor read)
+			learned[A_.TRAVEL] = torch.zeros_like(learned[A_.TRAVEL])
 		# BUILD: the town's query against each building. A purchase short of resources pays the trades it makes (known.
 		# build_trade, recruit_trade: the gold of worth they lose), priced as every change of Φ is (value_logit), in the
 		# entry and in its type's offer: the least any legal entry pays, 0 while one needs no trade (within the table

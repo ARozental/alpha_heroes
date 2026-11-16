@@ -462,6 +462,10 @@ class CustomFeatures(nn.Module):
 		# within features.DANGER_RANGE of the town) takes this logit as its start instead of multi_priors_16's shared one
 		# (live -4.40); IN, and OUT with such a rival near, unchanged (garrison_out_rows); unset: the branch is never taken
 		self.garrison_out = override("ALPHA_GARRISON_OUT")
+		# ALPHA_TRAVEL_LIFT (e5, 2026-11-16: T, an EVAL arm's switch, never in training): TRAVEL's learned table (travel_out +
+		# travel_view + act_travel) set to 0 for every hero, so its prior (with the night term) decides the entry and, through
+		# the type score's best legal entry, the type; the type's bias and everything else unchanged; unset: never taken
+		self.travel_lift = override("ALPHA_TRAVEL_LIFT")
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
