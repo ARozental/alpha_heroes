@@ -1133,6 +1133,12 @@ class CampaignModelV2(nn.Module):
 		guard = self.features.town_guard_cost(x, known)  # [B, HO]
 		move_prior = move_prior - guard.gather(1, ft.slot_heroes(x)).reshape(b, HO, 1, 1)
 		learned[A_.MOVE], prior[A_.MOVE] = move + self.act_move(own_heroes).reshape(b, HO).gather(1, ft.slot_heroes(x)).reshape(b, HO, 1, 1), move_prior
+		if getattr(self.features, "fight_lift", None) and known.n > 0:  # (ALPHA_FIGHT_LIFT: an eval arm's only; a construction-time constant, no tensor read)
+			on = lambda v: dense(real_only(v, known), known.windows, known.n, b)  # noqa: E731
+			learned[A_.MOVE] = lift_fights(
+				learned[A_.MOVE], on(self.move_out(state.move_pairs).squeeze(-1)), x["move_mask"].bool().reshape(b, HO, W, W), on(known.tile_stacks) > 0.5,
+				on(known.move_features[..., MOVE_FEATURES.index("win")]), on(known.move_features[..., MOVE_FEATURES.index("loss")]), x["w_turns"].reshape(b, HO, W, W) == 0,
+			)
 		offers[A_.MOVE] = ft.signed_offer(move_prior, x["move_mask"])  # (below 0 when every move is worse than staying)
 		# Nullkiller2's own choice now (schema 19: views.label), as a prior of nk_label_weight logits on its entry inside the
 		# entry's table and on its type's score, END's included (0 until turned on: config.nk2_label_prior); a targeted
@@ -1608,6 +1614,17 @@ def fight_forecast(x, known, foreseen):
 	stake, taken = share(known.move_relative[..., 2]), share(known.move_relative[..., 3])
 	value = starts * (win * taken - lost * stake)
 	return torch.stack([torch.sign(value) * torch.log1p(100.0 * value.abs()) / 3, starts, win, lost], dim=-1).detach()
+
+
+def lift_fights(move, pairs, legal, stacks, win, loss, today):
+	"""ALPHA_FIGHT_LIFT (e5, 2026-11-16: an eval arm's switch, never in training): MOVE's learned table [B, HO, W, W] with
+	the per-tile pair head's part (pairs: move_out's, dense) of each clear win (a wandering monster's tile or its zone,
+	tile_stacks, reachable today, legal, the fight's forecast win >= 0.95 and expected loss < 0.20) replaced by the
+	decision's largest pair part over its legal tiles: the best target's, so a clear win competes with it on the prior and
+	the other learned parts alone. Every other entry as it was."""
+	best = pairs.masked_fill(~legal, float("-inf")).amax(dim=(1, 2, 3), keepdim=True)
+	clear = stacks & legal & today & (win >= 0.95) & (loss < 0.20)
+	return torch.where(clear, move - pairs + best, move)
 
 
 def fight_features(known):

@@ -457,6 +457,10 @@ class CustomFeatures(nn.Module):
 		self.guard_override = override("ALPHA_TOWN_GUARD")
 		self.economy_override = override("ALPHA_BUILD_ECONOMY")
 		self.give_all_override = override("ALPHA_GIVE_ALL_EXACT")
+		# ALPHA_FIGHT_LIFT (e5, 2026-11-16: an EVAL arm's switch, never in training): at MOVE, the per-tile pair head's part
+		# (move_out) of a clear win (a wandering monster's tile, reachable today, legal, win >= 0.95, loss < 0.20) lifted to
+		# the decision's best legal tile's (model_v2.lift_fights); unset: the branch is never taken, bit for bit
+		self.fight_lift = override("ALPHA_FIGHT_LIFT")
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
