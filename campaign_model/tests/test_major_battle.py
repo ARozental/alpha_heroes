@@ -8,11 +8,11 @@ from campaign_model.records import Game
 RED, BLUE = 0, 1
 
 
-def snap(day, red_towns=1):
+def snap(day, red_towns=1, red_level=3, blue_level=5):
 	town = {"faction": 0, "built": [10], "garrison": [], "available": []}
 	return {"day": day, "final": False, "players": [
-		{"color": RED, "status": 0, "towns": [dict(town) for _ in range(red_towns)], "heroes": [{"type": 5, "level": 3, "exp": 2500, "army": [[0, 40]], "primary": [1, 1, 1, 1], "skills": [], "spells": []}], "resources": [0, 0, 0, 0, 0, 0, 5000], "income": [0, 0, 0, 0, 0, 0, 0], "dwellings": [], "armies": [], "explored": 0},
-		{"color": BLUE, "status": 0, "towns": [dict(town)], "heroes": [{"type": 7, "level": 5, "exp": 6000, "army": [[2, 30]], "primary": [2, 2, 1, 1], "skills": [], "spells": []}], "resources": [0, 0, 0, 0, 0, 0, 5000], "income": [0, 0, 0, 0, 0, 0, 0], "dwellings": [], "armies": [], "explored": 0},
+		{"color": RED, "status": 0, "towns": [dict(town) for _ in range(red_towns)], "heroes": [{"type": 5, "level": red_level, "exp": 2500, "army": [[0, 40]], "primary": [1, 1, 1, 1], "skills": [], "spells": []}], "resources": [0, 0, 0, 0, 0, 0, 5000], "income": [0, 0, 0, 0, 0, 0, 0], "dwellings": [], "armies": [], "explored": 0},
+		{"color": BLUE, "status": 0, "towns": [dict(town)], "heroes": [{"type": 7, "level": blue_level, "exp": 6000, "army": [[2, 30]], "primary": [2, 2, 1, 1], "skills": [], "spells": []}], "resources": [0, 0, 0, 0, 0, 0, 5000], "income": [0, 0, 0, 0, 0, 0, 0], "dwellings": [], "armies": [], "explored": 0},
 	]}
 
 
@@ -42,7 +42,7 @@ def test_a_town_taken_counts_and_no_battle_gives_nones():
 	m = major_battle(game, "RED")
 	assert m["major_day"] == 15 and m["major_kind"] == "town" and m["major_won"] is True
 	empty = major_battle(Game(ledgers={d: snap(d) for d in range(1, 5)}), "RED")
-	assert set(empty.values()) == {None}
+	assert {v for k, v in empty.items() if k.startswith("major_")} == {None} and empty["max_level_ours"] == 3
 
 
 def test_score_carries_the_fields():
@@ -51,3 +51,13 @@ def test_score_carries_the_fields():
 	game = Game(ledgers={d: snapshot(d, 3000, 1000) for d in range(1, 8)}, battles={"RED": [battle(3, 0, [[0, 40]], [[2, 30]], winner=True)]})
 	result = score(game, "RED", players=2, days=5)
 	assert result["major_day"] == 3 and result["major_won"] is True
+
+
+def test_the_max_levels_are_running_maxima_with_dead_heroes_and_before_the_major_battle():
+	ledgers = {d: snap(d, red_level=2 + (d >= 10) + 2 * (10 <= d < 25), blue_level=5 + (d >= 18) + 3 * (d >= 30)) for d in range(1, 40)}
+	game = Game(ledgers=ledgers, battles={"RED": [battle(20, 0, [[0, 40]], [[2, 30]], winner=False)]})
+	m = major_battle(game, "RED")
+	assert m["max_level_ours"] == 5 and m["max_level_theirs"] == 9  # (ours reached 5 on days 10-24, then the hero was lost: 3)
+	assert m["major_max_level_ours"] == 5 and m["major_max_level_theirs"] == 6  # (the ledgers of days < 20)
+	none = major_battle(Game(ledgers={d: snap(d) for d in range(1, 5)}), "RED")
+	assert none["major_day"] is None and none["major_max_level_ours"] is None and none["max_level_ours"] == 3 and none["max_level_theirs"] == 5

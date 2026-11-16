@@ -163,13 +163,31 @@ def major_battle(game, color):
 	heroes' levels (the record's), whether we attacked, won, and whether our hero stood at a town of ours (within 1 tile at
 	our last decision before it: a battle's serial is the index of the first decision after it; the hero ours whose army
 	of the day before is nearest the battle's). Every field None when there is no such battle; a diagnostic, never the
-	game's end (any failure: all None)."""
+	game's end (any failure: all None).
+	The heroes' max level (the user via e5, 2026-11-16: "we should track max hero level, looking at the end might be a
+	result of a hero dying"): the highest level any hero of the player reached, a running max over the daily ledgers (dead
+	heroes included): max_level_ours / max_level_theirs (the highest of the rivals') over the whole game, and
+	major_max_level_ours / major_max_level_theirs over the days before the major battle's (None without one)."""
 	from .empire import army_worth
 
-	keys = ("major_day", "major_kind", "major_ours", "major_theirs", "major_level_ours", "major_level_theirs", "major_attacked", "major_won", "major_at_town")
+	keys = ("major_day", "major_kind", "major_ours", "major_theirs", "major_level_ours", "major_level_theirs", "major_attacked", "major_won", "major_at_town", "max_level_ours", "max_level_theirs", "major_max_level_ours", "major_max_level_theirs")
 	empty = {k: None for k in keys}
 	try:
 		worth = lambda stacks: float(army_worth([(int(a), int(n)) for a, n in (stacks or []) if a >= 0 and n > 0], EVAL_EMPIRE))  # noqa: E731
+		def max_levels(before=None):  # (ours, the rivals' highest): the running max over the ledgers of days < before
+			mine, theirs = 0, 0
+			for day in sorted(game.ledgers):
+				if before is not None and day >= before:
+					break
+				for p in game.ledgers[day]["players"]:
+					top = max((int(h.get("level", 0)) for h in p.get("heroes", [])), default=0)
+					if COLORS[p["color"]] == color:
+						mine = max(mine, top)
+					else:
+						theirs = max(theirs, top)
+			return mine, theirs
+
+		levels = dict(zip(("max_level_ours", "max_level_theirs"), max_levels()))
 		ours_on = {}
 		for day, snapshot in game.ledgers.items():
 			mine = [p for p in snapshot["players"] if COLORS[p["color"]] == color]
@@ -187,7 +205,7 @@ def major_battle(game, color):
 			if best is None or value > best[0]:
 				best = (value, battle, kind, a, b)
 		if best is None:
-			return empty
+			return {**empty, **levels}
 		_, battle, kind, a, b = best
 		side, day = int(battle["side"]), int(battle["day"])
 		heroes = battle.get("heroes") or [None, None]
@@ -208,7 +226,8 @@ def major_battle(game, color):
 				at_town = bool(near) and min(near) <= 1
 		level = lambda h: int(h["level"]) if h and "level" in h else None  # noqa: E731
 		return {"major_day": day, "major_kind": kind, "major_ours": round(a, 1), "major_theirs": round(b, 1), "major_level_ours": level(heroes[side]), "major_level_theirs": level(heroes[1 - side] if len(heroes) > 1 else None),
-			"major_attacked": side == 0, "major_won": int(battle["winner"]) == side, "major_at_town": at_town}
+			"major_attacked": side == 0, "major_won": int(battle["winner"]) == side, "major_at_town": at_town, **levels,
+			**dict(zip(("major_max_level_ours", "major_max_level_theirs"), max_levels(before=day)))}
 	except Exception as error:  # noqa: BLE001
 		print(f"campaign eval: the major battle's reading failed: {error!r}", flush=True)
 		return empty
