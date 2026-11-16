@@ -35,6 +35,7 @@ from battle_model import play as battle_play
 from battle_model import supply
 from battle_model.supply import memory_allows
 
+from . import constants as c
 from .empire import EVAL_EMPIRE, EVAL_EMPIRE_VERSION, STATUS_INGAME, STATUS_LOST, empire_value
 from .failures import NAMES as FAILURES, failure_counts, failure_modes
 from .labels import COLORS, share_at, share_table
@@ -150,7 +151,67 @@ def score(game, color, players, days, empire=EVAL_EMPIRE):
 		"won": status == STATUS_WON,
 		"short": last < days and status == STATUS_INGAME,  # cut before the end (time limit, crash): its last day stands in
 		"ai_errors": sum(s.get("errors", 0) for s in game.done.values()),
+		**major_battle(game, color),  # (2026-11-16: the major battle, a line a game in eval_games.jsonl)
 	}
+
+
+def major_battle(game, color):
+	"""The game's major battle for our player (the user via e5, 2026-11-16: "save the major (highest value battle going by
+	... harmonic mean of value from both sides)"), from its records: among our battles (game.battles[color]) against a
+	rival hero or a town (a hero-less battle on a day our town count rose), the one with the highest harmonic mean 2ab/(a+b)
+	of the two sides' army worth at its start (empire.army_worth at EVAL_EMPIRE): its day, kind, both armies, both
+	heroes' levels (the record's), whether we attacked, won, and whether our hero stood at a town of ours (within 1 tile at
+	our last decision before it: a battle's serial is the index of the first decision after it; the hero ours whose army
+	of the day before is nearest the battle's). Every field None when there is no such battle; a diagnostic, never the
+	game's end (any failure: all None)."""
+	from .empire import army_worth
+
+	keys = ("major_day", "major_kind", "major_ours", "major_theirs", "major_level_ours", "major_level_theirs", "major_attacked", "major_won", "major_at_town")
+	empty = {k: None for k in keys}
+	try:
+		worth = lambda stacks: float(army_worth([(int(a), int(n)) for a, n in (stacks or []) if a >= 0 and n > 0], EVAL_EMPIRE))  # noqa: E731
+		ours_on = {}
+		for day, snapshot in game.ledgers.items():
+			mine = [p for p in snapshot["players"] if COLORS[p["color"]] == color]
+			ours_on[day] = len(mine[0].get("towns", [])) if mine and mine[0].get("status") != STATUS_LOST else 0
+		best = None
+		for battle in game.battles.get(color, []):
+			side, day = int(battle["side"]), int(battle["day"])
+			heroes = battle.get("heroes") or [None, None]
+			took = ours_on.get(day, 0) > ours_on.get(day - 1, ours_on.get(day, 0))
+			kind = "rival hero" if len(heroes) > 1 and heroes[1 - side] else ("town" if took else None)
+			if kind is None:
+				continue
+			a, b = worth(battle["armies"][side]), worth(battle["armies"][1 - side])
+			value = 2 * a * b / (a + b) if a + b > 0 else 0.0
+			if best is None or value > best[0]:
+				best = (value, battle, kind, a, b)
+		if best is None:
+			return empty
+		_, battle, kind, a, b = best
+		side, day = int(battle["side"]), int(battle["day"])
+		heroes = battle.get("heroes") or [None, None]
+		at_town = None
+		before = [d for d in sorted(game.ledgers) if d < day]
+		mine = [p for p in game.ledgers[before[-1]]["players"] if COLORS[p["color"]] == color] if before else []
+		ours = [d for d in game.decisions if d.color == color]
+		serial = int(battle["serial"])
+		if mine and mine[0].get("heroes") and 0 < serial <= len(ours):
+			from .records import decode_fields
+
+			hero = min(mine[0]["heroes"], key=lambda h: abs(worth(h.get("army", [])) - a))
+			x = decode_fields(ours[serial - 1 : serial], ("h_present", "h_owner", "h_type", "h_pos", "t_present", "t_owner", "t_pos"))
+			own = x["h_present"][0, : c.OWN_HEROES] & (x["h_owner"][0, : c.OWN_HEROES] == c.OWNER_SELF) & (x["h_type"][0, : c.OWN_HEROES] == int(hero.get("type", -1)))
+			if own.any():
+				pos = x["h_pos"][0, int(np.flatnonzero(own)[0])]
+				near = [max(abs(int(pos[0]) - int(t[0])), abs(int(pos[1]) - int(t[1]))) for k, t in enumerate(x["t_pos"][0]) if x["t_present"][0, k] and x["t_owner"][0, k] == c.OWNER_SELF and int(t[2]) == int(pos[2])]
+				at_town = bool(near) and min(near) <= 1
+		level = lambda h: int(h["level"]) if h and "level" in h else None  # noqa: E731
+		return {"major_day": day, "major_kind": kind, "major_ours": round(a, 1), "major_theirs": round(b, 1), "major_level_ours": level(heroes[side]), "major_level_theirs": level(heroes[1 - side] if len(heroes) > 1 else None),
+			"major_attacked": side == 0, "major_won": int(battle["winner"]) == side, "major_at_town": at_town}
+	except Exception as error:  # noqa: BLE001
+		print(f"campaign eval: the major battle's reading failed: {error!r}", flush=True)
+		return empty
 
 
 def count_waiting(shared, change):
