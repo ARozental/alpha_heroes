@@ -478,3 +478,27 @@ def test_the_recruit_hero_rows_train_apart(monkeypatch):
 		optimizer.step()
 	w = m.recruit_head[2].weight.detach()
 	assert float((w[1::2] - w[0::2]).abs().max()) > 0  # (the hero rows move apart from the garrison's)
+
+
+def test_recruit_by_the_visitors_role(monkeypatch):
+	"""Ready-work (e5 2026-11-17): RECRUIT's hero target, under M, by the visitor's role: the main by own score keeps
+	Nullkiller2's recruit_hero x safe; another hero takes recruit_other (-1 at the start): on rows whose two targets' learned
+	parts are equal (the copy at load), a scout's P(hero) is sigmoid(-1), about 27%; off: as before, bit for bit."""
+	on_m, off_m = model(monkeypatch, True), model(monkeypatch, False)
+	danger = torch.zeros(2, TO)
+	visitor_main = torch.zeros(2, TO, dtype=torch.bool)
+	visitor_main[0, 0] = True  # (row 0, town 0: the main visits; row 1: a scout)
+	with torch.no_grad():
+		on, off = on_m.features.recruit_prior(danger, visitor_main), off_m.features.recruit_prior(danger, visitor_main)
+		plain = off_m.features.recruit_prior(danger)
+	assert torch.equal(off, plain)
+	gap_main = float(on[0, 0, 0, 0, 1] - on[0, 0, 0, 0, 0])
+	gap_scout = float(on[1, 0, 0, 0, 1] - on[1, 0, 0, 0, 0])
+	assert gap_main == pytest.approx(float(off[0, 0, 0, 0, 1] - off[0, 0, 0, 0, 0]))  # (the main: as today)
+	assert gap_scout == pytest.approx(-1.0, abs=1e-5) and float(torch.sigmoid(torch.tensor(gap_scout))) == pytest.approx(0.269, abs=0.01)
+	x = inputs()
+	hero(x, 0, SOLMYR, 1)
+	hero(x, 1, ORRIN, 1)
+	x["t_visiting"][:, 0], x["t_visiting"][:, 1] = 0, 1
+	f = known(on_m, x)
+	assert on_m.features.visitor_main(x, f.main)[0, :2].tolist() == [True, False]

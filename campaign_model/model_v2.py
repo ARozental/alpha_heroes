@@ -1184,7 +1184,8 @@ class CampaignModelV2(nn.Module):
 		)
 		learned[A_.RECRUIT] = self.recruit_head(recruit_in).reshape(b, TO, c.N_LEVELS, c.N_RECRUIT_AMOUNTS, c.N_RECRUIT_TARGETS)
 		recruit_charge = (trade_cost * ft.value_logit(known.recruit_trade))[..., None, None].expand_as(learned[A_.RECRUIT])
-		prior[A_.RECRUIT] = self.features.recruit_prior(known.town_danger).expand_as(learned[A_.RECRUIT]) - recruit_charge
+		visitor_main = self.features.visitor_main(x, known.main) if self.features.main_on else None  # (M: the hero target by the visitor's role)
+		prior[A_.RECRUIT] = self.features.recruit_prior(known.town_danger, visitor_main).expand_as(learned[A_.RECRUIT]) - recruit_charge
 		_, upgrade_weight, book_weight, pause_weight = self.features.nk2_weights()  # (a skill's: model.CustomFeatures.option_knowledge)
 		home_weight, defend_weight, ferry_weight, hire_weight, _ = self.features.pull_weights()  # (TRADE: trade_cost_weight since 2026-11-04)
 		offers[A_.RECRUIT] = -pause_weight * known.recruit_pause + best_legal(-recruit_charge, x["recruit_mask"])  # (no army bought while saving for a hall: Nullkiller2's habit)

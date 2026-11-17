@@ -384,6 +384,7 @@ class CustomFeatures(nn.Module):
 		# (M, the user 2026-11-16: "a positive bias if this is the main hero (like a +10 if it is), we can maybe reduce this
 		# logit to -1 otherwise": the spellbook's prior, book_values)
 		self.book_main, self.book_other = zeros(), zeros()
+		self.recruit_other = zeros()  # (M: RECRUIT's hero-target prior for a visitor not the main, recruit_other_value)
 		self.register_buffer("hero_tier", ft.hero_tier_table(), persistent=False)
 		self.register_buffer("hero_faction", ft.hero_faction_table(), persistent=False)
 		self.swap_gain, self.swap_slot, self.last_swap = zeros(), zeros(), zeros()  # (2026-11-08: a swap priced by the power it moves: swap_priors)
@@ -493,7 +494,7 @@ class CustomFeatures(nn.Module):
 			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost, self.multi_weight, self.give_all_cost, self.gather_risk, self.gather_cost, self.disband_cost, self.drop_scale, self.drop_sign, self.trade_waste,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
 			self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay, self.multi_split, self.multi_merge, self.multi_garrison, self.multi_garrison_out, self.hero_table, self.town_bonus, self.chest_main_xp,
-			self.book_main, self.book_other,
+			self.book_main, self.book_other, self.recruit_other,
 			self.swap_gain, self.swap_slot, self.last_swap,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
@@ -640,10 +641,12 @@ class CustomFeatures(nn.Module):
 		"""The ARMY prior's cost, in logits, of a troop move into the other army of a garrison dialog (a mine's)."""
 		return ft.bounded(self.garrison_penalty, 0.0, 8.0, 4.0, CORRECTION_STEP)
 
-	def recruit_prior(self, danger):
+	def recruit_prior(self, danger, visitor_main=None):
 		"""RECRUIT's prior logits [B, TO, N_LEVELS, N_RECRUIT_AMOUNTS, N_RECRUIT_TARGETS] (danger: our towns' [B, TO]): all
 		that can be bought, into the hero visiting the town (less so as the town is threatened: defenders stay home,
-		DefenceBehavior), higher levels first (Nullkiller2's BuyArmy and pickBestCreatures)."""
+		DefenceBehavior), higher levels first (Nullkiller2's BuyArmy and pickBestCreatures). M (visitor_main [B, TO]: the
+		visitor is the main by own score): a visitor that is not the main takes recruit_other_value on the hero target
+		instead (e5 2026-11-17, the user's "-1 otherwise")."""
 		level = torch.arange(c.N_LEVELS, device=self.recruit_all.device).float()
 		all_of_it = (torch.arange(c.N_RECRUIT_AMOUNTS, device=level.device) == c.N_RECRUIT_AMOUNTS - 1).float()
 		hero = (torch.arange(c.N_RECRUIT_TARGETS, device=level.device) == 1).float()
@@ -651,8 +654,26 @@ class CustomFeatures(nn.Module):
 		return (
 			ft.bounded(self.recruit_level, 0.0, 1.0, 0.4, CORRECTION_STEP) * level[:, None, None]
 			+ ft.bounded(self.recruit_all, 0.0, 4.0, 2.0, CORRECTION_STEP) * all_of_it[None, :, None]
-			+ ft.bounded(self.recruit_hero, 0.0, 4.0, 2.0, CORRECTION_STEP) * hero[None, None, :] * safe
+			+ self.recruit_hero_term(hero, safe, visitor_main)
 		)
+
+	def recruit_hero_term(self, hero, safe, visitor_main):
+		"""RECRUIT's hero-target term: Nullkiller2's recruit_hero x safe; under M, for a visitor not the main,
+		recruit_other_value (-1 at the start, -4..2) instead."""
+		nk2 = ft.bounded(self.recruit_hero, 0.0, 4.0, 2.0, CORRECTION_STEP) * hero[None, None, :] * safe
+		if not self.main_on or visitor_main is None:
+			return nk2
+		other = self.recruit_other_value() * hero[None, None, :]
+		return torch.where(visitor_main[:, :, None, None, None], nk2, other)
+
+	def recruit_other_value(self):
+		"""M: RECRUIT's hero-target prior for a visiting hero that is not the main, -1 at the start, within -4..2."""
+		return ft.bounded(self.recruit_other, -4.0, 2.0, -1.0, CORRECTION_STEP)
+
+	def visitor_main(self, x, main):
+		"""[B, TO] bool: the hero visiting each of our towns is ours and the main (main [B, HO])."""
+		token = x["t_visiting"][:, :TO]
+		return (token >= 0) & (token < HO) & main.gather(1, token.clamp(0, HO - 1).long())
 
 	def army_prior(self, hero_strength):
 		"""ARMY's prior logits [B, HD, A, HD, N_ARMY_AMOUNTS] (hero_strength: our heroes' log strength [B, HO]): leaving
@@ -1915,7 +1936,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.multi_garrison_out", "features.hero_table", "features.town_bonus", "features.chest_main_xp", "features.book_main", "features.book_other", "buy_book_reset", "recruit_target_reset", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.multi_garrison_out", "features.hero_table", "features.town_bonus", "features.chest_main_xp", "features.book_main", "features.book_other", "features.recruit_other", "buy_book_reset", "recruit_target_reset", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
@@ -2426,7 +2447,7 @@ class CampaignModel(nn.Module):
 			dim=-1,
 		)
 		recruit = self.recruit_head(recruit_in).reshape(b, TO, c.N_LEVELS, c.N_RECRUIT_AMOUNTS, c.N_RECRUIT_TARGETS)
-		out["recruit_logp"] = flat_log_softmax(recruit + self.features.recruit_prior(f.town_danger), x["recruit_mask"])
+		out["recruit_logp"] = flat_log_softmax(recruit + self.features.recruit_prior(f.town_danger, self.features.visitor_main(x, f.main) if self.features.main_on else None), x["recruit_mask"])
 		tavern = self.hero_type(vocab_index(x["g_tavern"], c.HERO_TYPE_VOCAB))  # [B, 2, d]
 		hire_in = torch.cat(
 			[
