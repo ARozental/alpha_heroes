@@ -127,12 +127,12 @@ def test_a_checkpoint_from_before_loads_and_plays_as_it_did():
 	m = model()
 	x = inputs()
 	with torch.no_grad():
-		for name in GROWN_INPUTS[2:]:  # (a trained model's: its old columns as they are, the economy's at 0)
+		for name in GROWN_INPUTS[2:6]:  # (a trained model's: its old columns as they are, the economy's at 0)
 			p = dict(m.named_parameters())[name]
 			p[:, -NEW_COLUMNS:] = 0.0
 		base = m(x)
 	old = {k: v for k, v in m.state_dict().items() if not k.startswith("build_situational") and k not in ("features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy", "features.empire_alpha")}
-	for name in GROWN_INPUTS[2:]:
+	for name in GROWN_INPUTS[2:6]:
 		old[name] = old[name][:, : -NEW_COLUMNS].clone()
 	fresh = CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
 	fresh.load_state_dict(old)
