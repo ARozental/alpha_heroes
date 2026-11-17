@@ -1084,6 +1084,26 @@ def skill_table(scores):
 
 
 MAIN_SKILL_SCORE, SCOUT_SKILL_SCORE = skill_table(MAIN_SKILLS), skill_table(SCOUT_SKILLS)
+# M's own skill table (the user, 2026-11-16 ~20:40: "good stuff is air+earth magic, diplomacy, logistics, Bad stuff is: Eagle
+# Eye, Learning, First Aid, Mysticism, Scholar ... a bonus or penalty fixed bias for these, maybe +-2 to the logit"; e5's
+# +1 for offence and armorer; a hero not the main also estates and pathfinding +1); fixed, the situation the question
+# head's to learn
+OUR_SKILLS = {"airMagic": 2, "earthMagic": 2, "diplomacy": 2, "logistics": 2, "offence": 1, "armorer": 1, "eagleEye": -2, "learning": -2, "firstAid": -2, "mysticism": -2, "scholar": -2}
+OUR_MAIN_SKILL_SCORE = skill_table(OUR_SKILLS)
+OUR_OTHER_SKILL_SCORE = skill_table({**OUR_SKILLS, "estates": 1, "pathfinding": 1})
+
+
+def our_skill_scores(x, main):
+	"""M's score of each option of a level-up [B, O] (OUR_SKILLS: the main hero's, by its own score; another hero's adds
+	estates and pathfinding), 0 for options that are no skill; no Nullkiller2 extras."""
+	b = x["g_day"].shape[0]
+	rows = torch.arange(b, device=main.device)
+	hero = x["d_hero"].clamp(0, HO - 1)
+	is_main = (main[rows, hero] & (x["d_hero"] >= 0)).unsqueeze(-1)
+	skill = x["o_type"].clamp(0, c.N_SECONDARY_SKILLS - 1)
+	is_skill = (x["o_kind"] == c.OptionKind.SKILL) & (x["o_type"] >= 0)
+	score = torch.where(is_main, moved(OUR_MAIN_SKILL_SCORE, main.device)[skill], moved(OUR_OTHER_SKILL_SCORE, main.device)[skill])
+	return score * is_skill
 
 
 def own_towns(x):

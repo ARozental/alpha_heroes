@@ -10,16 +10,13 @@ from campaign_model import features as ft
 
 HO, TO = c.OWN_HEROES, c.OWN_TOWNS
 ORRIN, VALESKA, SOLMYR = 0, 1, 45  # (Castle, Castle, Tower)
-LEVEL = {1: 0, 2: 1000, 5: 4600, 10: 14700, 11: 17500}  # (VCMI's experience table)
+LEVEL = {1: 0, 2: 1000, 3: 2000, 4: 3200, 5: 4600, 10: 14700, 11: 17500}  # (VCMI's experience table)
 
 
 def model(monkeypatch, on):
 	from campaign_model.model_v2 import CampaignModelV2
 
-	if on:
-		monkeypatch.setenv("ALPHA_MAIN_HERO", "1")
-	else:
-		monkeypatch.delenv("ALPHA_MAIN_HERO", raising=False)
+	monkeypatch.setenv("ALPHA_MAIN_HERO", "1" if on else "0")  # (deploy 86: on by default; 0 turns it off)
 	torch.manual_seed(0)
 	return CampaignModelV2(dim=32, cell_dim=8, layers=1).eval()
 
@@ -240,3 +237,152 @@ def test_the_new_column_starts_at_0(monkeypatch):
 	for key in ("join_hero.mlp.up.weight", "again_hero.mlp.up.weight"):
 		w = dict(loading.named_parameters())[key]
 		assert float(w[:, -1].abs().max()) == 0.0 and torch.equal(w[:, :-1], m.state_dict()[key][:, :-1])
+
+
+def levelup(x, skills):
+	"""A level-up of our hero 0 offering `skills` (names)."""
+	x["g_kind"][:] = int(c.DecisionKind.LEVEL_UP)
+	x["d_hero"][:] = 0
+	x["option_mask"][:] = False
+	x["o_kind"][:] = 0
+	x["o_type"][:] = -1
+	for j, name in enumerate(skills):
+		x["option_mask"][:, j] = True
+		x["o_kind"][:, j] = int(c.OptionKind.SKILL)
+		x["o_type"][:, j] = ft.SKILLS.index(name)
+	return x
+
+
+def test_our_skill_table_in_the_level_ups_prior(monkeypatch):
+	"""Deploy 86 (the user 2026-11-16 ~20:40, e5's table): the level-up's prior is OUR_SKILLS at weight 1, fixed: eagleEye
+	against logistics 4 apart, wisdom against offence 1; Nullkiller2's with M off."""
+	x = inputs()
+	hero(x, 0, ORRIN, 3)
+	x = levelup(x, ["eagleEye", "logistics", "wisdom", "offence"])
+	on = known(model(monkeypatch, True), x)
+	p = on.option_prior[0, :4] - (on.option_prior[0, :4] - on.skill_scores[0, :4])  # (the skill part)
+	assert float(on.skill_scores[0, 1] - on.skill_scores[0, 0]) == pytest.approx(4.0) and float(on.skill_scores[0, 3] - on.skill_scores[0, 2]) == pytest.approx(1.0)
+	assert float(on.option_prior[0, 1] - on.option_prior[0, 0]) == pytest.approx(4.0, abs=1e-5) and float(on.option_prior[0, 3] - on.option_prior[0, 2]) == pytest.approx(1.0, abs=1e-5)
+	off = known(model(monkeypatch, False), x)
+	assert torch.equal(off.skill_scores, ft.skill_scores(x, off.main, model(monkeypatch, False).features)) and not torch.equal(off.skill_scores, on.skill_scores)
+	assert torch.equal(on.skill_scores_input, ft.skill_scores(x, on.army_main, model(monkeypatch, True).features))  # (the network's input: Nullkiller2's)
+	del p
+
+
+def test_a_scout_adds_estates_and_pathfinding(monkeypatch):
+	x = inputs()
+	hero(x, 0, ORRIN, 1)
+	hero(x, 1, SOLMYR, 5)  # (the main: Solmyr; hero 0 is not)
+	x = levelup(x, ["estates", "pathfinding", "logistics"])
+	f = known(model(monkeypatch, True), x)
+	assert f.skill_scores[0, :3].tolist() == [1.0, 1.0, 2.0]
+
+
+BOOK = c.BUY_ARTIFACTS.index(ft.SPELLBOOK)
+
+
+def trained_state(monkeypatch):
+	"""A model's state as a checkpoint from before deploy 86: no marker, the book row away from 0."""
+	m = model(monkeypatch, False)
+	with torch.no_grad():
+		m.buy_item.weight[BOOK] = 0.3
+	return {k: v for k, v in m.state_dict().items() if k not in ("buy_book_reset", "features.hero_table", "features.town_bonus")}
+
+
+def test_the_book_row_resets_once(monkeypatch):
+	old = trained_state(monkeypatch)
+	off = model(monkeypatch, False)
+	off.load_state_dict(old)
+	assert float(off.buy_item.weight[BOOK].abs().max()) > 0 and float(off.buy_book_reset) == 0.0 and not off.book_row_reset_now  # (M off: no reset)
+	m = model(monkeypatch, True)
+	m.load_state_dict(old)
+	assert float(m.buy_item.weight[BOOK].abs().max()) == 0.0 and float(m.buy_book_reset) == 1.0 and m.book_row_reset_now
+	other = [r for r in range(m.buy_item.weight.shape[0]) if r != BOOK]
+	assert torch.equal(m.buy_item.weight[other], old["buy_item.weight"][other])
+	with torch.no_grad():  # (training moves the row)
+		m.buy_item.weight[BOOK] = 0.07
+	saved = m.state_dict()  # (a restart's checkpoint and a worker's reload: both carry the marker)
+	restarted = model(monkeypatch, True)
+	restarted.load_state_dict(saved)
+	assert float(restarted.buy_item.weight[BOOK][0]) == pytest.approx(0.07) and not restarted.book_row_reset_now
+	worker = model(monkeypatch, True)
+	worker.load_state_dict({k: v.clone() for k, v in saved.items()})
+	assert torch.equal(worker.buy_item.weight, m.buy_item.weight) and not worker.book_row_reset_now
+
+
+def test_the_reset_row_moves_by_the_gradient_and_its_first_moment_is_0(monkeypatch):
+	from campaign_model.train import make_optimizer, zero_book_moment
+
+	m = model(monkeypatch, True).train()
+	optimizer = make_optimizer(m)
+	x = inputs()
+	hero(x, 0, ORRIN, 3)
+	mask = torch.zeros_like(x["buy_mask"]).reshape(-1, HO, c.N_BUY_ITEMS)
+	mask[:, 0, BOOK] = True
+	mask[:, 0, (BOOK + 1) % c.N_BUY_ITEMS] = True  # (two legal items: a head with one legal entry has no gradient on it)
+	x["buy_mask"] = mask.reshape(x["buy_mask"].shape)
+
+	def loss():  # (the book bought: BUY's type and its entry)
+		out = m(dict(x))
+		return -(out["type_logp"][:, c.ActionType.BUY] + out["buy_logp"].reshape(-1, HO, c.N_BUY_ITEMS)[:, 0, BOOK]).sum()
+
+	for _ in range(2):  # (two updates with old moments, then the reset)
+		optimizer.zero_grad()
+		loss().backward()
+		optimizer.step()
+	m.load_state_dict({k: v for k, v in m.state_dict().items() if k != "buy_book_reset"})
+	zero_book_moment(optimizer, m)
+	assert float(m.buy_item.weight[BOOK].abs().max()) == 0.0 and float(optimizer.state[m.buy_item.weight]["exp_avg"][BOOK].abs().max()) == 0.0
+	for _ in range(2):
+		optimizer.zero_grad()
+		loss().backward()
+		optimizer.step()
+	assert float(m.buy_item.weight[BOOK].abs().max()) > 0  # (the gradient alone moves it from 0)
+
+
+def test_every_prior_between_two_heroes_sends_the_army_to_the_main(monkeypatch):
+	"""e5 (2026-11-16 20:54): "swapping the main to some scout that should deliver creatures is bad". Our main (Solmyr,
+	level 1, 1 angel, a weak multiplier) meets a scout (Orrin, level 1, 20 angels, a strong multiplier) two tiles east:
+	with M, ARMY's moves between them (army_prior), GIVE_ALL's receiver (stronger_receiver) and the meeting's hero term in
+	MOVE's prior (meeting_value with the own score) all favour the main; off, each the scout."""
+	from campaign_model import features as ft_
+
+	x = inputs(1, 5)
+	hero(x, 0, SOLMYR, 1, army=1)
+	hero(x, 1, ORRIN, 1, army=20)
+	x["h_garrisoned"][:, :2] = 0
+	x["h_level"][0, :2] = 1
+	x["h_primary"][0, 0], x["h_primary"][0, 1], x["h_artifacts"][0, :2] = torch.tensor([0, 0, 2, 3]), torch.tensor([4, 4, 1, 1]), -1
+	x["h_detailed"][0, :2] = True
+	x["h_morale"][0, :2] = 1
+	x["h_pos"][0, 0], x["h_pos"][0, 1] = torch.tensor([10, 10, 0]), torch.tensor([12, 10, 0])
+	x["x_heroes"][0] = torch.tensor([1, 2])  # (GIVE_ALL's rows: hero 0 first, hero 1 second)
+	on_m, off_m = model(monkeypatch, True), model(monkeypatch, False)
+	on, off = known(on_m, x), known(off_m, x)
+	assert bool(on.main[0, 0]) and not bool(on.main[0, 1]) and bool(off.main[0, 1])
+	ALL = int(c.ArmyAmount.ALL)
+	a_on, a_off = on_m.features.army_prior(on.main_score), off_m.features.army_prior(off.hero_strength[:, :HO])
+	assert float(a_on[0, 1, 0, 0, ALL]) > float(a_on[0, 0, 0, 1, ALL]) and float(a_off[0, 1, 0, 0, ALL]) < float(a_off[0, 0, 0, 1, ALL])
+	assert on_m.features.stronger_receiver(x, on)[0].tolist() == [1.0, 0.0] and off_m.features.stronger_receiver(x, off)[0].tolist() == [0.0, 1.0]
+	offsets = torch.arange(c.WINDOW) - c.WINDOW_RADIUS
+	dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
+	tile_x, tile_y = 10 + dx, 10 + dy
+	r = c.WINDOW_RADIUS
+
+	def on_tile(pos, present):
+		return (pos[:, None, None, :, 0] == tile_x[None, ..., None]) & (pos[:, None, None, :, 1] == tile_y[None, ..., None]) & (pos[:, None, None, :, 2] == 0) & present[:, None, None, :]
+
+	t = on_m.features
+	with torch.no_grad():
+		by_score = float(t.meeting_value(x, on, torch.tensor([0]), torch.tensor([0]), on_tile, on.main, on.main_score)[0][r, r + 2])
+		by_army = float(t.meeting_value(x, on, torch.tensor([0]), torch.tensor([0]), on_tile, on.army_main)[0][r, r + 2])
+
+	def led(h, angels):
+		rest = x["h_morale"][0, h].float() - ft_.make_up_morales(x["h_army_creature"][0, h], x["h_army_count"][0, h].float(), t)
+		creatures = torch.tensor([13] + [-1] * 6)
+		return float(ft_.led_values(creatures, torch.tensor([float(angels)] + [0.0] * 6), on.hero_multiplier[0, h], rest, t))
+
+	apart = led(0, 1) + led(1, 20)
+	gain = float(t.gain(t.meeting_gain))
+	assert by_score == pytest.approx(max(led(0, 21) - apart, 0.0) * gain, rel=1e-4, abs=1e-3)  # (joined under the main)
+	assert by_army == pytest.approx(max(led(1, 21) - apart, 0.0) * gain, rel=1e-4, abs=1e-3) and by_army > by_score  # (under the scout: its multiplier makes more of it)

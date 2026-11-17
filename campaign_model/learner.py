@@ -355,6 +355,10 @@ class CampaignLearner:
 			self.model.load_state_dict(state["model"])
 			if "optimizer" in state:
 				load_optimizer(self.optimizer, self.model, state["optimizer"], state["model"].keys())
+				if getattr(self.model, "book_row_reset_now", False):  # (M: the spellbook row zeroed at this load; its first moment too)
+					from .train import zero_book_moment
+
+					zero_book_moment(self.optimizer, self.model)
 			self.version, self.lr_scale, self.games_used = state["version"], state.get("lr_scale", 1.0), state.get("games_used", 0)
 			self.teacher_weight = state.get("teacher_weight", config.teacher_kl)
 			self.value_ev = state.get("value_ev")
