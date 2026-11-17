@@ -589,6 +589,22 @@ def zero_book_moment(optimizer, model):
 	print(f"campaign: M's spellbook row reset at this load (buy_item.weight[{row}] = 0, its first moment 0{'' if state else ': no moments yet'})", flush=True)
 
 
+def zero_recruit_moments(optimizer, model):
+	"""M's RECRUIT reset (model_v2.reset_recruit_rows): Adam's first moments of recruit_head's last Linear's hero-target
+	rows (weights and bias) at 0, their second kept (zero_book_moment's reason). Logged."""
+	from .model_v2 import recruit_rows
+
+	rows = recruit_rows(1)
+	last = model.recruit_head[2]
+	done = 0
+	for p in (last.weight, last.bias):
+		state = optimizer.state.get(p)
+		if state and "exp_avg" in state:
+			state["exp_avg"][rows] = 0.0
+			done += 1
+	print(f"campaign: M's RECRUIT hero rows reset at this load (recruit_head.2's rows {rows} = the garrison's, {done} first moments 0)", flush=True)
+
+
 def fit_moments(optimizer, model):
 	"""Adam's moments loaded for a parameter whose shape has changed since (optimizer.load_state_dict does not check, and
 	the first step would fail): move_pair's first layer from before 2026-11-04's MOVE features moved with its weights

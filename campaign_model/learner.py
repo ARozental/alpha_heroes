@@ -359,6 +359,10 @@ class CampaignLearner:
 					from .train import zero_book_moment
 
 					zero_book_moment(self.optimizer, self.model)
+				if getattr(self.model, "recruit_rows_reset_now", False):  # (M: RECRUIT's hero rows copied at this load; their first moments zeroed)
+					from .train import zero_recruit_moments
+
+					zero_recruit_moments(self.optimizer, self.model)
 			self.version, self.lr_scale, self.games_used = state["version"], state.get("lr_scale", 1.0), state.get("games_used", 0)
 			self.teacher_weight = state.get("teacher_weight", config.teacher_kl)
 			self.value_ev = state.get("value_ev")
