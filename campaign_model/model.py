@@ -470,6 +470,10 @@ class CustomFeatures(nn.Module):
 		# MOVE's explore term (tile_features' `explore * explore_gold()`) replaced by this constant; TRAVEL's hidden-land term
 		# keeps explore_gold(); unset: the branch is never taken
 		self.explore_override = override("ALPHA_EXPLORE_GOLD")
+		# ALPHA_EXPLORE_PRIOR (e5, 2026-11-16 18:01: X's prior-only form, the one the arms use): MOVE's prior logit (tile_prior)
+		# reads the tile's value with a full new sight at this gold instead of explore_gold(); the value the network's MOVE
+		# features, views and foresight read is unchanged; unset: the branch is never taken
+		self.explore_prior = override("ALPHA_EXPLORE_PRIOR")
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -1590,6 +1594,8 @@ class CustomFeatures(nn.Module):
 		)
 		discount = ft.movement_discount(days, ft.bounded(self.travel_exponent, 0.7, 2.0, 1.3, CORRECTION_STEP))
 		value = value * discount ** self.move_discount_power()
+		# (ALPHA_EXPLORE_PRIOR: the prior's explore at the switch's gold, discounted as the value is; the features keep `value`)
+		explore_extra = explore * (float(self.explore_prior) - self.explore_gold()) * discount ** self.move_discount_power() if self.explore_prior is not None else None
 		# Danger: the enemy heroes we see, their reach to the tile x P(they beat this hero); what ending the move there
 		# instead of where the hero stands changes in the expected loss (army, hero, its replacement: hero); our towns'
 		# danger on them
@@ -1639,7 +1645,11 @@ class CustomFeatures(nn.Module):
 		home_weight, defend_weight, ferry_weight, _, _ = self.pull_weights()
 		rest = (torch.stack([home_weight, defend_weight, ferry_weight]) * pulls).sum(dim=-1) - self.safety_weight() * hopeless
 		prior = ft.value_logit(value) + rest  # (the network's input, as before the night term)
-		logits = ft.value_logit(value - danger_value + night_value) + rest  # (the MOVE prior's logits: tile_prior)
+		logit_value = value - danger_value + night_value
+		logits = ft.value_logit(logit_value) + rest  # (the MOVE prior's logits: tile_prior)
+		logits_view = logits  # (what model_v2's views read: the same tensor unless ALPHA_EXPLORE_PRIOR)
+		if explore_extra is not None:
+			logits = ft.value_logit(logit_value + explore_extra) + rest
 		# model_v2's MOVE features beside MOVE_FEATURES, relative so they keep their meaning on any map and day (the user,
 		# 2026-11-04): hopeless (above); the object as a share of our Φ (log(1 + 100 x share) / 3: 1% 0.23, 10% 0.8); where
 		# a fight starts, what losing it takes (the army, the hero, its replacement) and what winning it takes (the enemy's
@@ -1684,7 +1694,7 @@ class CustomFeatures(nn.Module):
 			dim=-1,
 		)  # CELL_FEATURES
 		return {
-			"tile_value": value, "tile_prior": logits, "tile_night": night, "tile_shift": logits - prior, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight, "tile_fight_ratio": fight_ratio, "tile_fights": fights.float(),
+			"tile_value": value, "tile_prior": logits, "tile_prior_view": logits_view, "tile_night": night, "tile_shift": logits - prior, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight, "tile_fight_ratio": fight_ratio, "tile_fights": fights.float(),
 			"tile_stacks": (monster | guarded).float(),  # (a wandering monster or its zone: model_v2's battle head)
 			"move_strength": ft.strength_view(torch.cat([this_hero, main_army], dim=-1)), "move_relative": relative,  # (model_v2: MOVE_STRENGTH, MOVE_RELATIVE)
 			"move_rate": rate,  # (model_v2: the MOVE pair's gain-per-movement and IRR views, MOVE_RATE)

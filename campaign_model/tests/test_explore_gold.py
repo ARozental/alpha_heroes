@@ -38,3 +38,12 @@ def test_only_move_and_the_types_move(monkeypatch):
 		with torch.no_grad():
 			outs[mode] = model(dict(x))
 	assert torch.equal(outs["5000"]["travel_logp"], outs[None]["travel_logp"])  # (TRAVEL keeps explore_gold(); that MOVE moves is the recorded decisions' gate, fl/gate1_x.sh: random inputs carry no windows to explore from)
+
+
+def test_the_prior_only_override_is_read_at_construction(monkeypatch):
+	from campaign_model.model import CustomFeatures
+
+	monkeypatch.delenv("ALPHA_EXPLORE_PRIOR", raising=False)
+	assert CustomFeatures().explore_prior is None
+	monkeypatch.setenv("ALPHA_EXPLORE_PRIOR", "2100")
+	assert CustomFeatures().explore_prior == 2100.0

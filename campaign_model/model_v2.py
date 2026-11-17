@@ -758,7 +758,7 @@ class CampaignModelV2(nn.Module):
 			k = known.windows.shape[0]
 			rows = torch.where(known.real, torch.arange(k, device=device), torch.full((k,), -1, dtype=torch.long, device=device))
 			inverse = inverse.index_copy(0, known.windows[: known.n], rows[: known.n])
-			tile_prior = real_only(known.tile_prior, known).detach()
+			tile_prior = real_only(getattr(known, "tile_prior_view", known.tile_prior), known).detach()  # (ALPHA_EXPLORE_PRIOR: the views read the prior without it)
 			move_prior = dense(tile_prior, known.windows, known.n, b)
 		travel_logits = known.travel_logits.detach().reshape(b, HO, AREAS)
 		# (a hero's best over its windows' tiles and its areas; by window slot: a hero's own slot holds its own)
