@@ -34,6 +34,10 @@ def golden_model():
 				old = 0.05 * torch.randn(p.shape[0], p.shape[1] - 3, generator=g)
 				p.copy_(torch.cat([old, torch.zeros(p.shape[0], 3)], dim=1))
 				continue
+			if name in ("join_hero.mlp.up.weight", "again_hero.mlp.up.weight"):  # (M's column, 2026-11-16: the old ones drawn as before, the new at 0)
+				old = 0.05 * torch.randn(p.shape[0], p.shape[1] - 1, generator=g)
+				p.copy_(torch.cat([old, torch.zeros(p.shape[0], 1)], dim=1))
+				continue
 			if name in GROWN_INPUTS[2:5]:  # (the economy's columns, 2026-11-12: the old ones drawn as before, the new at 0, as a checkpoint migrates)
 				old = 0.05 * torch.randn(p.shape[0], p.shape[1] - NEW_COLUMNS, generator=g)
 				p.copy_(torch.cat([old, torch.zeros(p.shape[0], NEW_COLUMNS)], dim=1))
