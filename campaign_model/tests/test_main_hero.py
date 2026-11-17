@@ -204,3 +204,39 @@ def test_the_actors_onnx_agrees_with_the_trainer(monkeypatch, tmp_path, bonus):
 	for name in ("hire_logp", "type_logp", "option_logp"):
 		finite = np.isfinite(ours[name])
 		assert np.array_equal(finite, np.isfinite(theirs[name])) and np.allclose(ours[name][finite], theirs[name][finite], atol=1e-4), name
+
+
+def test_the_networks_inputs_keep_the_army_main(monkeypatch):
+	"""e5's form (2026-11-16 19:31): the priors read the new main; the network's inputs (the hero's main flag, MOVE's and the
+	tile's values and pulls, the views) keep the strongest army's hero, and the new main is a new column at 0 weights: with
+	M on, where the two mains differ, the value heads and the foresight are unchanged."""
+	x = inputs()
+	hero(x, 0, ORRIN, 5)
+	hero(x, 1, VALESKA, 1, army=50)
+	off, on = model(monkeypatch, False), model(monkeypatch, True)
+	with torch.no_grad():  # (the new column at 0, as a checkpoint from before loads it: test_the_new_column_starts_at_0)
+		for m in (off, on):
+			for layer in (m.join_hero.mlp.up, m.again_hero.mlp.up):
+				layer.weight[:, -1] = 0.0
+	assert not torch.equal(known(off, x).main, known(on, x).main) and torch.equal(known(off, x).main, known(on, x).army_main)
+	with torch.no_grad():
+		a, b = off(dict(x)), on(dict(x))
+	for name in ("value", "value_logit", "value_hidden", "growth_logit", "end_logit", "fs_turn", "fs_hero", "fs_move", "fs_tiles", "fs_outcome", "memory"):
+		if name in a:
+			assert torch.equal(torch.nan_to_num(a[name]), torch.nan_to_num(b[name])), name
+
+
+def test_the_new_column_starts_at_0(monkeypatch):
+	"""The hero tokenizers' new last column (known.main) loads at 0 from a checkpoint without it (GROWN_INPUTS)."""
+	from campaign_model.model_v2 import GROWN_INPUTS
+
+	m = model(monkeypatch, True)
+	state = m.state_dict()
+	for key in ("join_hero.mlp.up.weight", "again_hero.mlp.up.weight"):
+		assert key in GROWN_INPUTS
+		state[key] = state[key][:, :-1].clone()
+	loading = model(monkeypatch, True)
+	loading.load_state_dict(state)
+	for key in ("join_hero.mlp.up.weight", "again_hero.mlp.up.weight"):
+		w = dict(loading.named_parameters())[key]
+		assert float(w[:, -1].abs().max()) == 0.0 and torch.equal(w[:, :-1], m.state_dict()[key][:, :-1])
