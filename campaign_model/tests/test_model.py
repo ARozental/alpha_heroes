@@ -676,6 +676,7 @@ def test_the_prior_tables_are_looked_up_by_object_and_subtype():
 	assert [float(power[0]), float(health[0])] == pytest.approx(list(guard)) and float(power[1]) == float(health[1]) == 0
 
 
+@pytest.mark.m_off  # (deploy 87's ready-work: Nullkiller2's recruit prior with no main visiting; a test of the behaviour from before M)
 def test_recruiting_starts_as_nullkiller2_buys_all_it_can_into_the_hero_best_first():
 	"""RECRUIT's prior (Nullkiller2's BuyArmy and pickBestCreatures): with a hero visiting the town, buying all of the
 	top level into the hero is the likeliest entry; each part of it is a learnable bounded parameter."""
