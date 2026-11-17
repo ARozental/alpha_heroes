@@ -373,6 +373,9 @@ class CustomFeatures(nn.Module):
 		# GARRISON_SWAP; each new option rare at the start: army_slot_priors, multi_priors_16)
 		self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.multi_split, self.multi_merge, self.multi_garrison = zeros(), zeros(), zeros()
+		# (deploy 85, the user 2026-11-16: "going in with a minus and going out is not (trainable bias from 0?)": GARRISON_SWAP's
+		# prior on the pure OUT rows, its own learned start from 0; garrison_out_rows, multi_garrison_out_start)
+		self.multi_garrison_out = zeros()
 		self.swap_gain, self.swap_slot, self.last_swap = zeros(), zeros(), zeros()  # (2026-11-08: a swap priced by the power it moves: swap_priors)
 		# Nullkiller2's own preference among its candidate tasks as a prior on MOVE's and TRAVEL's entries (schema 19, the
 		# user's design of 2026-11-11: its knowledge as inputs and a prior, never a loss on our choices; nk_prior_weights).
@@ -475,7 +478,7 @@ class CustomFeatures(nn.Module):
 			self.fight_sharpness, self.enemy_value, self.hero_value, self.danger_gain, self.meeting_gain, self.explore_gain, self.class_gain, self.travel_exponent,
 			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost, self.multi_weight, self.give_all_cost, self.gather_risk, self.gather_cost, self.disband_cost, self.drop_scale, self.drop_sign, self.trade_waste,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
-			self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay, self.multi_split, self.multi_merge, self.multi_garrison,
+			self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay, self.multi_split, self.multi_merge, self.multi_garrison, self.multi_garrison_out,
 			self.swap_gain, self.swap_slot, self.last_swap,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
@@ -679,6 +682,22 @@ class CustomFeatures(nn.Module):
 		or a human's labels, or their outcomes, lift them), learned."""
 		step = CORRECTION_STEP
 		return torch.stack([ft.bounded(raw, -10.0, 4.0, -4.0, step) for raw in (self.multi_split, self.multi_merge, self.multi_garrison)])
+
+	def multi_garrison_out_start(self):
+		"""GARRISON_SWAP's start on the pure OUT rows (deploy 85, garrison_out_rows): 0 at the start (a plain option, like
+		END), within -10..4, learned at the prior scalars' step; every other GARRISON_SWAP row keeps multi_garrison's."""
+		return ft.bounded(self.multi_garrison_out, -10.0, 4.0, 0.0, CORRECTION_STEP)
+
+	@staticmethod
+	def garrison_out_rows(x):
+		"""GARRISON_SWAP's pure OUT towns [B, TO] (deploy 85): the town's garrison hero is ours (one of our hero tokens,
+		garrisoned) with movement left, and the gate (the visitor's place, t_visiting) is empty: the swap only lets the hero
+		out. No rival condition (e5 2026-11-16: leaving is priced where it belongs, in MOVE's and TRAVEL's night and the
+		town's defence terms). Going in, and a swap with a visitor at the gate, are not OUT rows."""
+		token = x["t_garrison_hero"][:, :TO]
+		idx = token.clamp(0, HO - 1).long()
+		ours = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF) & x["h_garrisoned"][:, :HO].bool() & (x["h_move"][:, :HO] > 0)
+		return (token >= 0) & (token < HO) & ours.gather(1, idx) & (x["t_visiting"][:, :TO] < 0)
 
 	def nk2_weights(self):
 		"""The learnable weights of Nullkiller2's habits: (a skill score point, an upgrade, a wanted spellbook, the pause)."""
@@ -1110,6 +1129,8 @@ class CustomFeatures(nn.Module):
 		starts = self.multi_priors_16()  # (schema 16: their own starts; one kind at a time, no index tensor: CUDA graphs)
 		for i, kind in enumerate((c.MultiKind.SPLIT_SINGLES, c.MultiKind.MERGE_ALL, c.MultiKind.GARRISON_SWAP)):
 			cost[..., kind] = -starts[i]
+		swap = c.MultiKind.GARRISON_SWAP  # (deploy 85: the pure OUT rows' own start; the rest keep multi_garrison's)
+		cost[..., swap] = torch.where(self.garrison_out_rows(x), -self.multi_garrison_out_start(), cost[..., swap])
 		return prior - cost
 
 	def artifact_prior(self, x, f):
@@ -1817,7 +1838,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.multi_garrison_out", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
