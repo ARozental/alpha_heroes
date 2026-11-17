@@ -115,6 +115,9 @@ def test_the_main_by_its_own_score_not_its_army(monkeypatch):
 
 
 def test_the_chest(monkeypatch):
+	"""Nullkiller2's rule as before (gold for a hero not the main, or under gold pressure) + M's chest_main_xp (4.5 at the
+	start) on the experience for the main by own score: under pressure experience leads by 4.5 - select_weight (+1.5 at
+	the live 2.95), without by select_weight + 4.5; a hero not the main: gold as today; off: as before."""
 	from campaign_model.model import Features
 
 	x = inputs()
@@ -125,16 +128,24 @@ def test_the_chest(monkeypatch):
 	x["d_hero"][:] = 0
 	main = torch.zeros(x["g_day"].shape[0], HO, dtype=torch.bool)
 	main[0, 0] = True  # (row 0: the main hero; row 1: another hero)
-	f = Features(main=main, gold_pressure=torch.full((x["g_day"].shape[0],), 10.0))  # (far over Nullkiller2's MAX_GOLD_PRESSURE)
-	off = model(monkeypatch, False).features.nk2_select(x, f)
-	on = model(monkeypatch, True).features.nk2_select(x, f)
-	assert float(off[0, 0]) > float(off[0, 1]) and float(off[1, 0]) > float(off[1, 1])  # (before: gold for everyone under pressure)
-	assert float(on[0, 1]) > float(on[0, 0]) and float(on[1, 0]) > float(on[1, 1])  # (M: the main hero's experience; another's gold)
+	on_m, off_m = model(monkeypatch, True), model(monkeypatch, False)
+	with torch.no_grad():
+		for m in (on_m, off_m):
+			m.features.select_pick.fill_(-0.0024)  # (the live select_weight, 2.95)
+	sw = float(on_m.features.select_weight())
+	assert sw == pytest.approx(2.95, abs=0.01) and float(on_m.features.chest_main_xp_value()) == pytest.approx(4.5)
+	for pressure in (10.0, -10.0):
+		f = Features(main=main, gold_pressure=torch.full((x["g_day"].shape[0],), pressure))
+		on, off = on_m.features.nk2_select(x, f), off_m.features.nk2_select(x, f)
+		lead = float(on[0, 1] - on[0, 0])
+		assert lead == pytest.approx(4.5 - sw if pressure > 0 else sw + 4.5, abs=1e-3)
+		assert torch.equal(on[1], off[1]) and float(on[1, 0]) > float(on[1, 1])  # (another hero: gold, as today)
+	assert float(off[0, 1] - off[0, 0]) == pytest.approx(sw, abs=1e-3)  # (off, no pressure: experience by select_weight, as before)
 
 
 def test_the_new_keys_load_at_their_starts(monkeypatch):
 	m = model(monkeypatch, True)
-	old = {k: v for k, v in m.state_dict().items() if k not in ("features.hero_table", "features.town_bonus")}
+	old = {k: v for k, v in m.state_dict().items() if k not in ("features.hero_table", "features.town_bonus", "features.chest_main_xp")}
 	loading = model(monkeypatch, True)
 	with torch.no_grad():
 		loading.features.hero_table.fill_(3.0)
@@ -253,29 +264,20 @@ def levelup(x, skills):
 	return x
 
 
-def test_our_skill_table_in_the_level_ups_prior(monkeypatch):
-	"""Deploy 86 (the user 2026-11-16 ~20:40, e5's table): the level-up's prior is OUR_SKILLS at weight 1, fixed: eagleEye
-	against logistics 4 apart, wisdom against offence 1; Nullkiller2's with M off."""
+def test_the_level_ups_prior_is_nk2s_with_the_main_by_own_score(monkeypatch):
+	"""Deploy 86 (the user 2026-11-16: "we can keep the NK2 numbers for now"): the level-up's prior is Nullkiller2's tables
+	and extras at the learned skill_weight; only which hero takes the MAIN table is M's (by own score). Solmyr level 1 (the
+	main by own score) beside Orrin level 2 with an army (the main by strength): Solmyr's level-up reads the MAIN table."""
 	x = inputs()
-	hero(x, 0, ORRIN, 3)
-	x = levelup(x, ["eagleEye", "logistics", "wisdom", "offence"])
-	on = known(model(monkeypatch, True), x)
-	p = on.option_prior[0, :4] - (on.option_prior[0, :4] - on.skill_scores[0, :4])  # (the skill part)
-	assert float(on.skill_scores[0, 1] - on.skill_scores[0, 0]) == pytest.approx(4.0) and float(on.skill_scores[0, 3] - on.skill_scores[0, 2]) == pytest.approx(1.0)
-	assert float(on.option_prior[0, 1] - on.option_prior[0, 0]) == pytest.approx(4.0, abs=1e-5) and float(on.option_prior[0, 3] - on.option_prior[0, 2]) == pytest.approx(1.0, abs=1e-5)
-	off = known(model(monkeypatch, False), x)
-	assert torch.equal(off.skill_scores, ft.skill_scores(x, off.main, model(monkeypatch, False).features)) and not torch.equal(off.skill_scores, on.skill_scores)
-	assert torch.equal(on.skill_scores_input, ft.skill_scores(x, on.army_main, model(monkeypatch, True).features))  # (the network's input: Nullkiller2's)
-	del p
-
-
-def test_a_scout_adds_estates_and_pathfinding(monkeypatch):
-	x = inputs()
-	hero(x, 0, ORRIN, 1)
-	hero(x, 1, SOLMYR, 5)  # (the main: Solmyr; hero 0 is not)
-	x = levelup(x, ["estates", "pathfinding", "logistics"])
-	f = known(model(monkeypatch, True), x)
-	assert f.skill_scores[0, :3].tolist() == [1.0, 1.0, 2.0]
+	hero(x, 0, SOLMYR, 1)
+	hero(x, 1, ORRIN, 2, army=30)
+	x = levelup(x, ["estates", "logistics", "diplomacy"])
+	on_m, off_m = model(monkeypatch, True), model(monkeypatch, False)
+	on, off = known(on_m, x), known(off_m, x)
+	assert torch.equal(on.skill_scores, ft.skill_scores(x, on.main, on_m.features)) and bool(on.main[0, 0]) and not bool(off.main[0, 0])
+	main_est, scout_est = float(ft.MAIN_SKILL_SCORE[ft.SKILLS.index("estates")]), float(ft.SCOUT_SKILL_SCORE[ft.SKILLS.index("estates")])
+	assert float(on.skill_scores[0, 0]) < float(off.skill_scores[0, 0]) and main_est < scout_est  # (estates: the MAIN table's -1 (+1.5 new) on, the scout's 2 off)
+	assert torch.equal(on.skill_scores_input, off.skill_scores)  # (the network's input: by the army's main, as before)
 
 
 BOOK = c.BUY_ARTIFACTS.index(ft.SPELLBOOK)
@@ -286,7 +288,7 @@ def trained_state(monkeypatch):
 	m = model(monkeypatch, False)
 	with torch.no_grad():
 		m.buy_item.weight[BOOK] = 0.3
-	return {k: v for k, v in m.state_dict().items() if k not in ("buy_book_reset", "features.hero_table", "features.town_bonus")}
+	return {k: v for k, v in m.state_dict().items() if k not in ("buy_book_reset", "features.hero_table", "features.town_bonus", "features.chest_main_xp")}
 
 
 def test_the_book_row_resets_once(monkeypatch):
