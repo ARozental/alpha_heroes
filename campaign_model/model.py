@@ -373,6 +373,12 @@ class CustomFeatures(nn.Module):
 		# GARRISON_SWAP; each new option rare at the start: army_slot_priors, multi_priors_16)
 		self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.multi_split, self.multi_merge, self.multi_garrison = zeros(), zeros(), zeros()
+		# M (the user's main-hero design, e5's spec 2026-11-16 18:52; ALPHA_MAIN_HERO): each hero type's learned correction to
+		# its tier (ft.MAIN_TIERS) and the town bonus (0..4, 2 at the start) of main_scores; the tables as non-persistent buffers
+		self.hero_table = zeros(c.HERO_TYPE_VOCAB + 1)
+		self.town_bonus = zeros()
+		self.register_buffer("hero_tier", ft.hero_tier_table(), persistent=False)
+		self.register_buffer("hero_faction", ft.hero_faction_table(), persistent=False)
 		self.swap_gain, self.swap_slot, self.last_swap = zeros(), zeros(), zeros()  # (2026-11-08: a swap priced by the power it moves: swap_priors)
 		# Nullkiller2's own preference among its candidate tasks as a prior on MOVE's and TRAVEL's entries (schema 19, the
 		# user's design of 2026-11-11: its knowledge as inputs and a prior, never a loss on our choices; nk_prior_weights).
@@ -457,6 +463,7 @@ class CustomFeatures(nn.Module):
 		self.guard_override = override("ALPHA_TOWN_GUARD")
 		self.economy_override = override("ALPHA_BUILD_ECONOMY")
 		self.give_all_override = override("ALPHA_GIVE_ALL_EXACT")
+		self.main_on = override("ALPHA_MAIN_HERO") == 1.0  # (M, for its arms: main_scores rank the mains, HIRE's bonus, the chest; unset: as before, bit for bit)
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -475,7 +482,7 @@ class CustomFeatures(nn.Module):
 			self.fight_sharpness, self.enemy_value, self.hero_value, self.danger_gain, self.meeting_gain, self.explore_gain, self.class_gain, self.travel_exponent,
 			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost, self.multi_weight, self.give_all_cost, self.gather_risk, self.gather_cost, self.disband_cost, self.drop_scale, self.drop_sign, self.trade_waste,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
-			self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay, self.multi_split, self.multi_merge, self.multi_garrison,
+			self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay, self.multi_split, self.multi_merge, self.multi_garrison, self.hero_table, self.town_bonus,
 			self.swap_gain, self.swap_slot, self.last_swap,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
@@ -680,6 +687,14 @@ class CustomFeatures(nn.Module):
 		step = CORRECTION_STEP
 		return torch.stack([ft.bounded(raw, -10.0, 4.0, -4.0, step) for raw in (self.multi_split, self.multi_merge, self.multi_garrison)])
 
+	def hero_table_values(self):
+		"""M: each hero type's learned correction to its tier [HERO_TYPE_VOCAB + 1], 0 at the start, within -8..8."""
+		return ft.bounded(self.hero_table, -8.0, 8.0, 0.0, CORRECTION_STEP)
+
+	def town_bonus_value(self):
+		"""M: the town bonus of a hero native to one of our towns, 2 at the start, within 0..4."""
+		return ft.bounded(self.town_bonus, 0.0, 4.0, 2.0, CORRECTION_STEP)
+
 	def nk2_weights(self):
 		"""The learnable weights of Nullkiller2's habits: (a skill score point, an upgrade, a wanted spellbook, the pause)."""
 		bound = lambda raw, high, start: ft.bounded(raw, 0.0, high, start, CORRECTION_STEP)  # noqa: E731
@@ -814,7 +829,16 @@ class CustomFeatures(nn.Module):
 		f.last_hero, f.last_town = ft.last_actors(x)
 		# Nullkiller2's brain (features.py): its roles, skill scores, gold pressure and pause, buildings, upgrades, spellbook;
 		# its plans across days as weak pulls: reinforcements in our towns, their stakes, hiring, trading toward a building
-		f.main = ft.hero_roles(x, f.hero_strength)
+		if self.main_on:  # (M: the mains by their own scores, not their fighting strength; HIRE's bonus for a new main)
+			factions = ft.our_factions(x)
+			f.main_score = ft.main_scores(x["h_type"][:, :HO], x["h_primary_base"], x["h_skills"][:, :HO], x["h_exp"][:, :HO], factions, self)
+			tavern_level = ft.level_value(x["g_tavern_primary"], x["g_tavern_skills"], x["g_tavern_exp"], self)
+			tavern_score = ft.main_scores(x["g_tavern"], x["g_tavern_primary"], x["g_tavern_skills"], x["g_tavern_exp"], factions, self)
+			ours = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
+			f.hire_main = ft.main_hire_bonus(tavern_score, f.main_score, ours, tavern_level) * (x["g_tavern"] >= 0).float()
+			f.main = ft.hero_roles(x, f.main_score)
+		else:
+			f.main = ft.hero_roles(x, f.hero_strength)
 		f.skill_scores = ft.skill_scores(x, f.main, self)
 		f.gold_pressure = ft.gold_pressure(x, self)
 		f.recruit_pause = ft.recruit_pause(x, f.gold_pressure, f.town_danger)
@@ -904,7 +928,10 @@ class CustomFeatures(nn.Module):
 		hero = x["d_hero"].clamp(0, HO - 1)
 		main = (f.main.gather(1, hero.unsqueeze(1)).squeeze(1) & (x["d_hero"] >= 0)).float()
 		chest = ((count.squeeze(-1) == 2) & (x["o_type"][:, 0] == int(c.ComponentType.RESOURCE))).float()
-		gold = (chest * torch.maximum(1 - main, torch.sigmoid(10 * (f.gold_pressure - ft.MAX_GOLD_PRESSURE)))).unsqueeze(-1)
+		if self.main_on:  # (M: the main hero's chest is experience whatever the gold pressure)
+			gold = (chest * (1 - main)).unsqueeze(-1)
+		else:
+			gold = (chest * torch.maximum(1 - main, torch.sigmoid(10 * (f.gold_pressure - ft.MAX_GOLD_PRESSURE)))).unsqueeze(-1)
 		return self.select_weight() * (gold * first + (1 - gold) * last)
 
 	def nk2_amount(self, x):
@@ -1817,7 +1844,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.hero_table", "features.town_bonus", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
@@ -2343,6 +2370,8 @@ class CampaignModel(nn.Module):
 		gain = f.hire_gain.unsqueeze(1).expand(b, TO, c.N_TAVERN)
 		worth = torch.cat([scales(f.tavern_worth.clamp(min=0), (1000, 3000, 10000)), torch.tanh(f.hire_gain / 2000).unsqueeze(-1)], dim=-1)
 		hire_prior = ft.value_logit(gain)
+		if f.get("hire_main") is not None:  # (M)
+			hire_prior = hire_prior + f.hire_main.unsqueeze(1)
 		out["hire_logp"] = flat_log_softmax(self.hire_head(hire_in).squeeze(-1) + hire_prior + self.hire_worth(worth).squeeze(-1).unsqueeze(1), x["hire_mask"])
 		return hire_prior
 
