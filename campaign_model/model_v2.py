@@ -758,9 +758,9 @@ class CampaignModelV2(nn.Module):
 			k = known.windows.shape[0]
 			rows = torch.where(known.real, torch.arange(k, device=device), torch.full((k,), -1, dtype=torch.long, device=device))
 			inverse = inverse.index_copy(0, known.windows[: known.n], rows[: known.n])
-			tile_prior = real_only(known.tile_prior, known).detach()
+			tile_prior = real_only(known.tile_prior_view, known).detach()  # (the views: the prior without M's main, tile_prior when M is off)
 			move_prior = dense(tile_prior, known.windows, known.n, b)
-		travel_logits = known.travel_logits.detach().reshape(b, HO, AREAS)
+		travel_logits = known.travel_logits_view.detach().reshape(b, HO, AREAS)  # (the views: without M's main, travel_logits when M is off)
 		# (a hero's best over its windows' tiles and its areas; by window slot: a hero's own slot holds its own)
 		best_slot, best_any = V.hero_bests(move_prior, x["move_mask"], travel_logits, x["travel_mask"].reshape(b, HO, AREAS), ft.slot_heroes(x))
 		value = None
@@ -1419,12 +1419,14 @@ def global_known(known):
 	return torch.cat([known.phi, torch.stack([known.gold_pressure / (1 + known.gold_pressure), known.recruit_pause, known.hire_want], dim=-1), known.economy.to(known.phi.dtype), known.danger.to(known.phi.dtype)], dim=-1)
 
 
-HERO_KNOWN = 1 + 3 + 4 + 2 * E.AMOUNT_FEATURES + 1
+HERO_KNOWN = 1 + 3 + 4 + 2 * E.AMOUNT_FEATURES + 1 + 1
 
 
 def hero_known(x, known):
 	"""[B, H, HERO_KNOWN]: a hero's strength and army worth (absolute, and relative to our main army, our whole army and
-	the strongest rival's), its worth and its next level's gain (ours), whether it is our main hero."""
+	the strongest rival's), its worth and its next level's gain (ours), whether it is our main hero by its army (Nullkiller2's
+	roles: known.army_main) and by M's own score (known.main, the last column: e5 2026-11-16, a new input whose weights start
+	at 0, GROWN_INPUTS; the army's main again with M off)."""
 	pad = lambda t: F.pad(t.float(), (0, H - HO))  # noqa: E731
 	r = known.reference
 	gold = known.hero_gold
@@ -1432,7 +1434,7 @@ def hero_known(x, known):
 		[
 			(known.hero_strength / 10).unsqueeze(-1), scales(known.hero_power, (1e3, 1e4, 1e5)),
 			torch.stack([log_ratio(gold, r["main_army"][:, None]), log_ratio(gold, r["our_army"][:, None]), log_ratio(gold, r["rival_army"][:, None]), log_ratio(gold, r["phi"][:, None])], dim=-1) / 3,
-			E.amount(pad(known.hero_worth), "gold"), E.amount(pad(known.level_gain), "gold"), pad(known.main).unsqueeze(-1),
+			E.amount(pad(known.hero_worth), "gold"), E.amount(pad(known.level_gain), "gold"), pad(known.army_main).unsqueeze(-1), pad(known.main).unsqueeze(-1),
 		],
 		dim=-1,
 	)
@@ -1539,7 +1541,7 @@ def migrate_option_head(state_dict):
 	return state
 
 
-GROWN_INPUTS = ("recruit_head.0.weight", "option_weights.weight", "join_global.mlp.up.weight", "again_global.mlp.up.weight", "value_hidden.0.weight", "reach.mlp.up.weight")  # (B1b, 2026-11-13: reach's TILE_EMPTY_FOR_HERO column)  # (2026-11-04: + the visiting hero; + a purchase's fit)
+GROWN_INPUTS = ("join_hero.mlp.up.weight", "again_hero.mlp.up.weight", "recruit_head.0.weight", "option_weights.weight", "join_global.mlp.up.weight", "again_global.mlp.up.weight", "value_hidden.0.weight", "reach.mlp.up.weight")  # (B1b, 2026-11-13: reach's TILE_EMPTY_FOR_HERO column)  # (2026-11-04: + the visiting hero; + a purchase's fit)
 
 
 def migrate_action_types(state_dict, own):
