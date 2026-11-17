@@ -374,6 +374,9 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # bounded corrections in the corrections' group, logged each update ("campaign corrections:"). No new environment: the
 # config is the one source (learner.set_advice_prior with the version, test_phi_consumers). campaign.value_jump_from=3502:
 # the reward changes, the value-loss guard starts with no memory (deploy 73's and 81's precedent).
+# Deploy 86w (e5's night rule, 2026-11-16 ~23:50: an update over 220k decisions or available under 1.5 GB = the second
+# LOW): campaign.games 14 -> 11 (the PC's local game ceiling; the Mac's 9 remote slots unchanged: 23 -> 20 campaign workers).
+# A line-only restart; the code is deploy 86's (5cb5026).
 # Deploy 84 (e5, 2026-11-16): campaign.loop_charge=0.03 by its ramp (loop_charge_step 0.01 from loop_charge_from 3557, the
 # resume version + 1; the learner charges at its version before the update: the first update uncharged, then 0.01, 0.02, 0.03 from
 # the fourth), loop_charge_moves as before (the charge on a loop's exchange
@@ -460,6 +463,6 @@ exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $re
 	--set remote_port=7700 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
 		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
-		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=8 ahead=2 \
+		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=11 remote_slots=9 campaign.inference_device=cpu inference_processes=8 ahead=2 \
 		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=6.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3502 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=false campaign.value_shared=0.25 campaign.value_shared_from=3324 campaign.head_scale_freeze=3324 campaign.end_week_share=1.0 campaign.nk_predict_weight=0 campaign.build_economy=1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 campaign.game_seconds=4800 campaign.eval_seconds=1200 campaign.no_town_factor=0.1 campaign.no_town_from=3394 campaign.loop_charge=0.03 campaign.loop_charge_step=0.01 campaign.loop_charge_from=3557 campaign.update_decisions_cap=135000 campaign.update_games_floor=12 campaign.window_balance=true campaign.phi_hero_base=825 campaign.phi_armyless_share=1.0 campaign.phi_lead_weight=0.5 campaign.phi_stock_floor=0.333333 campaign.phi_from=3502 campaign.phi_ramp=20 campaign.unit_own_form=true campaign.give_all_exact=true campaign.foresight_minibatch_counts=true campaign.foresight_outcome_factor=0.526 campaign.foresight_answer_factor=0.735 campaign.foresight_answer_score_factor=0.058 \
 	>> runtime/train/joint7.log 2>&1 < /dev/null
