@@ -1541,7 +1541,7 @@ def migrate_option_head(state_dict):
 	return state
 
 
-GROWN_INPUTS = ("join_hero.mlp.up.weight", "again_hero.mlp.up.weight", "recruit_head.0.weight", "option_weights.weight", "join_global.mlp.up.weight", "again_global.mlp.up.weight", "value_hidden.0.weight", "reach.mlp.up.weight")  # (B1b, 2026-11-13: reach's TILE_EMPTY_FOR_HERO column)  # (2026-11-04: + the visiting hero; + a purchase's fit)
+GROWN_INPUTS = ("recruit_head.0.weight", "option_weights.weight", "join_global.mlp.up.weight", "again_global.mlp.up.weight", "value_hidden.0.weight", "reach.mlp.up.weight", "join_hero.mlp.up.weight", "again_hero.mlp.up.weight")  # (B1b, 2026-11-13: reach's TILE_EMPTY_FOR_HERO column)  # (2026-11-04: + the visiting hero; + a purchase's fit)
 
 
 def migrate_action_types(state_dict, own):
