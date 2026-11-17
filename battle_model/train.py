@@ -1671,6 +1671,10 @@ def train(config, resume=False):
 				# blocks of every size, a 22 GB footprint on a 26 GB machine, which then swapped heavily (and twice
 				# handed a training step garbage); give them back after each update
 				torch.mps.empty_cache()
+			if device.type == "cuda":  # (deploy 86y: the pinned host blocks this update staged, as the campaign learner does at its own end)
+				from .supply import empty_host_cache
+
+				empty_host_cache()
 			if pool:
 				pool.publish(model)
 				supply.publish(pool.version, advantage_config)

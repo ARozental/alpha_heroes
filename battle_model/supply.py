@@ -825,6 +825,21 @@ def trim_memory():
 			pass
 
 
+HOST_CACHE_EMPTIED = [0]  # (empty_host_cache's calls that emptied, for the tests: a counter, not a reading)
+
+
+def empty_host_cache():
+	"""The CUDA caching host allocator's free (pinned) blocks back to the system (deploy 86y, e5 2026-11-17: the campaign
+	learner emptied it only at a campaign update's end (learner.py's call), and between updates it grew back to about
+	2.3 GB, so every campaign update's peak began with it held). Only blocks no tensor uses; the next pin re-allocates
+	(milliseconds). No-op without CUDA. True when it emptied."""
+	if not (torch.cuda.is_available() and hasattr(torch._C, "_host_emptyCache")):
+		return False
+	torch._C._host_emptyCache()
+	HOST_CACHE_EMPTIED[0] += 1
+	return True
+
+
 def _identity(item):
 	return item
 
@@ -883,6 +898,7 @@ class Supply:
 					except Exception as error:  # (a diagnostic: never the run's end)
 						print(f"trainer memory: census failed: {str(error)[:200]}", flush=True)
 					trim_memory()  # (what the trainer freed meanwhile, the waiting games' inputs (strip_inputs) among it, back to the system)
+					empty_host_cache()  # (deploy 86y: the pinned blocks staged since, whichever path staged them)
 			self.stop.wait(PEAK_EVERY)
 
 	def memory_census(self, rss, by_type=False):
