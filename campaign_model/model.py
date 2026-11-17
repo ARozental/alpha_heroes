@@ -444,6 +444,12 @@ class CustomFeatures(nn.Module):
 		self.register_buffer("empire_unit_own", torch.tensor(1.0 if empire.unit_own_form else 0.0))
 		# The stockpile discount's floor (empire.py stock_floor) the same way: 1, as before; the learner's ramp fills it
 		self.register_buffer("phi_stock_floor", torch.tensor(float(empire.stock_floor)))
+		# GARRISON_SWAP's OUT rows (deploy 85, the user via e5 2026-11-16: "bugs should be fixed right away"; garrison_out_rows):
+		# their start ramped from the learned multi_garrison (schema 16's start-rare -4, live -4.40, one value for both
+		# directions) to garrison_out_target by garrison_out_weight (0: as before, bit for bit; the learner's ramp by version,
+		# config.garrison_out_*); IN, and OUT with a rival at least as strong near the town, keep the learned start
+		self.register_buffer("garrison_out_weight", torch.tensor(0.0))
+		self.register_buffer("garrison_out_target", torch.tensor(0.0))
 		# config.empty_as_visited (B1b's bit read as visited at the model's input: features.empty_as_visited) as a buffer the
 		# weights carry, the learner's fill; 1 to begin with and in a checkpoint from before (ADDED_HEADS: the loading model's)
 		self.register_buffer("empty_as_visited", torch.ones(()))
@@ -1110,7 +1116,26 @@ class CustomFeatures(nn.Module):
 		starts = self.multi_priors_16()  # (schema 16: their own starts; one kind at a time, no index tensor: CUDA graphs)
 		for i, kind in enumerate((c.MultiKind.SPLIT_SINGLES, c.MultiKind.MERGE_ALL, c.MultiKind.GARRISON_SWAP)):
 			cost[..., kind] = -starts[i]
+		# (deploy 85: the OUT rows' start, (1 - w) x the learned one + w x the target; at w 0 exactly the learned one)
+		swap, w = c.MultiKind.GARRISON_SWAP, self.garrison_out_weight
+		out_start = (1.0 - w) * starts[2] + w * self.garrison_out_target
+		cost[..., swap] = torch.where(self.garrison_out_rows(x, f), -out_start, cost[..., swap])
 		return prior - cost
+
+	def garrison_out_rows(self, x, f):
+		"""GARRISON_SWAP's OUT towns [B, TO] (deploy 85): the town's garrison hero is ours (a hero token of ours, garrisoned)
+		with movement left, and no rival hero at least as strong (f.hero_strength) within features.DANGER_RANGE of the town
+		(Chebyshev, the same level)."""
+		token = x["t_garrison_hero"][:, :TO]
+		idx = token.clamp(0, HO - 1).long()
+		ours = (x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF) & x["h_garrisoned"][:, :HO].bool() & (x["h_move"][:, :HO] > 0))
+		garrisoned = (token >= 0) & (token < HO) & ours.gather(1, idx)
+		mine = f.hero_strength[:, :HO].gather(1, idx)  # [B, TO]
+		rivals = x["h_present"][:, HO:] & (x["h_owner"][:, HO:] != c.OWNER_SELF)  # [B, R]
+		tp, rp = x["t_pos"][:, :TO].unsqueeze(2), x["h_pos"][:, HO:].unsqueeze(1)  # [B, TO, 1, 3], [B, 1, R, 3]
+		distance = torch.maximum((tp[..., 0] - rp[..., 0]).abs(), (tp[..., 1] - rp[..., 1]).abs()).float()
+		near = rivals.unsqueeze(1) & (tp[..., 2] == rp[..., 2]) & (distance <= ft.DANGER_RANGE) & (f.hero_strength[:, HO:].unsqueeze(1) >= mine.unsqueeze(-1))
+		return garrisoned & ~near.any(dim=-1)
 
 	def artifact_prior(self, x, f):
 		"""What each ARTIFACT entry does to Φ, as a prior logit [B, HO, N_ARTIFACT_POSITIONS, N_ARTIFACT_TARGETS]
@@ -1835,6 +1860,8 @@ ADDED_HEADS = (  # (+ trade_option: TRADE's options' cost and unlock; option_fla
 	"features.stock_weight",  # (BUILD's stockpile weight, 2026-11-15: 0 raw = 1, the loading model's)
 	"features.week_weights",  # (BUILD's week weights, 2026-11-15: 0, the loading model's)
 	"features.phi_stock_floor",  # (the stockpile discount's floor, 2026-11-15: as the phi_ buffers, the loading model's)
+	"features.garrison_out_weight",  # (deploy 85, the garrison swap's OUT start: 0, the loading model's)
+	"features.garrison_out_target",
 	"features.empire_unit_own",  # (the upgrade rule, config.unit_own_form, 2026-11-15: off, the loading model's)
 	"features.empire_last_town",  # (config.no_town_last_town: the loading model's, 0)
 	"features.empty_as_visited",  # (config.empty_as_visited: a checkpoint from before keeps the loading model's, 1)

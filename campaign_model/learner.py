@@ -216,6 +216,10 @@ def set_advice_prior(model, config, version=None):
 			features.empire_unit_own.fill_(1.0)
 		if hasattr(features, "empire_last_town"):  # (config.no_town_last_town: the last town's stake term)
 			features.empire_last_town.fill_(1.0 if getattr(config, "no_town_last_town", False) else 0.0)
+		if hasattr(features, "garrison_out_weight"):  # (deploy 85: GARRISON_SWAP's OUT start, config.garrison_out_*'s ramp at the version; off: 0)
+			weight, target = garrison_now(config, version)
+			features.garrison_out_weight.fill_(weight)
+			features.garrison_out_target.fill_(target)
 
 
 def take_count(finished, config):
@@ -256,6 +260,16 @@ def no_town_now(config, version):
 
 
 PHI_FIELDS = (("phi_hero_base", "hero_base", HERO_BASE), ("phi_armyless_share", "armyless_share", ARMYLESS_SHARE), ("phi_lead_weight", "lead_weight", LEAD_WEIGHT), ("phi_stock_floor", "stock_floor", 1.0))  # (config's, EmpireConfig's, today's)
+
+
+def garrison_now(config, version):
+	"""config.garrison_out_*'s ramp: (the OUT rows' weight on the target, the target) at this version: 0 before
+	garrison_out_from, while off and with no version; then (version - from + 1) / garrison_out_ramp up to 1. Stateless."""
+	if not getattr(config, "garrison_out_on", False) or version is None:
+		return 0.0, float(getattr(config, "garrison_out", 0.0))
+	start = int(getattr(config, "garrison_out_from", 0))
+	weight = min(1.0, max(0.0, (version - start + 1) / max(1, int(getattr(config, "garrison_out_ramp", 20)))))
+	return weight, float(getattr(config, "garrison_out", 0.0))
 
 
 def phi_now(config, version):
@@ -688,7 +702,13 @@ class CampaignLearner:
 	def _ramp_phi(self):
 		"""config.phi_*'s ramp: self.empire (the labels', the labeler's for each game submitted from now) and the model's
 		phi_ buffers at this version's values (phi_now); nothing while every target is today's (the EmpireConfig as it
-		was, ALPHA_EMPIRE_* included, bit for bit)."""
+		was, ALPHA_EMPIRE_* included, bit for bit). Deploy 85's garrison swap ramp the same way (garrison_now), first."""
+		weight, target = garrison_now(self.config, self.version)
+		for model in (self.model, getattr(self, "features_cpu", None)):
+			features = getattr(model, "features", model)
+			if features is not None and hasattr(features, "garrison_out_weight"):
+				features.garrison_out_weight.fill_(weight)
+				features.garrison_out_target.fill_(target)
 		if all(float(getattr(self.config, name, start)) == start for name, _, start in PHI_FIELDS):
 			return
 		values = phi_now(self.config, self.version)

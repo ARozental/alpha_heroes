@@ -263,6 +263,14 @@ class CampaignConfig:
 	# marginal value falling toward f; the income counts at its flat price (not discounted); ramped with the phi_ values
 	# from phi_from (1 today, 1/3 the target), into the labels and the model's buffer; 1: as before, bit for bit
 	phi_stock_floor: float = 1.0
+	# GARRISON_SWAP's OUT rows (deploy 85, the user via e5, 2026-11-16: the swap's one learned start-rare -4.40 for both
+	# directions kept our main hero parked in its town 11 days a game): with garrison_out_on, the OUT rows' start ramps
+	# from the learned multi_garrison to garrison_out in garrison_out_ramp equal steps from garrison_out_from (by version:
+	# the model's garrison_out_weight / _target buffers); off: as before, bit for bit
+	garrison_out_on: bool = False
+	garrison_out: float = 0.0
+	garrison_out_from: int = 0
+	garrison_out_ramp: int = 20
 	# The last town's stake term of B2's prior ((1 - f) x phi more at stake when we own exactly one town; e5: most of every
 	# game, a read input's size on common states): off (the default), the stake as before; its own decision later
 	no_town_last_town: bool = False
