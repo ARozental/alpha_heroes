@@ -1183,6 +1183,8 @@ class CampaignModelV2(nn.Module):
 		worth = torch.cat([scales(known.tavern_worth.clamp(min=0), (1000, 3000, 10000)), torch.tanh(known.hire_gain / 2000).unsqueeze(-1)], dim=-1)
 		learned[A_.HIRE] = torch.einsum("btd,bsd->bts", self.hire_q(own_towns), self.hire_k(state.tavern)) / math.sqrt(d) + self.hire_worth(worth).squeeze(-1).unsqueeze(1)
 		prior[A_.HIRE] = ft.value_logit(known.hire_gain).unsqueeze(1).expand(b, TO, c.N_TAVERN)
+		if known.get("hire_main") is not None:  # (M: the bonus for a hero that would become our new main)
+			prior[A_.HIRE] = prior[A_.HIRE] + known.hire_main.unsqueeze(1)
 		offers[A_.HIRE] = best_legal(prior[A_.HIRE], x["hire_mask"]) + hire_weight * known.hire_want
 		# ARMY and UPGRADE: each stack (its holder's token with it) against each holder
 		holders = torch.cat([own_heroes, own_towns, state.other.unsqueeze(1)], dim=1)

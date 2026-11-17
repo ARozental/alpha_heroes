@@ -244,7 +244,7 @@ def skill_value(primary, skills, experience, spells, t):
 	level = fractional_level(experience.clamp(min=0).float(), t.level_experience)
 	whole = level.floor()
 	levels = skills.clamp(min=0).sum(dim=-1).float()
-	known = (spells.float() * t.spell_value).sum(dim=-1)
+	known = (spells.float() * t.spell_value).sum(dim=-1) if spells is not None else 0.0  # (None: without spells, main_scores')
 	return t.skill_level * (levels - t.fresh_skill_levels) + t.primary_point * extra * (extra + 1) / 2 + t.level_bonus * (whole - 1).clamp(min=0) + (level - whole) * next_level_gain(primary, t) + known
 
 
@@ -1088,6 +1088,71 @@ MAIN_SKILL_SCORE, SCOUT_SKILL_SCORE = skill_table(MAIN_SKILLS), skill_table(SCOU
 
 def own_towns(x):
 	return x["t_present"][:, : c.OWN_TOWNS] & (x["t_owner"][:, : c.OWN_TOWNS] == c.OWNER_SELF)
+
+
+# M (the user's main-hero design, 2026-11-16; e5's spec 18:52): a hero's own score in logits, without its army
+MAIN_TIERS = {"Solmyr": 8.0, "Gunnar": 2.0, "Kyrre": 2.0, "Dessa": 2.0, "Crag Hack": 2.0, "Tazar": 2.0, "Mephala": 2.0, "Deemer": 2.0, "Isra": 2.0, "Vidomina": 2.0}
+MAIN_LEVEL_GOLD = 4000.0  # (a level value of 4,000 gold: one logit)
+
+
+def hero_tier_table():
+	"""[HERO_TYPE_VOCAB + 1] each hero type's tier (MAIN_TIERS by the vocab's names; 0 the others and the extra row)."""
+	from .vocab import raw
+
+	table = torch.zeros(c.HERO_TYPE_VOCAB + 1)
+	for hero in raw()["heroes"]:
+		if hero["name"] in MAIN_TIERS and 0 <= hero["id"] < c.HERO_TYPE_VOCAB:
+			table[hero["id"]] = MAIN_TIERS[hero["name"]]
+	return table
+
+
+def hero_faction_table():
+	"""[HERO_TYPE_VOCAB + 1] each hero type's faction id (the vocab's), FACTION_VOCAB where unknown (the extra row)."""
+	from .vocab import raw
+
+	ids = {f["key"]: f["id"] for f in raw()["factions"]}
+	table = torch.full((c.HERO_TYPE_VOCAB + 1,), c.FACTION_VOCAB, dtype=torch.long)
+	for hero in raw()["heroes"]:
+		faction = ids.get(hero.get("faction"), c.FACTION_VOCAB)
+		if 0 <= hero["id"] < c.HERO_TYPE_VOCAB and 0 <= faction < c.FACTION_VOCAB:
+			table[hero["id"]] = faction
+	return table
+
+
+def our_factions(x):
+	"""[B, FACTION_VOCAB + 1] bool: the factions of our towns (the extra row False)."""
+	faction = vocab_index(x["t_faction"][:, : c.OWN_TOWNS], c.FACTION_VOCAB)
+	have = (faction.unsqueeze(-1) == torch.arange(c.FACTION_VOCAB + 1, device=faction.device)) & own_towns(x).unsqueeze(-1)
+	return have.any(dim=1) & (torch.arange(c.FACTION_VOCAB + 1, device=faction.device) < c.FACTION_VOCAB)
+
+
+def level_value(primary, skills, experience, t):
+	"""A hero's level value (gold) [...]: Φ's skill_value without spells less a fresh hero's (e5's spec): the primary
+	points it was hired with are its points less one a level past the first (each level brings one), and their part of
+	skill_value is taken off; a fresh hero's secondary skill levels are skill_value's own fresh_skill_levels. 0 at least."""
+	points = primary.clamp(min=0).sum(dim=-1).float()
+	whole = fractional_level(experience.clamp(min=0).float(), t.level_experience).floor()
+	fresh = (points - (whole - 1).clamp(min=0) - t.primary_base).clamp(min=0)
+	return (skill_value(primary, skills, experience, None, t) - t.primary_point * fresh * (fresh + 1) / 2).clamp(min=0)
+
+
+def main_scores(types, primary, skills, experience, factions, t):
+	"""M's own score of heroes [B, N] in logits, without their armies (the user, 2026-11-16: "computed based on the hero
+	value itself, without accounting for the army"): the type's tier (MAIN_TIERS: Solmyr 8, nine heroes 2, the rest 0)
+	and its learned correction (t.hero_table_values), + the town bonus (t.town_bonus_value: 0..4, 2 at the start) where
+	the hero's faction is one of our towns' (factions: our_factions), + its level value / MAIN_LEVEL_GOLD."""
+	idx = vocab_index(types, c.HERO_TYPE_VOCAB)
+	native = factions.gather(1, t.hero_faction[idx]).float()
+	return t.hero_tier[idx] + t.hero_table_values()[idx] + t.town_bonus_value() * native + level_value(primary, skills, experience, t) / MAIN_LEVEL_GOLD
+
+
+def main_hire_bonus(tavern, ours, present, tavern_level):
+	"""M's HIRE prior bonus [B, N_TAVERN] (e5's spec: "will this hero become our new main"): relu(the tavern hero's
+	score - our best hero's) + its level value / MAIN_LEVEL_GOLD (the user: a level 10 hero's logit "would explode even if
+	we have a level 11 one"); our best is 0 with no hero of ours."""
+	best = ours.masked_fill(~present, float("-inf")).amax(dim=1, keepdim=True)
+	best = torch.where(present.any(dim=1, keepdim=True), best, torch.zeros_like(best))
+	return F.relu(tavern - best) + tavern_level / MAIN_LEVEL_GOLD
 
 
 def hero_roles(x, hero_strength):
