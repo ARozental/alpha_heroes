@@ -1205,7 +1205,7 @@ class CampaignModelV2(nn.Module):
 		gain_weight, slot_weight, last_weight = self.features.swap_priors()
 		gain, given, last = swap_terms(stack_power(x, self.features.fight_value))  # (a swap priced by the power it moves)
 		swapping = (swap_only + gain_weight * gain + last_weight * last[:, :, None, None]) * slots.swap_only.float()
-		prior[A_.ARMY] = self.features.army_prior(known.main_score if self.features.main_on else known.hero_strength[:, :HO]).expand_as(learned[A_.ARMY]) + swapping[..., None] * who  # (M: between heroes toward the higher own score)le
+		prior[A_.ARMY] = self.features.army_prior(known.main_score if self.features.main_on else known.hero_strength[:, :HO]).expand_as(learned[A_.ARMY]) + swapping[..., None] * whole  # (M: between heroes toward the higher own score)
 		offers[A_.ARMY] = best_legal(prior[A_.ARMY], x["army_mask"])  # (below 0 when every legal move leaves troops in a mine)
 		# its target slot (schema 16): each (stack, slot) pair's learned score and the slot's kind
 		keys = self.army_slot_k(slot_rows)
