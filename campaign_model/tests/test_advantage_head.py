@@ -58,6 +58,7 @@ def test_it_is_off_the_contract_and_at_the_policys_rate():
 	assert all(float(out[name].abs().max()) == 0.0 for name in ("adv_type", "adv_move", "adv_travel", "adv_named"))  # (0 to start)
 
 
+@pytest.mark.m_off  # (deploy 86: a test of the behaviour from before M)
 def test_an_older_checkpoint_loads_it_at_zero():
 	model, x, _ = setup(4)
 	state = {k: v for k, v in model.state_dict().items() if not k.startswith("advantage.")}
@@ -86,6 +87,7 @@ def test_at_weight_0_the_update_is_the_one_without_the_head():
 	assert not with_head.adv_outputs and metrics["adv_loss"] == 0.0 and "adv_ev" not in metrics
 
 
+@pytest.mark.m_off  # (deploy 86: a test of the behaviour from before M)
 def test_its_loss_reaches_its_own_weights_alone():
 	"""The head's term alone backpropagates into the head's weights and nothing else; and an update with it moves every
 	other weight exactly as one without it (no group clip binding)."""

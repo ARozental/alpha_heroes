@@ -1,3 +1,4 @@
+import pytest
 """The gain-per-movement view (2026-11-15, e5 for the user): a MOVE tile's value as gold a day (features.move_rate) and
 over the hero's capital (its IRR: features.hero_capital), their four bounded views (features.rate_views) through
 model_v2's pair_rate, a layer at 0 to begin with."""
@@ -47,6 +48,7 @@ def test_the_irr_and_the_best_use_of_any_hero():
 	assert torch.allclose(views[:, 0, :, 3], torch.tensor([[1.0, 0.0, 0.0], [0.0375 / 0.6, 0.0, 0.0], [1.0, 0.0, 0.0]]))
 
 
+@pytest.mark.m_off  # (deploy 86: a test of the behaviour from before M)
 def test_an_old_checkpoint_plays_bit_for_bit_and_the_pair_reads_the_views():
 	"""A state dict without pair_rate loads the loading model's, at 0 (zero_output; with_added): every output as the model's with the layer at 0, on
 	three seeds; and with the layer's weights not 0 the MOVE pair moves with the views."""
