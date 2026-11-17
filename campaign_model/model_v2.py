@@ -413,7 +413,11 @@ class CampaignModelV2(nn.Module):
 		before 2026-11-04's MOVE features with move_pair's first layer moved to its inputs now (migrate_move_inputs); one
 		from before 2026-11-04's question head with its fight and join weights in option_weights (migrate_option_head)."""
 		own = self.state_dict()
+		reset = self.features.main_on and "buy_book_reset" not in state_dict  # (M: the spellbook's learned block, once)
 		state = with_added(migrate_action_types(migrate_option_head(migrate_move_inputs(state_dict)), own), own)
+		if reset:
+			state = reset_book_row(state)
+		self.book_row_reset_now = reset  # (the learner zeroes the row's first moment after the optimizer's load)
 		return super().load_state_dict(pad_new_inputs(state, own), strict=strict, assign=assign)
 
 	def __init__(self, dim=64, cell_dim=16, heads=4, layers=2, share_target="share"):
@@ -527,6 +531,7 @@ class CampaignModelV2(nn.Module):
 		self.cast_q = zero_output(nn.Linear(d, d))
 		self.buy_item = small_embedding(c.N_BUY_ITEMS, d)
 		self.buy_q = zero_output(nn.Linear(d, d))
+		self.register_buffer("buy_book_reset", torch.zeros(()))  # (M: 1 once the spellbook's row was zeroed: reset_book_row)
 		self.dismiss_out = zero_output(nn.Linear(d, 1))
 		# ARTIFACT (schema 13): a hero's query against its artifact's own row (the hero encoder's) and what to do with it,
 		# at 0 to begin with; its prior: what the move does to Φ (model.CustomFeatures.artifact_prior)
@@ -1200,7 +1205,7 @@ class CampaignModelV2(nn.Module):
 		gain_weight, slot_weight, last_weight = self.features.swap_priors()
 		gain, given, last = swap_terms(stack_power(x, self.features.fight_value))  # (a swap priced by the power it moves)
 		swapping = (swap_only + gain_weight * gain + last_weight * last[:, :, None, None]) * slots.swap_only.float()
-		prior[A_.ARMY] = self.features.army_prior(known.hero_strength[:, :HO]).expand_as(learned[A_.ARMY]) + swapping[..., None] * whole
+		prior[A_.ARMY] = self.features.army_prior(known.main_score if self.features.main_on else known.hero_strength[:, :HO]).expand_as(learned[A_.ARMY]) + swapping[..., None] * who  # (M: between heroes toward the higher own score)le
 		offers[A_.ARMY] = best_legal(prior[A_.ARMY], x["army_mask"])  # (below 0 when every legal move leaves troops in a mine)
 		# its target slot (schema 16): each (stack, slot) pair's learned score and the slot's kind
 		keys = self.army_slot_k(slot_rows)
@@ -1557,6 +1562,18 @@ def migrate_action_types(state_dict, own):
 	if key in state and key in own and state[key].shape[0] < own[key].shape[0]:
 		old, types = state[key], state[key].shape[0] - 1  # (the old none row: its last)
 		state[key] = torch.cat([old[:types], own[key][types : own[key].shape[0] - 1].to(old), old[types:]])
+	return state
+
+
+def reset_book_row(state):
+	"""M (the user 2026-11-16, e5's option (a)): a state dict with BUY's spellbook item row (buy_item.weight[SPELLBOOK], the
+	book entry's whole learned part with buy_q: -6.7 on the live weights' legal books, a block the prior of 1.9 never
+	beat) at 0 and the marker buy_book_reset at 1, so it happens once: a checkpoint saved after holds the marker."""
+	state = dict(state)
+	weight = state["buy_item.weight"].clone()
+	weight[c.BUY_ARTIFACTS.index(ft.SPELLBOOK)] = 0.0
+	state["buy_item.weight"] = weight
+	state["buy_book_reset"] = torch.ones_like(state["buy_book_reset"])
 	return state
 
 

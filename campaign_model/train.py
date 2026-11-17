@@ -575,6 +575,20 @@ def load_optimizer(optimizer, model, saved, saved_keys):
 		print(f"campaign optimizer: Adam's moments kept by name{' (new groups: ' + ', '.join(moved) + ')' if moved else ''}, fresh for the new parameters: {', '.join(fresh) or 'none'}; dropped for the gone: {', '.join(gone) or 'none'}", flush=True)
 
 
+def zero_book_moment(optimizer, model):
+	"""M's spellbook reset (model_v2.reset_book_row): Adam's first moment of buy_item.weight's spellbook row at 0, so the
+	old direction does not walk the zeroed row on for some updates; its second moment kept (with both at 0 the bias
+	correction makes the row's first steps ~3x a normal step). Logged."""
+	from . import features as ft
+
+	row = c.BUY_ARTIFACTS.index(ft.SPELLBOOK)
+	p = model.buy_item.weight
+	state = optimizer.state.get(p)
+	if state and "exp_avg" in state:
+		state["exp_avg"][row] = 0.0
+	print(f"campaign: M's spellbook row reset at this load (buy_item.weight[{row}] = 0, its first moment 0{'' if state else ': no moments yet'})", flush=True)
+
+
 def fit_moments(optimizer, model):
 	"""Adam's moments loaded for a parameter whose shape has changed since (optimizer.load_state_dict does not check, and
 	the first step would fail): move_pair's first layer from before 2026-11-04's MOVE features moved with its weights
