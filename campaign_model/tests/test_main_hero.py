@@ -310,6 +310,13 @@ def test_the_book_row_resets_once(monkeypatch):
 	worker = model(monkeypatch, True)
 	worker.load_state_dict({k: v.clone() for k, v in saved.items()})
 	assert torch.equal(worker.buy_item.weight, m.buy_item.weight) and not worker.book_row_reset_now
+	from campaign_model.model import with_added  # (the eval's and the servers' path: with_added first fills the marker at 0)
+	served = model(monkeypatch, True)
+	served.load_state_dict(with_added(old, served.state_dict()))
+	assert float(served.buy_item.weight[BOOK].abs().max()) == 0.0 and served.book_row_reset_now
+	again = model(monkeypatch, True)
+	again.load_state_dict(with_added(saved, again.state_dict()))
+	assert float(again.buy_item.weight[BOOK][0]) == pytest.approx(0.07) and not again.book_row_reset_now
 
 
 def test_the_reset_row_moves_by_the_gradient_and_its_first_moment_is_0(monkeypatch):

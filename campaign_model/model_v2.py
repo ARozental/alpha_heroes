@@ -413,7 +413,7 @@ class CampaignModelV2(nn.Module):
 		before 2026-11-04's MOVE features with move_pair's first layer moved to its inputs now (migrate_move_inputs); one
 		from before 2026-11-04's question head with its fight and join weights in option_weights (migrate_option_head)."""
 		own = self.state_dict()
-		reset = self.features.main_on and "buy_book_reset" not in state_dict  # (M: the spellbook's learned block, once)
+		reset = self.features.main_on and float(state_dict.get("buy_book_reset", torch.zeros(()))) == 0.0  # (M: the spellbook's learned block, once: no marker, or one at 0 (with_added's), not yet reset)
 		state = with_added(migrate_action_types(migrate_option_head(migrate_move_inputs(state_dict)), own), own)
 		if reset:
 			state = reset_book_row(state)
