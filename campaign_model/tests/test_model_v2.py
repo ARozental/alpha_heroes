@@ -1734,7 +1734,7 @@ def test_stepping_on_a_hero_or_a_town_of_ours_is_worth_what_the_army_gains_where
 		x["h_army_creature"][0, 1, 0], x["h_army_count"][0, 1, 0] = partner, count
 		with torch.no_grad():
 			f = m.domain_knowledge(x)
-			return t.meeting_value(x, f, torch.tensor([0]), windows, on_tile)[0], f
+			return t.meeting_value(x, f, torch.tensor([0]), windows, on_tile, f.army_main)[0], f
 
 	def led(creatures, counts, h, f):
 		rest = x["h_morale"][0, h].float() - ft.make_up_morales(x["h_army_creature"][0, h], x["h_army_count"][0, h].float(), t)
