@@ -378,6 +378,9 @@ class CustomFeatures(nn.Module):
 		self.hero_table = zeros(c.HERO_TYPE_VOCAB + 1)
 		self.town_bonus = zeros()
 		self.chest_main_xp = zeros()  # (M: the main's chest experience bonus, chest_main_xp_value)
+		# (M, the user 2026-11-16: "a positive bias if this is the main hero (like a +10 if it is), we can maybe reduce this
+		# logit to -1 otherwise": the spellbook's prior, book_values)
+		self.book_main, self.book_other = zeros(), zeros()
 		self.register_buffer("hero_tier", ft.hero_tier_table(), persistent=False)
 		self.register_buffer("hero_faction", ft.hero_faction_table(), persistent=False)
 		self.swap_gain, self.swap_slot, self.last_swap = zeros(), zeros(), zeros()  # (2026-11-08: a swap priced by the power it moves: swap_priors)
@@ -487,6 +490,7 @@ class CustomFeatures(nn.Module):
 			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost, self.multi_weight, self.give_all_cost, self.gather_risk, self.gather_cost, self.disband_cost, self.drop_scale, self.drop_sign, self.trade_waste,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
 			self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay, self.multi_split, self.multi_merge, self.multi_garrison, self.hero_table, self.town_bonus, self.chest_main_xp,
+			self.book_main, self.book_other,
 			self.swap_gain, self.swap_slot, self.last_swap,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
@@ -694,6 +698,16 @@ class CustomFeatures(nn.Module):
 	def hero_table_values(self):
 		"""M: each hero type's learned correction to its tier [HERO_TYPE_VOCAB + 1], 0 at the start, within -8..8."""
 		return ft.bounded(self.hero_table, -8.0, 8.0, 0.0, CORRECTION_STEP)
+
+	def book_values(self):
+		"""M: the spellbook entry's prior for the main hero by own score (10 at the start, 0..12) and for any other hero of
+		ours (-1 at the start, -6..2), in logits; a hero with a book has no legal entry."""
+		return ft.bounded(self.book_main, 0.0, 12.0, 10.0, CORRECTION_STEP), ft.bounded(self.book_other, -6.0, 2.0, -1.0, CORRECTION_STEP)
+
+	def book_prior(self, main):
+		"""M: BUY's spellbook prior [B, HO] (book_values by f.main)."""
+		on_main, other = self.book_values()
+		return torch.where(main, on_main, other)
 
 	def chest_main_xp_value(self):
 		"""M: the main hero's (by own score) bonus on a Treasure Chest's experience, in logits (4.5 at the start, 0..6): over
@@ -1880,7 +1894,7 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.hero_table", "features.town_bonus", "features.chest_main_xp", "buy_book_reset", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.hero_table", "features.town_bonus", "features.chest_main_xp", "features.book_main", "features.book_other", "buy_book_reset", "recruit_target_reset", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
@@ -2446,7 +2460,7 @@ class CampaignModel(nn.Module):
 		out["cast_logp"] = flat_log_softmax(self.cast_q(own_heroes) @ self.spell.weight.t() / math.sqrt(d), x["cast_mask"])
 		_, _, book_weight, _ = self.features.nk2_weights()
 		book = (torch.arange(c.N_BUY_ITEMS, device=g.device) == c.BUY_ARTIFACTS.index(ft.SPELLBOOK)).float()
-		buy_prior = book_weight * f.spellbook_wanted.float().unsqueeze(-1) * book  # [B, HO, N_BUY_ITEMS]
+		buy_prior = (self.features.book_prior(f.main).unsqueeze(-1) if self.features.main_on else book_weight * f.spellbook_wanted.float().unsqueeze(-1)) * book  # [B, HO, N_BUY_ITEMS] (M: +10 the main, -1 another)
 		out["buy_logp"] = flat_log_softmax(self.buy_q(own_heroes) @ self.buy_item.weight.t() / math.sqrt(d) + buy_prior, x["buy_mask"])
 		out["dismiss_logp"] = flat_log_softmax(self.dismiss_out(own_heroes).squeeze(-1), x["dismiss_mask"])
 		legal = x["buy_mask"].reshape(b, -1)

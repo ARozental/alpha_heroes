@@ -414,10 +414,13 @@ class CampaignModelV2(nn.Module):
 		from before 2026-11-04's question head with its fight and join weights in option_weights (migrate_option_head)."""
 		own = self.state_dict()
 		reset = self.features.main_on and float(state_dict.get("buy_book_reset", torch.zeros(()))) == 0.0  # (M: the spellbook's learned block, once: no marker, or one at 0 (with_added's), not yet reset)
+		recruit = self.features.main_on and float(state_dict.get("recruit_target_reset", torch.zeros(()))) == 0.0  # (M: RECRUIT's hero rows, once, the same way)
 		state = with_added(migrate_action_types(migrate_option_head(migrate_move_inputs(state_dict)), own), own)
 		if reset:
 			state = reset_book_row(state)
-		self.book_row_reset_now = reset  # (the learner zeroes the row's first moment after the optimizer's load)
+		if recruit:
+			state = reset_recruit_rows(state)
+		self.book_row_reset_now, self.recruit_rows_reset_now = reset, recruit  # (the learner zeroes their first moments after the optimizer's load)
 		return super().load_state_dict(pad_new_inputs(state, own), strict=strict, assign=assign)
 
 	def __init__(self, dim=64, cell_dim=16, heads=4, layers=2, share_target="share"):
@@ -532,6 +535,7 @@ class CampaignModelV2(nn.Module):
 		self.buy_item = small_embedding(c.N_BUY_ITEMS, d)
 		self.buy_q = zero_output(nn.Linear(d, d))
 		self.register_buffer("buy_book_reset", torch.zeros(()))  # (M: 1 once the spellbook's row was zeroed: reset_book_row)
+		self.register_buffer("recruit_target_reset", torch.zeros(()))  # (M: 1 once RECRUIT's hero rows took the garrison's: reset_recruit_rows)
 		self.dismiss_out = zero_output(nn.Linear(d, 1))
 		# ARTIFACT (schema 13): a hero's query against its artifact's own row (the hero encoder's) and what to do with it,
 		# at 0 to begin with; its prior: what the move does to Φ (model.CustomFeatures.artifact_prior)
@@ -1229,7 +1233,8 @@ class CampaignModelV2(nn.Module):
 		prior[A_.CAST] = torch.zeros_like(learned[A_.CAST])
 		book = (torch.arange(c.N_BUY_ITEMS, device=gold.device) == c.BUY_ARTIFACTS.index(ft.SPELLBOOK)).float()
 		learned[A_.BUY] = self.buy_q(own_heroes) @ self.buy_item.weight.t() / math.sqrt(d)
-		prior[A_.BUY] = (book_weight * known.spellbook_wanted.float().unsqueeze(-1) * book).expand_as(learned[A_.BUY])
+		book_prior = self.features.book_prior(known.main) if self.features.main_on else book_weight * known.spellbook_wanted.float()  # (M: +10 the main by own score, -1 another hero)
+		prior[A_.BUY] = (book_prior.unsqueeze(-1) * book).expand_as(learned[A_.BUY])
 		offers[A_.BUY] = best_legal(prior[A_.BUY], x["buy_mask"])
 		ids = torch.cat([x["h_artifacts"][:, :HO], x["h_backpack"][:, :HO]], dim=-1)
 		query = self.artifact_q(own_heroes)  # [B, HO, d]
@@ -1574,6 +1579,25 @@ def reset_book_row(state):
 	weight[c.BUY_ARTIFACTS.index(ft.SPELLBOOK)] = 0.0
 	state["buy_item.weight"] = weight
 	state["buy_book_reset"] = torch.ones_like(state["buy_book_reset"])
+	return state
+
+
+def recruit_rows(target):
+	"""The rows of recruit_head's last Linear for a RECRUIT target (0 the garrison, 1 the visiting hero), one per amount."""
+	return [a * c.N_RECRUIT_TARGETS + target for a in range(c.N_RECRUIT_AMOUNTS)]
+
+
+def reset_recruit_rows(state):
+	"""M (the user 2026-11-16: "I think this -24 is from the time we used NK2 as a teacher ... remove it, set to +1.9 again";
+	e5's form): a state dict with recruit_head's last Linear's hero-target rows (weights and bias) set to the garrison
+	target's, so the two targets' learned parts are equal for every state and the prior (+1.9 x safe for the visiting
+	hero) decides on day 0; each row then trains on its own; the marker recruit_target_reset at 1 (once)."""
+	state = dict(state)
+	for key in ("recruit_head.2.weight", "recruit_head.2.bias"):
+		value = state[key].clone()
+		value[recruit_rows(1)] = value[recruit_rows(0)]
+		state[key] = value
+	state["recruit_target_reset"] = torch.ones_like(state["recruit_target_reset"])
 	return state
 
 

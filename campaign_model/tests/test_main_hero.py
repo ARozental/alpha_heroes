@@ -10,6 +10,7 @@ from campaign_model import features as ft
 
 HO, TO = c.OWN_HEROES, c.OWN_TOWNS
 ORRIN, VALESKA, SOLMYR = 0, 1, 45  # (Castle, Castle, Tower)
+NEW_KEYS = ("buy_book_reset", "recruit_target_reset", "features.hero_table", "features.town_bonus", "features.chest_main_xp", "features.book_main", "features.book_other")
 LEVEL = {1: 0, 2: 1000, 3: 2000, 4: 3200, 5: 4600, 10: 14700, 11: 17500}  # (VCMI's experience table)
 
 
@@ -145,7 +146,7 @@ def test_the_chest(monkeypatch):
 
 def test_the_new_keys_load_at_their_starts(monkeypatch):
 	m = model(monkeypatch, True)
-	old = {k: v for k, v in m.state_dict().items() if k not in ("features.hero_table", "features.town_bonus", "features.chest_main_xp")}
+	old = {k: v for k, v in m.state_dict().items() if k not in NEW_KEYS}
 	loading = model(monkeypatch, True)
 	with torch.no_grad():
 		loading.features.hero_table.fill_(3.0)
@@ -281,6 +282,7 @@ def test_the_level_ups_prior_is_nk2s_with_the_main_by_own_score(monkeypatch):
 
 
 BOOK = c.BUY_ARTIFACTS.index(ft.SPELLBOOK)
+NEW_KEYS = ("buy_book_reset", "recruit_target_reset", "features.hero_table", "features.town_bonus", "features.chest_main_xp", "features.book_main", "features.book_other")
 
 
 def trained_state(monkeypatch):
@@ -288,7 +290,7 @@ def trained_state(monkeypatch):
 	m = model(monkeypatch, False)
 	with torch.no_grad():
 		m.buy_item.weight[BOOK] = 0.3
-	return {k: v for k, v in m.state_dict().items() if k not in ("buy_book_reset", "features.hero_table", "features.town_bonus", "features.chest_main_xp")}
+	return {k: v for k, v in m.state_dict().items() if k not in NEW_KEYS}
 
 
 def test_the_book_row_resets_once(monkeypatch):
@@ -395,3 +397,84 @@ def test_every_prior_between_two_heroes_sends_the_army_to_the_main(monkeypatch):
 	gain = float(t.gain(t.meeting_gain))
 	assert by_score == pytest.approx(max(led(0, 21) - apart, 0.0) * gain, rel=1e-4, abs=1e-3)  # (joined under the main)
 	assert by_army == pytest.approx(max(led(1, 21) - apart, 0.0) * gain, rel=1e-4, abs=1e-3) and by_army > by_score  # (under the scout: its multiplier makes more of it)
+
+
+def test_the_spellbook_prior(monkeypatch):
+	"""The user (2026-11-16): the main hero's book +10, another hero's -1 (book_values); off: Nullkiller2's."""
+	x = inputs()
+	hero(x, 0, SOLMYR, 1)
+	hero(x, 1, ORRIN, 1)
+	on_m = model(monkeypatch, True)
+	f = known(on_m, x)
+	assert bool(f.main[0, 0]) and not bool(f.main[0, 1])
+	assert on_m.features.book_prior(f.main)[0, :2].tolist() == pytest.approx([10.0, -1.0])
+
+
+def recruit_state(monkeypatch):
+	m = model(monkeypatch, False)
+	with torch.no_grad():
+		last = m.recruit_head[2]
+		last.weight.normal_(0, 0.05)
+		last.bias.normal_(0, 0.05)
+		last.weight[1::2] -= 0.5  # (the hero rows far under the garrison's, as the teacher left them)
+	return {k: v for k, v in m.state_dict().items() if k not in NEW_KEYS}
+
+
+def recruit_parts(m, x):
+	from campaign_model.model_v2 import recruit_rows
+
+	cap = {}
+	hook = m.recruit_head.register_forward_hook(lambda mod, i, o: cap.__setitem__("out", o))
+	with torch.no_grad():
+		m(dict(x))
+	hook.remove()
+	out = cap["out"].reshape(*cap["out"].shape[:-1], c.N_RECRUIT_AMOUNTS, c.N_RECRUIT_TARGETS)
+	return out[..., 0], out[..., 1]
+
+
+def test_the_recruit_rows_copy_once(monkeypatch):
+	from campaign_model.model import with_added
+
+	old = recruit_state(monkeypatch)
+	x = inputs()
+	hero(x, 0, ORRIN, 1)
+	off = model(monkeypatch, False)
+	off.load_state_dict(old)
+	g, h = recruit_parts(off, x)
+	assert float((g - h).abs().max()) > 0.1 and not off.recruit_rows_reset_now
+	on = model(monkeypatch, True)
+	on.load_state_dict(old)
+	g, h = recruit_parts(on, x)
+	assert float((g - h).abs().max()) < 1e-6 and on.recruit_rows_reset_now and float(on.recruit_target_reset) == 1.0
+	with torch.no_grad():
+		on.recruit_head[2].bias[1] += 0.3  # (training moves a hero row)
+	saved = on.state_dict()
+	for loader in (lambda m: m.load_state_dict(saved), lambda m: m.load_state_dict({k: v.clone() for k, v in saved.items()}), lambda m: m.load_state_dict(with_added(saved, m.state_dict()))):
+		again = model(monkeypatch, True)
+		loader(again)
+		assert torch.equal(again.recruit_head[2].bias, on.recruit_head[2].bias) and not again.recruit_rows_reset_now
+	served = model(monkeypatch, True)
+	served.load_state_dict(with_added(old, served.state_dict()))
+	assert served.recruit_rows_reset_now
+
+
+def test_the_recruit_hero_rows_train_apart(monkeypatch):
+	from campaign_model.train import make_optimizer, zero_recruit_moments
+
+	m = model(monkeypatch, True).train()
+	m.load_state_dict(recruit_state(monkeypatch))
+	optimizer = make_optimizer(m)
+	zero_recruit_moments(optimizer, m)
+	x = inputs()
+	hero(x, 0, ORRIN, 1)
+	x["t_visiting"][:, 0] = 0
+	mask = torch.zeros_like(x["recruit_mask"]).reshape(x["recruit_mask"].shape[0], -1)
+	mask[:, :8] = True
+	x["recruit_mask"] = mask.reshape(x["recruit_mask"].shape)
+	for _ in range(2):
+		optimizer.zero_grad()
+		out = m(dict(x))
+		(-out["recruit_logp"].reshape(out["recruit_logp"].shape[0], -1)[:, 1].sum() - out["type_logp"][:, c.ActionType.RECRUIT].sum()).backward()
+		optimizer.step()
+	w = m.recruit_head[2].weight.detach()
+	assert float((w[1::2] - w[0::2]).abs().max()) > 0  # (the hero rows move apart from the garrison's)
