@@ -1290,10 +1290,11 @@ class CampaignModelV2(nn.Module):
 			named = label_weight * (label_action == int(action)).to(state.glob.dtype)  # [B]: Nullkiller2's own choice is of this type
 			if action == A_.END:
 				own_end = adv_types["adv_type"][:, action] + adv_types["adv_named"][:, action] * (label_action == int(action)).to(state.glob.dtype)
-				scores.append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named + pair[:, 0] + adv_gain * own_end.clamp(-ADV_CLIP, ADV_CLIP))
+				close = self.features.exchange_close_term(x["g_kind"]).to(state.glob.dtype)  # (0 off and at a turn decision)
+				scores.append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named + pair[:, 0] + close + adv_gain * own_end.clamp(-ADV_CLIP, ADV_CLIP))
 				legal_types.append((x["g_kind"] == c.DecisionKind.TURN) | (x["g_kind"] == c.DecisionKind.EXCHANGE))
 				if reading is not None:
-					reading["plain"].append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named + pair[:, 0])
+					reading["plain"].append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named + pair[:, 0] + close)
 					reading["kl"].append(torch.zeros_like(own_end))
 					reading["read"].append((adv_gain * own_end.clamp(-ADV_CLIP, ADV_CLIP)).abs().detach())
 				continue

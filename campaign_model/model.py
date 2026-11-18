@@ -376,6 +376,12 @@ class CustomFeatures(nn.Module):
 		# (deploy 85, the user 2026-11-16: "going in with a minus and going out is not (trainable bias from 0?)": GARRISON_SWAP's
 		# prior on the pure OUT rows, its own learned start from 0; garrison_out_rows, multi_garrison_out_start)
 		self.multi_garrison_out = zeros()
+		# (the fresh run, the user 2026-11-18: "let's give that option a plus to its logit as is") END's starting preference in
+		# an EXCHANGE decision (never at a turn decision: the type head is shared), learned from its start
+		# (exchange_close_start), switched on by config.exchange_close (exchange_close_on, set by learner.set_advice_prior
+		# and carried in the weights to every server); 0 off: the model as before, bit for bit
+		self.exchange_close = zeros()
+		self.register_buffer("exchange_close_on", torch.zeros(()))
 		# M (the user's main-hero design, e5's spec 2026-11-16 18:52; ALPHA_MAIN_HERO): each hero type's learned correction to
 		# its tier (ft.MAIN_TIERS) and the town bonus (0..4, 2 at the start) of main_scores; the tables as non-persistent buffers
 		self.hero_table = zeros(c.HERO_TYPE_VOCAB + 1)
@@ -720,6 +726,16 @@ class CustomFeatures(nn.Module):
 	def town_bonus_value(self):
 		"""M: the town bonus of a hero native to one of our towns, 2 at the start, within 0..4."""
 		return ft.bounded(self.town_bonus, 0.0, 4.0, 2.0, CORRECTION_STEP)
+
+	def exchange_close_start(self):
+		"""END's starting preference in an EXCHANGE decision (the fresh run, 2026-11-18): EXCHANGE_CLOSE_START at the start,
+		within 0..6, learned at the prior scalars' step."""
+		return ft.bounded(self.exchange_close, 0.0, 6.0, EXCHANGE_CLOSE_START, CORRECTION_STEP)
+
+	def exchange_close_term(self, kind):
+		"""[B]: END's score's term at each decision: exchange_close_start at an EXCHANGE decision when exchange_close_on, else
+		exactly 0 (a turn decision's END, and every decision with it off)."""
+		return self.exchange_close_on * (kind == c.DecisionKind.EXCHANGE).to(self.exchange_close.dtype) * self.exchange_close_start()
 
 	def multi_garrison_out_start(self):
 		"""GARRISON_SWAP's start on the pure OUT rows (deploy 85, garrison_out_rows): 0 at the start (a plain option, like
@@ -1915,7 +1931,9 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.multi_garrison_out", "features.hero_table", "features.town_bonus", "features.chest_main_xp", "features.book_main", "features.book_other", "buy_book_reset", "recruit_target_reset", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+EXCHANGE_CLOSE_START = 0.5  # (END's starting preference in an EXCHANGE decision: set from a fresh model's dialogs, 2026-11-18)
+
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.multi_garrison_out", "features.hero_table", "features.town_bonus", "features.chest_main_xp", "features.book_main", "features.book_other", "buy_book_reset", "recruit_target_reset", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy", "features.exchange_close", "features.exchange_close_on")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,

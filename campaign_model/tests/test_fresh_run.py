@@ -72,3 +72,43 @@ def test_a_fresh_models_weights_load_unchanged_once_its_reset_markers_are_set():
 	assert torch.equal(served.buy_item.weight, fresh.buy_item.weight)
 	assert torch.equal(served.recruit_head[2].weight[recruit_rows(1)], fresh.recruit_head[2].weight[recruit_rows(1)])
 	assert not served.book_row_reset_now and not served.recruit_rows_reset_now
+
+
+def test_the_close_preference_moves_end_at_exchange_rows_only_and_off_is_identical():
+	"""config.exchange_close (the user, 2026-11-18): off, the model's outputs bit for bit; on, END's type log-probability
+	rises at EXCHANGE rows by its start (0.5), every TURN row's outputs identical."""
+	import numpy as np
+
+	from campaign_model import constants as c
+	from campaign_model.config import CampaignConfig
+	from campaign_model.learner import set_advice_prior
+	from campaign_model.model import EXCHANGE_CLOSE_START, build_model
+	from campaign_model.tests.test_model_v2 import rich_inputs
+	from campaign_model.train import model_kwargs
+
+	torch.manual_seed(1)
+	model = build_model(model_kwargs(CampaignConfig(model_architecture="v2"))).eval()
+	x = {k: torch.as_tensor(v) for k, v in rich_inputs(32, seed=4).items()}
+	exchange = x["g_kind"] == c.DecisionKind.EXCHANGE
+	assert exchange.any() and (~exchange).any()
+	with torch.no_grad():
+		before = model(x)
+		set_advice_prior(model, CampaignConfig(model_architecture="v2", exchange_close=False))
+		off = model(x)
+		set_advice_prior(model, CampaignConfig(model_architecture="v2", exchange_close=True))
+		on = model(x)
+	assert float(model.features.exchange_close_on) == 1.0 and abs(float(model.features.exchange_close_start()) - EXCHANGE_CLOSE_START) < 1e-6
+	for k, v in before.items():
+		if torch.is_tensor(v):
+			assert torch.equal(v, off[k]), k
+	END = int(c.ActionType.END)
+	turn = ~exchange
+	for k, v in before.items():
+		if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == len(exchange):
+			assert torch.equal(v[turn], on[k][turn]), k
+	lift = on["type_logp"][exchange, END] - before["type_logp"][exchange, END]
+	finite = torch.isfinite(lift)
+	assert finite.any() and (lift[finite] > 0).all()
+	p = before["type_logp"][exchange, END].exp()[finite]
+	expected = torch.log(np.exp(EXCHANGE_CLOSE_START) / (1 - p + p * np.exp(EXCHANGE_CLOSE_START)))
+	assert torch.allclose(lift[finite], expected.to(lift.dtype), atol=1e-4)

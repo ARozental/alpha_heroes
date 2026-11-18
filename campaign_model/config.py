@@ -307,6 +307,10 @@ class CampaignConfig:
 	# 2026-11-18: a fresh run under today's settings from its first update): the loss shares' weights (loss_scale's, the
 	# balancer's memory of norms left fresh) and the value heads' held weights (head_weights_frozen). A resume ignores it
 	controls_from: str = ""
+	# END's trainable starting preference in an EXCHANGE decision (the user, 2026-11-18, for the fresh run: "let's give that
+	# option a plus to its logit as is"): model.CustomFeatures.exchange_close_start onto END's type score at exchange rows
+	# alone. False: the model as before, bit for bit
+	exchange_close: bool = False
 	# What the share heads V2, V5, V7 forecast (the model's "value" output; V_end is our share at the end either way):
 	#   "share"   our share of all empires' value VALUE_OFFSETS days on (from 1 / players)
 	#   "change"  how much the logit of that share changes by then (labels.share_change_labels; the user's design,
