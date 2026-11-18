@@ -220,6 +220,14 @@ class AlphaMapAI : public CAdventureAI
 	// dropped like a futile one for the rest of the day (loopsToday: futile is cleared by any change, so a cycle of two
 	// changing actions went on); counted in the summary's "loops_cut"
 	bool loopGuard = true;
+	// alpha_heroes patch (the fresh run, the user 2026-11-18: "on every dialog we can take exactly 1 action, then close it"):
+	// ALPHA_MAP_EXCHANGE_ACTIONS, the model's decisions in one exchange dialog at most (8, as before; 1: one action a
+	// meeting, END its "leave as is"), read once a game in Advice.cpp
+	int exchangeActions = 8;
+	// alpha_heroes patch (the fresh run, the user 2026-11-18: morale at half in our best army): ALPHA_MAP_TAKE_MORALE, the
+	// morale weight armies::takeBest uses for TAKE_BEST, TAKE_BEST_FAST and their x_take_* inputs (MoraleWeight.h); 1.0:
+	// Nullkiller2's getBestArmy weighting, as before. Nullkiller2's own play never reads it
+	double takeMorale = 1.0;
 	std::set<std::vector<int64_t>> seenToday;
 	std::set<std::tuple<int, int, int>> loopsToday;
 	int loopsCut = 0;

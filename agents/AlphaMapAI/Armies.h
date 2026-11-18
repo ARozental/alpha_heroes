@@ -26,7 +26,8 @@ struct Take
 	Army receiver;
 	Army giver;
 };
-std::optional<Take> takeBest(const CArmedInstance & receiver, const CArmedInstance & giver, const IGameSettings & settings, bool fast);
+// (moraleWeight: alpha_heroes patch, the fresh run; MoraleWeight.h: 1.0 Nullkiller2's weighting, 0.5 the fresh run's)
+std::optional<Take> takeBest(const CArmedInstance & receiver, const CArmedInstance & giver, const IGameSettings & settings, bool fast, double moraleWeight = 1.0);
 
 // DROP_SLOW: the army's stacks of its slowest speed (CCreature::getBaseSpeed, as vocab.json's "speed"), when it has more
 // than one speed; none otherwise

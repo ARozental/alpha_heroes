@@ -311,6 +311,18 @@ class CampaignConfig:
 	# option a plus to its logit as is"): model.CustomFeatures.exchange_close_start onto END's type score at exchange rows
 	# alone. False: the model as before, bit for bit
 	exchange_close: bool = False
+	# The model's decisions in one exchange dialog at most (the game's ALPHA_MAP_EXCHANGE_ACTIONS; play.window_settings: every
+	# game of a run alike, training and evaluation): 8 as before; 1 (the user, 2026-11-18, the fresh run): one action a
+	# meeting, then the dialog closes, END its "leave as is"
+	exchange_actions: int = 8
+	# Morale at this weight in our best army (the game's ALPHA_MAP_TAKE_MORALE; AlphaMapAI's MoraleWeight.h: TAKE_BEST,
+	# TAKE_BEST_FAST and their x_take_* inputs): each stack x (1 + weight x its morale's battle chance). 1.0: Nullkiller2's
+	# getBestArmy weighting, as before; 0.5 the fresh run's (the user, 2026-11-18: "make that half this effect")
+	take_morale: float = 1.0
+	# TAKE_BEST leads GIVE_ALL (the user, 2026-11-18: the default hand-over morale-aware): wherever TAKE_BEST is legal for
+	# the same receiver, GIVE_ALL's starting preference at most TAKE_BEST's - 1 (model.CustomFeatures.multi_prior;
+	# take_leads_on in the weights); GIVE_ALL stays legal. False: as before, bit for bit
+	take_best_leads: bool = False
 	# What the share heads V2, V5, V7 forecast (the model's "value" output; V_end is our share at the end either way):
 	#   "share"   our share of all empires' value VALUE_OFFSETS days on (from 1 / players)
 	#   "change"  how much the logit of that share changes by then (labels.share_change_labels; the user's design,

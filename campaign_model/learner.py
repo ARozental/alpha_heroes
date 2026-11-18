@@ -209,6 +209,8 @@ def set_advice_prior(model, config, version=None):
 			features.adv_gain.fill_(float(getattr(config, "adv_gain", 0.0)))
 		if hasattr(features, "exchange_close_on"):  # (END's starting preference in an exchange: config.exchange_close)
 			features.exchange_close_on.fill_(1.0 if getattr(config, "exchange_close", False) else 0.0)
+		if hasattr(features, "take_leads_on"):  # (TAKE_BEST leads GIVE_ALL: config.take_best_leads)
+			features.take_leads_on.fill_(1.0 if getattr(config, "take_best_leads", False) else 0.0)
 		if hasattr(features, "town_guard"):  # (bundle 60's town guard: config.town_guard)
 			features.town_guard.fill_(float(getattr(config, "town_guard", 0.0)))
 		if hasattr(features, "build_economy"):  # (the economy and BUILD: config.build_economy)

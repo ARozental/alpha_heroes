@@ -297,5 +297,8 @@ def test_the_games_get_the_runs_window_settings():
 	from campaign_model.config import CampaignConfig
 	from campaign_model.play import window_settings
 
-	assert dict(window_settings(CampaignConfig())) == {"ALPHA_MAP_FURTHER_WINDOWS": "1", "ALPHA_MAP_UNSEEN_EXITS": "1"}
-	assert dict(window_settings(CampaignConfig(further_windows=0, unseen_exits=False))) == {"ALPHA_MAP_FURTHER_WINDOWS": "0", "ALPHA_MAP_UNSEEN_EXITS": "0"}
+	assert dict(window_settings(CampaignConfig())) == {"ALPHA_MAP_FURTHER_WINDOWS": "1", "ALPHA_MAP_UNSEEN_EXITS": "1", "ALPHA_MAP_EXCHANGE_ACTIONS": "8", "ALPHA_MAP_TAKE_MORALE": "1"}
+	assert dict(window_settings(CampaignConfig(further_windows=0, unseen_exits=False))) == {"ALPHA_MAP_FURTHER_WINDOWS": "0", "ALPHA_MAP_UNSEEN_EXITS": "0", "ALPHA_MAP_EXCHANGE_ACTIONS": "8", "ALPHA_MAP_TAKE_MORALE": "1"}
+	# (the fresh run, 2026-11-18: one action a meeting; 8, AlphaMapAI's own default, as before)
+	assert dict(window_settings(CampaignConfig(exchange_actions=1)))["ALPHA_MAP_EXCHANGE_ACTIONS"] == "1"
+	assert dict(window_settings(CampaignConfig(take_morale=0.5)))["ALPHA_MAP_TAKE_MORALE"] == "0.5"

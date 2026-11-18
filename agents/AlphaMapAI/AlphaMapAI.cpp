@@ -1160,9 +1160,10 @@ void AlphaMapAI::exchange(ObjectInstanceID first, ObjectInstanceID second, Query
 {
 	// Troop moves between the two armies while the server holds the exchange open, until the model ends it, 8 at
 	// most (it was 32: joint7's model, never taught exchanges, used all 32 in nearly every one, 55% of its decisions,
-	// 2026-11-01; Nullkiller2 makes a few)
+	// 2026-11-01; Nullkiller2 makes a few); exchangeActions at most (ALPHA_MAP_EXCHANGE_ACTIONS, 8 by default; 1: one
+	// action a meeting, then the dialog closes with no decision of its own, END the "leave as is")
 	futile.clear();
-	for(int n = 0; n < 8 && !stopping; ++n)
+	for(int n = 0; n < exchangeActions && !stopping; ++n)
 	{
 		auto decision = encode(DecisionKind::EXCHANGE, first, second);
 		if(!decision.inputs.any(In::army_mask) && !decision.inputs.any(In::artifact_mask) && !decision.inputs.any(In::multi_mask))

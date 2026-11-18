@@ -315,6 +315,8 @@ void AlphaMapAI::initAdvice()
 	revisitEntry = adviceEnvironment("ALPHA_MAP_REVISIT", "1") != "0"; // (alpha_heroes patch, bundle 60: AlphaMapAI.h)
 	holdDay = adviceEnvironment("ALPHA_MAP_HOLD_DAY", "1") != "0"; // (alpha_heroes patch, bundle 60: AlphaMapAI.h heldToday)
 	loopGuard = adviceEnvironment("ALPHA_MAP_LOOP_GUARD", "1") != "0"; // (alpha_heroes patch, bundle 60: AlphaMapAI.h)
+	exchangeActions = std::clamp(std::stoi(adviceEnvironment("ALPHA_MAP_EXCHANGE_ACTIONS", "8")), 1, 32); // (alpha_heroes patch, the fresh run: AlphaMapAI.h)
+	takeMorale = std::clamp(std::stod(adviceEnvironment("ALPHA_MAP_TAKE_MORALE", "1")), 0.0, 1.0); // (alpha_heroes patch, the fresh run: AlphaMapAI.h)
 	followAdvice = std::clamp(std::stod(adviceEnvironment("ALPHA_MAP_FOLLOW_ADVICE", "0")), 0.0, 1.0);
 #ifdef ALPHA_MAP_NK2_ADVICE
 	if(adviceProbability <= 0 && !nk2Inputs)

@@ -382,6 +382,8 @@ class CustomFeatures(nn.Module):
 		# and carried in the weights to every server); 0 off: the model as before, bit for bit
 		self.exchange_close = zeros()
 		self.register_buffer("exchange_close_on", torch.zeros(()))
+		# (the fresh run, config.take_best_leads) TAKE_BEST leads GIVE_ALL where both are on offer to the same receiver
+		self.register_buffer("take_leads_on", torch.zeros(()))
 		# M (the user's main-hero design, e5's spec 2026-11-16 18:52; ALPHA_MAIN_HERO): each hero type's learned correction to
 		# its tier (ft.MAIN_TIERS) and the town bonus (0..4, 2 at the start) of main_scores; the tables as non-persistent buffers
 		self.hero_table = zeros(c.HERO_TYPE_VOCAB + 1)
@@ -1204,7 +1206,13 @@ class CustomFeatures(nn.Module):
 			cost[..., kind] = -starts[i]
 		swap = c.MultiKind.GARRISON_SWAP  # (deploy 85: the pure OUT rows' own start; the rest keep multi_garrison's)
 		cost[..., swap] = torch.where(self.garrison_out_rows(x), -self.multi_garrison_out_start(), cost[..., swap])
-		return prior - cost
+		prior = prior - cost
+		# (config.take_best_leads, the fresh run: GIVE_ALL at most TAKE_BEST's - 1 where TAKE_BEST is legal for that receiver;
+		# off: the prior as before, bit for bit)
+		give, take = c.MultiKind.GIVE_ALL, c.MultiKind.TAKE_BEST
+		led = (self.take_leads_on > 0) & x["multi_mask"][:, :2, take]  # [B, 2]
+		prior[:, :2, give] = torch.where(led, torch.minimum(prior[:, :2, give], prior[:, :2, take] - TAKE_LEAD_MARGIN), prior[:, :2, give])
+		return prior
 
 	def artifact_prior(self, x, f):
 		"""What each ARTIFACT entry does to Φ, as a prior logit [B, HO, N_ARTIFACT_POSITIONS, N_ARTIFACT_TARGETS]
@@ -1931,9 +1939,10 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-EXCHANGE_CLOSE_START = 0.5  # (END's starting preference in an EXCHANGE decision: set from a fresh model's dialogs, 2026-11-18)
+TAKE_LEAD_MARGIN = 1.0  # (config.take_best_leads: TAKE_BEST's lead over GIVE_ALL in starting preference, at least)
+EXCHANGE_CLOSE_START = 1.6  # (END's starting preference in an EXCHANGE decision: set from a fresh model's dialogs, 2026-11-18)
 
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.multi_garrison_out", "features.hero_table", "features.town_bonus", "features.chest_main_xp", "features.book_main", "features.book_other", "buy_book_reset", "recruit_target_reset", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy", "features.exchange_close", "features.exchange_close_on")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.multi_garrison_out", "features.hero_table", "features.town_bonus", "features.chest_main_xp", "features.book_main", "features.book_other", "buy_book_reset", "recruit_target_reset", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy", "features.exchange_close", "features.exchange_close_on", "features.take_leads_on")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,

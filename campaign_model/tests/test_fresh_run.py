@@ -112,3 +112,36 @@ def test_the_close_preference_moves_end_at_exchange_rows_only_and_off_is_identic
 	p = before["type_logp"][exchange, END].exp()[finite]
 	expected = torch.log(np.exp(EXCHANGE_CLOSE_START) / (1 - p + p * np.exp(EXCHANGE_CLOSE_START)))
 	assert torch.allclose(lift[finite], expected.to(lift.dtype), atol=1e-4)
+
+
+def test_take_best_leads_give_all_where_both_are_on_offer_and_off_is_identical():
+	"""config.take_best_leads (the user, 2026-11-18): off, MULTI's prior bit for bit; on, wherever TAKE_BEST is legal for a
+	receiver GIVE_ALL's prior is at most TAKE_BEST's - TAKE_LEAD_MARGIN, every other entry unchanged."""
+	from campaign_model import constants as c
+	from campaign_model.config import CampaignConfig
+	from campaign_model.learner import set_advice_prior
+	from campaign_model.model import TAKE_LEAD_MARGIN, build_model
+	from campaign_model.tests.test_model_v2 import rich_inputs
+	from campaign_model.train import model_kwargs
+
+	torch.manual_seed(2)
+	model = build_model(model_kwargs(CampaignConfig(model_architecture="v2"))).eval()
+	x = {k: torch.as_tensor(v) for k, v in rich_inputs(48, seed=6).items()}
+	give, take = c.MultiKind.GIVE_ALL, c.MultiKind.TAKE_BEST
+	x["multi_mask"] = x["multi_mask"].clone()
+	x["multi_mask"][:16, :2, take] = True  # (rich_inputs offers none: both on offer at the first rows, the prior as computed)
+	x["multi_mask"][:24, :2, give] = True
+	with torch.no_grad():
+		before = model.domain_knowledge(x).multi_prior.clone()
+		set_advice_prior(model, CampaignConfig(model_architecture="v2", take_best_leads=False))
+		off = model.domain_knowledge(x).multi_prior.clone()
+		set_advice_prior(model, CampaignConfig(model_architecture="v2", take_best_leads=True))
+		on = model.domain_knowledge(x).multi_prior.clone()
+	assert torch.equal(before, off)
+	legal = x["multi_mask"][:, :2, take]
+	assert legal.any(), "the inputs offer no TAKE_BEST"
+	assert (on[:, :2, give][legal] <= on[:, :2, take][legal] - TAKE_LEAD_MARGIN + 1e-6).all()
+	assert torch.equal(on[:, :2, give][~legal], before[:, :2, give][~legal])
+	rest = torch.ones_like(on, dtype=torch.bool)
+	rest[:, :2, give] = False
+	assert torch.equal(on[rest], before[rest])
