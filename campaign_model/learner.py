@@ -162,6 +162,17 @@ VALVE_WINDOW, VALVE_HORIZON, VALVE_S_MIN, VALVE_K_MIN, VALVE_RATE = 7, 50, 0.1, 
 MAX_LABEL_STALENESS = 2  # model versions: older precomputed labels (labeler.py) are recomputed with the current tables
 
 
+def mark_resets_done(model):
+	"""A freshly built model's one-time reset markers (model_v2's buy_book_reset, recruit_target_reset) at 1: it holds no
+	learned block to reset, and with the markers at 0 every load of its weights (the inference servers', the Mac
+	worker's on each publish; the run's first resume) would zero the spellbook row and copy the RECRUIT garrison rows over
+	the hero rows it learned (the fresh run of 2026-11-18)."""
+	for name in ("buy_book_reset", "recruit_target_reset"):
+		marker = getattr(model, name, None)
+		if marker is not None:
+			marker.fill_(1.0)
+
+
 def controls_of(state):
 	"""config.controls_from's part of a campaign checkpoint: (loss_scale with its weights alone, the balancer's norms
 	fresh; or None), the value heads' held weights (or None)."""
@@ -325,6 +336,7 @@ class CampaignLearner:
 			device = torch.device("cpu")
 			self.device = device
 		self.model = build_model(self.kwargs).to(device).eval()
+		mark_resets_done(self.model)  # (a fresh model: nothing to reset; a resumed or init_from one is rebuilt and loaded below)
 		self.optimizer = make_optimizer(self.model, config)
 		self.version, self.lr_scale, self.games_used = 1, 1.0, 0  # version: the served model's (1: as the run starts)
 		self.teacher_weight = config.teacher_kl  # (the teacher KL's weight, adapted after each update: config.teacher_kl_target)
