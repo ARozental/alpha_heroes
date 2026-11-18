@@ -40,7 +40,10 @@ def test_the_update_is_the_same_up_to_summation_order_and_logs_the_same(budget):
 	# train.gradient_check): its readings are that micro-batch's, so a re-deal changes which rows they read. They steer
 	# only the loss shares' balancing, frozen on the run's line (loss_shares_freeze 1420); every other number sums over
 	# the minibatch's counts
-	ONE_MICRO_BATCH = {"grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share", "grad_raw_policy", "grad_raw_value", "grad_raw_foresight", "grad_raw_plan"}
+	# (grad_raw_entropy too, 2026-11-18: one of the same check's terms; it read exactly 0 on this test's random model until a
+	# new parameter (features.exchange_close) shifted the model's initial draws; joint7's checkpoint gives the same outputs
+	# and entropy gradients before and after, bit for bit)
+	ONE_MICRO_BATCH = {"grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share", "grad_raw_policy", "grad_raw_value", "grad_raw_foresight", "grad_raw_plan", "grad_raw_entropy"}
 	assert {key for key, _, _ in differ} <= ONE_MICRO_BATCH, [d for d in differ if d[0] not in ONE_MICRO_BATCH]
 	assert len([k for k in mp if not k.endswith(clocks)]) - len(differ) > 50  # (the rest the same: KL, clip fraction, entropy, the value's, the foresight's parts)
 	assert "window_over_dealt" not in mp  # (off: nothing of it runs)
