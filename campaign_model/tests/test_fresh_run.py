@@ -145,3 +145,26 @@ def test_take_best_leads_give_all_where_both_are_on_offer_and_off_is_identical()
 	rest = torch.ones_like(on, dtype=torch.bool)
 	rest[:, :2, give] = False
 	assert torch.equal(on[rest], before[rest])
+
+
+def test_the_multi_prior_backpropagates_with_take_best_leading_on_and_off():
+	"""(The first smoke of 2026-11-18: an in-place write of GIVE_ALL's column, read from TAKE_BEST's, broke the backward
+	whether the switch was on or off.) A loss on MULTI's prior back through the model, both ways."""
+	from campaign_model import constants as c
+	from campaign_model.config import CampaignConfig
+	from campaign_model.learner import set_advice_prior
+	from campaign_model.model import build_model
+	from campaign_model.tests.test_model_v2 import rich_inputs
+	from campaign_model.train import model_kwargs
+
+	torch.manual_seed(3)
+	model = build_model(model_kwargs(CampaignConfig(model_architecture="v2")))
+	x = {k: torch.as_tensor(v) for k, v in rich_inputs(16, seed=7).items()}
+	x["multi_mask"] = x["multi_mask"].clone()
+	x["multi_mask"][:, :2, c.MultiKind.TAKE_BEST] = True
+	for on in (False, True):
+		set_advice_prior(model, CampaignConfig(model_architecture="v2", take_best_leads=on))
+		model.zero_grad(set_to_none=True)
+		out = model(x)
+		loss = sum(v.float()[torch.isfinite(v.float())].sum() for k, v in out.items() if torch.is_tensor(v) and v.requires_grad and v.is_floating_point())
+		loss.backward()

@@ -1211,7 +1211,9 @@ class CustomFeatures(nn.Module):
 		# off: the prior as before, bit for bit)
 		give, take = c.MultiKind.GIVE_ALL, c.MultiKind.TAKE_BEST
 		led = (self.take_leads_on > 0) & x["multi_mask"][:, :2, take]  # [B, 2]
-		prior[:, :2, give] = torch.where(led, torch.minimum(prior[:, :2, give], prior[:, :2, take] - TAKE_LEAD_MARGIN), prior[:, :2, give])
+		capped = torch.where(led, torch.minimum(prior[:, :2, give], prior[:, :2, take] - TAKE_LEAD_MARGIN), prior[:, :2, give])
+		prior = prior.clone()  # (out of place: the backward still reads TAKE_BEST's column of the prior before it)
+		prior[:, :2, give] = capped
 		return prior
 
 	def artifact_prior(self, x, f):
