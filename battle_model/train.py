@@ -1151,6 +1151,17 @@ def save_checkpoint(path, model, optimizer, epoch, config, elapsed=0.0, lr_scale
 	save_atomically({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "model_kwargs": model_kwargs(config), "elapsed": elapsed, "lr_scale": lr_scale, "value_ev": value_ev, **extra}, path)
 
 
+def weights_md5(model):
+	"""The md5 of the model's parameters and persistent buffers, in state_dict order (config.battle_frozen's proof)."""
+	import hashlib
+
+	digest = hashlib.md5()
+	for name, tensor in model.state_dict().items():
+		digest.update(name.encode())
+		digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+	return digest.hexdigest()[:12]
+
+
 FROZEN_DROPPED = [0]  # (config.battle_frozen: the takes whose battles were dropped; for the tests)
 
 
@@ -1481,6 +1492,9 @@ def train(config, resume=False):
 
 	for group in optimizer.param_groups:
 		group["betas"] = (group["betas"][0], config.adam_beta2)
+	frozen_md5 = weights_md5(model) if config.battle_frozen else None
+	if config.battle_frozen:
+		print(f"battle frozen: no battle updates, no battle loader; the battle weights' md5 {frozen_md5}", flush=True)
 	try:
 		for epoch in itertools.count(first_epoch):
 			if (config.run_hours and elapsed() >= config.run_hours * 3600) or (not config.run_hours and epoch > config.epochs):
@@ -1501,6 +1515,8 @@ def train(config, resume=False):
 					if items is None:
 						if campaign.step(epoch - 1):
 							last_campaign = time.monotonic()
+							if config.battle_frozen:  # (the proof the battle model did not move, after each campaign update)
+								print(f"battle frozen: the battle weights' md5 {weights_md5(model)} (at the start {frozen_md5})", flush=True)
 						campaign.check()
 					if config.battle_frozen:  # (frozen: the battles are dropped, the loop only serves the campaign)
 						items = None

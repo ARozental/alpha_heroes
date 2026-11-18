@@ -30,3 +30,14 @@ def test_a_frozen_battle_model_drops_its_battles_and_has_no_battle_loader():
 	s.shared = SimpleNamespace(ceilings={"campaign": 20})
 	s.config, s.listener = SimpleNamespace(remote_slots=15), object()
 	assert s.workers("battle") == 0 and s.workers("campaign") == 35
+
+
+def test_the_battle_weights_md5_reads_every_parameter():
+	from battle_model.train import weights_md5
+
+	model = torch.nn.Linear(3, 2)
+	before = weights_md5(model)
+	assert weights_md5(model) == before
+	with torch.no_grad():
+		model.bias[0] += 1e-6
+	assert weights_md5(model) != before
