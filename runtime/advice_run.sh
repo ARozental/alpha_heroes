@@ -82,6 +82,33 @@
 # The battle learner since 2026-11-06 ~19:30: its trunk's beta1 0.95 (the plan's step 5: its gradient read as pure noise
 # a step since accumulate 2), and the escapes pressed down while its value head says we are ahead (the user: "another -3
 # for the logit if we are ahead and maybe something that scales nicely with how much we are ahead": priors.escape_ahead)
+# THE FRESH RUN joint8-fresh (the user, 2026-11-18, via e5: "restart a fresh run (all weights initialized but our fixed
+# biases and graph remain) for the campaign with the current battle model frozen and not training ... for around a day";
+# "Today's settings apply from the first update": yes). joint7 is kept whole and resumable: its line is 5e4d9ef's
+# runtime/advice_run.sh (runtime/deploy-backup-fresh.sh on the PC), its run dir untouched. Here:
+# - the campaign fresh: campaign.init_from empty (model_kwargs' initializers, the code's fixed priors), a new optimizer;
+#   campaign.controls_from = joint7's last campaign checkpoint for its training controls alone (the loss weights frozen
+#   since v1420: value 352.6, foresight 0.696; the value heads' held weights), none of its weights;
+# - the battle model joint7's last (runtime/saved/battle_joint7_frozen.pt), battle_frozen=true: no battle updates, no
+#   battle loader (generated_actors=0, no remote battle slots), no battle evals;
+# - every version-keyed start at full effect from update 1: loss_shares_freeze -1 (frozen from the start at the copied
+#   weights), value_jump_from 0, value_shared_from -100 (0.25 at once), head_scale_freeze -1 (the copied held weights),
+#   no_town_from -100 (0.1 at once), phi_from 0 with phi_ramp 1 (Φ's targets at once); the loop charge OFF
+#   (campaign.loop_charge 0: the user via e5, 2026-11-18 ~09:00, "We might not want a direct loop charge, for the fresh
+#   run"), schedule_action_price 1e-5 kept.
+# - campaign.exchange_close=true (the user via e5, 2026-11-18: "let's give that option a plus to its logit as is"): END's
+#   trainable starting preference in an EXCHANGE decision, 0.5 at the start (a fresh model's dialog-first decisions with no
+#   MULTI preference above 0 then leave at about 0.75: start 1.6, e5 for one action a meeting), within 0..6; never at
+#   a turn decision.
+# - campaign.exchange_actions=1 (the user via e5, 2026-11-18: "on every dialog we can take exactly 1 action, then close
+#   it"): AlphaMapAI asks one decision a meeting (ALPHA_MAP_EXCHANGE_ACTIONS), END its "leave as is".
+# - campaign.take_morale=0.5 (the user: "a 4% chance of getting an extra turn is not 1.04 times stronger ... make that
+#   half"): our TAKE_BEST weighs morale at half (ALPHA_MAP_TAKE_MORALE; AlphaMapAI's MoraleWeight.h); Nullkiller2's own
+#   play untouched.
+# - campaign.take_best_leads=true: GIVE_ALL's starting preference at most TAKE_BEST's - 1 where TAKE_BEST is on offer to
+#   the same receiver (the default hand-over morale-aware).
+# - campaign.learning_rate=3e-5 (e5 after the user's "do we need a higher LR?": the top of the user's rule; a fresh model
+#   has nothing learned to protect, the KL control still bounds each update; joint7's stays 1e-5).
 cd "$HOME/projects/alpha_heroes"
 export MALLOC_ARENA_MAX=2
 # ALPHA (empire.py: u = ALPHA x a creature's unupgraded cost, what one for hire is worth): 0.5 from deploy 70 (the user,
@@ -91,7 +118,7 @@ export MALLOC_ARENA_MAX=2
 export ALPHA_EMPIRE_ALPHA=0.5
 # (no expandable CUDA segments here: the learner's step graph failed to record with them, "device not ready"; the
 # joint run's shapes are padded, fixed, so it does not fragment as imitation did)
-rm -f runtime/train/*-joint7/drain  # (runtime/drain_restart.sh's: a start always plays)
+rm -f runtime/train/*-joint8-fresh/drain  # (runtime/drain_restart.sh's: a start always plays)
 runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # campaign.memory_steps=2 (2026-11-05): the passes over pairs of a player's decisions, the memory carried from the first
 # into the second, so the losses reach its writer (the step graph replay 117 ms against 108 at 1, the GPU idle)
@@ -347,6 +374,12 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # 0.70-0.80 for 50 updates. Back to v3295 with every training game our own: campaign.nk2_choice_games=0 and
 # campaign.nk2_follow=0, as lines 60-65 had; the code a49b192's as it is (deploy 71's bound failed its paired test, not
 # deployed). The recorded mixed continuation from v3295 is the control.
+# Deploy 83 (2026-11-16 ~02:30, e5; code 2b2fd96 = 82b's 4643b23 + the window balance, no new weight keys):
+# campaign.window_balance=true. The slow updates after deploy 82 (23-55 s a step against 18) were micro-batches over
+# window_budget (6 windows a decision) stepped eagerly over every hero slot, never graphed: s/step = 18.01 + 96.0 x their
+# share (fit over 140 updates). Deploy 82's games carry 5.7 windows a decision against 4.7-5.0 on deploy 81's. The balance
+# re-deals each minibatch's sequences among its micro-batches (train.balance_order; exact with the minibatch's foresight
+# counts, on this line); an over-full minibatch gives up the fewest. Everything else as deploy 82b.
 # Deploy 82b (2026-11-15 ~22:15, e5; a line-only restart, code 4643b23 unchanged): campaign.update_decisions_cap=135000 with
 # campaign.update_games_floor=12 again (deploy 79's pair). Deploy 82's first update took 20 of the 46 reloaded spool games,
 # 217,673 decisions (about twice a normal update); the trainer's pinned host buffer grew to fit it (2.27 GB against 0.38-0.75)
@@ -368,6 +401,24 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # bounded corrections in the corrections' group, logged each update ("campaign corrections:"). No new environment: the
 # config is the one source (learner.set_advice_prior with the version, test_phi_consumers). campaign.value_jump_from=3502:
 # the reward changes, the value-loss guard starts with no memory (deploy 73's and 81's precedent).
+# Deploy 86x (e5, 2026-11-17 ~05:30: the PC 0.2 GB from the night rule's swap trigger): campaign.games 14 -> 11 (the PC's
+# local game ceiling; the Mac's 9 remote slots unchanged: 23 -> 20 campaign workers) AND campaign.update_games_floor 12 -> 9 (games
+# to day 62-69 put 14.6k decisions a game: the floor of 12 overrode the 135k cap, 165-175k updates; 9 x 14.6k = 131k). A line-only
+# restart; the code is deploy 86's (5cb5026).
+# Deploy 86z (b1's proposal, 2026-11-17 ~10:20, on e5's go): campaign.games 11 -> 14 again, update_games_floor kept at 9
+# (86y emptied the pinned host between updates: the floor 9.66/8.47/7.17 GB at its first three updates against 86x's
+# 8.20/6.45/3.94; at games 11 the backlog drained and the updates came every ~37 min, the game rate). A line-only restart.
+# Deploy 86 games 20 (the user via e5, 2026-11-17 13:46: 'We should utilize PC cpus before Mac cpus'; the PC 61% idle, the GPU
+# waiting for games): campaign.games 14 -> 20, floor 9 and cap 135000 unchanged. A line-only restart.
+# remote_slots 9 -> 15 (the user via e5, 2026-11-17 ~15:50: 75% of the Mac in real use; the PC capped the Mac at 9 campaign games;
+# each remote game holds a ~0.4 GB loader on the PC). A line-only restart.
+# Deploy 84 (e5, 2026-11-16): campaign.loop_charge=0.03 by its ramp (loop_charge_step 0.01 from loop_charge_from 3557, the
+# resume version + 1; the learner charges at its version before the update: the first update uncharged, then 0.01, 0.02, 0.03 from
+# the fourth), loop_charge_moves as before (the charge on a loop's exchange
+# decisions and the turn MOVE that opened it: the termdwell split put 80% of the 0.10 charge's END push on the exchange rows
+# through the shared END, so exchange-only would not answer the user's objection). The user via e5 (~13:50): "0.1 was too strong,
+# we should keep it weak 0.01 probably ... maybe 0.03 but no higher for now". campaign.game_seconds=4800 (3000 cut 22% of deploy
+# 83's PC games; pace.py on its records: 4,749 s leaves 5% cut, 5,323 s 3%). Everything else as deploy 83's line.
 # campaign.loop_charge=0 (the user, 2026-11-15, after the c010 read: "I do not like the raise in the end of day decisions ...
 # return it to 0.01 on the next push, maybe it should even be 0, these are wastful moves and we have a tiny penalty for
 # them already"; e5 decided 0: 0.01 measured no effect on loops, 577 against 557): no loop rows collected, the advantage
@@ -441,12 +492,12 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # games hold 5.03 hero windows a decision, 59% of micro-batches went eager and the update doubled (504 s against 254 s);
 # 6.0 left none over in 20,000 sampled micro-batches. Back to v3295 as deploy 72 did; the code a49b192's as it is.
 resume=""
-ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
-exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
-	--battle-from runtime/saved/battle_joint5_07295.pt \
+ls -d runtime/train/*-joint8-fresh > /dev/null 2>&1 && resume="--resume"
+exec .venv/bin/python -m campaign_model.joint --run joint8-fresh --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
+	--battle-from runtime/saved/battle_joint7_frozen.pt \
 	--set remote_port=7700 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
-		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
+		campaign.share_target=change campaign.init_from= campaign.controls_from=runtime/saved/campaign_joint7_pre_fresh.pt battle_frozen=true generated_actors=0 \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
-		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=14 remote_slots=9 campaign.inference_device=cpu inference_processes=8 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=6.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3502 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=false campaign.value_shared=0.25 campaign.value_shared_from=3324 campaign.head_scale_freeze=3324 campaign.end_week_share=1.0 campaign.nk_predict_weight=0 campaign.build_economy=1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 campaign.game_seconds=3000 campaign.eval_seconds=1200 campaign.no_town_factor=0.1 campaign.no_town_from=3394 campaign.loop_charge=0 campaign.loop_charge_step=0.01 campaign.loop_charge_from=3404 campaign.update_decisions_cap=135000 campaign.update_games_floor=12 campaign.phi_hero_base=825 campaign.phi_armyless_share=1.0 campaign.phi_lead_weight=0.5 campaign.phi_stock_floor=0.333333 campaign.phi_from=3502 campaign.phi_ramp=20 campaign.unit_own_form=true campaign.give_all_exact=true campaign.foresight_minibatch_counts=true campaign.foresight_outcome_factor=0.526 campaign.foresight_answer_factor=0.735 campaign.foresight_answer_score_factor=0.058 \
-	>> runtime/train/joint7.log 2>&1 < /dev/null
+		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=20 remote_slots=15 campaign.inference_device=cpu inference_processes=8 ahead=2 \
+		campaign.head_scale=true campaign.loss_shares_freeze=-1 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=6.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=0 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=false campaign.value_shared=0.25 campaign.value_shared_from=-100 campaign.head_scale_freeze=-1 campaign.end_week_share=1.0 campaign.nk_predict_weight=0 campaign.build_economy=1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 campaign.game_seconds=4800 campaign.eval_seconds=1200 campaign.no_town_factor=0.1 campaign.no_town_from=-100 campaign.loop_charge=0 campaign.exchange_close=true campaign.exchange_actions=1 campaign.take_morale=0.5 campaign.take_best_leads=true campaign.learning_rate=3e-5 campaign.loop_charge_step=0.03 campaign.loop_charge_from=0 campaign.update_decisions_cap=135000 campaign.update_games_floor=9 campaign.window_balance=true campaign.phi_hero_base=825 campaign.phi_armyless_share=1.0 campaign.phi_lead_weight=0.5 campaign.phi_stock_floor=0.333333 campaign.phi_from=0 campaign.phi_ramp=1 campaign.unit_own_form=true campaign.give_all_exact=true campaign.foresight_minibatch_counts=true campaign.foresight_outcome_factor=0.526 campaign.foresight_answer_factor=0.735 campaign.foresight_answer_score_factor=0.058 \
+	>> runtime/train/joint8-fresh.log 2>&1 < /dev/null

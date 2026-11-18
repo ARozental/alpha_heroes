@@ -253,3 +253,40 @@ def test_the_pool_workers_start_their_trimmer():
 		assert labeler.pool._initializer is forkserver.start_trimmer
 	finally:
 		labeler.pool.shutdown()
+
+
+def test_the_host_cache_is_emptied_where_it_must_be(monkeypatch):
+	"""Deploy 86y (e5, 2026-11-17): the CUDA caching host allocator's free blocks are emptied on the trainer's memory tick
+	(Supply._watch_trainer, after trim_memory) and after each battle update (train.py, beside MPS's empty_cache), as the
+	campaign learner empties them at its own update's end; a no-op without CUDA."""
+	import inspect
+	import threading
+	from types import SimpleNamespace
+
+	import torch
+
+	calls = []
+	monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+	monkeypatch.setattr(torch._C, "_host_emptyCache", lambda: calls.append(1), raising=False)
+	monkeypatch.setattr(torch.cuda, "host_memory_stats", lambda: {"reserved_bytes.current": 0}, raising=False)
+	before = supply.HOST_CACHE_EMPTIED[0]
+	assert supply.empty_host_cache() and calls == [1] and supply.HOST_CACHE_EMPTIED[0] == before + 1
+	# the tick: one pass of the watcher, the census due
+	s = supply.Supply.__new__(supply.Supply)
+	s.campaign = None
+	s.pool = SimpleNamespace(lock=threading.Lock(), buffer=[])
+	s.shared = SimpleNamespace(peak=SimpleNamespace(value=0.0))
+	stop = threading.Event()
+	s.stop = stop
+	monkeypatch.setattr(supply, "process_gb", lambda pid, key: 4.0)
+	monkeypatch.setattr(supply, "trim_memory", lambda: None)
+	monkeypatch.setattr(stop, "wait", lambda t: stop.set())  # (one pass, then stop)
+	s._watch_trainer()
+	assert calls == [1, 1]
+	# after a battle update: the call sits in the update's end, CUDA only
+	from battle_model import train
+
+	source = inspect.getsource(train.train)
+	assert 'if device.type == "cuda":  # (deploy 86y' in source and "empty_host_cache()" in source
+	monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+	assert not supply.empty_host_cache() and calls == [1, 1]

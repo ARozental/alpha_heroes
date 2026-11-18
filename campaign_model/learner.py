@@ -162,6 +162,24 @@ VALVE_WINDOW, VALVE_HORIZON, VALVE_S_MIN, VALVE_K_MIN, VALVE_RATE = 7, 50, 0.1, 
 MAX_LABEL_STALENESS = 2  # model versions: older precomputed labels (labeler.py) are recomputed with the current tables
 
 
+def mark_resets_done(model):
+	"""A freshly built model's one-time reset markers (model_v2's buy_book_reset, recruit_target_reset) at 1: it holds no
+	learned block to reset, and with the markers at 0 every load of its weights (the inference servers', the Mac
+	worker's on each publish; the run's first resume) would zero the spellbook row and copy the RECRUIT garrison rows over
+	the hero rows it learned (the fresh run of 2026-11-18)."""
+	for name in ("buy_book_reset", "recruit_target_reset"):
+		marker = getattr(model, name, None)
+		if marker is not None:
+			marker.fill_(1.0)
+
+
+def controls_of(state):
+	"""config.controls_from's part of a campaign checkpoint: (loss_scale with its weights alone, the balancer's norms
+	fresh; or None), the value heads' held weights (or None)."""
+	scale = state.get("loss_scale")
+	return ({"log_norm": {}, "weight": dict(scale["weight"])} if scale and scale.get("weight") else None), state.get("head_weights_frozen")
+
+
 def value_shared_now(config, version):
 	"""config.value_shared's scale on the value terms' gradient into the shared layers for the update from `version`: 1
 	before value_shared_from or with value_shared at 1, else max(value_shared, 1.25 ** -(version - value_shared_from + 1)):
@@ -189,6 +207,10 @@ def set_advice_prior(model, config, version=None):
 		features.nk_follow.fill_(float(getattr(config, "nk2_follow", 0.0)))
 		if hasattr(features, "adv_gain"):  # (the advantage head read by our own policy: config.adv_gain)
 			features.adv_gain.fill_(float(getattr(config, "adv_gain", 0.0)))
+		if hasattr(features, "exchange_close_on"):  # (END's starting preference in an exchange: config.exchange_close)
+			features.exchange_close_on.fill_(1.0 if getattr(config, "exchange_close", False) else 0.0)
+		if hasattr(features, "take_leads_on"):  # (TAKE_BEST leads GIVE_ALL: config.take_best_leads)
+			features.take_leads_on.fill_(1.0 if getattr(config, "take_best_leads", False) else 0.0)
 		if hasattr(features, "town_guard"):  # (bundle 60's town guard: config.town_guard)
 			features.town_guard.fill_(float(getattr(config, "town_guard", 0.0)))
 		if hasattr(features, "build_economy"):  # (the economy and BUILD: config.build_economy)
@@ -318,6 +340,7 @@ class CampaignLearner:
 			device = torch.device("cpu")
 			self.device = device
 		self.model = build_model(self.kwargs).to(device).eval()
+		mark_resets_done(self.model)  # (a fresh model: nothing to reset; a resumed or init_from one is rebuilt and loaded below)
 		self.optimizer = make_optimizer(self.model, config)
 		self.version, self.lr_scale, self.games_used = 1, 1.0, 0  # version: the served model's (1: as the run starts)
 		self.teacher_weight = config.teacher_kl  # (the teacher KL's weight, adapted after each update: config.teacher_kl_target)
@@ -355,6 +378,14 @@ class CampaignLearner:
 			self.model.load_state_dict(state["model"])
 			if "optimizer" in state:
 				load_optimizer(self.optimizer, self.model, state["optimizer"], state["model"].keys())
+				if getattr(self.model, "book_row_reset_now", False):  # (M: the spellbook row zeroed at this load; its first moment too)
+					from .train import zero_book_moment
+
+					zero_book_moment(self.optimizer, self.model)
+				if getattr(self.model, "recruit_rows_reset_now", False):  # (M: RECRUIT's hero rows copied at this load; their first moments zeroed)
+					from .train import zero_recruit_moments
+
+					zero_recruit_moments(self.optimizer, self.model)
 			self.version, self.lr_scale, self.games_used = state["version"], state.get("lr_scale", 1.0), state.get("games_used", 0)
 			self.teacher_weight = state.get("teacher_weight", config.teacher_kl)
 			self.value_ev = state.get("value_ev")
@@ -383,6 +414,9 @@ class CampaignLearner:
 			migrate_subtypes(state, self.model)
 			self.model.load_state_dict(state["model"])
 			print(f"campaign: starting from {config.init_from}", flush=True)
+		if not (resume and latest.exists()) and getattr(config, "controls_from", ""):
+			self.loss_scale, self.head_weights_frozen = controls_of(torch.load(config.controls_from, map_location="cpu", weights_only=False))
+			print(f"campaign: the training controls of {config.controls_from}: the loss weights {self.loss_scale and self.loss_scale['weight']}, the value heads' held weights {'taken' if self.head_weights_frozen is not None else 'none'}", flush=True)
 		set_advice_prior(self.model, config, self.version)
 		if getattr(config, "nk2_inputs", False) or config.nk2_prior or config.nk2_prior_fallback or config.nk2_label_prior or config.nk2_follow or not getattr(config, "nk2_teacher", True):
 			print(f"campaign: schema 19: Nullkiller2's view as inputs {'on' if getattr(config, 'nk2_inputs', False) else 'off'} (off in {getattr(config, 'nk2_input_dropout', 0.0):g} of the training games), its own choice followed at a chance of {config.nk2_follow:g}, the prior on it {config.nk2_label_prior:g}, on its best candidate {config.nk2_prior:g} (fallback {config.nk2_prior_fallback:g}), the teacher's loss {'on' if getattr(config, 'nk2_teacher', True) else 'OFF'}", flush=True)
@@ -1278,7 +1312,7 @@ class CampaignLearner:
 			"  value ev " + "/".join(f"{row[f'head_ev_v{k}']:+.2f}" for k in c.VALUE_OFFSETS)
 			+ f" (this update {row[f'value_ev_d{c.VALUE_OFFSETS[-1]}']:+.2f}: corr {metrics.get('value_corr', float('nan')):+.2f}, spread {metrics.get('value_spread', float('nan')):.3f} vs {metrics.get('label_spread', float('nan')):.3f}, unexplained {metrics.get('value_unexplained', float('nan')):.2f}{privileged_note})"
 			+ "  growth ev " + "/".join(f"{row[f'head_ev_g{k}']:+.2f}" for k in c.VALUE_OFFSETS) + f"  end ev {row['head_ev_vend']:+.2f} (credit {row['end_credit']:.2f})  trust {row['trust']:.2f} (today {self.trust_today():.2f})"
-			+ f"  kl {row['last_kl']:.4f} (target {metrics.get('kl_target', float('nan')):.4f})" + (f"  teacher kl {row['teacher_kl']:.3f} (weight {row['teacher_weight']:.2f})" if self.teacher is not None else "") + (f"  advice {row['advised']:.0%} of turns and exchanges, ours its {row['teacher_agree']:.0%}, teacher ce {row['teacher_ce']:.3f} (weight {row['teacher_weight']:.2f})" if self.config.nk2_advice > 0 else "") + (f"  action price {row['action_price_mean']:.2e} a decision ({row['action_price_share']:.2%} of the 7-day credit's spread), a day begun with END {row['end_first']:.3f}" if self.config.schedule_action_price > 0 else "") + (f"  credit by segments: k5 {row['segment_k5']:.3f} k7 {row['segment_k7']:.3f}, F {row['segment_f2']:.2f}/{row['segment_f5']:.2f}/{row['segment_f7']:.2f} over {row['segment_types2']}/{row['segment_types5']}/{row['segment_types7']} types (0-2/2-5/5-7 days), the credit's sd {row['segment_credit_std']:.4f} against the 7-day credit's {row['segment_full_std']:.4f}" if getattr(self.config, "credit_segments", False) else "") + (f"  its choice hidden in {row['choice_hidden']:.0%} of the games: ours its advice {row['teacher_agree_shown']:.0%} shown, {row['teacher_agree_hidden']:.0%} hidden; the head's ev {row['adv_ev_shown']:+.3f} shown, {row['adv_ev_hidden']:+.3f} hidden, the advantage's sd {row['adv_raw_sd_shown']:.3g} shown, {row['adv_raw_sd_hidden']:.3g} hidden; idle movement {row['idle_movement_shown']:.3f} shown, {row['idle_movement_hidden']:.3f} hidden; a day begun with END {row['end_first_shown']:.3f} shown, {row['end_first_hidden']:.3f} hidden; eliminated {row['eliminated_shown']:.3f} shown, {row['eliminated_hidden']:.3f} hidden" if getattr(self.config, "nk2_choice_games", 1.0) < 1.0 else "") + (f"  advantage head: loss {row['adv_loss']:.4f}, ev {row['adv_ev']:+.3f} (its own choice {row['adv_ev_followed']:+.3f} at {row['adv_followed']:.0%}, leaving it {row['adv_ev_deviating']:+.3f}), the advantage's sd {row['adv_raw_sd']:.3g}" + (f"; read by our policy at {float(self.model.features.adv_gain_weight().detach()):.3f} a unit: |term| {row['adv_read']:.4f}, its KL {row['adv_kl']:.5f} (shown {row['adv_kl_shown']:.5f}, hidden {row['adv_kl_hidden']:.5f})" if getattr(self.config, "adv_gain", 0.0) > 0 else "") if self.config.adv_weight > 0 else "") + (f"  planner prediction: loss {row['nkp_loss']:.4f}, AUC {row['nkp_auc']:.3f} (tasks at {row['nkp_positives']:.3f} of the entries), ev " + "/".join(f"{row[f'nkp_ev_{form}']:+.2f}" for form in ("preference_all", "preference_hero", "soon", "later", "rank")) + f", plan ce {row['nkp_ce']:.3f} against the uniform's {row['nkp_ce_uniform']:.3f}, top-1 {row['nkp_top1_best']:.3f} its best, {row['nkp_top1_choice']:.3f} its own choice" if getattr(self.config, "nk_predict_weight", 0.0) > 0 else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f} (fraction {(metrics.get('signal_fraction') or {}).get('all', float('nan')):.3f})  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f}" + (f", every hero slot in {metrics['full_windows']} steps" if metrics.get("full_windows") else "") + (", window budget refused" if metrics.get("window_budget_ok") is False else "") + f")  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
+			+ f"  kl {row['last_kl']:.4f} (target {metrics.get('kl_target', float('nan')):.4f})" + (f"  teacher kl {row['teacher_kl']:.3f} (weight {row['teacher_weight']:.2f})" if self.teacher is not None else "") + (f"  advice {row['advised']:.0%} of turns and exchanges, ours its {row['teacher_agree']:.0%}, teacher ce {row['teacher_ce']:.3f} (weight {row['teacher_weight']:.2f})" if self.config.nk2_advice > 0 else "") + (f"  action price {row['action_price_mean']:.2e} a decision ({row['action_price_share']:.2%} of the 7-day credit's spread), a day begun with END {row['end_first']:.3f}" if self.config.schedule_action_price > 0 else "") + (f"  credit by segments: k5 {row['segment_k5']:.3f} k7 {row['segment_k7']:.3f}, F {row['segment_f2']:.2f}/{row['segment_f5']:.2f}/{row['segment_f7']:.2f} over {row['segment_types2']}/{row['segment_types5']}/{row['segment_types7']} types (0-2/2-5/5-7 days), the credit's sd {row['segment_credit_std']:.4f} against the 7-day credit's {row['segment_full_std']:.4f}" if getattr(self.config, "credit_segments", False) else "") + (f"  its choice hidden in {row['choice_hidden']:.0%} of the games: ours its advice {row['teacher_agree_shown']:.0%} shown, {row['teacher_agree_hidden']:.0%} hidden; the head's ev {row['adv_ev_shown']:+.3f} shown, {row['adv_ev_hidden']:+.3f} hidden, the advantage's sd {row['adv_raw_sd_shown']:.3g} shown, {row['adv_raw_sd_hidden']:.3g} hidden; idle movement {row['idle_movement_shown']:.3f} shown, {row['idle_movement_hidden']:.3f} hidden; a day begun with END {row['end_first_shown']:.3f} shown, {row['end_first_hidden']:.3f} hidden; eliminated {row['eliminated_shown']:.3f} shown, {row['eliminated_hidden']:.3f} hidden" if getattr(self.config, "nk2_choice_games", 1.0) < 1.0 else "") + (f"  advantage head: loss {row['adv_loss']:.4f}, ev {row['adv_ev']:+.3f} (its own choice {row['adv_ev_followed']:+.3f} at {row['adv_followed']:.0%}, leaving it {row['adv_ev_deviating']:+.3f}), the advantage's sd {row['adv_raw_sd']:.3g}" + (f"; read by our policy at {float(self.model.features.adv_gain_weight().detach()):.3f} a unit: |term| {row['adv_read']:.4f}, its KL {row['adv_kl']:.5f} (shown {row['adv_kl_shown']:.5f}, hidden {row['adv_kl_hidden']:.5f})" if getattr(self.config, "adv_gain", 0.0) > 0 else "") if self.config.adv_weight > 0 else "") + (f"  planner prediction: loss {row['nkp_loss']:.4f}, AUC {row['nkp_auc']:.3f} (tasks at {row['nkp_positives']:.3f} of the entries), ev " + "/".join(f"{row[f'nkp_ev_{form}']:+.2f}" for form in ("preference_all", "preference_hero", "soon", "later", "rank")) + f", plan ce {row['nkp_ce']:.3f} against the uniform's {row['nkp_ce_uniform']:.3f}, top-1 {row['nkp_top1_best']:.3f} its best, {row['nkp_top1_choice']:.3f} its own choice" if getattr(self.config, "nk_predict_weight", 0.0) > 0 else "") + f"  signal {metrics.get('signal_ratio', float('nan')):.3f} (fraction {(metrics.get('signal_fraction') or {}).get('all', float('nan')):.3f})  steps {row['steps']}" + (f" (stopped in pass {metrics['stopped_pass']})" if metrics.get("stopped_pass") else "") + f"  {seconds:.1f}s (update {metrics.get('update_seconds', float('nan')):.0f}s: prepass {metrics.get('prepass_seconds', float('nan')):.0f}, decode waits {metrics.get('wait_seconds', float('nan')):.0f}, gpu syncs {metrics.get('sync_seconds', float('nan')):.0f}, cpu {metrics.get('cpu_share', float('nan')):.0%}; launching forward {metrics.get('forward_seconds', float('nan')):.0f}, losses {metrics.get('losses_seconds', float('nan')):.0f}, backward {metrics.get('backward_seconds', float('nan')):.0f}, optimizer {metrics.get('optimizer_seconds', float('nan')):.0f}" + (f", every hero slot in {metrics['full_windows']} steps" if metrics.get("full_windows") else "") + (", window budget refused" if metrics.get("window_budget_ok") is False else "") + (f", windows re-dealt: over budget {metrics['window_over_dealt']} as dealt, {metrics['window_over_balanced']} after" if "window_over_dealt" in metrics else "") + f")  gpu {row['gpu_mb']:.0f} MB (anchor {metrics.get('gpu_anchor_mb', float('nan')):.0f})  labels {row['label_staleness']} old",
 			flush=True,
 		)
 

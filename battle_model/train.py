@@ -258,6 +258,11 @@ class TrainConfig:
 	# A new run that goes on from another run's checkpoint (its weights, optimizer, epoch numbering, KL control and
 	# league snapshots; its eval baselines when the eval sets are the same), evaluated first
 	init_from: str = ""
+	# The battle model frozen (the user, 2026-11-18: a fresh campaign run beside a battle model that does not train): no
+	# battle updates (the loop takes the campaign games' battles and drops them, only calling the campaign's step, check
+	# and evals), no generated battles (supply.py: no battle loader, here or on remote slots), no battle evals or battle
+	# checkpoints. The weights stay those of init_from (or the resumed checkpoint) bit for bit.
+	battle_frozen: bool = False
 	reward: RewardConfig = field(default_factory=RewardConfig)
 	advantage: AdvantageConfig = field(default_factory=AdvantageConfig)
 	ppo: PPOConfig = field(default_factory=PPOConfig)
@@ -1146,6 +1151,20 @@ def save_checkpoint(path, model, optimizer, epoch, config, elapsed=0.0, lr_scale
 	save_atomically({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "model_kwargs": model_kwargs(config), "elapsed": elapsed, "lr_scale": lr_scale, "value_ev": value_ev, **extra}, path)
 
 
+def weights_md5(model):
+	"""The md5 of the model's parameters and persistent buffers, in state_dict order (config.battle_frozen's proof)."""
+	import hashlib
+
+	digest = hashlib.md5()
+	for name, tensor in model.state_dict().items():
+		digest.update(name.encode())
+		digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+	return digest.hexdigest()[:12]
+
+
+FROZEN_DROPPED = [0]  # (config.battle_frozen: the takes whose battles were dropped; for the tests)
+
+
 def train(config, resume=False):
 	out = run_dir(config, new=not resume)
 	out.mkdir(parents=True, exist_ok=True)
@@ -1473,6 +1492,9 @@ def train(config, resume=False):
 
 	for group in optimizer.param_groups:
 		group["betas"] = (group["betas"][0], config.adam_beta2)
+	frozen_md5 = weights_md5(model) if config.battle_frozen else None
+	if config.battle_frozen:
+		print(f"battle frozen: no battle updates, no battle loader; the battle weights' md5 {frozen_md5}", flush=True)
 	try:
 		for epoch in itertools.count(first_epoch):
 			if (config.run_hours and elapsed() >= config.run_hours * 3600) or (not config.run_hours and epoch > config.epochs):
@@ -1493,7 +1515,16 @@ def train(config, resume=False):
 					if items is None:
 						if campaign.step(epoch - 1):
 							last_campaign = time.monotonic()
+							if config.battle_frozen:  # (the proof the battle model did not move, after each campaign update)
+								print(f"battle frozen: the battle weights' md5 {weights_md5(model)} (at the start {frozen_md5})", flush=True)
 						campaign.check()
+					if config.battle_frozen:  # (frozen: the battles are dropped, the loop only serves the campaign)
+						items = None
+						FROZEN_DROPPED[0] += 1
+						if campaign:
+							campaign.check()
+							if campaign.eval_due():
+								campaign.start_eval(epoch - 1)
 				records = []
 			else:
 				records = producer.take()
@@ -1671,6 +1702,10 @@ def train(config, resume=False):
 				# blocks of every size, a 22 GB footprint on a 26 GB machine, which then swapped heavily (and twice
 				# handed a training step garbage); give them back after each update
 				torch.mps.empty_cache()
+			if device.type == "cuda":  # (deploy 86y: the pinned host blocks this update staged, as the campaign learner does at its own end)
+				from .supply import empty_host_cache
+
+				empty_host_cache()
 			if pool:
 				pool.publish(model)
 				supply.publish(pool.version, advantage_config)

@@ -104,6 +104,7 @@ def test_the_new_parts_add_nothing_until_they_are_turned_on():
 	assert all(float(w) == 0.0 for w in model.features.nk_prior_weights()) and float(model.features.nk_label_weight()) == 0.0
 
 
+@pytest.mark.m_off  # (deploy 86: a test of the behaviour from before M)
 def test_a_checkpoint_from_before_loads_with_the_new_parts_as_a_new_model_starts_them():
 	saved = small(0).state_dict()
 	old = {k: v for k, v in saved.items() if not k.startswith(NEW) and not k.startswith("features.nk_")}

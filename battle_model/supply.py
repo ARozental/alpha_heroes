@@ -825,6 +825,21 @@ def trim_memory():
 			pass
 
 
+HOST_CACHE_EMPTIED = [0]  # (empty_host_cache's calls that emptied, for the tests: a counter, not a reading)
+
+
+def empty_host_cache():
+	"""The CUDA caching host allocator's free (pinned) blocks back to the system (deploy 86y, e5 2026-11-17: the campaign
+	learner emptied it only at a campaign update's end (learner.py's call), and between updates it grew back to about
+	2.3 GB, so every campaign update's peak began with it held). Only blocks no tensor uses; the next pin re-allocates
+	(milliseconds). No-op without CUDA. True when it emptied."""
+	if not (torch.cuda.is_available() and hasattr(torch._C, "_host_emptyCache")):
+		return False
+	torch._C._host_emptyCache()
+	HOST_CACHE_EMPTIED[0] += 1
+	return True
+
+
 def _identity(item):
 	return item
 
@@ -840,7 +855,7 @@ class Supply:
 	def __init__(self, config, out, pool, campaign=None):
 		self.config, self.out, self.pool, self.campaign = config, Path(out), pool, campaign
 		self.ctx = forkserver.context()  # (fork_preload: every module a worker imports, once, frozen: inherited)
-		ceilings = {"battle": config.generated_actors, **({"campaign": config.campaign.games} if campaign else {})}
+		ceilings = {**({} if getattr(config, "battle_frozen", False) else {"battle": config.generated_actors}), **({"campaign": config.campaign.games} if campaign else {})}  # (battle_frozen: no battle loader)
 		self.shared = Shared(self.ctx, ceilings, servers=len(pool.server.socket_paths))
 		self.shared.version.value = pool.version
 		global SHARED
@@ -883,6 +898,7 @@ class Supply:
 					except Exception as error:  # (a diagnostic: never the run's end)
 						print(f"trainer memory: census failed: {str(error)[:200]}", flush=True)
 					trim_memory()  # (what the trainer freed meanwhile, the waiting games' inputs (strip_inputs) among it, back to the system)
+					empty_host_cache()  # (deploy 86y: the pinned blocks staged since, whichever path staged them)
 			self.stop.wait(PEAK_EVERY)
 
 	def memory_census(self, rss, by_type=False):
@@ -923,6 +939,8 @@ class Supply:
 		"""The loader's workers for a kind: this machine's ceiling, plus workers for the remote slots (the campaign's
 		all of them, the battles' half: the remote machines' slots are shared by both kinds, and a campaign game is the
 		longer use of one)."""
+		if kind not in self.shared.ceilings:  # (battle_frozen: no battle loader)
+			return 0
 		remote_workers = (self.config.remote_slots if kind == "campaign" else max(1, self.config.remote_slots // 2)) if self.listener is not None else 0
 		return self.shared.ceilings[kind] + remote_workers
 

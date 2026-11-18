@@ -413,7 +413,14 @@ class CampaignModelV2(nn.Module):
 		before 2026-11-04's MOVE features with move_pair's first layer moved to its inputs now (migrate_move_inputs); one
 		from before 2026-11-04's question head with its fight and join weights in option_weights (migrate_option_head)."""
 		own = self.state_dict()
+		reset = self.features.main_on and float(state_dict.get("buy_book_reset", torch.zeros(()))) == 0.0  # (M: the spellbook's learned block, once: no marker, or one at 0 (with_added's), not yet reset)
+		recruit = self.features.main_on and float(state_dict.get("recruit_target_reset", torch.zeros(()))) == 0.0  # (M: RECRUIT's hero rows, once, the same way)
 		state = with_added(migrate_action_types(migrate_option_head(migrate_move_inputs(state_dict)), own), own)
+		if reset:
+			state = reset_book_row(state)
+		if recruit:
+			state = reset_recruit_rows(state)
+		self.book_row_reset_now, self.recruit_rows_reset_now = reset, recruit  # (the learner zeroes their first moments after the optimizer's load)
 		return super().load_state_dict(pad_new_inputs(state, own), strict=strict, assign=assign)
 
 	def __init__(self, dim=64, cell_dim=16, heads=4, layers=2, share_target="share"):
@@ -527,6 +534,8 @@ class CampaignModelV2(nn.Module):
 		self.cast_q = zero_output(nn.Linear(d, d))
 		self.buy_item = small_embedding(c.N_BUY_ITEMS, d)
 		self.buy_q = zero_output(nn.Linear(d, d))
+		self.register_buffer("buy_book_reset", torch.zeros(()))  # (M: 1 once the spellbook's row was zeroed: reset_book_row)
+		self.register_buffer("recruit_target_reset", torch.zeros(()))  # (M: 1 once RECRUIT's hero rows took the garrison's: reset_recruit_rows)
 		self.dismiss_out = zero_output(nn.Linear(d, 1))
 		# ARTIFACT (schema 13): a hero's query against its artifact's own row (the hero encoder's) and what to do with it,
 		# at 0 to begin with; its prior: what the move does to Φ (model.CustomFeatures.artifact_prior)
@@ -758,9 +767,9 @@ class CampaignModelV2(nn.Module):
 			k = known.windows.shape[0]
 			rows = torch.where(known.real, torch.arange(k, device=device), torch.full((k,), -1, dtype=torch.long, device=device))
 			inverse = inverse.index_copy(0, known.windows[: known.n], rows[: known.n])
-			tile_prior = real_only(known.tile_prior, known).detach()
+			tile_prior = real_only(known.tile_prior_view, known).detach()  # (the views: the prior without M's main, tile_prior when M is off)
 			move_prior = dense(tile_prior, known.windows, known.n, b)
-		travel_logits = known.travel_logits.detach().reshape(b, HO, AREAS)
+		travel_logits = known.travel_logits_view.detach().reshape(b, HO, AREAS)  # (the views: without M's main, travel_logits when M is off)
 		# (a hero's best over its windows' tiles and its areas; by window slot: a hero's own slot holds its own)
 		best_slot, best_any = V.hero_bests(move_prior, x["move_mask"], travel_logits, x["travel_mask"].reshape(b, HO, AREAS), ft.slot_heroes(x))
 		value = None
@@ -1183,6 +1192,8 @@ class CampaignModelV2(nn.Module):
 		worth = torch.cat([scales(known.tavern_worth.clamp(min=0), (1000, 3000, 10000)), torch.tanh(known.hire_gain / 2000).unsqueeze(-1)], dim=-1)
 		learned[A_.HIRE] = torch.einsum("btd,bsd->bts", self.hire_q(own_towns), self.hire_k(state.tavern)) / math.sqrt(d) + self.hire_worth(worth).squeeze(-1).unsqueeze(1)
 		prior[A_.HIRE] = ft.value_logit(known.hire_gain).unsqueeze(1).expand(b, TO, c.N_TAVERN)
+		if known.get("hire_main") is not None:  # (M: the bonus for a hero that would become our new main)
+			prior[A_.HIRE] = prior[A_.HIRE] + known.hire_main.unsqueeze(1)
 		offers[A_.HIRE] = best_legal(prior[A_.HIRE], x["hire_mask"]) + hire_weight * known.hire_want
 		# ARMY and UPGRADE: each stack (its holder's token with it) against each holder
 		holders = torch.cat([own_heroes, own_towns, state.other.unsqueeze(1)], dim=1)
@@ -1198,7 +1209,7 @@ class CampaignModelV2(nn.Module):
 		gain_weight, slot_weight, last_weight = self.features.swap_priors()
 		gain, given, last = swap_terms(stack_power(x, self.features.fight_value))  # (a swap priced by the power it moves)
 		swapping = (swap_only + gain_weight * gain + last_weight * last[:, :, None, None]) * slots.swap_only.float()
-		prior[A_.ARMY] = self.features.army_prior(known.hero_strength[:, :HO]).expand_as(learned[A_.ARMY]) + swapping[..., None] * whole
+		prior[A_.ARMY] = self.features.army_prior(known.main_score if self.features.main_on else known.hero_strength[:, :HO]).expand_as(learned[A_.ARMY]) + swapping[..., None] * whole  # (M: between heroes toward the higher own score)
 		offers[A_.ARMY] = best_legal(prior[A_.ARMY], x["army_mask"])  # (below 0 when every legal move leaves troops in a mine)
 		# its target slot (schema 16): each (stack, slot) pair's learned score and the slot's kind
 		keys = self.army_slot_k(slot_rows)
@@ -1222,7 +1233,8 @@ class CampaignModelV2(nn.Module):
 		prior[A_.CAST] = torch.zeros_like(learned[A_.CAST])
 		book = (torch.arange(c.N_BUY_ITEMS, device=gold.device) == c.BUY_ARTIFACTS.index(ft.SPELLBOOK)).float()
 		learned[A_.BUY] = self.buy_q(own_heroes) @ self.buy_item.weight.t() / math.sqrt(d)
-		prior[A_.BUY] = (book_weight * known.spellbook_wanted.float().unsqueeze(-1) * book).expand_as(learned[A_.BUY])
+		book_prior = self.features.book_prior(known.main) if self.features.main_on else book_weight * known.spellbook_wanted.float()  # (M: +10 the main by own score, -1 another hero)
+		prior[A_.BUY] = (book_prior.unsqueeze(-1) * book).expand_as(learned[A_.BUY])
 		offers[A_.BUY] = best_legal(prior[A_.BUY], x["buy_mask"])
 		ids = torch.cat([x["h_artifacts"][:, :HO], x["h_backpack"][:, :HO]], dim=-1)
 		query = self.artifact_q(own_heroes)  # [B, HO, d]
@@ -1278,10 +1290,11 @@ class CampaignModelV2(nn.Module):
 			named = label_weight * (label_action == int(action)).to(state.glob.dtype)  # [B]: Nullkiller2's own choice is of this type
 			if action == A_.END:
 				own_end = adv_types["adv_type"][:, action] + adv_types["adv_named"][:, action] * (label_action == int(action)).to(state.glob.dtype)
-				scores.append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named + pair[:, 0] + adv_gain * own_end.clamp(-ADV_CLIP, ADV_CLIP))
+				close = self.features.exchange_close_term(x["g_kind"]).to(state.glob.dtype)  # (0 off and at a turn decision)
+				scores.append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named + pair[:, 0] + close + adv_gain * own_end.clamp(-ADV_CLIP, ADV_CLIP))
 				legal_types.append((x["g_kind"] == c.DecisionKind.TURN) | (x["g_kind"] == c.DecisionKind.EXCHANGE))
 				if reading is not None:
-					reading["plain"].append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named + pair[:, 0])
+					reading["plain"].append(self.end_out(state.glob).squeeze(-1) + self.type_bias[action] + named + pair[:, 0] + close)
 					reading["kl"].append(torch.zeros_like(own_end))
 					reading["read"].append((adv_gain * own_end.clamp(-ADV_CLIP, ADV_CLIP)).abs().detach())
 				continue
@@ -1417,12 +1430,14 @@ def global_known(known):
 	return torch.cat([known.phi, torch.stack([known.gold_pressure / (1 + known.gold_pressure), known.recruit_pause, known.hire_want], dim=-1), known.economy.to(known.phi.dtype), known.danger.to(known.phi.dtype)], dim=-1)
 
 
-HERO_KNOWN = 1 + 3 + 4 + 2 * E.AMOUNT_FEATURES + 1
+HERO_KNOWN = 1 + 3 + 4 + 2 * E.AMOUNT_FEATURES + 1 + 1
 
 
 def hero_known(x, known):
 	"""[B, H, HERO_KNOWN]: a hero's strength and army worth (absolute, and relative to our main army, our whole army and
-	the strongest rival's), its worth and its next level's gain (ours), whether it is our main hero."""
+	the strongest rival's), its worth and its next level's gain (ours), whether it is our main hero by its army (Nullkiller2's
+	roles: known.army_main) and by M's own score (known.main, the last column: e5 2026-11-16, a new input whose weights start
+	at 0, GROWN_INPUTS; the army's main again with M off)."""
 	pad = lambda t: F.pad(t.float(), (0, H - HO))  # noqa: E731
 	r = known.reference
 	gold = known.hero_gold
@@ -1430,7 +1445,7 @@ def hero_known(x, known):
 		[
 			(known.hero_strength / 10).unsqueeze(-1), scales(known.hero_power, (1e3, 1e4, 1e5)),
 			torch.stack([log_ratio(gold, r["main_army"][:, None]), log_ratio(gold, r["our_army"][:, None]), log_ratio(gold, r["rival_army"][:, None]), log_ratio(gold, r["phi"][:, None])], dim=-1) / 3,
-			E.amount(pad(known.hero_worth), "gold"), E.amount(pad(known.level_gain), "gold"), pad(known.main).unsqueeze(-1),
+			E.amount(pad(known.hero_worth), "gold"), E.amount(pad(known.level_gain), "gold"), pad(known.army_main).unsqueeze(-1), pad(known.main).unsqueeze(-1),
 		],
 		dim=-1,
 	)
@@ -1537,7 +1552,7 @@ def migrate_option_head(state_dict):
 	return state
 
 
-GROWN_INPUTS = ("recruit_head.0.weight", "option_weights.weight", "join_global.mlp.up.weight", "again_global.mlp.up.weight", "value_hidden.0.weight", "reach.mlp.up.weight")  # (B1b, 2026-11-13: reach's TILE_EMPTY_FOR_HERO column)  # (2026-11-04: + the visiting hero; + a purchase's fit)
+GROWN_INPUTS = ("recruit_head.0.weight", "option_weights.weight", "join_global.mlp.up.weight", "again_global.mlp.up.weight", "value_hidden.0.weight", "reach.mlp.up.weight", "join_hero.mlp.up.weight", "again_hero.mlp.up.weight")  # (B1b, 2026-11-13: reach's TILE_EMPTY_FOR_HERO column)  # (2026-11-04: + the visiting hero; + a purchase's fit)
 
 
 def migrate_action_types(state_dict, own):
@@ -1553,6 +1568,37 @@ def migrate_action_types(state_dict, own):
 	if key in state and key in own and state[key].shape[0] < own[key].shape[0]:
 		old, types = state[key], state[key].shape[0] - 1  # (the old none row: its last)
 		state[key] = torch.cat([old[:types], own[key][types : own[key].shape[0] - 1].to(old), old[types:]])
+	return state
+
+
+def reset_book_row(state):
+	"""M (the user 2026-11-16, e5's option (a)): a state dict with BUY's spellbook item row (buy_item.weight[SPELLBOOK], the
+	book entry's whole learned part with buy_q: -6.7 on the live weights' legal books, a block the prior of 1.9 never
+	beat) at 0 and the marker buy_book_reset at 1, so it happens once: a checkpoint saved after holds the marker."""
+	state = dict(state)
+	weight = state["buy_item.weight"].clone()
+	weight[c.BUY_ARTIFACTS.index(ft.SPELLBOOK)] = 0.0
+	state["buy_item.weight"] = weight
+	state["buy_book_reset"] = torch.ones_like(state["buy_book_reset"])
+	return state
+
+
+def recruit_rows(target):
+	"""The rows of recruit_head's last Linear for a RECRUIT target (0 the garrison, 1 the visiting hero), one per amount."""
+	return [a * c.N_RECRUIT_TARGETS + target for a in range(c.N_RECRUIT_AMOUNTS)]
+
+
+def reset_recruit_rows(state):
+	"""M (the user 2026-11-16: "I think this -24 is from the time we used NK2 as a teacher ... remove it, set to +1.9 again";
+	e5's form): a state dict with recruit_head's last Linear's hero-target rows (weights and bias) set to the garrison
+	target's, so the two targets' learned parts are equal for every state and the prior (+1.9 x safe for the visiting
+	hero) decides on day 0; each row then trains on its own; the marker recruit_target_reset at 1 (once)."""
+	state = dict(state)
+	for key in ("recruit_head.2.weight", "recruit_head.2.bias"):
+		value = state[key].clone()
+		value[recruit_rows(1)] = value[recruit_rows(0)]
+		state[key] = value
+	state["recruit_target_reset"] = torch.ones_like(state["recruit_target_reset"])
 	return state
 
 

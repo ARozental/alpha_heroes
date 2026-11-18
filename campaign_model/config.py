@@ -73,6 +73,13 @@ class CampaignConfig:
 	cuda_graphs: bool = True  # on CUDA: the update's forward and backward replayed from recorded graphs (graphs.py: launches cost under WSL)
 	step_graphs: bool = True  # with cuda_graphs: a micro-batch's forward, loss and backward as one recorded graph (graphs.StepGraph)
 	convert_in_graphs: bool = True  # with cuda_graphs, on CUDA: the wire's conversion (records.inputs_on_device, ~250 small kernels a micro-batch, ~20 ms of the main thread's ~58 under WSL, 2026-11-03) recorded in the update's graphs, which take the bytes as sent; each such graph checked at its first replay, the conversion done outside again if one fails
+	# The window balance (b1 for e5, 2026-11-16): each minibatch's sequences re-dealt among its micro-batches by their
+	# windows (train.balance_order), so that no micro-batch holds more than window_budget a decision while the minibatch
+	# itself does not; such a micro-batch was stepped eagerly over every hero slot, never graphed (35% of v3509's steps,
+	# 54.8 s a step against 18.6). The minibatch's rows and its counts unchanged: its gradient the same up to the order of
+	# summation, given foresight_minibatch_counts (without it the foresight's per-micro-batch means move: refused). False:
+	# the order as dealt, bit for bit
+	window_balance: bool = False
 	window_budget: float = 4.0  # with cuda_graphs: hero windows computed a decision (model_v2.windows_of), of OWN_HEROES slots: the same outputs for a batch with no more windows (it computes every slot otherwise); the PC's games, 2026-11-03: 2.8 heroes a decision, never more than 4; further windows (below) add theirs, ~0.4 a hero in the games looked at: 5.0 with them. 0: every slot
 	# Schema 17 (2026-11-10), the games' side of it (play.window_settings: AlphaMapAI's environment, every game's alike).
 	# further_windows: the windows a hero may have beside its own (ALPHA_MAP_FURTHER_WINDOWS; 0: none, the windows as
@@ -296,6 +303,26 @@ class CampaignConfig:
 	model_layers: int = 2
 	seed: int = 0
 	init_from: str = ""  # a campaign checkpoint a new run starts from (its weights; a new optimizer)
+	# A new run's training controls taken from this campaign checkpoint, none of its weights or its optimizer (the user,
+	# 2026-11-18: a fresh run under today's settings from its first update): the loss shares' weights (loss_scale's, the
+	# balancer's memory of norms left fresh) and the value heads' held weights (head_weights_frozen). A resume ignores it
+	controls_from: str = ""
+	# END's trainable starting preference in an EXCHANGE decision (the user, 2026-11-18, for the fresh run: "let's give that
+	# option a plus to its logit as is"): model.CustomFeatures.exchange_close_start onto END's type score at exchange rows
+	# alone. False: the model as before, bit for bit
+	exchange_close: bool = False
+	# The model's decisions in one exchange dialog at most (the game's ALPHA_MAP_EXCHANGE_ACTIONS; play.window_settings: every
+	# game of a run alike, training and evaluation): 8 as before; 1 (the user, 2026-11-18, the fresh run): one action a
+	# meeting, then the dialog closes, END its "leave as is"
+	exchange_actions: int = 8
+	# Morale at this weight in our best army (the game's ALPHA_MAP_TAKE_MORALE; AlphaMapAI's MoraleWeight.h: TAKE_BEST,
+	# TAKE_BEST_FAST and their x_take_* inputs): each stack x (1 + weight x its morale's battle chance). 1.0: Nullkiller2's
+	# getBestArmy weighting, as before; 0.5 the fresh run's (the user, 2026-11-18: "make that half this effect")
+	take_morale: float = 1.0
+	# TAKE_BEST leads GIVE_ALL (the user, 2026-11-18: the default hand-over morale-aware): wherever TAKE_BEST is legal for
+	# the same receiver, GIVE_ALL's starting preference at most TAKE_BEST's - 1 (model.CustomFeatures.multi_prior;
+	# take_leads_on in the weights); GIVE_ALL stays legal. False: as before, bit for bit
+	take_best_leads: bool = False
 	# What the share heads V2, V5, V7 forecast (the model's "value" output; V_end is our share at the end either way):
 	#   "share"   our share of all empires' value VALUE_OFFSETS days on (from 1 / players)
 	#   "change"  how much the logit of that share changes by then (labels.share_change_labels; the user's design,

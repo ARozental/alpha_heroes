@@ -357,6 +357,7 @@ def test_the_plan_head_changes_nothing_the_ai_reads(model):
 	assert all(torch.equal(served[k], trained[k]) for k in served if torch.is_tensor(served[k]))
 
 
+@pytest.mark.m_off  # (deploy 86: a test of the behaviour from before M)
 def test_a_checkpoint_without_the_plan_head_loads_it_as_a_new_model_starts_it():
 	"""model.ADDED_HEADS: a checkpoint from before foresight.plan* loads (strict) with the loading model's own fresh
 	weights there (not 0: a SwiGLU at 0 never gets a gradient), everything else the checkpoint's."""
@@ -1111,6 +1112,7 @@ def test_a_yes_names_what_it_does_and_a_no_does_not():
 	assert not torch.allclose(keys[1, 0], keys[2, 0], atol=1e-3)
 
 
+@pytest.mark.m_off  # (deploy 86: a test of the behaviour from before M)
 def test_nullkiller2s_selection_and_purchase_priors_lean_where_it_goes():
 	"""option_knowledge's Nullkiller2 rules (AIGateway::showBlockingDialog, recruitCreatures): a selection leans to its last
 	component, not its NO; a Treasure Chest (gold, experience) to its gold under gold pressure and to its experience for
@@ -1734,7 +1736,7 @@ def test_stepping_on_a_hero_or_a_town_of_ours_is_worth_what_the_army_gains_where
 		x["h_army_creature"][0, 1, 0], x["h_army_count"][0, 1, 0] = partner, count
 		with torch.no_grad():
 			f = m.domain_knowledge(x)
-			return t.meeting_value(x, f, torch.tensor([0]), windows, on_tile)[0], f
+			return t.meeting_value(x, f, torch.tensor([0]), windows, on_tile, f.army_main)[0], f
 
 	def led(creatures, counts, h, f):
 		rest = x["h_morale"][0, h].float() - ft.make_up_morales(x["h_army_creature"][0, h], x["h_army_count"][0, h].float(), t)
@@ -1864,6 +1866,7 @@ def test_a_take_best_and_a_drop_are_priced_on_the_armies_they_make():
 	assert angels_gone < 0 and killed == pytest.approx(scale * angels_gone / both - 12.0, abs=1e-4) and killed < -20.0
 
 
+@pytest.mark.m_off  # (deploy 86: a test of the behaviour from before M)
 def test_a_gather_counts_what_it_leaves_its_town_to():
 	"""model.CustomFeatures.gather_loss: an enemy hero beside a town of ours that its garrison holds and its empty fort
 	would not: GATHER's gain falls by about the town's buildings (features.emptied_danger ~1, town_danger ~0); with no
@@ -1922,6 +1925,7 @@ def test_a_gather_counts_what_it_leaves_its_town_to():
 	assert scout == pytest.approx(float(ft.value_logit(torch.tensor(gain))) - 3.0, abs=1e-4)
 
 
+@pytest.mark.m_off  # (deploy 86: a test of the behaviour from before M)
 def test_a_multi_actions_prior_is_what_it_does_to_phi():
 	"""model.CustomFeatures.multi_gain (schema 14, the user 2026-11-05): RECRUIT_ALL buys what we can pay for, the highest
 	level first, at (unled_share - 1) of its worth (a little below 0); RECRUIT_ALL_HERO into a visiting starting hero

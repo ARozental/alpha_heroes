@@ -1,5 +1,6 @@
 #include "StdInc.h"
 #include "Armies.h"
+#include "MoraleWeight.h"
 
 #include "lib/CCreatureHandler.h"
 #include "lib/GameConstants.h"
@@ -54,22 +55,15 @@ std::vector<Stack> sortedStacks(const CCreatureSet & one, const CCreatureSet & o
 }
 
 // An army's power as Nullkiller2 weighs it: each stack's at its morale's battle chance (ArmyManager::getBestArmy)
-uint64_t moraleWeighted(const CArmedInstance & army, const IGameSettings & settings)
+// (alpha_heroes patch, the fresh run: moraleWeight, MoraleWeight.h; 1.0 as before, bit for bit)
+uint64_t moraleWeighted(const CArmedInstance & army, const IGameSettings & settings, double moraleWeight)
 {
 	const auto & bad = settings.getVector(EGameSettings::COMBAT_BAD_MORALE_CHANCE);
 	const auto & good = settings.getVector(EGameSettings::COMBAT_GOOD_MORALE_CHANCE);
 	const int dice = settings.getInteger(EGameSettings::COMBAT_MORALE_DICE_SIZE);
 	uint64_t value = 0;
 	for(const auto & [slot, stack] : army.Slots())
-	{
-		const int morale = stack->moraleVal();
-		double multiplier = 1.0;
-		if(morale < 0 && !bad.empty())
-			multiplier -= 1.0 / dice * bad.at(std::min<size_t>(bad.size(), -morale) - 1);
-		else if(morale > 0 && !good.empty())
-			multiplier += 1.0 / dice * good.at(std::min<size_t>(good.size(), morale) - 1);
-		value += static_cast<uint64_t>(multiplier * static_cast<double>(stack->getPower()));
-	}
+		value += weighedPower(stack->getPower(), stack->moraleVal(), bad, good, dice, moraleWeight);
 	return value;
 }
 
@@ -82,7 +76,7 @@ std::map<CreatureID, int> counted(const Army & army)
 }
 }
 
-std::optional<Take> takeBest(const CArmedInstance & receiver, const CArmedInstance & giver, const IGameSettings & settings, bool fast)
+std::optional<Take> takeBest(const CArmedInstance & receiver, const CArmedInstance & giver, const IGameSettings & settings, bool fast, double moraleWeight)
 {
 	// Nullkiller2's best army of the two (ArmyManager::getBestArmy): the factions added, the strongest first, while the
 	// army's power at its morale grows; of them the most powerful creatures, as many as its slots take
@@ -112,7 +106,7 @@ std::optional<Take> takeBest(const CArmedInstance & receiver, const CArmedInstan
 					candidate.emplace_back(s.creature, s.count);
 				}
 		scratch.updateMoraleBonusFromArmy();
-		const uint64_t value = moraleWeighted(scratch, settings);
+		const uint64_t value = moraleWeighted(scratch, settings, moraleWeight);
 		if(bestValue >= value)
 			break;
 		best = candidate;

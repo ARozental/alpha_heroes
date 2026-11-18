@@ -71,7 +71,9 @@ def window_settings(config):
 	may have and whether the entrances with no exit seen are flagged (config.further_windows, config.unseen_exits;
 	Encoder.cpp reads them once a game). Every game of a run gets the same: a model taught with one and judged with the
 	other would see inputs it never trained on."""
-	return (("ALPHA_MAP_FURTHER_WINDOWS", str(int(config.further_windows))), ("ALPHA_MAP_UNSEEN_EXITS", "1" if config.unseen_exits else "0"))
+	return (("ALPHA_MAP_FURTHER_WINDOWS", str(int(config.further_windows))), ("ALPHA_MAP_UNSEEN_EXITS", "1" if config.unseen_exits else "0"),
+		("ALPHA_MAP_EXCHANGE_ACTIONS", str(int(getattr(config, "exchange_actions", 8)))),  # (the fresh run's one action a meeting: 1; 8 as before)
+		("ALPHA_MAP_TAKE_MORALE", f"{float(getattr(config, 'take_morale', 1.0)):g}"))  # (the fresh run's morale at half in TAKE_BEST: 0.5; 1 as before)
 
 
 def players_without_a_town(path):

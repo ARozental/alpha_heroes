@@ -373,6 +373,27 @@ class CustomFeatures(nn.Module):
 		# GARRISON_SWAP; each new option rare at the start: army_slot_priors, multi_priors_16)
 		self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay = zeros(), zeros(), zeros(), zeros(), zeros()
 		self.multi_split, self.multi_merge, self.multi_garrison = zeros(), zeros(), zeros()
+		# (deploy 85, the user 2026-11-16: "going in with a minus and going out is not (trainable bias from 0?)": GARRISON_SWAP's
+		# prior on the pure OUT rows, its own learned start from 0; garrison_out_rows, multi_garrison_out_start)
+		self.multi_garrison_out = zeros()
+		# (the fresh run, the user 2026-11-18: "let's give that option a plus to its logit as is") END's starting preference in
+		# an EXCHANGE decision (never at a turn decision: the type head is shared), learned from its start
+		# (exchange_close_start), switched on by config.exchange_close (exchange_close_on, set by learner.set_advice_prior
+		# and carried in the weights to every server); 0 off: the model as before, bit for bit
+		self.exchange_close = zeros()
+		self.register_buffer("exchange_close_on", torch.zeros(()))
+		# (the fresh run, config.take_best_leads) TAKE_BEST leads GIVE_ALL where both are on offer to the same receiver
+		self.register_buffer("take_leads_on", torch.zeros(()))
+		# M (the user's main-hero design, e5's spec 2026-11-16 18:52; ALPHA_MAIN_HERO): each hero type's learned correction to
+		# its tier (ft.MAIN_TIERS) and the town bonus (0..4, 2 at the start) of main_scores; the tables as non-persistent buffers
+		self.hero_table = zeros(c.HERO_TYPE_VOCAB + 1)
+		self.town_bonus = zeros()
+		self.chest_main_xp = zeros()  # (M: the main's chest experience bonus, chest_main_xp_value)
+		# (M, the user 2026-11-16: "a positive bias if this is the main hero (like a +10 if it is), we can maybe reduce this
+		# logit to -1 otherwise": the spellbook's prior, book_values)
+		self.book_main, self.book_other = zeros(), zeros()
+		self.register_buffer("hero_tier", ft.hero_tier_table(), persistent=False)
+		self.register_buffer("hero_faction", ft.hero_faction_table(), persistent=False)
 		self.swap_gain, self.swap_slot, self.last_swap = zeros(), zeros(), zeros()  # (2026-11-08: a swap priced by the power it moves: swap_priors)
 		# Nullkiller2's own preference among its candidate tasks as a prior on MOVE's and TRAVEL's entries (schema 19, the
 		# user's design of 2026-11-11: its knowledge as inputs and a prior, never a loss on our choices; nk_prior_weights).
@@ -457,6 +478,10 @@ class CustomFeatures(nn.Module):
 		self.guard_override = override("ALPHA_TOWN_GUARD")
 		self.economy_override = override("ALPHA_BUILD_ECONOMY")
 		self.give_all_override = override("ALPHA_GIVE_ALL_EXACT")
+		# M (deploy 86, the user 2026-11-16 ~20:50: "let ship these so they can train during the night"): ON by default in this
+		# tree, so the trainer, the servers, the Mac worker and the exported actors all run it from the code (no line token);
+		# ALPHA_MAIN_HERO=0 turns it off (the gates' off path: as before, bit for bit)
+		self.main_on = override("ALPHA_MAIN_HERO") != 0.0
 		self.class_gain = zeros(c.N_OBJECT_CLASSES)
 		self.object_type_gain, self.object_type_delta = nn.Embedding(c.OBJECT_VOCAB + 1, 1), nn.Embedding(c.OBJECT_VOCAB + 1, 1)
 		self.object_subtype_delta = nn.Embedding(c.PAIR_ROWS, 1)  # (an (object, subtype) pair's: constants.OBJECT_PAIRS)
@@ -475,7 +500,8 @@ class CustomFeatures(nn.Module):
 			self.fight_sharpness, self.enemy_value, self.hero_value, self.danger_gain, self.meeting_gain, self.explore_gain, self.class_gain, self.travel_exponent,
 			self.end_coupling, self.travel_coupling, self.garrison_penalty, self.fort_gain, self.safety, self.trade_unlock, self.trade_cost, self.recruit_yes, self.visit_yes, self.select_pick, self.artifact_cost, self.multi_weight, self.give_all_cost, self.gather_risk, self.gather_cost, self.disband_cost, self.drop_scale, self.drop_sign, self.trade_waste,
 			self.recruit_all, self.recruit_hero, self.recruit_level, self.army_take, self.army_gather,
-			self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay, self.multi_split, self.multi_merge, self.multi_garrison,
+			self.army_within, self.army_swap, self.slot_default, self.slot_swap, self.slot_stay, self.multi_split, self.multi_merge, self.multi_garrison, self.multi_garrison_out, self.hero_table, self.town_bonus, self.chest_main_xp,
+			self.book_main, self.book_other,
 			self.swap_gain, self.swap_slot, self.last_swap,
 			self.skill_weight, self.upgrade_bias, self.book_bias, self.pause_weight,
 			self.pull_home, self.pull_defend, self.pull_ferry, self.block_weight, self.hire_weight, self.trade_weight,
@@ -680,6 +706,55 @@ class CustomFeatures(nn.Module):
 		step = CORRECTION_STEP
 		return torch.stack([ft.bounded(raw, -10.0, 4.0, -4.0, step) for raw in (self.multi_split, self.multi_merge, self.multi_garrison)])
 
+	def hero_table_values(self):
+		"""M: each hero type's learned correction to its tier [HERO_TYPE_VOCAB + 1], 0 at the start, within -8..8."""
+		return ft.bounded(self.hero_table, -8.0, 8.0, 0.0, CORRECTION_STEP)
+
+	def book_values(self):
+		"""M: the spellbook entry's prior for the main hero by own score (10 at the start, 0..12) and for any other hero of
+		ours (-1 at the start, -6..2), in logits; a hero with a book has no legal entry."""
+		return ft.bounded(self.book_main, 0.0, 12.0, 10.0, CORRECTION_STEP), ft.bounded(self.book_other, -6.0, 2.0, -1.0, CORRECTION_STEP)
+
+	def book_prior(self, main):
+		"""M: BUY's spellbook prior [B, HO] (book_values by f.main)."""
+		on_main, other = self.book_values()
+		return torch.where(main, on_main, other)
+
+	def chest_main_xp_value(self):
+		"""M: the main hero's (by own score) bonus on a Treasure Chest's experience, in logits (4.5 at the start, 0..6): over
+		Nullkiller2's gold under pressure (select_weight, 2.95 live) by 1.5 on day 0; learned at the prior scalars' step."""
+		return ft.bounded(self.chest_main_xp, 0.0, 6.0, 4.5, CORRECTION_STEP)
+
+	def town_bonus_value(self):
+		"""M: the town bonus of a hero native to one of our towns, 2 at the start, within 0..4."""
+		return ft.bounded(self.town_bonus, 0.0, 4.0, 2.0, CORRECTION_STEP)
+
+	def exchange_close_start(self):
+		"""END's starting preference in an EXCHANGE decision (the fresh run, 2026-11-18): EXCHANGE_CLOSE_START at the start,
+		within 0..6, learned at the prior scalars' step."""
+		return ft.bounded(self.exchange_close, 0.0, 6.0, EXCHANGE_CLOSE_START, CORRECTION_STEP)
+
+	def exchange_close_term(self, kind):
+		"""[B]: END's score's term at each decision: exchange_close_start at an EXCHANGE decision when exchange_close_on, else
+		exactly 0 (a turn decision's END, and every decision with it off)."""
+		return self.exchange_close_on * (kind == c.DecisionKind.EXCHANGE).to(self.exchange_close.dtype) * self.exchange_close_start()
+
+	def multi_garrison_out_start(self):
+		"""GARRISON_SWAP's start on the pure OUT rows (deploy 85, garrison_out_rows): 0 at the start (a plain option, like
+		END), within -10..4, learned at the prior scalars' step; every other GARRISON_SWAP row keeps multi_garrison's."""
+		return ft.bounded(self.multi_garrison_out, -10.0, 4.0, 0.0, CORRECTION_STEP)
+
+	@staticmethod
+	def garrison_out_rows(x):
+		"""GARRISON_SWAP's pure OUT towns [B, TO] (deploy 85): the town's garrison hero is ours (one of our hero tokens,
+		garrisoned) with movement left, and the gate (the visitor's place, t_visiting) is empty: the swap only lets the hero
+		out. No rival condition (e5 2026-11-16: leaving is priced where it belongs, in MOVE's and TRAVEL's night and the
+		town's defence terms). Going in, and a swap with a visitor at the gate, are not OUT rows."""
+		token = x["t_garrison_hero"][:, :TO]
+		idx = token.clamp(0, HO - 1).long()
+		ours = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF) & x["h_garrisoned"][:, :HO].bool() & (x["h_move"][:, :HO] > 0)
+		return (token >= 0) & (token < HO) & ours.gather(1, idx) & (x["t_visiting"][:, :TO] < 0)
+
 	def nk2_weights(self):
 		"""The learnable weights of Nullkiller2's habits: (a skill score point, an upgrade, a wanted spellbook, the pause)."""
 		bound = lambda raw, high, start: ft.bounded(raw, 0.0, high, start, CORRECTION_STEP)  # noqa: E731
@@ -814,8 +889,20 @@ class CustomFeatures(nn.Module):
 		f.last_hero, f.last_town = ft.last_actors(x)
 		# Nullkiller2's brain (features.py): its roles, skill scores, gold pressure and pause, buildings, upgrades, spellbook;
 		# its plans across days as weak pulls: reinforcements in our towns, their stakes, hiring, trading toward a building
-		f.main = ft.hero_roles(x, f.hero_strength)
-		f.skill_scores = ft.skill_scores(x, f.main, self)
+		if self.main_on:  # (M: the mains by their own scores, not their fighting strength; HIRE's bonus for a new main)
+			factions = ft.our_factions(x)
+			f.main_score = ft.main_scores(x["h_type"][:, :HO], x["h_primary_base"], x["h_skills"][:, :HO], x["h_exp"][:, :HO], factions, self)
+			tavern_level = ft.level_value(x["g_tavern_primary"], x["g_tavern_skills"], x["g_tavern_exp"], self)
+			tavern_score = ft.main_scores(x["g_tavern"], x["g_tavern_primary"], x["g_tavern_skills"], x["g_tavern_exp"], factions, self)
+			ours = x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF)
+			f.hire_main = ft.main_hire_bonus(tavern_score, f.main_score, ours, tavern_level) * (x["g_tavern"] >= 0).float()
+			f.army_main = ft.hero_roles(x, f.hero_strength)  # (the network's inputs keep the strongest army's hero: e5 18:52's form)
+			f.main = ft.hero_roles(x, f.main_score)  # (every prior reads the new main)
+		else:
+			f.main = ft.hero_roles(x, f.hero_strength)
+			f.army_main = f.main
+		f.skill_scores = ft.skill_scores(x, f.main, self)  # (the level-up's prior: Nullkiller2's tables; M: its MAIN table for the main by own score)
+		f.skill_scores_input = ft.skill_scores(x, f.army_main, self) if self.main_on else f.skill_scores  # (the network's input, v1's nk2_option: by the army's main, as before)
 		f.gold_pressure = ft.gold_pressure(x, self)
 		f.recruit_pause = ft.recruit_pause(x, f.gold_pressure, f.town_danger)
 		f.build_rewards, f.upgrade_gains, f.spellbook_wanted = ft.build_rewards(x, self), ft.upgrade_gains(x, self), ft.spellbook_wanted(x, f.main)
@@ -832,7 +919,7 @@ class CustomFeatures(nn.Module):
 		f.trade_options = ft.trade_options(x, self)
 		f.build_trade, f.recruit_trade, f.recruit_short = ft.purchase_trades(x, self)
 		f.area_centres = ft.centres(x, TG)
-		f.travel_prior, f.travel_logits, f.travel_gold = self.travel_prior(x, f)
+		f.travel_prior, f.travel_logits, f.travel_gold, f.travel_logits_view = self.travel_prior(x, f)
 		if windows.shape[0] > 0:
 			f.update(self.tile_features(x, windows, f))
 		f.option_prior, f.option_features = self.option_knowledge(x, f)
@@ -905,7 +992,10 @@ class CustomFeatures(nn.Module):
 		main = (f.main.gather(1, hero.unsqueeze(1)).squeeze(1) & (x["d_hero"] >= 0)).float()
 		chest = ((count.squeeze(-1) == 2) & (x["o_type"][:, 0] == int(c.ComponentType.RESOURCE))).float()
 		gold = (chest * torch.maximum(1 - main, torch.sigmoid(10 * (f.gold_pressure - ft.MAX_GOLD_PRESSURE)))).unsqueeze(-1)
-		return self.select_weight() * (gold * first + (1 - gold) * last)
+		pick = self.select_weight() * (gold * first + (1 - gold) * last)
+		if self.main_on:  # (M, the user 2026-11-16: "maybe add a main hero bonus as well there for the xp": the main's chest experience, learned)
+			pick = pick + self.chest_main_xp_value() * (chest * main).unsqueeze(-1) * last
+		return pick
 
 	def nk2_amount(self, x):
 		"""Nullkiller2 buys all it can at a dwelling (AIGateway::recruitCreatures): its largest amount option [B, O], x the
@@ -1041,6 +1131,10 @@ class CustomFeatures(nn.Module):
 		higher level, else the stronger army), which names the same hero at 93% of the schema-14 games' exchanges and Φ's
 		factor first at 71%."""
 		pair = (x["x_heroes"] - 1).clamp(min=0)  # [B, 2]
+		if self.main_on:  # (M: the higher own score; ties the more experience, then the lower token)
+			score, exp = f.main_score.gather(1, pair), x["h_exp"][:, :HO].gather(1, pair).float()
+			first = (score[:, 0] > score[:, 1]) | ((score[:, 0] == score[:, 1]) & ((exp[:, 0] > exp[:, 1]) | ((exp[:, 0] == exp[:, 1]) & (pair[:, 0] <= pair[:, 1]))))
+			return torch.stack([first, ~first], dim=1).float()
 		level = x["h_level"][:, :HO].gather(1, pair).float()
 		factor, army = f.hero_multiplier.gather(1, pair), f.hero_gold[:, :HO].gather(1, pair)
 		first = (level[:, 0] > level[:, 1]) | ((level[:, 0] == level[:, 1]) & ((factor[:, 0] > factor[:, 1]) | ((factor[:, 0] == factor[:, 1]) & (army[:, 0] >= army[:, 1]))))
@@ -1110,7 +1204,17 @@ class CustomFeatures(nn.Module):
 		starts = self.multi_priors_16()  # (schema 16: their own starts; one kind at a time, no index tensor: CUDA graphs)
 		for i, kind in enumerate((c.MultiKind.SPLIT_SINGLES, c.MultiKind.MERGE_ALL, c.MultiKind.GARRISON_SWAP)):
 			cost[..., kind] = -starts[i]
-		return prior - cost
+		swap = c.MultiKind.GARRISON_SWAP  # (deploy 85: the pure OUT rows' own start; the rest keep multi_garrison's)
+		cost[..., swap] = torch.where(self.garrison_out_rows(x), -self.multi_garrison_out_start(), cost[..., swap])
+		prior = prior - cost
+		# (config.take_best_leads, the fresh run: GIVE_ALL at most TAKE_BEST's - 1 where TAKE_BEST is legal for that receiver;
+		# off: the prior as before, bit for bit)
+		give, take = c.MultiKind.GIVE_ALL, c.MultiKind.TAKE_BEST
+		led = (self.take_leads_on > 0) & x["multi_mask"][:, :2, take]  # [B, 2]
+		capped = torch.where(led, torch.minimum(prior[:, :2, give], prior[:, :2, take] - TAKE_LEAD_MARGIN), prior[:, :2, give])
+		prior = prior.clone()  # (out of place: the backward still reads TAKE_BEST's column of the prior before it)
+		prior[:, :2, give] = capped
+		return prior
 
 	def artifact_prior(self, x, f):
 		"""What each ARTIFACT entry does to Φ, as a prior logit [B, HO, N_ARTIFACT_POSITIONS, N_ARTIFACT_TARGETS]
@@ -1276,12 +1380,13 @@ class CustomFeatures(nn.Module):
 		days = (x["travel_days"][:, :HO].reshape(value.shape[0], HO, -1).float() / 100).clamp(min=0)  # (-1: not legal, masked)
 		discount = ft.movement_discount(days, ft.bounded(self.travel_exponent, 0.7, 2.0, 1.3, CORRECTION_STEP))
 		home, defend, ferry, _, _ = self.pull_weights()
-		pulls = self.travel_pulls(x, f, value.shape[-1])  # [B, HO, A, 3]
 		weights = torch.stack([home, defend, ferry])
-		rest = (weights * torch.tanh(pulls * discount.unsqueeze(-1) / ft.PULL_SCALE)).sum(dim=-1)
+		pulled = lambda main: (weights * torch.tanh(self.travel_pulls(x, f, value.shape[-1], main) * discount.unsqueeze(-1) / ft.PULL_SCALE)).sum(dim=-1)  # noqa: E731
+		rest = pulled(f.army_main)  # (the network's input and the views: the strongest army's hero as the main)
+		rest_prior = pulled(f.main) if self.main_on else rest  # (M: the logits' pulls by the new main)
 		gain = value * discount
 		if "travel_stop" not in x:
-			return ft.value_logit(gain) + rest, ft.value_logit(gain) + rest, value
+			return ft.value_logit(gain) + rest, ft.value_logit(gain) + rest_prior, value, ft.value_logit(gain) + rest
 		stops, known = ft.travel_stops(x)
 		manned = self.town_strength(x, f.town_power, manned=True)
 		here = ft.night_danger(x, f.hero_strength, manned, x["h_pos"][:, :HO].unsqueeze(2))  # [B, HO, 1]
@@ -1294,11 +1399,12 @@ class CustomFeatures(nn.Module):
 			foes = tuple(t.index_select(0, decision) for t in ft.enemies(x, f.hero_strength))
 			towns = ft.town_night(x, f.hero_strength, manned, f.town_strength, f.town_stakes, decision, hero, foes, stops.reshape(b * HO, -1, 3), f.phi_total if self.town_night == 2 else None).reshape(b, HO, -1)
 			night = night + towns * known * self.night_weight()
-		return ft.value_logit(gain) + rest, ft.value_logit(gain + night) + rest, value
+		return ft.value_logit(gain) + rest, ft.value_logit(gain + night) + rest_prior, value, ft.value_logit(gain + night) + rest
 
-	def travel_pulls(self, x, f, areas):
+	def travel_pulls(self, x, f, areas, main):
 		"""Nullkiller2's plans across days in each hero's TRAVEL areas [B, HO, A, 3] (gold): a main hero's pull to the area of
-		a town of ours that can reinforce it, any hero's to one under threat, a scout's with troops to a main hero's."""
+		a town of ours that can reinforce it, any hero's to one under threat, a scout's with troops to a main hero's. main: the
+		main heroes [B, HO] (f.army_main for the network's input, f.main for the logits)."""
 		b = x["g_day"].shape[0]
 		town_area = ft.area_index(x, x["t_pos"][:, :TO])  # [B, TO]
 		def scatter(values, index):  # [B, N] gold at areas [B, N] (-1 none) -> [B, A]: the most at each area
@@ -1307,19 +1413,19 @@ class CustomFeatures(nn.Module):
 			return out[:, :areas]
 		reinforce = scatter(f.reinforcements, town_area)
 		threatened = scatter(f.town_danger * f.town_stakes, town_area)
-		main_area = torch.where(f.main, ft.area_index(x, x["h_pos"][:, :HO]), torch.full_like(f.main, -1, dtype=torch.long))
-		mains = scatter(f.main.float() * 1e9, main_area).clamp(max=1)  # [B, A]: a main hero there
-		scout_army = f.hero_gold[:, :HO] * (~f.main) * (x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF))
+		main_area = torch.where(main, ft.area_index(x, x["h_pos"][:, :HO]), torch.full_like(main, -1, dtype=torch.long))
+		mains = scatter(main.float() * 1e9, main_area).clamp(max=1)  # [B, A]: a main hero there
+		scout_army = f.hero_gold[:, :HO] * (~main) * (x["h_present"][:, :HO] & (x["h_owner"][:, :HO] == c.OWNER_SELF))
 		return torch.stack(
 			[
-				f.main.float().unsqueeze(-1) * reinforce.unsqueeze(1),
+				main.float().unsqueeze(-1) * reinforce.unsqueeze(1),
 				threatened.unsqueeze(1).expand(b, HO, areas),
 				scout_army.unsqueeze(-1) * mains.unsqueeze(1),
 			],
 			dim=-1,
 		)
 
-	def meeting_value(self, x, f, decision, heroes, on_tile):
+	def meeting_value(self, x, f, decision, heroes, on_tile, main, score=None):
 		"""What stepping on a hero of ours (an exchange) or into a town of ours (its garrison) gains [K, W, W] (gold): the
 		best the exchange or the gather there would make to Φ (the user, 2026-11-05: a meeting's expected gain, as a
 		pickup's and a fight's), at least 0, priced as the actions are (features.led_values: each army at its hero's
@@ -1349,6 +1455,12 @@ class CustomFeatures(nn.Module):
 		mover_l, other_l = flat(level), level.index_select(0, decision)
 		mover_a, other_a = flat(f.hero_gold[:, :HO]), f.hero_gold[:, :HO].index_select(0, decision)
 		mover_first = (mover_l[:, None] > other_l) | ((mover_l[:, None] == other_l) & ((mover_m[:, None] > other_m) | ((mover_m[:, None] == other_m) & (mover_a[:, None] >= other_a))))  # [K, HO]
+		if score is not None:  # (M's prior: the receiver the higher own score; ties the more experience, then the lower token)
+			exp = x["h_exp"][:, :HO].float()
+			mover_s, other_s, mover_e, other_e = flat(score), score.index_select(0, decision), flat(exp), exp.index_select(0, decision)
+			token = torch.arange(HO, device=score.device)
+			mover_t = torch.remainder(heroes, HO)
+			mover_first = (mover_s[:, None] > other_s) | ((mover_s[:, None] == other_s) & ((mover_e[:, None] > other_e) | ((mover_e[:, None] == other_e) & (mover_t[:, None] <= token[None, :]))))
 		receiver_m = torch.where(mover_first, mover_m[:, None].expand(-1, HO), other_m)
 		receiver_r = torch.where(mover_first, mover_r[:, None].expand(-1, HO), other_r)
 		giver_m = torch.where(mover_first, other_m, mover_m[:, None].expand(-1, HO))
@@ -1376,7 +1488,7 @@ class CustomFeatures(nn.Module):
 			torch.cat([mover_c.unsqueeze(1).expand(-1, TO, -1), garrison_c], dim=-1), torch.cat([mover_n.unsqueeze(1).expand(-1, TO, -1), garrison_n], dim=-1), mover_m[:, None], mover_r[:, None], self
 		)  # [K, TO]
 		gathered = with_garrison - mover_v[:, None] - ft.unled_lead(self) * f.town_gold[:, :TO].index_select(0, decision) - self.gather_loss(f).index_select(0, decision)
-		garrison = gathered.clamp(min=0.0) * flat(f.main.float())[:, None]
+		garrison = gathered.clamp(min=0.0) * flat(main.float())[:, None]  # (main: f.army_main in the tile's value the network reads, f.main in MOVE's prior)
 		entered = (on_tile(x["t_pos"][:, :TO], own).float() * garrison[:, None, None, :]).amax(dim=-1)
 		return (met + entered) * self.gain(self.meeting_gain)
 
@@ -1538,7 +1650,9 @@ class CustomFeatures(nn.Module):
 		# it, the land around it long revealed). Not a whirlpool's, which takes troops for the passage
 		explore = torch.maximum(ft.unexplored_around(flags), (ft.bit(flags, c.TILE_UNSEEN_EXIT) & (obj != ft.OBJ_WHIRLPOOL)).float())
 		# The object is ours only if we win the fight in front of it (a bank's guards, a monster's zone, a town's garrison)
-		value = object_gold * torch.where(fights, win, torch.ones_like(win)) + fight + explore * self.explore_gold() + self.meeting_value(x, f, decision, heroes, on_tile)
+		meeting = self.meeting_value(x, f, decision, heroes, on_tile, f.army_main)  # (the value the network reads: the strongest army's hero as the main)
+		value = object_gold * torch.where(fights, win, torch.ones_like(win)) + fight + explore * self.explore_gold() + meeting
+		meeting_shift = self.meeting_value(x, f, decision, heroes, on_tile, f.main, f.main_score) - meeting if self.main_on else None  # (M: MOVE's prior with the new main's GATHER and the exchange's receiver by own score)
 		# The value as gold a day (e5 for the user, 2026-11-15; features.move_rate), and over the hero's capital (its IRR:
 		# features.hero_capital): before the time discount and the danger below, model_v2's MOVE pair reads their four
 		# views (rate_views) through a layer at 0 to begin with
@@ -1558,6 +1672,8 @@ class CustomFeatures(nn.Module):
 		)
 		discount = ft.movement_discount(days, ft.bounded(self.travel_exponent, 0.7, 2.0, 1.3, CORRECTION_STEP))
 		value = value * discount ** self.move_discount_power()
+		if meeting_shift is not None:
+			meeting_shift = meeting_shift * discount ** self.move_discount_power()
 		# Danger: the enemy heroes we see, their reach to the tile x P(they beat this hero); what ending the move there
 		# instead of where the hero stands changes in the expected loss (army, hero, its replacement: hero); our towns'
 		# danger on them
@@ -1596,18 +1712,26 @@ class CustomFeatures(nn.Module):
 		# Nullkiller2's plans across days, as weak pulls in logits (pull_weights): a main hero toward a town of ours that can
 		# reinforce it, any hero toward one under threat, a scout with troops toward a main hero
 		own = x["t_present"][:, :TO] & (x["t_owner"][:, :TO] == c.OWNER_SELF)
-		ours_here, mains_here = on_tile(x["t_pos"][:, :TO], own), on_tile(x["h_pos"][:, :HO], f.main)
-		main = ours(f.main.float())  # the window's hero: a main hero?
-		pulls = torch.tanh(
-			torch.stack(
-				[of(ours_here, f.reinforcements) * main[:, None, None], of(ours_here, f.town_danger * f.town_stakes), mains_here.any(dim=-1).float() * (ours(f.hero_gold) * (1 - main))[:, None, None]],
-				dim=-1,
-			) / ft.PULL_SCALE
-		)  # [K, W, W, 3]
+		ours_here = on_tile(x["t_pos"][:, :TO], own)
 		home_weight, defend_weight, ferry_weight, _, _ = self.pull_weights()
-		rest = (torch.stack([home_weight, defend_weight, ferry_weight]) * pulls).sum(dim=-1) - self.safety_weight() * hopeless
+
+		def pulled(main_flags):  # (the pulls' logits by these main heroes; the main heroes on each tile; the window's hero main?; the pulls)
+			here = on_tile(x["h_pos"][:, :HO], main_flags)
+			is_main = ours(main_flags.float())
+			pulls = torch.tanh(
+				torch.stack(
+					[of(ours_here, f.reinforcements) * is_main[:, None, None], of(ours_here, f.town_danger * f.town_stakes), here.any(dim=-1).float() * (ours(f.hero_gold) * (1 - is_main))[:, None, None]],
+					dim=-1,
+				) / ft.PULL_SCALE
+			)  # [K, W, W, 3]
+			return (torch.stack([home_weight, defend_weight, ferry_weight]) * pulls).sum(dim=-1) - self.safety_weight() * hopeless, here, is_main, pulls
+
+		rest, mains_here, main, pulls = pulled(f.army_main)  # (the network's input, MOVE's features, the views: the strongest army's hero as the main)
+		rest_prior = pulled(f.main)[0] if self.main_on else rest  # (M: the MOVE prior's pulls by the new main)
 		prior = ft.value_logit(value) + rest  # (the network's input, as before the night term)
-		logits = ft.value_logit(value - danger_value + night_value) + rest  # (the MOVE prior's logits: tile_prior)
+		value_prior = value + meeting_shift if meeting_shift is not None else value
+		logits = ft.value_logit(value_prior - danger_value + night_value) + rest_prior  # (the MOVE prior's logits: tile_prior)
+		view = ft.value_logit(value - danger_value + night_value) + rest if self.main_on else logits  # (model_v2's views: tile_prior_view)
 		# model_v2's MOVE features beside MOVE_FEATURES, relative so they keep their meaning on any map and day (the user,
 		# 2026-11-04): hopeless (above); the object as a share of our Φ (log(1 + 100 x share) / 3: 1% 0.23, 10% 0.8); where
 		# a fight starts, what losing it takes (the army, the hero, its replacement) and what winning it takes (the enemy's
@@ -1652,7 +1776,7 @@ class CustomFeatures(nn.Module):
 			dim=-1,
 		)  # CELL_FEATURES
 		return {
-			"tile_value": value, "tile_prior": logits, "tile_night": night, "tile_shift": logits - prior, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight, "tile_fight_ratio": fight_ratio, "tile_fights": fights.float(),
+			"tile_value": value, "tile_prior": logits, "tile_prior_view": view, "tile_night": night, "tile_shift": logits - prior, "move_features": move, "cell_features": cells, "tile_object_gold": object_gold, "tile_fight_gold": fight, "tile_fight_ratio": fight_ratio, "tile_fights": fights.float(),
 			"tile_stacks": (monster | guarded).float(),  # (a wandering monster or its zone: model_v2's battle head)
 			"move_strength": ft.strength_view(torch.cat([this_hero, main_army], dim=-1)), "move_relative": relative,  # (model_v2: MOVE_STRENGTH, MOVE_RELATIVE)
 			"move_rate": rate,  # (model_v2: the MOVE pair's gain-per-movement and IRR views, MOVE_RATE)
@@ -1817,7 +1941,10 @@ class PairBias(nn.Module):
 
 # Parameters added since checkpoints were saved, each at 0 the model as before it existed: a checkpoint without them
 # loads with them at 0 (with_added; 2026-11-02: features.move_discount, CustomFeatures.move_discount_power)
-ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
+TAKE_LEAD_MARGIN = 1.0  # (config.take_best_leads: TAKE_BEST's lead over GIVE_ALL in starting preference, at least)
+EXCHANGE_CLOSE_START = 1.6  # (END's starting preference in an EXCHANGE decision: set from a fresh model's dialogs, 2026-11-18)
+
+ADDED = ("features.army_within", "features.army_swap", "features.slot_default", "features.slot_swap", "features.slot_stay", "features.swap_gain", "features.swap_slot", "features.last_swap", "features.multi_split", "features.multi_merge", "features.multi_garrison", "features.multi_garrison_out", "features.hero_table", "features.town_bonus", "features.chest_main_xp", "features.book_main", "features.book_other", "buy_book_reset", "recruit_target_reset", "features.move_discount", "features.safety", "features.trade_unlock", "features.trade_cost", "features.recruit_yes", "features.visit_yes", "features.select_pick", "features.artifact_cost", "features.meeting_gain", "features.multi_weight", "features.give_all_cost", "features.gather_risk", "features.gather_cost", "features.disband_cost", "features.drop_scale", "features.drop_sign", "features.trade_waste", "encode_tiles.unseen_exit", "features.night_gain", "features.nk_gain", "features.nk_gain_fallback", "features.nk_survival", "features.nk_risk", "features.nk_beta", "features.nk_beta_fallback", "features.nk_label_gain", "features.nk_label", "features.nk_follow_shift", "features.nk_follow", "features.adv_gain_shift", "features.adv_gain", "features.town_guard_shift", "features.town_guard", "features.build_income_gain", "features.build_production_gain", "features.build_prior_gain", "features.build_faction_bias", "features.build_economy", "features.exchange_close", "features.exchange_close_on", "features.take_leads_on")  # (2026-11-04: at 0, their starts: safety 6; TRADE's unlock 2, cost 0.5; YES at a dwelling, a guard, a quest 4; a selection's pick 3)
 # Parts added since, by prefix: a checkpoint without them loads them as a new model starts them, heads nothing the AI
 # reads depends on (their losses only: 2026-11-02, foresight.plan*, model_v2.plan_of) or layers whose output starts at 0
 # (2026-11-03: model_v2's pair_fight and move_fight, the fight features; 2026-11-04: its strength estimates' pair_strength,
@@ -2155,7 +2282,7 @@ class CampaignModel(nn.Module):
 			+ (self.artifact(vocab_index(artifacts, c.ARTIFACT_VOCAB)) * (artifacts >= 0).unsqueeze(-1)).sum(dim=-2)
 			+ self.skills_in(x["h_skills"].float() / 3) + self.spells_in(x["h_spells"].float())
 			+ self.last_hero_in(F.pad(f.last_hero, (0, c.N_HEROES - HO)).unsqueeze(-1))
-			+ self.nk2_hero(F.pad(f.main.float(), (0, c.N_HEROES - HO)).unsqueeze(-1))
+			+ self.nk2_hero(F.pad(f.army_main.float(), (0, c.N_HEROES - HO)).unsqueeze(-1))  # (the strongest army's hero: an input)
 		)
 		return token, stacks
 
@@ -2194,7 +2321,7 @@ class CampaignModel(nn.Module):
 		numbers = torch.cat([scales(x["o_amount"], (500, 2000, 8000)), x["o_pos"].float() / size[:, None, :], (x["o_type"] >= 0).float().unsqueeze(-1)], dim=-1)
 		return (
 			self.option_kind(vocab_index(x["o_kind"], len(c.OptionKind))) + self.subtype(ft.bucket(x["o_kind"], x["o_type"], x["o_subtype"])) + self.option_in(numbers)
-			+ self.nk2_option(f.skill_scores.unsqueeze(-1) / 4)
+			+ self.nk2_option(f.skill_scores_input.unsqueeze(-1) / 4)
 		)
 
 	def all_tokens(self, x, f, hero_tokens, town_tokens, blocks, block_valid):
@@ -2343,6 +2470,8 @@ class CampaignModel(nn.Module):
 		gain = f.hire_gain.unsqueeze(1).expand(b, TO, c.N_TAVERN)
 		worth = torch.cat([scales(f.tavern_worth.clamp(min=0), (1000, 3000, 10000)), torch.tanh(f.hire_gain / 2000).unsqueeze(-1)], dim=-1)
 		hire_prior = ft.value_logit(gain)
+		if f.get("hire_main") is not None:  # (M)
+			hire_prior = hire_prior + f.hire_main.unsqueeze(1)
 		out["hire_logp"] = flat_log_softmax(self.hire_head(hire_in).squeeze(-1) + hire_prior + self.hire_worth(worth).squeeze(-1).unsqueeze(1), x["hire_mask"])
 		return hire_prior
 
@@ -2352,7 +2481,7 @@ class CampaignModel(nn.Module):
 		holder_stacks = torch.cat([hero_stacks[:, :HO], town_stacks[:, :TO], other_stacks.unsqueeze(1)], dim=1)  # [B, HD, A, d]
 		src = self.army_src(torch.cat([holders.unsqueeze(2).expand(b, HD, A, d), holder_stacks], dim=-1))  # [B, HD, A, d]
 		dst = self.army_dst(holders)
-		prior = self.features.army_prior(f.hero_strength[:, :HO])  # (CustomFeatures.army_prior: Nullkiller2's habits)
+		prior = self.features.army_prior(f.main_score if self.features.main_on else f.hero_strength[:, :HO])  # (CustomFeatures.army_prior: Nullkiller2's habits; M: toward the higher own score)
 		out["army_logp"] = flat_log_softmax(self.army_out(src[:, :, :, None, :] + dst[:, None, None, :, :]) + prior, x["army_mask"])
 		_, upgrade_weight, _, _ = self.features.nk2_weights()
 		upgrade_prior = upgrade_weight * (f.upgrade_gains[..., 0] > 0).float()  # Nullkiller2 upgrades every stack it can
@@ -2381,7 +2510,7 @@ class CampaignModel(nn.Module):
 		out["cast_logp"] = flat_log_softmax(self.cast_q(own_heroes) @ self.spell.weight.t() / math.sqrt(d), x["cast_mask"])
 		_, _, book_weight, _ = self.features.nk2_weights()
 		book = (torch.arange(c.N_BUY_ITEMS, device=g.device) == c.BUY_ARTIFACTS.index(ft.SPELLBOOK)).float()
-		buy_prior = book_weight * f.spellbook_wanted.float().unsqueeze(-1) * book  # [B, HO, N_BUY_ITEMS]
+		buy_prior = (self.features.book_prior(f.main).unsqueeze(-1) if self.features.main_on else book_weight * f.spellbook_wanted.float().unsqueeze(-1)) * book  # [B, HO, N_BUY_ITEMS] (M: +10 the main, -1 another)
 		out["buy_logp"] = flat_log_softmax(self.buy_q(own_heroes) @ self.buy_item.weight.t() / math.sqrt(d) + buy_prior, x["buy_mask"])
 		out["dismiss_logp"] = flat_log_softmax(self.dismiss_out(own_heroes).squeeze(-1), x["dismiss_mask"])
 		legal = x["buy_mask"].reshape(b, -1)

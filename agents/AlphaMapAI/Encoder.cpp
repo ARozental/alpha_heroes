@@ -1463,7 +1463,7 @@ void AlphaMapAI::encodeMulti(Decision & decision, int first, int second)
 			if(movesAny(giver, receiver) || artifacts)
 				add(r, MultiKind::GIVE_ALL, giver->id, receiver->id);
 			for(int fast = 0; fast < 2; ++fast)
-				if(const auto take = armies::takeBest(*receiver, *giver, cb->getSettings(), fast == 1))
+				if(const auto take = armies::takeBest(*receiver, *giver, cb->getSettings(), fast == 1, takeMorale))
 				{
 					for(int side = 0; side < 2; ++side)
 					{

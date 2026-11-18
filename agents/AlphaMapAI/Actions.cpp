@@ -268,7 +268,7 @@ void AlphaMapAI::executeMulti(const Entry & e)
 		const auto * receiver = armyOf(*cb, e.second);
 		if(!giver || !receiver)
 			return;
-		if(const auto take = armies::takeBest(*receiver, *giver, cb->getSettings(), kind == MultiKind::TAKE_BEST_FAST))
+		if(const auto take = armies::takeBest(*receiver, *giver, cb->getSettings(), kind == MultiKind::TAKE_BEST_FAST, takeMorale))
 		{
 			arrange(giver, receiver, *take);
 			std::map<CreatureID, int> made, priced;

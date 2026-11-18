@@ -1,3 +1,4 @@
+import pytest
 """The map grid's blocks (docs/map_size_plan.md, 2026-11-08): every map up to 36 x 36 reads as before, bit for bit; a
 bigger one a block of side x side tiles a cell, its positions and distances still in tiles."""
 from pathlib import Path
@@ -34,6 +35,10 @@ def golden_model():
 				old = 0.05 * torch.randn(p.shape[0], p.shape[1] - 3, generator=g)
 				p.copy_(torch.cat([old, torch.zeros(p.shape[0], 3)], dim=1))
 				continue
+			if name in ("join_hero.mlp.up.weight", "again_hero.mlp.up.weight"):  # (M's column, 2026-11-16: the old ones drawn as before, the new at 0)
+				old = 0.05 * torch.randn(p.shape[0], p.shape[1] - 1, generator=g)
+				p.copy_(torch.cat([old, torch.zeros(p.shape[0], 1)], dim=1))
+				continue
 			if name in GROWN_INPUTS[2:5]:  # (the economy's columns, 2026-11-12: the old ones drawn as before, the new at 0, as a checkpoint migrates)
 				old = 0.05 * torch.randn(p.shape[0], p.shape[1] - NEW_COLUMNS, generator=g)
 				p.copy_(torch.cat([old, torch.zeros(p.shape[0], NEW_COLUMNS)], dim=1))
@@ -49,6 +54,7 @@ NEW_COLUMNS = len(ECONOMY) + len(DANGER)  # (the grown layers' columns since 128
 WIDENED = ("value_logit", "growth_logit", "memory", "option_logp")
 
 
+@pytest.mark.m_off  # (deploy 86: a test of the behaviour from before M)
 def test_a_small_map_gives_the_outputs_it_gave_before_the_blocks():
 	"""At side 1 (every map up to 36 x 36) every output is the one the model gave before the change: bit for bit on the
 	machine that wrote them (the Mac); on another CPU within float32 rounding (the PC's: 4.8e-7 at most, 2026-11-08), the
