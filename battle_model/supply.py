@@ -855,7 +855,7 @@ class Supply:
 	def __init__(self, config, out, pool, campaign=None):
 		self.config, self.out, self.pool, self.campaign = config, Path(out), pool, campaign
 		self.ctx = forkserver.context()  # (fork_preload: every module a worker imports, once, frozen: inherited)
-		ceilings = {"battle": config.generated_actors, **({"campaign": config.campaign.games} if campaign else {})}
+		ceilings = {**({} if getattr(config, "battle_frozen", False) else {"battle": config.generated_actors}), **({"campaign": config.campaign.games} if campaign else {})}  # (battle_frozen: no battle loader)
 		self.shared = Shared(self.ctx, ceilings, servers=len(pool.server.socket_paths))
 		self.shared.version.value = pool.version
 		global SHARED
@@ -939,6 +939,8 @@ class Supply:
 		"""The loader's workers for a kind: this machine's ceiling, plus workers for the remote slots (the campaign's
 		all of them, the battles' half: the remote machines' slots are shared by both kinds, and a campaign game is the
 		longer use of one)."""
+		if kind not in self.shared.ceilings:  # (battle_frozen: no battle loader)
+			return 0
 		remote_workers = (self.config.remote_slots if kind == "campaign" else max(1, self.config.remote_slots // 2)) if self.listener is not None else 0
 		return self.shared.ceilings[kind] + remote_workers
 

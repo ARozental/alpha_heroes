@@ -162,6 +162,13 @@ VALVE_WINDOW, VALVE_HORIZON, VALVE_S_MIN, VALVE_K_MIN, VALVE_RATE = 7, 50, 0.1, 
 MAX_LABEL_STALENESS = 2  # model versions: older precomputed labels (labeler.py) are recomputed with the current tables
 
 
+def controls_of(state):
+	"""config.controls_from's part of a campaign checkpoint: (loss_scale with its weights alone, the balancer's norms
+	fresh; or None), the value heads' held weights (or None)."""
+	scale = state.get("loss_scale")
+	return ({"log_norm": {}, "weight": dict(scale["weight"])} if scale and scale.get("weight") else None), state.get("head_weights_frozen")
+
+
 def value_shared_now(config, version):
 	"""config.value_shared's scale on the value terms' gradient into the shared layers for the update from `version`: 1
 	before value_shared_from or with value_shared at 1, else max(value_shared, 1.25 ** -(version - value_shared_from + 1)):
@@ -391,6 +398,9 @@ class CampaignLearner:
 			migrate_subtypes(state, self.model)
 			self.model.load_state_dict(state["model"])
 			print(f"campaign: starting from {config.init_from}", flush=True)
+		if not (resume and latest.exists()) and getattr(config, "controls_from", ""):
+			self.loss_scale, self.head_weights_frozen = controls_of(torch.load(config.controls_from, map_location="cpu", weights_only=False))
+			print(f"campaign: the training controls of {config.controls_from}: the loss weights {self.loss_scale and self.loss_scale['weight']}, the value heads' held weights {'taken' if self.head_weights_frozen is not None else 'none'}", flush=True)
 		set_advice_prior(self.model, config, self.version)
 		if getattr(config, "nk2_inputs", False) or config.nk2_prior or config.nk2_prior_fallback or config.nk2_label_prior or config.nk2_follow or not getattr(config, "nk2_teacher", True):
 			print(f"campaign: schema 19: Nullkiller2's view as inputs {'on' if getattr(config, 'nk2_inputs', False) else 'off'} (off in {getattr(config, 'nk2_input_dropout', 0.0):g} of the training games), its own choice followed at a chance of {config.nk2_follow:g}, the prior on it {config.nk2_label_prior:g}, on its best candidate {config.nk2_prior:g} (fallback {config.nk2_prior_fallback:g}), the teacher's loss {'on' if getattr(config, 'nk2_teacher', True) else 'OFF'}", flush=True)
