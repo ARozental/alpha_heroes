@@ -82,6 +82,19 @@
 # The battle learner since 2026-11-06 ~19:30: its trunk's beta1 0.95 (the plan's step 5: its gradient read as pure noise
 # a step since accumulate 2), and the escapes pressed down while its value head says we are ahead (the user: "another -3
 # for the logit if we are ahead and maybe something that scales nicely with how much we are ahead": priors.escape_ahead)
+# THE FRESH RUN joint8-fresh (the user, 2026-11-18, via e5: "restart a fresh run (all weights initialized but our fixed
+# biases and graph remain) for the campaign with the current battle model frozen and not training ... for around a day";
+# "Today's settings apply from the first update": yes). joint7 is kept whole and resumable: its line is 5e4d9ef's
+# runtime/advice_run.sh (runtime/deploy-backup-fresh.sh on the PC), its run dir untouched. Here:
+# - the campaign fresh: campaign.init_from empty (model_kwargs' initializers, the code's fixed priors), a new optimizer;
+#   campaign.controls_from = joint7's last campaign checkpoint for its training controls alone (the loss weights frozen
+#   since v1420: value 352.6, foresight 0.696; the value heads' held weights), none of its weights;
+# - the battle model joint7's last (runtime/saved/battle_joint7_frozen.pt), battle_frozen=true: no battle updates, no
+#   battle loader (generated_actors=0, no remote battle slots), no battle evals;
+# - every version-keyed start at full effect from update 1: loss_shares_freeze -1 (frozen from the start at the copied
+#   weights), value_jump_from 0, value_shared_from -100 (0.25 at once), head_scale_freeze -1 (the copied held weights),
+#   no_town_from -100 (0.1 at once), loop_charge_step 0.03 with loop_charge_from 0 (0.03 at once), phi_from 0 with
+#   phi_ramp 1 (Φ's targets at once).
 cd "$HOME/projects/alpha_heroes"
 export MALLOC_ARENA_MAX=2
 # ALPHA (empire.py: u = ALPHA x a creature's unupgraded cost, what one for hire is worth): 0.5 from deploy 70 (the user,
@@ -91,7 +104,7 @@ export MALLOC_ARENA_MAX=2
 export ALPHA_EMPIRE_ALPHA=0.5
 # (no expandable CUDA segments here: the learner's step graph failed to record with them, "device not ready"; the
 # joint run's shapes are padded, fixed, so it does not fragment as imitation did)
-rm -f runtime/train/*-joint7/drain  # (runtime/drain_restart.sh's: a start always plays)
+rm -f runtime/train/*-joint8-fresh/drain  # (runtime/drain_restart.sh's: a start always plays)
 runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # campaign.memory_steps=2 (2026-11-05): the passes over pairs of a player's decisions, the memory carried from the first
 # into the second, so the losses reach its writer (the step graph replay 117 ms against 108 at 1, the GPU idle)
@@ -465,12 +478,12 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # games hold 5.03 hero windows a decision, 59% of micro-batches went eager and the update doubled (504 s against 254 s);
 # 6.0 left none over in 20,000 sampled micro-batches. Back to v3295 as deploy 72 did; the code a49b192's as it is.
 resume=""
-ls -d runtime/train/*-joint7 > /dev/null 2>&1 && resume="--resume"
-exec .venv/bin/python -m campaign_model.joint --run joint7 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
-	--battle-from runtime/saved/battle_joint5_07295.pt \
+ls -d runtime/train/*-joint8-fresh > /dev/null 2>&1 && resume="--resume"
+exec .venv/bin/python -m campaign_model.joint --run joint8-fresh --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
+	--battle-from runtime/saved/battle_joint7_frozen.pt \
 	--set remote_port=7700 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
-		campaign.share_target=change campaign.init_from=runtime/saved/campaign_imitation.pt \
+		campaign.share_target=change campaign.init_from= campaign.controls_from=runtime/saved/campaign_joint7_pre_fresh.pt battle_frozen=true generated_actors=0 \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=20 remote_slots=15 campaign.inference_device=cpu inference_processes=8 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=1420 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=6.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=3502 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=false campaign.value_shared=0.25 campaign.value_shared_from=3324 campaign.head_scale_freeze=3324 campaign.end_week_share=1.0 campaign.nk_predict_weight=0 campaign.build_economy=1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 campaign.game_seconds=4800 campaign.eval_seconds=1200 campaign.no_town_factor=0.1 campaign.no_town_from=3394 campaign.loop_charge=0.03 campaign.loop_charge_step=0.01 campaign.loop_charge_from=3557 campaign.update_decisions_cap=135000 campaign.update_games_floor=9 campaign.window_balance=true campaign.phi_hero_base=825 campaign.phi_armyless_share=1.0 campaign.phi_lead_weight=0.5 campaign.phi_stock_floor=0.333333 campaign.phi_from=3502 campaign.phi_ramp=20 campaign.unit_own_form=true campaign.give_all_exact=true campaign.foresight_minibatch_counts=true campaign.foresight_outcome_factor=0.526 campaign.foresight_answer_factor=0.735 campaign.foresight_answer_score_factor=0.058 \
-	>> runtime/train/joint7.log 2>&1 < /dev/null
+		campaign.head_scale=true campaign.loss_shares_freeze=-1 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=6.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=0 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=false campaign.value_shared=0.25 campaign.value_shared_from=-100 campaign.head_scale_freeze=-1 campaign.end_week_share=1.0 campaign.nk_predict_weight=0 campaign.build_economy=1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 campaign.game_seconds=4800 campaign.eval_seconds=1200 campaign.no_town_factor=0.1 campaign.no_town_from=-100 campaign.loop_charge=0.03 campaign.loop_charge_step=0.03 campaign.loop_charge_from=0 campaign.update_decisions_cap=135000 campaign.update_games_floor=9 campaign.window_balance=true campaign.phi_hero_base=825 campaign.phi_armyless_share=1.0 campaign.phi_lead_weight=0.5 campaign.phi_stock_floor=0.333333 campaign.phi_from=0 campaign.phi_ramp=1 campaign.unit_own_form=true campaign.give_all_exact=true campaign.foresight_minibatch_counts=true campaign.foresight_outcome_factor=0.526 campaign.foresight_answer_factor=0.735 campaign.foresight_answer_score_factor=0.058 \
+	>> runtime/train/joint8-fresh.log 2>&1 < /dev/null
