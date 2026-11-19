@@ -1239,7 +1239,12 @@ def train(config, resume=False):
 		if value_ev is None:  # a checkpoint from before value_ev was kept: the last updates' explained variance
 			evs = [(float(r["attack_value_ev"]) + float(r["defence_value_ev"])) / 2 for r in list(csv.DictReader(progress.open()))[-10:] if r.get("attack_value_ev") not in (None, "", "nan") and r.get("defence_value_ev") not in (None, "", "nan")]
 			value_ev = sum(evs) / len(evs) if evs else None
-	writer = SummaryWriter(out / "tensorboard" / "run")  # one folder for the whole run: a resume goes on with the same line
+	if getattr(config, "battle_frozen", False):  # (a frozen battle model: nothing of its own to chart, no folder)
+		from campaign_model.tb_filter import NullWriter
+
+		writer = NullWriter()
+	else:
+		writer = SummaryWriter(out / "tensorboard" / "run")  # one folder for the whole run: a resume goes on with the same line
 	eval_csv = out / "eval.csv"
 	if not eval_csv.exists() or not resume:
 		with eval_csv.open("w", newline="") as f:

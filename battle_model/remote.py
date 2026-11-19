@@ -44,7 +44,7 @@ import zlib
 from dataclasses import asdict
 from pathlib import Path
 
-PROTOCOL = 2
+PROTOCOL = 3  # (3, 2026-11-19: a slot plays the critic's Nullkiller2 games too, spec kind "nk2")
 BATTLE_PORT, CAMPAIGN_PORT = 1, 51  # the inference servers' ports past the hub's: remote_port + these + process
 SLOT_PORT = 100  # the game slots' port past the hub's (supply.py: a worker's connection waits there for a game to play)
 STATE_SECONDS = 1.0

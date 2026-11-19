@@ -434,6 +434,8 @@ class Games(IterableDataset):
 		# MB), so it waits only for LAST_GAME_GB, not the floor with the trainer's peak kept free: under that the Mac's 4
 		# slots played ~6 games in 15 minutes while 11 permits were open (2026-11-02 03:10-03:26 CST)
 		free = available_gb()
+		if kind == "nk2" and not int(getattr(self.config.campaign, "nk2_remote", 0)):  # (the NK2 stream's local workers never take a remote slot it was not given)
+			return None
 		if self.listener is not None and (free is None or free >= LAST_GAME_GB):
 			conn = self._accept_slot()
 			if conn is not None:
@@ -506,7 +508,7 @@ class Games(IterableDataset):
 		index = info.id if info else 0
 		# (and the battle model's version at the worker's start: seeded by its index alone, each worker played the same
 		# battles and games again after every restart, w2_g2_11 among them five times in a day, 2026-11-05)
-		rng = random.Random(1_000_003 * (self.config.seed + 1) + 7919 * index + (104_729 * self.config.campaign.seed if self.kind == "campaign" else 0) + 15_485_863 * self.shared.version.value)
+		rng = random.Random(1_000_003 * (self.config.seed + 1) + 7919 * index + (104_729 * self.config.campaign.seed if self.kind == "campaign" else 32_452_843 * (self.config.campaign.seed + 1) if self.kind == "nk2" else 0) + 15_485_863 * self.shared.version.value)
 		runner = Runner(self.config, self.run_dir, self.battle_sockets[index % len(self.battle_sockets)], self.campaign_sockets[index % len(self.campaign_sockets)] if self.campaign_sockets else None, self.link, f"w{index}", self.shared.version, self.shared.credit)
 		stop = self.shared.stop
 		n = 0
@@ -532,7 +534,7 @@ class Games(IterableDataset):
 					time.sleep(0.5)
 					continue
 				n += 1
-				spec = runner.sample_battle(rng, index, n) if self.kind == "battle" else runner.sample_campaign(rng, index, n)
+				spec = runner.sample_battle(rng, index, n) if self.kind == "battle" else runner.sample_nk2(rng, index, n) if self.kind == "nk2" else runner.sample_campaign(rng, index, n)
 				slot = self.take_server() if where == "here" else None
 				if slot is not None:  # (both models' processes are the same: a game's battles go where its decisions do)
 					runner.battle_socket = self.battle_sockets[slot % len(self.battle_sockets)]
@@ -540,7 +542,7 @@ class Games(IterableDataset):
 						runner.campaign_socket = self.campaign_sockets[slot % len(self.campaign_sockets)]
 				try:
 					if where == "here":
-						yield from (runner.battle(spec, keep_record=index == 0 and n % TRACE_EVERY == 0) if self.kind == "battle" else runner.campaign(spec, stop))
+						yield from (runner.battle(spec, keep_record=index == 0 and n % TRACE_EVERY == 0) if self.kind == "battle" else runner.nk2(spec, stop) if self.kind == "nk2" else runner.campaign(spec, stop))
 					else:
 						yield from relay(conn, spec)
 				except Exception as error:  # one failed game does not stop the worker
@@ -551,7 +553,7 @@ class Games(IterableDataset):
 						self.release_server(slot)
 					self.release(where, conn)
 					trim_memory()
-				if self.kind == "campaign":
+				if self.kind in ("campaign", "nk2"):
 					# (the loader's feeder thread keeps the last item it sent until the next one: a whole game's pickle,
 					# 0.1-0.7 GB, held for as long as the memory gate keeps this worker waiting; e5, 2026-11-14: nine idle
 					# workers held 3.0 GB of PSS on the PC. A small item after each game takes its place; _route ignores it)
@@ -659,6 +661,54 @@ class Runner:
 			spec["map"], spec["players"] = rng.choice(sorted(GAME_MAPS.items()))
 			spec["size"] = 36
 		return spec
+
+	def sample_nk2(self, rng, index, n):
+		"""One Nullkiller2 game's spec for the critic's stream (campaign_model/nk2_stream.py): its players, size, seed and
+		day cap (config.nk2_days), on a map made for it."""
+		config = self.config.campaign
+		return {"kind": "nk2", "key": f"{self.name}_n{index}_{n}", "players": rng.choice(config.players), "size": rng.choice(config.sizes), "seed": rng.randrange(1, 2**31), "days": int(config.nk2_days)}
+
+	def nk2(self, spec, stop=None):
+		"""Plays one all-Nullkiller2 game here (teacher.py's: AlphaTeacherAI records every seat's requests as our decisions;
+		no inference, the battles Nullkiller2's and BattleAI's), with our games' window and Nullkiller2-view settings so
+		its inputs are encoded as ours are; slims it (nk2_stream.slim) and checks its decision history (history_problem).
+		Yields {"kind": "nk2", "key", "game" (the slim records.Game), "seconds"} for the learner to label at its own empire,
+		or a counted "failed" (a game that did not finish, or failed the check: "check" True)."""
+		import random as random_module
+
+		from campaign_model.nk2_stream import history_problem, slim
+		from campaign_model.play import GameRun, make_map, nk2_settings, time_scale, window_settings
+		from battle_model import play as battle_play
+
+		config = self.config.campaign
+		key, players, seed, days = spec["key"], spec["players"], spec["seed"], spec["days"]
+		begun = time.time()
+		map_name = make_map(seed, players, spec["size"], config.levels, config.water)[0]
+		settings = window_settings(config) + nk2_settings(config, seed)
+		try:
+			self.game = GameRun(battle_play.SOCKET_DIR / "teacher-none.sock", map_name, days, seed, max_seconds=config.game_seconds * time_scale(spec["size"]), battle_ai="BattleAI", game_key=key, settings=settings, niceness=config.niceness, teacher=True)
+			try:
+				while not self.game.poll(stop):
+					time.sleep(0.25)
+				game, info = self.game.result()
+			finally:
+				self.game.terminate()
+				self.game = None
+		finally:
+			(battle_play.USER_DIR / (map_name + ".vmap")).unlink(missing_ok=True)
+		if not (info.status.startswith("stopped") or "exit code 0" in info.status):
+			yield {"kind": "failed", "what": "nk2", "message": f"game {key} ({map_name}, {players} players): {info.status} (run {info.run_dir})"}
+			return
+		import shutil
+
+		shutil.rmtree(info.run_dir, ignore_errors=True)
+		game.days = days
+		game = slim(game, random_module.Random(int(seed) * 7919 + 17))
+		problem = history_problem(game)
+		if problem is not None:
+			yield {"kind": "failed", "what": "nk2", "message": f"game {key}: the history check: {problem}", "check": True}
+			return
+		yield {"kind": "nk2", "key": key, "game": game, "seconds": time.time() - begun, "host": socket.gethostname()}  # (where it played: the stream's games by machine)
 
 	def battle(self, spec, keep_record=False):
 		"""Plays one generated battle here; yields its items (one a recorded side)."""
@@ -855,7 +905,12 @@ class Supply:
 	def __init__(self, config, out, pool, campaign=None):
 		self.config, self.out, self.pool, self.campaign = config, Path(out), pool, campaign
 		self.ctx = forkserver.context()  # (fork_preload: every module a worker imports, once, frozen: inherited)
-		ceilings = {**({} if getattr(config, "battle_frozen", False) else {"battle": config.generated_actors}), **({"campaign": config.campaign.games} if campaign else {})}  # (battle_frozen: no battle loader)
+		# (battle_frozen: no battle loader; campaign.stage "critic", the critic alone on NK2 games: no campaign loader, every
+		# slot here and remote plays the NK2 stream's games)
+		critic_only = campaign and getattr(config.campaign, "stage", "joint") == "critic"
+		ceilings = {**({} if getattr(config, "battle_frozen", False) else {"battle": config.generated_actors}), **({"campaign": config.campaign.games} if campaign and not critic_only else {})}
+		if campaign and getattr(config.campaign, "nk2_stream", False):  # (the critic's Nullkiller2 games, made on the fly: nk2_stream.py)
+			ceilings["nk2"] = int(config.campaign.nk2_games)
 		self.shared = Shared(self.ctx, ceilings, servers=len(pool.server.socket_paths))
 		self.shared.version.value = pool.version
 		global SHARED
@@ -941,13 +996,13 @@ class Supply:
 		longer use of one)."""
 		if kind not in self.shared.ceilings:  # (battle_frozen: no battle loader)
 			return 0
-		remote_workers = (self.config.remote_slots if kind == "campaign" else max(1, self.config.remote_slots // 2)) if self.listener is not None else 0
+		remote_workers = (self.config.remote_slots if kind == "campaign" else int(getattr(self.config.campaign, "nk2_remote", 0)) if kind == "nk2" else max(1, self.config.remote_slots // 2)) if self.listener is not None else 0
 		return self.shared.ceilings[kind] + remote_workers
 
 	def start(self):
 		for kind, dataset in self.datasets.items():
 			loader = DataLoader(
-				dataset, batch_size=None, num_workers=self.workers(kind), prefetch_factor=1 if kind == "battle" else 8, in_order=False, persistent_workers=True,
+				dataset, batch_size=None, num_workers=self.workers(kind), prefetch_factor=1 if kind in ("battle", "nk2") else 8, in_order=False, persistent_workers=True,
 				multiprocessing_context=self.ctx, timeout=60, collate_fn=_identity, worker_init_fn=_worker_init,
 			)
 			self.loaders[kind] = loader
@@ -989,6 +1044,11 @@ class Supply:
 						pool.lock.wait(timeout=1)
 				if self.stop.is_set():
 					return
+			if kind == "nk2":  # (the stream's buffer full: its workers park with one game each until it has room)
+				while not self.stop.is_set() and not self.campaign.nk2_room():
+					time.sleep(1)
+				if self.stop.is_set():
+					return
 			try:
 				item = next(iterator)
 			except RuntimeError as error:  # the loader's timeout (nothing finished in a minute), or a worker died
@@ -1011,6 +1071,11 @@ class Supply:
 			self.game_decisions += (n - self.game_decisions) * 0.1
 			self.campaign._game_done(item["key"], item["map"], item["players"], item["game"], item["info"], item["game_map"])
 			self.allow()
+		elif kind == "nk2":  # (the learner labels it at its empire and puts its groups into its NK2Stream)
+			self.stats["nk2_games"] += 1
+			self.campaign.nk2_arrived(item)
+		elif kind == "failed" and item.get("what") == "nk2":
+			self.campaign.nk2_failed(item)
 		elif kind == "failed":
 			if item.get("lost"):  # a campaign game that never came: over, for the permits
 				self.received += 1

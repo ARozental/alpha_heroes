@@ -22,6 +22,7 @@ timescale), the trunk's at trunk_beta1, each group's gradient clipped apart (cli
 import argparse
 import collections
 import contextlib
+import gc
 import itertools
 import json
 import queue
@@ -57,7 +58,7 @@ def model_kwargs(config):
 	kwargs = {"dim": config.model_dim, "cell_dim": config.model_cell_dim, "heads": config.model_heads, "layers": config.model_layers}
 	if config.model_architecture == "v1":
 		return kwargs
-	return {**kwargs, "architecture": config.model_architecture, **({"share_target": config.share_target} if config.share_target != "share" else {})}
+	return {**kwargs, "architecture": config.model_architecture, **({"share_target": config.share_target} if config.share_target != "share" else {}), **({"link_map": True} if getattr(config, "critic_net", False) else {})}
 
 
 @contextlib.contextmanager
@@ -749,7 +750,7 @@ def excess_loss(logits, targets):
 
 # A step's metrics, in ppo_update's order: value the heads' loss at their own weights (comparable whatever head_scale
 # does), value_weighted at head_scale's (what the update takes)
-STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl", "teacher_kl", "teacher_ce", "value_weighted", "teacher_outside", "value_privileged", "adv_loss", "nkp_loss")
+STEP_PARTS = ("policy", "value", "entropy", "below_floor", "clip_fraction", "kl", "teacher_kl", "teacher_ce", "value_weighted", "teacher_outside", "value_privileged", "adv_loss", "nkp_loss", "link_loss")
 # The teacher's outputs its KL reads (teacher_kl), put in each micro-batch as "t:<name>"
 TEACHER_OUTPUTS = ("type_logp", "option_logp") + tuple(output for output, _ in HEADS.values())
 
@@ -979,6 +980,13 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 
 		nkp_part, _ = nk_loss({k: v for k, v in out.items() if k.startswith("nkp_")}, {k[4:]: v for k, v in out.items() if k.startswith("nkt:")})
 		loss = loss + config.nk_predict_weight * batch["share"] * nkp_part
+	# The link loss (config.critic_net, critic.py): the policy's state mapped onto the separate critic's (its target
+	# detached: the critic's state as the update started), on the critic's rows of the minibatch alone
+	link_part = torch.zeros((), device=keep.device)
+	if "link_pred" in out and "link_target" in batch:
+		err = ((out["link_pred"].float() - batch["link_target"].float()) ** 2).mean(dim=-1)
+		link_part = (err * batch["link_valid"]).sum() / batch["count_link"]
+		loss = loss + config.link_weight * link_part * batch.get("lw:link", 1.0)  # (the learner's loss shares: the link's in the value's place)
 	fs_parts = fs_share = None
 	labels = {name[3:]: value for name, value in batch.items() if name.startswith("fs:")}
 	if labels and "fs_turn" in out:
@@ -1006,6 +1014,7 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 		privileged_part.detach(),  # value_privileged: the privileged critic's loss, its heads' mean at their own weights
 		adv_part.detach(),  # adv_loss: the advantage head's squared error (0 with config.adv_weight 0)
 		nkp_part.detach(),  # nkp_loss: nk_predict's head's loss on its blind rows (0 with config.nk_predict_weight 0)
+		link_part.detach(),  # link_loss: the policy's state against the critic's on the critic's rows (0 without config.critic_net)
 	]).float()
 	if split:  # (each term at weight 1 against the learner's loss shares, the loss_weights it sets: the plan's apart too;
 		# the privileged critic's not among them: it reaches its own weights only)
@@ -1019,11 +1028,372 @@ def micro_loss(out, batch, config, foresight_config=None, split=False, privilege
 			terms["advantage"] = config.adv_weight * adv_part
 		if config.nk_predict_weight > 0 and "nkp_move" in out:
 			terms["nk_predict"] = config.nk_predict_weight * batch["share"] * nkp_part
+		if "link_pred" in out and "link_target" in batch:  # (grad_raw_link: its gradient's norm, at its weight, to size it)
+			terms["link"] = config.link_weight * link_part
 		return loss, metrics, fs_parts, fs_share, terms
 	return loss, metrics, fs_parts, fs_share
 
 
 NKP_PREPASS = 8  # nk_predict's fit (config.nk_predict_weight): read on the prepass's first this many chunks
+
+
+CRITIC_OOM_FLOOR = 64  # the critic's steps halve on running out of the GPU's memory down to this many rows
+CRITIC_PREPASS_CHUNKS = 2  # (was 4: 512 rows a call asked one 6.3-6.5 GiB block, more than the card had free beside the step graph's pool from each process's second update, joint9 v13 x8, 2026-11-18; 256 rows ~3.3 GiB, halved on running out: critic_states) # the prepass's chunks the critic's trunk takes at once (eager: its cost was its launches, 3x the policy's prepass at 128 rows a call, joint9's first updates)
+
+
+def trunk_in_halves(critic, inputs, oom=None, floor=None):
+	"""critic.trunk(inputs) (no gradient: the caller's); out of the GPU's memory, the cache emptied and the rows in two
+	halves, each again, down to `floor` rows (CRITIC_OOM_FLOOR), their outputs joined (oom["retries"] counted)."""
+	floor = CRITIC_OOM_FLOOR if floor is None else floor
+	try:
+		return critic.trunk(inputs)
+	except torch.OutOfMemoryError:
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+		n = next(iter(inputs.values())).shape[0]
+		if n <= floor:
+			raise
+		if oom is not None:
+			oom["retries"] = oom.get("retries", 0) + 1
+		half = n // 2
+		first = trunk_in_halves(critic, {k: v[:half] for k, v in inputs.items()}, oom, floor)
+		second = trunk_in_halves(critic, {k: v[half:] for k, v in inputs.items()}, oom, floor)
+		return tuple(torch.cat([a, b]) for a, b in zip(first, second))
+
+
+def critic_states(cm, pending, hidden_all, link_all, phi_all, oom=None):
+	"""The critic's trunk on the prepass's pending chunks at once (their inputs joined row-wise), its states written to
+	their rows; pending emptied. Out of the GPU's memory (e5, 2026-11-18: a size constant degrades, never drops an
+	update): the cache emptied, the chunks in two halves, each again, down to one chunk (oom["retries"] counted)."""
+	try:
+		index = torch.cat([i for i, _ in pending])
+		inputs = {name: torch.cat([x[name] for _, x in pending]) for name in pending[0][1]}
+		with torch.no_grad():
+			link, hidden, phi = cm.trunk(inputs)
+		hidden_all[index], link_all[index], phi_all[index] = hidden.float(), link.float(), phi.float()
+	except torch.OutOfMemoryError:
+		inputs = link = hidden = phi = None
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+		if len(pending) <= 1:
+			raise
+		if oom is not None:
+			oom["retries"] = oom.get("retries", 0) + 1
+		half = len(pending) // 2
+		first, second = list(pending[:half]), list(pending[half:])
+		critic_states(cm, first, hidden_all, link_all, phi_all, oom)
+		critic_states(cm, second, hidden_all, link_all, phi_all, oom)
+	pending.clear()
+
+
+def critic_outputs(cm, hidden, phi, rivals, mask, share_logit, chunk=4096):
+	"""The separate critic's outputs (critic.Critic.outputs) for every row from its trunk's states (no gradient): each
+	row's rivals [N, R] (rows of the same states), mask [N, R], our true share's logit as the day began [N]."""
+	from .critic import CRITIC_OUT, rival_extra
+
+	n = hidden.shape[0]
+	raw = torch.zeros(n, CRITIC_OUT, device=hidden.device)
+	with torch.no_grad():
+		for first in range(0, n, chunk):
+			part = slice(first, first + chunk)
+			r = rivals[part]
+			raw[part] = cm.head(hidden[part], hidden[r], mask[part], share_logit[part], rival_extra(phi[part], phi[r], mask[part])).float()
+		return cm.outputs(raw, share_logit)
+
+
+def critic_unexplained(out, rows, targets, valid):
+	"""The share heads' fresh loss over a constant guess's (value_unexplained's form) on these rows: 1 no fit at all."""
+	if rows.numel() == 0:
+		return float("nan")
+	t, v = targets[rows], valid[rows]
+	mean = (t * v).sum(dim=0) / v.sum(dim=0).clamp(min=1)
+	guess = torch.logit(mean.clamp(1e-4, 1 - 1e-4)).expand_as(t)
+	masked = lambda x: ((x * v).sum(dim=0) / v.sum(dim=0).clamp(min=1)).sum()  # noqa: E731
+	base = float(masked(excess_loss(guess, t)))
+	return float(masked(excess_loss(out["value_logit"][rows].float(), t))) / base if base > 1e-6 else float("nan")
+
+
+CRITIC_HEADS = ("V2", "V5", "V7", "G2", "G5", "G7", "Vend")
+
+
+def critic_head_fit(out, rows, phi, targets, share_valid, growth=None, growth_valid=None, end=None, end_valid=None, head_w=None):
+	"""{head: its fresh excess loss over a constant guess's (each head's mean target in these rows)} for V2 V5 V7 (the
+	share heads), G2 G5 G7 (growth on the loss's 0..1 scale, over these rows' Phi) and Vend, and "total": the seven at
+	the loss's head weights (head_w, 1 each without), sum of excess over sum of the guess's: 1 no fit, 0 exact; nan with
+	no graded row (e5 for the user, 2026-11-18: every output's unexplained share and the weighted total)."""
+	parts = []  # (head, its excess, the guess's excess, its weight)
+
+	def fit(names, logits, t, v, weights):
+		v = v.float()
+		count = v.sum(dim=0)
+		mean = (t * v).sum(dim=0) / count.clamp(min=1)
+		guess = torch.logit(mean.clamp(1e-4, 1 - 1e-4)).expand_as(t)
+		ours = (excess_loss(logits.float(), t) * v).sum(dim=0) / count.clamp(min=1)
+		base = (excess_loss(guess, t) * v).sum(dim=0) / count.clamp(min=1)
+		for k, name in enumerate(names):
+			if count[k] > 0:
+				parts.append((name, float(ours[k]), float(base[k]), float(weights[k]) if weights is not None else 1.0))
+			else:
+				parts.append((name, float("nan"), float("nan"), 0.0))
+
+	weight = lambda key: head_w[key].float().tolist() if head_w is not None and key in head_w else None  # noqa: E731
+	out_rows = {k: v[rows] for k, v in out.items() if torch.is_tensor(v) and v.shape[:1] == phi.shape[:1]}
+	fit(CRITIC_HEADS[:3], out_rows["value_logit"], targets[rows], share_valid[rows], weight("w:share"))
+	if growth is not None and "growth_logit" in out_rows:
+		now = phi[rows].float().clamp(min=PHI_FLOOR).log().unsqueeze(-1)
+		scaled = ((growth[rows] - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
+		fit(CRITIC_HEADS[3:6], out_rows["growth_logit"], scaled, growth_valid[rows], weight("w:growth"))
+	if end is not None and "end_logit" in out_rows:
+		fit(CRITIC_HEADS[6:], out_rows["end_logit"].unsqueeze(-1), end[rows].unsqueeze(-1), end_valid[rows].unsqueeze(-1), weight("w:end"))
+	result = {name: (ours / base if base > 1e-6 else float("nan")) for name, ours, base, _ in parts}
+	graded = [(o, b, w) for _, o, b, w in parts if w > 0 and o == o and b == b]
+	total_base = sum(w * b for _, b, w in graded)
+	result["total"] = sum(w * o for o, _, w in graded) / total_base if total_base > 1e-6 else float("nan")
+	return result
+
+
+def head_stats(rows, fits, visible=False):
+	"""{"critic_heads/unexplained_[visible_]<head>_<rows>": value} of critic_head_fit's dict (TensorBoard's critic_heads/;
+	the privileged head's unprefixed)."""
+	return {f"critic_heads/unexplained_{'visible_' if visible else ''}{head}_{rows}": value for head, value in fits.items()}
+
+
+def excess_head_loss(logits, targets, valid):
+	"""[heads] each head's EXCESS cross-entropy (excess_loss: the cross-entropy less the targets' own entropy, a constant
+	of the targets with no gradient through it) over the rows that have a target: 0 when it predicts them exactly."""
+	return (excess_loss(logits, targets) * valid).sum(dim=0) / valid.sum(dim=0).clamp(min=1)
+
+
+def critic_loss(out, phi, targets, share_valid, growth, growth_valid, end, end_valid, head_w, growth_weight, share_now=None, raw=False):
+	"""The critic's loss on its rows: the share heads, the growth heads (our value's log growth on their 0..1 scale) and
+	V_end, each at the update's head weight (head_w, config.head_scale) where it has one, their mean. Each head's term is
+	its EXCESS cross-entropy (the user, 2026-11-18: "the current loss minus the 'perfect answer' ... inside the graph"):
+	0 for a perfect critic, the gradient the cross-entropy's; raw=True: the cross-entropy itself (logged for a restart,
+	so the series join). share_now (the visible head's, critic.FreeHead): our true share's logit as the day began [B],
+	its guess out["share_now_logit"] graded as a share head is at critic.FREE_SHARE_AUX_WEIGHT x the share heads' mean
+	weight."""
+	from .critic import FREE_SHARE_AUX_WEIGHT
+
+	head_loss_ = head_loss if raw else excess_head_loss
+	share = head_loss_(out["value_logit"], targets, share_valid)
+	total = (share * head_w["w:share"]).sum() if head_w is not None and "w:share" in head_w else share.sum()
+	heads = float(c.N_VALUE_OFFSETS)
+	if share_now is not None and "share_now_logit" in out:
+		known = torch.isfinite(share_now).float().unsqueeze(-1)
+		truth = torch.sigmoid(share_now.float().nan_to_num(0.0).clamp(-10.0, 10.0)).unsqueeze(-1)
+		guessed = head_loss_(out["share_now_logit"].float().unsqueeze(-1), truth, known)
+		weight = head_w["w:share"].float().mean() if head_w is not None and "w:share" in head_w else 1.0
+		total = total + FREE_SHARE_AUX_WEIGHT * weight * guessed.sum()
+	if growth is not None:
+		now = phi.detach().clamp(min=PHI_FLOOR).log().unsqueeze(-1)
+		scaled = ((growth - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
+		grown = head_loss_(out["growth_logit"], scaled, growth_valid)
+		total = total + ((grown * head_w["w:growth"]).sum() if head_w is not None and "w:growth" in head_w else growth_weight * grown.sum())
+		heads += growth_weight * c.N_VALUE_OFFSETS
+	if end is not None:
+		ended = head_loss_(out["end_logit"].unsqueeze(-1), end.unsqueeze(-1), end_valid.unsqueeze(-1))
+		total = total + ((ended * head_w["w:end"]).sum() if head_w is not None and "w:end" in head_w else ended.sum())
+		heads += 1.0
+	return total / heads
+
+
+CARD_FREE_THIN_GB = 2.5  # (e5, 2026-11-18) below this much free on the card the held-out passes go 128 rows a call and the after-read is dropped
+
+
+def card_free_gb(device):
+	"""The card's free memory in GB (nan off CUDA): torch.cuda.mem_get_info's."""
+	if getattr(device, "type", None) != "cuda":
+		return float("nan")
+	try:
+		return torch.cuda.mem_get_info(device)[0] / 2**30
+	except Exception:  # noqa: BLE001 (a reading)
+		return float("nan")
+
+
+def pool_states(cm, pool, device, config, oom=None, players=False, chunk=256):
+	"""An NK2 pool sample's tensors on the device (rivals, mask, share logit, targets with their valid masks), its rows'
+	states and Phi from the critic's trunk (no gradient, 256 rows a call, halved on running out of memory), its decoder
+	and its row count."""
+	from .records import decode_inputs
+
+	m = len(pool["decisions"])
+	pool_t = {name: torch.from_numpy(np.asarray(pool[name])).to(device) for name in ("rivals", "present", "share_logit", "targets", "growth", "end")}
+	pool_t["mask"] = pool_t["present"].float() * (pool_t["rivals"] >= 0).float()
+	pool_t["rivals"] = pool_t["rivals"].clamp(min=0)
+	pool_t["share_valid"], pool_t["growth_valid"], pool_t["end_valid"] = (torch.isfinite(pool_t[k]).float() for k in ("targets", "growth", "end"))
+	for k in ("targets", "growth", "end"):
+		pool_t[k] = pool_t[k].float().nan_to_num(0.0)
+	decode_pool = pool.get("decode") or (lambda rows_: decode_inputs([pool["decisions"][i] for i in rows_]))  # noqa: E731 (a test's own inputs: pool["decode"])
+	p_hidden, p_phi, p_players = torch.zeros(m, cm.dim, device=device), torch.zeros(m, device=device), torch.zeros(m, device=device)
+	with torch.no_grad():  # (the pool's states for its rows' rivals, and its fit before the steps)
+		for rows, inputs in _prefetched([np.arange(i, min(i + chunk, m)) for i in range(0, m, chunk)], decode_pool, device, threads=config.decode_threads):
+			_, h, p = trunk_in_halves(cm, inputs, oom)
+			p_hidden[rows], p_phi[rows], p_players[rows] = h.float(), p.float(), inputs["g_players"].float()
+	if players:  # (each row's g_players: the free head's share prior)
+		return pool_t, p_hidden, p_phi, decode_pool, m, p_players
+	return pool_t, p_hidden, p_phi, decode_pool, m
+
+
+def stream_head_weights(pool_t, p_phi, trained, head_scale, config, device):
+	"""campaign.stage "critic" (no own rows to measure them on; e5, 2026-11-19): head_scale's per-head weights from the NK2
+	stream rows' targets, the formula and memory of ppo_update's (the share's variance, the growth's on its 0..1 scale over
+	the value now, the end's); held weights (head_scale["frozen"]) as they are. (head_w, the running variances, the weights)."""
+	rows = torch.as_tensor(np.asarray(trained, dtype=np.int64), device=device)
+	measured = {"share": masked_variance(pool_t["targets"][rows], pool_t["share_valid"][rows]).tolist()}
+	now = p_phi[rows].clamp(min=PHI_FLOOR).log().unsqueeze(-1)
+	scaled = ((pool_t["growth"][rows] - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
+	measured["growth"] = masked_variance(scaled, pool_t["growth_valid"][rows]).tolist()
+	measured["end"] = masked_variance(pool_t["end"][rows].unsqueeze(-1), pool_t["end_valid"][rows].unsqueeze(-1)).tolist()
+	var = running(head_scale.get("var") or {}, measured, HEAD_SCALE_MEMORY)
+	weights = head_weights(var, float(head_scale.get("ramp", 1.0)), config.growth_weight)
+	if head_scale.get("frozen"):
+		weights = {name: list(values) for name, values in head_scale["frozen"].items()}
+	return {f"w:{name}": torch.tensor(values, dtype=torch.float32, device=device) for name, values in weights.items() if name in measured}, var, weights
+
+
+def train_critic(cm, crit, config, own_rows, hidden_all, phi_all, rivals, mask, share, targets_t, share_valid, growth_t, growth_valid, end_t, end_valid, head_w, prefetch, model_inputs, device, head_scale=None):
+	"""The separate critic's steps an update (config.critic_net): one pass over its rows of this update (one decision drawn
+	per player-day) and the NK2 pool's (crit["pool"], at most config.critic_pool_share of its positions), in minibatches
+	of config.critic_batch, alternating; each row's rivals' states and Phi as the update started (no gradient through
+	them). Its own optimizer: nothing else moves. Its losses' means over the pass's first and last quarter, its fit on the
+	pool's rows before its steps (the own rows' is the prepass's)."""
+	from .critic import rival_extra
+
+	opt, size = crit["optimizer"], max(1, int(config.critic_batch))
+	order = own_rows[torch.randperm(own_rows.numel(), device=own_rows.device)].cpu().numpy()
+	own_chunks = [order[i : i + size] for i in range(0, len(order), size)]
+	pool = crit.get("pool")
+	pool_iter, pool_chunks, pool_t = iter(()), [], None
+	stats = {"critic_rows_own": int(len(order)), "critic_rows_pool": 0} if len(order) else {"critic_rows_pool": 0}
+	heldout = crit.get("pool_heldout")
+	free = card_free_gb(device)
+	stats["card_free_gb"] = free
+	thin = free == free and free < CARD_FREE_THIN_GB  # (the held-out passes 128 rows a call, no after-read)
+	def read_heldout(held, suffix, heads_name):
+		"""A held-out block's readings before the steps (the critic never trains on it): unexplained, each head's, the loss;
+		the visible head's the same; under critic_*_pool_heldout<suffix> (the NK2 stream's held-out: "")."""
+		h_t, h_hidden, h_phi, _, h_m, h_players = pool_states(cm, held, device, config, oom=crit.get("oom"), players=True, chunk=128 if thin else 256)
+		h_out = critic_outputs(cm, h_hidden, h_phi, h_t["rivals"], h_t["mask"], h_t["share_logit"].float())
+		h_rows = torch.arange(h_m, device=device)
+		stats[f"critic_unexplained_pool_heldout{suffix}"] = critic_unexplained(h_out, h_rows, h_t["targets"], h_t["share_valid"])
+		h_args = (h_t["growth"], h_t["growth_valid"], h_t["end"], h_t["end_valid"])
+		stats.update(head_stats(heads_name, critic_head_fit(h_out, h_rows, h_phi, h_t["targets"], h_t["share_valid"], *h_args, head_w=head_w)))
+		with torch.no_grad():  # (the loss on the held-out rows before the steps: 0 a perfect critic)
+			h_sl = h_t["share_logit"].float()
+			stats[f"critic_loss_pool_heldout{suffix}"] = float(critic_loss(h_out, h_phi, h_t["targets"], h_t["share_valid"], *h_args, head_w, config.growth_weight))
+		if hasattr(cm, "free"):
+			with torch.no_grad():
+				h_free = cm.free(h_hidden, h_players)
+				stats[f"critic_unexplained_visible_pool_heldout{suffix}"] = critic_unexplained(h_free, h_rows, h_t["targets"], h_t["share_valid"])
+				stats.update(head_stats(heads_name, critic_head_fit(h_free, h_rows, h_phi, h_t["targets"], h_t["share_valid"], *h_args, head_w=head_w), visible=True))
+				stats[f"critic_loss_visible_pool_heldout{suffix}"] = float(critic_loss(h_free, h_phi, h_t["targets"], h_t["share_valid"], *h_args, head_w, config.growth_weight, share_now=h_sl))
+		stats[f"critic_rows_pool_heldout{suffix}"] = int(h_m)
+
+	if pool is not None and len(pool["decisions"]):
+		pool_t, p_hidden, p_phi, decode_pool, m = pool_states(cm, pool, device, config, oom=crit.get("oom"))
+		p_out = critic_outputs(cm, p_hidden, p_phi, pool_t["rivals"], pool_t["mask"], pool_t["share_logit"].float())
+		stats["critic_unexplained_pool"] = critic_unexplained(p_out, torch.arange(m, device=device), pool_t["targets"], pool_t["share_valid"])
+		if hasattr(cm, "free"):
+			with torch.no_grad():
+				stats["critic_unexplained_visible_pool"] = critic_unexplained(cm.free(p_hidden), torch.arange(m, device=device), pool_t["targets"], pool_t["share_valid"])
+		# (the NK2 stream's groups, critic_store.assemble: their rival-only rows feed states only, never a step)
+		trained = np.asarray(pool["train"], dtype=np.int64) if pool.get("train") is not None else np.arange(m)
+		perm = np.random.permutation(trained)
+		pool_chunks = [perm[i : i + size] for i in range(0, len(perm), size)]
+		pool_iter = _prefetched(pool_chunks, decode_pool, device, threads=config.decode_threads)
+		stats["critic_rows_pool"] = int(len(trained))
+		if head_w is None and head_scale is not None:  # (campaign.stage "critic": the heads' weights from the stream's rows)
+			head_w, stats["head_var"], stats["head_weights"] = stream_head_weights(pool_t, p_phi, trained, head_scale, config, device)
+	if heldout is not None and len(heldout["decisions"]):  # (e5, 2026-11-18: the pool's fit on games the critic never trains on; after the stream's states, for its head weights)
+		read_heldout(heldout, "", "heldout")
+	cm.train()
+	losses = {name: [] for name in ("own", "pool", "visible_own", "visible_pool", "raw_own", "raw_pool")}
+	grads = {"own": [], "pool": []}  # (each step's gradient norm before the clip, by source: e5's own-rows weight question)
+	sequence = []  # ((source, its loss) of each step in order)
+	own_weight = float(crit.get("own_weight", 1.0) or 1.0)  # (learner.balance_critic_own's)
+	if len(order):  # (no own rows, campaign.stage "critic": no own readings at all)
+		stats["critic_own_weight"] = own_weight
+	oom = crit.get("oom") if isinstance(crit.get("oom"), dict) else {"retries": 0}
+
+	def step_rows(name, idx, x):
+		"""One critic step on these rows; out of the GPU's memory, the cache emptied and the rows in two halves, a step each,
+		down to 64 (e5, 2026-11-18: a size constant degrades, never drops an update)."""
+		try:
+			_, h, p = cm.trunk(x)
+			if name == "own":
+				r, mk, sl = rivals[idx], mask[idx], share[idx]
+				raw = cm.head(h, hidden_all[r], mk, sl, rival_extra(p.detach().float(), phi_all[r], mk))
+				t, sv = targets_t[idx], share_valid[idx]
+				g, gv = (growth_t[idx], growth_valid[idx]) if growth_t is not None else (None, None)
+				e, ev = (end_t[idx], end_valid[idx]) if end_t is not None else (None, None)
+			else:  # (the NK2 stream's rows)
+				r, mk, sl = pool_t["rivals"][idx], pool_t["mask"][idx], pool_t["share_logit"][idx].float()
+				raw = cm.head(h, p_hidden[r], mk, sl, rival_extra(p.detach().float(), p_phi[r], mk))
+				t, sv, g, gv, e, ev = pool_t["targets"][idx], pool_t["share_valid"][idx], pool_t["growth"][idx], pool_t["growth_valid"][idx], pool_t["end"][idx], pool_t["end_valid"][idx]
+			out_p = cm.outputs(raw.float(), sl)
+			loss = critic_loss(out_p, p, t, sv, g, gv, e, ev, head_w, config.growth_weight)
+			with torch.no_grad():  # (the raw cross-entropy, logged for one restart so the series join: progress.csv)
+				losses[f"raw_{name}"].append(float(critic_loss({k: v.detach() for k, v in out_p.items()}, p, t, sv, g, gv, e, ev, head_w, config.growth_weight, raw=True)))
+			if hasattr(cm, "free"):  # (the visible head: the same rows, targets and weights, from the body's state alone)
+				free_loss = critic_loss(cm.free(h, x.get("g_players")), p, t, sv, g, gv, e, ev, head_w, config.growth_weight, share_now=sl)
+				losses[f"visible_{name}"].append(float(free_loss.detach()))
+				losses[name].append(float(loss.detach()))  # (critic_loss_own / _pool: the privileged head's alone, as before)
+				loss = loss + free_loss
+			if name == "own" and own_weight != 1.0:  # (config.critic_own_balance: our rows' share of the critic's movement)
+				loss = loss * own_weight
+			opt.zero_grad(set_to_none=True)
+			loss.backward()
+			norm = torch.nn.utils.clip_grad_norm_(cm.parameters(), max(float(config.grad_clip), 1e-6))  # (its return: the norm before the clip)
+			grads[name].append(float(norm))
+			opt.step()
+			if not hasattr(cm, "free"):
+				losses[name].append(float(loss.detach()))
+			sequence.append((name, losses[name][-1]))  # (the steps in order, own and pool: the learner's critic_steps/ charts)
+		except torch.OutOfMemoryError:
+			opt.zero_grad(set_to_none=True)
+			if torch.cuda.is_available():
+				torch.cuda.empty_cache()
+			if len(idx) <= CRITIC_OOM_FLOOR:
+				raise
+			oom["retries"] = oom.get("retries", 0) + 1
+			half = len(idx) // 2
+			step_rows(name, idx[:half], {k: v[:half] for k, v in x.items()})
+			step_rows(name, idx[half:], {k: v[half:] for k, v in x.items()})
+	own_iter = prefetch(own_chunks)
+	sources = [("own", own_iter, len(own_chunks)), ("pool", pool_iter, len(pool_chunks))]
+	left = {name: count for name, _, count in sources}
+	while any(left.values()):
+		for name, it, _ in sources:
+			if not left[name]:
+				continue
+			left[name] -= 1
+			rows, inputs = next(it)
+			idx = torch.as_tensor(np.asarray(rows), device=device)
+			step_rows(name, idx, model_inputs(inputs) if name == "own" else inputs)
+	cm.eval()
+	for it in (own_iter, pool_iter):  # (their decode threads ended)
+		if hasattr(it, "close"):
+			it.close()
+	stats["critic_oom_retries"] = int(oom.get("retries", 0))
+	stats["critic_step_sequence"] = sequence
+	for name, values in grads.items():
+		if values:
+			stats[f"critic_grad_{name}"] = float(np.mean(values))
+			stats[f"critic_clipped_{name}"] = float(np.mean([v > float(config.grad_clip) for v in values]))
+	for name, values in losses.items():
+		if values:
+			q = max(1, len(values) // 4)
+			stats[f"critic_loss_{name}_first"], stats[f"critic_loss_{name}_last"] = float(np.mean(values[:q])), float(np.mean(values[-q:]))
+			stats[f"critic_loss_{name}_mean"] = float(np.mean(values))  # (the whole pass's, less noisy than a quarter's)
+			if name in ("own", "pool"):
+				stats[f"critic_steps_{name}"] = len(values)
+				stats[f"critic_pass_{name}"] = [round(v, 4) for v in values]  # (each minibatch's loss in order: the log's pass line)
+	if heldout is not None and len(heldout["decisions"]) and not thin:  # (the held-out tenth again after the steps: does the pass's gain reach games it never saw?)
+		h_t, h_hidden, h_phi, _, h_m = pool_states(cm, heldout, device, config, oom=crit.get("oom"))
+		h_out = critic_outputs(cm, h_hidden, h_phi, h_t["rivals"], h_t["mask"], h_t["share_logit"].float())
+		stats["critic_unexplained_pool_heldout_after"] = critic_unexplained(h_out, torch.arange(h_m, device=device), h_t["targets"], h_t["share_valid"])
+		del h_t, h_hidden, h_phi, h_out
+	return stats
 
 
 SHARED_PREFIXES = ("encode_", "blocks.", "unet.", "read_tiles.", "sides.", "tile_sides.", "join_", "stamp_")  # (foresight.gradient_check's shared layers)
@@ -1322,7 +1692,7 @@ def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
 	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None, teacher=None, teacher_weight=None,
 	share_trust=1.0, head_scale=None, teacher_sets=None, loss_weights=None, streams=None, clips=None, privileged=None,
-	growth_trust=1.0, hidden=None, segment_k=None,
+	growth_trust=1.0, hidden=None, segment_k=None, critic=None,
 ):
 	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
 	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
@@ -1452,7 +1822,7 @@ def ppo_update(
 	# (config.kl_teacher_inflation False since 2026-11-06, docs/optimizer_plan.md step 2: the target is target_kl, the
 	# actor on the slow timescale: inflated, the policy's budget was 0.015 x (1 + 0.6 / 0.2) = 0.06 an update)
 	kl_target = config.target_kl * (1.0 + kl_teacher) if config.kl_teacher_inflation and (advice_t is not None or teacher is not None) else config.target_kl
-	weights_t = {f"lw:{name}": torch.full((), float(loss_weights[name]), device=device) for name in ("value", "foresight")} if loss_weights is not None else {}
+	weights_t = {f"lw:{name}": torch.full((), float(loss_weights[name]), device=device) for name in ("value", "foresight", "link") if name in loss_weights} if loss_weights is not None else {}
 	steps_graph = None
 	privileged_module = getattr(model, "privileged", None)  # (its loss only where a batch has rivals: config.privileged_critic)
 	if graphs is not None and config.step_graphs:
@@ -1488,6 +1858,18 @@ def ppo_update(
 	anchor, end_now, prior = torch.empty(n, device=device), torch.empty(n, device=device), torch.empty(n, device=device)
 	growth_now, log_phi = torch.zeros(n, device=device), torch.zeros(n, device=device)  # (G7's logit, our log value: the attributed credit's)
 	segments = getattr(config, "credit_segments", False) and config.credit == "schedule" and growth is not None
+	# The separate critic (config.critic_net; critic.py): its trunk on every row in the prepass (no gradient), its head
+	# over them after it (the credit's per-row baselines V7, G7, V_end), its link state on its training rows (the policy's
+	# link loss), then its own steps on those rows and the pool's (train_critic)
+	crit = critic
+	if crit is not None:
+		cm = crit["module"]
+		cm.eval()
+		model.link_outputs = True
+		c_hidden_all, c_link_all, c_phi_all = torch.zeros(n, cm.dim, device=device), torch.zeros(n, 3 * cm.dim, device=device), torch.zeros(n, device=device)
+		c_players_all = torch.zeros(n, device=device)  # (each row's g_players: the free head's share prior)
+		c_pending = []  # (the prepass's chunks waiting for the critic's trunk: critic_states)
+		c_oom = {"retries": 0}  # (critic_states' and train_critic's halvings on running out of the GPU's memory)
 	if segments:  # (config.credit_segments: every offset's heads, V2 V5 V7 and G2 G5 G7)
 		value_all, growth_all = torch.zeros(n, c.N_VALUE_OFFSETS, device=device), torch.zeros(n, c.N_VALUE_OFFSETS, device=device)
 	side = torch.full((n,), 36.0, device=device)  # (each decision's map side: the schedule credit's share weight)
@@ -1529,6 +1911,10 @@ def ppo_update(
 			out = graphs.eval(raw, budget, prepare) if graphs else model(model_inputs(raw))
 			logp, _ = chosen_logp(out, {k: choice[k][index] for k in ("kind", "action", "index", "cell")})
 			anchor[index] = logp
+			if crit is not None:  # (the critic's trunk, eager, no gradient: its state at every row, CRITIC_PREPASS_CHUNKS chunks at once)
+				c_pending.append((index, model_inputs(raw)))
+				if len(c_pending) >= CRITIC_PREPASS_CHUNKS:
+					critic_states(cm, c_pending, c_hidden_all, c_link_all, c_phi_all, c_oom)
 			if adv_before is not None:
 				predicted, named = advantage_of(out, choice["action"][index], choice["index"][index])
 				adv_before[index], adv_followed[index], adv_labelled[index] = predicted.float(), named, out["adv_label"][:, 0] >= 0
@@ -1552,6 +1938,8 @@ def ppo_update(
 					growth_all[index], value_all[index] = out["growth_logit"].float(), out["value_logit"].float()
 				log_phi[index] = out["phi"].float().clamp(min=PHI_FLOOR).log()
 			players = input_on_device(raw["wire"], "g_players") if prepare is not None else raw["g_players"]
+			if crit is not None:
+				c_players_all[index] = players.float()
 			side[index] = (input_on_device(raw["wire"], "g_map") if prepare is not None else raw["g_map"])[:, :2].amax(dim=1).float()
 			prior[index] = 1.0 / players.float().clamp(min=2) if config.share_target == "share" else 0.5  # the share heads' start: 1 / players (no change: 1/2)
 			fresh["share"][index] = excess_loss(out["value_logit"].float(), targets_t[index])
@@ -1564,6 +1952,8 @@ def ppo_update(
 				state_all[index] = out["value_hidden"].float()
 				logits_all["share"][index], logits_all["end"][index] = out["value_logit"].float(), out["end_logit"].float()
 			gpu_anchor_mb = max(gpu_anchor_mb, gpu_held(device))
+		if crit is not None and c_pending:
+			critic_states(cm, c_pending, c_hidden_all, c_link_all, c_phi_all, c_oom)
 		if device.type == "cuda":
 			torch.cuda.synchronize(device)
 		clock["prepass"] = time.perf_counter() - prepass_started
@@ -1614,6 +2004,35 @@ def ppo_update(
 			value_now = value_now + corr_all[:, k - 1]
 			end_now = torch.sigmoid(logits_all["end"] + corr_all[:, k])
 		del logits_all, corr_all
+	critic_stats = {}
+	if crit is not None:  # (the critic's per-row baselines: V7, G7, V_end at every row, as the update starts)
+		c_rivals = torch.from_numpy(np.asarray(crit["rivals"])).to(device)
+		c_mask = torch.from_numpy(np.asarray(crit["present"], dtype=np.float32)).to(device) * (c_rivals >= 0).float()
+		c_rivals = c_rivals.clamp(min=0)
+		c_share = torch.from_numpy(np.asarray(crit["share_logit"], dtype=np.float32)).to(device)
+		c_out = critic_outputs(cm, c_hidden_all, c_phi_all, c_rivals, c_mask, c_share)
+		value_now, growth_now, end_now = c_out["value_logit"][:, -1].float(), c_out["growth_logit"][:, -1].float(), torch.sigmoid(c_out["end_logit"].float())
+		own_rows = torch.from_numpy(np.asarray(crit["rows"], dtype=np.int64)).to(device)
+		critic_stats["critic_unexplained_own"] = critic_unexplained(c_out, own_rows, targets_t, share_valid)
+		if hasattr(cm, "free"):  # (the free head's change heads need no prior: share_target "change"'s)
+			with torch.no_grad():
+				critic_stats["critic_unexplained_visible_own"] = critic_unexplained(cm.free(c_hidden_all), own_rows, targets_t, share_valid)
+		# The value readings from the critic, not the policy's dead heads (the audit of 2026-11-18): value_fresh and
+		# value_unexplained over every row of the update (the update line, the value-loss guard's input)
+		with torch.no_grad():
+			c_fresh = {"share": excess_loss(c_out["value_logit"].float(), targets_t)}
+			value_unexplained = float(masked(c_fresh["share"], share_valid)) / baseline if baseline > 1e-6 else float("nan")
+			value_fresh, heads = masked(c_fresh["share"], share_valid), float(c.N_VALUE_OFFSETS)
+			if growth is not None:
+				now = c_phi_all.float().clamp(min=PHI_FLOOR).log().unsqueeze(-1)
+				scaled = ((growth_t - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
+				value_fresh, heads = value_fresh + config.growth_weight * masked(excess_loss(c_out["growth_logit"].float(), scaled), growth_valid), heads + config.growth_weight * c.N_VALUE_OFFSETS
+			if end is not None:
+				value_fresh, heads = value_fresh + masked(excess_loss(c_out["end_logit"].float().unsqueeze(-1), end_t.unsqueeze(-1)), end_valid.unsqueeze(-1)), heads + 1.0
+			value_fresh = float(value_fresh) / heads
+			critic_value = c_out["value"].float().cpu().numpy()
+		link_valid = torch.zeros(n, device=device)
+		link_valid[own_rows] = 1.0
 	# config.head_scale: the heads' target variances this update (the growth heads' on their 0..1 scale, over the value
 	# now), into the running ones (head_scale["var"]), and the heads' weights from them (head_weights)
 	head_w, head_var, head_residual, head_var_slow = None, None, None, None
@@ -1801,6 +2220,11 @@ def ppo_update(
 			torch.cuda.empty_cache()
 	totals, steps, stopped, update_kl, recent = Counter(), 0, False, 0.0, deque(maxlen=KL_WINDOW)
 	step_norms, step_bound = [], []  # each step's gradient norms before the clip ([total, GRAD_GROUPS']) and which clips bound
+	# each micro-batch's own policy loss and link loss, in order (the user, 2026-11-18 16:05: "I expected to see the loss at
+	# every step during training"): its parts are its share of the minibatch's means, taken back to its own rows' means on
+	# the device and read at the minibatch's one sync
+	step_losses = []
+	policy_at, link_at = STEP_PARTS.index("policy"), STEP_PARTS.index("link_loss")
 	kl_trace = []  # each step's KL before it, in order (the KL control's reading: kl_first, kl_growth)
 	full_windows = 0  # micro-batches stepped over every hero slot (more of our heroes than config.window_budget allows)
 	stopped_pass = 0  # the pass the KL control ended (0: none; b1, 2026-10-31: with passes=2, a second pass mostly cut short adds nothing)
@@ -1833,6 +2257,8 @@ def ppo_update(
 			# up to the whole minibatch's, at 1 / micro_batches of its peak memory (2026-10-28: the update's ~8 GB on
 			# Apple's GPU next to the battle learner's sent the machine into swap)
 			counts = {"credit": (whole * credited[index].float()).sum().clamp(min=1), "keep": whole.sum().clamp(min=1), "share": share_valid[index].sum(dim=0)}
+			if crit is not None:  # (the link loss: a mean over the minibatch's critic rows)
+				counts["link"] = link_valid[index].sum().clamp(min=1)
 			if advice_t is not None:
 				counts["advised"] = (whole * advice_t["advised"][index]).sum().clamp(min=1)
 			if growth is not None:
@@ -1842,7 +2268,7 @@ def ppo_update(
 			if fs_rows is not None:  # (config.foresight_minibatch_counts: each foresight mask's count over the minibatch)
 				counts.update({f"fs:{name}": fs_rows[name][index].sum() for name in COUNT_NAMES if name in fs_rows})
 			optimizer.zero_grad(set_to_none=False)  # (in place: a recorded step adds into these .grad tensors)
-			parts = []
+			parts, micro_reads = [], []
 			for part in parts_of_rows:
 				sub, keep = index[part[0] : part[-1] + 1], whole[part[0] : part[-1] + 1]  # (array_split's parts: consecutive)
 				waited = time.perf_counter()
@@ -1869,6 +2295,8 @@ def ppo_update(
 					batch.update(head_w)
 				if priv_t is not None:  # (the privileged critic's rivals: their states as the update started)
 					batch.update(priv_rivals=state_all[priv_t["rivals"][sub]], priv_mask=priv_t["mask"][sub], priv_share=priv_t["share_logit"][sub])
+				if crit is not None:  # (the link loss's targets: the critic's state as the update started, its rows alone)
+					batch.update(link_target=c_link_all[sub], link_valid=link_valid[sub], count_link=counts["link"])
 				batch.update(weights_t)
 				if advice_t is not None:  # Nullkiller2's advice, at the teacher's weight
 					batch.update({name: value[sub] for name, value in advice_t.items()}, count_advised=counts["advised"], teacher_weight=teacher_weight_t)
@@ -1880,15 +2308,6 @@ def ppo_update(
 					with torch.no_grad():
 						t_out = teacher_graphs.eval(raw, prepare=prepare) if teacher_graphs is not None else teacher(model_inputs(raw))
 					batch.update({"t:" + name: t_out[name] for name in TEACHER_OUTPUTS}, teacher_weight=teacher_weight_t)
-				if foresight_t is not None and not checked:
-					# The gradient check, once an update, on an eager forward of its own, through torch.autograd.grad; every tensor
-					# of that forward is dropped before the graphed step: its autograd graph alive (one tensor of it kept) made
-					# the parameters' AccumulateGrad nodes reference the default stream, and the capture refused them ("a stale
-					# reference to the default stream (stream 0) from warmup", 2026-10-30)
-					check = micro_loss(forward(model_inputs(raw)), batch, config, foresight_config, split=True, privileged=privileged_module)
-					if check[3] is not None:
-						checked = gradient_check(model, check[0] - check[3], check[3], check[4], prefix="grad_raw_", watch=WATCHED)
-					del check
 				mark = time.perf_counter()
 				recorded = steps_graph.run(raw, batch, budget, prepare) if steps_graph is not None and not eager else None
 				if recorded is not None:  # forward, loss and backward in one replay, its gradient added to .grad
@@ -1899,16 +2318,36 @@ def ppo_update(
 					out = graphs.train(inputs) if graphs and not eager and unroll == 1 else forward(inputs)
 					clock["forward"] += time.perf_counter() - mark
 					mark = time.perf_counter()
-					loss, metrics, fs_parts, _ = micro_loss(out, batch, config, foresight_config, privileged=privileged_module)
+					loss, metrics, fs_parts, fs_kept = micro_loss(out, batch, config, foresight_config, privileged=privileged_module)
 					clock["losses"] += time.perf_counter() - mark
 					mark = time.perf_counter()
 					loss.backward()
 					clock["backward"] += time.perf_counter() - mark
+					# (its forward's graph let go now, not when the next micro-batch rebinds them: alive, the next step graph's
+					# capture met its parameters' AccumulateGrad nodes on the default stream and was refused, joint9
+					# 2026-11-18, whenever an update's first micro-batch was over the window budget and stepped eagerly)
+					del out, loss, fs_kept, inputs
+				if foresight_t is not None and not checked:
+					# The gradient check, once an update, on an eager forward of its own, through torch.autograd.grad, AFTER the
+					# micro-batch's step (joint9 2026-11-18: before it, one update's data kept its autograd graph alive into the
+					# step graph's first capture: "a stale reference to the default stream (stream 0) from warmup", as on
+					# 2026-10-30); every tensor of it dropped, the garbage collector run
+					check = micro_loss(forward(model_inputs(raw)), batch, config, foresight_config, split=True, privileged=privileged_module)
+					if check[3] is not None:
+						checked = gradient_check(model, check[0] - check[3], check[3], check[4], prefix="grad_raw_", watch=WATCHED)
+					del check
+					gc.collect()
 				if fs_parts is not None:  # (summed on the device: a float() here waited for the GPU every micro-batch)
 					fs_scale = 1.0 if fs_rows is not None else share  # (with the minibatch's counts a micro-batch's parts are already its share of the mean)
 					foresight_sum = fs_parts * fs_scale if foresight_sum is None else foresight_sum + fs_parts * fs_scale
 					foresight_sums["steps_seen"] += share
 				parts.append(metrics)  # (summed on the device: one sync a step, not six a micro-batch)
+				own_credit = (keep * credited_f[sub]).sum()  # (a micro-batch without credited or critic rows: nan, no point charted)
+				own_link = link_valid[sub].sum() if crit is not None else None
+				micro_reads.append(torch.stack([
+					torch.where(own_credit > 0, metrics[policy_at] * counts["credit"] / own_credit.clamp(min=1), torch.full_like(metrics[policy_at], float("nan"))),
+					torch.where(own_link > 0, metrics[link_at] * counts["link"] / own_link.clamp(min=1), torch.full_like(metrics[link_at], float("nan"))) if crit is not None else metrics[link_at],
+				]).float())
 				if nkp_on and micro_count % nkp_every == 0:  # (nk_predict's own step: its gradient into the head's .grad, the minibatch's step takes it)
 					mark = time.perf_counter()
 					nkp_batch = {"scale": shares.setdefault(("nkp", share), torch.full((), share * nkp_every, device=device))}
@@ -1932,6 +2371,7 @@ def ppo_update(
 			read = torch.cat([torch.stack(parts).sum(dim=0), grad_norm.detach().float().reshape(1), group_norms, bound]).tolist()  # (a sync: the minibatch's GPU work is done here)
 			sums, grad_norm, norms_now, bound_now = read[: len(STEP_PARTS)], read[len(STEP_PARTS)], read[len(STEP_PARTS) + 1 : len(STEP_PARTS) + 1 + len(GRAD_GROUPS)], read[len(STEP_PARTS) + 1 + len(GRAD_GROUPS) :]
 			step_norms.append([grad_norm, *norms_now])
+			step_losses.extend(torch.stack(micro_reads).tolist())  # (after the sync above: no wait of its own)
 			step_bound.append(bound_now)
 			clock["steps"] += time.perf_counter() - stepped
 			step = Counter(dict(zip(STEP_PARTS, sums)))
@@ -1947,6 +2387,18 @@ def ppo_update(
 		decoded.close()  # (its thread ends, its decoded batches freed)
 	model.eval()
 	gpu_mb = max(gpu_mb, gpu_held(device, release=True))  # (CUDA: the peak logged, the cache released: the other GPU process keeps its headroom)
+	if crit is not None:  # (the critic's own steps: its rows of this update and the pool's)
+		crit["oom"] = c_oom
+		with torch.no_grad():  # (the per-head readings on our rows, before the critic's steps as the prepass read them, at the update's head weights: TensorBoard's critic_heads/)
+			g_args = (growth_t, growth_valid) if growth is not None else (None, None)
+			e_args = (end_t, end_valid) if end is not None else (None, None)
+			critic_stats.update(head_stats("own", critic_head_fit(c_out, own_rows, c_phi_all, targets_t, share_valid, *g_args, *e_args, head_w=head_w)))
+			if hasattr(cm, "free"):
+				critic_stats.update(head_stats("own", critic_head_fit(cm.free(c_hidden_all, c_players_all), own_rows, c_phi_all, targets_t, share_valid, *g_args, *e_args, head_w=head_w), visible=True))
+		critic_stats.update(train_critic(cm, crit, config, own_rows, c_hidden_all, c_phi_all, c_rivals, c_mask, c_share, targets_t, share_valid,
+			growth_t if growth is not None else None, growth_valid if growth is not None else None, end_t if end is not None else None, end_valid if end is not None else None,
+			head_w, lambda chunks: _prefetched(chunks, decode, device, fed, config.decode_threads), model_inputs, device))
+		del c_hidden_all, c_link_all, c_phi_all
 	if config.target_kl and steps:
 		if stopped:
 			lr_scale = max(0.1, lr_scale / 1.5)
@@ -1954,7 +2406,10 @@ def ppo_update(
 			lr_scale = min(config.lr_scale_max, lr_scale * 1.5)
 	# The share heads' explained variance over the share prior's: the player count alone explains much of a share (1/2 in
 	# a 2-player game, 1/4 in a 4-player one), and the heads start there, so plain EV trusted them before they learned
-	predicted, actual = choice["old_value"].cpu().numpy(), np.asarray(targets if labels is None else labels, dtype=np.float32)
+	# (the heads' fit for the learner's trust: the critic's forecasts on these rows with config.critic_net, the policy's
+	# recorded ones, its dead heads', otherwise)
+	predicted = critic_value if crit is not None else choice["old_value"].cpu().numpy()
+	actual = np.asarray(targets if labels is None else labels, dtype=np.float32)
 	predicted, actual = predicted - prior.cpu().numpy()[:, None], actual - prior.cpu().numpy()[:, None]
 	metrics = {key: value / max(steps, 1) for key, value in totals.items()}
 	metrics.update(
@@ -1968,6 +2423,7 @@ def ppo_update(
 		signal_fraction=signal_fraction(optimizer),  # (the share of each group's gradient that is signal, at any beta1)
 		**trunk_moments(model, optimizer),  # (the trunk group's shared layers and its policy heads apart)
 		grad_norms=step_norms,  # (each step's: the learner's clip calibration, config.grad_clip_by_group)
+		policy_step_losses=step_losses,  # ([policy, link] of each micro-batch in order: the learner's policy_steps/ charts)
 		**{f"grad_norm_{name}": float(np.median([norms[1 + i] for norms in step_norms])) for i, name in enumerate(GRAD_GROUPS) if step_norms},
 		**{f"clip_bound_{name}": float(np.mean([bound[i] for bound in step_bound])) for i, name in enumerate(GRAD_GROUPS) if step_bound},
 		clipped_by_group=clips is not None,
@@ -1986,6 +2442,7 @@ def ppo_update(
 		kl_growth=float(np.polyfit(np.arange(len(kl_trace)), kl_trace, 1)[0]) if len(kl_trace) > 2 else float("nan"),
 		unsound=int(unsound.sum()),
 		decisions=n,
+		**critic_stats,
 		value_fresh=value_fresh,
 		value_unexplained=value_unexplained,
 		**privileged_stats,  # (config.privileged_critic: its fit, its corrections' size, the rivals a decision had)

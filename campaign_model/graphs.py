@@ -161,6 +161,10 @@ class Graphs:
 		return result
 
 
+RETRY_EVERY = 4  # eager steps between a failed recording and the next try
+RETRY_MAX = 6
+
+
 class StepGraph:
 	"""A micro-batch's whole training step recorded as one CUDA graph: the model's forward, the loss (fn) and the backward,
 	its gradient added into the parameters' .grad (the tensors there when it was recorded: the caller zeroes them in
@@ -184,6 +188,10 @@ class StepGraph:
 		# the update uses budgets while not False, and in its first pass (no check there) once True
 		self.budget_ok = None
 		self.prepare_ok = True  # (False once a graph converting its inputs failed: converted outside from then on)
+		# A recording that failed is tried again (joint9 2026-11-18: one update's data left an autograd graph alive at the
+		# first capture, "a stale reference to the default stream from warmup", and every later step of the process ran
+		# eager): its None entries cleared every RETRY_EVERY eager steps, at most RETRY_MAX times
+		self.eager_calls, self.retries = 0, 0
 
 	@staticmethod
 	def signature(*dicts):
@@ -203,7 +211,14 @@ class StepGraph:
 		if key not in self.entries:
 			self.entries[key] = self._record(inputs, batch, budget, prepare)
 		entry = self.entries[key]
+		if entry is None and self.eager_calls >= RETRY_EVERY and self.retries < RETRY_MAX:
+			self.eager_calls, self.retries = 0, self.retries + 1
+			print(f"campaign step graph: recording again (try {self.retries + 1} of {RETRY_MAX + 1})", flush=True)
+			self.entries = {k: v for k, v in self.entries.items() if v is not None}
+			self.prepare_ok = True
+			return self.run(inputs, batch, budget, prepare)
 		if entry is None:
+			self.eager_calls += 1
 			if prepare is not None:
 				self.prepare_ok = False
 				return self.run(prepare(inputs), batch, budget)
@@ -221,6 +236,11 @@ class StepGraph:
 		return [p for p in self.model.parameters() if p.requires_grad]
 
 	def _record(self, inputs, batch, budget=None, prepare=None):
+		import gc
+
+		gc.collect()  # (an earlier eager step's or check's autograd graph in a reference cycle: freed before the warm-up)
+		if torch.cuda.is_available():
+			torch.cuda.synchronize()
 		params, before = self._params(), None
 		try:
 			for p in params:
@@ -234,9 +254,9 @@ class StepGraph:
 				side.wait_stream(torch.cuda.current_stream())
 				with torch.cuda.stream(side):
 					for _ in range(2):  # (the allocator and the libraries' choices settle before the recording)
-						loss, *_ = self.fn(self.forward(prepare(static_inputs) if prepare is not None else static_inputs), static_batch)
+						loss, *rest = self.fn(self.forward(prepare(static_inputs) if prepare is not None else static_inputs), static_batch)
 						loss.backward()
-						del loss
+						del loss, rest  # (every output of the warm-up let go: none of its autograd graph alive at the capture)
 				torch.cuda.current_stream().wait_stream(side)
 				for p, g in zip(params, before):
 					p.grad.copy_(g)

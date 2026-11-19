@@ -109,6 +109,35 @@
 #   the same receiver (the default hand-over morale-aware).
 # - campaign.learning_rate=3e-5 (e5 after the user's "do we need a higher LR?": the top of the user's rule; a fresh model
 #   has nothing learned to protect, the KL control still bounds each update; joint7's stays 1e-5).
+# - campaign.value_shared=1.0 (the user via e5, 2026-11-18 11:15: "we start with no good policy and need the critic to be
+#   better first"): the value terms' gradient into the shared layers at full from update 1 (joint7's 0.25).
+# - eval_every=0: the frozen battle model is not evaluated (its baselines and its first eval held the campaign's start
+#   ~10 min); the campaign's evals against Nullkiller2 are campaign.eval_minutes', as before.
+# JOINT9 (the user, 2026-11-18 ~12:05 via e5: "Go. Build it all now see that it works and start a new run on the PC"): joint8-fresh's
+# line (above) with the separate critic network (campaign.critic_net, campaign_model/critic.py: its own trunk and head,
+# the credit's per-row baselines, trained on one decision drawn per player-day and the NK2 pool's rows at up to half
+# of its positions, the policy's link loss toward its states; the policy's value heads out of the loss), the NK2 pool
+# (campaign.critic_pool: all-NK2 games' rows, two drawn a player-day, for the critic alone) and the policy's rate 1e-4
+# (the user: "we can start there, having separate networks will make it safer anyway"). Its own run dir and log.
+# campaign.link_weight 0.05: the link loss's gradient on the shared layers about the policy loss's (e5's rule), sized on the
+# Mac smoke's update v3 (grad_shared_main 0.19 at weight 1, the policy's 0.0105; at 1 its KL went to 0.107 against 0.03).
+# The 9j restart (the user, 2026-11-18 ~22:00: "is it possible that the link_loss is too strong? it shouldn't be very
+# strong, it is a moving target after all"; "I think the MSE effect on the gradient should be around 5%"): the link off
+# the loss shares (campaign.link_balanced=false: the balancer had driven its weight to 16, an effective 0.8, the link
+# 0.42-0.56 of the gradient with its loss flat at ~0.09), FIXED at campaign.link_weight 0.04 (~5% of the gradient by
+# 9i's reads: 1.0-2.1 of the policy's per unit), fading by itself as the states match; its share and 5-update mean on
+# the loss-shares line (policy/link_share: re-sized at a restart if the mean leaves 0.02-0.08, nothing automatic); the
+# foresight's weight frozen where it stood (campaign.loss_shares_freeze=1: 0.0455, the balancer's last step, not 0.0263).
+# The 9k restart (e5 for the user, 2026-11-18 ~23:15): campaign.loss_shares_freeze=0 (the balancer steers the foresight
+# alone to 1/8 of policy + foresight: at the frozen 0.0455 it took 0.33-0.53 of the gradient once the link left the
+# total); campaign.critic_own_cap=4 (e5's pre-registered rule: two own-fit readings above 1.3 in v49-v53, v51 1.515 and
+# v52 1.32 at own weights 11.6 and 14.6, so the spikes are not interference that a larger weight ends); campaign.
+# critic_replay_updates=40 (~800 own games a pass, the NK2 store's size; ~190 MB an update on disk); campaign.
+# eval_own_set=rep12 (the representative 12 setups, charted as eval_rep12/ from v1 and v11 recomputed on them).
+# The rates (the user, 2026-11-18 ~12:35: "the e-5 rule was for when we used 1 network for both of them, lets go with e-4 for
+# the critic and 5e-5 for the policy"): campaign.learning_rate 5e-5 (the policy), the critic's body campaign.critic_lr 1e-4
+# and its head learning_rate x value_lr_factor = 5e-5 x 2 = 1e-4 (value_lr_factor's other reader, the policy's value
+# group, has no gradient here: its value terms are off).
 cd "$HOME/projects/alpha_heroes"
 export MALLOC_ARENA_MAX=2
 # ALPHA (empire.py: u = ALPHA x a creature's unupgraded cost, what one for hire is worth): 0.5 from deploy 70 (the user,
@@ -118,7 +147,7 @@ export MALLOC_ARENA_MAX=2
 export ALPHA_EMPIRE_ALPHA=0.5
 # (no expandable CUDA segments here: the learner's step graph failed to record with them, "device not ready"; the
 # joint run's shapes are padded, fixed, so it does not fragment as imitation did)
-rm -f runtime/train/*-joint8-fresh/drain  # (runtime/drain_restart.sh's: a start always plays)
+rm -f runtime/train/*-joint9/drain  # (runtime/drain_restart.sh's: a start always plays)
 runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # campaign.memory_steps=2 (2026-11-05): the passes over pairs of a player's decisions, the memory carried from the first
 # into the second, so the losses reach its writer (the step graph replay 117 ms against 108 at 1, the GPU idle)
@@ -492,12 +521,14 @@ runtime/memwatch.sh alpha-joint7 > /dev/null 2>&1 &
 # games hold 5.03 hero windows a decision, 59% of micro-batches went eager and the update doubled (504 s against 254 s);
 # 6.0 left none over in 20,000 sampled micro-batches. Back to v3295 as deploy 72 did; the code a49b192's as it is.
 resume=""
-ls -d runtime/train/*-joint8-fresh > /dev/null 2>&1 && resume="--resume"
-exec .venv/bin/python -m campaign_model.joint --run joint8-fresh --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
+ls -d runtime/train/*-joint9 > /dev/null 2>&1 && resume="--resume"
+# (nk2stream, 2026-11-19: the static NK2 pool, the critic store, its intake and the own replay ring are gone from the code;
+# the critic's NK2 games come from the stream, campaign.nk2_stream=true with its game counts, set by the new run's line)
+exec .venv/bin/python -m campaign_model.joint --run joint9 --hours 100000000 $resume --machine configs/machines/rtx5090/joint-gpu-free.toml \
 	--battle-from runtime/saved/battle_joint7_frozen.pt \
 	--set remote_port=7700 campaign.model_architecture=v2 campaign.model_cell_dim=16 campaign.model_dim=128 \
 		campaign.share_target=change campaign.init_from= campaign.controls_from=runtime/saved/campaign_joint7_pre_fresh.pt battle_frozen=true generated_actors=0 \
 		campaign.credit=schedule campaign.share_weight_start=0.1 campaign.share_weight_per_day=0.03 campaign.entropy_floor_weight=0 \
 		campaign.nk2_advice=1.0 campaign.loss_shares=true campaign.teacher_mix=score campaign.teacher_kl=19 campaign.games=20 remote_slots=15 campaign.inference_device=cpu inference_processes=8 ahead=2 \
-		campaign.head_scale=true campaign.loss_shares_freeze=-1 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=6.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=0 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=false campaign.value_shared=0.25 campaign.value_shared_from=-100 campaign.head_scale_freeze=-1 campaign.end_week_share=1.0 campaign.nk_predict_weight=0 campaign.build_economy=1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 campaign.game_seconds=4800 campaign.eval_seconds=1200 campaign.no_town_factor=0.1 campaign.no_town_from=-100 campaign.loop_charge=0 campaign.exchange_close=true campaign.exchange_actions=1 campaign.take_morale=0.5 campaign.take_best_leads=true campaign.learning_rate=3e-5 campaign.loop_charge_step=0.03 campaign.loop_charge_from=0 campaign.update_decisions_cap=135000 campaign.update_games_floor=9 campaign.window_balance=true campaign.phi_hero_base=825 campaign.phi_armyless_share=1.0 campaign.phi_lead_weight=0.5 campaign.phi_stock_floor=0.333333 campaign.phi_from=0 campaign.phi_ramp=1 campaign.unit_own_form=true campaign.give_all_exact=true campaign.foresight_minibatch_counts=true campaign.foresight_outcome_factor=0.526 campaign.foresight_answer_factor=0.735 campaign.foresight_answer_score_factor=0.058 \
-	>> runtime/train/joint8-fresh.log 2>&1 < /dev/null
+		campaign.head_scale=true campaign.loss_shares_freeze=0 campaign.target_kl=0.03 campaign.memory_steps=2 campaign.privileged_credit=true campaign.exchange_span_advised=true campaign.further_windows=1 campaign.window_budget=6.0 campaign.unseen_exits=true campaign.nk2_inputs=true campaign.nk2_follow=0 campaign.nk2_teacher=false campaign.value_jump_from=0 campaign.value_jump_stop=0 campaign.adv_weight=1 campaign.nk2_choice_games=0 campaign.eval_own_games=48 campaign.eval_own_every=4 campaign.eval_follow_games=0 campaign.adv_gain=1 campaign.schedule_action_price=1e-5 campaign.adv_by_kind=true campaign.town_guard=0 campaign.credit_segments=false campaign.value_shared=1.0 campaign.value_shared_from=-100 campaign.head_scale_freeze=-1 campaign.end_week_share=1.0 campaign.nk_predict_weight=0 campaign.build_economy=1 campaign.nk_predict_every=8 trunk_beta1=0.9 fixed_mix=true real_share=0.6 league=0.5,0.5,0.0 real_keep=0.12 eval_minutes=180 battle_length_scale=30 campaign.game_seconds=4800 campaign.eval_seconds=1200 campaign.no_town_factor=0.1 campaign.no_town_from=-100 campaign.loop_charge=0 campaign.exchange_close=true campaign.exchange_actions=1 campaign.take_morale=0.5 campaign.take_best_leads=true campaign.learning_rate=5e-5 campaign.value_lr_factor=2 campaign.critic_lr=1e-4 campaign.critic_net=true campaign.link_weight=0.04 campaign.link_balanced=false campaign.critic_batch=256 campaign.critic_pool_share=0.8 campaign.critic_own_balance=true campaign.critic_own_cap=4 campaign.eval_own_set=rep12 eval_every=0 campaign.loop_charge_step=0.03 campaign.loop_charge_from=0 campaign.update_decisions_cap=135000 campaign.update_games_floor=9 campaign.window_balance=true campaign.phi_hero_base=825 campaign.phi_armyless_share=1.0 campaign.phi_lead_weight=0.5 campaign.phi_stock_floor=0.333333 campaign.phi_from=0 campaign.phi_ramp=1 campaign.unit_own_form=true campaign.give_all_exact=true campaign.foresight_minibatch_counts=true campaign.foresight_outcome_factor=0.526 campaign.foresight_answer_factor=0.735 campaign.foresight_answer_score_factor=0.058 \
+	>> runtime/train/joint9.log 2>&1 < /dev/null

@@ -189,12 +189,12 @@ class Slot:
 					continue
 				decisions = 0
 				try:
-					items = self.runner.battle(spec) if spec["kind"] == "battle" else self.runner.campaign(spec, self.stop)
+					items = self.runner.battle(spec) if spec["kind"] == "battle" else self.runner.nk2(spec, self.stop) if spec["kind"] == "nk2" else self.runner.campaign(spec, self.stop)
 					for item in items:
 						remote.send_message(conn, ("item", item))
 						if item["kind"] == "battle":
 							decisions += item["decisions"]
-						elif item["kind"] == "campaign":
+						elif item["kind"] in ("campaign", "nk2"):
 							decisions += len(item["game"].decisions)
 					remote.send_message(conn, ("done",))
 				except Exception as error:  # the game failed: the master counts it

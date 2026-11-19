@@ -323,6 +323,49 @@ class CampaignConfig:
 	# the same receiver, GIVE_ALL's starting preference at most TAKE_BEST's - 1 (model.CustomFeatures.multi_prior;
 	# take_leads_on in the weights); GIVE_ALL stays legal. False: as before, bit for bit
 	take_best_leads: bool = False
+	# The separate critic network (the user, 2026-11-18; campaign_model/critic.py): the policy loses the value heads'
+	# gradient; the credit's per-row baselines (V7, G7, V_end) are the critic's; it trains on one decision drawn per
+	# player-day (and critic_pool's rows, up to critic_pool_share of its positions); the link loss (link_weight) on those
+	# rows pulls the policy's state toward the critic's. False: as before, bit for bit
+	critic_net: bool = False
+	critic_dim: int = 0  # (0: the policy's model_dim)
+	critic_cell_dim: int = 0  # (0: the policy's model_cell_dim)
+	critic_layers: int = 0  # (0: the policy's model_layers)
+	critic_lr: float = 1e-4  # the critic's body; its head at learning_rate x value_lr_factor (the value group's)
+	critic_batch: int = 64  # the critic's rows a step (its gradient over them)
+	link_weight: float = 1.0  # the link loss's weight in the policy's loss (sized on a smoke: its gradient on the body ~ the policy loss's)
+	# The link on the loss shares (config.loss_shares: its weight x the balancer's, steered to its share). False (the
+	# user via e5, 2026-11-18: "is it possible that the link_loss is too strong? ... it is a moving target after all"; a
+	# share kept constant pulls at full strength when the states already match): the balancer's link weight held at 1,
+	# link_weight alone sets it, the link's share a reading only; policy and foresight balanced between themselves
+	link_balanced: bool = True
+	critic_pool_share: float = 0.5  # the NK2 stream's share of the critic's rows an update (nk2_rows 0: by this share of our own rows)
+	# The critic's Nullkiller2 games, made on the fly and each used once (the user, 2026-11-19: "there shouldn't be a pool at
+	# all! the IterableDataset should hold code to make them on the fly"; campaign_model/nk2_stream.py, supply.Games' kind
+	# "nk2"): nk2_games of them at once on this machine, nk2_remote loader workers for remote slots; each an all-Nullkiller2
+	# game of nk2_days, slimmed, its history checked, labelled at the learner's empire; an update takes nk2_rows trained rows
+	# (0: critic_pool_share of the update's rows, as the store's take was) of the buffer, leaving nk2_floor_games games' groups
+	# in it for mixing; the first nk2_heldout_games games are the fixed held-out (nk2_heldout_rows trained rows, saved);
+	# no game starts while the buffer holds nk2_buffer_cap_games games
+	nk2_stream: bool = False
+	nk2_games: int = 0
+	nk2_remote: int = 0
+	nk2_days: int = 56
+	nk2_rows: int = 0
+	nk2_floor_games: int = 125
+	nk2_heldout_games: int = 150
+	nk2_heldout_rows: int = 5000
+	nk2_buffer_cap_games: int = 300
+	nk2_keep_games: int = 0  # the first this many stream games' groups, as labelled, kept in run_dir/campaign/nk2_kept (a ridge's rows)
+	# The run's stage (e5 for the user, 2026-11-19): "critic", the critic alone on the NK2 stream (no own games, no policy
+	# step, no link; an update when the stream holds a take above its floor); "joint", today's update
+	stage: str = "joint"
+	# One init (the user, 2026-11-19): a new run's critic body set to the policy's own tensors at construction
+	critic_body_from_policy: bool = False
+	# Our rows' weight in the critic's loss balanced toward parity per step with the NK2 store's (e5, 2026-11-18: their
+	# pre-clip gradient norms 0.05-0.08 against 1.2-1.3, our rows ~1.3% of the critic's movement): learner.balance_critic_own
+	critic_own_balance: bool = False
+	critic_own_cap: float = 32.0  # its weight's most (e5, 2026-11-18: ~4 if v49-v53 say too few own games fitted harder are the spikes' cause)
 	# What the share heads V2, V5, V7 forecast (the model's "value" output; V_end is our share at the end either way):
 	#   "share"   our share of all empires' value VALUE_OFFSETS days on (from 1 / players)
 	#   "change"  how much the logit of that share changes by then (labels.share_change_labels; the user's design,
@@ -576,6 +619,13 @@ class CampaignConfig:
 	# hidden (our own policy: score_own, what it is judged by), eval_follow_games of them with it shown (score_follow,
 	# paired with OWN on those). 0: every eval_games setup with it shown, as before. The run: 32 and 16 (48 games, as before)
 	eval_own_games: int = 0
+	# OWN's setups: every this-many-th of the first eval_own_games (the user via e5, 2026-11-18: "evals before that are
+	# mostly a waste of time, so they can be smaller": 48 and 4, the 12 setups 0, 4, ... 44, 4 games each of 2, 3, 4 players)
+	eval_own_every: int = 1
+	# OWN's setups by name, over eval_own_every (evaluate.EVAL_SETS): "rep12" the representative 12 (e5 for the user,
+	# 2026-11-18: every fourth was the hard quarter, v1 0.000 and v11 0.066 there against 0.144 / 0.141 on the 48),
+	# charted as eval_rep12/ from v1 and v11 recomputed on its setups; "" the setups by eval_own_every
+	eval_own_set: str = ""
 	eval_follow_games: int = 0
 	eval_days: int = 56  # (the score at day 28 is logged too: score_d28)
 	# The campaign model samples, as in training (seeded per game and seat: AlphaMapAI's ALPHA_MAP_SEED_<COLOR>). Greedy

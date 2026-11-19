@@ -407,6 +407,7 @@ class CampaignModelV2(nn.Module):
 	plan_outputs = False  # fs_plan too (plan_of): the trainer's model sets it (train.ppo_update); a server's does not
 	adv_outputs = False  # the advantage head's too (AdvantageHead): the trainer's model sets it with config.adv_weight (train.ppo_update); a server's does not
 	nkp_outputs = False  # nk_predict's blind pass, head and targets too (nk_blind): the trainer's model with config.nk_predict_weight; a server's never
+	link_outputs = False  # the link state and link_map's prediction of the critic's too (config.critic_net): the trainer's model only
 
 	def load_state_dict(self, state_dict, strict=True, assign=False):
 		"""A checkpoint from before a parameter was added (model.ADDED) loads with it at 0: the model as it was; one from
@@ -423,7 +424,7 @@ class CampaignModelV2(nn.Module):
 		self.book_row_reset_now, self.recruit_rows_reset_now = reset, recruit  # (the learner zeroes their first moments after the optimizer's load)
 		return super().load_state_dict(pad_new_inputs(state, own), strict=strict, assign=assign)
 
-	def __init__(self, dim=64, cell_dim=16, heads=4, layers=2, share_target="share"):
+	def __init__(self, dim=64, cell_dim=16, heads=4, layers=2, share_target="share", link_map=False):
 		"""cell_dim: the map tiles' width (the U-Net's at full resolution; twice and four times it at half and a quarter):
 		16, as 32 cost 3x v1's inference on the CPU (2026-10-30: 27 ms a decision against 9 ms, the U-Net most of it)."""
 		super().__init__()
@@ -615,6 +616,11 @@ class CampaignModelV2(nn.Module):
 		# (features.build_features), its output 0 at the start; made last: the others' initialisation as before
 		self.build_situational = SwiGLU(len(ft.BUILD_ENTRY), 32, 1)
 		zero_output(self.build_situational.down)
+
+		# (config.critic_net, the user 2026-11-18) the link loss's map of the policy's state onto the separate critic's,
+		# created last (the other parameters' initial draws as before); absent without it (the model as before)
+		if link_map:
+			self.link_map = nn.Linear(3 * d, 3 * d)
 
 	def prior_corrections(self):
 		"""The parameters that correct a fixed prior (model.CustomFeatures): weight decay pulls them back to it."""
@@ -1399,6 +1405,8 @@ class CampaignModelV2(nn.Module):
 		out["end_logit"] = self.end_head(hidden).squeeze(-1) + share_prior
 		out["phi"] = known.phi_total
 		out["value_hidden"] = hidden  # (the privileged critic's: our state, and a rival's at its decisions)
+		if self.link_outputs and hasattr(self, "link_map"):  # (config.critic_net: the link loss's prediction, train.micro_loss)
+			out["link_pred"] = self.link_map(torch.cat([state.glob, own_mean, state.players[:, 0]], dim=-1))
 
 
 # ---- helpers: the known facts per entity ----

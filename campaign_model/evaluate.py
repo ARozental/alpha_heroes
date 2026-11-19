@@ -56,6 +56,16 @@ COLUMNS = [
 SHOWN_ONLY = ("score", "score_se", "vs_previous", "vs_previous_se", "vs_first", "vs_first_se", "score_d28", "score_2p", "score_3p", "score_4p", "share", "phi", "phi_nullkiller", "heroes", "heroes_nullkiller", "eliminated", "won")
 
 
+# OWN's named setup sets (config.eval_own_set). rep12 (e5 for the user, 2026-11-18): one setup of each class mod 12, so
+# 3 of each residue mod 4, 4 of each player count, every seat of the 2- and 4-player games twice and once, the
+# 3-player games' seats 0, 1, 2 and 0; each of the four seeds' copies 3 times; of the 12 such fixed rules (copy =
+# (c // 3 + c % 3 + 3) mod 4) the one nearest the 48's mean on both 48-setup evals: v1 0.141 against 0.144, v11 0.171
+# against 0.141 (every fourth, 0 mod 4: 0.000 and 0.066, its 2-player games all at seat 0 and its 4-player at seat 2)
+EVAL_SETS = {"rep12": (1, 3, 11, 14, 16, 18, 29, 31, 33, 36, 44, 46)}
+# (the charts a named set writes: tb_filter.SET_CHARTS, served as eval_<set>/<name>; one basis a line, the old eval/
+# line kept on its own)
+
+
 def plan(config):
 	"""[(setup index, arm)] of an evaluation's games: every setup of eval_games with Nullkiller2's choice shown ("shown");
 	or, split (config.eval_own_games > 0), the first eval_own_games with it hidden ("own": 11 / 11 / 10 games of 2, 3
@@ -72,7 +82,13 @@ def plan(config):
 	while sum(map(len, by_players.values())) > follow:
 		longest = max(by_players, key=lambda n: (len(by_players[n]), n))
 		by_players[longest].pop()
-	return [(i, "own") for i in range(own)] + [(i, "shown") for i in sorted(i for chosen in by_players.values() for i in chosen)]
+	every = max(1, int(getattr(config, "eval_own_every", 1) or 1))  # (config.eval_own_every: a fixed part of the setups)
+	named = getattr(config, "eval_own_set", "") or ""
+	if named:  # (config.eval_own_set: a named set, every one of its setups within eval_own_games)
+		chosen = EVAL_SETS[named]
+		assert max(chosen) < own, f"eval_own_set {named} needs eval_own_games > {max(chosen)}"
+		return [(i, "own") for i in chosen] + [(i, "shown") for i in sorted(i for chosen in by_players.values() for i in chosen)]
+	return [(i, "own") for i in range(own) if i % every == 0] + [(i, "shown") for i in sorted(i for chosen in by_players.values() for i in chosen)]
 
 
 def eval_score(row):
@@ -353,6 +369,53 @@ def split_row(played):
 	return out
 
 
+from .tb_filter import SET_CHARTS  # noqa: E402,F401 (the names set_charts writes)
+
+
+def set_of(games):
+	"""The named set (EVAL_SETS) an evaluation's OWN games are exactly, or None."""
+	own = tuple(sorted({g["setup"] for g in games if g.get("arm") == "own" and "setup" in g}))
+	return next((name for name, chosen in EVAL_SETS.items() if own == tuple(sorted(chosen))), None)
+
+
+def set_charts(games, chosen):
+	"""SET_CHARTS' values of an evaluation's OWN games on the setups `chosen` (an earlier, larger evaluation's recomputed
+	on a set's: its per-game records), or None when it lacks any of them."""
+	own = {g["setup"]: g for g in games if g.get("arm") == "own" and "setup" in g}
+	if not all(i in own for i in chosen):
+		return None
+	picked = [own[i] for i in chosen]
+	scores = [float(g["score"]) for g in picked]
+	out = {"score_own": float(np.mean(scores)), "score_own_se": float(np.std(scores, ddof=1) / np.sqrt(len(scores))),
+		"score_own_d28": float(np.mean([g["score_d28"] for g in picked])), "eliminated_own": sum(bool(g["eliminated"]) for g in picked), "won_own": sum(bool(g["won"]) for g in picked)}
+	for key in ("max_level_ours", "max_level_theirs", "major_won"):
+		values = [float(g[key]) for g in picked if isinstance(g.get(key), (int, float, bool)) and g.get(key) == g.get(key)]
+		if values:
+			out[key] = sum(values) / len(values)
+	return out
+
+
+def write_set_charts(writer, row, earlier):
+	"""A named set's evaluation (set_of) charted as campaign_eval_<set>/<chart>: the first one on the set first writes
+	every earlier same-measure evaluation that played all its setups (the 48-setup ones), recomputed on them, at their
+	versions; the old campaign_eval/ charts take none of its points (one basis a line)."""
+	name = set_of(row.get("per_game", []))
+	if name is None:
+		return False
+	chosen = EVAL_SETS[name]
+	points = []
+	if not any(set_of(games) == name for games in earlier):  # (the switch: the line's history from the evaluations that cover the set)
+		for games in earlier:
+			values = set_charts(games, chosen)
+			if values is not None:
+				points.append((int(games[0]["version"]), values))
+	points.append((int(row["version"]), set_charts(row["per_game"], chosen)))
+	for version, values in sorted(points, key=lambda p: p[0]):
+		for key, value in values.items():
+			writer.add_scalar(f"campaign_eval_{name}/{key}", value, version)
+	return True
+
+
 def paired(games, earlier):
 	"""(mean, standard error) of this eval's score minus an earlier one's, game by game on the same setups (nan when
 	fewer than 2 games match)."""
@@ -401,12 +464,18 @@ def log(row, path, writer=None):
 			csv.writer(f).writerow(COLUMNS)
 		csv.writer(f).writerow([round(row[k], 5) if isinstance(row.get(k, ""), float) else row.get(k, "") for k in COLUMNS])
 	if writer is not None:
+		on_set = write_set_charts(writer, row, evals)  # (a named set's: its own charts, the old ones without its points)
 		for key in COLUMNS[2:]:
-			if isinstance(row.get(key), (int, float)) and row[key] == row[key]:
+			if not on_set and isinstance(row.get(key), (int, float)) and row[key] == row[key]:
 				writer.add_scalar(f"campaign_eval/{key}", row[key], row["version"])
 		# TensorBoard's eval tab: the top-level scores only, eval/battle beside this (battle_model/train.py EVAL_TAB);
 		# self-play training never shows there. Our own policy's score (eval_score: OWN's in a split evaluation)
 		writer.add_scalar("eval/campaign", eval_score(row), row["version"])
+		# (the tracked set's per-game means: the highest levels, ours and the rivals', and the major battle won)
+		for key in ("max_level_ours", "max_level_theirs", "major_won"):
+			values = [float(game[key]) for game in row.get("per_game", []) if isinstance(game.get(key), (int, float, bool)) and game.get(key) == game.get(key)]
+			if values and not on_set:
+				writer.add_scalar(f"campaign_eval/{key}", sum(values) / len(values), row["version"])
 		if split:
 			writer.add_scalar("eval/campaign_follow", row["score_follow"], row["version"])
 		writer.flush()

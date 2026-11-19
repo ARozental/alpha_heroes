@@ -315,3 +315,89 @@ def test_moments_of_another_shape_start_fresh():
 	optimizer.step()  # (no shape error)
 	torch.testing.assert_close(optimizer.state[new.bias]["exp_avg"], kept * 0.9 + 0.1 * new.bias.grad)  # (the bias's kept)
 	assert optimizer.state[new.weight]["exp_avg"].shape == new.weight.shape
+
+
+def test_with_the_separate_critic_the_link_takes_the_values_share():
+	"""(the user via e5, 2026-11-18, joint9) config.critic_net: the balancing's terms policy, link, teacher, foresight at
+	shares 4 : 3 : - : 1 (the value's off); the link's weight starts at 1 (over campaign.link_weight) and moves toward
+	its share by the same step rule; the value's weight is left as it is."""
+	from campaign_model.learner import LOSS_SCALE_STEP
+
+	config = CampaignConfig(loss_shares=True, nk2_teacher=False)
+	one = learner(config, critic=object(), loss_scale={"log_norm": {}, "weight": {"value": 353.0, "teacher": 2.0, "foresight": 0.7}})
+	shares = one.loss_shares()
+	assert shares["link"] == pytest.approx(3 / 8) and shares["value"] == 0.0 and shares["policy"] == pytest.approx(0.5) and shares["foresight"] == pytest.approx(1 / 8)
+	assert one.loss_weights()["link"] == 1.0
+	metrics = {"grad_raw_policy": 1.0, "grad_raw_value": 0.0, "grad_raw_link": 0.01, "grad_raw_teacher": float("nan"), "grad_raw_foresight": 5.0}
+	one._note_gradients(dict(metrics))
+	w = one.loss_scale["weight"]
+	assert w["link"] == pytest.approx(LOSS_SCALE_STEP) and w["foresight"] == pytest.approx(0.7 / LOSS_SCALE_STEP) and w["value"] == 353.0
+	plain = learner(CampaignConfig(loss_shares=True, nk2_teacher=False), loss_scale={"log_norm": {}, "weight": {"value": 1.0, "teacher": 2.0, "foresight": 1.0}})
+	assert "link" not in plain.loss_shares() and "link" not in plain.loss_weights()
+
+
+def test_with_the_critic_the_weights_follow_the_last_five_shares_mean_within_bounds():
+	"""(e5, 2026-11-18) learner.step_by_mean_shares: one update's share does not steer alone; link at most 16,
+	foresight at least 0.01."""
+	from campaign_model.learner import LOSS_SCALE_STEP, LOSS_WEIGHT_BOUNDS
+
+	config = CampaignConfig(loss_shares=True, nk2_teacher=False)
+	one = learner(config, critic=object(), loss_scale={"log_norm": {}, "weight": {"value": 1.0, "teacher": 1.0, "foresight": 1.0, "link": 15.0}})
+	# the link's share far under its 3/8 and the foresight's far over its 1/8, five updates running
+	for _ in range(5):
+		one._note_gradients({"grad_raw_policy": 1.0, "grad_raw_link": 0.001, "grad_raw_teacher": float("nan"), "grad_raw_foresight": 10.0})
+	w = one.loss_scale["weight"]
+	assert w["link"] == LOSS_WEIGHT_BOUNDS["link"][1]  # (15 x 1.25 capped at 16)
+	assert w["foresight"] == pytest.approx(1.0 / LOSS_SCALE_STEP**5)
+	for _ in range(60):
+		one._note_gradients({"grad_raw_policy": 1.0, "grad_raw_link": 0.001, "grad_raw_teacher": float("nan"), "grad_raw_foresight": 1000.0})
+	assert one.loss_scale["weight"]["foresight"] == LOSS_WEIGHT_BOUNDS["foresight"][0]
+	# one update of noise against four steady ones: the mean steers, not the noise
+	two = learner(config, critic=object(), loss_scale={"log_norm": {}, "weight": {"value": 1.0, "teacher": 1.0, "foresight": 1.0, "link": 4.0}})
+	for raw_link in (0.375 / 4.0, 0.375 / 4.0, 0.375 / 4.0, 0.375 / 4.0, 3.0 / 4.0):
+		two._note_gradients({"grad_raw_policy": 0.5, "grad_raw_link": raw_link, "grad_raw_teacher": float("nan"), "grad_raw_foresight": 0.125})
+	assert two.loss_scale["weight"]["link"] < 4.0 and two.loss_scale["weight"]["link"] > 4.0 / LOSS_SCALE_STEP
+
+
+def test_the_link_off_the_balancer_holds_at_one_and_its_share_is_a_reading():
+	"""(the user via e5, 2026-11-18: "is it possible that the link_loss is too strong? ... a moving target") config.
+	link_balanced False: the balancer's link weight 1 whatever the checkpoint held (16), never moved; the foresight
+	balanced against the policy alone (7 : 1), the link's gradient outside the total; with the shares frozen the
+	foresight's weight holds too."""
+	config = CampaignConfig(loss_shares=True, nk2_teacher=False, link_balanced=False)
+	one = learner(config, critic=object(), loss_scale={"log_norm": {}, "weight": {"value": 1.0, "teacher": 1.0, "foresight": 1.0, "link": 16.0}})
+	shares = one.loss_shares()
+	assert shares["link"] == 0.0 and shares["policy"] == pytest.approx(7 / 8) and shares["foresight"] == pytest.approx(1 / 8)
+	assert one.loss_weights()["link"] == 1.0
+	for _ in range(5):  # (the foresight exactly at 1/8 of policy + foresight; the link's gradient 5x the policy's)
+		one._note_gradients({"grad_raw_policy": 0.875, "grad_raw_link": 5.0, "grad_raw_teacher": float("nan"), "grad_raw_foresight": 0.125})
+	w = one.loss_scale["weight"]
+	assert w["link"] == 1.0 and w["foresight"] == pytest.approx(1.0)  # (the link not in the foresight's total)
+	frozen = learner(CampaignConfig(loss_shares=True, nk2_teacher=False, link_balanced=False, loss_shares_freeze=1), critic=object(),
+		loss_scale={"log_norm": {}, "weight": {"value": 1.0, "teacher": 1.0, "foresight": 0.0263, "link": 16.0}})
+	frozen.version = 45
+	for _ in range(5):
+		frozen._note_gradients({"grad_raw_policy": 1.0, "grad_raw_link": 0.1, "grad_raw_teacher": float("nan"), "grad_raw_foresight": 10.0})
+	assert frozen.loss_weights()["link"] == 1.0 and frozen.loss_scale["weight"]["foresight"] == 0.0263
+	balanced = learner(CampaignConfig(loss_shares=True, nk2_teacher=False), critic=object(), loss_scale={"log_norm": {}, "weight": {"value": 1.0, "teacher": 1.0, "foresight": 1.0, "link": 16.0}})
+	assert balanced.loss_weights()["link"] == 16.0  # (the default: as before)
+
+
+def test_the_links_share_and_its_five_update_mean_are_read_and_charted():
+	"""(the user via e5, 2026-11-18: "the MSE effect on the gradient should be around 5%") the link's share of every
+	term's gradient each update and the mean of the last five, charted as campaign/link_share_mean (policy/link_share)."""
+	config = CampaignConfig(loss_shares=True, nk2_teacher=False, link_balanced=False, loss_shares_freeze=1)
+	one = learner(config, critic=object(), loss_scale={"log_norm": {}, "weight": {"value": 1.0, "teacher": 1.0, "foresight": 0.0263, "link": 1.0}})
+	one.version = 45
+	points = []
+	one.writer = type("W", (), {"add_scalar": lambda self, tag, value, step: points.append((tag, value, step))})()
+	reads = []
+	for link in (0.1, 0.0, 0.1, 0.0, 0.1, 0.1):
+		m = {"grad_raw_policy": 0.9, "grad_raw_link": link, "grad_raw_teacher": float("nan"), "grad_raw_foresight": 0.0}
+		one._note_gradients(m)
+		reads.append((m["link_share"], m["link_share_mean"]))
+	assert reads[0] == pytest.approx((0.1, 0.1)) and reads[1] == pytest.approx((0.0, 0.05))
+	assert reads[-1][1] == pytest.approx(np.mean([0.0, 0.1, 0.0, 0.1, 0.1]))  # (the last five)
+	assert points[-1][0] == "campaign/link_share_mean" and points[-1][2] == 45
+	from campaign_model.tb_filter import tracked
+	assert tracked("campaign/link_share_mean") == "policy/link_share" and tracked("policy_steps/link_loss") == "policy_steps/link_loss" and tracked("critic_steps/loss_own") == "critic_steps/loss_own"

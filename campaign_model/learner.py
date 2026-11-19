@@ -80,6 +80,66 @@ GRADIENT_COLUMNS = GRADIENT_COLUMNS + PUSH_COLUMNS
 # LOSS_SCALE_STEP times an update. The teacher's share is how good we are (teacher_share_for), the rest policy : value :
 # foresight 4 : 3 : 1: policy and value never under 15% each
 LOSS_TERMS = ("policy", "value", "teacher", "foresight")
+# (config.critic_net: the link loss in the value's place, its share the value's; the user via e5, 2026-11-18: the
+# balancing unfrozen for joint9, "policy 0.50, link 0.38, foresight 0.12", campaign.link_weight following it)
+CRITIC_LOSS_TERMS = ("policy", "link", "teacher", "foresight")
+
+
+LOSS_SHARE_WINDOW = 5  # (e5, 2026-11-18: the link's share read 0.08, 0.33, 0.12 while its weight climbed: one update's share is noise)
+LOSS_WEIGHT_BOUNDS = {"link": (1e-4, 16.0), "foresight": (0.01, 1e6), "teacher": (1e-4, 1e6)}
+
+
+def step_by_mean_shares(learner, metrics, terms, shares, state, frozen):
+	"""The separate critic's loss shares: each term's weight a step toward its target share by the mean of its last
+	LOSS_SHARE_WINDOW updates' shares of the policy body's gradient (grad_shared_*, at the weights then): weight x
+	target / mean, at most LOSS_SCALE_STEP an update, within LOSS_WEIGHT_BOUNDS; a term with no target share keeps its
+	weight."""
+	# (the shares among the balanced terms: the policy and those with a target; config.link_balanced False: the link's a
+	# reading only, outside the total its partners' shares are read against)
+	now = {term: metrics.get(f"grad_shared_{term}", float("nan")) for term in terms if term == "policy" or shares.get(term, 0.0) > 0}
+	total = sum(v for v in now.values() if np.isfinite(v))
+	history = getattr(learner, "loss_share_history", None)
+	if history is None:
+		history = learner.loss_share_history = []
+	if total > 0:
+		history.append({term: now[term] / total for term in now if np.isfinite(now[term])})
+		del history[:-LOSS_SHARE_WINDOW]
+	if frozen or not history:
+		return
+	for term in terms[1:]:
+		if term not in state["weight"] or shares.get(term, 0.0) <= 0:
+			continue
+		seen = [h[term] for h in history if term in h]
+		mean = float(np.mean(seen)) if seen else float("nan")
+		if not mean > 0:
+			continue
+		weight = state["weight"][term]
+		target = weight * shares[term] / mean
+		low, high = LOSS_WEIGHT_BOUNDS.get(term, (1e-4, 1e6))
+		state["weight"][term] = float(np.clip(np.clip(target, weight / LOSS_SCALE_STEP, weight * LOSS_SCALE_STEP), low, high))
+
+
+def write_step_losses(self, metrics):
+	"""The per-step charts (the user, 2026-11-18 16:05: "I expected to see the loss at every step during training"): each
+	policy micro-batch's own policy loss and link loss (policy_steps/), each critic step's excess loss by source
+	(critic_steps/loss_own, _pool); x a count of steps since the run began, kept in the checkpoint."""
+	counts = getattr(self, "step_counts", None)
+	if counts is None:  # (a learner made without __init__: the tests')
+		counts = self.step_counts = {"policy": 0, "critic": 0}
+	for policy, link in metrics.pop("policy_step_losses", None) or []:
+		counts["policy"] += 1
+		if policy == policy:  # (nan: a micro-batch without credited rows, no point)
+			self.writer.add_scalar("policy_steps/policy_loss", float(policy), counts["policy"])
+		if getattr(self, "critic", None) is not None and link == link:  # (nan: none of the critic's rows in it)
+			self.writer.add_scalar("policy_steps/link_loss", float(link), counts["policy"])
+	for source, loss in metrics.pop("critic_step_sequence", None) or []:
+		counts["critic"] += 1
+		self.writer.add_scalar(f"critic_steps/loss_{source}", float(loss), counts["critic"])
+
+
+def loss_terms(learner):
+	"""The loss shares' terms: the link's in the value's place with the separate critic."""
+	return CRITIC_LOSS_TERMS if getattr(learner, "critic", None) is not None else LOSS_TERMS
 TEACHER_SHARE_MAX = 0.6
 LOSS_SCALE_STEP = 1.25
 LOSS_SCALE_MEMORY = 0.9  # (each term's log gradient norm, averaged over ~10 updates)
@@ -89,6 +149,10 @@ LOSS_SCALE_MEMORY = 0.9  # (each term's log gradient norm, averaged over ~10 upd
 # 0.33-0.47 against 0.15 and its weight fell 356 -> 146; the 7-day growth heads' explained variance 0.40-0.45 -> 0.19-0.23,
 # and ~100 updates later it had won back half (2026-11-05)
 VALUE_SHARE_CAP = 3.0
+CRITIC_COLUMNS = (  # (progress.csv's critic columns: the loss and its raw cross-entropy side by side for a restart, e5 2026-11-18)
+	"critic_loss_own_mean", "critic_loss_raw_own_mean", "critic_loss_pool_mean", "critic_loss_raw_pool_mean", "critic_loss_pool_heldout",
+	"critic_unexplained_own", "critic_unexplained_pool_heldout", "critic_unexplained_own_med5",
+)
 COLUMNS = [
 	"version", "epoch", "games", "decisions", "dropped_old", "unsound", "credited", "days", "players", "phi_end", "heroes", "label_mean", "price_mean",
 	"trust", "credit_trust", "end_credit", "policy_loss", "value_loss", "value_loss_weighted", "value_loss_fresh", "entropy", "below_floor", "kl", "last_kl", "teacher_kl", "teacher_weight", "advised", "teacher_agree", "teacher_ce", "teacher_outside", "clip_fraction", "grad_norm", "steps", "learning_rate",
@@ -142,6 +206,7 @@ COLUMNS = [
 	# (config.end_week_share, deploy 75: the end credit's week share this update used, and the share of the update's rows
 	# with no end credit)
 	"end_week_share", "end_credit_none",
+	*CRITIC_COLUMNS,
 ]
 TYPE_PARTS = ("blend", "seven", "end")  # (config.type_evidence: the policy's credit as blended, its 7-day part, its end part)
 TYPE_SHOWN = ("ARMY", "UPGRADE", "HIRE", "BUILD", "END", "RECRUIT", "MOVE", "TRAVEL", "MULTI")  # (the log line's types, in this order)
@@ -188,6 +253,123 @@ def value_shared_now(config, version):
 	if shared >= 1.0 or version < start:
 		return 1.0
 	return max(shared, 1.25 ** -(version - start + 1))
+
+
+CRITIC_OWN_STEP = 1.25  # the own rows' weight moves at most this factor an update (the loss shares' step)
+CRITIC_OWN_CAP = 32.0  # (the default of config.critic_own_cap)
+CRITIC_KEEP_EVERY = 20  # (campaign.stage "critic": a checkpoint_<v> kept every this many updates, the critic's readings at 20, 40, 80, 160)
+CRITIC_PROGRESS = (  # (critic_progress.csv's columns, campaign.stage "critic": the stop rule's and the reports' readings)
+	"critic_rows_pool", "critic_steps_pool", "critic_loss_pool_mean", "critic_loss_visible_pool_mean", "critic_loss_pool_heldout", "critic_loss_visible_pool_heldout",
+	"critic_loss_pool_first", "critic_loss_pool_last", "critic_unexplained_pool", "critic_unexplained_pool_heldout", "critic_unexplained_visible_pool_heldout",
+	"critic_unexplained_pool_heldout_after", "critic_grad_pool", "critic_clipped_pool", "critic_oom_retries", "card_free_gb", "host_available_gb",
+	"nk2_games_in", "nk2_dropped", "nk2_held_out", "nk2_games_per_minute", "nk2_buffer_before", "nk2_buffer_after", "nk2_rows_taken", "nk2_rows_wanted",
+)
+
+
+def body_from_policy(critic, policy):
+	"""The critic's body (a CampaignModelV2 at the policy's dims) set to the policy's own tensors, key for key: one init
+	for the shared layers (the user, 2026-11-19: "on batch 0 I expect the shared layer to be identical"). Every body key
+	must be the policy's at its shape (else ValueError: two nets that cannot be identical). Returns the tensors copied."""
+	theirs, ours = policy.state_dict(), critic.body.state_dict()
+	wrong = [k for k, v in ours.items() if k not in theirs or theirs[k].shape != v.shape or theirs[k].dtype != v.dtype]
+	if wrong:
+		raise ValueError(f"the critic's body is not the policy's: {len(wrong)} tensors differ ({wrong[:4]})")
+	with torch.no_grad():  # (in place, past load_state_dict's hooks: a load with the reset markers at 0 re-draws buy_item)
+		for k, v in ours.items():
+			v.copy_(theirs[k])
+	after = critic.body.state_dict()
+	unequal = [k for k in ours if not torch.equal(after[k], theirs[k])]
+	if unequal:
+		raise ValueError(f"the critic's body differs from the policy's after the copy: {unequal[:4]}")
+	return len(ours)
+
+
+def write_critic_progress(learner, metrics, seconds):
+	"""campaign.stage "critic": one row of run/campaign/critic_progress.csv an update (version, time, seconds and
+	CRITIC_PROGRESS's readings; nan where missing). A reading: its error a line, never the run's end."""
+	try:
+		path = learner.out / "critic_progress.csv"
+		new = not path.exists()
+		with open(path, "a") as f:
+			if new:
+				f.write(",".join(("version", "time", "seconds") + CRITIC_PROGRESS) + "\n")
+			values = [float(metrics[k]) if isinstance(metrics.get(k), (int, float, bool, np.floating, np.integer)) else float("nan") for k in CRITIC_PROGRESS]
+			f.write(",".join([str(learner.version), f"{time.time():.0f}", f"{seconds:.1f}"] + [f"{v:.6g}" for v in values]) + "\n")
+	except Exception as error:  # noqa: BLE001
+		print(f"campaign: critic_progress.csv not written ({type(error).__name__}: {str(error)[:120]})", flush=True)
+
+
+def balance_critic_own(learner, metrics):
+	"""config.critic_own_balance: our rows' weight in the critic's loss a step toward parity per step with the store's
+	rows (the mean pre-clip gradient norms of the two sources' steps, critic_grad_own / _pool, at the weight used), at
+	most CRITIC_OWN_STEP an update, between 1 and CRITIC_OWN_CAP; the weight used this update on the critic's line."""
+	if not getattr(learner.config, "critic_own_balance", False) or not isinstance(metrics, dict):
+		return
+	weight = float(getattr(learner, "critic_own_weight", 1.0))
+	own, pool = metrics.get("critic_grad_own", float("nan")), metrics.get("critic_grad_pool", float("nan"))
+	if own == own and pool == pool and own > 0 and pool > 0:
+		target = weight * pool / own
+		weight = float(np.clip(np.clip(target, weight / CRITIC_OWN_STEP, weight * CRITIC_OWN_STEP), 1.0, float(getattr(learner.config, "critic_own_cap", CRITIC_OWN_CAP))))
+	learner.critic_own_weight = weight
+
+
+OWN_FIT_WINDOW = 5  # (e5, 2026-11-18: one update's own reading is ~20 games' luck, single spikes of 1.5-1.7)
+
+
+def note_own_fit(learner, metrics):
+	"""critic_unexplained_own_med5: the median of the last OWN_FIT_WINDOW updates' critic_unexplained_own, the reading the
+	own balance and the replay are judged by (e5, 2026-11-18: v42's 1.50 and v45's 1.69 were single spikes; never two in
+	a row in v34-v47); its memory from progress.csv's rows of the run's line at the first update after a start."""
+	if not isinstance(metrics, dict) or not metrics.get("critic_unexplained_own", float("nan")) == metrics.get("critic_unexplained_own", float("nan")):
+		return
+	seen = getattr(learner, "own_fit_history", None)
+	if seen is None:
+		seen = []
+		try:
+			with open(learner.progress, newline="") as f:
+				rows = list(csv.DictReader(f))
+			versions = [float(row.get("version") or 0) for row in rows]
+			start = max((i for i in range(1, len(versions)) if versions[i] < versions[i - 1]), default=0)  # (the run's line: after the last roll-back)
+			for row in rows[start:]:
+				try:
+					value = float(row.get("critic_unexplained_own") or "nan")
+				except ValueError:
+					continue
+				if value == value:
+					seen.append(value)
+		except (OSError, AttributeError, TypeError, csv.Error):
+			pass
+	seen = learner.own_fit_history = (seen + [float(metrics["critic_unexplained_own"])])[-OWN_FIT_WINDOW:]
+	metrics["critic_unexplained_own_med5"] = float(np.median(seen))
+
+
+def host_available_gb():
+	"""The host's available memory in GB (/proc/meminfo's MemAvailable; nan elsewhere)."""
+	try:
+		with open("/proc/meminfo") as f:
+			for line in f:
+				if line.startswith("MemAvailable:"):
+					return int(line.split()[1]) / 2**20
+	except OSError:
+		pass
+	return float("nan")
+
+
+def mirror_empire(critic_body, model):
+	"""The separate critic's Φ as the policy's (the audit of 2026-11-18: set_advice_prior refilled the critic's from
+	EmpireConfig() every update while the run's ramps, _ramp_no_town / _ramp_phi / _unit_rule, set the policy's alone:
+	the critic's no-town factor 1.0 against the policy's 0.1): every empire_* / phi_* buffer copied from the policy's."""
+	theirs = getattr(critic_body, "features", None)
+	ours = getattr(model, "features", None)
+	if theirs is None or ours is None:
+		return []
+	source = dict(ours.named_buffers())
+	copied = []
+	for name, buffer in theirs.named_buffers():
+		if name.startswith(("empire_", "phi_")) and name in source and source[name].shape == buffer.shape:
+			buffer.copy_(source[name].to(buffer.device, buffer.dtype))
+			copied.append(name)
+	return copied
 
 
 def set_advice_prior(model, config, version=None):
@@ -354,6 +536,7 @@ class CampaignLearner:
 		self.type_evidence = {part: {} for part in TYPE_PARTS}  # (config.type_evidence: the policy's credit by action type, a reading)
 		self.head_ev = {}  # each head's explained variance at the day starts, smoothed: how far it grades the next (grade_trust)
 		self.value_pool, self.head_pool = None, {}  # their parts (labels.pooled_ev): the residual variance and the variance, smoothed apart
+		self.step_counts = {"policy": 0, "critic": 0}  # (the per-step charts' x: every micro-batch and critic step since the run began)
 		self.head_var, self.head_scale_updates = None, 0  # (config.head_scale) the heads' running target variances, the updates since it began
 		self.loss_scale, self.teacher_share = None, None  # (config.loss_shares) {"log_norm", "weight"} of the terms; the teacher's share
 		self.trust_ema = None  # (config.trust_memory) trust's slow average, trust() floors it at config.trust_floor
@@ -399,6 +582,7 @@ class CampaignLearner:
 			self.value_pool, self.head_pool = state.get("value_pool"), state.get("head_pool", {})
 			self.head_var, self.head_scale_updates = state.get("head_var"), state.get("head_scale_updates", 0)
 			self.loss_scale, self.teacher_share = state.get("loss_scale"), state.get("teacher_share")
+			self.step_counts.update(state.get("step_counts") or {})
 			self.trust_ema = state.get("trust_ema")
 			self.head_residual, self.head_var_slow, self.head_residual_updates = state.get("head_residual"), state.get("head_var_slow"), state.get("head_residual_updates", 0)
 			self.head_weights_frozen = state.get("head_weights_frozen")
@@ -418,6 +602,40 @@ class CampaignLearner:
 			self.loss_scale, self.head_weights_frozen = controls_of(torch.load(config.controls_from, map_location="cpu", weights_only=False))
 			print(f"campaign: the training controls of {config.controls_from}: the loss weights {self.loss_scale and self.loss_scale['weight']}, the value heads' held weights {'taken' if self.head_weights_frozen is not None else 'none'}", flush=True)
 		set_advice_prior(self.model, config, self.version)
+		# The separate critic (config.critic_net, critic.py): its own network and optimizer, saved beside the policy's in
+		# the checkpoint ("critic", "critic_optimizer"), never served; the policy's link_map trains toward its states
+		self.critic = self.critic_optimizer = None
+		# The critic's Nullkiller2 games, made on the fly by supply.Games' kind "nk2", each used once (nk2_stream.py; the
+		# user, 2026-11-19): its held-out fixed from the first games and saved beside the checkpoints (a restart reads it)
+		self.nk2_stream = self.nk2_heldout_batch = None
+		if getattr(config, "stage", "joint") == "critic" and not (getattr(config, "critic_net", False) and getattr(config, "nk2_stream", False) and int(getattr(config, "nk2_rows", 0)) > 0):
+			raise ValueError("campaign.stage critic needs campaign.critic_net, campaign.nk2_stream and campaign.nk2_rows > 0")
+		if getattr(config, "critic_net", False) and getattr(config, "nk2_stream", False):
+			from .nk2_stream import NK2Stream
+
+			self.nk2_stream = NK2Stream(config.nk2_heldout_games, config.nk2_heldout_rows, config.nk2_floor_games, heldout_path=self.out / "nk2_heldout.pkl")
+			print(f"campaign: the critic's NK2 stream: {config.nk2_games} games at once here, {config.nk2_remote} loader workers for remote slots, {config.nk2_days} days a game; an update takes {config.nk2_rows or 'by critic_pool_share'} rows leaving {config.nk2_floor_games} games in the buffer, no game starts past {config.nk2_buffer_cap_games}; the held-out {'read from ' + str(self.out / 'nk2_heldout.pkl') if self.nk2_stream.heldout is not None else f'the first {config.nk2_heldout_games} games ({config.nk2_heldout_rows} rows)'}", flush=True)
+		if getattr(config, "critic_net", False):
+			from .critic import Critic, critic_kwargs, critic_optimizer, load_critic
+
+			self.critic_kwargs = critic_kwargs(config, self.kwargs)
+			self.critic = Critic(**self.critic_kwargs).to(device).eval()
+			mark_resets_done(self.critic.body)
+			set_advice_prior(self.critic.body, config, self.version)
+			mirror_empire(self.critic.body, self.model)
+			self.critic_optimizer = critic_optimizer(self.critic, config)
+			resumed_critic = False
+			if resume and latest.exists():
+				saved = torch.load(latest, map_location=device, weights_only=False)
+				resumed_critic = "critic" in saved
+				if "critic" in saved:
+					self.critic, self.critic_optimizer, added = load_critic(self.critic, config, saved["critic"], saved["critic_optimizer"])
+					self.critic_own_weight = min(float(saved.get("critic_own_weight", 1.0)), float(getattr(config, "critic_own_cap", CRITIC_OWN_CAP)))  # (a lowered cap from the first update)
+					print(f"campaign: the critic resumed ({sum(p.numel() for p in self.critic.parameters())} parameters){f'; new, from 0: {len(added)} tensors ({added[0].split(chr(46))[0]}), its own optimizer group' if added else ''}", flush=True)
+				del saved
+			self.model.link_outputs = True
+			self._resumed_critic = resumed_critic
+			print(f"campaign: the critic network: {self.critic_kwargs}, {sum(p.numel() for p in self.critic.parameters())} parameters", flush=True)
 		if getattr(config, "nk2_inputs", False) or config.nk2_prior or config.nk2_prior_fallback or config.nk2_label_prior or config.nk2_follow or not getattr(config, "nk2_teacher", True):
 			print(f"campaign: schema 19: Nullkiller2's view as inputs {'on' if getattr(config, 'nk2_inputs', False) else 'off'} (off in {getattr(config, 'nk2_input_dropout', 0.0):g} of the training games), its own choice followed at a chance of {config.nk2_follow:g}, the prior on it {config.nk2_label_prior:g}, on its best candidate {config.nk2_prior:g} (fallback {config.nk2_prior_fallback:g}), the teacher's loss {'on' if getattr(config, 'nk2_teacher', True) else 'OFF'}", flush=True)
 		if stale_clips(self.grad_clips, config.grad_clip_since):  # (a recalibration: config.grad_clip_since)
@@ -445,6 +663,11 @@ class CampaignLearner:
 		self._ramp_no_town()  # (B2's factor at the resume version: the labels' and the model's)
 		self._ramp_phi()  # (Φ's hero base, armyless share and lead weight at the resume version, the same way)
 		self._unit_rule()  # (the upgrade rule, config.unit_own_form)
+		if getattr(self, "critic", None) is not None and getattr(config, "critic_body_from_policy", False) and not self._resumed_critic:
+			# (one init, the user 2026-11-19: "on batch 0 I expect the shared layer to be identical"; after the ramps, so
+			# the empire's buffers are the policy's as it will be served)
+			copied = body_from_policy(self.critic, self.model)
+			print(f"campaign: the critic's body set to the policy's, {copied} tensors (one init: identical at batch 0)", flush=True)
 		self.labeler = Labeler(self.labels, self.empire, foresight=self.kwargs.get("architecture") == "v2", share_target=config.share_target)
 		if config.credit == "schedule" and config.share_target != "change":
 			raise SystemExit("campaign.credit 'schedule' reads the share heads as changes: it needs campaign.share_target 'change'")
@@ -481,7 +704,12 @@ class CampaignLearner:
 		self.key_prefix = ""  # (a worker's games: its name first, remote.Hub)
 		self.failed_runs = []
 		self.threads = []
-		self.writer = SummaryWriter(self.run / "tensorboard" / "campaign")
+		if getattr(config, "critic_net", False):  # (the tracked set alone, its own folder: tb_filter.WHITELIST)
+			from .tb_filter import FilteredWriter
+
+			self.writer = FilteredWriter(SummaryWriter(self.run / "tensorboard" / "main"))
+		else:
+			self.writer = SummaryWriter(self.run / "tensorboard" / "campaign")
 		self.progress = self.out / "progress.csv"
 		if not self.progress.exists() or not resume:
 			with self.progress.open("w", newline="") as f:
@@ -664,7 +892,9 @@ class CampaignLearner:
 			return len(self.finished)
 
 	def ready(self):
-		"""Whether an update's games are in (what _take would take)."""
+		"""Whether an update's games are in (what _take would take); campaign.stage "critic": the NK2 stream's take."""
+		if getattr(self.config, "stage", "joint") == "critic":
+			return CampaignLearner.critic_ready(self)
 		with self.lock:
 			return take_count(self.finished, self.config) is not None
 
@@ -747,7 +977,35 @@ class CampaignLearner:
 				features.empire_unit_own.fill_(1.0)
 
 	def step(self, epoch):
+		"""One campaign update (_step), then the GPU mode (gpu_mode, the user 2026-11-18: runtime/gpu_mode "95" or "80",
+		read at each update's end, 95 when missing or unreadable): at 80 the trainer waits so its busy share is about 0.8
+		of the wall time and releases its cached GPU memory, for another job's compute and memory. Never the run's end."""
+		self._step_started = time.monotonic()
+		self.gpu_mode = gpu_mode()
+		done = CampaignLearner._step(self, epoch)  # (through the class: the tests drive step() with a SimpleNamespace for self)
+		if done:
+			now = time.monotonic()
+			self._last_update_end = now
+			if self.gpu_mode == 80:
+				try:
+					time.sleep(max(0.0, (now - self._step_started) * (1.0 / 0.8 - 1.0)))
+					if getattr(getattr(self, "device", None), "type", None) == "cuda" and hasattr(torch._C, "_host_emptyCache"):
+						torch._C._host_emptyCache()
+				except Exception as error:  # noqa: BLE001 (a diagnostic never ends the run)
+					print(f"campaign: the gpu mode's wait failed ({type(error).__name__}: {str(error)[:120]})", flush=True)
+		# The GPU's cache emptied after every update, done or not, in both modes (e5, 2026-11-18: joint9's second update
+		# after each restart ran out of memory, eight times, with 23.4 GB reserved between updates)
+		if getattr(getattr(self, "device", None), "type", None) == "cuda":
+			try:
+				torch.cuda.empty_cache()
+			except Exception as error:  # noqa: BLE001
+				print(f"campaign: emptying the GPU's cache failed ({type(error).__name__}: {str(error)[:120]})", flush=True)
+		return done
+
+	def _step(self, epoch):
 		"""One update if its games are in (the battle learner calls this between its updates); True if it ran."""
+		if getattr(self.config, "stage", "joint") == "critic":  # (the critic alone on the NK2 stream: _critic_step)
+			return CampaignLearner._critic_step(self, epoch)
 		games = self._take()
 		if games is None:
 			return False
@@ -768,11 +1026,13 @@ class CampaignLearner:
 				print(f"campaign: FAILURE: the updates are HELD at version {self.version} ({self.held}); {self.held_updates} updates' games dropped since. A restart lifts the hold", flush=True)
 			return False
 		started, memory = time.time(), [("waited", rss_gb())]
+		marks = [("waited", time.perf_counter())]  # (each stage's moment: the seconds between them on the memory line)
 		unread = [game for game, _ in games if not restore_inputs(game)]  # (strip_inputs: only their spool files had them)
 		if unread:
 			games = [(game, info) for game, info in games if not any(game is u for u in unread)]
 			unspool(unread)
 		memory.append(("taken", rss_gb()))
+		marks.append(("taken", time.perf_counter()))
 		played = []
 		for game, _ in games:
 			game.all_decisions = game.decisions  # (the foresight's labels count record serials: the battles' point at them)
@@ -782,13 +1042,19 @@ class CampaignLearner:
 		if not played:
 			unspool(game for game, _ in games)
 			return False
-		starts, trust, (weight, outcome) = day_starts(self.model, played, self.model_lock), self.grade_trust(), self.end_credit()
+		if getattr(self, "critic", None) is not None:
+			set_advice_prior(self.critic.body, self.config, self.version)
+			mirror_empire(self.critic.body, self.model)  # (after the ramps of this update: the policy's Φ)
+		starts = critic_day_starts(self.critic, played, self.model_lock, self.empire) if getattr(self, "critic", None) is not None else day_starts(self.model, played, self.model_lock)
+		trust, (weight, outcome) = self.grade_trust(), self.end_credit()
 		memory.append(("starts", rss_gb()))
+		marks.append(("starts", time.perf_counter()))
 		foresight = [] if self.kwargs.get("architecture") == "v2" else None  # (v2's foresight labels, each game's)
 		sets = [] if getattr(self.config, "nk2_advice", 0) > 0 else None  # (the teacher's entries beyond the advice's: advice.teacher_sets)
 		decisions, targets, labels, growth, returns, advantages, errors, players, forecasts, row = [], [], [], [], [], [], [], [], [], Counter()
 		growth_real, attributed = [], {"share_now": [], "taken": []}
-		privileged = [] if self.config.privileged_critic and getattr(self.model, "privileged", None) is not None else None  # (privileged_rivals, each game's)
+		privileged = [] if self.config.privileged_critic and getattr(self.model, "privileged", None) is not None and getattr(self, "critic", None) is None else None  # (privileged_rivals, each game's)
+		critic_parts, critic_rows = [], []  # (config.critic_net)
 		end = {"targets": [], "real": [], "step": [], "week": [], "price": []}
 		if self.config.schedule_action_price > 0:  # (each decision's actions through its 7-day window: labels.actions_ahead)
 			end["actions"] = []
@@ -832,6 +1098,12 @@ class CampaignLearner:
 				end["loops"].append(loop_rows(game, stats=loop_seen)[fresh])
 			if privileged is not None:
 				privileged.append(privileged_rivals(game, fresh, len(decisions), self.empire))
+			if getattr(self, "critic", None) is not None:  # (the critic's rivals at every row; its rows: one decision drawn per player-day)
+				critic_parts.append(privileged_rivals(game, fresh, len(decisions), self.empire))
+				groups = {}
+				for j, d in enumerate([d for d, keep in zip(game.decisions, fresh) if keep]):
+					groups.setdefault((d.color, d.day), []).append(len(decisions) + j)
+				critic_rows.extend(int(np.random.choice(rows_)) for rows_ in groups.values())
 			decisions += [d for d, keep in zip(game.decisions, fresh) if keep]
 			hidden.append(np.full(int(fresh.sum()), choice_hidden(game), dtype=bool))
 			place, count = {}, Counter()  # (all_decisions: every record as sent, unusable ones too: a gap breaks a sequence)
@@ -877,6 +1149,7 @@ class CampaignLearner:
 		if not decisions:
 			return False
 		memory.append(("labels", rss_gb()))
+		marks.append(("labels", time.perf_counter()))
 		self._note_head_ev(forecasts)  # (for the next update's grades: these were graded by the trust before them)
 		targets, labels, growth = np.concatenate(targets), np.concatenate(labels), np.concatenate(growth)
 		gather_weight = self.gather_weight_now()
@@ -921,9 +1194,12 @@ class CampaignLearner:
 			out_of_memory = None
 			with self.model_lock:
 				try:
-					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, replace(self.config, nk2_gather_weight=gather_weight, target_kl=self.config.target_kl * valve_k), device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), growth_trust=self.grade_trust().get("G7", 0.0), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None, privileged={name: np.concatenate([part[name] for part in privileged]) for name in privileged[0]} if privileged else None, hidden=np.concatenate(hidden) if hidden else None, segment_k=self.segment_k if getattr(self.config, "credit_segments", False) else None)
+					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, replace(self.config, nk2_gather_weight=gather_weight, target_kl=self.config.target_kl * valve_k, **({"value_weight": 0.0, "privileged_critic": False} if getattr(self, "critic", None) is not None else {})), critic=self._critic_batch(critic_parts, critic_rows) if getattr(self, "critic", None) is not None else None, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), growth_trust=self.grade_trust().get("G7", 0.0), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None, privileged={name: np.concatenate([part[name] for part in privileged]) for name in privileged[0]} if privileged else None, hidden=np.concatenate(hidden) if hidden else None, segment_k=self.segment_k if getattr(self.config, "credit_segments", False) else None)
 				except torch.OutOfMemoryError as error:  # (handled below, once the error's frames, and their tensors, are gone)
-					out_of_memory = str(error)[:200]
+					import traceback
+
+					where = " < ".join(f"{Path(f.filename).name}:{f.lineno} {f.name}" for f in reversed(traceback.extract_tb(error.__traceback__)[-5:]))
+					out_of_memory = f"{str(error)[:700]} AT {where}"  # (the whole message: allocated against reserved; and where it asked)
 			if out_of_memory is not None:
 				# The run goes on (2026-11-01: two of joint7's updates ran out of the GPU's 27 GB and ended it, and their
 				# games with it): this update's games are dropped, as games with no decisions are; the weights keep the
@@ -942,6 +1218,8 @@ class CampaignLearner:
 				self._note_value_ev(metrics)
 				self.teacher_weight = adapted_teacher_weight(self.teacher_weight, metrics.get("teacher_kl"), self.config.teacher_kl_target)
 				self._note_gradients(metrics)
+				balance_critic_own(self, metrics)
+				note_own_fit(self, metrics)
 				self._calibrate_clips(metrics)
 				if metrics.get("head_residual") is not None:  # (config.head_scale_by "residual": for the next update; its ramp goes on)
 					self.head_residual, self.head_var_slow, self.head_residual_updates = metrics["head_residual"], metrics["head_var_slow"], self.head_residual_updates + 1
@@ -980,6 +1258,7 @@ class CampaignLearner:
 			row.update(self._note_segments(decisions, surprises, np.concatenate(streams[0]), np.concatenate(hidden) if hidden else None))
 		self._relabel_waiting()
 		memory.append(("updated", rss_gb()))
+		marks.append(("updated", time.perf_counter()))
 		features = getattr(self.model, "features", None)
 		if features is not None and hasattr(features, "correction_values"):  # (2026-11-15: the new bounded corrections, each update)
 			values = features.correction_values()
@@ -989,6 +1268,7 @@ class CampaignLearner:
 					self.writer.add_scalar(f"campaign_corrections/{name}", value, self.version)
 		self._log(epoch, games, decisions, row, metrics, time.time() - started)
 		memory.append(("logged", rss_gb()))
+		marks.append(("logged", time.perf_counter()))
 		# The update's freed memory back to the system: glibc kept it, and the trainer climbed from ~4 GB after each
 		# restart to 11-14 GB within ~4 updates (2026-11-01), memory the games here could not have. Every name holding the
 		# update's games or their arrays goes first (2026-11-14, the heap census: `played` and the loops' last `game` kept
@@ -999,12 +1279,50 @@ class CampaignLearner:
 		if self.device.type == "cuda" and hasattr(torch._C, "_host_emptyCache"):
 			torch._C._host_emptyCache()  # (the pinned staging's cached blocks: the trainer held 1.85 GB of such mappings)
 		memory.append(("trimmed", rss_gb()))
+		marks.append(("trimmed", time.perf_counter()))
 		if all(value == value for _, value in memory):
 			print("campaign memory (GB, this process): " + "  ".join(f"{stage} {value:.1f}" for stage, value in memory), flush=True)
+		print("campaign stages (seconds): " + "  ".join(f"{b[0]} {b[1] - a[1]:.1f}" for a, b in zip(marks, marks[1:])), flush=True)
+		CampaignLearner._report_critic(self, metrics)
+		return True
+
+	def _report_critic(self, metrics):
+		"""Each update's critic report (an update of either stage): the per-step charts, the critic's per-head charts and
+		its critic/ set, the "campaign critic:" line, the NK2 stream's line and nk2/ charts, the GPU's memory."""
+		if isinstance(metrics, dict):
+			write_step_losses(self, metrics)
+		if getattr(self, "critic", None) is not None and isinstance(metrics, dict):  # (config.critic_net: the per-head charts, critic_heads/)
+			for key, value in metrics.items():
+				if key.startswith("critic_heads/") and isinstance(value, float) and value == value:
+					self.writer.add_scalar(key, value, self.version)
+			heads = [k for k in metrics if k.startswith("critic_heads/")]
+			if heads:
+				print("campaign critic heads (unexplained, 1 none): " + "  ".join(f"{k[len('critic_heads/'):]} {float(metrics[k]):.3f}" for k in sorted(heads)), flush=True)
+		if getattr(self, "critic", None) is not None and isinstance(metrics, dict):  # (config.critic_net: TensorBoard's critic/ set)
+			for name, key in CRITIC_CHARTS:
+				if key in metrics and float(metrics[key]) == float(metrics[key]):
+					self.writer.add_scalar(f"critic/{name}", float(metrics[key]), self.version)
+		if getattr(self, "critic", None) is not None and isinstance(metrics, dict):  # (config.critic_net: the critic's and the link's readings)
+			metrics["host_available_gb"] = host_available_gb()
+			keys = CRITIC_LINE
+			print("campaign critic: " + "  ".join(f"{k} {float(metrics[k]):.4g}" for k in keys if k in metrics), flush=True)
+			if "critic_pass_pool" in metrics or "critic_pass_own" in metrics:  # (each minibatch's loss in order, e5's question of 2026-11-18)
+				print(f"campaign critic pass (each minibatch's loss): own {metrics.get('critic_pass_own')}  pool {metrics.get('critic_pass_pool')}", flush=True)
+		if getattr(self, "nk2_stream", None) is not None:  # (the NK2 stream since the last update: "each game once" as it holds; e5 2026-11-19)
+			r = self.nk2_stream.reading()
+			if isinstance(metrics, dict):
+				metrics.update(r)  # (critic_progress.csv's, after this report)
+			hosts, self.nk2_hosts = dict(getattr(self, "nk2_hosts", None) or {}), Counter()
+			total = sum(hosts.values())
+			if total:
+				rate = r["nk2_games_per_minute"] * total / max(1, r["nk2_games_in"] + r["nk2_held_out"] + r["nk2_dropped"])
+				print("campaign nk2 stream by machine: " + "  ".join(f"{host} {n} games ({rate * n / total:.1f} a minute)" for host, n in sorted(hosts.items())), flush=True)
+			print(f"campaign nk2 stream: {r['nk2_games_in']} games in ({r['nk2_games_per_minute']:.1f} a minute), {r['nk2_dropped']} dropped by the history check, {r['nk2_held_out']} to the held-out ({'fixed' if r['nk2_heldout_ready'] else str(r['nk2_heldout_games_pending']) + ' of ' + str(self.config.nk2_heldout_games)}); the buffer {r['nk2_buffer_before']} -> {r['nk2_buffer_after']} games (groups over the mean a game); rows taken {r['nk2_rows_taken']} of {r['nk2_rows_wanted']} wanted", flush=True)
+			for key, value in r.items():
+				self.writer.add_scalar(f"nk2_stream/{key[len('nk2_'):]}", float(value), self.version)
 		if self.device.type == "cuda":  # (the allocator's live tensors and its reserve, and what the card has left)
 			free, total = torch.cuda.mem_get_info(self.device)
 			print(f"campaign gpu memory (GB): allocated {torch.cuda.memory_allocated(self.device) / 2**30:.1f}  reserved {torch.cuda.memory_reserved(self.device) / 2**30:.1f}  card free {free / 2**30:.1f} of {total / 2**30:.1f}", flush=True)
-		return True
 
 	def _note_segments(self, decisions, surprises, players, hidden=None):
 		"""config.credit_segments: each segment's surprise (ppo_update's, [n, 3]) into its evidence (labels.credit_evidence:
@@ -1139,6 +1457,7 @@ class CampaignLearner:
 		return self.config.end_credit_max * trust, share
 
 	def _log(self, epoch, games, decisions, sums, metrics, seconds):
+		parts = [("start", time.perf_counter())]  # (the log step's parts timed: "campaign log step (seconds)")
 		n = len(decisions)
 		turn = [d for d in decisions if d.action_type >= 0]
 		types = Counter(c.ActionType(d.action_type).name.lower() for d in turn)
@@ -1224,6 +1543,7 @@ class CampaignLearner:
 			"probes_no_way": sum(s.get("probes_no_way", 0) for s in done) / max(len(games), 1),
 			# (e5, 2026-11-11: loops_cut is the sum over a game's players, a mean over the update's games; this one is per
 			# player-day, comparable across player counts and game lengths: the cuts over the players' days played)
+			"decisions_per_player_day": n / max(sum(len(game.ledgers[min(game.ledgers)]["players"]) * (max(game.ledgers) - 1) for game, _ in games if game.ledgers), 1),
 			"loops_per_player_day": sum(s.get("loops_cut", 0) for s in done) / max(sum(len(game.ledgers[min(game.ledgers)]["players"]) * (max(game.ledgers) - 1) for game, _ in games if game.ledgers), 1),
 			"game_failures": self.stats["game_failures"],
 			"game_maps": sum(1 for _, info in games if not info.map_name.startswith("Maps/alpha_random/")),
@@ -1237,11 +1557,15 @@ class CampaignLearner:
 			**{f"failure_{k}": v for k, v in failure_modes(decisions, moves_limit=3000).items()},  # dumb decisions (failures.py; the meetings' over ~3k moves)
 			"kinds": " ".join(f"{k}:{n}" for k, n in sorted(Counter(c.DecisionKind(d.kind).name for d in decisions).items())),
 			"no_effect_types": " ".join(f"{t}:{n}" for t, n in sorted(Counter(c.ActionType(d.action_type).name for d in decisions if d.flags & NO_EFFECT).items())),
-			**{name: metrics.get(name, float("nan")) for name in (*FORESIGHT_COLUMNS, "grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share", *GRADIENT_COLUMNS) if name != "teacher_set_agree"},
+			**{name: metrics.get(name, float("nan")) for name in (*CRITIC_COLUMNS, *FORESIGHT_COLUMNS, "grad_shared_main", "grad_shared_foresight", "grad_shared_cosine", "grad_dead_share", *GRADIENT_COLUMNS) if name != "teacher_set_agree"},
 			"teacher_set_agree": sums["set_agree"] / sums["set_advised"] if sums.get("set_advised") else float("nan"),  # (ours one of the teacher's entries: its advice's or a set's)
 		}
+		parts.append(("row", time.perf_counter()))
 		with self.progress.open("a", newline="") as f:
 			csv.writer(f).writerow([round(row[k], 6) if isinstance(row[k], float) else row[k] for k in COLUMNS])
+		parts.append(("csv", time.perf_counter()))
+		if row.get("decisions_per_player_day", float("nan")) == row.get("decisions_per_player_day", float("nan")):
+			self.writer.add_scalar("campaign/decisions_per_player_day", row["decisions_per_player_day"], self.version)
 		if row["value_loss_fresh"] == row["value_loss_fresh"]:  # the eval tab's (battle_model/train.py VALUE_LOSS_TAB)
 			self.writer.add_scalar("eval/campaign_value_loss", row["value_loss_fresh"], self.version)
 		self._judge_value(row["value_loss_fresh"])
@@ -1291,22 +1615,29 @@ class CampaignLearner:
 			print("campaign noise scale (decisions, the batch where a term's gradient noise equals its signal): " + "  ".join(f"{name} {scale:.0f}" for name, scale in noise.items()), flush=True)
 		if "end_check" in sums:  # (how far the end credit's step part is used: 1 all of it, 0 its week part alone)
 			self.writer.add_scalar("campaign/end_check", sums["end_check"], self.version)
+		parts.append(("readings", time.perf_counter()))
 		for skill, (picked, offered) in skill_picks(decisions).items():  # (how often each skill is taken when offered)
 			self.writer.add_scalar(f"campaign_skills/{skill}", picked / offered, self.version)
+		parts.append(("skills", time.perf_counter()))
 		turns = max(1, sum(1 for d in decisions if d.action_type >= 0))
 		for what, (count, rise) in cast_report(game for game, _ in games).items():  # (each spell's share of the turn decisions, V7's rise after it)
 			self.writer.add_scalar(f"campaign_casts/{what}", count / turns, self.version)
 			if rise == rise:
 				self.writer.add_scalar(f"campaign_casts/{what}_v7_rise", rise, self.version)
+		parts.append(("casts", time.perf_counter()))
 		for key in COLUMNS[2:]:
 			value = row[key]
 			if isinstance(value, (int, float)) and not isinstance(value, bool) and value == value:
 				group = "campaign_actions/" + key[6:] if key.startswith("share_") else "campaign_failures/" + key[8:] if key.startswith("failure_") else "campaign/" + key
 				self.writer.add_scalar(group, value, self.version)
+		parts.append(("columns", time.perf_counter()))
 		self.writer.flush()
+		parts.append(("flush", time.perf_counter()))
+		print("campaign log step (seconds): " + "  ".join(f"{b[0]} {b[1] - a[1]:.1f}" for a, b in zip(parts, parts[1:])), flush=True)
 		privileged_note = f", privileged {metrics['value_unexplained_privileged']:.2f}" if "value_unexplained_privileged" in metrics else ""
 		print(
 			f"campaign {self.version:4d}  games {row['games']}  decisions {n}  days {row['days']:.1f}  Φ at the end {row['phi_end']:.0f}  heroes {row['heroes']:.2f}"
+			f"  gpu mode {getattr(self, 'gpu_mode', 95)} busy {busy_share(self):.2f}"
 			# (pooled over ~10 updates like the growth and end heads': this update's alone swings with its few games' spread,
 			# -0.65 at a correlation of +0.22 and a spread as wide as the outcomes', 2026-10-30, while the pooled rose)
 			"  value ev " + "/".join(f"{row[f'head_ev_v{k}']:+.2f}" for k in c.VALUE_OFFSETS)
@@ -1343,12 +1674,142 @@ class CampaignLearner:
 		with self.model_lock:
 			self._save(path)
 
+	def _critic_batch(self, parts, rows):
+		"""ppo_update's critic: the network, its optimizer, every row's rivals (privileged_rivals'), its rows (one decision
+		drawn per player-day of this update's games) and the NK2 stream's rows for it alone: config.nk2_rows trained rows
+		(0: critic_pool_share of the update's), taken once and never again, leaving nk2_floor_games games in the buffer;
+		its held-out, fixed, read every update once it is complete."""
+		batch = {"module": self.critic, "optimizer": self.critic_optimizer, "rows": np.asarray(rows, dtype=np.int64)}
+		batch["own_weight"] = float(getattr(self, "critic_own_weight", 1.0)) if getattr(self.config, "critic_own_balance", False) else 1.0
+		batch.update({name: np.concatenate([part[name] for part in parts]) for name in ("rivals", "present", "share_logit")})
+		batch["pool"] = batch["pool_heldout"] = None
+		stream = getattr(self, "nk2_stream", None)
+		if stream is None:
+			return batch
+		from .critic_store import assemble
+
+		share = float(getattr(self.config, "critic_pool_share", 0.5))
+		want = int(self.config.nk2_rows) if getattr(self.config, "nk2_rows", 0) else int(round(len(rows) * share / max(1e-6, 1.0 - share)))
+		groups = stream.take(want, keep_floor=True)
+		batch["pool"] = assemble(groups) if groups else None
+		if stream.heldout is not None and self.nk2_heldout_batch is None:  # (assembled once: the same rows every update)
+			self.nk2_heldout_batch = assemble(stream.heldout, rng=np.random.default_rng(0))
+		batch["pool_heldout"] = self.nk2_heldout_batch
+		return batch
+
+	# ---- the critic's NK2 stream (supply.Supply routes its games here) ----
+
+	def nk2_arrived(self, item):
+		"""An NK2 game from supply.Games' kind "nk2" (slim, its history checked): labelled at this learner's empire, one
+		group a game-day (critic_store.game_groups), into the stream. A game that does not label is dropped and said."""
+		if getattr(self, "nk2_stream", None) is None:
+			return
+		from .critic_store import game_groups
+
+		try:
+			groups = game_groups(item["game"], item["key"], self.config, self.empire, getattr(self, "labels", None), np.random.default_rng())
+		except Exception as error:  # noqa: BLE001 (one game: never the run's end)
+			print(f"campaign: FAILURE: the NK2 game {item.get('key')} did not label ({type(error).__name__}: {str(error)[:200]})", flush=True)
+			return
+		if groups:
+			self.nk2_stream.put(item["key"], groups)
+		hosts = getattr(self, "nk2_hosts", None)
+		if hosts is None:
+			hosts = self.nk2_hosts = Counter()
+		hosts[str(item.get("host", "?"))] += 1  # (the games by machine since the last report: the stream's line)
+		keep = int(getattr(self.config, "nk2_keep_games", 0))
+		if keep and groups and self.nk2_stream.games_seen <= keep:  # (config.nk2_keep_games: the first games' groups as labelled, a ridge's rows)
+			try:
+				folder = self.out / "nk2_kept"
+				folder.mkdir(parents=True, exist_ok=True)
+				with open(folder / f"groups_{item['key']}.pkl", "wb") as f:  # (one pickle a group, critic_store's old block format)
+					for group in groups:
+						pickle.dump(group, f, protocol=pickle.HIGHEST_PROTOCOL)
+			except Exception as error:  # noqa: BLE001 (a reading's rows: never the run's end)
+				print(f"campaign: an NK2 game not kept ({type(error).__name__}: {str(error)[:120]})", flush=True)
+
+	def nk2_failed(self, item):
+		"""An NK2 game that failed: the history check's refusals counted in the stream's reading; the others said."""
+		if getattr(self, "nk2_stream", None) is not None and item.get("check"):
+			self.nk2_stream.dropped(item.get("message", ""))
+		else:
+			print(f"campaign: an NK2 game failed: {str(item.get('message', ''))[:300]}", flush=True)
+
+	def critic_ready(self):
+		"""campaign.stage "critic": the held-out fixed and a whole take (config.nk2_rows trained rows) above the floor."""
+		stream = getattr(self, "nk2_stream", None)
+		return stream is not None and stream.heldout is not None and stream.room_rows() >= int(self.config.nk2_rows)
+
+	def _critic_step(self, epoch):
+		"""campaign.stage "critic" (e5 for the user, 2026-11-19, stage A): one update of the critic alone on the NK2
+		stream: config.nk2_rows trained rows taken once (train_critic's pool, no own rows), the heads' weights from those
+		rows' targets, the fixed held-out read before the steps; the policy, its optimizer and the link untouched.
+		The version counts these updates; checkpoint_latest after each, checkpoint_<v> every CRITIC_KEEP_EVERY."""
+		if not CampaignLearner.critic_ready(self):
+			return False
+		from .critic_store import assemble
+		from .train import HEAD_SCALE_RAMP, train_critic
+
+		started = time.time()
+		CampaignLearner._ramp_no_town(self)  # (the empire at this version, as _step: constant from v0 on joint10's line)
+		CampaignLearner._ramp_phi(self)
+		CampaignLearner._unit_rule(self)
+		set_advice_prior(self.critic.body, self.config, self.version)
+		mirror_empire(self.critic.body, self.model)
+		groups = self.nk2_stream.take(int(self.config.nk2_rows), keep_floor=True)
+		pool = assemble(groups) if groups else None
+		if pool is None:
+			return False
+		if self.nk2_heldout_batch is None and self.nk2_stream.heldout:
+			self.nk2_heldout_batch = assemble(self.nk2_stream.heldout, rng=np.random.default_rng(0))
+		self.critic_oom = getattr(self, "critic_oom", None) or {"retries": 0}
+		crit = {"module": self.critic, "optimizer": self.critic_optimizer, "pool": pool, "pool_heldout": self.nk2_heldout_batch, "oom": self.critic_oom}
+		updates = getattr(self, "head_scale_updates", 0)
+		scale = None
+		if getattr(self.config, "head_scale", False):
+			scale = {"var": getattr(self, "head_var", None), "ramp": min(1.0, updates / HEAD_SCALE_RAMP)}  # (measured on the stream's rows, never held: e5 2026-11-19)
+		none = torch.zeros(0, dtype=torch.long, device=self.device)
+		try:
+			metrics = train_critic(self.critic, crit, self.config, none, *([None] * 12), lambda chunks: iter(()), None, self.device, head_scale=scale)
+		except torch.OutOfMemoryError as error:  # (its rows were taken: used once, never again)
+			torch.cuda.empty_cache()
+			print(f"campaign critic update {self.version + 1}: out of GPU memory, its {len(groups)} game-days dropped: {str(error)[:300]}", flush=True)
+			return False
+		self.version += 1
+		if metrics.get("head_var") is not None:
+			self.head_var, self.head_scale_updates = metrics.pop("head_var"), updates + 1
+			weights = metrics.pop("head_weights", None) or {}
+			print("campaign value heads' weights (ramp %.2f, the stream's rows): " % min(1.0, self.head_scale_updates / HEAD_SCALE_RAMP) + "  ".join(f"{name} " + "/".join(f"{w:.2f}" for w in values) for name, values in weights.items()), flush=True)
+		with self.model_lock:
+			self._save(self.out / "checkpoint_latest.pt")
+			if self.version % CRITIC_KEEP_EVERY == 0:
+				self._save(self.out / f"checkpoint_{self.version:05d}.pt")
+		seconds = time.time() - started
+		metrics["host_available_gb"] = host_available_gb()
+		print(f"campaign critic update {self.version}: {len(groups)} game-days, {metrics.get('critic_rows_pool', 0)} rows, {metrics.get('critic_steps_pool', 0)} steps, {seconds:.0f} s", flush=True)
+		self.writer.add_scalar("campaign/update_seconds", seconds, self.version)
+		CampaignLearner._report_critic(self, metrics)
+		write_critic_progress(self, metrics, seconds)
+		return True
+
+	def nk2_room(self):
+		"""Whether an NK2 game may be handed in now: the held-out filling, the buffer (in games: its groups over the mean
+		groups a game, the floor's unit) under config.nk2_buffer_cap_games, or campaign.stage "critic" waiting for a whole
+		take (never parked while the learner waits: the cap alone held the smoke of 2026-11-19 with too few rows above the
+		floor for a take, and nothing moved)."""
+		stream = getattr(self, "nk2_stream", None)
+		if stream is None:
+			return False
+		if stream.heldout is None or stream.buffer_size() < float(getattr(self.config, "nk2_buffer_cap_games", 300)):
+			return True
+		return getattr(self.config, "stage", "joint") == "critic" and not CampaignLearner.critic_ready(self)
+
 	def _save(self, path):
 		from battle_model.train import save_atomically  # (whole or not at all: the run resumes from it)
 
 		state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
 		optimizer = {} if self.worker else {"optimizer": self.optimizer.state_dict()}  # (the process's is in checkpoint_latest.pt)
-		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "segment_evidence": getattr(self, "segment_evidence", [{}, {}, {}]), "type_evidence": getattr(self, "type_evidence", {}), "segment_k": getattr(self, "segment_k", (0.0, 0.0)), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "head_weights_frozen": getattr(self, "head_weights_frozen", None), "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "gather_ramp_start": self.gather_ramp_start, "valve": self.valve, "model_kwargs": self.kwargs}, path)
+		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "segment_evidence": getattr(self, "segment_evidence", [{}, {}, {}]), "type_evidence": getattr(self, "type_evidence", {}), "segment_k": getattr(self, "segment_k", (0.0, 0.0)), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "head_weights_frozen": getattr(self, "head_weights_frozen", None), "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "gather_ramp_start": self.gather_ramp_start, "valve": self.valve, "model_kwargs": self.kwargs, **({"critic": {k: v.detach().cpu() for k, v in self.critic.state_dict().items()}, "critic_optimizer": self.critic_optimizer.state_dict(), "critic_kwargs": self.critic_kwargs, "critic_own_weight": float(getattr(self, "critic_own_weight", 1.0)), "step_counts": dict(getattr(self, "step_counts", {}))} if getattr(self, "critic", None) is not None else {})}, path)
 
 	# ---- the loss shares (config.loss_shares) ----
 
@@ -1359,6 +1820,10 @@ class CampaignLearner:
 		if not getattr(self.config, "nk2_teacher", True):
 			teacher = 0.0
 		rest = 1.0 - teacher
+		if getattr(self, "critic", None) is not None and not getattr(self.config, "link_balanced", True):  # (the link a reading: policy : foresight 7 : 1)
+			return {"policy": rest * 7 / 8, "link": 0.0, "value": 0.0, "teacher": teacher, "foresight": rest / 8}
+		if getattr(self, "critic", None) is not None:  # (the value's terms are off: the link takes its share)
+			return {"policy": rest * 4 / 8, "link": rest * 3 / 8, "value": 0.0, "teacher": teacher, "foresight": rest / 8}
 		return {"policy": rest * 4 / 8, "value": rest * 3 / 8, "teacher": teacher, "foresight": rest / 8}
 
 	def loss_weights(self):
@@ -1370,6 +1835,10 @@ class CampaignLearner:
 			return {"value": 1.0, "foresight": 1.0, "teacher": self.teacher_weight if taught else 0.0}
 		if getattr(self, "loss_scale", None) is None:
 			self.loss_scale = {"log_norm": {}, "weight": {"value": 1.0, "teacher": self.teacher_weight, "foresight": 1.0}}
+		if getattr(self, "critic", None) is not None:  # (the link's weight over campaign.link_weight: 1 to start, as it ran)
+			self.loss_scale["weight"].setdefault("link", 1.0)
+			if not getattr(self.config, "link_balanced", True):  # (held at 1 whatever a checkpoint saved: link_weight alone)
+				self.loss_scale["weight"]["link"] = 1.0
 		shares = self.loss_shares()
 		if not taught:  # (the others' weights as they stand: the frozen ones, or the balancer's with the teacher's share 0)
 			return {**self.loss_scale["weight"], "teacher": 0.0, "kl_teacher": 0.0}
@@ -1447,33 +1916,45 @@ class CampaignLearner:
 		mean and each weight a step toward the one that gives its term its share against the policy's (GradNorm's balance:
 		weight = share / share_policy x norm_policy / norm over the running means), at most LOSS_SCALE_STEP times."""
 		weights = self.loss_weights()
-		scale = {"policy": 1.0, "entropy": 1.0, "value": weights["value"], "teacher": weights["teacher"], "foresight": weights["foresight"], "plan": weights["foresight"]}
+		scale = {"policy": 1.0, "entropy": 1.0, "value": weights["value"], "teacher": weights["teacher"], "foresight": weights["foresight"], "plan": weights["foresight"], "link": weights.get("link", 1.0)}
 		for term, weight in scale.items():
 			metrics[f"grad_shared_{term}"] = metrics.get(f"grad_raw_{term}", float("nan")) * weight
 			for label in ("night_gain", "danger_gain"):
 				metrics[f"push_{label}_{term}"] = -metrics.get(f"grad_raw_{label}_{term}", float("nan")) * weight
-		metrics.update({f"loss_weight_{term}": weights[term] for term in ("value", "teacher", "foresight")}, teacher_share=self.loss_shares()["teacher"])
+		metrics.update({f"loss_weight_{term}": weights[term] for term in ("value", "teacher", "foresight", "link") if term in weights}, teacher_share=self.loss_shares()["teacher"])
 		if not getattr(self.config, "loss_shares", False):
 			return
 		state = self.loss_scale
-		for term in LOSS_TERMS:
+		terms = loss_terms(self)
+		for term in terms:
 			norm = metrics.get(f"grad_raw_{term}", float("nan"))
 			if np.isfinite(norm) and norm > 0:
 				old = state["log_norm"].get(term)
 				state["log_norm"][term] = math.log(norm) if old is None else LOSS_SCALE_MEMORY * old + (1 - LOSS_SCALE_MEMORY) * math.log(norm)
 		shares, norms = self.loss_shares(), state["log_norm"]
 		frozen = bool(self.config.loss_shares_freeze) and self.version >= self.config.loss_shares_freeze  # (step 3: measured, not moved)
-		if "policy" in norms and not frozen:
-			for term in ("value", "teacher", "foresight"):
-				if term in norms:
+		if terms == CRITIC_LOSS_TERMS:  # (the separate critic: steered by the last LOSS_SHARE_WINDOW updates' mean shares, bounded)
+			step_by_mean_shares(self, metrics, terms, shares, state, frozen)
+		elif "policy" in norms and not frozen:
+			for term in terms[1:]:
+				if term in norms and term in state["weight"]:
 					target = shares[term] / shares["policy"] * math.exp(norms["policy"] - norms[term])
 					weight = state["weight"][term]
 					if term == "value":  # (a floor: between its share and VALUE_SHARE_CAP times it, the weight holds)
 						target = float(np.clip(weight, target, VALUE_SHARE_CAP * target))
 					state["weight"][term] = float(np.clip(np.clip(target, weight / LOSS_SCALE_STEP, weight * LOSS_SCALE_STEP), 1e-4, 1e6))
-		now = {term: metrics[f"grad_shared_{term}"] for term in LOSS_TERMS}
-		total = sum(v for v in now.values() if np.isfinite(v))
-		print("campaign loss shares (target / this update's): " + "  ".join(f"{term} {shares[term]:.2f}/{now[term] / total if total > 0 and np.isfinite(now[term]) else float('nan'):.2f}" for term in LOSS_TERMS) + "  weights next: " + "  ".join(f"{term} {state['weight'][term]:.3g}" for term in ("value", "teacher", "foresight")) + (f" (frozen since v{self.config.loss_shares_freeze})" if frozen else ""), flush=True)
+		now = {term: metrics.get(f"grad_shared_{term}", float("nan")) for term in terms}
+		total = sum(v for v in now.values() if np.isfinite(v))  # (every term's: the link's share as a reading even when not balanced)
+		link_note = ""
+		if "link" in now and total > 0 and np.isfinite(now["link"]):  # (the link's share of the gradient, a reading: e5 re-sizes link_weight by its 5-update mean)
+			seen = getattr(self, "link_share_history", None)
+			seen = self.link_share_history = (seen or []) + [now["link"] / total]
+			del seen[:-LOSS_SHARE_WINDOW]
+			metrics["link_share"], metrics["link_share_mean"] = seen[-1], float(np.mean(seen))
+			if getattr(self, "writer", None) is not None:
+				self.writer.add_scalar("campaign/link_share_mean", metrics["link_share_mean"], self.version)
+			link_note = f"  link share {seen[-1]:.3f}, mean of {len(seen)} {metrics['link_share_mean']:.3f}"
+		print("campaign loss shares (target / this update's): " + "  ".join(f"{term} {shares[term]:.2f}/{now[term] / total if total > 0 and np.isfinite(now[term]) else float('nan'):.2f}" for term in terms) + "  weights next: " + "  ".join(f"{term} {state['weight'][term]:.3g}" for term in terms[1:] if term in state["weight"]) + (f" (frozen since v{self.config.loss_shares_freeze})" if frozen else "") + link_note, flush=True)
 
 	# ---- evaluation ----
 
@@ -1746,6 +2227,106 @@ def day_starts(model, games, lock, batch=64):
 		for j, (g, i) in enumerate(chunk):
 			d = games[g].decisions[i]
 			starts[g][(d.color, d.day)] = (i, shares[j], grown[j], float(log_value[j]), float(end[j]), float(prior[j]))
+	return starts
+
+
+GPU_MODE_FILE = Path(__file__).resolve().parents[1] / "runtime" / "gpu_mode"
+
+
+def busy_share(learner):
+	"""This update's share of the wall time since the last update ended (the trainer busy on it), nan at the first."""
+	last, started = getattr(learner, "_last_update_end", None), getattr(learner, "_step_started", None)
+	now = time.monotonic()
+	return (now - started) / max(now - last, 1e-6) if last is not None and started is not None else float("nan")
+
+
+def gpu_mode(path=None):
+	"""The GPU mode (the user, 2026-11-18): 80 when the file says "80", else 95 (missing, unreadable, anything else)."""
+	try:
+		return 80 if Path(path or GPU_MODE_FILE).read_text().strip() == "80" else 95
+	except Exception:  # noqa: BLE001
+		return 95
+
+
+# TensorBoard's critic/ charts (e5 for the user, 2026-11-18: names that explain themselves): (chart, metric). "visible":
+# the unprivileged head (critic.FreeHead), from what the policy can see; the privileged head's unprefixed. Losses: the
+# whole pass's mean, beside the floor the targets' own entropy sets (loss - floor: what the head can still gain). The
+# pool's unexplained on its held-out tenth only (its trained rows' reading is in the log line, not charted); _after: the
+# held-out tenth again after the pass's steps
+CRITIC_CHARTS = (
+	("unexplained_own", "critic_unexplained_own"), ("unexplained_own_med5", "critic_unexplained_own_med5"), ("unexplained_pool_heldout", "critic_unexplained_pool_heldout"),
+	("unexplained_pool_heldout_after", "critic_unexplained_pool_heldout_after"),
+	("unexplained_visible_own", "critic_unexplained_visible_own"), ("unexplained_visible_pool_heldout", "critic_unexplained_visible_pool_heldout"),
+	# (the critic's loss: each head's cross-entropy less its targets' own entropy, 0 a perfect critic (train.critic_loss);
+	# ours: the pass's mean, the held-out tenth's before the steps)
+	("loss_own", "critic_loss_own_mean"), ("loss_pool_heldout", "critic_loss_pool_heldout"),
+	("loss_pool", "critic_loss_pool_mean"), ("loss_visible_pool", "critic_loss_visible_pool_mean"),  # (the NK2 stream's rows, each seen once: read before its step)
+	("loss_visible_own", "critic_loss_visible_own_mean"), ("loss_visible_pool_heldout", "critic_loss_visible_pool_heldout"),
+	("link_loss", "link_loss"), ("rows_own", "critic_rows_own"), ("rows_pool", "critic_rows_pool"), ("own_weight", "critic_own_weight"),
+)
+CRITIC_LINE = (  # (the log's "campaign critic:" line; _raw: the cross-entropy before the floor came off, for one restart)
+	"critic_unexplained_own", "critic_unexplained_own_med5", "critic_unexplained_pool", "critic_unexplained_pool_heldout", "critic_unexplained_pool_heldout_after",
+	"critic_unexplained_visible_own", "critic_unexplained_visible_pool", "critic_unexplained_visible_pool_heldout",
+	"critic_loss_own_first", "critic_loss_own_last", "critic_loss_own_mean", "critic_loss_raw_own_mean",
+	"critic_loss_pool_first", "critic_loss_pool_last", "critic_loss_pool_mean", "critic_loss_raw_pool_mean", "critic_loss_pool_heldout",
+	"critic_loss_visible_own_mean", "critic_loss_visible_pool_mean", "critic_loss_visible_pool_heldout",
+	"critic_rows_own", "critic_rows_pool", "critic_rows_pool_heldout", "critic_steps_own", "critic_steps_pool", "critic_oom_retries",
+	"critic_grad_own", "critic_grad_pool", "critic_clipped_own", "critic_clipped_pool", "critic_own_weight", "card_free_gb", "host_available_gb",
+	"link_loss", "policy", "last_kl", "kl_target",
+)
+CRITIC_HELDOUT_ROWS = 1024  # the held-out tenth of the NK2 pool's rows read an update (no gradient): critic_unexplained_pool_heldout
+CRITIC_DAY_START_BATCH = 256  # (was 64: ~80 eager trunk calls an update under the model lock; 512 would ask the 6.5 GiB block that failed joint9 v13: 256 as the prepass, ~3.3 GiB)
+
+
+def critic_day_starts(critic, games, lock, empire=EmpireConfig(), batch=None, oom=None):
+	"""day_starts' forecasts from the separate critic (config.critic_net): each player's first turn decision of each day,
+	its trunk then its head with the rivals' states at those rows (privileged_rivals over them: each rival's last
+	day-start row on a day before) and our true share's logit as the day began. The same structure as day_starts'. The
+	trunk on CRITIC_DAY_START_BATCH rows a call, halved on running out of the GPU's memory (train.trunk_in_halves)."""
+	import copy
+
+	from .critic import rival_extra
+	from .train import trunk_in_halves
+
+	batch = batch or CRITIC_DAY_START_BATCH
+
+	rows, parts, firsts = [], [], []
+	for g, game in enumerate(games):
+		seen, chosen = set(), []
+		for i, d in enumerate(game.decisions):
+			if d.kind == c.DecisionKind.TURN and (d.color, d.day) not in seen:
+				seen.add((d.color, d.day))
+				chosen.append(i)
+		view = copy.copy(game)
+		view.decisions = [game.decisions[i] for i in chosen]
+		parts.append(privileged_rivals(view, np.ones(len(chosen), dtype=bool), len(rows), empire))
+		rows += [(g, i) for i in chosen]
+	starts = [{} for _ in games]
+	if not rows:
+		return starts
+	device = next(critic.parameters()).device
+	n = len(rows)
+	hidden, phi, players = torch.zeros(n, critic.dim, device=device), torch.zeros(n, device=device), torch.zeros(n, device=device)
+	chunks = [np.arange(k, min(k + batch, n)) for k in range(0, n, batch)]
+	with lock, torch.no_grad():
+		for chunk, inputs in _prefetched(chunks, lambda part: decode_inputs([games[rows[j][0]].decisions[rows[j][1]] for j in part]), device):
+			_, h, p = trunk_in_halves(critic, inputs, oom)
+			index = torch.as_tensor(chunk, device=device)
+			hidden[index], phi[index], players[index] = h.float(), p.float(), inputs["g_players"].float()
+		rivals = torch.from_numpy(np.concatenate([part["rivals"] for part in parts])).to(device)
+		mask = torch.from_numpy(np.concatenate([part["present"] for part in parts])).to(device).float() * (rivals >= 0).float()
+		rivals = rivals.clamp(min=0)
+		share = torch.from_numpy(np.concatenate([part["share_logit"] for part in parts]).astype(np.float32)).to(device)
+		raw = critic.head(hidden, hidden[rivals], mask, share, rival_extra(phi, phi[rivals], mask)).float()
+		out = critic.outputs(raw, share)
+	shares = out["value"].float().cpu().numpy()
+	grown = ((2 * torch.sigmoid(out["growth_logit"]) - 1) * GROWTH_CAP).float().cpu().numpy()
+	log_value = np.log(np.maximum(phi.cpu().numpy(), PHI_FLOOR))
+	end = torch.sigmoid(out["end_logit"]).float().cpu().numpy()
+	prior = 1.0 / np.maximum(players.cpu().numpy(), 2.0)
+	for j, (g, i) in enumerate(rows):
+		d = games[g].decisions[i]
+		starts[g][(d.color, d.day)] = (i, shares[j], grown[j], float(log_value[j]), float(end[j]), float(prior[j]))
 	return starts
 
 
