@@ -748,3 +748,64 @@ def test_one_init_the_critics_body_is_the_policys_tensor_for_tensor():
 		with torch.no_grad():
 			dict(critic.body.named_parameters())[first].add_(1.0)
 		assert torch.equal(policy.state_dict()[first], before)
+
+
+def test_stage_b_the_policy_takes_the_critics_body_and_the_link_reads_zero():
+	"""(e5 for the user, 2026-11-19, stage B) learner.policy_from_critic: every critic body tensor copied into the policy,
+	link_map at the identity: the link's prediction is the critic's own link state, its loss 0."""
+	from campaign_model.learner import policy_from_critic
+
+	cfg = CampaignConfig(**SMALL, critic_net=True)
+	torch.manual_seed(11)
+	policy = build_model(model_kwargs(cfg))
+	critic = Critic(**critic_kwargs(cfg, model_kwargs(cfg)))
+	with torch.no_grad():  # (a trained critic: its body moved off any init)
+		for p in critic.body.parameters():
+			p.add_(0.01 * torch.randn_like(p))
+	n = policy_from_critic(policy, critic)
+	theirs, ours = critic.body.state_dict(), policy.state_dict()
+	assert n == len(theirs) and all(torch.equal(ours[k], v) for k, v in theirs.items())
+	assert torch.equal(policy.link_map.weight, torch.eye(policy.link_map.weight.shape[0])) and not policy.link_map.bias.any()
+	policy.eval().link_outputs = True
+	critic.eval()
+	with torch.no_grad():
+		after_again = policy(tensors(rich_inputs(6, seed=11)))["link_pred"]
+	policy.link_before_again = True  # (the link at the critic's point: config.link_before_again)
+	x = tensors(rich_inputs(6, seed=11))
+	with torch.no_grad():
+		pred = policy(x)["link_pred"]
+		link, _, _ = critic.trunk(x)
+	assert torch.allclose(pred, link.float(), atol=1e-5)
+	assert not torch.allclose(after_again, link.float(), atol=1e-3)  # (after the foresight's second pass: not the critic's state)
+
+
+def test_stage_b_a_frozen_critic_takes_no_step_and_the_policy_still_moves():
+	cfg, policy, critic, decisions, targets, decode, none = _update_setup(seed=19)
+	p0, c0 = copy.deepcopy(policy), copy.deepcopy(critic)
+	torch.manual_seed(9)
+	np.random.seed(9)
+	optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+	crit = {"module": critic, "optimizer": critic_optimizer(critic, cfg), "rows": np.array([0, 3, 5], dtype=np.int64), **none, "pool": None, "frozen": True}
+	metrics, _ = ppo_update(policy, optimizer, decisions, targets, None, cfg, decode=decode, advantages=np.linspace(-1, 1, len(decisions)).astype(np.float32), critic=crit)
+	assert metrics.get("critic_frozen") == 1.0 and "critic_loss_own_first" not in metrics
+	assert all(torch.equal(a, b) for (_, a), (_, b) in zip(critic.named_parameters(), c0.named_parameters()))
+	assert any(not torch.equal(a, b) for (_, a), (_, b) in zip(policy.named_parameters(), p0.named_parameters()))
+
+
+def test_the_fixed_weight_losses_are_the_start_weights_ruler_whatever_head_scale_says():
+	"""(e5, 2026-11-19) train.fixed_losses: "six" and "end" at the start's weights recombine to critic_loss at no head
+	weights ((4.5 x six + end) / 5.5 with growth_weight 0.5); head weights never move them."""
+	from campaign_model.train import fixed_losses
+
+	g = torch.Generator().manual_seed(3)
+	n, k = 64, c.N_VALUE_OFFSETS
+	out = {"value_logit": torch.randn(n, k, generator=g), "growth_logit": torch.randn(n, k, generator=g), "end_logit": torch.randn(n, generator=g)}
+	phi = torch.rand(n, generator=g) * 5000 + 100
+	targets, share_valid = torch.rand(n, k, generator=g), torch.ones(n, k)
+	growth, growth_valid = torch.log(phi).unsqueeze(-1) + torch.randn(n, k, generator=g) * 0.3, torch.ones(n, k)
+	end, end_valid = torch.rand(n, generator=g), torch.ones(n)
+	six, ended = fixed_losses(out, phi, targets, share_valid, growth, growth_valid, end, end_valid, 0.5)
+	whole = float(critic_loss(out, phi, targets, share_valid, growth, growth_valid, end, end_valid, None, 0.5))
+	assert whole == pytest.approx((4.5 * six + ended) / 5.5, rel=1e-5)
+	heavy = {"w:share": torch.tensor([3.0, 1.0, 1.0]), "w:growth": torch.tensor([2.0, 0.5, 0.2]), "w:end": torch.tensor([0.3])}
+	assert float(critic_loss(out, phi, targets, share_valid, growth, growth_valid, end, end_valid, heavy, 0.5)) != pytest.approx(whole, rel=1e-3)

@@ -257,11 +257,13 @@ def value_shared_now(config, version):
 
 CRITIC_OWN_STEP = 1.25  # the own rows' weight moves at most this factor an update (the loss shares' step)
 CRITIC_OWN_CAP = 32.0  # (the default of config.critic_own_cap)
+POLICY_KEEP_EVERY = 10  # (campaign.stage "policy": a checkpoint_<v> kept every this many policy updates, the random-walk check's at 30, 60, ...)
 CRITIC_KEEP_EVERY = 20  # (campaign.stage "critic": a checkpoint_<v> kept every this many updates, the critic's readings at 20, 40, 80, 160)
 CRITIC_PROGRESS = (  # (critic_progress.csv's columns, campaign.stage "critic": the stop rule's and the reports' readings)
 	"critic_rows_pool", "critic_steps_pool", "critic_loss_pool_mean", "critic_loss_visible_pool_mean", "critic_loss_pool_heldout", "critic_loss_visible_pool_heldout",
 	"critic_loss_pool_first", "critic_loss_pool_last", "critic_unexplained_pool", "critic_unexplained_pool_heldout", "critic_unexplained_visible_pool_heldout",
 	"critic_unexplained_pool_heldout_after", "critic_grad_pool", "critic_clipped_pool", "critic_oom_retries", "card_free_gb", "host_available_gb",
+	"critic_fixed_six_pool_mean", "critic_fixed_six_pool_heldout", "critic_fixed_six_visible_pool_mean", "critic_fixed_six_visible_pool_heldout", "critic_fixed_end_pool_mean", "critic_fixed_end_pool_heldout", "critic_fixed_end_visible_pool_mean", "critic_fixed_end_visible_pool_heldout",
 	"nk2_games_in", "nk2_dropped", "nk2_held_out", "nk2_games_per_minute", "nk2_buffer_before", "nk2_buffer_after", "nk2_rows_taken", "nk2_rows_wanted",
 )
 
@@ -282,6 +284,29 @@ def body_from_policy(critic, policy):
 	if unequal:
 		raise ValueError(f"the critic's body differs from the policy's after the copy: {unequal[:4]}")
 	return len(ours)
+
+
+def policy_from_critic(policy, critic):
+	"""Stage B's copy (e5 for the user, 2026-11-19): the policy's tensors that the critic's body has (every body key, at
+	its shape) set to the critic's in place, then link_map at the identity (weight I, bias 0: with identical bodies the
+	link's prediction is the critic's state and its loss 0). Every body key must be the policy's (else ValueError).
+	Returns the tensors copied."""
+	theirs, ours = critic.body.state_dict(), policy.state_dict()
+	wrong = [k for k, v in theirs.items() if k not in ours or ours[k].shape != v.shape or ours[k].dtype != v.dtype]
+	if wrong:
+		raise ValueError(f"the policy cannot take the critic's body: {len(wrong)} tensors differ ({wrong[:4]})")
+	with torch.no_grad():
+		for k, v in theirs.items():
+			ours[k].copy_(v)
+		link = getattr(policy, "link_map", None)
+		if link is not None:
+			link.weight.copy_(torch.eye(link.weight.shape[0], link.weight.shape[1], dtype=link.weight.dtype, device=link.weight.device))
+			link.bias.zero_()
+	after = policy.state_dict()
+	unequal = [k for k in theirs if not torch.equal(after[k], theirs[k])]
+	if unequal:
+		raise ValueError(f"the policy differs from the critic's body after the copy: {unequal[:4]}")
+	return len(theirs)
 
 
 def write_critic_progress(learner, metrics, seconds):
@@ -538,6 +563,7 @@ class CampaignLearner:
 		self.value_pool, self.head_pool = None, {}  # their parts (labels.pooled_ev): the residual variance and the variance, smoothed apart
 		self.step_counts = {"policy": 0, "critic": 0}  # (the per-step charts' x: every micro-batch and critic step since the run began)
 		self.head_var, self.head_scale_updates = None, 0  # (config.head_scale) the heads' running target variances, the updates since it began
+		self.policy_updates = 0  # (the policy's own updates, stage A's critic updates not among them: the credit gate reads the first)
 		self.loss_scale, self.teacher_share = None, None  # (config.loss_shares) {"log_norm", "weight"} of the terms; the teacher's share
 		self.trust_ema = None  # (config.trust_memory) trust's slow average, trust() floors it at config.trust_floor
 		self.head_residual, self.head_var_slow, self.head_residual_updates = None, None, 0  # (config.head_scale_by "residual") the heads' running fresh excess, the variances that scale it, the updates since it began
@@ -581,6 +607,7 @@ class CampaignLearner:
 			self.head_ev = state.get("head_ev", {})
 			self.value_pool, self.head_pool = state.get("value_pool"), state.get("head_pool", {})
 			self.head_var, self.head_scale_updates = state.get("head_var"), state.get("head_scale_updates", 0)
+			self.policy_updates = int(state.get("policy_updates", 0))  # (the policy's own updates: the credit gate's first)
 			self.loss_scale, self.teacher_share = state.get("loss_scale"), state.get("teacher_share")
 			self.step_counts.update(state.get("step_counts") or {})
 			self.trust_ema = state.get("trust_ema")
@@ -634,6 +661,7 @@ class CampaignLearner:
 					print(f"campaign: the critic resumed ({sum(p.numel() for p in self.critic.parameters())} parameters){f'; new, from 0: {len(added)} tensors ({added[0].split(chr(46))[0]}), its own optimizer group' if added else ''}", flush=True)
 				del saved
 			self.model.link_outputs = True
+			self.model.link_before_again = bool(getattr(config, "link_before_again", False))  # (stage B: the link at the critic's point)
 			self._resumed_critic = resumed_critic
 			print(f"campaign: the critic network: {self.critic_kwargs}, {sum(p.numel() for p in self.critic.parameters())} parameters", flush=True)
 		if getattr(config, "nk2_inputs", False) or config.nk2_prior or config.nk2_prior_fallback or config.nk2_label_prior or config.nk2_follow or not getattr(config, "nk2_teacher", True):
@@ -668,6 +696,12 @@ class CampaignLearner:
 			# the empire's buffers are the policy's as it will be served)
 			copied = body_from_policy(self.critic, self.model)
 			print(f"campaign: the critic's body set to the policy's, {copied} tensors (one init: identical at batch 0)", flush=True)
+		if getattr(self, "critic", None) is not None and getattr(config, "stage", "joint") == "policy" and getattr(config, "policy_body_from_critic", False) and self.policy_updates == 0:
+			# (stage B, e5 for the user 2026-11-19: the policy's shared layers set to the trained critic's, link_map at the
+			# identity so the link reads 0; at the stage's start, before its first game is played and served, so the first
+			# update's old log-probabilities are the copied policy's own)
+			copied = policy_from_critic(self.model, self.critic)
+			print(f"campaign: stage policy: the policy's shared layers set to the critic's, {copied} tensors; link_map at the identity", flush=True)
 		self.labeler = Labeler(self.labels, self.empire, foresight=self.kwargs.get("architecture") == "v2", share_target=config.share_target)
 		if config.credit == "schedule" and config.share_target != "change":
 			raise SystemExit("campaign.credit 'schedule' reads the share heads as changes: it needs campaign.share_target 'change'")
@@ -1187,6 +1221,7 @@ class CampaignLearner:
 				self.model.load_state_dict(state)
 				self.lr_scale = lr_scale
 				self.version += 1
+				self.policy_updates = getattr(self, "policy_updates", 0) + 1
 				self.server.set_model("current", self.version, self.model)
 				self.games_used += len(games)
 				self._refresh_features()
@@ -1194,7 +1229,7 @@ class CampaignLearner:
 			out_of_memory = None
 			with self.model_lock:
 				try:
-					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, replace(self.config, nk2_gather_weight=gather_weight, target_kl=self.config.target_kl * valve_k, **({"value_weight": 0.0, "privileged_critic": False} if getattr(self, "critic", None) is not None else {})), critic=self._critic_batch(critic_parts, critic_rows) if getattr(self, "critic", None) is not None else None, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), growth_trust=self.grade_trust().get("G7", 0.0), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None, privileged={name: np.concatenate([part[name] for part in privileged]) for name in privileged[0]} if privileged else None, hidden=np.concatenate(hidden) if hidden else None, segment_k=self.segment_k if getattr(self.config, "credit_segments", False) else None)
+					metrics, self.lr_scale = ppo_update(self.model, self.optimizer, decisions, targets, returns, replace(self.config, nk2_gather_weight=gather_weight, target_kl=self.config.target_kl * valve_k, **({"value_weight": 0.0, "privileged_critic": False} if getattr(self, "critic", None) is not None else {})), critic=self._critic_batch(critic_parts, critic_rows) if getattr(self, "critic", None) is not None else None, device=self.device, lr_scale=self.lr_scale, weights=self.labels.weights, advantages=advantages, growth=growth, labels=labels, end=end, foresight=foresight, growth_real=np.concatenate(growth_real), attributed=attributed, teacher=self.teacher, teacher_weight=self.loss_weights()["teacher"], share_trust=self.trust(), growth_trust=self.grade_trust().get("G7", 0.0), teacher_sets=sets, loss_weights=self.loss_weights() if getattr(self.config, "loss_shares", False) else None, head_scale=self._head_scale() if getattr(self.config, "head_scale", False) else None, measure_noise=bool(self.config.noise_every) and self.version % self.config.noise_every == 0, streams=(np.concatenate(streams[0]), np.concatenate(streams[1])), clips=self.grad_clips if self.config.grad_clip_by_group else None, privileged={name: np.concatenate([part[name] for part in privileged]) for name in privileged[0]} if privileged else None, hidden=np.concatenate(hidden) if hidden else None, segment_k=self.segment_k if getattr(self.config, "credit_segments", False) else None, credit_gate=getattr(self.config, "credit_horizons", False) and getattr(self, "policy_updates", 0) == 0)
 				except torch.OutOfMemoryError as error:  # (handled below, once the error's frames, and their tensors, are gone)
 					import traceback
 
@@ -1212,6 +1247,7 @@ class CampaignLearner:
 				if self.device.type == "mps":
 					torch.mps.empty_cache()  # (the battle learner's lesson: MPS keeps blocks of every size it saw)
 				self.version += 1
+				self.policy_updates = getattr(self, "policy_updates", 0) + 1
 				self.server.set_model("current", self.version, self.model)
 				self.games_used += len(games)
 				self._refresh_features()
@@ -1238,6 +1274,8 @@ class CampaignLearner:
 						+ f"), their mean advantage before the charge {metrics['loop_adv_before']:+.4f}; a pair's same-day repeat dialogs {loop_seen.get('repeat_dialogs', 0)}, "
 						+ f"not loops {loop_seen.get('repeat_not_loop', 0) / max(loop_seen.get('repeat_dialogs', 0), 1):.3f}, of those troops back to the last giver {loop_seen.get('repeat_not_loop_back', 0) / max(loop_seen.get('repeat_not_loop', 0), 1):.3f}", flush=True)
 				self._save(self.out / "checkpoint_latest.pt")
+				if getattr(self.config, "stage", "joint") == "policy" and self.policy_updates % POLICY_KEEP_EVERY == 0:  # (stage B: e5's random-walk check reads kept weights)
+					self._save(self.out / f"checkpoint_{self.version:05d}.pt")
 		unspool(game for game, _ in games)  # (in the checkpoint now: this process's, or the update process's)
 		if self.worker:  # (the process saved its checkpoint with the trust before this update: one update behind)
 			self._note_value_ev(metrics)
@@ -1289,6 +1327,12 @@ class CampaignLearner:
 	def _report_critic(self, metrics):
 		"""Each update's critic report (an update of either stage): the per-step charts, the critic's per-head charts and
 		its critic/ set, the "campaign critic:" line, the NK2 stream's line and nk2/ charts, the GPU's memory."""
+		credit = {k: v for k, v in metrics.items() if k.startswith("credit_") and isinstance(v, (int, float))} if isinstance(metrics, dict) else {}
+		if credit:  # (config.credit_horizons: each term's and point's readings, credit/ in TensorBoard; e5 2026-11-19)
+			for key, value in credit.items():
+				if value == value:
+					self.writer.add_scalar(f"credit/{key[len('credit_'):]}", float(value), self.version)
+			print("campaign credit: " + "  ".join(f"{key[len('credit_'):]} {float(value):.4g}" for key, value in sorted(credit.items())), flush=True)
 		if isinstance(metrics, dict):
 			write_step_losses(self, metrics)
 		if getattr(self, "critic", None) is not None and isinstance(metrics, dict):  # (config.critic_net: the per-head charts, critic_heads/)
@@ -1680,6 +1724,7 @@ class CampaignLearner:
 		(0: critic_pool_share of the update's), taken once and never again, leaving nk2_floor_games games in the buffer;
 		its held-out, fixed, read every update once it is complete."""
 		batch = {"module": self.critic, "optimizer": self.critic_optimizer, "rows": np.asarray(rows, dtype=np.int64)}
+		batch["frozen"] = getattr(self.config, "stage", "joint") == "policy"  # (stage B: the critic frozen, its baselines and the link's targets only)
 		batch["own_weight"] = float(getattr(self, "critic_own_weight", 1.0)) if getattr(self.config, "critic_own_balance", False) else 1.0
 		batch.update({name: np.concatenate([part[name] for part in parts]) for name in ("rivals", "present", "share_logit")})
 		batch["pool"] = batch["pool_heldout"] = None
@@ -1769,8 +1814,9 @@ class CampaignLearner:
 		if getattr(self.config, "head_scale", False):
 			scale = {"var": getattr(self, "head_var", None), "ramp": min(1.0, updates / HEAD_SCALE_RAMP)}  # (measured on the stream's rows, never held: e5 2026-11-19)
 		none = torch.zeros(0, dtype=torch.long, device=self.device)
+		memory = [("taken", rss_gb())]  # (the update's memory by stage, this process's RSS: e5's question of 2026-11-19)
 		try:
-			metrics = train_critic(self.critic, crit, self.config, none, *([None] * 12), lambda chunks: iter(()), None, self.device, head_scale=scale)
+			metrics = train_critic(self.critic, crit, self.config, none, *([None] * 12), lambda chunks: iter(()), None, self.device, head_scale=scale, marks=lambda stage: memory.append((stage, rss_gb())))
 		except torch.OutOfMemoryError as error:  # (its rows were taken: used once, never again)
 			torch.cuda.empty_cache()
 			print(f"campaign critic update {self.version + 1}: out of GPU memory, its {len(groups)} game-days dropped: {str(error)[:300]}", flush=True)
@@ -1786,7 +1832,13 @@ class CampaignLearner:
 				self._save(self.out / f"checkpoint_{self.version:05d}.pt")
 		seconds = time.time() - started
 		metrics["host_available_gb"] = host_available_gb()
-		print(f"campaign critic update {self.version}: {len(groups)} game-days, {metrics.get('critic_rows_pool', 0)} rows, {metrics.get('critic_steps_pool', 0)} steps, {seconds:.0f} s", flush=True)
+		n_groups = len(groups)
+		del pool, crit, groups  # (the take's rows: used once, never again)
+		trim_memory()
+		memory.append(("trimmed", rss_gb()))
+		if all(value == value for _, value in memory):
+			print("campaign critic memory (GB, this process): " + "  ".join(f"{stage} {value:.1f}" for stage, value in memory), flush=True)
+		print(f"campaign critic update {self.version}: {n_groups} game-days, {metrics.get('critic_rows_pool', 0)} rows, {metrics.get('critic_steps_pool', 0)} steps, {seconds:.0f} s", flush=True)
 		self.writer.add_scalar("campaign/update_seconds", seconds, self.version)
 		CampaignLearner._report_critic(self, metrics)
 		write_critic_progress(self, metrics, seconds)
@@ -1809,7 +1861,7 @@ class CampaignLearner:
 
 		state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
 		optimizer = {} if self.worker else {"optimizer": self.optimizer.state_dict()}  # (the process's is in checkpoint_latest.pt)
-		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "segment_evidence": getattr(self, "segment_evidence", [{}, {}, {}]), "type_evidence": getattr(self, "type_evidence", {}), "segment_k": getattr(self, "segment_k", (0.0, 0.0)), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "head_weights_frozen": getattr(self, "head_weights_frozen", None), "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "gather_ramp_start": self.gather_ramp_start, "valve": self.valve, "model_kwargs": self.kwargs, **({"critic": {k: v.detach().cpu() for k, v in self.critic.state_dict().items()}, "critic_optimizer": self.critic_optimizer.state_dict(), "critic_kwargs": self.critic_kwargs, "critic_own_weight": float(getattr(self, "critic_own_weight", 1.0)), "step_counts": dict(getattr(self, "step_counts", {}))} if getattr(self, "critic", None) is not None else {})}, path)
+		save_atomically({"model": state, **optimizer, "version": self.version, "lr_scale": self.lr_scale, "teacher_weight": self.teacher_weight, "games_used": self.games_used, "value_ev": self.value_ev, "credit_evidence": self.credit_evidence, "end_evidence": getattr(self, "end_evidence", {}), "segment_evidence": getattr(self, "segment_evidence", [{}, {}, {}]), "type_evidence": getattr(self, "type_evidence", {}), "segment_k": getattr(self, "segment_k", (0.0, 0.0)), "head_ev": self.head_ev, "value_pool": self.value_pool, "head_pool": self.head_pool, "head_var": getattr(self, "head_var", None), "head_scale_updates": getattr(self, "head_scale_updates", 0), "policy_updates": int(getattr(self, "policy_updates", 0)), "loss_scale": getattr(self, "loss_scale", None), "teacher_share": getattr(self, "teacher_share", None), "trust_ema": self.trust_ema, "head_residual": self.head_residual, "head_var_slow": self.head_var_slow, "head_residual_updates": self.head_residual_updates, "head_weights_frozen": getattr(self, "head_weights_frozen", None), "grad_clips": self.grad_clips, "clip_samples": self.clip_samples, "gather_ramp_start": self.gather_ramp_start, "valve": self.valve, "model_kwargs": self.kwargs, **({"critic": {k: v.detach().cpu() for k, v in self.critic.state_dict().items()}, "critic_optimizer": self.critic_optimizer.state_dict(), "critic_kwargs": self.critic_kwargs, "critic_own_weight": float(getattr(self, "critic_own_weight", 1.0)), "step_counts": dict(getattr(self, "step_counts", {}))} if getattr(self, "critic", None) is not None else {})}, path)
 
 	# ---- the loss shares (config.loss_shares) ----
 
@@ -1992,7 +2044,10 @@ class CampaignLearner:
 		if self.config.teacher_mix == "score" and (self.teacher is not None or self.config.nk2_advice > 0) and np.isfinite(score):
 			self.teacher_weight = teacher_weight_for(score)  # (config.teacher_mix: the teacher's share by our strength)
 			self.teacher_share = teacher_share_for(score)  # (config.loss_shares: its share of the gradient)
-			print(f"campaign: the teacher's weight {self.teacher_weight:.2f} (its share of the loss {self.teacher_weight / (1 + self.teacher_weight):.2f}) for an eval score of {score:.3f}", flush=True)
+			if getattr(self.config, "nk2_teacher", True):
+				print(f"campaign: the teacher's weight {self.teacher_weight:.2f} (its share of the loss {self.teacher_weight / (1 + self.teacher_weight):.2f}) for an eval score of {score:.3f}", flush=True)
+			else:  # (e5, 2026-11-19: the weight above read as live on the user's screen; loss_weights gives the teacher 0)
+				print(f"campaign: the teacher's loss is OFF (campaign.nk2_teacher false: its weight in the loss 0); the score-based weight it would have, {self.teacher_weight:.2f}, is unused", flush=True)
 		return row
 
 	def start_eval(self, epoch):
@@ -2261,6 +2316,9 @@ CRITIC_CHARTS = (
 	# ours: the pass's mean, the held-out tenth's before the steps)
 	("loss_own", "critic_loss_own_mean"), ("loss_pool_heldout", "critic_loss_pool_heldout"),
 	("loss_pool", "critic_loss_pool_mean"), ("loss_visible_pool", "critic_loss_visible_pool_mean"),  # (the NK2 stream's rows, each seen once: read before its step)
+	# (e5, 2026-11-19: the losses at FIXED weights, the start's share 1 / growth 0.5 / end 1, a ruler head_scale never moves;
+	# "six" the share and growth heads, "end" V_end; our rows', the stream's, the held-out's, both heads)
+	("fixed_six_own", "critic_fixed_six_own_mean"), ("fixed_six_pool", "critic_fixed_six_pool_mean"), ("fixed_six_pool_heldout", "critic_fixed_six_pool_heldout"), ("fixed_six_visible_own", "critic_fixed_six_visible_own_mean"), ("fixed_six_visible_pool", "critic_fixed_six_visible_pool_mean"), ("fixed_six_visible_pool_heldout", "critic_fixed_six_visible_pool_heldout"), ("fixed_end_own", "critic_fixed_end_own_mean"), ("fixed_end_pool", "critic_fixed_end_pool_mean"), ("fixed_end_pool_heldout", "critic_fixed_end_pool_heldout"), ("fixed_end_visible_own", "critic_fixed_end_visible_own_mean"), ("fixed_end_visible_pool", "critic_fixed_end_visible_pool_mean"), ("fixed_end_visible_pool_heldout", "critic_fixed_end_visible_pool_heldout"),
 	("loss_visible_own", "critic_loss_visible_own_mean"), ("loss_visible_pool_heldout", "critic_loss_visible_pool_heldout"),
 	("link_loss", "link_loss"), ("rows_own", "critic_rows_own"), ("rows_pool", "critic_rows_pool"), ("own_weight", "critic_own_weight"),
 )
@@ -2270,6 +2328,7 @@ CRITIC_LINE = (  # (the log's "campaign critic:" line; _raw: the cross-entropy b
 	"critic_loss_own_first", "critic_loss_own_last", "critic_loss_own_mean", "critic_loss_raw_own_mean",
 	"critic_loss_pool_first", "critic_loss_pool_last", "critic_loss_pool_mean", "critic_loss_raw_pool_mean", "critic_loss_pool_heldout",
 	"critic_loss_visible_own_mean", "critic_loss_visible_pool_mean", "critic_loss_visible_pool_heldout",
+	"critic_fixed_six_own_mean", "critic_fixed_six_pool_mean", "critic_fixed_six_pool_heldout", "critic_fixed_six_visible_own_mean", "critic_fixed_six_visible_pool_mean", "critic_fixed_six_visible_pool_heldout", "critic_fixed_end_own_mean", "critic_fixed_end_pool_mean", "critic_fixed_end_pool_heldout", "critic_fixed_end_visible_own_mean", "critic_fixed_end_visible_pool_mean", "critic_fixed_end_visible_pool_heldout",
 	"critic_rows_own", "critic_rows_pool", "critic_rows_pool_heldout", "critic_steps_own", "critic_steps_pool", "critic_oom_retries",
 	"critic_grad_own", "critic_grad_pool", "critic_clipped_own", "critic_clipped_pool", "critic_own_weight", "card_free_gb", "host_available_gb",
 	"link_loss", "policy", "last_kl", "kl_target",

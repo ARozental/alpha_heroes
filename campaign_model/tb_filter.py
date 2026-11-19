@@ -11,7 +11,7 @@ WHITELIST = {
 	# the critic's (the learner's critic/ writes; the user via e5, 2026-11-18: "the only things I want there are the losses
 	# that should go to 0 and are active"): critic/ its losses alone, critic_fit/ the unexplained readings, critic_info/
 	# the counts and the own weight (runtime/tb_relay.py's names: the relay a pass-through on them)
-	**{f"critic/{name}": f"critic/{name}" for name in ("loss_own", "loss_pool_heldout", "loss_visible_own", "loss_visible_pool_heldout", "link_loss", "loss_pool", "loss_visible_pool")},
+	**{f"critic/{name}": f"critic/{name}" for name in ("loss_own", "loss_pool_heldout", "loss_visible_own", "loss_visible_pool_heldout", "link_loss", "loss_pool", "loss_visible_pool", "fixed_six_own", "fixed_six_pool", "fixed_six_pool_heldout", "fixed_six_visible_own", "fixed_six_visible_pool", "fixed_six_visible_pool_heldout", "fixed_end_own", "fixed_end_pool", "fixed_end_pool_heldout", "fixed_end_visible_own", "fixed_end_visible_pool", "fixed_end_visible_pool_heldout")},
 	**{f"critic/{name}": f"critic_fit/{name}" for name in (
 		"unexplained_own", "unexplained_own_med5", "unexplained_pool_heldout", "unexplained_pool_heldout_after", "unexplained_visible_own", "unexplained_visible_pool_heldout",
 	)},
@@ -34,7 +34,7 @@ WHITELIST = {
 	"campaign/update_seconds": "speed/update_seconds", "campaign/games": "speed/games", "campaign/decisions": "speed/decisions",
 	"campaign/wait_seconds": "speed/wait_seconds", "campaign/game_seconds": "speed/game_seconds", "campaign/prepass_seconds": "speed/prepass_seconds",
 }
-PREFIXES = {"campaign_actions/": "actions/", "critic_heads/": "critic_heads/", "critic_steps/": "critic_steps/", "policy_steps/": "policy_steps/", "nk2_stream/": "nk2/"}  # (the action-type shares, their names kept; the critic's per-head fits)
+PREFIXES = {"campaign_actions/": "actions/", "critic_heads/": "critic_heads/", "critic_steps/": "critic_steps/", "policy_steps/": "policy_steps/", "nk2_stream/": "nk2/", "credit/": "credit/"}  # (the action-type shares, their names kept; the critic's per-head fits)
 # A named eval set's charts (evaluate.write_set_charts' campaign_eval_<set>/<key>, served as eval_<set>/<name>)
 SET_CHARTS = {"score_own": "score", "score_own_se": "score_se", "score_own_d28": "score_d28", "eliminated_own": "eliminated", "won_own": "won",
 	"max_level_ours": "max_level_ours", "max_level_theirs": "max_level_theirs", "major_won": "major_won"}

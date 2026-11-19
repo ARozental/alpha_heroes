@@ -1164,6 +1164,21 @@ def excess_head_loss(logits, targets, valid):
 	return (excess_loss(logits, targets) * valid).sum(dim=0) / valid.sum(dim=0).clamp(min=1)
 
 
+def fixed_losses(out, phi, targets, share_valid, growth, growth_valid, end, end_valid, growth_weight):
+	"""The critic's excess losses at FIXED weights (e5, 2026-11-19: a ruler head_scale's weights never move; the start's,
+	share 1, growth growth_weight, end 1): "six", the share and growth heads' weighted mean, and "end", V_end's; no
+	auxiliary term. Without gradient. (six, end), nan where a part has no rows."""
+	with torch.no_grad():
+		six, weight = excess_head_loss(out["value_logit"], targets, share_valid).sum(), float(c.N_VALUE_OFFSETS)
+		if growth is not None:
+			now = phi.detach().clamp(min=PHI_FLOOR).log().unsqueeze(-1)
+			scaled = ((growth - now).clamp(-GROWTH_CAP, GROWTH_CAP) + GROWTH_CAP) / (2 * GROWTH_CAP)
+			six = six + growth_weight * excess_head_loss(out["growth_logit"], scaled, growth_valid).sum()
+			weight += growth_weight * c.N_VALUE_OFFSETS
+		ended = excess_head_loss(out["end_logit"].unsqueeze(-1), end.unsqueeze(-1), end_valid.unsqueeze(-1)).sum() if end is not None else torch.tensor(float("nan"))
+	return float(six) / weight, float(ended)
+
+
 def critic_loss(out, phi, targets, share_valid, growth, growth_valid, end, end_valid, head_w, growth_weight, share_now=None, raw=False):
 	"""The critic's loss on its rows: the share heads, the growth heads (our value's log growth on their 0..1 scale) and
 	V_end, each at the update's head weight (head_w, config.head_scale) where it has one, their mean. Each head's term is
@@ -1251,7 +1266,7 @@ def stream_head_weights(pool_t, p_phi, trained, head_scale, config, device):
 	return {f"w:{name}": torch.tensor(values, dtype=torch.float32, device=device) for name, values in weights.items() if name in measured}, var, weights
 
 
-def train_critic(cm, crit, config, own_rows, hidden_all, phi_all, rivals, mask, share, targets_t, share_valid, growth_t, growth_valid, end_t, end_valid, head_w, prefetch, model_inputs, device, head_scale=None):
+def train_critic(cm, crit, config, own_rows, hidden_all, phi_all, rivals, mask, share, targets_t, share_valid, growth_t, growth_valid, end_t, end_valid, head_w, prefetch, model_inputs, device, head_scale=None, marks=None):
 	"""The separate critic's steps an update (config.critic_net): one pass over its rows of this update (one decision drawn
 	per player-day) and the NK2 pool's (crit["pool"], at most config.critic_pool_share of its positions), in minibatches
 	of config.critic_batch, alternating; each row's rivals' states and Phi as the update started (no gradient through
@@ -1281,12 +1296,14 @@ def train_critic(cm, crit, config, own_rows, hidden_all, phi_all, rivals, mask, 
 		with torch.no_grad():  # (the loss on the held-out rows before the steps: 0 a perfect critic)
 			h_sl = h_t["share_logit"].float()
 			stats[f"critic_loss_pool_heldout{suffix}"] = float(critic_loss(h_out, h_phi, h_t["targets"], h_t["share_valid"], *h_args, head_w, config.growth_weight))
+		stats[f"critic_fixed_six_pool_heldout{suffix}"], stats[f"critic_fixed_end_pool_heldout{suffix}"] = fixed_losses(h_out, h_phi, h_t["targets"], h_t["share_valid"], *h_args, config.growth_weight)
 		if hasattr(cm, "free"):
 			with torch.no_grad():
 				h_free = cm.free(h_hidden, h_players)
 				stats[f"critic_unexplained_visible_pool_heldout{suffix}"] = critic_unexplained(h_free, h_rows, h_t["targets"], h_t["share_valid"])
 				stats.update(head_stats(heads_name, critic_head_fit(h_free, h_rows, h_phi, h_t["targets"], h_t["share_valid"], *h_args, head_w=head_w), visible=True))
 				stats[f"critic_loss_visible_pool_heldout{suffix}"] = float(critic_loss(h_free, h_phi, h_t["targets"], h_t["share_valid"], *h_args, head_w, config.growth_weight, share_now=h_sl))
+				stats[f"critic_fixed_six_visible_pool_heldout{suffix}"], stats[f"critic_fixed_end_visible_pool_heldout{suffix}"] = fixed_losses(h_free, h_phi, h_t["targets"], h_t["share_valid"], *h_args, config.growth_weight)
 		stats[f"critic_rows_pool_heldout{suffix}"] = int(h_m)
 
 	if pool is not None and len(pool["decisions"]):
@@ -1304,10 +1321,15 @@ def train_critic(cm, crit, config, own_rows, hidden_all, phi_all, rivals, mask, 
 		stats["critic_rows_pool"] = int(len(trained))
 		if head_w is None and head_scale is not None:  # (campaign.stage "critic": the heads' weights from the stream's rows)
 			head_w, stats["head_var"], stats["head_weights"] = stream_head_weights(pool_t, p_phi, trained, head_scale, config, device)
+	if marks is not None:  # (the caller's memory stages: rss_gb's at each, e5 2026-11-19)
+		marks("states")
 	if heldout is not None and len(heldout["decisions"]):  # (e5, 2026-11-18: the pool's fit on games the critic never trains on; after the stream's states, for its head weights)
 		read_heldout(heldout, "", "heldout")
+	if marks is not None:
+		marks("heldout")
 	cm.train()
 	losses = {name: [] for name in ("own", "pool", "visible_own", "visible_pool", "raw_own", "raw_pool")}
+	fixed = {f"{part}_{head}{name}": [] for part in ("six", "end") for head in ("", "visible_") for name in ("own", "pool")}  # (fixed_losses' a step: the stream's rows' ruler)
 	grads = {"own": [], "pool": []}  # (each step's gradient norm before the clip, by source: e5's own-rows weight question)
 	sequence = []  # ((source, its loss) of each step in order)
 	own_weight = float(crit.get("own_weight", 1.0) or 1.0)  # (learner.balance_critic_own's)
@@ -1332,10 +1354,17 @@ def train_critic(cm, crit, config, own_rows, hidden_all, phi_all, rivals, mask, 
 				t, sv, g, gv, e, ev = pool_t["targets"][idx], pool_t["share_valid"][idx], pool_t["growth"][idx], pool_t["growth_valid"][idx], pool_t["end"][idx], pool_t["end_valid"][idx]
 			out_p = cm.outputs(raw.float(), sl)
 			loss = critic_loss(out_p, p, t, sv, g, gv, e, ev, head_w, config.growth_weight)
+			six, end_ = fixed_losses(out_p, p, t, sv, g, gv, e, ev, config.growth_weight)
+			fixed[f"six_{name}"].append(six)
+			fixed[f"end_{name}"].append(end_)
 			with torch.no_grad():  # (the raw cross-entropy, logged for one restart so the series join: progress.csv)
 				losses[f"raw_{name}"].append(float(critic_loss({k: v.detach() for k, v in out_p.items()}, p, t, sv, g, gv, e, ev, head_w, config.growth_weight, raw=True)))
 			if hasattr(cm, "free"):  # (the visible head: the same rows, targets and weights, from the body's state alone)
-				free_loss = critic_loss(cm.free(h, x.get("g_players")), p, t, sv, g, gv, e, ev, head_w, config.growth_weight, share_now=sl)
+				free_out = cm.free(h, x.get("g_players"))
+				free_loss = critic_loss(free_out, p, t, sv, g, gv, e, ev, head_w, config.growth_weight, share_now=sl)
+				six, end_ = fixed_losses(free_out, p, t, sv, g, gv, e, ev, config.growth_weight)
+				fixed[f"six_visible_{name}"].append(six)
+				fixed[f"end_visible_{name}"].append(end_)
 				losses[f"visible_{name}"].append(float(free_loss.detach()))
 				losses[name].append(float(loss.detach()))  # (critic_loss_own / _pool: the privileged head's alone, as before)
 				loss = loss + free_loss
@@ -1371,6 +1400,8 @@ def train_critic(cm, crit, config, own_rows, hidden_all, phi_all, rivals, mask, 
 			idx = torch.as_tensor(np.asarray(rows), device=device)
 			step_rows(name, idx, model_inputs(inputs) if name == "own" else inputs)
 	cm.eval()
+	if marks is not None:
+		marks("steps")
 	for it in (own_iter, pool_iter):  # (their decode threads ended)
 		if hasattr(it, "close"):
 			it.close()
@@ -1380,6 +1411,11 @@ def train_critic(cm, crit, config, own_rows, hidden_all, phi_all, rivals, mask, 
 		if values:
 			stats[f"critic_grad_{name}"] = float(np.mean(values))
 			stats[f"critic_clipped_{name}"] = float(np.mean([v > float(config.grad_clip) for v in values]))
+	for key, values in fixed.items():  # (each source's mean over the pass: critic_fixed_<six|end>_<visible_><own|pool>_mean)
+		kept = [v for v in values if v == v]
+		if kept:
+			part, rest = key.split("_", 1)
+			stats[f"critic_fixed_{part}_{rest}_mean"] = float(np.mean(kept))
 	for name, values in losses.items():
 		if values:
 			q = max(1, len(values) // 4)
@@ -1496,6 +1532,125 @@ def share_baseline(real_change, predicted, trust):
 	known = torch.isfinite(real_change)
 	mean = real_change[known].mean() if int(known.sum()) else torch.zeros((), device=real_change.device)
 	return trust * predicted + (1.0 - trust) * mean
+
+
+HORIZONS = (2, 5, 7)  # (the credit's day points; the fourth, the end, is labels.end_advantages' week of V_end)
+
+
+def calibrated_baseline(real, forecast):
+	"""config.credit_calibrated (e5 for the user, 2026-11-19): the baseline b = alpha + beta x forecast fitted by least
+	squares on the rows where both are known, beta clamped to [0, 1] (a shrink toward the batch's mean: a forecast that
+	anti-correlates leaves the mean alone); (b [n], alpha, beta). Its residual never has more variance than real's."""
+	known = torch.isfinite(real) & torch.isfinite(forecast)
+	if int(known.sum()) < 2:
+		mean = real[known].mean() if int(known.sum()) else torch.zeros((), device=real.device)
+		return torch.full_like(real, float(mean)), float(mean), 0.0
+	r, f = real[known], forecast[known]
+	spread = f.var(unbiased=False)
+	beta = float(((r - r.mean()) * (f - f.mean())).mean() / spread) if float(spread) > 1e-12 else 0.0
+	beta = min(1.0, max(0.0, beta))
+	alpha = float(r.mean()) - beta * float(f.mean())
+	return alpha + beta * forecast, alpha, beta
+
+
+def horizon_terms(targets, growth_real, value_k, growth_k, log_phi, share_trust, calibrated=False):
+	"""The credit's two terms at each horizon of HORIZONS, [n, K] each, nan where the label is unknown: the share's real
+	change less its baseline (trust x V_k + (1 - trust) x the batch's mean, share_baseline's; calibrated: alpha + beta x
+	V_k) and the real log growth less its baseline (G_k's forecast whole; calibrated: alpha + beta x G_k). value_k,
+	growth_k: the heads' logits [n, K]. Readings for each term and horizon (rows where known): alpha, beta, the variance
+	ratio var(term) / var(real), rho (forecast against real) and s (the forecast's spread over the real's)."""
+	device = value_k.device
+	real = torch.from_numpy(np.asarray(targets, dtype=np.float32)).to(device) * 2 * SHARE_CHANGE_CAP - SHARE_CHANGE_CAP
+	predicted = torch.sigmoid(value_k.float()) * 2 * SHARE_CHANGE_CAP - SHARE_CHANGE_CAP
+	grown = (torch.from_numpy(np.asarray(growth_real, dtype=np.float32)).to(device) - log_phi.unsqueeze(1)).clamp(-GROWTH_CAP, GROWTH_CAP)
+	forecast = torch.sigmoid(growth_k.float()) * 2 * GROWTH_CAP - GROWTH_CAP
+	share, growth, stats = torch.empty_like(real), torch.empty_like(grown), {}
+	for k, h in enumerate(HORIZONS):
+		for name, x, f, out in (("share", real[:, k], predicted[:, k], share), ("growth", grown[:, k], forecast[:, k], growth)):
+			if calibrated:
+				b, alpha, beta = calibrated_baseline(x, f)
+			elif name == "share":
+				b, beta = share_baseline(x, f, share_trust), float(share_trust)
+				known = torch.isfinite(x)
+				alpha = (1.0 - beta) * (float(x[known].mean()) if int(known.sum()) else 0.0)
+			else:
+				b, alpha, beta = f, 0.0, 1.0
+			out[:, k] = x - b
+			known = torch.isfinite(x) & torch.isfinite(f)
+			tag = f"credit_{name}{h}"
+			stats[f"{tag}_alpha"], stats[f"{tag}_beta"] = alpha, beta
+			if int(known.sum()) > 2:
+				xs, fs, rs = x[known], f[known], out[:, k][known]
+				sx, sf = float(xs.std()), float(fs.std())
+				stats[f"{tag}_var_ratio"] = float(rs.var() / xs.var().clamp(min=1e-12))
+				stats[f"{tag}_rho"] = float(((xs - xs.mean()) * (fs - fs.mean())).mean() / max(sx * sf, 1e-12))
+				stats[f"{tag}_s"] = sf / max(sx, 1e-12)
+	return share, growth, stats
+
+
+class CreditGateError(RuntimeError):
+	"""The credit's baselines would add variance (credit_gate_check): the run stops before the policy's first step."""
+
+
+def credit_gate_check(stats, calibrated, ratio_max=1.2):
+	"""(e5 for the user, 2026-11-19) the policy's first update, before any step: prints each of the six terms' rho (the
+	forecast against the real), s (the forecast's spread over the real's) and the variance ratio its baseline gives;
+	uncalibrated, any ratio above ratio_max stops the run (CreditGateError): the credit would be noisier than with no
+	baseline at all."""
+	rows = []
+	for name in ("share", "growth"):
+		for h in HORIZONS:
+			tag = f"credit_{name}{h}"
+			rows.append((f"{name}{h}", stats.get(f"{tag}_rho", float("nan")), stats.get(f"{tag}_s", float("nan")), stats.get(f"{tag}_var_ratio", float("nan")), stats.get(f"{tag}_beta", float("nan"))))
+	print("campaign credit gate (the policy's first update, before any step; " + ("calibrated" if calibrated else "uncalibrated") + "): " + "  ".join(f"{n} rho {r:+.3f} s {sp:.2f} ratio {v:.2f} beta {b:.2f}" for n, r, sp, v, b in rows), flush=True)
+	bad = [(n, v) for n, _, _, v, _ in rows if v == v and v > ratio_max]
+	if bad and not calibrated:
+		raise CreditGateError(f"THE CREDIT GATE: the baselines add variance on {', '.join(f'{n} (ratio {v:.2f})' for n, v in bad)} (over {ratio_max}): stopped before the policy's first step; campaign.credit_calibrated or the user's word")
+
+
+def four_point(parts, end_part, weights):
+	"""The credit of the four points (e5 for the user, 2026-11-19: "ensuring equal effects is the minimum"): each point's
+	credit standardized over the rows where it is known (z_k), then A = the sum over the row's known points of
+	weight_k x z_k over the sum of those weights (a row near the game's end keeps its shorter horizons, at its scale);
+	nan where no point is known. parts [n, 3] (2, 5, 7 days), end_part [n] or None. (A [n], components [n, 4]: each
+	point's term of A, 0 where unknown; nan rows where A is)."""
+	n, device = parts.shape[0], parts.device
+	end_t = torch.from_numpy(np.asarray(end_part, dtype=np.float32)).to(device) if end_part is not None else torch.full((n,), float("nan"), device=device)
+	columns = torch.cat([parts.float(), end_t.unsqueeze(1)], dim=1)
+	z = torch.full_like(columns, float("nan"))
+	for k in range(columns.shape[1]):
+		known = torch.isfinite(columns[:, k])
+		if int(known.sum()) > 1:
+			x = columns[:, k][known]
+			z[:, k][known] = (x - x.mean()) / (x.std() + 1e-8)
+	w = torch.tensor([float(v) for v in weights], dtype=torch.float32, device=device)
+	valid = torch.isfinite(z)
+	total = (w * valid.float()).sum(dim=1)
+	components = torch.where(valid, w * z.nan_to_num(0.0), torch.zeros_like(z)) / total.clamp(min=1e-12).unsqueeze(1)
+	advantage = torch.where(total > 0, components.sum(dim=1), torch.full((n,), float("nan"), device=device))
+	components = torch.where((total > 0).unsqueeze(1), components, torch.full_like(components, float("nan")))
+	return advantage, components
+
+
+def horizon_gradient_shares(model, out, batch, final, clip):
+	"""Each credit point's share of the policy term's gradient norm on one micro-batch (e5, 2026-11-19: "equal effect" is
+	judged on it): the surrogate with the advantage replaced by the point's term of it (final [m, 4], horizon_final's:
+	the four sum to the advantage), its gradient's norm over the model's trainable weights; shares of the four norms'
+	sum, under credit_grad_share_<2|5|7|end>."""
+	keep = batch["keep"]
+	logp, _ = chosen_logp(out, {k: batch[k] for k in ("kind", "action", "index", "cell")})
+	logp = torch.where(keep > 0, logp, batch["old_logp"])
+	ratio = (logp - batch["old_logp"]).exp()
+	credit = keep * batch["credited"]
+	params = [p for p in model.parameters() if p.requires_grad]
+	norms = []
+	for k in range(final.shape[1]):
+		a = final[:, k].nan_to_num(0.0).to(ratio.dtype)
+		term = -(torch.minimum(ratio * a, ratio.clamp(1 - clip, 1 + clip) * a) * credit).sum() / batch["count_credit"]
+		grads = torch.autograd.grad(term, params, retain_graph=k < final.shape[1] - 1, allow_unused=True)
+		norms.append(float(torch.sqrt(sum(g.float().pow(2).sum() for g in grads if g is not None))))
+	total = sum(norms) or 1e-12
+	return {f"credit_grad_share_{name}": norm / total for name, norm in zip(("2", "5", "7", "end"), norms)}
 
 
 STEP_CLASS_PRIOR = 50.0  # rows at 0 added to each class's mean rest (step_credit): a class of few rows is barely corrected
@@ -1692,7 +1847,7 @@ def ppo_update(
 	model, optimizer, decisions, targets, returns, config=CampaignConfig(), decode=None, device=torch.device("cpu"), lr_scale=1.0, weights=LabelConfig().weights, advantages=None,
 	growth=None, labels=None, end=None, foresight=None, growth_real=None, measure_noise=False, attributed=None, teacher=None, teacher_weight=None,
 	share_trust=1.0, head_scale=None, teacher_sets=None, loss_weights=None, streams=None, clips=None, privileged=None,
-	growth_trust=1.0, hidden=None, segment_k=None, critic=None,
+	growth_trust=1.0, hidden=None, segment_k=None, critic=None, credit_gate=False,
 ):
 	"""One update: config.passes over the decisions in minibatches of config.batch_size (each pass leaves out its
 	last partial one: fixed shapes for Apple's GPU), stopped by the KL control. targets [N, N_VALUE_OFFSETS]: the
@@ -1858,6 +2013,7 @@ def ppo_update(
 	anchor, end_now, prior = torch.empty(n, device=device), torch.empty(n, device=device), torch.empty(n, device=device)
 	growth_now, log_phi = torch.zeros(n, device=device), torch.zeros(n, device=device)  # (G7's logit, our log value: the attributed credit's)
 	segments = getattr(config, "credit_segments", False) and config.credit == "schedule" and growth is not None
+	horizons_by_policy = getattr(config, "credit_horizons", False) and config.credit == "schedule" and growth is not None and critic is None  # (the four points at the policy's own V_k, G_k)
 	# The separate critic (config.critic_net; critic.py): its trunk on every row in the prepass (no gradient), its head
 	# over them after it (the credit's per-row baselines V7, G7, V_end), its link state on its training rows (the policy's
 	# link loss), then its own steps on those rows and the pool's (train_critic)
@@ -1870,7 +2026,7 @@ def ppo_update(
 		c_players_all = torch.zeros(n, device=device)  # (each row's g_players: the free head's share prior)
 		c_pending = []  # (the prepass's chunks waiting for the critic's trunk: critic_states)
 		c_oom = {"retries": 0}  # (critic_states' and train_critic's halvings on running out of the GPU's memory)
-	if segments:  # (config.credit_segments: every offset's heads, V2 V5 V7 and G2 G5 G7)
+	if segments or horizons_by_policy:  # (config.credit_segments, credit_horizons without the critic: every offset's heads, V2 V5 V7 and G2 G5 G7)
 		value_all, growth_all = torch.zeros(n, c.N_VALUE_OFFSETS, device=device), torch.zeros(n, c.N_VALUE_OFFSETS, device=device)
 	side = torch.full((n,), 36.0, device=device)  # (each decision's map side: the schedule credit's share weight)
 	value_now = torch.zeros(n, device=device)  # (V7's logit: the schedule credit's share forecast)
@@ -1934,7 +2090,7 @@ def ppo_update(
 			if "growth_logit" in out:
 				growth_now[index] = out["growth_logit"][:, -1].float()
 				value_now[index] = out["value_logit"][:, -1].float()
-				if segments:
+				if segments or horizons_by_policy:
 					growth_all[index], value_all[index] = out["growth_logit"].float(), out["value_logit"].float()
 				log_phi[index] = out["phi"].float().clamp(min=PHI_FLOOR).log()
 			players = input_on_device(raw["wire"], "g_players") if prepare is not None else raw["g_players"]
@@ -2067,6 +2223,11 @@ def ppo_update(
 		if int(known.sum()) > 1:
 			attributed_stats = {"attributed_taken_share": float((taken[known] > 0).float().mean()), "attributed_taken_mean": float(taken[known].mean()), "attributed_own_std": float(own[known].std()), "attributed_taken_std": float(taken[known].std())}
 	schedule_stats, schedule_stats_segments, segment_rows = {}, {}, None
+	# config.credit_horizons (e5 for the user, 2026-11-19: "ensuring equal effects is the minimum"): the credit of the four
+	# points 2, 5, 7 days and the end, each standardized, at config.credit_horizon_weights (four_point)
+	horizons = getattr(config, "credit_horizons", False) and config.credit == "schedule" and growth_real is not None
+	horizon_parts = horizon_components = horizon_final = None
+	horizon_stats = {}
 	if config.credit == "schedule" and growth_real is not None:  # (config.credit: the share's weight grows by the day)
 		real7 = torch.from_numpy(np.asarray(growth_real, dtype=np.float32)[:, -1]).to(device)
 		grow = (real7 - log_phi).clamp(-GROWTH_CAP, GROWTH_CAP) - (torch.sigmoid(growth_now) * 2 * GROWTH_CAP - GROWTH_CAP)
@@ -2097,6 +2258,12 @@ def ppo_update(
 		# 	change = step_credit(change, share_forecast, step, day, share_step_trust, classes, price, config.outcome_share_min)
 		w = share_weight(day, side, config)
 		advantage = w * change + (1 - w) * grow  # (nan where a label is unknown: no credit)
+		if horizons:  # (each horizon's terms at the critic's own V_k and G_k; the 7-day point as the line above when uncalibrated)
+			h_value, h_growth = (c_out["value_logit"].float(), c_out["growth_logit"].float()) if crit is not None else (value_all, growth_all)
+			h_share, h_grow, horizon_stats = horizon_terms(targets, growth_real, h_value, h_growth, log_phi, share_trust, calibrated=getattr(config, "credit_calibrated", False))
+			horizon_parts = w.unsqueeze(1) * h_share + (1 - w.unsqueeze(1)) * h_grow  # [n, 3]
+			if credit_gate:  # (e5, 2026-11-19: the policy's first update, before any step: each term's fit and what its baseline does)
+				credit_gate_check(horizon_stats, getattr(config, "credit_calibrated", False), float(getattr(config, "credit_gate_ratio", 1.2)))
 		if segments:  # (config.credit_segments: the 7-day credit by segments, the long ones at the learner's measured k)
 			full = advantage
 			pieces = segment_surprises(targets, growth_real, value_all, growth_all, log_phi, share_trust, w, device)  # [n, 3]
@@ -2117,15 +2284,17 @@ def ppo_update(
 			if int(known.sum()) > 1:
 				schedule_stats.update(schedule_action_price_mean=float(charged[known].mean()), schedule_action_price_std=float(charged[known].std()), schedule_action_price_share=float(charged[known].mean() / advantage[known].std().clamp(min=1e-12)))  # (the mean charge over the 7-day credit's spread)
 			advantage = advantage - charged
+			if horizon_parts is not None:  # (the price stays on the 7-day point alone)
+				horizon_parts = torch.cat([horizon_parts[:, :2], (horizon_parts[:, 2] - charged).unsqueeze(1)], dim=1)
 	type_parts = None  # (config.type_evidence: the 7-day credit as it enters the blend, the end credit, each standardized, the learner's reading)
 	if getattr(config, "type_evidence", False):
 		try:
 			type_parts = [standardized(advantage.detach().cpu().numpy().astype(np.float32)), np.full(len(decisions), np.nan, np.float32)]
 		except Exception as error:  # (a reading: never the update's end)
 			print(f"campaign: FAILURE: the type evidence's credit parts ({type(error).__name__}: {str(error)[:200]})", flush=True)
-	if end is not None and end["weight"] > 0:  # the policy's credit moves toward the end's as V_end proves itself
+	if end is not None and (end["weight"] > 0 or horizon_parts is not None):  # the policy's credit moves toward the end's as V_end proves itself
 		turn = choices(decisions)["kind"] == c.DecisionKind.TURN
-		later = end_advantages(end_now.cpu().numpy(), end["step"], end["week"], end["real"], end["price"], turn, config.decision_price, end["outcome"], week_only=getattr(config, "end_week_share", -1.0) >= 1.0)
+		later = end_advantages(end_now.cpu().numpy(), end["step"], end["week"], end["real"], end["price"], turn, config.decision_price, end["outcome"], week_only=getattr(config, "end_week_share", -1.0) >= 1.0 or horizon_parts is not None)
 		end_credit_none = float(np.mean(~np.isfinite(later))) if len(later) else float("nan")  # (learner column end_credit_none)
 		if type_parts is not None:
 			try:
@@ -2137,10 +2306,21 @@ def ppo_update(
 		# in the learner, as the 7-day credit's check: the end credit is two thirds of the advantage, and no check saw it)
 		values = end_now.cpu().numpy()
 		end_step_error = np.where(end["step"] >= 0, values[np.maximum(end["step"], 0)] - end["real"], np.nan).astype(np.float32)
-		if attributed is not None or config.credit == "schedule":  # (two units, log growth and share: each standardized before they mix)
+		if horizon_parts is not None:  # (the four points, the end's the week of V_end: e5 2026-11-19)
+			advantage, horizon_components = four_point(horizon_parts, later, config.credit_horizon_weights)
+		elif attributed is not None or config.credit == "schedule":  # (two units, log growth and share: each standardized before they mix)
 			advantage = torch.from_numpy(blend_credit(standardized(advantage.cpu().numpy()), standardized(later), end["weight"])).to(device)
 		else:
 			advantage = torch.from_numpy(blend_credit(advantage.cpu().numpy(), later, end["weight"])).to(device)
+	if horizon_parts is not None and horizon_components is None:  # (no end point: the three day points)
+		advantage, horizon_components = four_point(horizon_parts, None, config.credit_horizon_weights)
+	if horizon_parts is not None:  # (each day point's raw spread and the share of rows that have it)
+		for k, name in enumerate(("2", "5", "7")):
+			column = horizon_parts[:, k]
+			known = torch.isfinite(column)
+			horizon_stats[f"credit_point_{name}_known"] = float(known.float().mean())
+			if int(known.sum()) > 1:
+				horizon_stats[f"credit_point_{name}_sd"] = float(column[known].std())
 	credited = torch.isfinite(advantage)
 	type_credit = None
 	if type_parts is not None:
@@ -2160,6 +2340,11 @@ def ppo_update(
 		hidden_t = torch.from_numpy(np.asarray(hidden, dtype=bool)).to(device)
 		kinds = [rows for rows in (credited & ~hidden_t, credited & hidden_t) if int(rows.sum()) > 1]
 		by_kind = len(kinds) == 2
+	if horizon_components is not None:  # (each point's term through the same standardization: the four sum to the advantage)
+		horizon_final = torch.zeros_like(horizon_components)
+		for rows in (kinds if by_kind else [credited] if int(credited.sum()) > 1 else []):
+			scale = advantage[rows].std() + 1e-8
+			horizon_final = torch.where(rows.unsqueeze(1), (horizon_components - horizon_components[rows].mean(dim=0)) / scale, horizon_final)
 	if by_kind:
 		standard = advantage.clone()
 		for rows in kinds:
@@ -2337,6 +2522,13 @@ def ppo_update(
 						checked = gradient_check(model, check[0] - check[3], check[3], check[4], prefix="grad_raw_", watch=WATCHED)
 					del check
 					gc.collect()
+				if horizon_final is not None and "credit_grad_share_2" not in horizon_stats:
+					try:  # (a reading on the check micro-batch, never the step's path: each point's share of the policy term's gradient)
+						horizon_stats.update(horizon_gradient_shares(model, forward(model_inputs(raw)), batch, horizon_final[sub], config.clip))
+					except Exception as error:  # noqa: BLE001
+						horizon_stats["credit_grad_share_2"] = float("nan")
+						print(f"campaign: the credit points' gradient shares failed ({type(error).__name__}: {str(error)[:160]})", flush=True)
+					gc.collect()
 				if fs_parts is not None:  # (summed on the device: a float() here waited for the GPU every micro-batch)
 					fs_scale = 1.0 if fs_rows is not None else share  # (with the minibatch's counts a micro-batch's parts are already its share of the mean)
 					foresight_sum = fs_parts * fs_scale if foresight_sum is None else foresight_sum + fs_parts * fs_scale
@@ -2395,9 +2587,12 @@ def ppo_update(
 			critic_stats.update(head_stats("own", critic_head_fit(c_out, own_rows, c_phi_all, targets_t, share_valid, *g_args, *e_args, head_w=head_w)))
 			if hasattr(cm, "free"):
 				critic_stats.update(head_stats("own", critic_head_fit(cm.free(c_hidden_all, c_players_all), own_rows, c_phi_all, targets_t, share_valid, *g_args, *e_args, head_w=head_w), visible=True))
-		critic_stats.update(train_critic(cm, crit, config, own_rows, c_hidden_all, c_phi_all, c_rivals, c_mask, c_share, targets_t, share_valid,
-			growth_t if growth is not None else None, growth_valid if growth is not None else None, end_t if end is not None else None, end_valid if end is not None else None,
-			head_w, lambda chunks: _prefetched(chunks, decode, device, fed, config.decode_threads), model_inputs, device))
+		if crit.get("frozen"):  # (campaign.stage "policy": the critic frozen, no step; its readings on our rows above only)
+			critic_stats["critic_frozen"] = 1.0
+		else:
+			critic_stats.update(train_critic(cm, crit, config, own_rows, c_hidden_all, c_phi_all, c_rivals, c_mask, c_share, targets_t, share_valid,
+				growth_t if growth is not None else None, growth_valid if growth is not None else None, end_t if end is not None else None, end_valid if end is not None else None,
+				head_w, lambda chunks: _prefetched(chunks, decode, device, fed, config.decode_threads), model_inputs, device))
 		del c_hidden_all, c_link_all, c_phi_all
 	if config.target_kl and steps:
 		if stopped:
@@ -2419,6 +2614,7 @@ def ppo_update(
 		noise=noise,  # (loss_noise's, when measured)
 		**attributed_stats,
 		**schedule_stats,
+		**horizon_stats,
 		signal_ratio=signal_ratio(optimizer),  # (the steps' noise: the user's 2026-10-31 aim of 0.25+, with 4,096-decision steps)
 		signal_fraction=signal_fraction(optimizer),  # (the share of each group's gradient that is signal, at any beta1)
 		**trunk_moments(model, optimizer),  # (the trunk group's shared layers and its policy heads apart)

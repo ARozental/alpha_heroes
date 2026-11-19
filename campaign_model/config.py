@@ -358,10 +358,26 @@ class CampaignConfig:
 	nk2_buffer_cap_games: int = 300
 	nk2_keep_games: int = 0  # the first this many stream games' groups, as labelled, kept in run_dir/campaign/nk2_kept (a ridge's rows)
 	# The run's stage (e5 for the user, 2026-11-19): "critic", the critic alone on the NK2 stream (no own games, no policy
-	# step, no link; an update when the stream holds a take above its floor); "joint", today's update
+	# step, no link; an update when the stream holds a take above its floor); "policy", the policy alone on our games, the
+	# critic frozen; "joint", today's update
 	stage: str = "joint"
+	# The credit of four points (e5 for the user, 2026-11-19: "we want to at the very least ensure an average effect for
+	# each 2/5/7/end day points"): each horizon's credit (the share's real change less its baseline, mixed with the log
+	# growth's by today's w(day)), and the end's (the week of V_end, labels.end_advantages), each standardized over the
+	# rows that have it, then A = the sum of the row's known points at credit_horizon_weights over those weights' sum,
+	# standardized as before; the action price on the 7-day point. end_week_share and the end credit's weight unused.
+	credit_horizons: bool = False
+	credit_horizon_weights: tuple = (0.25, 0.25, 0.25, 0.25)  # (2, 5, 7 days, the end)
+	# The baselines fitted each update (train.calibrated_baseline): b = alpha + beta x the forecast, beta in [0, 1], per
+	# term and horizon, in place of the trust (share) and the whole forecast (growth). Off: today's forms at each horizon
+	credit_calibrated: bool = False
+	credit_gate_ratio: float = 1.2  # (the policy's first update: an uncalibrated baseline's variance ratio above this stops the run)
 	# One init (the user, 2026-11-19): a new run's critic body set to the policy's own tensors at construction
 	critic_body_from_policy: bool = False
+	# Stage B (campaign.stage "policy"): the critic frozen (no step: its baselines and the link's targets only); at the
+	# stage's start, before its first game, the policy's shared layers set to the critic's and link_map at the identity
+	policy_body_from_critic: bool = False
+	link_before_again: bool = False  # (model_v2.link_before_again: the link reads the state the critic's trunk reads)
 	# Our rows' weight in the critic's loss balanced toward parity per step with the NK2 store's (e5, 2026-11-18: their
 	# pre-clip gradient norms 0.05-0.08 against 1.2-1.3, our rows ~1.3% of the critic's movement): learner.balance_critic_own
 	critic_own_balance: bool = False

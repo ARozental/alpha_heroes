@@ -238,6 +238,7 @@ def test_a_critic_only_update_trains_the_critic_alone_on_stream_rows_taken_once(
 	assert learner.head_var is not None
 	tags = learner.writer.tags
 	assert {"critic/loss_pool", "critic/loss_visible_pool", "critic/loss_pool_heldout", "critic/loss_visible_pool_heldout"} <= set(tags)
+	assert {f"critic/fixed_{p}_{h}{s}" for p in ("six", "end") for h in ("", "visible_") for s in ("pool", "pool_heldout")} <= set(tags)  # (the fixed-weight ruler)
 	assert not any(t.startswith("critic/") and "own" in t for t in tags)  # (no own rows: no own readings)
 	assert "nk2_stream/rows_taken" in tags
 	rows = (tmp_path / "critic_progress.csv").read_text().splitlines()

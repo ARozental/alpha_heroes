@@ -408,6 +408,10 @@ class CampaignModelV2(nn.Module):
 	adv_outputs = False  # the advantage head's too (AdvantageHead): the trainer's model sets it with config.adv_weight (train.ppo_update); a server's does not
 	nkp_outputs = False  # nk_predict's blind pass, head and targets too (nk_blind): the trainer's model with config.nk_predict_weight; a server's never
 	link_outputs = False  # the link state and link_map's prediction of the critic's too (config.critic_net): the trainer's model only
+	# (config.link_before_again, e5 for the user 2026-11-19, stage B) link_map reads the state after think, before the
+	# foresight's second pass: the point the critic's trunk reads (critic.Critic.trunk), so identical shared layers give
+	# the critic's own link state and, at link_map's identity, a link loss of 0; its gradient reaches the shared layers
+	link_before_again = False
 
 	def load_state_dict(self, state_dict, strict=True, assign=False):
 		"""A checkpoint from before a parameter was added (model.ADDED) loads with it at 0: the model as it was; one from
@@ -642,9 +646,12 @@ class CampaignModelV2(nn.Module):
 		state = self.see(state, known)
 		state = self.advise(state, known)
 		state = self.think(state)
+		early = self.link_state(state) if self.link_outputs and self.link_before_again and hasattr(self, "link_map") else None
 		foresight = self.foresee(state, known)
 		state = self.think_again(state, foresight, known)
 		out = {**self.decide(state, known), **foresight["outputs"], "memory": state.memory_out, "resource_worth": known.resource_worth}
+		if early is not None:
+			out["link_pred"] = self.link_map(early)
 		if self.plan_outputs:
 			out["fs_plan"] = state.plan
 		if self.adv_outputs:  # (decide's: the trainer's model only, never the contract's)
@@ -1386,6 +1393,14 @@ class CampaignModelV2(nn.Module):
 			mixed = torch.where(its, log_sum(own, log_rho.to(options.dtype)), own)
 			out["option_logp"] = torch.where(asked.unsqueeze(1), mixed, options)
 
+	def link_state(self, state):
+		"""The link's state as critic.Critic.trunk makes it: the global token, our heroes' and towns' mean, our player's."""
+		x = state.x
+		mine = torch.cat([x["h_present"][:, :HO], x["t_present"][:, :TO]], dim=1).float().unsqueeze(-1)
+		own = torch.cat([state.heroes[:, :HO], state.towns[:, :TO]], dim=1)
+		own_mean = (own * mine).sum(dim=1) / mine.sum(dim=1).clamp(min=1)
+		return torch.cat([state.glob, own_mean, state.players[:, 0]], dim=-1)
+
 	def value(self, state, known, out):
 		"""The value heads as v1's (model.CampaignModel.value): V2, V5, V7 (our share at the end of those days), the
 		growth heads and V_end, from the global token, our heroes' and towns' mean, our player's token and Φ."""
@@ -1405,7 +1420,7 @@ class CampaignModelV2(nn.Module):
 		out["end_logit"] = self.end_head(hidden).squeeze(-1) + share_prior
 		out["phi"] = known.phi_total
 		out["value_hidden"] = hidden  # (the privileged critic's: our state, and a rival's at its decisions)
-		if self.link_outputs and hasattr(self, "link_map"):  # (config.critic_net: the link loss's prediction, train.micro_loss)
+		if self.link_outputs and hasattr(self, "link_map") and not self.link_before_again:  # (config.critic_net: the link loss's prediction, train.micro_loss)
 			out["link_pred"] = self.link_map(torch.cat([state.glob, own_mean, state.players[:, 0]], dim=-1))
 
 
